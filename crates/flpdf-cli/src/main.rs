@@ -13,7 +13,7 @@ use flpdf::{
 };
 use flpdf::{
     check_reader_with_options_and_limits, enumerate_document_annotations, filters,
-    flatten_annotations, flatten_rotation_on_pages, fonts, generate_button_field_appearance,
+    flatten_rotation_on_pages, fonts, generate_button_field_appearance,
     generate_choice_field_appearance, generate_text_field_appearance,
     json_inspect::{
         write_qpdf_json_v2_selected_objects_to_output_with_options, DecodeLevel, JsonKey,
@@ -26,10 +26,10 @@ use flpdf::{
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
     parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
-    CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FlattenMode,
-    FormFieldObjectHelper, NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef,
-    ObjectStreamMode, PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig,
-    PrintPermission, RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
+    CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FormFieldObjectHelper,
+    NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper,
+    PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig, PrintPermission,
+    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -1283,12 +1283,15 @@ enum CliFlattenMode {
     Print,
 }
 
-impl From<CliFlattenMode> for FlattenMode {
-    fn from(v: CliFlattenMode) -> Self {
-        match v {
-            CliFlattenMode::All => FlattenMode::All,
-            CliFlattenMode::Screen => FlattenMode::Screen,
-            CliFlattenMode::Print => FlattenMode::Print,
+impl CliFlattenMode {
+    /// qpdf's `QPDFJob::Config::flattenAnnotations` mapping. Every CLI mode
+    /// rejects Invisible and Hidden; `screen` additionally rejects NoView,
+    /// while `print` requires the Print bit.
+    fn flags(self) -> (i64, i64) {
+        match self {
+            CliFlattenMode::All => (0, 0x3),
+            CliFlattenMode::Screen => (0, 0x3 | 0x20),
+            CliFlattenMode::Print => (0x4, 0x3),
         }
     }
 }
@@ -3212,7 +3215,9 @@ fn run_rewrite(
 
         // Step 5: flatten annotations into page content (--flatten-annotations).
         if let Some(mode) = flatten_annotations_mode {
-            flatten_annotations(&mut pdf, mode.into())?;
+            let (required_flags, forbidden_flags) = mode.flags();
+            PageDocumentHelper::new(&mut pdf)
+                .flatten_annotations(required_flags, forbidden_flags)?;
         }
 
         // Step 6: flatten page rotation into content (--flatten-rotation).

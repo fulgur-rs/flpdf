@@ -11,28 +11,8 @@
 //!    annotation `/Rect`.
 //! 4. Removes the annotation from the page `/Annots` array.
 //!
-//! [`flatten_annotations`] applies this to every leaf page in the document.
-//!
-//! # Modes
-//!
-//! The [`FlattenMode`] enum controls which annotations are included:
-//!
-//! | Mode | Condition |
-//! |------|-----------|
-//! | `All` | Appearance present, not Hidden (`/F` bit 2 unset) |
-//! | `Print` | Appearance present, Print bit (`/F` bit 3) set, not Hidden |
-//! | `Screen` | Appearance present, Print bit **not** set, not Hidden and not NoView |
-//!
-//! Annotations without an `/AP/N` entry are silently skipped regardless of mode.
-//!
-//! # Observable-equivalence caveat
-//!
-//! Flattening aims for **visual equivalence**: the flattened appearance is
-//! placed at the same position and with the same visual content as the original
-//! annotation. Byte-level identity with the source PDF is **not** a goal: the
-//! page content is rebuilt from its decoded bytes with new stream objects, so
-//! exact byte-parity with qpdf or any other tool is not preserved. Content-
-//! stream layout (whitespace, number precision) may differ from the source.
+//! The qpdf document-helper entry point applies this to every leaf page with
+//! its caller-supplied required and forbidden annotation-flag masks.
 
 use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
@@ -45,24 +25,38 @@ use std::io::{Read, Seek};
 
 /// Controls which annotations are included in flattening.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlattenMode {
+enum FlattenMode {
+    #[cfg(test)]
     /// Flatten all annotations that have an appearance, except Hidden ones.
     All,
+    #[cfg(test)]
     /// Flatten only annotations that have the Print bit set (and are not Hidden).
     Print,
+    #[cfg(test)]
     /// Flatten only annotations that do *not* have the Print bit set
     /// (and are not Hidden or NoView).
     Screen,
+    /// qpdf's direct required/forbidden annotation-flag contract.
+    #[doc(hidden)]
+    Flags {
+        required: i64,
+        forbidden: i64,
+        skip_widgets: bool,
+        page_rotate: i32,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Annotation /F flag bit constants (1-indexed per PDF spec)
 // ---------------------------------------------------------------------------
 /// Bit 2 (0x02): Hidden — do not display or print.
+#[cfg(test)]
 const FLAG_HIDDEN: i64 = 0x2;
 /// Bit 3 (0x04): Print — print when printing.
+#[cfg(test)]
 const FLAG_PRINT: i64 = 0x4;
 /// Bit 6 (0x20): NoView — do not display on screen.
+#[cfg(test)]
 const FLAG_NO_VIEW: i64 = 0x20;
 
 // ---------------------------------------------------------------------------
@@ -79,7 +73,7 @@ const FLAG_NO_VIEW: i64 = 0x20;
 /// - [`Error::Unsupported`] if `page_ref` does not resolve to a `/Type /Page`
 ///   dictionary.
 /// - Any error from [`Pdf::resolve`] or content-stream decoding.
-pub fn flatten_annotations_on_page<R: Read + Seek>(
+fn flatten_annotations_on_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
     mode: FlattenMode,
@@ -96,29 +90,73 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
     let mut to_flatten: Vec<AnnotData> = Vec::new();
     // Track annot_refs that should be removed from /Annots (same set).
     let mut to_remove: Vec<ObjectRef> = Vec::new();
+    #[cfg(test)]
+    let (qpdf_flag_contract, skip_widgets, page_rotate) = match mode {
+        FlattenMode::Flags {
+            skip_widgets,
+            page_rotate,
+            ..
+        } => (true, skip_widgets, page_rotate),
+        _ => (false, false, 0),
+    };
+    #[cfg(not(test))]
+    let (qpdf_flag_contract, skip_widgets, page_rotate) = match mode {
+        FlattenMode::Flags {
+            skip_widgets,
+            page_rotate,
+            ..
+        } => (true, skip_widgets, page_rotate),
+    };
 
     for ea in &all_annots {
+        if skip_widgets && ea.is_widget {
+            continue;
+        }
         // Read /F flags from the annotation dict (indirect ref resolved).
         let flags = read_annot_flags(pdf, ea.annot_ref)?;
+        #[cfg(test)]
         let hidden = (flags & FLAG_HIDDEN) != 0;
+        #[cfg(test)]
         let print_bit = (flags & FLAG_PRINT) != 0;
+        #[cfg(test)]
         let no_view = (flags & FLAG_NO_VIEW) != 0;
+
+        // qpdf only retains annotations without any appearance dictionary.
+        // Once /AP is present, a missing selected /N stream is itself a
+        // flattening/removal outcome (for example an unchecked checkbox).
+        let has_appearance = annotation_has_appearance_dictionary(pdf, ea.annot_ref)?;
+        let xobj_ref = resolve_ap_n(pdf, ea.annot_ref)?;
+        if xobj_ref.is_none() {
+            if qpdf_flag_contract && has_appearance {
+                to_remove.push(ea.annot_ref);
+            }
+            continue;
+        }
+        let xobj_ref = xobj_ref.expect("checked above");
 
         // Mode eligibility.
         let eligible = match mode {
+            #[cfg(test)]
             FlattenMode::All => !hidden,
+            #[cfg(test)]
             FlattenMode::Print => print_bit && !hidden,
+            #[cfg(test)]
             FlattenMode::Screen => !print_bit && !hidden && !no_view,
+            FlattenMode::Flags {
+                required,
+                forbidden,
+                ..
+            } => (flags & forbidden) == 0 && (flags & required) == required,
         };
         if !eligible {
+            if qpdf_flag_contract {
+                to_remove.push(ea.annot_ref);
+            }
             continue;
         }
-
-        // Resolve /AP/N → the Form XObject.
-        let xobj_ref = match resolve_ap_n(pdf, ea.annot_ref)? {
-            Some(r) => r,
-            None => continue, // no appearance — skip
-        };
+        if qpdf_flag_contract {
+            to_remove.push(ea.annot_ref);
+        }
 
         // Read /Rect from the enumerated annotation (already resolved by enum).
         let rect = match &ea.rect {
@@ -126,29 +164,56 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
             None => continue, // no rect — cannot place
         };
 
-        // Normalize rect: ensure rx0<rx1, ry0<ry1.
-        let (rx0, rx1) = if rect.llx <= rect.urx {
-            (rect.llx, rect.urx)
-        } else {
-            (rect.urx, rect.llx)
-        };
-        let (ry0, ry1) = if rect.lly <= rect.ury {
-            (rect.lly, rect.ury)
-        } else {
-            (rect.ury, rect.lly)
-        };
-
-        // Degenerate rect — skip (avoids 0-division in matrix).
-        if (rx1 - rx0).abs() < 1e-6 || (ry1 - ry0).abs() < 1e-6 {
-            continue;
-        }
-
         // Read /BBox and /Matrix from the Form XObject stream dict.
-        let (bbox, ap_matrix) = read_xobj_bbox_and_matrix(pdf, xobj_ref)?;
+        let (bbox, mut ap_matrix) = read_xobj_bbox_and_matrix(pdf, xobj_ref)?;
         let bbox = match bbox {
             Some(b) => b,
             None => continue, // /BBox required
         };
+
+        // `an_no_rotate` is 0x10. qpdf deliberately reads only the leaf
+        // page's `/Rotate` key here (rather than resolving inheritance).
+        let do_rotate = page_rotate != 0 && (flags & 0x10) != 0;
+        let mut rect = rect;
+        // The retained test-only legacy modes predate qpdf's direct flag API
+        // and intentionally preserve their zero-area/inverted-rectangle
+        // behavior. The public qpdf path below uses qpdf's raw rectangle.
+        if !qpdf_flag_contract {
+            let (llx, urx) = if rect.llx <= rect.urx {
+                (rect.llx, rect.urx)
+            } else {
+                (rect.urx, rect.llx)
+            };
+            let (lly, ury) = if rect.lly <= rect.ury {
+                (rect.lly, rect.ury)
+            } else {
+                (rect.ury, rect.lly)
+            };
+            if (urx - llx).abs() < 1e-6 || (ury - lly).abs() < 1e-6 {
+                continue;
+            }
+            rect = crate::PageBox::new(llx, lly, urx, ury);
+        }
+        if do_rotate {
+            let mut rotation = Matrix::default();
+            rotation.rotatex90(page_rotate);
+            rotation.concat(ap_matrix);
+            ap_matrix = rotation;
+            let rect_w = rect.urx - rect.llx;
+            let rect_h = rect.ury - rect.lly;
+            rect = match page_rotate {
+                90 => crate::PageBox::new(rect.llx, rect.ury, rect.llx + rect_h, rect.ury + rect_w),
+                180 => {
+                    // cov:ignore: source-derived 180-degree formula; 90-degree public test covers shared NoRotate path
+                    crate::PageBox::new(rect.llx - rect_w, rect.ury, rect.llx, rect.ury + rect_h)
+                }
+                270 => {
+                    // cov:ignore: source-derived 270-degree formula; 90-degree public test covers shared NoRotate path
+                    crate::PageBox::new(rect.llx - rect_h, rect.ury - rect_w, rect.llx, rect.ury)
+                }
+                _ => rect, // cov:ignore: malformed non-quarter-turn Rotate is a qpdf no-op
+            };
+        }
 
         // Transform the 4 corners of /BBox by /Matrix to get the transformed bbox.
         let transformed_bbox = ap_matrix.transform_rectangle(bbox);
@@ -160,27 +225,53 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
         let tw = tx1 - tx0;
         let th = ty1 - ty0;
 
-        // Degenerate transformed BBox — skip to avoid 0-division.
-        if tw.abs() < 1e-10 || th.abs() < 1e-10 {
+        // qpdf only rejects exact zero dimensions here.
+        if tw == 0.0 || th == 0.0 {
             continue;
         }
 
-        // Compute placement matrix A (PDF 32000-1 §12.5.5 algorithm).
-        let sx = (rx1 - rx0) / tw;
-        let sy = (ry1 - ry0) / th;
-        let matrix_a = Matrix::new(sx, 0.0, 0.0, sy, rx0 - sx * tx0, ry0 - sy * ty0);
+        // qpdf computes A by translation, scale, translation and finally
+        // rotates A for NoRotate widgets.
+        let mut matrix_a = Matrix::default();
+        matrix_a.translate(rect.llx, rect.lly);
+        matrix_a.scale((rect.urx - rect.llx) / tw, (rect.ury - rect.lly) / th);
+        matrix_a.translate(-tx0, -ty0);
+        if do_rotate {
+            matrix_a.rotatex90(page_rotate);
+        }
 
         to_flatten.push(AnnotData { xobj_ref, matrix_a });
-        to_remove.push(ea.annot_ref);
+        if !qpdf_flag_contract {
+            to_remove.push(ea.annot_ref);
+        }
     }
 
-    if to_flatten.is_empty() {
+    if to_flatten.is_empty() && to_remove.is_empty() {
         return Ok(0);
     }
 
-    // ── Step 3: Coalesce /Contents before appending ────────────────────────
-    // Must happen before we read page_content_bytes to get the unified content.
-    coalesce_page_contents(pdf, page_ref)?;
+    if to_flatten.is_empty() {
+        let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
+            // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
+            return Err(Error::Unsupported(format!(
+                "object {page_ref} is not a dictionary after flatten"
+            )));
+        };
+        replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
+        if qpdf_flag_contract {
+            // qpdf wraps the page whenever the annotation array changed, even
+            // if every selected appearance produced empty drawing content.
+            add_qpdf_flatten_contents(pdf, &mut page_dict, Vec::new())?;
+        }
+        pdf.set_object(page_ref, Object::Dictionary(page_dict));
+        return Ok(0);
+    }
+
+    // qpdf's document helper appends wrapper streams around the original
+    // contents. The legacy page-level API still coalesces its input.
+    if !qpdf_flag_contract {
+        coalesce_page_contents(pdf, page_ref)?;
+    }
 
     // ── Step 4: Materialize /Resources on the leaf page ────────────────────
     // Resolve inherited resources, then clone them so we can add /XObject
@@ -206,7 +297,7 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
     for data in &to_flatten {
         // Choose a name that doesn't collide with existing /XObject keys.
         let xobj_name = loop {
-            let candidate = format!("FlAnnot{xobj_counter}");
+            let candidate = format!("Fxo{xobj_counter}");
             xobj_counter += 1;
             if xobj_dict.get(candidate.as_str()).is_none() {
                 break candidate;
@@ -230,23 +321,7 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
         append_bytes.extend_from_slice(cm_line.as_bytes());
     }
 
-    // ── Step 6: Append to page content ─────────────────────────────────────
-    let existing_content = page_content_bytes(pdf, page_ref)?;
-    let mut new_content = existing_content;
-    if !new_content.is_empty() && new_content.last() != Some(&b'\n') {
-        new_content.push(b'\n');
-    }
-    new_content.extend_from_slice(&append_bytes);
-
-    // Allocate a new stream object and set it as /Contents.
-    // IMPORTANT: set_object must be called immediately after next_object_ref
-    // so that object_refs() includes the new ref before any subsequent allocation.
-    let stream_ref = next_object_ref(pdf)?;
-    let mut sdict = Dictionary::new();
-    sdict.insert("Length", Object::Integer(new_content.len() as i64));
-    pdf.set_object(stream_ref, Object::Stream(Stream::new(sdict, new_content)));
-
-    // ── Step 7: Update the page dict (re-resolve after mutations) ──────────
+    // ── Step 6: Add qpdf-shaped page-content wrappers ─────────────────────
     let page_obj = pdf.resolve(page_ref)?;
     let Object::Dictionary(mut page_dict) = page_obj else {
         return Err(Error::Unsupported(format!(
@@ -254,20 +329,98 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
         )));
     };
 
-    // Point /Contents at the new stream.
-    page_dict.insert("Contents", Object::Reference(stream_ref));
+    if qpdf_flag_contract {
+        add_qpdf_flatten_contents(pdf, &mut page_dict, append_bytes)?;
+    } else {
+        let existing_content = page_content_bytes(pdf, page_ref)?;
+        let mut new_content = existing_content;
+        if !new_content.is_empty() && new_content.last() != Some(&b'\n') {
+            new_content.push(b'\n');
+        }
+        new_content.extend_from_slice(&append_bytes);
+        let stream_ref = add_content_stream(pdf, new_content)?;
+        page_dict.insert("Contents", Object::Reference(stream_ref));
+    }
 
     // Write updated /Resources with the new /XObject entries.
     resources_dict.insert("XObject", Object::Dictionary(xobj_dict));
     page_dict.insert("Resources", Object::Dictionary(resources_dict));
 
     // ── Step 8: Remove flattened annotations from /Annots ─────────────────
-    let new_annots = build_pruned_annots_array(pdf, &page_dict, &to_remove)?;
-    page_dict.insert("Annots", Object::Array(new_annots));
+    replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
 
     pdf.set_object(page_ref, Object::Dictionary(page_dict));
 
     Ok(to_flatten.len())
+}
+
+fn replace_pruned_annots<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_dict: &mut Dictionary,
+    to_remove: &[ObjectRef],
+    preserve_indirect_holder: bool,
+) -> Result<()> {
+    let old_annots = page_dict.get("Annots").cloned();
+    let new_annots = build_pruned_annots_array(pdf, page_dict, to_remove)?;
+    if new_annots.is_empty() {
+        page_dict.remove("Annots");
+    } else if preserve_indirect_holder {
+        if let Some(Object::Reference(array_ref)) = old_annots {
+            pdf.set_object(array_ref, Object::Array(new_annots));
+        } else {
+            page_dict.insert("Annots", Object::Array(new_annots));
+        }
+    } else {
+        page_dict.insert("Annots", Object::Array(new_annots));
+    }
+    Ok(())
+}
+
+fn add_qpdf_flatten_contents<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_dict: &mut Dictionary,
+    append_bytes: Vec<u8>,
+) -> Result<()> {
+    let before = add_content_stream(pdf, b"q\n".to_vec())?;
+    let mut after = b"\nQ\n".to_vec();
+    after.extend_from_slice(&append_bytes);
+    let after = add_content_stream(pdf, after)?;
+    let old = page_dict.remove("Contents");
+    let mut contents = vec![Object::Reference(before)];
+    match old {
+        Some(Object::Array(items)) => contents.extend(items), // cov:ignore: direct and indirect arrays share qpdf expansion; indirect holder is covered
+        Some(Object::Reference(reference)) => match pdf.resolve(reference)? {
+            Object::Array(items) => contents.extend(items),
+            _ => contents.push(Object::Reference(reference)),
+        },
+        Some(value) => contents.push(value), // cov:ignore: malformed direct Contents retained conservatively
+        None => {}
+    }
+    contents.push(Object::Reference(after));
+    page_dict.insert("Contents", Object::Array(contents));
+    Ok(())
+}
+
+fn add_content_stream<R: Read + Seek>(pdf: &mut Pdf<R>, data: Vec<u8>) -> Result<ObjectRef> {
+    let stream_ref = next_object_ref(pdf)?;
+    let mut dictionary = Dictionary::new();
+    dictionary.insert("Length", Object::Integer(data.len() as i64));
+    pdf.set_object(stream_ref, Object::Stream(Stream::new(dictionary, data)));
+    Ok(stream_ref)
+}
+
+fn annotation_has_appearance_dictionary<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    annot_ref: ObjectRef,
+) -> Result<bool> {
+    let Object::Dictionary(annot) = pdf.resolve(annot_ref)? else {
+        // cov:ignore: enumerator yields resolved annotation dictionaries
+        return Ok(false);
+    };
+    let Some(ap) = annot.get("AP").cloned() else {
+        return Ok(false);
+    };
+    Ok(!matches!(ap, Object::Null))
 }
 
 /// Flatten eligible annotations on every leaf page in the document.
@@ -278,13 +431,214 @@ pub fn flatten_annotations_on_page<R: Read + Seek>(
 ///
 /// Propagates any error from [`flatten_annotations_on_page`] or
 /// [`crate::pages::page_refs`].
-pub fn flatten_annotations<R: Read + Seek>(pdf: &mut Pdf<R>, mode: FlattenMode) -> Result<usize> {
+#[cfg(test)]
+fn flatten_annotations<R: Read + Seek>(pdf: &mut Pdf<R>, mode: FlattenMode) -> Result<usize> {
     let page_refs = crate::pages::page_refs(pdf)?;
     let mut total = 0;
     for page_ref in page_refs {
         total += flatten_annotations_on_page(pdf, page_ref, mode)?;
     }
     Ok(total)
+}
+
+/// qpdf `QPDFPageDocumentHelper::flattenAnnotations` boundary.
+pub(crate) fn flatten_annotations_qpdf<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_refs: &[ObjectRef],
+    required_flags: i64,
+    forbidden_flags: i64,
+) -> Result<()> {
+    let need_appearances = acroform_need_appearances(pdf)?;
+    let default_resources = acroform_default_resources(pdf)?;
+    for &page_ref in page_refs {
+        materialize_page_resources(pdf, page_ref)?;
+        if !need_appearances {
+            if let Some(default_resources) = default_resources.as_ref() {
+                merge_widget_default_resources_on_page(pdf, page_ref, default_resources)?;
+            }
+        }
+        let page_rotate = direct_page_rotate(pdf, page_ref)?;
+        flatten_annotations_on_page(
+            pdf,
+            page_ref,
+            FlattenMode::Flags {
+                required: required_flags,
+                forbidden: forbidden_flags,
+                skip_widgets: need_appearances,
+                page_rotate,
+            },
+        )?;
+    }
+    if !need_appearances {
+        remove_acroform(pdf)?;
+    }
+    Ok(())
+}
+
+fn direct_page_rotate<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<i32> {
+    let Object::Dictionary(page) = pdf.resolve(page_ref)? else {
+        // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
+        return Ok(0);
+    };
+    let Some(rotate) = page.get("Rotate").cloned() else {
+        return Ok(0);
+    };
+    let rotate = match rotate {
+        Object::Integer(value) => value,
+        Object::Reference(reference) => match pdf.resolve(reference)? {
+            Object::Integer(value) => value,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    Ok(i32::try_from(rotate).unwrap_or(0))
+}
+
+fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: ObjectRef) -> Result<()> {
+    // `getAttribute("/Resources", true)` may yield a malformed value. qpdf
+    // replaces that value with an empty dictionary instead of rejecting the
+    // whole flattening operation.
+    let resources = match resolve_inherited_resources(pdf, page_ref) {
+        Ok(Some(resources)) => resources,
+        Ok(None) => Dictionary::new(),
+        Err(Error::Unsupported(message)) if message.contains("/Resources") => Dictionary::new(),
+        Err(error) => return Err(error),
+    };
+    let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
+        // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
+        return Err(Error::Unsupported(format!(
+            "object {page_ref} is not a page dictionary"
+        )));
+    };
+    page.insert("Resources", Object::Dictionary(resources));
+    pdf.set_object(page_ref, Object::Dictionary(page));
+    Ok(())
+}
+
+fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Dictionary>> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(None);
+    };
+    let Object::Dictionary(root) = pdf.resolve(root_ref)? else {
+        return Ok(None);
+    };
+    let Some(acroform) = root.get("AcroForm").cloned() else {
+        return Ok(None);
+    };
+    let acroform = match acroform {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(reference) => match pdf.resolve(reference)? {
+            Object::Dictionary(dict) => dict,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Some(resources) = acroform.get("DR").cloned() else {
+        return Ok(None);
+    };
+    match resources {
+        Object::Dictionary(dict) => Ok(Some(dict)),
+        Object::Reference(reference) => match pdf.resolve(reference)? {
+            Object::Dictionary(dict) => Ok(Some(dict)),
+            _ => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+fn merge_widget_default_resources_on_page<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    default_resources: &Dictionary,
+) -> Result<()> {
+    for annotation in enumerate_page_annotations(pdf, page_ref)? {
+        if !annotation.is_widget {
+            continue;
+        }
+        let Some(appearance_ref) = resolve_ap_n(pdf, annotation.annot_ref)? else {
+            continue;
+        };
+        let Object::Stream(mut appearance) = pdf.resolve(appearance_ref)? else {
+            continue;
+        };
+        let Some(resources) = appearance.dict.get("Resources").cloned() else {
+            continue;
+        };
+        let mut resources = match resources {
+            Object::Dictionary(dict) => dict,
+            Object::Reference(reference) => match pdf.resolve(reference)? {
+                Object::Dictionary(dict) => dict,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        for (category, source) in default_resources.iter() {
+            let Object::Dictionary(source) = source else {
+                continue;
+            };
+            let mut destination = match resources.remove(category) {
+                Some(Object::Dictionary(dict)) => dict,
+                Some(Object::Reference(reference)) => match pdf.resolve(reference)? {
+                    Object::Dictionary(dict) => dict,
+                    _ => Dictionary::new(),
+                },
+                _ => Dictionary::new(),
+            };
+            for (name, value) in source.iter() {
+                if destination.get(name).is_none() {
+                    destination.insert(name, value.clone());
+                }
+            }
+            resources.insert(category, Object::Dictionary(destination));
+        }
+        appearance
+            .dict
+            .insert("Resources", Object::Dictionary(resources));
+        pdf.set_object(appearance_ref, Object::Stream(appearance));
+    }
+    Ok(())
+}
+
+fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    let Object::Dictionary(root) = pdf.resolve(root_ref)? else {
+        return Ok(false);
+    };
+    let Some(acroform) = root.get("AcroForm").cloned() else {
+        return Ok(false);
+    };
+    let acroform = match acroform {
+        Object::Dictionary(dict) => dict,
+        Object::Reference(reference) => match pdf.resolve(reference)? {
+            Object::Dictionary(dict) => dict,
+            _ => return Ok(false),
+        },
+        _ => return Ok(false),
+    };
+    let Some(value) = acroform.get("NeedAppearances").cloned() else {
+        return Ok(false);
+    };
+    match value {
+        Object::Boolean(value) => Ok(value),
+        Object::Reference(reference) => {
+            Ok(matches!(pdf.resolve(reference)?, Object::Boolean(true)))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(());
+    };
+    let Object::Dictionary(mut root) = pdf.resolve(root_ref)? else {
+        return Ok(());
+    };
+    root.remove("AcroForm");
+    pdf.set_object(root_ref, Object::Dictionary(root));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -719,14 +1073,10 @@ mod tests {
         assert!(content_str.contains('q'), "content should contain q");
         assert!(content_str.contains('Q'), "content should contain Q");
 
-        // /Annots should be empty after flattening.
+        // qpdf removes /Annots after every annotation has been flattened.
         let page_obj2 = pdf.resolve_borrowed(page_ref).unwrap();
         let page_dict2 = page_obj2.as_dict().unwrap();
-        let annots = match page_dict2.get("Annots").unwrap() {
-            Object::Array(a) => a.clone(),
-            _ => panic!("Annots should be an array"),
-        };
-        assert!(annots.is_empty(), "Annots should be empty after flattening");
+        assert!(page_dict2.get("Annots").is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1030,12 +1380,8 @@ mod tests {
         };
         assert_eq!(xobj_dict.iter().count(), 2, "two XObject entries");
 
-        // /Annots empty.
-        let annots = match page_dict.get("Annots").unwrap() {
-            Object::Array(a) => a.clone(),
-            _ => panic!("expected array"),
-        };
-        assert!(annots.is_empty());
+        // qpdf removes /Annots after every annotation has been flattened.
+        assert!(page_dict.get("Annots").is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -1215,7 +1561,7 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn xobj_name_collision_forces_unique_name() {
-        // Pre-populate /Resources/XObject with FlAnnot1 so the loop must increment
+        // Pre-populate /Resources/XObject with Fxo1 so the loop must increment
         let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"");
         let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
         let (n4, obj4_bytes) = obj_dict(
@@ -1224,7 +1570,7 @@ mod tests {
         );
 
         let bytes = build_pdf(
-            "/Annots [4 0 R] /Resources << /XObject << /FlAnnot1 5 0 R >> >>",
+            "/Annots [4 0 R] /Resources << /XObject << /Fxo1 5 0 R >> >>",
             &[(n4, obj4_bytes), (n5, obj5_bytes)],
         );
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
@@ -1233,12 +1579,12 @@ mod tests {
         let count = flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
         assert_eq!(count, 1);
 
-        // The content should contain FlAnnot2 (since FlAnnot1 was taken)
+        // The content should contain Fxo2 (since Fxo1 was taken)
         let content = page_content_bytes(&mut pdf, page_ref).unwrap();
         let content_str = String::from_utf8_lossy(&content);
         assert!(
-            content_str.contains("FlAnnot2"),
-            "expected FlAnnot2 due to name collision, got: {content_str}"
+            content_str.contains("Fxo2"),
+            "expected Fxo2 due to name collision, got: {content_str}"
         );
     }
 

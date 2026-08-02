@@ -5,8 +5,8 @@
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
 use flpdf::{
-    write_pdf_with_options, Dictionary, FlattenMode, Object, ObjectRef, PageDocumentHelper, Pdf,
-    Stream, WriteOptions,
+    write_pdf_with_options, Dictionary, Object, ObjectRef, PageDocumentHelper, Pdf, Stream,
+    WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -276,7 +276,7 @@ fn helper_flatten_annotations_repairs_page_tree_before_enumerating() {
     pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
 
     PageDocumentHelper::new(&mut pdf)
-        .flatten_annotations(FlattenMode::All)
+        .flatten_annotations(0, 0x3)
         .unwrap();
 
     let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
@@ -286,6 +286,509 @@ fn helper_flatten_annotations_repairs_page_tree_before_enumerating() {
         catalog.get("Pages"),
         Some(&Object::Reference(ObjectRef::new(2, 0))),
         "qpdf flattenAnnotations obtains the repaired all-pages list before processing pages"
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+    );
+
+    let mut appearance = Dictionary::new();
+    appearance.insert("Type", Object::Name(b"XObject".to_vec()));
+    appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Stream(Stream::new(appearance, Vec::new())),
+    );
+    for (object_ref, flags) in [(ObjectRef::new(6, 0), 4), (ObjectRef::new(7, 0), 0)] {
+        let mut annot = Dictionary::new();
+        annot.insert("Type", Object::Name(b"Annot".to_vec()));
+        annot.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        annot.insert("F", Object::Integer(flags));
+        annot.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(8, 0)));
+        annot.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(object_ref, Object::Dictionary(annot));
+    }
+
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert(
+        "Annots",
+        Object::Array(vec![
+            Object::Reference(ObjectRef::new(6, 0)),
+            Object::Reference(ObjectRef::new(7, 0)),
+        ]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    let mut acroform = Dictionary::new();
+    acroform.insert(
+        "Fields",
+        Object::Array(vec![
+            Object::Reference(ObjectRef::new(6, 0)),
+            Object::Reference(ObjectRef::new(7, 0)),
+        ]),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("AcroForm", Object::Reference(ObjectRef::new(9, 0)));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let mut input = Vec::new();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.static_id = true;
+        write_pdf_with_options(&mut pdf, &mut input, &options).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("flags-input.pdf");
+        let output_path = dir.path().join("flags-qpdf.pdf");
+        fs::write(&input_path, input).unwrap();
+        let output = Command::new("qpdf")
+            .arg("--flatten-annotations=print")
+            .arg(&input_path)
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "qpdf failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut qpdf_output = Pdf::open(Cursor::new(fs::read(&output_path).unwrap())).unwrap();
+        let qpdf_pages = PageDocumentHelper::new(&mut qpdf_output)
+            .get_all_pages()
+            .unwrap();
+        let qpdf_annots =
+            flpdf::enumerate_page_annotations(&mut qpdf_output, qpdf_pages[0]).unwrap();
+        assert!(qpdf_annots.is_empty());
+        let Object::Dictionary(qpdf_catalog) = qpdf_output.resolve(ObjectRef::new(1, 0)).unwrap()
+        else {
+            panic!("qpdf output catalog must be a dictionary");
+        };
+        assert!(qpdf_catalog.get("AcroForm").is_none());
+    }
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0x4, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(page.get("Annots").is_none());
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    assert!(catalog.get("AcroForm").is_none());
+    let contents = flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+    assert!(String::from_utf8_lossy(&contents).contains("/Fxo1 Do"));
+}
+
+#[test]
+fn helper_flatten_annotations_keeps_widgets_when_need_appearances_is_true() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut appearance = Dictionary::new();
+    appearance.insert("Type", Object::Name(b"XObject".to_vec()));
+    appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Stream(Stream::new(appearance, Vec::new())),
+    );
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+    let mut widget = Dictionary::new();
+    widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+    widget.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    widget.insert("AP", Object::Dictionary(ap));
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+    let mut acroform = Dictionary::new();
+    pdf.set_object(ObjectRef::new(7, 0), Object::Boolean(true));
+    acroform.insert("NeedAppearances", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(acroform));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("AcroForm", Object::Reference(ObjectRef::new(6, 0)));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(page.get("Annots").is_some());
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    assert!(catalog.get("AcroForm").is_some());
+}
+
+#[test]
+fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut appearance_resources = Dictionary::new();
+    appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+    let mut appearance = Dictionary::new();
+    appearance.insert("Type", Object::Name(b"XObject".to_vec()));
+    appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
+    appearance.insert("Resources", Object::Dictionary(appearance_resources));
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Stream(Stream::new(appearance, Vec::new())),
+    );
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+    let mut widget = Dictionary::new();
+    widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+    widget.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    widget.insert("AP", Object::Dictionary(ap));
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    let mut fonts = Dictionary::new();
+    fonts.insert("Helv", Object::Integer(42));
+    let mut dr = Dictionary::new();
+    dr.insert("Font", Object::Dictionary(fonts));
+    let mut acroform = Dictionary::new();
+    acroform.insert("DR", Object::Dictionary(dr));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(acroform));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("AcroForm", Object::Reference(ObjectRef::new(6, 0)));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("appearance must remain a stream");
+    };
+    let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+        panic!("appearance must retain a resource dictionary");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("appearance must retain font resources");
+    };
+    assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
+}
+
+#[test]
+fn helper_flatten_annotations_materializes_indirect_page_resources_without_annotations() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut fonts = Dictionary::new();
+    fonts.insert("F1", Object::Integer(42));
+    let mut resources = Dictionary::new();
+    resources.insert("Font", Object::Dictionary(fonts));
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Resources", Object::Reference(ObjectRef::new(4, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    let Some(Object::Dictionary(resources)) = page.get("Resources") else {
+        panic!("qpdf flattenAnnotations materializes an indirect /Resources");
+    };
+    assert!(resources.get("Font").is_some());
+}
+
+#[test]
+fn helper_flatten_annotations_replaces_invalid_page_resources() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Resources", Object::Integer(42));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
+}
+
+#[test]
+fn helper_flatten_annotations_preserves_indirect_annots_holder_when_an_annotation_remains() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut appearance = Dictionary::new();
+    appearance.insert("Type", Object::Name(b"XObject".to_vec()));
+    appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Stream(Stream::new(appearance, Vec::new())),
+    );
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+    let mut widget = Dictionary::new();
+    widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+    widget.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    widget.insert("AP", Object::Dictionary(ap));
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+    let mut link = Dictionary::new();
+    link.insert("Subtype", Object::Name(b"Link".to_vec()));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(link));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Array(vec![
+            Object::Reference(ObjectRef::new(4, 0)),
+            Object::Reference(ObjectRef::new(6, 0)),
+        ]),
+    );
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Annots", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert_eq!(
+        page.get("Annots"),
+        Some(&Object::Reference(ObjectRef::new(7, 0)))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(7, 0)).unwrap(),
+        Object::Array(vec![Object::Reference(ObjectRef::new(6, 0))])
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_expands_indirect_contents_and_wraps_empty_output() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"old-a\n".to_vec())),
+    );
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"old-b\n".to_vec())),
+    );
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Array(vec![
+            Object::Reference(ObjectRef::new(4, 0)),
+            Object::Reference(ObjectRef::new(5, 0)),
+        ]),
+    );
+
+    // The selected appearance is a stream without /BBox. qpdf removes the
+    // annotation and still appends its q/Q wrapper streams, but has no Do.
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Stream(Stream::new(Dictionary::new(), Vec::new())),
+    );
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Reference(ObjectRef::new(7, 0)));
+    let mut annot = Dictionary::new();
+    annot.insert("Subtype", Object::Name(b"Text".to_vec()));
+    annot.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(10),
+            Object::Integer(10),
+        ]),
+    );
+    annot.insert("AP", Object::Dictionary(ap));
+    pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(annot));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(6, 0)));
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(8, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(page.get("Annots").is_none());
+    let Some(Object::Array(contents)) = page.get("Contents") else {
+        panic!("qpdf addPageContents always writes a direct contents array");
+    };
+    assert_eq!(contents.len(), 4, "before, both original streams, after");
+    assert_eq!(contents[1], Object::Reference(ObjectRef::new(4, 0)));
+    assert_eq!(contents[2], Object::Reference(ObjectRef::new(5, 0)));
+    assert_eq!(
+        flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+        b"q\nold-a\nold-b\n\nQ\n"
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_applies_no_rotate_using_leaf_rotate() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut appearance = Dictionary::new();
+    appearance.insert("Type", Object::Name(b"XObject".to_vec()));
+    appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(appearance, Vec::new())),
+    );
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Reference(ObjectRef::new(4, 0)));
+    let mut annot = Dictionary::new();
+    annot.insert("Subtype", Object::Name(b"Widget".to_vec()));
+    annot.insert("F", Object::Integer(0x10));
+    annot.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(10),
+            Object::Integer(20),
+            Object::Integer(110),
+            Object::Integer(40),
+        ]),
+    );
+    annot.insert("AP", Object::Dictionary(ap));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(annot));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Rotate", Object::Integer(90));
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let contents = flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+    assert!(
+        String::from_utf8_lossy(&contents).contains("0 1 -1 0 30 40 cm"),
+        "qpdf's NoRotate 90-degree matrix must be applied"
     );
 }
 

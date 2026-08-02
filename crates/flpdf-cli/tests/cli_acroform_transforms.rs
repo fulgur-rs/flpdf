@@ -551,10 +551,10 @@ fn generate_then_flatten_all_do_in_content() {
 
 // ── Tests: flatten=print ──────────────────────────────────────────────────────
 
-/// `--flatten-annotations=print` removes only annotations with the Print bit
-/// (bit 3, /F & 0x4 != 0) and leaves annotations without it in `/Annots`.
+/// `--flatten-annotations=print` draws only Print annotations, but qpdf drops
+/// every annotation that has a selected appearance stream.
 #[test]
-fn flatten_print_removes_print_bit_annot_only() {
+fn flatten_print_draws_print_bit_annot_and_removes_all_selected_appearances() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("two_annots.pdf");
     let output = temp.path().join("out.pdf");
@@ -575,33 +575,8 @@ fn flatten_print_removes_print_bit_annot_only() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
 
-    // Exactly one annotation must remain (the non-Print one).
     let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
-    assert_eq!(
-        annots.len(),
-        1,
-        "flatten=print must leave exactly 1 annotation (the non-Print one), found {}",
-        annots.len()
-    );
-
-    // The surviving annotation must be the non-Print widget. Identify it by
-    // the behavioral property (Print bit clear in /F) rather than its object
-    // number, which is unstable under the Catalog-first renumber. An absent /F
-    // means no flags set, i.e. no Print bit — that is exactly the survivor.
-    let survivor = pdf.resolve(annots[0].annot_ref).unwrap();
-    let survivor_dict = survivor
-        .as_dict()
-        .expect("surviving annotation must resolve to a dictionary");
-    // An absent /F means no flags set, i.e. no Print bit — that is the survivor.
-    let f = survivor_dict
-        .get("F")
-        .and_then(|o| o.as_integer())
-        .unwrap_or(0);
-    assert_eq!(
-        f & 0x4,
-        0,
-        "surviving annotation must be the non-Print widget (Print bit clear in /F), got /F={f}"
-    );
+    assert!(annots.is_empty());
 
     // Page content must have a Do (from the Print-bit annotation being flattened).
     let content = flpdf::pages::page_content_bytes(&mut pdf, page_refs[0]).unwrap();
