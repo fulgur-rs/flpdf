@@ -259,21 +259,9 @@ pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8>
 /// Returns [`Error::Unsupported`] when the field-tree depth limit is exceeded
 /// or an object is structurally invalid.
 ///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{generate_text_field_appearance, ObjectRef, Pdf};
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
-/// let widget = ObjectRef::new(10, 0);
-/// if let Some(ap_ref) = generate_text_field_appearance(&mut pdf, widget)? {
-///     println!("appearance stream written at {ap_ref}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn generate_text_field_appearance<R: Read + Seek>(
+/// This is an internal renderer. Public callers use
+/// [`crate::FormFieldObjectHelper::generate_appearance`] instead.
+pub(crate) fn generate_text_field_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
@@ -432,21 +420,9 @@ pub fn generate_text_field_appearance<R: Read + Seek>(
 /// Returns [`Error::Unsupported`] when the field-tree depth limit is
 /// exceeded or an object is structurally invalid.
 ///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{generate_button_field_appearance, ObjectRef, Pdf};
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
-/// let widget = ObjectRef::new(10, 0);
-/// if let Some(ap_ref) = generate_button_field_appearance(&mut pdf, widget)? {
-///     println!("button appearance stream written at {ap_ref}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn generate_button_field_appearance<R: Read + Seek>(
+/// This internal renderer is not a public form-field entry point.
+#[allow(dead_code)] // qpdf's public helper intentionally dispatches only /Tx and /Ch.
+pub(crate) fn generate_button_field_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
@@ -1531,21 +1507,9 @@ fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
 /// Returns [`Error::Unsupported`] when the field-tree depth limit is exceeded
 /// or an object is structurally invalid.
 ///
-/// # Examples
-///
-/// ```no_run
-/// use flpdf::{generate_choice_field_appearance, ObjectRef, Pdf};
-/// use std::fs::File;
-/// use std::io::BufReader;
-///
-/// let mut pdf = Pdf::open(BufReader::new(File::open("form.pdf")?))?;
-/// let widget = ObjectRef::new(10, 0);
-/// if let Some(ap_ref) = generate_choice_field_appearance(&mut pdf, widget)? {
-///     println!("choice appearance stream written at {ap_ref}");
-/// }
-/// # Ok::<(), Box<dyn std::error::Error>>(())
-/// ```
-pub fn generate_choice_field_appearance<R: Read + Seek>(
+/// This is an internal renderer. Public callers use
+/// [`crate::FormFieldObjectHelper::generate_appearance`] instead.
+pub(crate) fn generate_choice_field_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
@@ -4191,8 +4155,6 @@ mod tests {
 
     // ── Btn appearance tests ─────────────────────────────────────────────────
 
-    use crate::generate_button_field_appearance;
-
     /// Non-Btn field → generate_button_field_appearance must return None.
     #[test]
     fn btn_non_btn_field_returns_none() {
@@ -4786,8 +4748,6 @@ mod tests {
     }
 
     // ── Ch (choice) appearance tests ─────────────────────────────────────────
-
-    use crate::generate_choice_field_appearance;
 
     /// Build a minimal PDF with a Ch combo widget.
     fn build_combo_pdf(value: &str, ff: i64) -> Vec<u8> {

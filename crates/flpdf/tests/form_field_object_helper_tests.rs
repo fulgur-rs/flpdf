@@ -105,8 +105,6 @@ fn mapping_name_falls_back_to_alternative_then_qualified_name() {
         field.mapping_name().unwrap(),
         Some(b"parent.child".to_vec())
     );
-    drop(field);
-
     let bytes = doc(vec![(10, "<< /T (child) /TU (alt) >>".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
@@ -179,7 +177,7 @@ fn classifies_qpdf_field_types_from_inherited_type_and_flags() {
 
     for (field_type, flags, text, checkbox, radio, pushbutton, choice) in cases {
         let bytes = doc(vec![
-            (10, format!("<< /Parent 11 0 R >>")),
+            (10, "<< /Parent 11 0 R >>".to_string()),
             (11, format!("<< /FT {field_type} /Ff {flags} >>")),
         ]);
         let mut pdf = open(bytes);
@@ -371,4 +369,353 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
     assert!(field.is_null().unwrap());
+}
+
+#[test]
+fn set_field_attribute_string_writes_a_qpdf_unicode_string_on_the_field() {
+    let bytes = doc(vec![
+        (10, "<< /Parent 11 0 R >>".into()),
+        (11, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_field_attribute_string(b"TU", "日本語")
+        .expect("attribute set");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("field");
+    let Object::Dictionary(field) = field else {
+        panic!("field must stay a dictionary");
+    };
+    assert_eq!(
+        field.get(b"TU".as_slice()),
+        Some(&Object::String(flpdf::pdf_string::new_unicode_string(
+            "日本語".as_bytes()
+        )))
+    );
+}
+
+#[test]
+fn set_value_marks_text_and_choice_fields_as_needing_appearances() {
+    for field_type in ["/Tx", "/Ch"] {
+        let bytes = doc_with_acroform(vec![
+            (10, format!("<< /FT {field_type} >>")),
+            (20, "<< >>".into()),
+        ]);
+        let mut pdf = open(bytes);
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .set_value_string("日本語", true)
+            .expect("set text value");
+
+        let field = pdf.resolve(ObjectRef::new(10, 0)).expect("field");
+        let Object::Dictionary(field) = field else {
+            panic!("field must be a dictionary");
+        };
+        assert_eq!(
+            field.get(b"V".as_slice()),
+            Some(&Object::String(flpdf::pdf_string::new_unicode_string(
+                "日本語".as_bytes()
+            )))
+        );
+        let acroform = pdf.resolve(ObjectRef::new(20, 0)).expect("acroform");
+        let Object::Dictionary(acroform) = acroform else {
+            panic!("AcroForm must be a dictionary");
+        };
+        assert_eq!(
+            acroform.get(b"NeedAppearances".as_slice()),
+            Some(&Object::Boolean(true))
+        );
+    }
+}
+
+#[test]
+fn set_value_updates_checkbox_and_radio_widget_states_without_need_appearances() {
+    let bytes = doc_with_acroform(vec![
+        (
+            10,
+            "<< /FT /Btn /AP << /N << /Off null /Chosen null >> >> >>".into(),
+        ),
+        (20, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"anything-but-Off".to_vec()), true)
+        .expect("set checkbox value");
+    let checkbox = pdf.resolve(ObjectRef::new(10, 0)).expect("checkbox");
+    let Object::Dictionary(checkbox) = checkbox else {
+        panic!("checkbox must be a dictionary");
+    };
+    assert_eq!(
+        checkbox.get(b"V".as_slice()),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+    assert_eq!(
+        checkbox.get(b"AS".as_slice()),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+
+    let bytes = doc_with_acroform(vec![
+        (10, "<< /FT /Btn /Ff 32768 /Kids [11 0 R 12 0 R] >>".into()),
+        (11, "<< /AP << /N << /Off null /First null >> >> >>".into()),
+        (12, "<< /AP << /N << /Off null /Second null >> >> >>".into()),
+        (20, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Second".to_vec()), true)
+        .expect("set radio value");
+    for (reference, expected) in [(11, b"Off".as_slice()), (12, b"Second".as_slice())] {
+        let widget = pdf.resolve(ObjectRef::new(reference, 0)).expect("widget");
+        let Object::Dictionary(widget) = widget else {
+            panic!("widget must be a dictionary");
+        };
+        assert_eq!(
+            widget.get(b"AS".as_slice()),
+            Some(&Object::Name(expected.to_vec()))
+        );
+    }
+    let acroform = pdf.resolve(ObjectRef::new(20, 0)).expect("acroform");
+    let Object::Dictionary(acroform) = acroform else {
+        panic!("AcroForm must be a dictionary");
+    };
+    assert_eq!(acroform.get(b"NeedAppearances".as_slice()), None);
+}
+
+#[test]
+fn set_value_turns_an_existing_checkbox_off_and_leaves_pushbuttons_unchanged() {
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Btn /V /Chosen /AS /Chosen /AP << /N << /Off null /Chosen null >> >> >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Off".to_vec()), true)
+        .expect("turn checkbox off");
+    let checkbox = pdf.resolve(ObjectRef::new(10, 0)).expect("checkbox");
+    let Object::Dictionary(checkbox) = checkbox else {
+        panic!("checkbox must be a dictionary");
+    };
+    assert_eq!(
+        checkbox.get(b"V".as_slice()),
+        Some(&Object::Name(b"Off".to_vec()))
+    );
+    assert_eq!(
+        checkbox.get(b"AS".as_slice()),
+        Some(&Object::Name(b"Off".to_vec()))
+    );
+
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Btn /Ff 65536 /V /Existing /AS /Existing /AP << /N /Existing >> >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    let before = pdf.resolve(ObjectRef::new(10, 0)).expect("pushbutton");
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"New".to_vec()), true)
+        .expect("pushbutton value is ignored");
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0)).expect("pushbutton"),
+        before,
+        "qpdf ignores pushbutton value updates"
+    );
+}
+
+#[test]
+fn set_value_updates_a_checkbox_direct_kid_widget() {
+    // qpdf calls `getKey("/AP")` on each /Kids array item, including direct
+    // dictionaries, and writes both the field value and that widget's state.
+    let bytes = doc(vec![
+        ((
+            10,
+            "<< /FT /Btn /Kids [ << /AP << /N << /Off null /Chosen null >> >> >> ] >>".into(),
+        )),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), true)
+        .expect("set direct-widget checkbox value");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("checkbox field");
+    let Object::Dictionary(field) = field else {
+        panic!("checkbox field must be a dictionary");
+    };
+    assert_eq!(
+        field.get(b"V".as_slice()),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+    let Some(Object::Array(kids)) = field.get(b"Kids".as_slice()) else {
+        panic!("checkbox must retain direct widget child");
+    };
+    let Some(Object::Dictionary(widget)) = kids.first() else {
+        panic!("widget must be a direct dictionary");
+    };
+    assert_eq!(
+        widget.get(b"AS".as_slice()),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+}
+
+#[test]
+fn set_value_resolves_null_parent_and_indirect_kids_for_button_widgets() {
+    // qpdf's `getKey("/Parent")` returns a null object for an explicit
+    // `/Parent null`, so `setRadioButtonValue` treats this as a top-level
+    // field. `getKey("/Kids")` also resolves its indirect array.
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids 13 0 R >>".into(),
+        ),
+        (11, "<< /AP << /N << /Off null /First null >> >> >>".into()),
+        (12, "<< /AP << /N << /Off null /Second null >> >> >>".into()),
+        (13, "[11 0 R 12 0 R]".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Second".to_vec()), true)
+        .expect("set indirect-kids radio value");
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("radio field");
+    let Object::Dictionary(field) = field else {
+        panic!("radio field must be a dictionary");
+    };
+    assert_eq!(
+        field.get(b"V".as_slice()),
+        Some(&Object::Name(b"Second".to_vec()))
+    );
+    for (reference, expected) in [(11, b"Off".as_slice()), (12, b"Second".as_slice())] {
+        let widget = pdf.resolve(ObjectRef::new(reference, 0)).expect("widget");
+        let Object::Dictionary(widget) = widget else {
+            panic!("widget must be a dictionary");
+        };
+        assert_eq!(
+            widget.get(b"AS".as_slice()),
+            Some(&Object::Name(expected.to_vec()))
+        );
+    }
+
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids 12 0 R >>".into()),
+        (11, "<< /AP << /N << /Off null /Chosen null >> >> >>".into()),
+        (12, "[11 0 R]".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), true)
+        .expect("set indirect-kids checkbox value");
+    let widget = pdf.resolve(ObjectRef::new(11, 0)).expect("widget");
+    let Object::Dictionary(widget) = widget else {
+        panic!("widget must be a dictionary");
+    };
+    assert_eq!(
+        widget.get(b"AS".as_slice()),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+}
+
+#[test]
+fn set_value_updates_a_radio_grandchild_widget_and_direct_kid_dictionaries() {
+    // `setRadioButtonValue` examines only one `/Kids` level when a radio
+    // child field has no `/AP`. qpdf object handles allow both that child and
+    // its widget to be direct dictionaries in their respective arrays.
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids [ << /Kids [ << /AP << /N << /Off null /On null >> >> >> ] >> ] >>"
+                .into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), true)
+        .expect("set nested radio value");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("radio field");
+    let Object::Dictionary(field) = field else {
+        panic!("radio field must be a dictionary");
+    };
+    assert_eq!(
+        field.get(b"V".as_slice()),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+    let Some(Object::Array(children)) = field.get(b"Kids".as_slice()) else {
+        panic!("radio field must retain direct children");
+    };
+    let Some(Object::Dictionary(child)) = children.first() else {
+        panic!("child field must be a direct dictionary");
+    };
+    let Some(Object::Array(widgets)) = child.get(b"Kids".as_slice()) else {
+        panic!("child field must retain direct widget children");
+    };
+    let Some(Object::Dictionary(widget)) = widgets.first() else {
+        panic!("widget must be a direct dictionary");
+    };
+    assert_eq!(
+        widget.get(b"AS".as_slice()),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+}
+
+#[test]
+fn set_value_turns_on_state_off_when_radio_appearance_is_non_null_but_not_a_dictionary() {
+    // qpdf selects a radio kid as soon as `/AP` is non-null. It still writes
+    // `/AS /Off` when that appearance cannot have an `/N` dictionary, whether
+    // `/AP` is direct or indirect.
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Ff 32768 /Kids [11 0 R 12 0 R] >>".into()),
+        (11, "<< /AP /Bogus >>".into()),
+        (12, "<< /AP 13 0 R >>".into()),
+        (13, "/AlsoBogus".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), true)
+        .expect("set radio value with malformed appearances");
+
+    for reference in [11, 12] {
+        let widget = pdf.resolve(ObjectRef::new(reference, 0)).expect("widget");
+        let Object::Dictionary(widget) = widget else {
+            panic!("widget must be a dictionary");
+        };
+        assert_eq!(
+            widget.get(b"AS".as_slice()),
+            Some(&Object::Name(b"Off".to_vec()))
+        );
+    }
+}
+
+#[test]
+fn generate_appearance_dispatches_only_text_and_choice_fields() {
+    let bytes = doc_with_acroform(vec![
+        (
+            10,
+            "<< /FT /Tx /V (value) /Rect [0 0 100 20] /DA (/Helv 12 Tf 0 g) >>".into(),
+        ),
+        (20, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .generate_appearance()
+        .expect("text appearance")
+        .is_some());
+
+    let bytes = doc_with_acroform(vec![
+        (
+            10,
+            "<< /FT /Ch /V (value) /Opt [(value)] /Rect [0 0 100 20] /DA (/Helv 12 Tf 0 g) >>"
+                .into(),
+        ),
+        (20, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .generate_appearance()
+        .expect("choice appearance")
+        .is_some());
+
+    let bytes = doc(vec![(10, "<< /FT /Btn >>".into())]);
+    let mut pdf = open(bytes);
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .generate_appearance()
+            .expect("button is skipped"),
+        None
+    );
 }

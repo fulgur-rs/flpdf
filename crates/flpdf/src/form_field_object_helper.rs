@@ -4,7 +4,7 @@
 //! attributes. This intentionally covers only the object-helper read boundary.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-use crate::{Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -297,6 +297,474 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
         }
         Ok(choices)
+    }
+
+    /// Replace a direct attribute on this field dictionary.
+    ///
+    /// This is qpdf's `setFieldAttribute(key, value)`: inherited attributes
+    /// are never modified on an ancestor.
+    pub fn set_field_attribute(&mut self, key: &[u8], value: Object) -> Result<()> {
+        let mut field = self.field_dict()?;
+        field.insert(String::from_utf8_lossy(key).into_owned(), value);
+        self.pdf
+            .set_object(self.field_ref, Object::Dictionary(field));
+        Ok(())
+    }
+
+    /// Replace a direct string attribute using qpdf's Unicode-string encoding.
+    pub fn set_field_attribute_string(&mut self, key: &[u8], value: &str) -> Result<()> {
+        self.set_field_attribute(
+            key,
+            Object::String(crate::pdf_string::new_unicode_string(value.as_bytes())),
+        )
+    }
+
+    /// Set the field's `/V` value using qpdf's form-field dispatch.
+    ///
+    /// Text and choice strings are normalized to a PDF Unicode string.  A
+    /// requested `/NeedAppearances` update applies only to non-button fields;
+    /// button fields instead synchronize their widget appearance states.
+    pub fn set_value(&mut self, value: Object, need_appearances: bool) -> Result<()> {
+        if self.field_type()?.as_deref() == Some(b"/Btn") {
+            if self.is_checkbox()? {
+                if let Object::Name(name) = value {
+                    self.set_checkbox_value(name != b"Off")?;
+                }
+            } else if self.is_radio_button()? {
+                if let Object::Name(name) = value {
+                    self.set_radio_button_value(self.field_ref, name)?;
+                }
+            }
+            // qpdf intentionally ignores both invalid button input and
+            // pushbutton values after issuing a warning when available.
+            return Ok(());
+        }
+
+        let value = match value {
+            Object::String(value) => Object::String(crate::pdf_string::new_unicode_string(
+                &crate::pdf_string::utf8_value(&value),
+            )),
+            value => value,
+        };
+        self.set_field_attribute(b"V", value)?;
+        if need_appearances {
+            self.set_need_appearances()?;
+        }
+        Ok(())
+    }
+
+    /// Set `/V` from UTF-8 text using qpdf's Unicode-string encoding.
+    pub fn set_value_string(&mut self, value: &str, need_appearances: bool) -> Result<()> {
+        self.set_value(
+            Object::String(crate::pdf_string::new_unicode_string(value.as_bytes())),
+            need_appearances,
+        )
+    }
+
+    /// Generate a normal appearance only for text and choice fields.
+    ///
+    /// Button appearance generation remains deliberately outside qpdf's
+    /// `QPDFFormFieldObjectHelper::generateAppearance` dispatch.
+    pub fn generate_appearance(&mut self) -> Result<Option<ObjectRef>> {
+        match self.field_type()?.as_deref() {
+            Some(b"/Tx") => {
+                crate::appearance::generate_text_field_appearance(self.pdf, self.field_ref)
+            }
+            Some(b"/Ch") => {
+                crate::appearance::generate_choice_field_appearance(self.pdf, self.field_ref)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn field_dict(&mut self) -> Result<Dictionary> {
+        match self.pdf.resolve_borrowed(self.field_ref)? {
+            Object::Dictionary(field) => Ok(field.clone()),
+            _ => Err(Error::Unsupported(format!(
+                "form field object {} is not a dictionary",
+                self.field_ref
+            ))),
+        }
+    }
+
+    fn set_need_appearances(&mut self) -> Result<()> {
+        let Some(root_ref) = self.pdf.root_ref() else {
+            return Ok(());
+        };
+        let root = self.pdf.resolve(root_ref)?;
+        let Some(acroform) = root
+            .as_dict()
+            .and_then(|dictionary| dictionary.get(b"AcroForm".as_slice()))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let acroform_ref = match acroform {
+            Object::Reference(reference) => Some(reference),
+            _ => None,
+        };
+        let acroform = match acroform {
+            Object::Reference(reference) => self.pdf.resolve(reference)?,
+            value => value,
+        };
+        let Some(mut acroform) = acroform.as_dict().cloned() else {
+            return Ok(());
+        };
+        acroform.insert("NeedAppearances", Object::Boolean(true));
+        if let Some(reference) = acroform_ref {
+            self.pdf.set_object(reference, Object::Dictionary(acroform));
+        } else {
+            let mut root = self.field_dict_for(root_ref, "catalog")?;
+            root.insert("AcroForm", Object::Dictionary(acroform));
+            self.pdf.set_object(root_ref, Object::Dictionary(root));
+        }
+        Ok(())
+    }
+
+    fn set_checkbox_value(&mut self, checked: bool) -> Result<()> {
+        let annotation = self.appearance_annotation(self.field_ref)?;
+        if annotation.is_none() {
+            if let Some((kids, state)) = self.update_direct_checkbox_kid(checked)? {
+                self.set_field_attribute(b"V", Object::Name(state))?;
+                self.set_direct_attribute(self.field_ref, b"Kids", kids)?;
+                return Ok(());
+            }
+        }
+        let on_value = self.checkbox_state(annotation.as_ref().map(|(_, dict)| dict), checked)?;
+        let value = Object::Name(on_value);
+        self.set_field_attribute(b"V", value.clone())?;
+        if let Some((annotation_ref, _)) = annotation {
+            self.set_direct_attribute(annotation_ref, b"AS", value)?;
+        }
+        Ok(())
+    }
+
+    /// qpdf permits direct widget dictionaries in `/Kids`; mutate the first
+    /// such child with a usable appearance and preserve the containing array.
+    fn update_direct_checkbox_kid(&mut self, checked: bool) -> Result<Option<(Object, Vec<u8>)>> {
+        let field = self.field_dict()?;
+        let Some(kids) = field.get(b"Kids".as_slice()).cloned() else {
+            return Ok(None);
+        };
+        self.update_direct_checkbox_kid_in_array(kids, checked)
+    }
+
+    fn update_direct_checkbox_kid_in_array(
+        &mut self,
+        kids: Object,
+        checked: bool,
+    ) -> Result<Option<(Object, Vec<u8>)>> {
+        match kids {
+            Object::Array(mut kids) => {
+                for kid in &mut kids {
+                    let Object::Dictionary(mut widget) = kid.clone() else {
+                        continue;
+                    };
+                    if !self.has_appearance(&widget)? {
+                        continue;
+                    }
+                    let state = self.checkbox_state(Some(&widget), checked)?;
+                    widget.insert("AS", Object::Name(state.clone()));
+                    *kid = Object::Dictionary(widget);
+                    return Ok(Some((Object::Array(kids), state)));
+                }
+                Ok(None)
+            }
+            Object::Reference(reference) => {
+                let resolved = self.pdf.resolve(reference)?;
+                let Some((updated, state)) =
+                    self.update_direct_checkbox_kid_in_array(resolved, checked)?
+                else {
+                    return Ok(None);
+                };
+                self.pdf.set_object(reference, updated);
+                Ok(Some((Object::Reference(reference), state)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn checkbox_state(
+        &mut self,
+        annotation: Option<&Dictionary>,
+        checked: bool,
+    ) -> Result<Vec<u8>> {
+        if !checked {
+            return Ok(b"Off".to_vec());
+        }
+        Ok(annotation
+            .map(|dictionary| self.normal_appearance_names(dictionary))
+            .transpose()?
+            .and_then(|names| names.into_iter().find(|name| name != b"Off"))
+            .unwrap_or_else(|| b"Yes".to_vec()))
+    }
+
+    fn set_radio_button_value(&mut self, field_ref: ObjectRef, value: Vec<u8>) -> Result<()> {
+        let field = self.field_dict_for(field_ref, "form field")?;
+        if let Some(parent) = field.get_ref(b"Parent".as_slice()) {
+            let parent_dict = self.field_dict_for(parent, "form field parent")?;
+            if self.value_is_null(parent_dict.get(b"Parent".as_slice()).cloned())? {
+                let parent_is_radio = {
+                    let previous = self.field_ref;
+                    self.field_ref = parent;
+                    let result = self.is_radio_button();
+                    self.field_ref = previous;
+                    result?
+                };
+                if parent_is_radio {
+                    return self.set_radio_button_value(parent, value);
+                }
+            }
+        }
+
+        let parent_is_null = self.value_is_null(field.get(b"Parent".as_slice()).cloned())?;
+        let Some(kids_value) = field.get(b"Kids".as_slice()).cloned() else {
+            return Ok(());
+        };
+        if self.object_array(Some(kids_value.clone()))?.is_none() {
+            return Ok(());
+        }
+        if !parent_is_null {
+            return Ok(());
+        }
+        self.set_direct_attribute(field_ref, b"V", Object::Name(value.clone()))?;
+        self.update_radio_kids(field_ref, kids_value, &value)?;
+        Ok(())
+    }
+
+    fn update_radio_kids(
+        &mut self,
+        field_ref: ObjectRef,
+        kids_value: Object,
+        value: &[u8],
+    ) -> Result<()> {
+        match kids_value {
+            Object::Array(kids) => {
+                let mut updated = Vec::with_capacity(kids.len());
+                for kid in kids {
+                    updated.push(self.update_radio_kid(kid, value)?);
+                }
+                self.set_direct_attribute(field_ref, b"Kids", Object::Array(updated))?;
+            }
+            Object::Reference(reference) => {
+                let resolved = self.pdf.resolve(reference)?;
+                let Object::Array(kids) = resolved else {
+                    return Ok(());
+                };
+                let mut updated = Vec::with_capacity(kids.len());
+                for kid in kids {
+                    updated.push(self.update_radio_kid(kid, value)?);
+                }
+                self.pdf.set_object(reference, Object::Array(updated));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// qpdf looks one level below a radio child that has no `/AP`; it does
+    /// not recurse beyond that child field.
+    fn update_radio_kid(&mut self, kid: Object, value: &[u8]) -> Result<Object> {
+        match kid {
+            Object::Reference(reference) => {
+                let object = self.pdf.resolve(reference)?;
+                if let Object::Dictionary(dictionary) = object {
+                    let dictionary = self.update_radio_kid_dict(dictionary, value)?;
+                    self.pdf
+                        .set_object(reference, Object::Dictionary(dictionary));
+                }
+                Ok(Object::Reference(reference))
+            }
+            Object::Dictionary(dictionary) => Ok(Object::Dictionary(
+                self.update_radio_kid_dict(dictionary, value)?,
+            )),
+            object => Ok(object),
+        }
+    }
+
+    fn update_radio_kid_dict(&mut self, mut kid: Dictionary, value: &[u8]) -> Result<Dictionary> {
+        if self.has_non_null_appearance(&kid)? {
+            kid.insert("AS", Object::Name(self.radio_state(&kid, value)?));
+            return Ok(kid);
+        }
+        let Some(grandkids) = kid.get(b"Kids".as_slice()).cloned() else {
+            return Ok(kid);
+        };
+        let (grandkids, _) = self.update_first_radio_widget(grandkids, value)?;
+        kid.insert("Kids", grandkids);
+        Ok(kid)
+    }
+
+    fn update_first_radio_widget(&mut self, kids: Object, value: &[u8]) -> Result<(Object, bool)> {
+        match kids {
+            Object::Array(mut kids) => {
+                for kid in &mut kids {
+                    let (updated, found) = self.update_radio_widget(kid.clone(), value)?;
+                    *kid = updated;
+                    if found {
+                        return Ok((Object::Array(kids), true));
+                    }
+                }
+                Ok((Object::Array(kids), false))
+            }
+            Object::Reference(reference) => {
+                let resolved = self.pdf.resolve(reference)?;
+                let Object::Array(kids) = resolved else {
+                    return Ok((Object::Reference(reference), false));
+                };
+                let (updated, found) =
+                    self.update_first_radio_widget(Object::Array(kids), value)?;
+                if let Object::Array(updated) = updated {
+                    self.pdf.set_object(reference, Object::Array(updated));
+                }
+                Ok((Object::Reference(reference), found))
+            }
+            object => Ok((object, false)),
+        }
+    }
+
+    fn update_radio_widget(&mut self, widget: Object, value: &[u8]) -> Result<(Object, bool)> {
+        match widget {
+            Object::Reference(reference) => {
+                let object = self.pdf.resolve(reference)?;
+                let Object::Dictionary(mut dictionary) = object else {
+                    return Ok((Object::Reference(reference), false));
+                };
+                if !self.has_non_null_appearance(&dictionary)? {
+                    return Ok((Object::Reference(reference), false));
+                }
+                dictionary.insert("AS", Object::Name(self.radio_state(&dictionary, value)?));
+                self.pdf
+                    .set_object(reference, Object::Dictionary(dictionary));
+                Ok((Object::Reference(reference), true))
+            }
+            Object::Dictionary(mut dictionary) => {
+                if !self.has_non_null_appearance(&dictionary)? {
+                    return Ok((Object::Dictionary(dictionary), false));
+                }
+                dictionary.insert("AS", Object::Name(self.radio_state(&dictionary, value)?));
+                Ok((Object::Dictionary(dictionary), true))
+            }
+            object => Ok((object, false)),
+        }
+    }
+
+    fn radio_state(&mut self, widget: &Dictionary, value: &[u8]) -> Result<Vec<u8>> {
+        let names = self.normal_appearance_names(widget)?;
+        Ok(if names.iter().any(|name| name == value) {
+            value.to_vec()
+        } else {
+            b"Off".to_vec()
+        })
+    }
+
+    fn appearance_annotation(
+        &mut self,
+        start: ObjectRef,
+    ) -> Result<Option<(ObjectRef, Dictionary)>> {
+        let field = self.field_dict_for(start, "form field")?;
+        if self.has_appearance(&field)? {
+            return Ok(Some((start, field)));
+        }
+        let Some(kids) = self.object_array(field.get(b"Kids".as_slice()).cloned())? else {
+            return Ok(None);
+        };
+        for kid in &kids {
+            let Object::Reference(kid_ref) = kid else {
+                continue;
+            };
+            let kid = self.field_dict_for(*kid_ref, "widget")?;
+            if self.has_appearance(&kid)? {
+                return Ok(Some((*kid_ref, kid)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_appearance(&mut self, dictionary: &Dictionary) -> Result<bool> {
+        let Some(value) = dictionary.get(b"AP".as_slice()).cloned() else {
+            return Ok(false);
+        };
+        Ok(matches!(self.resolve_object(value)?, Object::Dictionary(_)))
+    }
+
+    /// Radio-button mutation follows qpdf's candidate selection: any
+    /// non-null `/AP` identifies a widget, even when it is malformed and can
+    /// therefore only receive an `/AS /Off` state.
+    fn has_non_null_appearance(&mut self, dictionary: &Dictionary) -> Result<bool> {
+        let Some(value) = dictionary.get(b"AP".as_slice()).cloned() else {
+            return Ok(false);
+        };
+        Ok(!matches!(self.resolve_object(value)?, Object::Null))
+    }
+
+    fn normal_appearance_names(&mut self, dictionary: &Dictionary) -> Result<Vec<Vec<u8>>> {
+        let Some(appearance) = dictionary.get(b"AP".as_slice()).cloned() else {
+            return Ok(Vec::new());
+        };
+        let appearance = self.resolve_object(appearance)?;
+        let Some(normal) = appearance
+            .as_dict()
+            .and_then(|dictionary| dictionary.get(b"N".as_slice()))
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        let normal = self.resolve_object(normal)?;
+        Ok(normal
+            .as_dict()
+            .map(|dictionary| dictionary.iter().map(|(key, _)| key.to_vec()).collect())
+            .unwrap_or_default())
+    }
+
+    fn set_direct_attribute(
+        &mut self,
+        reference: ObjectRef,
+        key: &[u8],
+        value: Object,
+    ) -> Result<()> {
+        let mut dictionary = self.field_dict_for(reference, "form field")?;
+        dictionary.insert(String::from_utf8_lossy(key).into_owned(), value);
+        self.pdf
+            .set_object(reference, Object::Dictionary(dictionary));
+        Ok(())
+    }
+
+    fn field_dict_for(&mut self, reference: ObjectRef, label: &str) -> Result<Dictionary> {
+        match self.pdf.resolve_borrowed(reference)? {
+            Object::Dictionary(dictionary) => Ok(dictionary.clone()),
+            _ => Err(Error::Unsupported(format!(
+                "{label} object {reference} is not a dictionary"
+            ))),
+        }
+    }
+
+    fn resolve_object(&mut self, value: Object) -> Result<Object> {
+        match value {
+            Object::Reference(reference) => self.pdf.resolve(reference),
+            value => Ok(value),
+        }
+    }
+
+    /// qpdf's `getKey` returns a null handle for an absent key, an explicit
+    /// null, or a reference resolving to null. Keep that distinction at the
+    /// helper boundary so button mutation uses the same top-level check.
+    fn value_is_null(&mut self, value: Option<Object>) -> Result<bool> {
+        match value {
+            Some(value) => Ok(matches!(self.resolve_object(value)?, Object::Null)),
+            None => Ok(true),
+        }
+    }
+
+    /// Resolve one `/Kids` holder object as qpdf's `getKey` does.
+    fn object_array(&mut self, value: Option<Object>) -> Result<Option<Vec<Object>>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        match self.resolve_object(value)? {
+            Object::Array(items) => Ok(Some(items)),
+            _ => Ok(None),
+        }
     }
 
     fn acroform_value(&mut self, key: &[u8]) -> Result<Option<Object>> {
