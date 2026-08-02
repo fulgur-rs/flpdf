@@ -426,7 +426,7 @@ fn annotation_has_appearance_dictionary<R: Read + Seek>(
     let Some(ap) = annot.get("AP").cloned() else {
         return Ok(false);
     };
-    Ok(!matches!(ap, Object::Null))
+    Ok(!matches!(resolve_ref_chain(pdf, &ap)?.0, Object::Null))
 }
 
 /// Flatten eligible annotations on every leaf page in the document.
@@ -835,12 +835,8 @@ fn build_pruned_annots_array<R: Read + Seek>(
         None | Some(Object::Null) => return Ok(Vec::new()),
         Some(v) => v,
     };
-    let annots_arr = match annots_val {
+    let annots_arr = match resolve_ref_chain(pdf, &annots_val)?.0 {
         Object::Array(a) => a,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(a) => a,
-            _ => return Ok(Vec::new()),
-        },
         _ => return Ok(Vec::new()),
     };
 

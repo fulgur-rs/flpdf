@@ -826,6 +826,84 @@ fn helper_flatten_annotations_wraps_when_non_null_ap_has_no_normal_stream() {
 }
 
 #[test]
+fn helper_flatten_annotations_keeps_an_indirect_null_appearance() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Reference(ObjectRef::new(7, 0)),
+    );
+    pdf.set_object(ObjectRef::new(7, 0), Object::Null);
+    let mut annot = Dictionary::new();
+    annot.insert("AP", Object::Reference(ObjectRef::new(6, 0)));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(annot));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert_eq!(
+        page.get("Annots"),
+        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+            5, 0
+        ))])),
+        "qpdf preserves an annotation whose /AP resolves to null"
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_prunes_a_chained_annots_holder() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut removable = Dictionary::new();
+    removable.insert("AP", Object::Integer(1));
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(removable));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(Dictionary::new()));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Reference(ObjectRef::new(7, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Array(vec![
+            Object::Reference(ObjectRef::new(4, 0)),
+            Object::Reference(ObjectRef::new(5, 0)),
+        ]),
+    );
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Annots", Object::Reference(ObjectRef::new(6, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert_eq!(
+        page.get("Annots"),
+        Some(&Object::Reference(ObjectRef::new(6, 0)))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(6, 0)).unwrap(),
+        Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
+        "qpdf replaces the outer /Annots holder with the retained annotations"
+    );
+}
+
+#[test]
 fn helper_flatten_annotations_follows_chained_appearance_holders() {
     let mut pdf = open(build_n_page_pdf(1));
     let mut appearance = Dictionary::new();
