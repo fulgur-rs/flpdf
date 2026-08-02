@@ -1413,3 +1413,70 @@ fn helper_replace_rejects_foreign_indirect_filespec_without_mutation() {
         .is_err());
     assert!(list_embedded_files(&mut pdf).expect("list").is_empty());
 }
+
+#[test]
+fn helper_remove_nulls_indirect_filespec_without_attachment_gc() {
+    let mut pdf = open(build_no_names_pdf());
+    let filespec = make_filespec(&mut pdf, b"remove.txt");
+    let filespec_ref = filespec.object_ref().expect("indirect filespec");
+
+    pdf.embedded_files()
+        .replace_embedded_file(b"remove", filespec)
+        .expect("insert");
+    assert!(pdf
+        .embedded_files()
+        .remove_embedded_file(b"remove")
+        .expect("remove"));
+
+    assert!(pdf
+        .resolve_borrowed(filespec_ref)
+        .expect("resolved filespec")
+        .is_null());
+}
+
+#[test]
+fn helper_remove_returns_false_for_absent_tree_and_key() {
+    let mut pdf = open(build_no_names_pdf());
+    assert!(!pdf
+        .embedded_files()
+        .remove_embedded_file(b"missing")
+        .expect("absent tree"));
+
+    let filespec = make_filespec(&mut pdf, b"present.txt");
+    pdf.embedded_files()
+        .replace_embedded_file(b"present", filespec)
+        .expect("insert");
+    assert!(!pdf
+        .embedded_files()
+        .remove_embedded_file(b"missing")
+        .expect("absent key"));
+}
+
+#[test]
+fn helper_remove_direct_filespec_does_not_null_an_indirect_object() {
+    let mut pdf = open(build_no_names_pdf());
+    let sentinel = ObjectRef::new(500, 0);
+    pdf.set_object(sentinel, Object::Integer(7));
+    let direct = ObjectHandle::dictionary(vec![
+        (b"Type".to_vec(), ObjectHandle::name(b"Filespec".to_vec())),
+        (b"F".to_vec(), ObjectHandle::string(b"direct.txt".to_vec())),
+    ]);
+
+    pdf.embedded_files()
+        .replace_embedded_file(b"direct", direct)
+        .expect("insert direct");
+    assert!(pdf
+        .embedded_files()
+        .remove_embedded_file(b"direct")
+        .expect("remove direct"));
+
+    assert_eq!(
+        pdf.resolve_borrowed(sentinel).expect("sentinel"),
+        &Object::Integer(7)
+    );
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_files()
+        .expect("list")
+        .is_empty());
+}

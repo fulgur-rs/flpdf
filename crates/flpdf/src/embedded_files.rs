@@ -176,6 +176,29 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         insert_embedded_file_value(self.pdf, key, value)
     }
+
+    /// Remove the Filespec stored under `key`.
+    ///
+    /// Returns `false` if the embedded-files tree or the named entry is
+    /// absent. An indirect Filespec is replaced with `null`, matching qpdf's
+    /// `removeEmbeddedFile`; direct Filespec values have no object slot to
+    /// replace. This method intentionally does not perform `/AF` cleanup or
+    /// reachability-based garbage collection.
+    pub fn remove_embedded_file(&mut self, key: &[u8]) -> Result<bool> {
+        let Some(mut tree) = self.name_tree()? else {
+            return Ok(false);
+        };
+        let Some(removed) = tree.find_object(self.pdf, key)? else {
+            return Ok(false);
+        };
+        if !delete_embedded_file(self.pdf, key)? {
+            return Ok(false);
+        }
+        if let Object::Reference(object_ref) = removed {
+            self.pdf.set_object(object_ref, Object::Null);
+        }
+        Ok(true)
+    }
 }
 
 impl<R: Read + Seek> Pdf<R> {
