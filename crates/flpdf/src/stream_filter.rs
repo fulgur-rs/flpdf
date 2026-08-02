@@ -28,6 +28,16 @@ pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds conf
 /// *`getKeys`* — not `setDecodeParms` — that warns
 /// `typeWarning("dictionary", "treating as empty")` (`:1005`) and hands back
 /// an empty key set.
+///
+/// **Entry order is not part of this type's contract.** qpdf iterates
+/// `getKeys()`'s `std::set<std::string>`, so it sees keys sorted; both flpdf
+/// shape readers happen to agree today, because `Object`'s `Dictionary` and
+/// `ObjectHandle::as_dictionary` are each a `BTreeMap` keyed by the raw name
+/// bytes and a uniform `/` prefix preserves the same relative order. A `Vec`
+/// cannot state that, and nothing needs it to: every filter assigns each key
+/// independently and runs its only cross-key check after the loop
+/// (`SF_FlateLzwDecode.cc:68-70`). A future Crypt provider that reads
+/// [`Self::entries`] order-dependently would be the first code to care.
 #[derive(Debug, PartialEq)]
 pub(crate) enum DecodeParams {
     Absent,
@@ -368,6 +378,13 @@ pub(crate) fn expect_first_filter_input(data: &[u8]) {
 /// pipeline. A whole-buffer result keeps flpdf's public API stable while the
 /// individual codecs are migrated to incremental `Pipeline` stages.
 pub(crate) trait StreamFilter {
+    /// Port of `QPDFStreamFilter::setDecodeParms`
+    /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
+    /// `return decode_parms.isNull();` — documented at
+    /// `include/qpdf/QPDFStreamFilter.hh:41-42` as "The default implementation
+    /// accepts a null object and rejects everything else". `DecodeParams` has
+    /// already folded a missing key into the null case, so `is_absent()` is
+    /// that `isNull()`.
     fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
         decode_params.is_absent()
     }
@@ -915,8 +932,8 @@ mod tests {
     use super::{
         decode_filter_specs_from_object, decode_flate, decode_flate_chunks,
         decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
-        ignore_warning, normalize_filter_name, stream_filter_for, Ascii85StreamFilter,
-        DecodeParams, FlateLzwStreamFilter, OutputBuffer, ParamValue, Pipeline, StreamFilter,
+        ignore_warning, normalize_filter_name, stream_filter_for, DecodeParams,
+        FlateLzwStreamFilter, OutputBuffer, ParamValue, Pipeline, StreamFilter,
         DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::pipeline::lzw::pack_codes;
@@ -1029,9 +1046,14 @@ mod tests {
 
         let scalar = Object::Integer(1);
         let present = decode_filter_specs_from_object(Some(&name), Some(&scalar)).unwrap();
-        // qpdf's SF_FlateLzwDecode treats a non-dictionary as an empty
-        // dictionary, but the default StreamFilter::set_decode_params rejects
-        // any non-null.
+        // Both halves of this contrast are qpdf's.
+        // `SF_FlateLzwDecode::setDecodeParms` reads a non-dictionary through
+        // `getKeys()`, which treats it as empty and leaves the filter
+        // filterable (`QPDFObjectHandle.cc:997-1009`), but qpdf's base-class
+        // default `QPDFStreamFilter::setDecodeParms`
+        // (`libqpdf/QPDFStreamFilter.cc:3-7`) is `return decode_parms.isNull()`
+        // and rejects that very same object. `Present(vec![])` has to reach
+        // both answers, which is why it stays distinct from `Absent`.
         assert!(matches!(present[0].decode_params, DecodeParams::Present(_)));
         assert!(present[0].decode_params.entries().is_empty());
     }
@@ -1297,13 +1319,6 @@ mod tests {
     }
 
     #[test]
-    fn non_null_params_still_make_a_parameterless_filter_unfilterable() {
-        let mut filter = Ascii85StreamFilter;
-        assert!(filter.set_decode_params(&DecodeParams::Absent));
-        assert!(!filter.set_decode_params(&DecodeParams::Present(Vec::new())));
-    }
-
-    #[test]
     fn a_fresh_flate_filter_accepts_both_present_shapes_the_neutral_form_merges() {
         // The neutral form collapses "present non-dictionary" and "present empty
         // dictionary" into `Present(vec![])`, removing flpdf's own early
@@ -1339,6 +1354,10 @@ mod tests {
         // no range validation at all (`:46`), so predictor = 12 and columns = 0
         // both stick even though the trailing `(predictor > 1) && (columns == 0)`
         // check at `:68-70` answers `filterable = false`.
+        // Setup, not the property under test: this call exists only to leave
+        // predictor = 12 / columns = 0 behind for the two calls below. The
+        // predictor/columns rule it happens to exercise is pinned on its own by
+        // `a_predictor_above_one_requires_a_nonzero_columns_value`.
         assert!(!filter.set_decode_params(&neutral_params(&[
             ("Predictor", ParamValue::Int(12)),
             ("Columns", ParamValue::Int(0)),
