@@ -15,6 +15,7 @@ use crate::parser::array_item_source_offset;
 use crate::parser::dictionary_value_source_offset;
 use crate::parser::parse_qpdf_file_object;
 use crate::pipeline::rc4::PlRc4;
+use crate::qpdf_resolver::QpdfResolver;
 use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
@@ -28,8 +29,10 @@ use crate::{
     Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry,
     XrefForm,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::rc::Rc;
 
 static NULL_OBJECT: Object = Object::Null;
 
@@ -54,7 +57,7 @@ static NULL_OBJECT: Object = Object::Null;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct Pdf<R: Read + Seek> {
-    reader: R,
+    reader: SharedInput<R>,
     /// Physical byte position corresponding to qpdf's logical input offset 0.
     /// This is nonzero only when repair found a valid header after leading
     /// material in the first 1024 bytes.
@@ -75,6 +78,10 @@ pub struct Pdf<R: Read + Seek> {
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
     handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
+    /// qpdf-native canonical slot registry and resolver. This is intentionally
+    /// separate from every `qpdf-cutover-delete(flpdf-25kg.3.3)` field and is
+    /// initialized lazily by [`Pdf::get_object`].
+    qpdf_resolver: Option<Rc<QpdfResolver<R>>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
     /// repeated [`Pdf::trailer_handle`] calls return the same shared handle
     /// rather than re-deriving a fresh one from `self.trailer` each time.
@@ -144,6 +151,35 @@ pub struct Pdf<R: Read + Seek> {
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     ever_called_get_all_pages: bool,
     encryption: Option<EncryptionState>,
+}
+
+/// Cloneable access to one seekable input. Existing `Pdf` methods continue to
+/// use ordinary `Read`/`Seek`; the qpdf-native resolver gets a clone without
+/// copying or converting any object-cache state.
+pub(crate) struct SharedInput<R>(Rc<RefCell<R>>);
+
+impl<R> SharedInput<R> {
+    fn new(reader: R) -> Self {
+        Self(Rc::new(RefCell::new(reader)))
+    }
+}
+
+impl<R> Clone for SharedInput<R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<R: Read> Read for SharedInput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().read(buffer)
+    }
+}
+
+impl<R: Seek> Seek for SharedInput<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.0.borrow_mut().seek(position)
+    }
 }
 
 pub(crate) struct QpdfPreparedObjects {
@@ -353,6 +389,9 @@ impl<R: Read + Seek> Drop for Pdf<R> {
     // registry itself drops ensures no lingering cycle keeps a document's
     // object graph (and any reachable stream buffers) alive past `self`.
     fn drop(&mut self) {
+        if let Some(resolver) = &self.qpdf_resolver {
+            resolver.disconnect_all();
+        }
         for handle in self.handle_registry.values() {
             handle.disconnect();
         }
@@ -631,7 +670,7 @@ impl<R: Read + Seek> Pdf<R> {
         sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
         let mut pdf = Self {
-            reader,
+            reader: SharedInput::new(reader),
             header_offset: loaded_state.header_offset,
             version: loaded.version,
             trailer: loaded.trailer,
@@ -640,6 +679,7 @@ impl<R: Read + Seek> Pdf<R> {
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
             handle_registry: BTreeMap::new(),
+            qpdf_resolver: None,
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
             compressed_member_parents: BTreeMap::new(),
@@ -2866,6 +2906,32 @@ impl<R: Read + Seek> Pdf<R> {
 
         streams.push((stream_ref, stream_object.clone()));
         Ok(())
+    }
+}
+
+impl<R: Read + Seek + 'static> Pdf<R> {
+    /// Return qpdf's canonical indirect-object handle for `object_ref`.
+    ///
+    /// The handle preserves its indirect identity while its value is resolved
+    /// lazily by [`ObjectHandle`] accessors. Repeated calls for the same object
+    /// return clones of the same canonical slot.
+    pub fn get_object(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        if self.qpdf_resolver.is_none() {
+            let resolver = Rc::new(QpdfResolver::new(
+                self.reader.clone(),
+                self.header_offset,
+                self.source_xref_entries.clone(),
+                self.sorted_object_offsets.clone(),
+            ));
+            let erased: Rc<dyn crate::object_handle::DocumentResolver> = resolver.clone();
+            resolver.attach(Rc::downgrade(&erased));
+            self.qpdf_resolver = Some(resolver);
+        }
+
+        self.qpdf_resolver
+            .as_ref()
+            .expect("initialized above")
+            .get_object(object_ref)
     }
 }
 
@@ -5146,7 +5212,7 @@ mod tests {
         )
         .expect("parse pending target stream");
 
-        pdf.reader.fail_reads = true;
+        pdf.reader.0.borrow_mut().fail_reads = true;
         let err = pdf
             .resolve_pending_stream_length(target, &pending, target_offset)
             .expect_err("holder I/O errors must remain unrecoverable");
@@ -6321,7 +6387,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
         let first = pdf.get_object_handle(object_ref);
         let second = pdf.get_object_handle(object_ref);
-        assert!(first.ptr_eq(&second));
+        assert!(first.is_same_object_as(&second));
     }
 
     #[test]
@@ -6375,7 +6441,7 @@ mod tests {
             .find(|handle| handle.object_ref() == Some(object_ref))
             .expect("ref 2 0 is present in the result");
         assert!(
-            found.ptr_eq(&pre_registered),
+            found.is_same_object_as(&pre_registered),
             "a ref already registered via get_object_handle must not be re-minted"
         );
     }
@@ -6433,7 +6499,7 @@ mod tests {
         let second = pdf.trailer_handle();
 
         assert!(
-            first.ptr_eq(&second),
+            first.is_same_object_as(&second),
             "repeated trailer_handle calls must return the same canonical handle"
         );
     }
@@ -6640,7 +6706,10 @@ mod tests {
             .resolve_object_handle_to_terminal(&handle)
             .expect("resolve a plain, never-redirected object");
 
-        assert!(result.ptr_eq(&handle), "no chase needed: same handle back");
+        assert!(
+            result.is_same_object_as(&handle),
+            "no chase needed: same handle back"
+        );
         assert!(result.as_dictionary().is_some());
         assert_eq!(result.as_reference(), None);
     }

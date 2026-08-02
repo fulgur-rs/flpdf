@@ -94,6 +94,97 @@ fn compressed_entry_pdf() -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn qpdf_native_handle_accessor_lazily_resolves_catalog_and_preserves_holder_identity() {
+    let file = File::open(minimal_fixture_path()).unwrap();
+    let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
+    let root_ref = pdf.root_ref().expect("minimal fixture has a root");
+    let root = pdf.get_object(root_ref);
+
+    assert!(root.is_indirect());
+    assert!(!root.is_resolved());
+    assert!(root.try_has_key(b"Pages").unwrap());
+    assert!(root.is_resolved());
+    assert_eq!(root.object_ref(), Some(root_ref));
+
+    let pages = root.try_get_key(b"Pages").unwrap();
+    assert!(pages.is_indirect());
+    assert_eq!(pages.object_ref(), Some(ObjectRef::new(2, 0)));
+    assert!(pages.try_has_key(b"Kids").unwrap());
+}
+
+#[test]
+fn qpdf_native_lookup_returns_the_same_canonical_object() {
+    let mut pdf = Pdf::open_mem_owned(classic_pdf_with_bodies(
+        &[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+            b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+        ],
+        ObjectRef::new(1, 0),
+    ))
+    .unwrap();
+
+    let first = pdf.get_object(ObjectRef::new(1, 0));
+    let second = pdf.get_object(ObjectRef::new(1, 0));
+
+    assert!(first.is_same_object_as(&second));
+    assert!(!first.is_resolved());
+    assert!(second.try_has_key(b"Pages").unwrap());
+    assert!(first.is_resolved());
+}
+
+#[test]
+fn qpdf_native_dangling_child_resolves_to_null_in_place() {
+    let mut pdf = Pdf::open_mem_owned(classic_pdf_with_bodies(
+        &[b"1 0 obj\n<< /Type /Catalog /Missing 9 0 R >>\nendobj\n"],
+        ObjectRef::new(1, 0),
+    ))
+    .unwrap();
+
+    let missing = pdf
+        .get_object(ObjectRef::new(1, 0))
+        .try_get_key(b"Missing")
+        .unwrap();
+
+    assert!(missing.is_indirect());
+    assert_eq!(missing.object_ref(), Some(ObjectRef::new(9, 0)));
+    assert!(!missing.is_resolved());
+    assert!(missing.try_is_null().unwrap());
+    assert!(missing.is_resolved());
+}
+
+#[test]
+fn qpdf_native_cycle_reuses_the_resolving_holder() {
+    let mut pdf = Pdf::open_mem_owned(classic_pdf_with_bodies(
+        &[b"1 0 obj\n<< /Type /Catalog /Self 1 0 R >>\nendobj\n"],
+        ObjectRef::new(1, 0),
+    ))
+    .unwrap();
+
+    let root = pdf.get_object(ObjectRef::new(1, 0));
+    let self_reference = root.try_get_key(b"Self").unwrap();
+
+    assert!(root.is_same_object_as(&self_reference));
+    assert!(self_reference.try_has_key(b"Self").unwrap());
+}
+
+#[test]
+fn qpdf_native_handle_is_destroyed_when_its_document_drops() {
+    let root = {
+        let mut pdf = Pdf::open_mem_owned(classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        ))
+        .unwrap();
+        let root = pdf.get_object(ObjectRef::new(1, 0));
+        assert!(root.try_has_key(b"Type").unwrap());
+        root
+    };
+
+    assert_eq!(root.type_code(), 14);
+    assert!(root.try_as_dictionary().unwrap().is_none());
+}
+
 /// Resolving an indirect handle yields its parsed value: the document's
 /// root/Catalog dictionary resolves, and its indirect `/Pages` entry lifts to
 /// an *unresolved* indirect handle carrying the correct object reference

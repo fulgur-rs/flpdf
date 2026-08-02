@@ -203,14 +203,20 @@ impl ObjectHandle {
 
     /// True if `self` and `other` share the same underlying storage — the
     /// same canonical object, not merely an equal value.
-    #[allow(dead_code)] // exercised by this module's identity tests; wired into
-                        // production resolution/comparison paths in a later task
-    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+    ///
+    /// This is qpdf's `QPDFObjectHandle::isSameObjectAs`: mutations and lazy
+    /// resolution observed through either handle affect the same object.
+    pub fn is_same_object_as(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (Repr::Direct(a), Repr::Direct(b)) => Rc::ptr_eq(a, b),
             (Repr::Indirect(a), Repr::Indirect(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
+    }
+
+    #[cfg(test)]
+    fn ptr_eq(&self, other: &Self) -> bool {
+        self.is_same_object_as(other)
     }
 
     // Used by this module's identity tests, and by `Pdf::get_object_handle`
