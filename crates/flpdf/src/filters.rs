@@ -7,8 +7,8 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs_from_object, decode_params_to_object, encode_flate, encode_run_length,
-    stream_filter_for, DecodeParams, FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs_from_object, encode_flate, encode_run_length, stream_filter_for,
+    DecodeParams, FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -348,7 +348,7 @@ fn decode_stream_data_with_filters_and_crypt<F>(
     decrypt_crypt: &mut F,
 ) -> Result<StreamDecodeOutcome>
 where
-    F: FnMut(Option<&Object>, &[u8]) -> Result<Vec<u8>>,
+    F: FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>,
 {
     if let Some(Object::Array(filters)) = filter {
         validate_filter_chain_count(filters.len(), limits.max_filter_chain)?;
@@ -366,8 +366,7 @@ where
         let is_last_stage = stage_index + 1 == stage_count;
         let next = match &mut stage.stage {
             PreparedStage::Crypt => {
-                let bridged = decode_params_to_object(&stage.spec.decode_params);
-                let data = decrypt_crypt(bridged.as_ref(), decoded.as_ref())?;
+                let data = decrypt_crypt(&stage.spec.decode_params, decoded.as_ref())?;
                 append_final_crypt_events(
                     is_last_stage,
                     &mut events,
@@ -1330,7 +1329,7 @@ mod tests {
         let cleanup = ascii85::encode(b"G");
         encoded.extend_from_slice(&cleanup[..2]);
         encoded.push(b'z');
-        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+        let mut decrypt = |_: &DecodeParams, data: &[u8]| Ok(data.to_vec());
 
         let outcome = decode_stream_data_with_filters_and_crypt(
             Some(&filter),
@@ -1353,7 +1352,7 @@ mod tests {
 
     #[test]
     fn recovering_decode_preserves_prefix_probe_and_intermediate_error_paths() {
-        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+        let mut decrypt = |_: &DecodeParams, data: &[u8]| Ok(data.to_vec());
         let two_ascii_hex = Object::Array(vec![
             Object::Name(b"ASCIIHexDecode".to_vec()),
             Object::Name(b"ASCIIHexDecode".to_vec()),
@@ -2708,7 +2707,7 @@ mod tests {
     #[test]
     fn recovering_crypt_stage_emits_final_data_event() {
         let filter = Object::Name(b"Crypt".to_vec());
-        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+        let mut decrypt = |_: &DecodeParams, data: &[u8]| Ok(data.to_vec());
 
         let outcome = decode_stream_data_with_filters_and_crypt(
             Some(&filter),
@@ -2730,15 +2729,19 @@ mod tests {
     /// Plan decision D2: a Crypt provider selects its crypt filter from
     /// `/DecodeParms /Name`, so a name must survive the neutral spec as a name
     /// rather than collapsing into the `ParamValue::Other` stand-in.
+    ///
+    /// This is also what pins the Crypt arm to *its own* stage's parameters:
+    /// the assertion fails for any provider argument that is not
+    /// `stage.spec.decode_params`.
     #[test]
     fn crypt_stage_receives_the_name_parameter_a_provider_selects_on() {
         let filter = Object::Name(b"Crypt".to_vec());
         let mut parms = Dictionary::new();
         parms.insert("Name", Object::Name(b"Identity".to_vec()));
         let parms = Object::Dictionary(parms);
-        let mut seen = None;
-        let mut decrypt = |params: Option<&Object>, data: &[u8]| {
-            seen = params.cloned();
+        let mut seen = Vec::new();
+        let mut decrypt = |params: &DecodeParams, data: &[u8]| {
+            seen = params.entries().to_vec();
             Ok(data.to_vec())
         };
 
@@ -2752,7 +2755,34 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(seen, Some(parms));
+        assert_eq!(
+            seen,
+            vec![(b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec()))]
+        );
+    }
+
+    /// The other half of the Crypt provider contract: an absent `/DecodeParms`
+    /// reaches the provider as `DecodeParams::Absent`, not as a present-but-empty
+    /// parameter set.
+    #[test]
+    fn crypt_stage_receives_neutral_decode_params() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        let mut seen_absent = false;
+        let result = decode_stream_data_with_filters_and_crypt(
+            dict.get("Filter"),
+            dict.get("DecodeParms"),
+            b"payload",
+            DecodeLimits::default(),
+            DataEventMode::Suppress,
+            &mut |params: &DecodeParams, data: &[u8]| {
+                seen_absent = params.is_absent();
+                Ok(data.to_vec())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(seen_absent);
     }
 
     #[test]
@@ -2761,7 +2791,7 @@ mod tests {
             Object::Name(b"ASCIIHexDecode".to_vec()),
             Object::Name(b"Crypt".to_vec()),
         ]);
-        let mut decrypt = |_: Option<&Object>, data: &[u8]| Ok(data.to_vec());
+        let mut decrypt = |_: &DecodeParams, data: &[u8]| Ok(data.to_vec());
 
         let outcome = decode_stream_data_with_filters_and_crypt(
             Some(&filter),
@@ -2789,7 +2819,7 @@ mod tests {
             Object::Name(b"Crypt".to_vec()),
             Object::Name(b"ASCIIHexDecode".to_vec()),
         ]);
-        let mut decrypt = |_: Option<&Object>, data: &[u8]| {
+        let mut decrypt = |_: &DecodeParams, data: &[u8]| {
             assert_eq!(data, b"encrypted");
             Ok(b"41>".to_vec())
         };

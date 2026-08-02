@@ -8,7 +8,7 @@ use crate::pipeline::lzw::LzwDecoder;
 use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
 use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-use crate::{Dictionary, Error, Object, Result};
+use crate::{Error, Object, Result};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -160,55 +160,6 @@ fn param_value_from_object(value: &Object) -> ParamValue {
             Some(name) => ParamValue::Name(name.to_vec()),
             None => ParamValue::Other,
         },
-    }
-}
-
-/// Re-materialize the `Object` shape the Crypt stage provider still takes,
-/// bridging the shape-neutral `FilterSpec` to the one caller that has not been
-/// migrated.
-///
-/// Every `StreamFilter` now reads `&DecodeParams` directly, so the sole
-/// remaining caller is the `PreparedStage::Crypt` arm of
-/// `decode_stream_data_with_filters_and_crypt`; moving that provider closure
-/// onto `&DecodeParams` retires this function entirely.
-///
-/// The round trip loses information in two places, both of which now reach
-/// only that closure.
-///
-/// 1. A present *non-dictionary* reduces to `Present(vec![])` and comes back
-///    as an empty dictionary, so a provider cannot tell the two apart. For the
-///    codec filters that merge was a convergence toward qpdf — see
-///    `FlateLzwStreamFilter::set_decode_params` below — but a crypt provider
-///    reading its own shapes would have to reckon with it.
-/// 2. `ParamValue::Other` flattens to `Object::Null`, so a reconstruction
-///    cannot report which non-integer shape the source held. This is
-///    unobservable today only because the sole production provider ignores its
-///    argument and returns `Unsupported`. `ParamValue::Name` does survive the
-///    round trip, so plan decision D2 (a Crypt provider reading `/Name`) is
-///    unaffected.
-pub(crate) fn decode_params_to_object(params: &DecodeParams) -> Option<Object> {
-    if params.is_absent() {
-        return None;
-    }
-    let mut dictionary = Dictionary::new();
-    for (key, value) in params.entries() {
-        dictionary.insert(key, param_value_to_object(value));
-    }
-    Some(Object::Dictionary(dictionary))
-}
-
-fn param_value_to_object(value: &ParamValue) -> Object {
-    match value {
-        ParamValue::Int(int) => Object::Integer(i64::from(*int)),
-        ParamValue::Name(name) => Object::Name(name.clone()),
-        // `Other` is the shape `param_value_from_object` reaches only after
-        // both `clamped_int_param` and `as_name` decline, so the simplest
-        // non-integer, non-name object stands in for every remaining shape.
-        // This holds only for a value *inside* the parameter dictionary: at
-        // the top level `Null` means absent (`DecodeParams::Absent`), so
-        // reusing this mapping for a whole params object would invert the
-        // meaning of `Other`.
-        ParamValue::Other => Object::Null,
     }
 }
 
