@@ -963,8 +963,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             };
             let _ = node_obj;
             if let Some(value) = found {
-                if !matches!(value, Object::Null) {
-                    return Ok(Some(value));
+                match &value {
+                    Object::Null => {}
+                    Object::Reference(reference)
+                        if matches!(self.pdf.resolve(*reference)?, Object::Null) => {}
+                    _ => return Ok(Some(value)),
                 }
             }
             match parent_ref {
@@ -1039,7 +1042,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             None => return Ok(None),
         };
         Ok(match value {
-            Object::String(value) => Some(value),
+            Object::String(value) => Some(
+                crate::pdf_string::decode_pdf_text_string(&value)
+                    .unwrap_or_else(|| String::from_utf8_lossy(&value).into_owned())
+                    .into_bytes(),
+            ),
             _ => None,
         })
     }

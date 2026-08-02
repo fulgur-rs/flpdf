@@ -94,6 +94,22 @@ fn qualifies_names_from_the_parent_chain() {
 }
 
 #[test]
+fn decodes_pdf_text_strings_in_field_names() {
+    // qpdf's getUTF8Value() decodes PDFDocEncoding and UTF-16BE before
+    // assembling the public field-name strings.
+    let bytes = doc(vec![(
+        10,
+        "<< /T <FEFF006300680069006C0064> /TU <FEFF30E630FC30B630FC> /TM <FEFF30DE30C330D7> >>"
+            .into(),
+    )]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    assert_eq!(field.partial_name().unwrap(), Some("child".into()));
+    assert_eq!(field.alternative_name().unwrap(), Some("ユーザー".into()));
+    assert_eq!(field.mapping_name().unwrap(), Some("マップ".into()));
+}
+
+#[test]
 fn mapping_name_falls_back_to_alternative_then_qualified_name() {
     let bytes = doc(vec![
         (10, "<< /T (child) /Parent 11 0 R >>".into()),
@@ -150,6 +166,22 @@ fn field_type_wrong_type_on_child_stops_parent_inheritance() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
     assert_eq!(field.field_type().unwrap(), None);
+}
+
+#[test]
+fn value_reference_skips_a_child_reference_that_resolves_to_null() {
+    let bytes = doc(vec![
+        (10, "<< /V 20 0 R /Parent 11 0 R >>".into()),
+        (11, "<< /V 21 0 R >>".into()),
+        (20, "null".into()),
+        (21, "<< /ByteRange [0 1 2 3] >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    assert_eq!(
+        field.field_value_reference().unwrap(),
+        Some(ObjectRef::new(21, 0))
+    );
 }
 
 #[test]

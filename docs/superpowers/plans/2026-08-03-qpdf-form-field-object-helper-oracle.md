@@ -1,7 +1,7 @@
 # QPDFFormFieldObjectHelper oracle matrix
 
-**Oracle:** pinned qpdf 11.9.0 at
-`/home/ubuntu/.cache/flpdf/qpdf-11.9.0`.  The Rust helper is the sole public
+**Oracle:** the pinned qpdf 11.9.0 worktree resolved by
+`scripts/fetch-qpdf-source.sh --print-path`. The Rust helper is the sole public
 form-field boundary: `flpdf::form_field_object_helper::FormFieldObjectHelper`.
 It owns a mutable `Pdf` borrow and an `ObjectRef`; every fallible operation
 therefore returns `flpdf::Result<_>`.
