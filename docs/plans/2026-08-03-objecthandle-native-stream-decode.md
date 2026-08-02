@@ -253,10 +253,25 @@ git commit -m "refactor: give FilterSpec a shape-neutral DecodeParams"
 
 ## Task 2: Move `StreamFilter::set_decode_params` onto `DecodeParams`
 
+> **Blocked by `flpdf-4rfl`.** Task 1's code review found that
+> `filters.rs:675` wraps the side-effecting `adapter.set_decode_params(...)`
+> in `debug_assert!`, which `cfg!(debug_assertions)` compiles out — so
+> release builds decode the pending-boundary prefix with default predictor
+> geometry and `decode_stream_data` returns a *different error* than in
+> debug. Reproduced at `cf6b6885` and `aebb9446`:
+> `cargo test --release -p flpdf --lib filters::` → 99 passed, 1 failed
+> (`recovering_pending_error_precedes_equal_offset_final_finish_warning`),
+> while the debug build passes. Task 2 rewrites that exact line onto the new
+> signature, so fix `flpdf-4rfl` first or the swallowed side effect is
+> carried into the new API.
+
 **Files:**
 - Modify: `crates/flpdf/src/stream_filter.rs:283-286` (trait default),
-  `:377-434` (`FlateLzwStreamFilter`)
-- Modify: `crates/flpdf/src/filters.rs:539`, `:676`
+  `:377-434` (`FlateLzwStreamFilter`), and `png_encode_geometry`
+  (`:761-773`) — the encode path calls `set_decode_params` too, so **Task 2
+  does not compile until it is migrated as well**. Task 1's review surfaced
+  this; the original file list missed it.
+- Modify: `crates/flpdf/src/filters.rs:539`, `:676`, and `apply_encode_params`
 
 **Step 1: Write the failing test**
 
@@ -283,14 +298,21 @@ fn non_null_params_still_make_a_parameterless_filter_unfilterable() {
 #[test]
 fn a_fresh_flate_filter_accepts_both_present_shapes_the_neutral_form_merges() {
     // The neutral form collapses "present non-dictionary" and "present empty
-    // dictionary" into `Present(vec![])`, but the legacy `&Object` bodies did
-    // not: a non-dictionary returned `true` early, skipping the trailing
-    // `(predictor > 1) && (columns == 0)` check, while an empty dictionary
-    // fell through to it. They agree ONLY because `prepare_decode_filters`
-    // and `decode_codec_prefix` always construct a fresh adapter, whose
-    // defaults are `predictor = 1, columns = 1`, making that check false
-    // either way. This assertion is what fails if an adapter is ever reused
-    // across specs.
+    // dictionary" into `Present(vec![])`, removing flpdf's own early
+    // `return true` for a non-dictionary (`stream_filter.rs:487-490`). That
+    // shortcut was never qpdf's: `SF_FlateLzwDecode::setDecodeParms`
+    // (`libqpdf/SF_FlateLzwDecode.cc:21-73`) early-returns only for
+    // `isNull()` (`:24-26`); a present non-dictionary reaches `getKeys()`,
+    // which warns `typeWarning("dictionary", "treating as empty")`
+    // (`libqpdf/QPDFObjectHandle.cc:998-1009`), yields an empty set, and
+    // falls through to the trailing `(predictor > 1) && (columns == 0)`
+    // check at `:68-70`. So this merge is a CONVERGENCE toward qpdf, not a
+    // tolerated loss.
+    //
+    // Both shapes still answer `true` because every caller applies params to
+    // a freshly constructed adapter (defaults `predictor = 1, columns = 1`),
+    // making that trailing check false either way. This assertion is what
+    // fails if an adapter is ever reused across specs.
     assert!(FlateLzwStreamFilter::new(false).set_decode_params(&DecodeParams::Present(Vec::new())));
     assert!(FlateLzwStreamFilter::new(true).set_decode_params(&DecodeParams::Present(Vec::new())));
 }
@@ -344,7 +366,7 @@ git commit -m "refactor: take DecodeParams in StreamFilter::set_decode_params"
 fn crypt_stage_receives_neutral_decode_params() {
     let mut dict = Dictionary::new();
     dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
-    let mut seen: Option<DecodeParams> = None;
+    let mut seen_absent = false;
     let result = decode_stream_data_with_filters_and_crypt(
         dict.get("Filter"),
         dict.get("DecodeParms"),
@@ -352,14 +374,24 @@ fn crypt_stage_receives_neutral_decode_params() {
         DecodeLimits::default(),
         DataEventMode::None,
         &mut |params: &DecodeParams, data: &[u8]| {
-            seen = Some(params.clone());
+            seen_absent = params.is_absent();
             Ok(data.to_vec())
         },
     );
     assert!(result.is_ok());
-    assert_eq!(seen, Some(DecodeParams::Absent));
+    assert!(seen_absent);
 }
 ```
+
+> **`DecodeParams` no longer derives `Clone`.** Task 1's cleanup made
+> `PreparedStage::Crypt` a unit variant reading `&stage.spec.decode_params`,
+> which removed the last `clone()` caller, so the derive was dropped. The
+> snippet above therefore inspects the borrow instead of cloning it; re-add
+> the derive only if a real caller needs it. `ParamValue` still derives
+> `Clone`.
+>
+> Task 1 also already made the Crypt arm a unit variant, so this task's only
+> remaining work here is the closure bound and `decrypt_crypt(&stage.spec.decode_params, ...)`.
 
 **Step 2: Run it to verify it fails**
 
