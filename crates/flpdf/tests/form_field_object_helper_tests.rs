@@ -523,12 +523,10 @@ fn set_value_turns_an_existing_checkbox_off_and_leaves_pushbuttons_unchanged() {
 fn set_value_updates_a_checkbox_direct_kid_widget() {
     // qpdf calls `getKey("/AP")` on each /Kids array item, including direct
     // dictionaries, and writes both the field value and that widget's state.
-    let bytes = doc(vec![
-        ((
-            10,
-            "<< /FT /Btn /Kids [ << /AP << /N << /Off null /Chosen null >> >> >> ] >>".into(),
-        )),
-    ]);
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Btn /Kids [ << /AP << /N << /Off null /Chosen null >> >> >> ] >>".into(),
+    )]);
     let mut pdf = open(bytes);
     FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .set_value(Object::Name(b"On".to_vec()), true)
@@ -551,6 +549,30 @@ fn set_value_updates_a_checkbox_direct_kid_widget() {
     assert_eq!(
         widget.get(b"AS".as_slice()),
         Some(&Object::Name(b"Chosen".to_vec()))
+    );
+}
+
+#[test]
+fn set_value_updates_checkbox_state_for_a_non_dictionary_direct_appearance() {
+    // qpdf treats any non-null field-level `/AP` as the annotation to update;
+    // only its on-state lookup requires a dictionary, so `/Yes` is the
+    // fallback when `/AP` itself is malformed.
+    let bytes = doc(vec![(10, "<< /FT /Btn /AP 42 >>".into())]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("set checkbox value with malformed appearance");
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("checkbox field");
+    let Object::Dictionary(field) = field else {
+        panic!("checkbox field must be a dictionary");
+    };
+    assert_eq!(
+        field.get(b"V".as_slice()),
+        Some(&Object::Name(b"Yes".to_vec()))
+    );
+    assert_eq!(
+        field.get(b"AS".as_slice()),
+        Some(&Object::Name(b"Yes".to_vec()))
     );
 }
 

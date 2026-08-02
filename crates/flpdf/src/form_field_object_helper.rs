@@ -515,7 +515,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                     let Object::Dictionary(mut widget) = kid.clone() else {
                         continue;
                     };
-                    if !self.has_appearance(&widget)? {
+                    if !self.has_non_null_appearance(&widget)? {
                         continue;
                     }
                     let state = self.checkbox_state(Some(&widget), checked)?;
@@ -718,7 +718,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         start: ObjectRef,
     ) -> Result<Option<(ObjectRef, Dictionary)>> {
         let field = self.field_dict_for(start, "form field")?;
-        if self.has_appearance(&field)? {
+        if self.has_non_null_appearance(&field)? {
             return Ok(Some((start, field)));
         }
         let Some(kids) = self.object_array(field.get(b"Kids".as_slice()).cloned())? else {
@@ -729,18 +729,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 continue;
             };
             let kid = self.field_dict_for(*kid_ref, "widget")?;
-            if self.has_appearance(&kid)? {
+            if self.has_non_null_appearance(&kid)? {
                 return Ok(Some((*kid_ref, kid)));
             }
         }
         Ok(None)
-    }
-
-    fn has_appearance(&mut self, dictionary: &Dictionary) -> Result<bool> {
-        let Some(value) = dictionary.get(b"AP".as_slice()).cloned() else {
-            return Ok(false);
-        };
-        Ok(matches!(self.resolve_object(value)?, Object::Dictionary(_)))
     }
 
     /// Radio-button mutation follows qpdf's candidate selection: any
