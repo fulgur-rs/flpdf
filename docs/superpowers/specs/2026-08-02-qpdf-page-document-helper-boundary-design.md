@@ -64,6 +64,27 @@ reparents every flattened leaf to the final direct root value. The same
 selection, cloning, and inherited-attribute materialization logic is shared
 with the indirect-root branch.
 
+### Direct page-tree handles and caller depth limits
+
+The direct-root ownership boundary must also apply while finding the effective
+root and resolving inherited attributes. qpdf uses `QPDFObjectHandle` for both
+paths: `getAllPages()` follows `/Parent` while the current handle is a
+dictionary, whether that dictionary is direct or indirect, and
+`pushInheritedAttributesToPage()` traverses direct `/Kids` entries in the same
+way. The Rust translation therefore uses one internal parent cursor that can
+hold either an indirect object reference or an owned direct dictionary. It
+supports the catalog `/Pages` correction path and the `/Resources`, `/Rotate`,
+`/MediaBox`, and `/CropBox` inherited-value walks without materializing a
+direct root into a new indirect object.
+
+`rebuild_page_tree_with_max_depth` must pass its supplied bound through the
+repair traversal as well as its existing inherited-value walks. qpdf has no
+public depth-limit parameter, but the Rust API does; using the default only for
+repair would make the same caller-supplied limit observe two different trees.
+`prepare_for_optimization` remains the default-bound wrapper used by qpdf-like
+public helper operations, while an internal `with_max_depth` entry point keeps
+the bound coherent for rebuilding.
+
 ### Fresh-document extraction boundary
 
 `page_extract.rs` retains ownership of `extract_pages` and `extract_page`.
@@ -92,3 +113,8 @@ without mutating the document.
    ambiguous.
 4. Run the affected `flpdf` tests, formatting, workspace clippy, workspace
    tests, and changed-line coverage.
+5. Verify a direct catalog page value with an indirect `/Parent` is corrected
+   to the real root, and verify direct `/Parent` dictionaries supply inherited
+   resources and rotation during helper mutation and resource pruning.
+6. Verify a small `rebuild_page_tree_with_max_depth` bound rejects an overly
+   deep repaired tree before any page-tree mutation.
