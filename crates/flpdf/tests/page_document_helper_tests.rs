@@ -4,9 +4,14 @@
 //! `PageDocumentHelper` for all page-list access rather than calling
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
-use flpdf::{Dictionary, FlattenMode, Object, ObjectRef, PageDocumentHelper, Pdf, Stream};
+use flpdf::{
+    write_pdf_with_options, Dictionary, FlattenMode, Object, ObjectRef, PageDocumentHelper, Pdf,
+    Stream, WriteOptions,
+};
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Cursor;
+use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Minimal PDF builder
@@ -595,15 +600,15 @@ fn helper_resource_pruning_accepts_pages_without_content_or_resources() {
 }
 
 #[test]
-fn helper_resource_pruning_skips_non_dictionary_categories_and_malformed_forms() {
+fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
     let mut pdf = open(build_n_page_pdf(1));
     pdf.set_object(
         ObjectRef::new(4, 0),
         Object::Stream(Stream::new(Dictionary::new(), b"/Good Do".to_vec())),
     );
 
-    // The pre-pass sees every declared XObject. None of these malformed entries
-    // is a usable Form; qpdf skips them without preventing page-level pruning.
+    // qpdf skips non-Form entries but an undecodable Form makes the page's
+    // resource set incomplete, so it retains the page resources unchanged.
     pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(Dictionary::new()));
     pdf.set_object(
         ObjectRef::new(7, 0),
@@ -657,8 +662,12 @@ fn helper_resource_pruning_skips_non_dictionary_categories_and_malformed_forms()
     let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
         panic!("page must remain a dictionary");
     };
-    let Some(Object::Dictionary(resources)) = page.get("Resources") else {
-        panic!("page must retain a direct resource dictionary");
+    assert_eq!(
+        page.get("Resources"),
+        Some(&Object::Reference(ObjectRef::new(5, 0)))
+    );
+    let Object::Dictionary(resources) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("page resources must remain an indirect dictionary");
     };
     assert_eq!(resources.get("Font"), Some(&Object::Integer(99)));
     let Some(Object::Dictionary(xobjects)) = resources.get("XObject") else {
@@ -666,10 +675,11 @@ fn helper_resource_pruning_skips_non_dictionary_categories_and_malformed_forms()
     };
     assert_eq!(
         xobjects.iter().count(),
-        1,
-        "only the invoked XObject remains"
+        6,
+        "page-level pruning must not run after an undecodable Form"
     );
     assert!(xobjects.get("Good").is_some());
+    assert!(xobjects.get("Bad").is_some());
 }
 
 #[test]
@@ -718,6 +728,105 @@ fn helper_resource_pruning_keeps_a_form_resources_after_a_content_parse_error() 
     };
     assert!(fonts.get("F1").is_some());
     assert!(fonts.get("F2").is_some());
+}
+
+#[test]
+fn helper_resource_pruning_keeps_form_and_page_resources_for_unresolved_form_name() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"/Fm0 Do".to_vec())),
+    );
+
+    let mut form_fonts = Dictionary::new();
+    form_fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    form_fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut form_resources = Dictionary::new();
+    form_resources.insert("Font", Object::Dictionary(form_fonts));
+    let mut form_dict = Dictionary::new();
+    form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
+    form_dict.insert("Resources", Object::Dictionary(form_resources));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(
+            form_dict,
+            b"BT /F1 12 Tf /Missing 12 Tf ET".to_vec(),
+        )),
+    );
+
+    let mut page_fonts = Dictionary::new();
+    page_fonts.insert("P1", Object::Dictionary(Dictionary::new()));
+    page_fonts.insert("P2", Object::Dictionary(Dictionary::new()));
+    let mut page_xobjects = Dictionary::new();
+    page_xobjects.insert("Fm0", Object::Reference(ObjectRef::new(6, 0)));
+    let mut page_resources = Dictionary::new();
+    page_resources.insert("Font", Object::Dictionary(page_fonts));
+    page_resources.insert("XObject", Object::Dictionary(page_xobjects));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(page_resources));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let mut input = Vec::new();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.static_id = true;
+        write_pdf_with_options(&mut pdf, &mut input, &options).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("unresolved-form.pdf");
+        let output_path = dir.path().join("qpdf-output.pdf");
+        fs::write(&input_path, input).unwrap();
+        let output = Command::new("qpdf")
+            .arg("--remove-unreferenced-resources=yes")
+            .arg(&input_path)
+            .arg(&output_path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "qpdf failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = fs::read(output_path).unwrap();
+        assert!(output.windows(3).any(|window| window == b"/F2"));
+        assert!(output.windows(3).any(|window| window == b"/P2"));
+    }
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Stream(form) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("form must remain a stream");
+    };
+    let Some(Object::Dictionary(form_resources)) = form.dict.get("Resources") else {
+        panic!("form must retain resources");
+    };
+    let Some(Object::Dictionary(form_fonts)) = form_resources.get("Font") else {
+        panic!("form must retain font resources");
+    };
+    assert!(form_fonts.get("F1").is_some());
+    assert!(form_fonts.get("F2").is_some());
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must remain a dictionary");
+    };
+    assert_eq!(
+        page.get("Resources"),
+        Some(&Object::Reference(ObjectRef::new(5, 0)))
+    );
+    let Object::Dictionary(page_resources) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("page resources must remain an indirect dictionary");
+    };
+    let Some(Object::Dictionary(page_fonts)) = page_resources.get("Font") else {
+        panic!("page must retain font resources");
+    };
+    assert!(page_fonts.get("P1").is_some());
+    assert!(page_fonts.get("P2").is_some());
 }
 
 #[test]
