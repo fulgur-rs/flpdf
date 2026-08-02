@@ -21,8 +21,8 @@
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
 use flpdf::{
-    delete_embedded_file, insert_embedded_file, list_embedded_files, Object, ObjectRef, Pdf,
-    LEAF_MAX,
+    delete_embedded_file, insert_embedded_file, list_embedded_files, EmbeddedFileDocumentHelper,
+    FileSpec, Object, ObjectRef, Pdf, LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -1336,4 +1336,40 @@ fn insert_with_non_dict_names_terminal_allocates_fresh_dict() {
     );
     assert_eq!(entries[0].0, b"new.txt");
     assert_eq!(entries[0].1, ObjectRef::new(3, 0));
+}
+
+#[test]
+fn helper_reads_named_filespecs_as_handles() {
+    let mut pdf = open(build_single_level_pdf());
+    let files = EmbeddedFileDocumentHelper::new(&mut pdf)
+        .get_embedded_files()
+        .expect("list handles");
+
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        vec![b"alpha".to_vec(), b"beta".to_vec()]
+    );
+    let alpha = files.get(b"alpha".as_slice()).expect("alpha").clone();
+    drop(files);
+
+    assert_eq!(
+        FileSpec::new(alpha, &mut pdf)
+            .expect("filespec helper")
+            .get_filename()
+            .expect("filename"),
+        b"alpha.txt"
+    );
+}
+
+#[test]
+fn helper_absent_tree_has_no_entries_or_lookup() {
+    let mut pdf = open(build_no_embedded_files_pdf());
+    let mut helper = EmbeddedFileDocumentHelper::new(&mut pdf);
+
+    assert!(!helper.has_embedded_files().expect("has"));
+    assert!(helper.get_embedded_files().expect("list").is_empty());
+    assert!(helper
+        .get_embedded_file(b"missing")
+        .expect("lookup")
+        .is_none());
 }

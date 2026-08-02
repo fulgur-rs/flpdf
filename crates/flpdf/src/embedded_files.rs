@@ -78,8 +78,93 @@
 //! ```
 
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use std::collections::BTreeMap;
 use std::io::{Read, Seek};
+
+/// High-level helper for a document's `/Names /EmbeddedFiles` name tree.
+///
+/// Construct with [`EmbeddedFileDocumentHelper::new`] or
+/// [`Pdf::embedded_files`]. The helper does not cache name-tree state; each
+/// method observes the document's current object graph.
+pub struct EmbeddedFileDocumentHelper<'a, R: Read + Seek> {
+    pdf: &'a mut Pdf<R>,
+}
+
+impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
+    /// Create an embedded-files helper borrowing `pdf` mutably.
+    pub fn new(pdf: &'a mut Pdf<R>) -> Self {
+        Self { pdf }
+    }
+
+    fn embedded_files_root(&mut self) -> Result<Option<Object>> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(None);
+        };
+        let Some(catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict() else {
+            return Ok(None);
+        };
+        let Some(names) = catalog.get("Names").cloned() else {
+            return Ok(None);
+        };
+        let (names, _) = resolve_ref_chain(self.pdf, &names)?;
+        let Some(names) = names.into_dict() else {
+            return Ok(None);
+        };
+        let Some(root) = names.get("EmbeddedFiles").cloned() else {
+            return Ok(None);
+        };
+        let (terminal, _) = resolve_ref_chain(self.pdf, &root)?;
+        if terminal.as_dict().is_some() {
+            Ok(Some(root))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn name_tree(&mut self) -> Result<Option<crate::NameTree>> {
+        Ok(self
+            .embedded_files_root()?
+            .map(|root| crate::NameTree::new(root, false)))
+    }
+
+    /// Return whether this document has an `/EmbeddedFiles` name tree.
+    pub fn has_embedded_files(&mut self) -> Result<bool> {
+        Ok(self.embedded_files_root()?.is_some())
+    }
+
+    /// Return every embedded-files entry in key order.
+    ///
+    /// The values are qpdf-shaped Filespec object handles. Indirect values use
+    /// the canonical handle of this document; direct Filespec dictionaries are
+    /// returned as direct handles.
+    pub fn get_embedded_files(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        let Some(mut tree) = self.name_tree()? else {
+            return Ok(BTreeMap::new());
+        };
+        tree.as_map(self.pdf)?
+            .into_iter()
+            .map(|(key, value)| Ok((key, self.pdf.lift_object_to_handle(&value)?)))
+            .collect()
+    }
+
+    /// Return the Filespec handle stored under `key`, if present.
+    pub fn get_embedded_file(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+        let Some(mut tree) = self.name_tree()? else {
+            return Ok(None);
+        };
+        tree.find_object(self.pdf, key)?
+            .map(|value| self.pdf.lift_object_to_handle(&value))
+            .transpose()
+    }
+}
+
+impl<R: Read + Seek> Pdf<R> {
+    /// Return a high-level embedded-files helper for this document.
+    pub fn embedded_files(&mut self) -> EmbeddedFileDocumentHelper<'_, R> {
+        EmbeddedFileDocumentHelper::new(self)
+    }
+}
 
 // ── remove_attachment ─────────────────────────────────────────────────────────
 
