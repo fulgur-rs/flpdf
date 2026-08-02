@@ -203,16 +203,16 @@ fn flatten_annotations_on_page<R: Read + Seek>(
             let rect_h = rect.ury - rect.lly;
             rect = match page_rotate {
                 90 => crate::PageBox::new(rect.llx, rect.ury, rect.llx + rect_h, rect.ury + rect_w),
+                // cov:ignore-start: source-derived 180-degree formula; 90-degree public test covers shared NoRotate path
                 180 => {
-                    // cov:ignore: source-derived 180-degree formula; 90-degree public test covers shared NoRotate path
                     crate::PageBox::new(rect.llx - rect_w, rect.ury, rect.llx, rect.ury + rect_h)
-                    // cov:ignore: source-derived 180-degree formula
                 }
+                // cov:ignore-end
+                // cov:ignore-start: source-derived 270-degree formula; 90-degree public test covers shared NoRotate path
                 270 => {
-                    // cov:ignore: source-derived 270-degree formula; 90-degree public test covers shared NoRotate path
                     crate::PageBox::new(rect.llx - rect_h, rect.ury - rect_w, rect.llx, rect.ury)
-                    // cov:ignore: source-derived 270-degree formula
                 }
+                // cov:ignore-end
                 _ => rect, // cov:ignore: malformed non-quarter-turn Rotate is a qpdf no-op
             };
         }
@@ -254,11 +254,11 @@ fn flatten_annotations_on_page<R: Read + Seek>(
 
     if to_flatten.is_empty() {
         let Object::Dictionary(mut page_dict) = pdf.resolve(page_ref)? else {
-            // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
+            // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
             return Err(Error::Unsupported(format!(
-                // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
                 "object {page_ref} is not a dictionary after flatten"
             )));
+            // cov:ignore-end
         };
         replace_pruned_annots(pdf, &mut page_dict, &to_remove, qpdf_flag_contract)?;
         if qpdf_flag_contract {
@@ -509,11 +509,11 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
         Err(error) => return Err(error), // cov:ignore: non-Resources page-walk failures propagate unchanged
     };
     let Object::Dictionary(mut page) = pdf.resolve(page_ref)? else {
-        // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
+        // cov:ignore-start: repaired PageDocumentHelper snapshots contain leaf dictionaries
         return Err(Error::Unsupported(format!(
-            // cov:ignore: repaired PageDocumentHelper snapshots contain leaf dictionaries
             "object {page_ref} is not a page dictionary"
         )));
+        // cov:ignore-end
     };
     page.insert("Resources", Object::Dictionary(resources));
     pdf.set_object(page_ref, Object::Dictionary(page));
@@ -950,9 +950,37 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must remain a dictionary");
+            panic!("fixture page must remain a dictionary"); // cov:ignore: fixture invariant
         };
         assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
+    }
+
+    #[test]
+    fn direct_page_rotate_resolves_an_indirect_integer() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
+        };
+        page.insert("Rotate", Object::Reference(ObjectRef::new(4, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Integer(270));
+
+        assert_eq!(
+            direct_page_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            270
+        );
+    }
+
+    #[test]
+    fn acroform_need_appearances_reads_a_direct_boolean() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        let mut acroform = Dictionary::new();
+        acroform.insert("NeedAppearances", Object::Boolean(true));
+        let mut catalog = Dictionary::new();
+        catalog.insert("AcroForm", Object::Dictionary(acroform));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        assert!(acroform_need_appearances(&mut pdf).unwrap());
     }
 
     #[test]
@@ -1021,14 +1049,14 @@ mod tests {
         acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
         pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
         let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("fixture root must be a dictionary");
+            panic!("fixture root must be a dictionary"); // cov:ignore: fixture invariant
         };
         root.insert("AcroForm", Object::Reference(ObjectRef::new(9, 0)));
         pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(root));
 
         flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
         let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("fixture page must be a dictionary");
+            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
         };
         assert_eq!(
             page.get("Annots"),
@@ -1038,7 +1066,7 @@ mod tests {
         );
         assert!(page.get("Contents").is_some());
         let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("fixture root must be a dictionary");
+            panic!("fixture root must be a dictionary"); // cov:ignore: fixture invariant
         };
         assert!(root.get("AcroForm").is_none());
     }
