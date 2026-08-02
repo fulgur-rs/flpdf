@@ -30,14 +30,17 @@ pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds conf
 /// an empty key set.
 ///
 /// **Entry order is not part of this type's contract.** qpdf iterates
-/// `getKeys()`'s `std::set<std::string>`, so it sees keys sorted; both flpdf
-/// shape readers happen to agree today, because `Object`'s `Dictionary` and
-/// `ObjectHandle::as_dictionary` are each a `BTreeMap` keyed by the raw name
-/// bytes and a uniform `/` prefix preserves the same relative order. A `Vec`
-/// cannot state that, and nothing needs it to: every filter assigns each key
-/// independently and runs its only cross-key check after the loop
-/// (`SF_FlateLzwDecode.cc:68-70`). A future Crypt provider that reads
-/// [`Self::entries`] order-dependently would be the first code to care.
+/// `getKeys()`'s `std::set<std::string>`, so it sees keys sorted. The `Object`
+/// shape reader agrees today by construction rather than by intent:
+/// `Dictionary` is a `BTreeMap` keyed by the raw name bytes, and because
+/// qpdf's keys differ only by a uniform leading `/`, the two orderings
+/// coincide. A handle-shaped reader entering through
+/// `ObjectHandle::as_dictionary` — a `BTreeMap` over the same keys — would
+/// coincide for the same reason. A `Vec` cannot state any of that, and nothing
+/// needs it to: every filter assigns each key independently and runs its only
+/// cross-key check after the loop (`SF_FlateLzwDecode.cc:68-70`). A future
+/// Crypt provider that reads [`Self::entries`] order-dependently would be the
+/// first code to care.
 #[derive(Debug, PartialEq)]
 pub(crate) enum DecodeParams {
     Absent,
@@ -1349,15 +1352,17 @@ mod tests {
     #[test]
     fn a_dirtied_adapter_shows_why_absent_short_circuits_and_present_does_not() {
         let mut filter = FlateLzwStreamFilter::new(false);
+        // Setup, not the property under test: this first call exists only to
+        // leave predictor = 12 / columns = 0 behind for the two calls below.
+        // The predictor/columns rule it returns `false` on is pinned on its own
+        // by `a_predictor_above_one_requires_a_nonzero_columns_value`, so this
+        // is not a duplicate of that test.
+        //
         // `/Predictor` is stored before its own range check
         // (`SF_FlateLzwDecode.cc:34` then `:35-38`) and `/Columns` is stored with
         // no range validation at all (`:46`), so predictor = 12 and columns = 0
         // both stick even though the trailing `(predictor > 1) && (columns == 0)`
         // check at `:68-70` answers `filterable = false`.
-        // Setup, not the property under test: this call exists only to leave
-        // predictor = 12 / columns = 0 behind for the two calls below. The
-        // predictor/columns rule it happens to exercise is pinned on its own by
-        // `a_predictor_above_one_requires_a_nonzero_columns_value`.
         assert!(!filter.set_decode_params(&neutral_params(&[
             ("Predictor", ParamValue::Int(12)),
             ("Columns", ParamValue::Int(0)),

@@ -1896,6 +1896,12 @@ mod identity_tests {
     impl RecordingResolver {
         /// Install `value` instead of the default one-key dictionary, so a
         /// test can exercise a resolving accessor for a non-dictionary shape.
+        ///
+        /// One instance installs the *same* child handles on every resolution:
+        /// cloning an `ObjectValue` container clones child `Rc`s rather than
+        /// the subtree (see that enum's own doc). Resolving two handles through
+        /// a single resolver therefore leaves their children `ptr_eq`, which no
+        /// current test wants — give each such test its own resolver.
         fn installing(value: ObjectValue) -> Self {
             Self {
                 calls: RefCell::new(Vec::new()),
