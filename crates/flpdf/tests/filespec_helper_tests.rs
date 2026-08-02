@@ -288,7 +288,12 @@ fn direct_embedded_stream_metadata_setters_update_existing_and_new_params() {
     )
     .unwrap();
     existing.set_creation_date(b"new").unwrap();
+    existing.set_subtype(b"application/test").unwrap();
     assert_eq!(existing.creation_date().unwrap(), Some(b"new".to_vec()));
+    assert_eq!(
+        existing.mimetype().unwrap(),
+        Some(b"application/test".to_vec())
+    );
 
     let mut absent = EmbeddedFileStream::new(
         ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"absent".to_vec()),
