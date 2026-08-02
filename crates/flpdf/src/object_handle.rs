@@ -1,11 +1,15 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) and its backing `QPDFValue` (`libqpdf/qpdf/QPDFValue.hh`).
+//! qpdf correspondence: `QPDFObjectHandle`
+//! (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
+//! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
+//! (`libqpdf/qpdf/QPDFValue.hh`).
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
-// std::shared_ptr<QPDFValue> — internal structure only, does not affect
-// output bytes (see docs/qpdf-correspondence.md).
+// std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
+// internal structure only and does not affect output bytes (see
+// docs/qpdf-correspondence.md).
 
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;

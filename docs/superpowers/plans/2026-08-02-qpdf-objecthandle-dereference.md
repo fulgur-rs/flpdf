@@ -93,12 +93,14 @@ all applicable members and records decoded-stream-relative offsets.
 
 ## Task 5: Verify and publish the primitive slice
 
-- [ ] Run the focused primitive tests.
-- [ ] Run the oracle runner and runner contract.
-- [ ] Run the full flpdf and workspace suites.
-- [ ] Run format, clippy with warnings denied, and fresh changed-line coverage.
-- [ ] Record exact results in `flpdf-25kg.3.3`.
-- [ ] Commit the responsibility correction.
+- [x] Run the focused primitive tests (128 passed).
+- [x] Run the oracle runner and runner contract (minimal offsets 17/66;
+  generated ObjStm offsets 9/43).
+- [x] Run the full flpdf and workspace suites (zero failures).
+- [x] Run format, clippy with warnings denied, and fresh changed-line coverage
+  (156/156 executable lines, 100%).
+- [x] Record exact results in `flpdf-25kg.3.3`.
+- [x] Commit the responsibility correction.
 - [ ] Push Beads and git.
 - [ ] Open the pull request for the primitive slice.
 
