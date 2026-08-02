@@ -587,10 +587,12 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
             };
             let mut destination = match resources.remove(category) {
                 Some(Object::Dictionary(dict)) => dict,
-                Some(Object::Reference(reference)) => match pdf.resolve(reference)? {
-                    Object::Dictionary(dict) => dict,
-                    _ => Dictionary::new(), // cov:ignore: malformed category holder is replaced
-                },
+                Some(Object::Reference(reference)) => {
+                    match resolve_ref_chain(pdf, &Object::Reference(reference))?.0 {
+                        Object::Dictionary(dict) => dict,
+                        _ => Dictionary::new(), // cov:ignore: malformed category holder is replaced
+                    }
+                }
                 _ => Dictionary::new(), // cov:ignore: absent or invalid category is materialized
             };
             for (name, value) in source.iter() {
@@ -618,12 +620,8 @@ fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let Some(acroform) = root.get("AcroForm").cloned() else {
         return Ok(false);
     };
-    let acroform = match acroform {
+    let acroform = match resolve_ref_chain(pdf, &acroform)?.0 {
         Object::Dictionary(dict) => dict,
-        Object::Reference(reference) => match pdf.resolve(reference)? {
-            Object::Dictionary(dict) => dict,
-            _ => return Ok(false), // cov:ignore: malformed indirect AcroForm is ignored like qpdf
-        },
         _ => return Ok(false), // cov:ignore: malformed direct AcroForm is ignored like qpdf
     };
     let Some(value) = acroform.get("NeedAppearances").cloned() else {
@@ -674,11 +672,7 @@ fn read_annot_flags<R: Read + Seek>(pdf: &mut Pdf<R>, annot_ref: ObjectRef) -> R
         None | Some(Object::Null) => return Ok(0),
         Some(v) => v,
     };
-    // Resolve indirect reference (review-pattern #2).
-    let resolved = match flags_val {
-        Object::Reference(r) => pdf.resolve(r)?,
-        other => other,
-    };
+    let resolved = resolve_ref_chain(pdf, &flags_val)?.0;
     Ok(resolved.as_integer().unwrap_or(0))
 }
 
@@ -708,12 +702,8 @@ fn resolve_ap_n<R: Read + Seek>(
         None | Some(Object::Null) => return Ok(None),
         Some(v) => v,
     };
-    let ap_dict: Dictionary = match ap_val {
+    let ap_dict: Dictionary = match resolve_ref_chain(pdf, &ap_val)?.0 {
         Object::Dictionary(d) => d,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Dictionary(d) => d,
-            _ => return Ok(None),
-        },
         _ => return Ok(None),
     };
 
@@ -723,33 +713,13 @@ fn resolve_ap_n<R: Read + Seek>(
         Some(v) => v,
     };
 
-    // Resolve /N.
-    let n_resolved_for_type: Object = match &n_val {
-        Object::Reference(r) => {
-            // Peek at the type without consuming ownership.
-            let peeked = pdf.resolve_borrowed(*r)?;
-            match peeked {
-                Object::Stream(_) => return Ok(Some(*r)), // ← ref to stream: use as-is
-                Object::Dictionary(_) => {
-                    // State dict case — fall through to select by /AS.
-                    pdf.resolve(*r)?
-                }
-                _ => return Ok(None),
-            }
-        }
-        // Per PDF 32000-1 §7.3.8.1, streams must be indirect objects; a direct
-        // stream here would only appear in structurally-malformed PDFs.  The
-        // flpdf parser never emits direct Object::Stream values as dictionary
-        // entries, so the two branches below are defensive dead-code for real
-        // PDFs.  They materialize the stream so callers get a valid ref even on
-        // malformed input, rather than silently dropping the annotation.
-        Object::Stream(_) => n_val.clone(), // inline stream (malformed PDF)
-        Object::Dictionary(_) => n_val.clone(), // inline state dict
-        _ => return Ok(None),
-    };
+    let (n_resolved_for_type, n_terminal_ref) = resolve_ref_chain(pdf, &n_val)?;
 
     match n_resolved_for_type {
         Object::Stream(s) => {
+            if let Some(stream_ref) = n_terminal_ref {
+                return Ok(Some(stream_ref));
+            }
             // Inline stream in malformed PDF — materialize as new indirect object.
             let new_ref = next_object_ref(pdf)?;
             pdf.set_object(new_ref, Object::Stream(s));
@@ -762,22 +732,24 @@ fn resolve_ap_n<R: Read + Seek>(
                 let Some(adict) = obj.as_dict() else {
                     return Ok(None);
                 };
-                match adict.get("AS").cloned() {
-                    Some(Object::Name(n)) => n,
-                    Some(Object::Reference(r)) => match pdf.resolve(r)? {
-                        Object::Name(n) => n,
-                        _ => return Ok(None),
-                    },
+                let Some(as_value) = adict.get("AS").cloned() else {
+                    return Ok(None);
+                };
+                match resolve_ref_chain(pdf, &as_value)?.0 {
+                    Object::Name(n) => n,
                     _ => return Ok(None),
                 }
             };
             let as_key = String::from_utf8_lossy(&as_name).into_owned();
-            match state_dict.get(as_key.as_str()).cloned() {
-                Some(Object::Reference(r)) => match pdf.resolve_borrowed(r)? {
-                    Object::Stream(_) => Ok(Some(r)),
-                    _ => Ok(None),
-                },
-                Some(Object::Stream(s)) => {
+            let Some(state_value) = state_dict.get(as_key.as_str()).cloned() else {
+                return Ok(None);
+            };
+            let (state_value, state_terminal_ref) = resolve_ref_chain(pdf, &state_value)?;
+            match state_value {
+                Object::Stream(s) => {
+                    if let Some(stream_ref) = state_terminal_ref {
+                        return Ok(Some(stream_ref));
+                    }
                     // Inline stream in state dict of malformed PDF.
                     let new_ref = next_object_ref(pdf)?;
                     pdf.set_object(new_ref, Object::Stream(s));

@@ -3408,10 +3408,14 @@ fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
     let Object::Dictionary(mut acroform) = acroform else {
         return Ok(());
     };
-    if !matches!(acroform.get("NeedAppearances"), Some(Object::Boolean(true))) {
+    let Some(need_appearances) = acroform.get("NeedAppearances").cloned() else {
+        return Ok(());
+    };
+    let (need_appearances, _) = resolve_acroform_reference_chain(pdf, need_appearances)?;
+    if !matches!(need_appearances, Object::Boolean(true)) {
         return Ok(());
     }
-    acroform.insert("NeedAppearances", Object::Boolean(false));
+    acroform.remove("NeedAppearances");
     if let Some(acroform_ref) = terminal_ref {
         pdf.set_object(acroform_ref, Object::Dictionary(acroform));
     } else {
@@ -5878,6 +5882,38 @@ mod tests {
                 .map(|stream| stream.data.as_slice()),
             Some(&b"\r<0g"[..])
         );
+    }
+
+    #[test]
+    fn clear_need_appearances_removes_a_chained_true_value() {
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .unwrap();
+        let root_ref = pdf.root_ref().unwrap();
+        let mut root = pdf.resolve(root_ref).unwrap().into_dict().unwrap();
+        root.insert("AcroForm", Object::Reference(ObjectRef::new(100, 0)));
+        pdf.set_object(root_ref, Object::Dictionary(root));
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("NeedAppearances", Object::Reference(ObjectRef::new(102, 0)));
+        pdf.set_object(
+            ObjectRef::new(100, 0),
+            Object::Reference(ObjectRef::new(101, 0)),
+        );
+        pdf.set_object(ObjectRef::new(101, 0), Object::Dictionary(acroform));
+        pdf.set_object(
+            ObjectRef::new(102, 0),
+            Object::Reference(ObjectRef::new(103, 0)),
+        );
+        pdf.set_object(ObjectRef::new(103, 0), Object::Boolean(true));
+
+        clear_need_appearances_after_generation(&mut pdf).unwrap();
+
+        let Object::Dictionary(acroform) = pdf.resolve(ObjectRef::new(101, 0)).unwrap() else {
+            panic!("terminal AcroForm must remain a dictionary");
+        };
+        assert!(acroform.get("NeedAppearances").is_none());
     }
 
     #[cfg(unix)]
