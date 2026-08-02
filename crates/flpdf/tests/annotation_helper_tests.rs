@@ -115,6 +115,24 @@ fn annotation_subtype_follows_indirect_name() {
     );
 }
 
+#[test]
+fn annotation_subtype_indirect_non_name_returns_none() {
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>".to_vec(),
+        ),
+        (4, b"<< /Type /Annot /Subtype 5 0 R >>".to_vec()),
+        (5, b"42".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut annot = AnnotationObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
+
+    assert_eq!(annot.subtype().expect("subtype()"), None);
+}
+
 // ── AnnotationObjectHelper::rect ─────────────────────────────────────────────
 
 #[test]
