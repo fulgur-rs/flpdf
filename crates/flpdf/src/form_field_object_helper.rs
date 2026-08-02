@@ -376,27 +376,16 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         )
     }
 
-    /// Generate a normal appearance only for text and choice fields.
+    /// Generate a normal appearance for `widget_ref` from this field's value.
     ///
     /// Button appearance generation remains deliberately outside qpdf's
     /// `QPDFFormFieldObjectHelper::generateAppearance` dispatch.
-    pub fn generate_appearance(&mut self) -> Result<Option<ObjectRef>> {
+    pub fn generate_appearance_for(&mut self, widget_ref: ObjectRef) -> Result<Option<ObjectRef>> {
         match self.field_type()?.as_deref() {
-            Some(b"/Tx") => rendering::render_text_field(self.pdf, self.field_ref),
-            Some(b"/Ch") => rendering::render_choice_field(self.pdf, self.field_ref),
+            Some(b"/Tx") => rendering::render_text_field(self.pdf, widget_ref),
+            Some(b"/Ch") => rendering::render_choice_field(self.pdf, widget_ref),
             _ => Ok(None),
         }
-    }
-
-    /// Generate an appearance for a button widget used by the document-level
-    /// appearance pass.
-    ///
-    /// This is deliberately separate from [`Self::generate_appearance`]:
-    /// qpdf's public `generateAppearance` dispatches only text and choice
-    /// fields, while the CLI's existing document pass also preserves its
-    /// button-widget rendering.
-    pub fn generate_button_appearance(&mut self) -> Result<Option<ObjectRef>> {
-        rendering::render_button_field(self.pdf, self.field_ref)
     }
 
     /// Clear `/AcroForm/NeedAppearances` after a document appearance pass.

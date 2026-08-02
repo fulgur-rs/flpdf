@@ -779,6 +779,34 @@ fn set_value_turns_on_state_off_when_radio_appearance_is_non_null_but_not_a_dict
 }
 
 #[test]
+fn generates_a_field_value_on_its_separate_widget() {
+    let bytes = doc_with_acroform(vec![
+        (
+            10,
+            "<< /FT /Tx /V (value) /DA (/Helv 12 Tf 0 g) /Kids [11 0 R] >>".into(),
+        ),
+        (
+            11,
+            "<< /Subtype /Widget /Parent 10 0 R /Rect [0 0 100 20] >>".into(),
+        ),
+        (20, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .generate_appearance_for(ObjectRef::new(11, 0))
+        .unwrap()
+        .is_some());
+    assert!(pdf
+        .resolve(ObjectRef::new(11, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("AP")
+        .is_some());
+}
+
+#[test]
 fn generate_appearance_dispatches_only_text_and_choice_fields() {
     let bytes = doc_with_acroform(vec![
         (
@@ -789,7 +817,7 @@ fn generate_appearance_dispatches_only_text_and_choice_fields() {
     ]);
     let mut pdf = open(bytes);
     assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .generate_appearance()
+        .generate_appearance_for(ObjectRef::new(10, 0))
         .expect("text appearance")
         .is_some());
 
@@ -803,7 +831,7 @@ fn generate_appearance_dispatches_only_text_and_choice_fields() {
     ]);
     let mut pdf = open(bytes);
     assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-        .generate_appearance()
+        .generate_appearance_for(ObjectRef::new(10, 0))
         .expect("choice appearance")
         .is_some());
 
@@ -811,7 +839,7 @@ fn generate_appearance_dispatches_only_text_and_choice_fields() {
     let mut pdf = open(bytes);
     assert_eq!(
         FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
-            .generate_appearance()
+            .generate_appearance_for(ObjectRef::new(10, 0))
             .expect("button is skipped"),
         None
     );
