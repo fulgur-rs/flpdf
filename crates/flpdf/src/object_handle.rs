@@ -867,8 +867,7 @@ impl ObjectHandle {
             return;
         }
         let Repr::Direct(slot) = &self.0 else {
-            // cov:ignore: is_direct guard above excludes Indirect
-            return;
+            return; // cov:ignore: is_direct guard above excludes Indirect
         };
         let children = {
             let mut slot = slot.borrow_mut();
