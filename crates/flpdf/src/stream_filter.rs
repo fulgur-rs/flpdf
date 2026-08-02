@@ -18,12 +18,17 @@ pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds conf
 /// needs, with no `Object` or `ObjectHandle` left in it.
 ///
 /// `Absent` covers both a missing key and an explicit null, matching
-/// `QPDF_Stream::filterable`'s treatment of a null `/DecodeParms`.
+/// `QPDF_Stream::filterable`'s treatment of a null `/DecodeParms` and
+/// `SF_FlateLzwDecode::setDecodeParms`'s sole early return
+/// (`SF_FlateLzwDecode.cc:24-26`).
 /// `Present` carries the dictionary's entries in iteration order; a present
-/// non-dictionary yields `Present` with no entries, mirroring
-/// `SF_FlateLzwDecode::setDecodeParms`, which warns and treats a
-/// non-dictionary as an empty dictionary while remaining filterable.
-#[derive(Clone, Debug, PartialEq)]
+/// non-dictionary yields `Present` with no entries, which is what qpdf sees:
+/// `setDecodeParms` asks `QPDFObjectHandle::getKeys`
+/// (`QPDFObjectHandle.cc:997-1009`) for every non-null object, and it is
+/// *`getKeys`* — not `setDecodeParms` — that warns
+/// `typeWarning("dictionary", "treating as empty")` (`:1005`) and hands back
+/// an empty key set.
+#[derive(Debug, PartialEq)]
 pub(crate) enum DecodeParams {
     Absent,
     Present(Vec<(Vec<u8>, ParamValue)>),
@@ -31,11 +36,12 @@ pub(crate) enum DecodeParams {
 
 /// A `/DecodeParms` value reduced to the bounded scalars any filter reads.
 ///
-/// `Int` carries `getIntValueAsInt`'s saturating clamp. `Name` exists for
-/// `Crypt`'s `/Name`, which selects the crypt filter — carrying it now keeps
-/// Phase 3's AES/Crypt cutover from having to widen this shared type.
-/// `Other` is every remaining shape, which every current filter rejects the
-/// same way `clamped_int_param` rejected a non-integer.
+/// `Int` carries `getIntValueAsInt`'s clamp, which saturates at *both* ends
+/// (`QPDFObjectHandle.cc:526-543`). `Name` exists for `Crypt`'s `/Name`, which
+/// selects the crypt filter — carrying it now keeps Phase 3's AES/Crypt cutover
+/// from having to widen this shared type. `Other` is every remaining shape,
+/// which every current filter rejects the same way `clamped_int_param`
+/// rejected a non-integer.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ParamValue {
     Int(i32),
@@ -56,7 +62,7 @@ impl DecodeParams {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct FilterSpec {
     pub(crate) name: Vec<u8>,
     pub(crate) decode_params: DecodeParams,
@@ -159,17 +165,36 @@ fn param_value_from_object(value: &Object) -> ParamValue {
 
 /// Re-materialize the `Object` shape `StreamFilter::set_decode_params` still
 /// takes, bridging the shape-neutral `FilterSpec` to the not-yet-migrated
-/// filters. Removed once `set_decode_params` and the Crypt stage provider take
-/// `&DecodeParams` directly.
+/// filters.
 ///
-/// The round trip is lossy in exactly one way: a present *non-dictionary*
-/// reduces to `Present(vec![])` and comes back as an empty dictionary, so
-/// `SF_FlateLzwDecode::setDecodeParms`'s early `return true` for a
-/// non-dictionary becomes a fall-through to its trailing
-/// `(predictor > 1) && (columns == 0)` check. Both answer `true` only because
-/// every caller applies the parameters to a freshly constructed filter, whose
-/// defaults are `predictor = 1, columns = 1`. Reusing one adapter across specs
-/// would break that equivalence.
+/// Expiry is mechanical: moving `set_decode_params` onto `&DecodeParams`
+/// removes the `prepare_decode_filters`, `decode_codec_prefix`, and
+/// `apply_encode_params`/`png_encode_geometry` call sites in `filters.rs`;
+/// moving the Crypt stage provider onto `&DecodeParams` removes the last one,
+/// in the Crypt arm of `decode_stream_data_with_filters_and_crypt`. Note that
+/// `png_encode_geometry` below also calls `set_decode_params`, so that
+/// migration must cover this module too, not just `filters.rs`.
+///
+/// The round trip loses information in two places.
+///
+/// 1. A present *non-dictionary* reduces to `Present(vec![])` and comes back
+///    as an empty dictionary. That converges *toward* qpdf rather than away
+///    from it: `SF_FlateLzwDecode::setDecodeParms` early-returns only for null
+///    (`SF_FlateLzwDecode.cc:24-26`); a non-dictionary reaches `getKeys`, gets
+///    an empty key set, and falls through to the trailing
+///    `(predictor > 1) && (columns == 0)` check at `:68-70`. The early
+///    `return true` for a non-dictionary is flpdf's own shortcut in
+///    `FlateLzwStreamFilter::set_decode_params` below. Both answer `true` only
+///    because every caller applies the parameters to a freshly constructed
+///    filter, whose defaults are `predictor = 1, columns = 1`; reusing one
+///    adapter across specs would break that equivalence.
+/// 2. `ParamValue::Other` flattens to `Object::Null`, so a reconstruction
+///    cannot report which non-integer shape the source held. Unlike (1) this
+///    reaches a caller-supplied closure — the Crypt stage provider — and is
+///    unobservable today only because the sole production provider ignores its
+///    argument and returns `Unsupported`. `ParamValue::Name` does survive the
+///    round trip, so plan decision D2 (a Crypt provider reading `/Name`) is
+///    unaffected.
 pub(crate) fn decode_params_to_object(params: &DecodeParams) -> Option<Object> {
     if params.is_absent() {
         return None;
@@ -187,7 +212,11 @@ fn param_value_to_object(value: &ParamValue) -> Object {
         ParamValue::Name(name) => Object::Name(name.clone()),
         // Every filter reads a parameter through `clamped_int_param`, which
         // answers `None` for any non-integer, so the simplest non-integer
-        // object stands in for every remaining shape.
+        // object stands in for every remaining shape. This holds only for a
+        // value *inside* the parameter dictionary: at the top level `Null`
+        // means absent (see `FlateLzwStreamFilter::set_decode_params` below),
+        // so reusing this mapping for a whole params object would invert the
+        // meaning of `Other`.
         ParamValue::Other => Object::Null,
     }
 }
@@ -483,8 +512,11 @@ impl StreamFilter for FlateLzwStreamFilter {
             return true;
         }
         // SF_FlateLzwDecode::setDecodeParms asks getKeys() for every non-null
-        // object. qpdf warns and treats a non-dictionary as an empty
-        // dictionary, so it remains filterable.
+        // object, and QPDFObjectHandle::getKeys warns and hands back an empty
+        // key set for a non-dictionary, so it remains filterable. qpdf then
+        // still runs the trailing (predictor > 1) && (columns == 0) check; the
+        // early return here is flpdf's own shortcut, equivalent only because
+        // every caller applies parameters to a freshly constructed filter.
         let Some(params) = params.as_dict() else {
             return true;
         };
@@ -1039,6 +1071,8 @@ mod tests {
     fn object_shape_reader_reduces_each_parameter_value_to_its_bounded_shape() {
         let name = Object::Name(b"FlateDecode".to_vec());
         let dictionary = params(&[
+            // getIntValueAsInt saturates at both ends, so pin both.
+            ("Colors", Object::Integer(i64::from(i32::MIN) - 10)),
             ("Columns", Object::Integer(i64::from(i32::MAX) + 10)),
             ("Name", Object::Name(b"Identity".to_vec())),
             ("Whatever", Object::Null),
@@ -1049,6 +1083,7 @@ mod tests {
         assert_eq!(
             specs[0].decode_params.entries().to_vec(),
             vec![
+                (b"Colors".to_vec(), ParamValue::Int(i32::MIN)),
                 (b"Columns".to_vec(), ParamValue::Int(i32::MAX)),
                 (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
                 (b"Whatever".to_vec(), ParamValue::Other),

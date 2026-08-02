@@ -365,8 +365,8 @@ where
     for (stage_index, mut stage) in prepared.into_iter().enumerate() {
         let is_last_stage = stage_index + 1 == stage_count;
         let next = match &mut stage.stage {
-            PreparedStage::Crypt { decode_params } => {
-                let bridged = decode_params_to_object(decode_params);
+            PreparedStage::Crypt => {
+                let bridged = decode_params_to_object(&stage.spec.decode_params);
                 let data = decrypt_crypt(bridged.as_ref(), decoded.as_ref())?;
                 append_final_crypt_events(
                     is_last_stage,
@@ -505,9 +505,9 @@ where
 /// Every name flpdf decodes resolves to a registered `StreamFilter`;
 /// `Crypt` is the one stage the caller decrypts instead.
 enum PreparedStage {
-    Crypt {
-        decode_params: DecodeParams,
-    },
+    /// The stage's `/DecodeParms` stay on `PreparedDecodeFilter::spec`, where
+    /// the crypt provider reads them.
+    Crypt,
     Codec {
         adapter: Box<dyn crate::stream_filter::StreamFilter>,
     },
@@ -525,10 +525,10 @@ fn prepare_decode_filters(
     for spec in specs {
         let filter_name = spec.normalized_name();
         if filter_name == b"Crypt" {
-            let stage = PreparedStage::Crypt {
-                decode_params: spec.decode_params.clone(),
-            };
-            prepared.push(PreparedDecodeFilter { spec, stage });
+            prepared.push(PreparedDecodeFilter {
+                spec,
+                stage: PreparedStage::Crypt,
+            });
             continue;
         }
 
@@ -2726,6 +2726,34 @@ mod tests {
             &outcome.events[..],
             [StreamDecodeEvent::Data(data)] if data == b"decrypted"
         ));
+    }
+
+    /// Plan decision D2: a Crypt provider selects its crypt filter from
+    /// `/DecodeParms /Name`, so a name must survive the neutral spec as a name
+    /// rather than collapsing into the `ParamValue::Other` stand-in.
+    #[test]
+    fn crypt_stage_receives_the_name_parameter_a_provider_selects_on() {
+        let filter = Object::Name(b"Crypt".to_vec());
+        let mut parms = Dictionary::new();
+        parms.insert("Name", Object::Name(b"Identity".to_vec()));
+        let parms = Object::Dictionary(parms);
+        let mut seen = None;
+        let mut decrypt = |params: Option<&Object>, data: &[u8]| {
+            seen = params.cloned();
+            Ok(data.to_vec())
+        };
+
+        decode_stream_data_with_filters_and_crypt(
+            Some(&filter),
+            Some(&parms),
+            b"payload",
+            DecodeLimits::default(),
+            DataEventMode::Record,
+            &mut decrypt,
+        )
+        .unwrap();
+
+        assert_eq!(seen, Some(parms));
     }
 
     #[test]
