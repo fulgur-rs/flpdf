@@ -672,7 +672,12 @@ fn decode_codec_prefix(
     let filter_name = spec.normalized_name();
     let mut adapter =
         stream_filter_for(filter_name).expect("a prepared codec has a registered prefix decoder");
-    debug_assert!(adapter.set_decode_params(decode_params_to_object(&spec.decode_params).as_ref()));
+    // `debug_assert!` evaluates its expression only when debug assertions are
+    // on, so applying the parameters *inside* the assertion silently skipped
+    // the predictor in release builds and produced a different prefix length,
+    // a different event boundary, and ultimately a different public error.
+    let applied = adapter.set_decode_params(decode_params_to_object(&spec.decode_params).as_ref());
+    debug_assert!(applied);
     adapter
         .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
         .expect("preflighted codec prefix pipeline is infallible")
@@ -783,6 +788,7 @@ fn apply_single_filter_encode(
 mod tests {
     use super::*;
     use crate::pipeline::lzw::pack_codes;
+    use crate::stream_filter::ParamValue;
 
     #[test]
     fn decode_limits_default_to_unbounded_output_and_sixteen_filters() {
@@ -1101,6 +1107,29 @@ mod tests {
                 && warning.code == -5
                 && data == b"A\0"
         ));
+    }
+
+    /// flpdf-4rfl: the prefix probe must apply `/DecodeParms` in every build
+    /// profile. Applying them inside `debug_assert!` skipped the call whenever
+    /// debug assertions were off, so the probe decoded with default geometry,
+    /// `PendingDataBoundary` landed elsewhere, and `decode_stream_data`
+    /// returned a different error in release than in debug.
+    #[test]
+    fn codec_prefix_probe_applies_decode_params_in_every_build_profile() {
+        let spec = crate::stream_filter::FilterSpec {
+            name: b"FlateDecode".to_vec(),
+            decode_params: DecodeParams::Present(vec![
+                (b"Predictor".to_vec(), ParamValue::Int(12)),
+                (b"Columns".to_vec(), ParamValue::Int(4)),
+            ]),
+        };
+        // One Up-filtered PNG row: without the predictor the probe emits the
+        // five encoded bytes instead of the four predicted ones.
+        let encoded = encode_flate(&[2, 0x01, 0x02, 0x03, 0x04]).unwrap();
+
+        let outcome = decode_codec_prefix(&spec, &encoded, DecodeLimits::default());
+
+        assert_eq!(outcome.data, [0x01, 0x02, 0x03, 0x04]);
     }
 
     #[test]
