@@ -1347,7 +1347,8 @@ fn insert_with_non_dict_names_terminal_allocates_fresh_dict() {
 #[test]
 fn helper_reads_named_filespecs_as_handles() {
     let mut pdf = open(build_single_level_pdf());
-    let files = EmbeddedFileDocumentHelper::new(&mut pdf)
+    let files = pdf
+        .embedded_files()
         .get_embedded_files()
         .expect("list handles");
 
