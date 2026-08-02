@@ -211,14 +211,17 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 "expected an /EmbeddedFile stream object".to_string(),
             ));
         };
-        let Object::Dictionary(dictionary) = stream_dict.materialize() else {
-            return Err(Error::Unsupported(
-                "embedded-file stream has a non-dictionary stream dictionary".to_string(),
-            ));
-        };
-        let data = self.stream.as_stream_data().ok_or_else(|| {
-            Error::Unsupported("expected an /EmbeddedFile stream object".to_string())
-        })?;
+        // `as_stream_dict` and `as_stream_data` are paired ObjectHandle
+        // projections: a stream dictionary is always a dictionary and comes
+        // from the same stream value that owns the payload.
+        let dictionary = stream_dict
+            .materialize()
+            .into_dict()
+            .expect("stream dictionary handle must materialize as a dictionary");
+        let data = self
+            .stream
+            .as_stream_data()
+            .expect("stream dictionary handle must have stream data");
         decode_stream_data(&dictionary, &data)
     }
 
@@ -466,9 +469,10 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let Some(dictionary) = self.filespec_dict()? else {
             return Ok(None);
         };
-        let Object::Dictionary(dict) = dictionary.materialize() else {
-            return Ok(None);
-        };
+        let dict = dictionary
+            .materialize()
+            .into_dict()
+            .expect("dictionary handle must materialize as a dictionary");
         Ok(Some(dict))
     }
 
