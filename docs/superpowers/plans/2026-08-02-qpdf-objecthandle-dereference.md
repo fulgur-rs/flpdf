@@ -4,7 +4,7 @@
 
 **Goal:** Make `ObjectHandle` resolve its canonical indirect slot through its document-owned resolver, matching qpdf 11.9.0, without retaining a raw-`Object` or `ref_chain` bridge.
 
-**Architecture:** `Pdf` moves its document state behind one `Rc<RefCell<PdfCore<R>>>`; a sealed resolver object retains only a weak link to that state. Each indirect `ObjectHandle` stores a weak resolver link, so its fallible `try_*` accessors dereference the same canonical slot in place. Existing APIs remain untouched during the primitive cutover; the first consumer receives a new handle-native route and the old route is deleted only after its caller is redirected.
+**Architecture:** `Pdf` keeps its legacy raw-object fields untouched while callers remain, but wraps its input in a cloneable `SharedInput<R>` and owns a separate qpdf-native resolver/cache that never converts from the legacy cache. Each indirect `ObjectHandle` stores a weak resolver link, so its fallible `try_*` accessors dereference the same canonical slot in place. The first consumer receives a new handle-native route; concrete replacements are then deprecated and the old route is deleted only after its caller is redirected.
 
 **Tech Stack:** Rust stable, `Rc`/`Weak`/`RefCell`, pinned qpdf 11.9.0 source, C++ qpdf oracle probe, Cargo tests and llvm-cov.
 
@@ -167,7 +167,7 @@
   git commit -m "feat: add objecthandle dereference primitive"
   ```
 
-### Task 3: Make document state the resolver owner and register canonical slots
+### Task 3: Add the qpdf-native resolver state beside the untouched legacy route
 
 **Files:**
 
@@ -183,7 +183,7 @@
   #[test]
   fn handle_accessor_lazily_resolves_catalog_and_preserves_holder_identity() {
       let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).unwrap();
-      let root = pdf.get_object_handle(pdf.root_ref().unwrap());
+      let root = pdf.get_object(pdf.root_ref().unwrap());
       assert!(root.is_indirect());
       assert!(!root.is_resolved());
       assert!(root.try_has_key(b"Pages").unwrap());
@@ -207,43 +207,44 @@
 
   Expected: FAIL because handles returned from `Pdf` have no resolver link.
 
-- [ ] **Step 3: Extract `PdfCore<R>` without changing the public `Pdf<R>` API**
+- [ ] **Step 3: Share only the input and add an independent resolver state**
 
-  Move every current document-state field from `Pdf<R>` into private
-  `PdfCore<R>`: `reader`, header/version/trailer/xref fields, diagnostics,
-  cache, handle registry, both legacy memo fields, object-stream metadata,
-  resolution bounds, source-xref snapshots, dirty/recovery/encryption state,
-  and `ever_called_get_all_pages`. Make `Pdf<R>` hold
-  `Rc<RefCell<PdfCore<R>>>` only. Construct it in `open_with_repair_mode` and
-  retain all existing public method signatures by borrowing the core inside
-  their existing bodies.
+  Add `SharedInput<R>(Rc<RefCell<R>>)` with `Clone`, `Read`, and `Seek`
+  implementations. Change `Pdf.reader` from `R` to `SharedInput<R>` and wrap
+  the input once in `open_with_repair_mode`; existing reader method bodies and
+  every legacy cache field remain unchanged.
 
-  Add `ReaderResolver<R> { core: Weak<RefCell<PdfCore<R>>> }`, implement
-  `DocumentResolver` for it, and move the existing private body of
-  `resolve_object_handle` into `ReaderResolver::resolve_indirect`. The resolver
-  reads/parses/decrypts through `PdfCore`, then calls `handle.set_resolved` or
-  `handle.set_missing` on the exact handle passed by `try_dereference`.
+  Add `QpdfResolver<R>` containing a cloned `SharedInput<R>`, the source xref
+  snapshot, canonical handle registry, in-progress-resolution set, and only
+  the parser/decryption metadata needed to produce `ObjectValue` directly.
+  Implement `DocumentResolver` for it. `resolve_indirect` must parse directly
+  into the supplied handle and may not call `resolve_to_cache`,
+  `resolve_object_handle`, `resolve_borrowed`, `ObjectHandle::materialize`, or
+  any raw-`Object` conversion.
+
+  Add `Pdf::get_object(ObjectRef) -> ObjectHandle` as the only entry into this
+  registry. Do not modify or call the existing `get_object_handle`; it remains
+  marked for deletion until its legacy callers migrate.
 
 - [ ] **Step 4: Register the resolver when creating an indirect handle**
 
-  Change only the new canonical constructor path so
-  `Pdf::get_object_handle` creates:
+  Implement the new canonical constructor path so `Pdf::get_object` creates:
 
   ```rust
   ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET, Rc::downgrade(&resolver))
   ```
 
-  The resolver itself must be held strongly by `PdfCore`; the handle stores
-  only the weak link. Preserve the existing cache key and `ObjectRef`; do not
+  The resolver itself must be held strongly by `Pdf`; the handle stores only
+  the weak link. Preserve the existing cache key and `ObjectRef`; do not
   materialize an `Object` to construct the handle.
 
 - [ ] **Step 5: Preserve qpdf teardown and run GREEN**
 
-  In `Drop for PdfCore<R>`, first clear resolver reachability, then disconnect
-  every canonical indirect handle. Keep the existing `Pdf` drop behavior only
-  as the call into its core. Add a test retaining a resolved `/Pages` handle
-  after `Pdf` drops: `try_dereference` must not access the former reader, and
-  the handle must remain `Destroyed`.
+  In `Drop for Pdf<R>`, disconnect every canonical indirect handle before the
+  strong resolver owner is dropped, matching qpdf teardown. Add a test
+  retaining a resolved `/Pages` handle after `Pdf` drops:
+  `try_dereference` must not access the former reader, and the handle must
+  remain `Destroyed`.
 
   Run:
 

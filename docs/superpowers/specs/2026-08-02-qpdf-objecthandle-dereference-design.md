@@ -56,16 +56,23 @@ xref state, cache, diagnostics, and canonical-slot registry. The handle never
 owns `Pdf`, never becomes generic over `R`, and cannot resolve a foreign or
 dropped document.
 
-To express qpdf's object-to-document call safely, the reader/cache state moves
-behind a document-owned `Rc<RefCell<PdfCore<R>>>`. A sealed
-`DocumentResolver` implementation holds a `Weak` link to that core. It is
-created after the core and registered into each canonical indirect slot.
+To express qpdf's object-to-document call safely without preserving the legacy
+raw-object API as a design constraint, `Pdf` gains a new document-owned
+resolver state. The input is wrapped in a cloneable `SharedInput<R>` whose
+`Read`/`Seek` implementations borrow the same reader only for the duration of
+each operation. Existing methods keep their current signatures and raw-object
+cache while they still have callers; the new resolver owns only the canonical
+handle cache and the metadata required to parse into `ObjectValue` directly.
+A sealed `DocumentResolver` implementation holds a `Weak` link to that new
+state and is registered into each canonical indirect slot.
 `ObjectHandle::try_dereference` upgrades the link and asks the resolver to
 resolve that slot's `ObjectRef`; the resolver updates that *same* slot. Borrows
 are released before resolver entry, preventing `RefCell` re-entrancy.
 
-This is a Rust representation change, not a new semantic layer: it is the
-safe equivalent of qpdf's non-owning `QPDF*` stored by `QPDFObject`.
+This is a Rust representation change, not a bridge between object models: the
+new resolver never reads `legacy_materialized_memo`, calls
+`resolve_borrowed`, or converts `Object` into `ObjectValue`. It is the safe
+equivalent of qpdf's non-owning `QPDF*` stored by `QPDFObject`.
 
 ## Public and crate-private API
 
@@ -82,14 +89,21 @@ impl ObjectHandle {
 }
 ```
 
+`Pdf::get_object(ObjectRef) -> ObjectHandle` is the new qpdf-shaped canonical
+lookup. It creates or returns the resolver-owned slot without resolving it.
+The existing `get_object_handle` remains on the marked legacy route until its
+callers migrate; the two methods never exchange or convert cached values.
+
 The exact typed views are selected by the RED tests, but each `try_*` accessor
 must call the one dereference primitive before it examines the slot. A direct
 handle is a no-op. A missing indirect object becomes the canonical null slot;
 a destroyed object cannot reconnect to a document.
 
-Existing non-fallible accessors and `Pdf::resolve_object_handle*` are not
-modified into wrappers. They are left as legacy routes while complete qpdf
-components are migrated to the new API, then removed at zero call sites.
+Existing non-fallible accessors, `Pdf::resolve_object_handle*`, `resolve`, and
+`resolve_borrowed` are not modified into wrappers. They are marked with
+`qpdf-cutover-delete(flpdf-25kg.3.3)`, left as legacy routes while complete
+qpdf components migrate to the new API, deprecated once a concrete replacement
+exists, and removed at zero call sites.
 
 ## Explicit prohibitions
 
