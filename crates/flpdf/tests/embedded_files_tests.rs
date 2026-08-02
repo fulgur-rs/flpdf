@@ -1826,6 +1826,39 @@ fn helper_persists_direct_kid_repair_before_next_error() {
 }
 
 #[test]
+fn helper_lookup_persists_direct_kid_repair_before_find_error() {
+    let mut pdf = open(build_direct_kid_with_broken_names_reference_pdf());
+
+    assert!(pdf.embedded_files().get_embedded_file(b"missing").is_err());
+
+    let names = embedded_names_dict(&mut pdf);
+    let root = names
+        .get("EmbeddedFiles")
+        .and_then(Object::as_dict)
+        .expect("direct root");
+    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
+    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+}
+
+#[test]
+fn helper_remove_persists_direct_kid_repair_before_find_error() {
+    let mut pdf = open(build_direct_kid_with_broken_names_reference_pdf());
+
+    assert!(pdf
+        .embedded_files()
+        .remove_embedded_file(b"missing")
+        .is_err());
+
+    let names = embedded_names_dict(&mut pdf);
+    let root = names
+        .get("EmbeddedFiles")
+        .and_then(Object::as_dict)
+        .expect("direct root");
+    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
+    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+}
+
+#[test]
 fn helper_remove_missing_persists_direct_kid_repair() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"kid.txt");

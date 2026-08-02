@@ -254,6 +254,7 @@ pub(crate) struct NNTree<K: TreeKey> {
     auto_repair: bool,
     split_threshold: usize,
     max_depth: Option<usize>,
+    repair_allocator: ObjectAllocator,
     marker: PhantomData<K>,
 }
 
@@ -921,6 +922,7 @@ impl<K: TreeKey> NNTree<K> {
             auto_repair,
             split_threshold: DEFAULT_SPLIT_THRESHOLD,
             max_depth: None,
+            repair_allocator: ObjectAllocator::default(),
             marker: PhantomData,
         }
     }
@@ -943,6 +945,7 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        self.repair_allocator = ObjectAllocator::default();
         let mut cursor = NNTreeCursor::empty();
         let root = self.root_handle(pdf)?;
         self.descend(pdf, &mut cursor, root, true, true)?;
@@ -954,6 +957,7 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        self.repair_allocator = ObjectAllocator::default();
         let mut cursor = NNTreeCursor::empty();
         let root = self.root_handle(pdf)?;
         self.descend(pdf, &mut cursor, root, false, true)?;
@@ -982,6 +986,7 @@ impl<K: TreeKey> NNTree<K> {
         key: &K::Key,
         return_previous_if_missing: bool,
     ) -> Result<NNTreeCursor<K>> {
+        self.repair_allocator = ObjectAllocator::default();
         match self.find_internal(pdf, key, return_previous_if_missing) {
             Ok(cursor) => Ok(cursor),
             Err(Error::Parse { message, .. }) if self.auto_repair => {
@@ -2090,8 +2095,7 @@ impl<K: TreeKey> NNTree<K> {
                 parent,
                 format!("converting kid number {kid_number} to an indirect object"),
             );
-            let mut allocator = ObjectAllocator::default();
-            let object_ref = make_indirect(pdf, &mut allocator, kid_object)?;
+            let object_ref = make_indirect(pdf, &mut self.repair_allocator, kid_object)?;
             let mut dictionary = self.load_node(pdf, parent)?;
             // cov:ignore-start: prepare_kid receives kid_object from this same parent Kids array
             let Some(mut kids) = resolved_array(pdf, dictionary.get("Kids"))? else {

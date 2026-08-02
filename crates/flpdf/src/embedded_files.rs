@@ -275,6 +275,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         }
         self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
         let mut result = BTreeMap::new();
+        let mut direct_pairs: BTreeMap<Vec<usize>, ObjectHandle> = BTreeMap::new();
         for (key, value, direct_path) in entries {
             let handle = match value {
                 Object::Reference(_) => self.pdf.lift_object_to_handle(&value)?,
@@ -286,14 +287,32 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                         ));
                     };
                     // cov:ignore-end
-                    // cov:ignore-start: exclusive helper borrow prevents the live lookup from losing this cursor position
-                    self.live_embedded_file(&path, item_number)?
+                    let pairs = match direct_pairs.get(&path) {
+                        Some(pairs) => pairs.clone(),
+                        None => {
+                            let Some((pairs, _)) =
+                                self.live_embedded_file_slot(&path, item_number)?
+                            else {
+                                // cov:ignore-start: selected cursor path remains live under this exclusive helper borrow
+                                return Err(Error::Unsupported(
+                                    "embedded-files tree changed during enumeration".to_string(),
+                                ));
+                                // cov:ignore-end
+                            };
+                            direct_pairs.insert(path, pairs.clone());
+                            pairs
+                        }
+                    };
+                    pairs
+                        .as_array()
+                        .and_then(|pairs| pairs.get(item_number + 1).cloned())
                         .ok_or_else(|| {
+                            // cov:ignore-start: cached live pairs were validated at this selected slot
                             Error::Unsupported(
                                 "embedded-files tree changed during enumeration".to_string(),
                             )
-                        })?
-                    // cov:ignore-end
+                            // cov:ignore-end
+                        })? // cov:ignore: LLVM assigns an uncovered region to this covered defensive-error terminator
                 }
             };
             result.insert(key, handle);
@@ -307,7 +326,13 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             return Ok(None);
         };
         let original_root = tree.root().clone();
-        let cursor = tree.find(self.pdf, key, false)?;
+        let cursor = match tree.find(self.pdf, key, false) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
+                return Err(error);
+            }
+        };
         let value = cursor.current().map(|(_, value)| value.clone());
         let direct_path = cursor.selected_path();
         self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
@@ -378,7 +403,14 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.name_tree()? else {
             return Ok(false);
         };
-        let removed = tree.find_object(self.pdf, key)?;
+        let original_root = tree.root().clone();
+        let removed = match tree.find_object(self.pdf, key) {
+            Ok(removed) => removed,
+            Err(error) => {
+                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
+                return Err(error);
+            }
+        };
         self.store_embedded_files_root(tree.into_root())?;
         // cov:ignore-start: the exercised missing-key return is attributed to find_object
         let Some(removed) = removed else {
