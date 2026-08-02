@@ -719,3 +719,24 @@ fn generate_appearance_dispatches_only_text_and_choice_fields() {
         None
     );
 }
+
+#[test]
+fn consumer_clear_need_appearances_uses_the_form_field_helper_boundary() {
+    let bytes = doc_with_acroform(vec![
+        (
+            10,
+            "<< /FT /Tx /V (value) /Rect [0 0 100 20] /DA (/Helv 12 Tf 0 g) >>".into(),
+        ),
+        (20, "<< /NeedAppearances true >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf)
+        .expect("clear generated-appearance marker");
+
+    let acroform = pdf.resolve(ObjectRef::new(20, 0)).expect("AcroForm");
+    let Object::Dictionary(acroform) = acroform else {
+        panic!("AcroForm must be a dictionary");
+    };
+    assert_eq!(acroform.get(b"NeedAppearances".as_slice()), None);
+}

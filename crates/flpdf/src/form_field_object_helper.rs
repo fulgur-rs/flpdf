@@ -4,9 +4,13 @@
 //! attributes. This intentionally covers only the object-helper read boundary.
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
+
+#[path = "form_field_object_helper/rendering.rs"]
+mod rendering;
 
 /// Typed read-only accessor helper for a PDF AcroForm field or widget
 /// annotation dictionary.
@@ -95,6 +99,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Return the inheritable `/V` field value.
     pub fn field_value(&mut self) -> Result<Option<Object>> {
         self.resolve_inherited_object(b"V")
+    }
+
+    /// Return the indirect object reference used by the inherited `/V`, when
+    /// the selected value is indirect. This preserves the signature
+    /// inspector's observable reference reporting without giving consumers a
+    /// second parent-chain walker.
+    pub fn field_value_reference(&mut self) -> Result<Option<ObjectRef>> {
+        Ok(match self.resolve_inherited_raw(b"V")? {
+            Some(Object::Reference(reference)) => Some(reference),
+            _ => None,
+        })
     }
 
     /// Return the inheritable `/DV` field default value.
@@ -367,14 +382,57 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// `QPDFFormFieldObjectHelper::generateAppearance` dispatch.
     pub fn generate_appearance(&mut self) -> Result<Option<ObjectRef>> {
         match self.field_type()?.as_deref() {
-            Some(b"/Tx") => {
-                crate::appearance::generate_text_field_appearance(self.pdf, self.field_ref)
-            }
-            Some(b"/Ch") => {
-                crate::appearance::generate_choice_field_appearance(self.pdf, self.field_ref)
-            }
+            Some(b"/Tx") => rendering::render_text_field(self.pdf, self.field_ref),
+            Some(b"/Ch") => rendering::render_choice_field(self.pdf, self.field_ref),
             _ => Ok(None),
         }
+    }
+
+    /// Generate an appearance for a button widget used by the document-level
+    /// appearance pass.
+    ///
+    /// This is deliberately separate from [`Self::generate_appearance`]:
+    /// qpdf's public `generateAppearance` dispatches only text and choice
+    /// fields, while the CLI's existing document pass also preserves its
+    /// button-widget rendering.
+    pub fn generate_button_appearance(&mut self) -> Result<Option<ObjectRef>> {
+        rendering::render_button_field(self.pdf, self.field_ref)
+    }
+
+    /// Clear `/AcroForm/NeedAppearances` after a document appearance pass.
+    ///
+    /// As in qpdf, absent, indirect-non-dictionary, and non-true values are
+    /// left untouched. The operation lives with the form-field helper so
+    /// callers do not duplicate AcroForm ownership traversal.
+    pub fn clear_need_appearances_after_generation(pdf: &mut Pdf<R>) -> Result<()> {
+        let Some(root_ref) = pdf.root_ref() else {
+            return Ok(());
+        };
+        let Object::Dictionary(mut root) = pdf.resolve(root_ref)? else {
+            return Ok(());
+        };
+        let Some(acroform) = root.get("AcroForm").cloned() else {
+            return Ok(());
+        };
+        let (acroform, terminal_ref) = resolve_ref_chain(pdf, &acroform)?;
+        let Object::Dictionary(mut acroform) = acroform else {
+            return Ok(());
+        };
+        let Some(need_appearances) = acroform.get("NeedAppearances").cloned() else {
+            return Ok(());
+        };
+        let (need_appearances, _) = resolve_ref_chain(pdf, &need_appearances)?;
+        if !matches!(need_appearances, Object::Boolean(true)) {
+            return Ok(());
+        }
+        acroform.remove("NeedAppearances");
+        if let Some(acroform_ref) = terminal_ref {
+            pdf.set_object(acroform_ref, Object::Dictionary(acroform));
+        } else {
+            root.insert("AcroForm", Object::Dictionary(acroform));
+            pdf.set_object(root_ref, Object::Dictionary(root));
+        }
+        Ok(())
     }
 
     fn field_dict(&mut self) -> Result<Dictionary> {
@@ -403,10 +461,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             Object::Reference(reference) => Some(reference),
             _ => None,
         };
-        let acroform = match acroform {
-            Object::Reference(reference) => self.pdf.resolve(reference)?,
-            value => value,
-        };
+        let acroform = resolve_ref_chain(self.pdf, &acroform)?.0;
         let Some(mut acroform) = acroform.as_dict().cloned() else {
             return Ok(());
         };
@@ -779,17 +834,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         else {
             return Ok(None);
         };
-        let acroform = match acroform {
-            Object::Reference(reference) => self.pdf.resolve(reference)?,
-            value => value,
-        };
+        let acroform = resolve_ref_chain(self.pdf, &acroform)?.0;
         let Some(value) = acroform.as_dict().and_then(|dict| dict.get(key)).cloned() else {
             return Ok(None);
         };
-        let value = match value {
-            Object::Reference(reference) => self.pdf.resolve(reference)?,
-            value => value,
-        };
+        let value = resolve_ref_chain(self.pdf, &value)?.0;
         Ok((!matches!(value, Object::Null)).then_some(value))
     }
 
@@ -884,6 +933,45 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                         resolved => return Ok(Some(resolved)),
                     },
                     other => return Ok(Some(other)),
+                }
+            }
+            match parent_ref {
+                Some(parent) => {
+                    current = parent;
+                    depth += 1;
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn resolve_inherited_raw(&mut self, key: &[u8]) -> Result<Option<Object>> {
+        let mut seen = BTreeSet::new();
+        let mut current = self.field_ref;
+        let mut depth = 0;
+        loop {
+            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
+                return Err(Error::Unsupported(format!(
+                    "field tree depth exceeds maximum of {} at {}",
+                    DEFAULT_MAX_PAGE_TREE_DEPTH, current
+                )));
+            }
+            if !seen.insert(current) {
+                return Ok(None);
+            }
+            let node_obj = self.pdf.resolve_borrowed(current)?;
+            let Some(dict) = node_obj.as_dict() else {
+                return Ok(None);
+            };
+            let found = dict.get(key).cloned();
+            let parent_ref = match dict.get("Parent") {
+                Some(Object::Reference(reference)) => Some(*reference),
+                _ => None,
+            };
+            let _ = node_obj;
+            if let Some(value) = found {
+                if !matches!(value, Object::Null) {
+                    return Ok(Some(value));
                 }
             }
             match parent_ref {

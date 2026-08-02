@@ -13,8 +13,7 @@ use flpdf::{
 };
 use flpdf::{
     check_reader_with_options_and_limits, enumerate_document_annotations, filters,
-    flatten_rotation_on_pages, fonts, generate_button_field_appearance,
-    generate_choice_field_appearance, generate_text_field_appearance,
+    flatten_rotation_on_pages, fonts,
     json_inspect::{
         write_qpdf_json_v2_selected_objects_to_output_with_options, DecodeLevel, JsonKey,
         JsonObjectSelector, JsonOutput, StreamDataMode as JsonStreamDataMode,
@@ -3376,14 +3375,11 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             helper.field_type()?
         };
         match field_type.as_deref() {
-            Some(b"Tx") => {
-                generate_text_field_appearance(pdf, widget_ref)?;
+            Some(b"/Tx") | Some(b"/Ch") => {
+                FormFieldObjectHelper::new(widget_ref, pdf).generate_appearance()?;
             }
-            Some(b"Btn") => {
-                generate_button_field_appearance(pdf, widget_ref)?;
-            }
-            Some(b"Ch") => {
-                generate_choice_field_appearance(pdf, widget_ref)?;
+            Some(b"/Btn") => {
+                FormFieldObjectHelper::new(widget_ref, pdf).generate_button_appearance()?;
             }
             _ => {}
         }
@@ -3396,33 +3392,7 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
 /// Keep an absent or already-false key unchanged, so the explicit CLI pass
 /// does not introduce a catalog mutation when qpdf would have returned early.
 fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(());
-    };
-    let Object::Dictionary(mut root) = pdf.resolve(root_ref)? else {
-        return Ok(());
-    };
-    let Some(acroform) = root.get("AcroForm").cloned() else {
-        return Ok(());
-    };
-    let (acroform, terminal_ref) = resolve_reference_chain(pdf, acroform)?;
-    let Object::Dictionary(mut acroform) = acroform else {
-        return Ok(());
-    };
-    let Some(need_appearances) = acroform.get("NeedAppearances").cloned() else {
-        return Ok(());
-    };
-    let (need_appearances, _) = resolve_reference_chain(pdf, need_appearances)?;
-    if !matches!(need_appearances, Object::Boolean(true)) {
-        return Ok(());
-    }
-    acroform.remove("NeedAppearances");
-    if let Some(acroform_ref) = terminal_ref {
-        pdf.set_object(acroform_ref, Object::Dictionary(acroform));
-    } else {
-        root.insert("AcroForm", Object::Dictionary(acroform));
-        pdf.set_object(root_ref, Object::Dictionary(root));
-    }
+    FormFieldObjectHelper::clear_need_appearances_after_generation(pdf)?;
     Ok(())
 }
 

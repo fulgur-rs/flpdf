@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFFormFieldObjectHelper.cc appearance generation shared with annotation helpers.
+//! qpdf correspondence: `QPDFFormFieldObjectHelper.cc` rendering primitives.
 //! Appearance-stream generators for AcroForm widgets.
 //!
 //! This module builds the `/AP/N` (normal-appearance) Form XObject for
@@ -28,14 +28,13 @@
 //!   These are best-effort decorations; callers that require them should
 //!   generate the appearance themselves.
 
-use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 use crate::default_appearance::{parse_default_appearance, TextColor};
+use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json_inspect::decode_pdf_text_string;
 use crate::object::write_literal_string;
 use crate::page_object_helper::PageBox;
-use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::ref_chain::resolve_ref_chain;
 use crate::standard_font_metrics::StandardFont;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
@@ -261,18 +260,18 @@ pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8>
 ///
 /// This is an internal renderer. Public callers use
 /// [`crate::FormFieldObjectHelper::generate_appearance`] instead.
-pub(crate) fn generate_text_field_appearance<R: Read + Seek>(
+pub(crate) fn render_text_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     // ── 1. Verify /FT is Tx ────────────────────────────────────────────────
-    let ft = resolve_inherited_name(pdf, widget_ref, b"FT")?;
+    let ft = field_name(pdf, widget_ref, b"FT")?;
     if ft.as_deref() != Some(b"Tx") {
         return Ok(None);
     }
 
     // ── 2. /V — field value ────────────────────────────────────────────────
-    let raw_value = resolve_inherited_object(pdf, widget_ref, b"V")?;
+    let raw_value = field_object(pdf, widget_ref, b"V")?;
     let value_bytes: Option<Vec<u8>> = match raw_value {
         None => None,
         Some(Object::String(bytes)) => decode_pdf_text_string(&bytes)
@@ -319,14 +318,13 @@ pub(crate) fn generate_text_field_appearance<R: Read + Seek>(
     let da = parse_default_appearance(da_bytes.as_deref().unwrap_or(b""));
 
     // ── 5. /Q — quadding (0 = left, 1 = centre, 2 = right) ───────────────
-    let quadding = resolve_inherited_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
+    let quadding = field_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
 
     // ── 6. /Ff — field flags (bit 13 = multiline, 0-indexed) ─────────────
     // A negative or out-of-range /Ff is malformed; treat it as "no flags". A
     // bare `as u32` would wrap a negative value to a large unsigned int and
     // could spuriously set the multiline bit (review pattern #3).
-    let ff =
-        u32::try_from(resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
+    let ff = u32::try_from(field_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
     let multiline = (ff >> 12) & 1 != 0; // bit 13 (1-indexed) = bit 12 (0-indexed)
 
     // ── 7. Font resolution — DA font name → standard font ─────────────────
@@ -422,12 +420,12 @@ pub(crate) fn generate_text_field_appearance<R: Read + Seek>(
 ///
 /// This internal renderer is not a public form-field entry point.
 #[allow(dead_code)] // qpdf's public helper intentionally dispatches only /Tx and /Ch.
-pub(crate) fn generate_button_field_appearance<R: Read + Seek>(
+pub(crate) fn render_button_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     // ── 1. /FT must be Btn ────────────────────────────────────────────────
-    let ft = resolve_inherited_name(pdf, widget_ref, b"FT")?;
+    let ft = field_name(pdf, widget_ref, b"FT")?;
     if ft.as_deref() != Some(b"Btn") {
         return Ok(None);
     }
@@ -437,8 +435,7 @@ pub(crate) fn generate_button_field_appearance<R: Read + Seek>(
     // Testing bits on a raw i64 would let `/Ff -1` (all bits set) read as both
     // pushbutton and radio, mis-classifying a broken field instead of falling
     // back to the safe checkbox path (review pattern #3).
-    let ff =
-        u32::try_from(resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
+    let ff = u32::try_from(field_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
     let is_pushbutton = ff & 0x10000 != 0; // bit 17 (1-indexed)
     let is_radio = !is_pushbutton && ff & 0x8000 != 0; // bit 16
 
@@ -881,273 +878,43 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     Ok(ObjectRef::new(n, 0))
 }
 
-/// Walk the `/Parent` chain looking for a `Name` value for `key`.
-fn resolve_inherited_name<R: Read + Seek>(
+/// Read an inheritable name through the form-field helper boundary.
+fn field_name<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = start;
-    let mut depth: usize = 0;
-
-    loop {
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "field tree depth exceeds maximum of {} at {}",
-                DEFAULT_MAX_PAGE_TREE_DEPTH, current
-            )));
-        }
-        if !seen.insert(current) {
-            return Ok(None);
-        }
-
-        let node_obj = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node_obj.as_dict() else {
-            return Err(Error::Unsupported(format!(
-                "field tree node {current} is not a dictionary"
-            )));
-        };
-
-        let val = dict.get(key).cloned();
-        let parent_val = dict.get("Parent").cloned();
-        // The two `.cloned()` calls above copy what we need; the `node_obj`
-        // borrow ends here so `pdf.resolve` can run below.
-        let _ = node_obj;
-
-        if let Some(val) = val {
-            // The value may itself be an indirect reference (review pattern #2);
-            // resolve it before matching the type, otherwise an indirect `/FT`
-            // would be missed and the field skipped.
-            let resolved = match val {
-                Object::Reference(r) => pdf.resolve(r)?,
-                other => other,
-            };
-            match resolved {
-                Object::Null => {}
-                Object::Name(bytes) => return Ok(Some(bytes)),
-                _ => {}
-            }
-        }
-
-        match parent_val {
-            Some(Object::Reference(r)) => {
-                current = r;
-                depth += 1;
-            }
-            _ => return Ok(None),
-        }
-    }
+    let value = FormFieldObjectHelper::new(start, pdf).inheritable_name(key)?;
+    Ok((!value.is_empty()).then(|| value[1..].to_vec()))
 }
 
-/// Walk the `/Parent` chain looking for an arbitrary `Object` value for `key`.
-fn resolve_inherited_object<R: Read + Seek>(
+/// Read an inheritable object through the form-field helper boundary.
+fn field_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
     key: &[u8],
 ) -> Result<Option<Object>> {
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = start;
-    let mut depth: usize = 0;
-
-    loop {
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "field tree depth exceeds maximum of {} at {}",
-                DEFAULT_MAX_PAGE_TREE_DEPTH, current
-            )));
-        }
-        if !seen.insert(current) {
-            return Ok(None);
-        }
-
-        let node_obj = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node_obj.as_dict() else {
-            return Err(Error::Unsupported(format!(
-                "field tree node {current} is not a dictionary"
-            )));
-        };
-
-        if let Some(val) = dict.get(key).cloned() {
-            match val {
-                Object::Null => {}
-                other => return Ok(Some(other)),
-            }
-        }
-
-        match dict.get("Parent").cloned() {
-            Some(Object::Reference(r)) => {
-                current = r;
-                depth += 1;
-            }
-            _ => return Ok(None),
-        }
-    }
+    FormFieldObjectHelper::new(start, pdf).inheritable_value(key)
 }
 
-/// Walk the `/Parent` chain looking for an `Integer` value for `key`.
-fn resolve_inherited_integer<R: Read + Seek>(
+/// Read an inheritable integer through the form-field helper boundary.
+fn field_integer<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
     key: &[u8],
 ) -> Result<Option<i64>> {
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = start;
-    let mut depth: usize = 0;
-
-    loop {
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "field tree depth exceeds maximum of {} at {}",
-                DEFAULT_MAX_PAGE_TREE_DEPTH, current
-            )));
-        }
-        if !seen.insert(current) {
-            return Ok(None);
-        }
-
-        let node_obj = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node_obj.as_dict() else {
-            return Err(Error::Unsupported(format!(
-                "field tree node {current} is not a dictionary"
-            )));
-        };
-
-        let val = dict.get(key).cloned();
-        let parent_val = dict.get("Parent").cloned();
-        // Values cloned above; release the `node_obj` borrow before `pdf.resolve`.
-        let _ = node_obj;
-
-        if let Some(val) = val {
-            // Inherited integer properties such as `/Ff` (field flags) or `/Q`
-            // (quadding) may be stored as indirect references (review pattern #2);
-            // resolve before matching so they are not missed (which would fall
-            // back to single-line / left-aligned defaults).
-            let resolved = match val {
-                Object::Reference(r) => pdf.resolve(r)?,
-                other => other,
-            };
-            match resolved {
-                Object::Null => {}
-                Object::Integer(n) => return Ok(Some(n)),
-                _ => {}
-            }
-        }
-
-        match parent_val {
-            Some(Object::Reference(r)) => {
-                current = r;
-                depth += 1;
-            }
-            _ => return Ok(None),
-        }
-    }
+    Ok(
+        match FormFieldObjectHelper::new(start, pdf).inheritable_value(key)? {
+            Some(Object::Integer(value)) => Some(value),
+            _ => None,
+        },
+    )
 }
 
-/// Look up `/DA` (default appearance string) by walking the `/Parent` chain
-/// first, then falling back to `/AcroForm/DA` at the document level.
-///
-/// Returns `None` when no `/DA` is found anywhere in the chain or in
-/// `/AcroForm`.
+/// Obtain `/DA` from the form-field helper.
 fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Option<Vec<u8>>> {
-    // Walk /Parent chain for /DA first.
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = start;
-    let mut depth: usize = 0;
-
-    loop {
-        // Malformed parent chains (over-deep, cyclic, non-dictionary node) are
-        // not fatal: stop walking, warn, and fall back to /AcroForm /DA — the
-        // same graceful degradation qpdf performs (it warns and continues rather
-        // than aborting on a broken field tree). The depth limit + `seen` set
-        // also bound traversal per review pattern #4 (DoS).
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-            pdf.push_warning(format!(
-                "/DA inheritance: parent chain exceeded max depth {DEFAULT_MAX_PAGE_TREE_DEPTH} at {current}; falling back to /AcroForm /DA"
-            ));
-            break;
-        }
-        if !seen.insert(current) {
-            pdf.push_warning(format!(
-                "/DA inheritance: cycle detected at {current}; falling back to /AcroForm /DA"
-            ));
-            break;
-        }
-
-        let node_obj = pdf.resolve_borrowed(current)?;
-        // Extract the values we need while the borrow is live, then drop it so
-        // `pdf` is free for `push_warning` / `resolve` below.
-        let extracted = node_obj
-            .as_dict()
-            .map(|dict| (dict.get("DA").cloned(), dict.get("Parent").cloned()));
-        let _ = node_obj;
-        let Some((da_val, parent_val)) = extracted else {
-            pdf.push_warning(format!(
-                "/DA inheritance: /Parent node {current} is not a dictionary; falling back to /AcroForm /DA"
-            ));
-            break;
-        };
-
-        if let Some(val) = da_val {
-            // /DA may itself be an indirect reference (rule #2 in review patterns).
-            let resolved_val = match val {
-                Object::Reference(r) => pdf.resolve(r)?,
-                other => other,
-            };
-            match resolved_val {
-                Object::Null => {}
-                Object::String(bytes) => return Ok(Some(bytes)),
-                _ => {}
-            }
-        }
-
-        match parent_val {
-            // No /Parent — reached the field-tree root. Normal termination, not
-            // an anomaly, so no warning.
-            Some(Object::Reference(r)) => {
-                current = r;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-
-    // Fallback: /AcroForm /DA at document root.
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(None);
-    };
-    let catalog_obj = pdf.resolve_borrowed(root_ref)?;
-    let Some(catalog) = catalog_obj.as_dict() else {
-        return Ok(None);
-    };
-    let acroform_val = catalog.get("AcroForm").cloned();
-
-    let acroform_dict: Option<Dictionary> = match acroform_val {
-        None | Some(Object::Null) => None,
-        Some(Object::Dictionary(d)) => Some(d),
-        // `/AcroForm` may be stored behind a holder chain; follow it to the
-        // terminal dict so the document-level `/DA` fallback is found.
-        Some(Object::Reference(r)) => resolve_ref_chain(pdf, &Object::Reference(r))?.0.into_dict(),
-        _ => None,
-    };
-
-    // /AcroForm /DA may also be an indirect reference.
-    let da_raw = acroform_dict.as_ref().and_then(|d| d.get("DA")).cloned();
-
-    let da = match da_raw {
-        None | Some(Object::Null) => None,
-        Some(Object::String(bytes)) => Some(bytes),
-        Some(Object::Reference(r)) => {
-            let resolved = pdf.resolve(r)?;
-            match resolved {
-                Object::String(bytes) => Some(bytes),
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-
-    Ok(da)
+    let appearance = FormFieldObjectHelper::new(start, pdf).default_appearance()?;
+    Ok((!appearance.is_empty()).then_some(appearance.into_bytes()))
 }
 
 /// Resolve a (possibly indirect) dictionary-valued entry to an owned
@@ -1168,82 +935,18 @@ fn resolve_to_dict<R: Read + Seek>(
     }
 }
 
-/// Resolve a `/DA` font resource name (e.g. `b"F1"`) to a [`StandardFont`] by
-/// consulting the `/DR` `/Font` resource dictionaries.
-///
-/// `/DA` references a font by the resource key it carries in `/DR` (the field's
-/// own `/DR`, walked up the `/Parent` chain, then the `/AcroForm` `/DR`). The
-/// referenced font's `/BaseFont` may name a standard-14 font even when the
-/// resource key itself (`F1`) is not a recognised alias. Returns the standard
-/// font when `/BaseFont` resolves to one, else `None`.
-///
-/// All intermediate values are resolved through indirect references
-/// (review-pattern #2): `/DR`, `/Font`, the font resource, and `/BaseFont` can
-/// each be stored indirectly.
+/// Resolve a `/DA` font resource name using the document-level `/AcroForm/DR`
+/// supplied by the form-field helper.
 fn lookup_dr_basefont<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
     resource_name: &[u8],
 ) -> Result<Option<StandardFont>> {
-    // Collect candidate /DR dictionaries: the field /Parent chain first
-    // (most specific), then the document /AcroForm /DR.
-    let mut dr_candidates: Vec<Dictionary> = Vec::new();
-
-    let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = start;
-    let mut depth: usize = 0;
-    loop {
-        // Same graceful-degradation policy as resolve_da: warn and fall back to
-        // /AcroForm /DR (and ultimately the default font) on an over-deep,
-        // cyclic, or non-dictionary parent chain rather than aborting.
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-            pdf.push_warning(format!(
-                "/DR font lookup: parent chain exceeded max depth {DEFAULT_MAX_PAGE_TREE_DEPTH} at {current}; falling back to /AcroForm /DR"
-            ));
-            break;
-        }
-        if !seen.insert(current) {
-            pdf.push_warning(format!(
-                "/DR font lookup: cycle detected at {current}; falling back to /AcroForm /DR"
-            ));
-            break;
-        }
-        let node = pdf.resolve_borrowed(current)?;
-        let extracted = node
-            .as_dict()
-            .map(|dict| (dict.get("DR").cloned(), dict.get("Parent").cloned()));
-        let _ = node;
-        let Some((dr_val, parent_val)) = extracted else {
-            pdf.push_warning(format!(
-                "/DR font lookup: /Parent node {current} is not a dictionary; falling back to /AcroForm /DR"
-            ));
-            break;
-        };
-        if let Some(dr) = resolve_to_dict(pdf, dr_val)? {
-            dr_candidates.push(dr);
-        }
-        match parent_val {
-            Some(Object::Reference(r)) => {
-                current = r;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-
-    if let Some(root_ref) = pdf.root_ref() {
-        let catalog = pdf.resolve_borrowed(root_ref)?;
-        let acroform_val = catalog.as_dict().and_then(|c| c.get("AcroForm").cloned());
-        let _ = catalog;
-        if let Some(acroform) = resolve_to_dict(pdf, acroform_val)? {
-            let dr_val = acroform.get("DR").cloned();
-            if let Some(dr) = resolve_to_dict(pdf, dr_val)? {
-                dr_candidates.push(dr);
-            }
-        }
-    }
-
-    for dr in dr_candidates {
+    let resources = FormFieldObjectHelper::new(start, pdf).default_resources()?;
+    let Some(dr) = resolve_to_dict(pdf, resources)? else {
+        return Ok(None);
+    };
+    for dr in [dr] {
         let font_val = dr.get("Font").cloned();
         let Some(font_dict) = resolve_to_dict(pdf, font_val)? else {
             continue;
@@ -1509,18 +1212,18 @@ fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
 ///
 /// This is an internal renderer. Public callers use
 /// [`crate::FormFieldObjectHelper::generate_appearance`] instead.
-pub(crate) fn generate_choice_field_appearance<R: Read + Seek>(
+pub(crate) fn render_choice_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     // ── 1. Verify /FT is Ch ───────────────────────────────────────────────────
-    let ft = resolve_inherited_name(pdf, widget_ref, b"FT")?;
+    let ft = field_name(pdf, widget_ref, b"FT")?;
     if ft.as_deref() != Some(b"Ch") {
         return Ok(None);
     }
 
     // ── 2. /Ff — field flags; bit 18 (1-indexed) = Combo ─────────────────────
-    let ff = resolve_inherited_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0);
+    let ff = field_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0);
     let is_combo = ff & 0x20000 != 0; // bit 18 (1-indexed)
 
     // ── 3. /Rect — bounding box ───────────────────────────────────────────────
@@ -1556,7 +1259,7 @@ pub(crate) fn generate_choice_field_appearance<R: Read + Seek>(
     };
 
     // ── 5. /Q — quadding ──────────────────────────────────────────────────────
-    let quadding = resolve_inherited_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
+    let quadding = field_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
 
     if is_combo {
         generate_combo_appearance(pdf, widget_ref, bbox_w, bbox_h, &da, font_info, quadding)
@@ -1587,7 +1290,7 @@ fn generate_combo_appearance<R: Read + Seek>(
 ) -> Result<Option<ObjectRef>> {
     // Read /V — combo boxes have a single String value.
     // Resolve the raw value through any indirect reference (review-pattern #2).
-    let raw_value = resolve_inherited_object(pdf, widget_ref, b"V")?;
+    let raw_value = field_object(pdf, widget_ref, b"V")?;
     let text_bytes: Vec<u8> = match raw_value {
         None => Vec::new(),
         Some(Object::String(bytes)) => decode_pdf_text_string(&bytes)
@@ -1655,9 +1358,7 @@ fn resolve_combo_display<R: Read + Seek>(
 ) -> Vec<u8> {
     // /Opt may live on a parent field (child widget carries only /Parent), so
     // walk the field inheritance chain like /FT, /V, and /DA do.
-    let opt_val = resolve_inherited_object(pdf, widget_ref, b"Opt")
-        .ok()
-        .flatten();
+    let opt_val = field_object(pdf, widget_ref, b"Opt").ok().flatten();
     let opt_arr = match resolve_opt_array(pdf, opt_val) {
         Some(a) => a,
         None => return value,
@@ -1744,7 +1445,7 @@ fn generate_list_appearance<R: Read + Seek>(
     // ── Collect options from /Opt (inherited from a parent field if needed) ──
     // /Opt may sit on a parent field (child widget carries only /Parent) and may
     // itself be an indirect reference (review-pattern #2).
-    let opt_val = resolve_inherited_object(pdf, widget_ref, b"Opt")?;
+    let opt_val = field_object(pdf, widget_ref, b"Opt")?;
     let opt_arr = resolve_opt_array(pdf, opt_val).unwrap_or_default();
     let n_opts = opt_arr.len();
 
@@ -1795,7 +1496,7 @@ fn generate_list_appearance<R: Read + Seek>(
     let selected: std::collections::BTreeSet<usize> = {
         // /I may live on a parent field (like /Opt, /V); walk the inheritance
         // chain so a /Parent-only widget still highlights the selected rows.
-        let i_val = resolve_inherited_object(pdf, widget_ref, b"I")?;
+        let i_val = field_object(pdf, widget_ref, b"I")?;
         let i_arr = resolve_opt_array(pdf, i_val);
 
         if let Some(arr) = i_arr {
@@ -1821,7 +1522,7 @@ fn generate_list_appearance<R: Read + Seek>(
             // single string or an array (multi-select), and either form may
             // arrive indirectly — resolve a top-level reference first so the
             // indirect array case is handled identically to the direct one.
-            let v_val = match resolve_inherited_object(pdf, widget_ref, b"V")? {
+            let v_val = match field_object(pdf, widget_ref, b"V")? {
                 Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
                 other => other,
             };
@@ -1861,7 +1562,7 @@ fn generate_list_appearance<R: Read + Seek>(
 
     // ── /TI — top index (first visible option) ────────────────────────────────
     // Inherited like /Opt and /I; non-negative and in-bounds (review-pattern #3).
-    let ti_val = resolve_inherited_object(pdf, widget_ref, b"TI")?;
+    let ti_val = field_object(pdf, widget_ref, b"TI")?;
     let ti: usize = match ti_val {
         Some(Object::Reference(r)) => {
             let resolved = pdf.resolve(r)?;
@@ -2466,10 +2167,10 @@ mod tests {
         let mut pdf = Pdf::open(cursor).expect("parse minimal PDF");
 
         let widget_ref = ObjectRef::new(4, 0);
-        let result = generate_text_field_appearance(&mut pdf, widget_ref);
+        let result = render_text_field(&mut pdf, widget_ref);
         assert!(
             result.is_ok(),
-            "generate_text_field_appearance returned error: {:?}",
+            "render_text_field returned error: {:?}",
             result
         );
         let xobj_ref = result.unwrap();
@@ -2620,7 +2321,7 @@ mod tests {
         // resolve /F1 -> /BaseFont /Times-Roman and synthesize a Times-Roman
         // font dict, while the Tf operator keeps the /DA resource name "F1".
         let mut pdf = Pdf::open(Cursor::new(build_dr_font_tx_pdf())).expect("parse");
-        let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_text_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
 
@@ -2731,7 +2432,7 @@ mod tests {
     /// the raw content-stream bytes.
     fn btn_on_state_content(pdf_bytes: Vec<u8>) -> (Object, Vec<u8>) {
         let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("parse");
-        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let on_ref = render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
         let ap_n = match pdf.resolve(ObjectRef::new(4, 0)).expect("widget") {
@@ -2826,7 +2527,7 @@ mod tests {
     fn non_tx_field_returns_none() {
         // A widget with /FT /Btn should be skipped.
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none(), "non-Tx field should return None");
     }
@@ -2835,7 +2536,7 @@ mod tests {
     fn missing_value_returns_none() {
         // A Tx widget with no /V should be skipped.
         let mut pdf = Pdf::open(Cursor::new(build_tx_no_value_pdf())).expect("parse");
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none(), "missing /V should return None");
     }
@@ -2849,8 +2550,7 @@ mod tests {
         let cursor = Cursor::new(raw);
         let mut pdf = Pdf::open(cursor).expect("parse");
         let widget_ref = ObjectRef::new(4, 0);
-        let result = generate_text_field_appearance(&mut pdf, widget_ref)
-            .expect("generate should not error");
+        let result = render_text_field(&mut pdf, widget_ref).expect("generate should not error");
         assert!(
             result.is_some(),
             "should produce appearance via AcroForm /DA fallback"
@@ -2977,20 +2677,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_inherited_name_follows_indirect_reference() {
+    fn field_name_follows_indirect_reference() {
         // /FT stored as `5 0 R` (-> /Tx) must resolve to the name, not None.
         let raw = build_pdf_with_indirect_field_props();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let ft = resolve_inherited_name(&mut pdf, ObjectRef::new(4, 0), b"FT").unwrap();
+        let ft = field_name(&mut pdf, ObjectRef::new(4, 0), b"FT").unwrap();
         assert_eq!(ft.as_deref(), Some(b"Tx" as &[u8]));
     }
 
     #[test]
-    fn resolve_inherited_integer_follows_indirect_reference() {
+    fn field_integer_follows_indirect_reference() {
         // /Q stored as `6 0 R` (-> 1) must resolve to the integer, not None.
         let raw = build_pdf_with_indirect_field_props();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let q = resolve_inherited_integer(&mut pdf, ObjectRef::new(4, 0), b"Q").unwrap();
+        let q = field_integer(&mut pdf, ObjectRef::new(4, 0), b"Q").unwrap();
         assert_eq!(q, Some(1));
     }
 
@@ -3001,7 +2701,7 @@ mod tests {
         // indirect /FT were not resolved).
         let raw = build_pdf_with_indirect_field_props();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).unwrap();
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(
             result.is_some(),
             "indirect /FT /Tx must be resolved so the field is not skipped"
@@ -3268,10 +2968,10 @@ mod tests {
 
     #[test]
     fn generate_appearance_with_indirect_rect() {
-        // generate_text_field_appearance must work when /Rect is indirect
+        // render_text_field must work when /Rect is indirect
         let raw = build_pdf_with_indirect_rect();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(
             result.unwrap().is_some(),
@@ -3325,7 +3025,7 @@ mod tests {
         // A degenerate /Rect should cause generate to return Ok(None)
         let raw = build_pdf_with_short_rect();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none(), "short /Rect must cause None");
     }
@@ -3596,11 +3296,11 @@ mod tests {
 
     #[test]
     fn generate_appearance_with_no_da_uses_empty_da() {
-        // generate_text_field_appearance must succeed even without /DA
+        // render_text_field must succeed even without /DA
         // (falls back to empty string → default params)
         let raw = build_pdf_with_no_da();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok(), "no /DA must not cause error");
         assert!(
             result.unwrap().is_some(),
@@ -3656,7 +3356,7 @@ mod tests {
         // /V stored as indirect reference must be rendered
         let raw = build_pdf_with_indirect_v();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok(), "indirect /V must not cause error");
         assert!(
             result.unwrap().is_some(),
@@ -3734,11 +3434,11 @@ mod tests {
 
     #[test]
     fn generate_appearance_replaces_existing_ap() {
-        // When widget has existing /AP, generate_text_field_appearance must
+        // When widget has existing /AP, render_text_field must
         // replace it with a new appearance (not panic or return None).
         let raw = build_pdf_with_existing_ap();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok(), "existing /AP must not cause error");
         assert!(
             result.unwrap().is_some(),
@@ -3746,21 +3446,19 @@ mod tests {
         );
     }
 
-    // ── resolve_inherited_object: /V as indirect reference ──────────────────
+    // ── form helper field value: /V as indirect reference ───────────────────
 
     #[test]
-    fn resolve_inherited_object_indirect_reference() {
+    fn field_object_indirect_reference() {
         // obj 5 in build_pdf_with_indirect_field_props is `/Tx` (a Name).
-        // resolve_inherited_object on obj 4 for key "V" gives a String directly.
+        // `field_object` on obj 4 for key "V" gives a String directly.
         // But we can test the Reference arm by using build_pdf_with_indirect_v.
         let raw = build_pdf_with_indirect_v();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let val = resolve_inherited_object(&mut pdf, ObjectRef::new(4, 0), b"V").unwrap();
-        // /V is 5 0 R (a Reference) → resolve_inherited_object returns the Reference itself
-        // (not the resolved object), so it must be Some(Object::Reference(...))
+        let val = field_object(&mut pdf, ObjectRef::new(4, 0), b"V").unwrap();
         assert!(
             val.is_some(),
-            "indirect /V must not return None from resolve_inherited_object"
+            "indirect /V must not return None from field_object"
         );
     }
 
@@ -3816,28 +3514,20 @@ mod tests {
     }
 
     #[test]
-    fn lookup_dr_basefont_field_level_dr() {
-        // /DR /Font at the field level (not AcroForm) must be found
+    fn lookup_dr_basefont_ignores_field_level_dr() {
+        // qpdf's form-field helper sources /DR from /AcroForm, not the field.
         let raw = build_pdf_with_field_dr_font();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
         let sf = lookup_dr_basefont(&mut pdf, ObjectRef::new(4, 0), b"MyFont").unwrap();
-        assert!(
-            sf.is_some(),
-            "field-level /DR /Font must resolve to a StandardFont"
-        );
-        assert_eq!(
-            sf.unwrap(),
-            StandardFont::CourierBold,
-            "must resolve to Courier-Bold"
-        );
+        assert!(sf.is_none(), "field-level /DR must not bypass /AcroForm");
     }
 
     #[test]
     fn generate_appearance_field_level_dr_font() {
-        // generate_text_field_appearance with field-level /DR must produce appearance
+        // render_text_field with field-level /DR must produce appearance
         let raw = build_pdf_with_field_dr_font();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(
             result.unwrap().is_some(),
@@ -3845,7 +3535,7 @@ mod tests {
         );
     }
 
-    // ── multiline appearance via generate_text_field_appearance ─────────────
+    // ── multiline appearance via render_text_field ─────────────
 
     /// PDF with multiline /Ff (bit 13 set = 4096) and multi-word /V
     fn build_pdf_multiline_tx() -> Vec<u8> {
@@ -3889,7 +3579,7 @@ mod tests {
         // /Ff 4096 (bit 13) must trigger multiline rendering
         let raw = build_pdf_multiline_tx();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok(), "multiline /Ff must not cause error");
         let xobj_ref = result.unwrap();
         assert!(
@@ -3909,7 +3599,7 @@ mod tests {
         }
     }
 
-    // ── center/right quadding via generate_text_field_appearance ────────────
+    // ── center/right quadding via render_text_field ────────────
 
     /// PDF with /Q 1 (center quadding)
     fn build_pdf_with_quadding(q: i64) -> Vec<u8> {
@@ -3952,7 +3642,7 @@ mod tests {
     fn generate_appearance_center_quadding() {
         let raw = build_pdf_with_quadding(1);
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(result.unwrap().is_some(), "Q=1 must produce appearance");
     }
@@ -3961,7 +3651,7 @@ mod tests {
     fn generate_appearance_right_quadding() {
         let raw = build_pdf_with_quadding(2);
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(result.unwrap().is_some(), "Q=2 must produce appearance");
     }
@@ -4012,92 +3702,74 @@ mod tests {
 
     #[test]
     fn resolve_da_cycle_returns_none() {
-        // A /Parent cycle must be detected and return Ok(None) without looping,
-        // and must record a warning (qpdf-style: warn + fall back, not silent,
-        // not abort).
+        // The helper's cycle guard terminates without exposing the renderer to
+        // parent traversal.
         let raw = build_pdf_with_parent_cycle();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
         let da = resolve_da(&mut pdf, ObjectRef::new(4, 0)).unwrap();
         assert!(da.is_none(), "cycle in /Parent chain must return None");
-        assert!(
-            pdf.repair_diagnostics().entries().iter().any(|d| {
-                d.severity == crate::Severity::Warning && d.message.contains("cycle detected")
-            }),
-            "a cycle in the /DA parent chain must record a warning, got: {:?}",
-            pdf.repair_diagnostics().entries()
-        );
     }
 
     #[test]
-    fn resolve_inherited_name_cycle_returns_none() {
-        // resolve_inherited_name must detect cycle and return Ok(None)
+    fn field_name_cycle_returns_none() {
         let raw = build_pdf_with_parent_cycle();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
         // Walk from obj 4 for key "DA" — no /DA on either node, cycle detected
-        let result = resolve_inherited_name(&mut pdf, ObjectRef::new(4, 0), b"DA").unwrap();
-        assert!(
-            result.is_none(),
-            "cycle must return None for resolve_inherited_name"
-        );
+        let result = field_name(&mut pdf, ObjectRef::new(4, 0), b"DA").unwrap();
+        assert!(result.is_none(), "cycle must return None for field_name");
     }
 
     #[test]
-    fn resolve_inherited_object_cycle_returns_none() {
+    fn field_object_cycle_returns_none() {
         let raw = build_pdf_with_parent_cycle();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = resolve_inherited_object(&mut pdf, ObjectRef::new(4, 0), b"DA").unwrap();
-        assert!(
-            result.is_none(),
-            "cycle must return None for resolve_inherited_object"
-        );
+        let result = field_object(&mut pdf, ObjectRef::new(4, 0), b"DA").unwrap();
+        assert!(result.is_none(), "cycle must return None for field_object");
     }
 
     #[test]
-    fn resolve_inherited_integer_cycle_returns_none() {
+    fn field_integer_cycle_returns_none() {
         let raw = build_pdf_with_parent_cycle();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = resolve_inherited_integer(&mut pdf, ObjectRef::new(4, 0), b"Q").unwrap();
-        assert!(
-            result.is_none(),
-            "cycle must return None for resolve_inherited_integer"
-        );
+        let result = field_integer(&mut pdf, ObjectRef::new(4, 0), b"Q").unwrap();
+        assert!(result.is_none(), "cycle must return None for field_integer");
     }
 
-    // ── resolve_inherited_name/object: not-a-dict node ──────────────────────
+    // ── form helper accessors: not-a-dict node ───────────────────────────────
 
     #[test]
-    fn resolve_inherited_name_non_dict_node_errors() {
+    fn field_name_non_dict_node_is_empty() {
         // obj 5 in build_pdf_with_indirect_field_props is /Tx (a Name), not a dict
-        // → resolve_inherited_name should return Err (not a dictionary)
+        // → the public helper returns no inherited value.
         let raw = build_pdf_with_indirect_field_props();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
         // Start walk from obj 5 (not a dict)
-        let result = resolve_inherited_name(&mut pdf, ObjectRef::new(5, 0), b"FT");
+        let result = field_name(&mut pdf, ObjectRef::new(5, 0), b"FT");
         assert!(
-            result.is_err(),
-            "non-dict node must return Err from resolve_inherited_name"
+            result.unwrap().is_none(),
+            "non-dict node has no readable inherited name"
         );
     }
 
     #[test]
-    fn resolve_inherited_object_non_dict_node_errors() {
+    fn field_object_non_dict_node_is_empty() {
         let raw = build_pdf_with_indirect_field_props();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = resolve_inherited_object(&mut pdf, ObjectRef::new(5, 0), b"V");
+        let result = field_object(&mut pdf, ObjectRef::new(5, 0), b"V");
         assert!(
-            result.is_err(),
-            "non-dict node must return Err from resolve_inherited_object"
+            result.unwrap().is_none(),
+            "non-dict node has no readable inherited object"
         );
     }
 
     #[test]
-    fn resolve_inherited_integer_non_dict_node_errors() {
+    fn field_integer_non_dict_node_is_empty() {
         let raw = build_pdf_with_indirect_field_props();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = resolve_inherited_integer(&mut pdf, ObjectRef::new(5, 0), b"Q");
+        let result = field_integer(&mut pdf, ObjectRef::new(5, 0), b"Q");
         assert!(
-            result.is_err(),
-            "non-dict node must return Err from resolve_inherited_integer"
+            result.unwrap().is_none(),
+            "non-dict node has no readable inherited integer"
         );
     }
 
@@ -4145,7 +3817,7 @@ mod tests {
         // /DA font-size 0 → auto_size heuristic branch must execute
         let raw = build_pdf_autosize_tx();
         let mut pdf = Pdf::open(Cursor::new(raw)).unwrap();
-        let result = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok(), "auto-size /DA must not cause error");
         assert!(
             result.unwrap().is_some(),
@@ -4155,13 +3827,13 @@ mod tests {
 
     // ── Btn appearance tests ─────────────────────────────────────────────────
 
-    /// Non-Btn field → generate_button_field_appearance must return None.
+    /// Non-Btn field → render_button_field must return None.
     #[test]
     fn btn_non_btn_field_returns_none() {
         // /FT is /Tx — should return None for the Btn generator.
         let raw = build_tx_no_value_pdf();
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(
             result.unwrap().is_none(),
@@ -4196,7 +3868,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(
             result.unwrap().is_none(),
@@ -4239,8 +3911,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let xobj_ref = result.expect("pushbutton must produce appearance");
 
         // /AP/N must be a direct reference (single stream, not a sub-dict).
@@ -4287,13 +3958,12 @@ mod tests {
         assert!(found_caption, "pushbutton Tj must contain caption 'OK'");
     }
 
-    /// checkbox (no Ff bits): generate_button_field_appearance produces on + off
+    /// checkbox (no Ff bits): render_button_field produces on + off
     /// state appearances under /AP/N as a sub-dict with /<on> and /Off keys.
     #[test]
     fn btn_checkbox_ap_has_on_and_off_states() {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        let result =
-            generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let on_ref = result.expect("checkbox must produce appearance");
 
         // /AP/N must be a dict with "Yes" and "Off" keys.
@@ -4405,7 +4075,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let on_ref = render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("radio must produce appearance");
 
@@ -4466,7 +4136,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("should produce appearance");
 
@@ -4524,7 +4194,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("should produce appearance");
 
@@ -4577,7 +4247,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let on_ref = render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("should produce appearance");
 
@@ -4606,7 +4276,7 @@ mod tests {
     #[test]
     fn btn_checkbox_object_refs_are_distinct() {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -4671,7 +4341,7 @@ mod tests {
     #[test]
     fn btn_zapf_font_dict_has_no_encoding() {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -4721,7 +4391,7 @@ mod tests {
     #[test]
     fn btn_checkbox_round_trip() {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let on_ref = render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -4886,7 +4556,7 @@ mod tests {
     #[test]
     fn ch_list_inherits_opt_from_parent_field() {
         let mut pdf = Pdf::open(Cursor::new(build_inherited_opt_list_pdf())).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Ch widget handled");
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -4955,7 +4625,7 @@ mod tests {
     #[test]
     fn ch_list_inherits_i_from_parent_field() {
         let mut pdf = Pdf::open(Cursor::new(build_inherited_i_list_pdf())).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Ch widget handled");
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -5025,7 +4695,7 @@ mod tests {
     #[test]
     fn ch_list_indirect_array_v_highlights_multiselect() {
         let mut pdf = Pdf::open(Cursor::new(build_indirect_array_v_list_pdf())).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Ch widget handled");
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -5045,11 +4715,11 @@ mod tests {
         );
     }
 
-    /// non-Ch field → generate_choice_field_appearance must return None.
+    /// non-Ch field → render_choice_field must return None.
     #[test]
     fn ch_non_ch_field_returns_none() {
         let mut pdf = Pdf::open(Cursor::new(build_btn_widget_pdf())).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(
             result.unwrap().is_none(),
@@ -5083,7 +4753,7 @@ mod tests {
                 .as_bytes(),
         );
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0));
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0));
         assert!(result.is_ok());
         assert!(
             result.unwrap().is_none(),
@@ -5097,8 +4767,7 @@ mod tests {
         let ff_combo = 0x20000_i64; // bit 18
         let raw = build_combo_pdf("Blue", ff_combo);
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let xobj_ref = result.expect("combo must produce appearance");
 
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -5166,8 +4835,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         // Combo always generates (even blank), so this must be Some.
         assert!(
             result.is_some(),
@@ -5180,8 +4848,7 @@ mod tests {
     fn ch_list_selected_index_highlighted() {
         let raw = build_list_pdf("(Red) (Green) (Blue)", "[1]", "");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("generate");
         let xobj_ref = result.expect("list must produce appearance");
 
         let Object::Stream(stream) = pdf.resolve(xobj_ref).expect("resolve xobj") else {
@@ -5235,7 +4902,7 @@ mod tests {
     fn ch_list_multi_select_highlights() {
         let raw = build_list_pdf("(Red) (Green) (Blue)", "[0 2]", "");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -5255,7 +4922,7 @@ mod tests {
         // No /I; /V selects "Green".
         let raw = build_list_pdf("(Red) (Green) (Blue)", "", "(Green)");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -5283,7 +4950,7 @@ mod tests {
         // We verify the display strings appear in Tj, not export strings.
         let raw = build_list_pdf("[(expA)(dispA)] [(expB)(dispB)]", "[0]", "");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -5349,7 +5016,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -5379,7 +5046,7 @@ mod tests {
     fn ch_list_round_trip() {
         let raw = build_list_pdf("(Red) (Green) (Blue)", "[1]", "");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let xobj_ref = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_choice_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("must produce appearance");
 
@@ -5402,13 +5069,12 @@ mod tests {
 
     // ── New tests for previously uncovered production branches ──────────────
 
-    /// Btn widget with no /Rect key → generate_button_field_appearance returns Ok(None).
+    /// Btn widget with no /Rect key → render_button_field returns Ok(None).
     #[test]
     fn btn_no_rect_returns_none() {
         let pdf = build_btn_pdf_obj4("<</Type /Annot /Subtype /Widget /FT /Btn /T (c)>>");
         let mut pdf = Pdf::open(Cursor::new(pdf)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(result.is_none(), "missing /Rect must return None");
     }
 
@@ -5451,8 +5117,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         // Pushbutton appearance should be produced.
         assert!(
             result.is_some(),
@@ -5469,8 +5134,7 @@ mod tests {
              /Ff 65536 /MK <<>> /Rect [10 10 80 30]>>",
         );
         let mut pdf = Pdf::open(Cursor::new(pdf)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "pushbutton with empty /MK must produce appearance"
@@ -5516,7 +5180,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("must not error")
             .expect("must produce appearance");
 
@@ -5572,7 +5236,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let on_ref = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let on_ref = render_button_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("must not error")
             .expect("must produce appearance");
 
@@ -5785,11 +5449,11 @@ mod tests {
         );
     }
 
-    /// resolve_inherited_name: value resolves to Null → skip, keep walking.
+    /// A null `/FT` does not produce a text appearance.
     #[test]
-    fn resolve_inherited_name_null_value() {
+    fn field_name_null_value_is_empty() {
         // obj-5 is a Null object; widget /FT 5 0 R resolves to Null → walk to parent.
-        // No parent → returns None, then generate_text_field_appearance returns None.
+        // No parent → returns None, then render_text_field returns None.
         let mut raw = Vec::<u8>::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
         let off1 = raw.len() as u64;
@@ -5826,14 +5490,13 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // /FT is Null → not Btn → generate_button returns None; not Tx → generate_text returns None.
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(result.is_none(), "Null /FT must return None");
     }
 
-    /// resolve_inherited_integer: value resolves to Null → skip (line 1054).
+    /// A null `/Ff` behaves as zero flags.
     #[test]
-    fn resolve_inherited_integer_null_value() {
+    fn field_integer_null_value_is_empty() {
         // obj-5 is null; widget /Ff 5 0 R resolves to Null → skip, use default 0.
         // Result: checkbox (no pushbutton/radio bit set) → appearance produced.
         let mut raw = Vec::<u8>::new();
@@ -5871,17 +5534,16 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // /Ff resolves to Null → defaults to 0 → checkbox → produces appearance.
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "Null /Ff must fall back to 0 (checkbox) and produce appearance"
         );
     }
 
-    /// resolve_inherited_integer: value resolves to non-integer (name) → skip (line 1056).
+    /// A non-integer `/Ff` behaves as zero flags.
     #[test]
-    fn resolve_inherited_integer_non_integer_value() {
+    fn field_integer_non_integer_value_is_empty() {
         // obj-5 is /Name; widget /Ff 5 0 R → resolves to Name → skip → default 0 → checkbox.
         let mut raw = Vec::<u8>::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
@@ -5917,8 +5579,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "non-integer /Ff must fall back to 0 and produce appearance"
@@ -5929,7 +5590,7 @@ mod tests {
     #[test]
     fn resolve_da_null_da_value() {
         // Widget /DA 5 0 R → Null; no AcroForm /DA → resolve_da returns None.
-        // But generate_text_field_appearance still succeeds (uses default font).
+        // But render_text_field still succeeds (uses default font).
         let mut raw = Vec::<u8>::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
         let off1 = raw.len() as u64;
@@ -5965,8 +5626,7 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // Null /DA → resolve_da returns None → generate falls back to defaults → still produces appearance.
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "Null /DA must not prevent appearance generation"
@@ -6011,8 +5671,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "non-string /DA must not prevent appearance generation"
@@ -6061,8 +5720,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "indirect AcroForm /DA must produce appearance"
@@ -6109,8 +5767,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "indirect /AcroForm must produce appearance via indirect /DA"
@@ -6155,8 +5812,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_none(),
             "indirect /Rect → non-array must return None"
@@ -6172,8 +5828,7 @@ mod tests {
              /Rect [10 10 /Bad 30]>>",
         );
         let mut pdf = Pdf::open(Cursor::new(pdf)).expect("parse");
-        let result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_none(),
             "/Rect with non-numeric element must return None"
@@ -6218,8 +5873,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_none(),
             "indirect /V → non-String must return None"
@@ -6261,8 +5915,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(result.is_none(), "integer /V must return None");
     }
 
@@ -6301,8 +5954,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_none(),
             "degenerate (narrow) /Rect must return None"
@@ -6359,17 +6011,16 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // With /Helv→Helvetica mapped indirectly, appearance should use Helvetica font.
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "indirect /BaseFont must be resolved and produce appearance"
         );
     }
 
-    /// resolve_inherited_name: resolves to a non-Name object → skip (line 952 else-arm).
+    /// A non-name `/FT` does not select a button renderer.
     #[test]
-    fn resolve_inherited_name_non_name_value() {
+    fn field_name_non_name_value_is_empty() {
         // obj-5 is a String; /FT 5 0 R → resolves to String → not a Name → skip → returns None.
         let mut raw = Vec::<u8>::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
@@ -6405,20 +6056,20 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        // /FT resolves to a String → not a Name → resolve_inherited_name returns None
+        // /FT resolves to a String → not a Name → no field type.
         // → neither Tx nor Btn → both generate functions return None.
-        let btn_result = generate_button_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let btn_result =
+            render_button_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             btn_result.is_none(),
             "non-Name /FT must return None from Btn generator"
         );
     }
 
-    /// resolve_inherited_object: /V resolves to Null → returns None (line 996).
+    /// A null `/V` leaves the text appearance untouched.
     #[test]
-    fn resolve_inherited_object_null_value() {
-        // obj-5 is null; /V 5 0 R → Null → resolve_inherited_object returns None → Ok(None).
+    fn field_object_null_value_is_empty() {
+        // obj-5 is null; /V 5 0 R produces no renderable value.
         let mut raw = Vec::<u8>::new();
         raw.extend_from_slice(b"%PDF-1.4\n");
         let off1 = raw.len() as u64;
@@ -6454,13 +6105,12 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // /V is Null → no value to render → Ok(None).
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(result.is_none(), "Null /V must return None");
     }
 
     /// resolve_da: /DA parent node is not a dictionary → warning, fall back (line 1108/1111).
-    /// Calls resolve_da directly so resolve_inherited_name's same check doesn't interfere.
+    /// Calls the default-appearance resolver directly.
     #[test]
     fn resolve_da_parent_is_not_dict() {
         // Widget /Parent 5 0 R where obj-5 is an integer (not a dict).
@@ -6551,8 +6201,7 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // /DR has no /Font → font lookup fails → default Helvetica is used → appearance produced.
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "missing /DR /Font must fall back to default font"
@@ -6603,8 +6252,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "indirect AcroForm /DR must yield appearance"
@@ -6651,8 +6299,7 @@ mod tests {
         );
 
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result =
-            generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
+        let result = render_text_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "Times-Roman /BaseFont in /DR must produce appearance"
@@ -6738,7 +6385,7 @@ mod tests {
 
     /// Extract the content-stream bytes from the /AP/N XObject generated for obj-4.
     fn ch_ap_content(pdf: &mut Pdf<Cursor<Vec<u8>>>, widget: ObjectRef) -> Vec<u8> {
-        let xobj_ref = generate_choice_field_appearance(pdf, widget)
+        let xobj_ref = render_choice_field(pdf, widget)
             .expect("generate")
             .expect("must produce appearance");
         match pdf.resolve(xobj_ref).expect("resolve xobj") {
@@ -6775,14 +6422,13 @@ mod tests {
 
     // ── Ch: missing /Rect → None (line 1569) ────────────────────────────────
 
-    /// Ch widget with no /Rect key → generate_choice_field_appearance returns None.
+    /// Ch widget with no /Rect key → render_choice_field returns None.
     #[test]
     fn ch_no_rect_returns_none() {
         let raw =
             build_ch_pdf_obj4("<</Type /Annot /Subtype /Widget /FT /Ch /T (c) /Ff 131072 /V (A)>>");
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(result.is_none(), "missing /Rect must return None");
     }
 
@@ -6837,8 +6483,7 @@ mod tests {
         );
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         // Must produce a (blank) appearance without panic.
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "combo must still produce appearance for non-string indirect /V"
@@ -6854,8 +6499,7 @@ mod tests {
              /V /SomeName /DA (/Helv 12 Tf 0 g) /Rect [100 700 300 720]>>",
         );
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "combo must still produce appearance for non-string /V"
@@ -7300,8 +6944,7 @@ mod tests {
              /Opt [] /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>",
         );
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
-        let result = generate_choice_field_appearance(&mut pdf, ObjectRef::new(4, 0))
-            .expect("must not error");
+        let result = render_choice_field(&mut pdf, ObjectRef::new(4, 0)).expect("must not error");
         assert!(
             result.is_some(),
             "list with empty /Opt must still produce appearance"
@@ -7415,7 +7058,7 @@ mod tests {
             ObjectRef::new(6, 0),
             Object::Reference(ObjectRef::new(7, 0)),
         );
-        generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        render_text_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
 
@@ -7495,7 +7138,7 @@ mod tests {
             ObjectRef::new(6, 0),
             Object::Reference(ObjectRef::new(7, 0)),
         );
-        let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_text_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
         let xobj = pdf.resolve(xobj_ref).expect("resolve xobj");
@@ -7571,7 +7214,7 @@ mod tests {
             ObjectRef::new(6, 0),
             Object::Reference(ObjectRef::new(7, 0)),
         );
-        let xobj_ref = generate_text_field_appearance(&mut pdf, ObjectRef::new(4, 0))
+        let xobj_ref = render_text_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
         let xobj = pdf.resolve(xobj_ref).expect("resolve xobj");

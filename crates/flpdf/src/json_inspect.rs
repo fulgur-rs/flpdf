@@ -10,6 +10,7 @@
 //! close/drop without finishing `PlStdioFile`, and each side file explicitly
 //! finishes `PlStdioFile` before close/drop.
 
+use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json::Json;
 use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::object_handle::ObjectHandle;
@@ -1613,44 +1614,29 @@ fn walk_acroform_fields<R: Read + Seek>(
         None => Json::make_null(),
     };
 
-    // /FT, /V, /DV, /Ff are all inheritable down the /Parent chain
-    // (ISO 32000-1 §12.7.3.1). Use the same lookup helper for each.
-    let ft_obj = inherited_field_value(pdf, &field_dict, "FT")?;
-    let fieldtype = match &ft_obj {
-        Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
-            // qpdf's `getFieldType()` returns `QPDFObjectHandle::getName()`
-            // verbatim, which includes the leading "/" (QPDFFormFieldObjectHelper.cc).
-            handle
-                .as_name()
-                .map(|bytes| Json::make_string(format!("/{}", String::from_utf8_lossy(&bytes))))
-                .unwrap_or_else(Json::make_null)
-        }
+    // /FT, /V, /DV, and /Ff are inherited through the form-field helper so
+    // JSON inspection observes the same indirect-value and parent-chain
+    // behavior as the public qpdf-shaped API.
+    let fieldtype = match FormFieldObjectHelper::new(field_ref, pdf).field_type()? {
+        Some(name) => Json::make_string(String::from_utf8_lossy(&name).into_owned()),
         None => Json::make_null(),
     };
 
     // /V — value, run through pdf_object_to_json. Inherited from /Parent.
-    let value = match inherited_field_value(pdf, &field_dict, "V")? {
-        Some(v) => pdf_object_to_json(&v)?,
+    let value = match FormFieldObjectHelper::new(field_ref, pdf).field_value()? {
+        Some(v) => lift_and_convert_to_json(pdf, &v)?,
         None => Json::make_null(),
     };
 
     // /DV — default value. Inherited from /Parent.
-    let defaultvalue = match inherited_field_value(pdf, &field_dict, "DV")? {
-        Some(v) => pdf_object_to_json(&v)?,
+    let defaultvalue = match FormFieldObjectHelper::new(field_ref, pdf).field_default_value()? {
+        Some(v) => lift_and_convert_to_json(pdf, &v)?,
         None => Json::make_null(),
     };
 
     // /Ff — field flags integer. Inherited from /Parent.
-    let ff_obj = inherited_field_value(pdf, &field_dict, "Ff")?;
-    let fieldflags = match &ff_obj {
-        Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
-            handle
-                .as_integer()
-                .map(Json::make_int)
-                .unwrap_or_else(Json::make_null)
-        }
+    let fieldflags = match FormFieldObjectHelper::new(field_ref, pdf).field_flags()? {
+        Some(value) => Json::make_int(value),
         None => Json::make_null(),
     };
 
@@ -1805,51 +1791,6 @@ fn walk_acroform_fields<R: Read + Seek>(
     }
 
     Ok(())
-}
-
-// Look up an inheritable AcroForm field entry on `field_dict`, walking the
-// `/Parent` chain if the key is absent locally (ISO 32000-1 §12.7.3.1).
-//
-// Returns `Some(value)` for the first non-absent value found at this dict or
-// any ancestor; `None` if neither this field nor any ancestor carries `key`.
-// Cycle-safe: never visits the same `/Parent` twice.
-fn inherited_field_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field_dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
-    key: &str,
-) -> Result<Option<ObjectHandle>, ConvertError> {
-    use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-    if let Some(local) = field_dict.get(key.as_bytes()) {
-        return Ok(Some(local.clone()));
-    }
-    let mut parent_ref = field_dict
-        .get(b"Parent".as_slice())
-        .and_then(ObjectHandle::object_ref);
-    let mut seen: std::collections::BTreeSet<crate::ObjectRef> = std::collections::BTreeSet::new();
-    let mut depth: usize = 0;
-    while let Some(pr) = parent_ref {
-        if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-            return Err(ConvertError::PdfError(format!(
-                "AcroForm field-tree depth limit {DEFAULT_MAX_PAGE_TREE_DEPTH} exceeded"
-            )));
-        }
-        if !seen.insert(pr) {
-            break;
-        }
-        let parent_handle = pdf.get_object_handle(pr);
-        pdf.resolve_object_handle(&parent_handle)?;
-        let Some(pd) = parent_handle.as_dictionary() else {
-            break;
-        };
-        if let Some(v) = pd.get(key.as_bytes()) {
-            return Ok(Some(v.clone()));
-        }
-        parent_ref = pd
-            .get(b"Parent".as_slice())
-            .and_then(ObjectHandle::object_ref);
-        depth += 1;
-    }
-    Ok(None)
 }
 
 /// Build the qpdf JSON v2 `"acroform"` section.
@@ -5552,66 +5493,6 @@ mod tests {
             }
             assert_eq!(out.bytes, b"{\n  \"version\": 2,\n  ");
         }
-    }
-
-    // Register a /Parent chain obj(start)->obj(start+1)->...->obj(start+len-1).
-    // The deepest node carries `key`; the starting dict (returned) only has /Parent.
-    fn parent_chain(
-        pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>,
-        start: u32,
-        len: u32,
-        key: &str,
-    ) -> std::collections::BTreeMap<Vec<u8>, ObjectHandle> {
-        for i in 0..len {
-            let num = start + i;
-            let mut d = Dictionary::new();
-            if i + 1 < len {
-                d.insert(
-                    "Parent",
-                    Object::Reference(crate::ObjectRef::new(num + 1, 0)),
-                );
-            } else {
-                // deepest node holds the inheritable value
-                d.insert(key, Object::Integer(42));
-            }
-            pdf.set_object(crate::ObjectRef::new(num, 0), Object::Dictionary(d));
-        }
-        let mut start_dict = std::collections::BTreeMap::new();
-        start_dict.insert(
-            b"Parent".to_vec(),
-            pdf.get_object_handle(crate::ObjectRef::new(start, 0)),
-        );
-        start_dict
-    }
-
-    #[test]
-    fn inherited_field_value_errors_on_excessive_parent_depth() {
-        use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
-        let mut pdf = empty_pdf();
-        let start_dict = parent_chain(&mut pdf, 2, (DEFAULT_MAX_PAGE_TREE_DEPTH as u32) + 5, "V");
-        let err = inherited_field_value(&mut pdf, &start_dict, "V");
-        assert!(matches!(err, Err(ConvertError::PdfError(_))));
-    }
-
-    #[test]
-    fn inherited_field_value_resolves_within_limit() {
-        let mut pdf = empty_pdf();
-        let start_dict = parent_chain(&mut pdf, 2, 4, "V");
-        let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
-        assert_eq!(got.and_then(|h| h.as_integer()), Some(42));
-    }
-
-    #[test]
-    fn inherited_field_value_parent_resolving_to_non_dictionary_stops_the_walk() {
-        let mut pdf = empty_pdf();
-        let parent_ref = crate::ObjectRef::new(5, 0);
-        pdf.set_object(parent_ref, Object::Integer(1));
-
-        let mut start_dict = std::collections::BTreeMap::new();
-        start_dict.insert(b"Parent".to_vec(), pdf.get_object_handle(parent_ref));
-
-        let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
-        assert!(got.is_none());
     }
 
     // ── 5. Default is Generalized ─────────────────────────────────────────────

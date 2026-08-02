@@ -85,7 +85,6 @@
 pub mod acroform_document_helper;
 pub mod acroform_field_prune;
 pub mod annotation_helper;
-pub mod appearance;
 pub(crate) mod ascii85;
 pub(crate) mod ascii_hex;
 pub mod attachment_list;
