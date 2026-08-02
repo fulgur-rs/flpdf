@@ -311,12 +311,18 @@ fn a_fresh_flate_filter_accepts_both_present_shapes_the_neutral_form_merges() {
     //
     // Both shapes still answer `true` because every caller applies params to
     // a freshly constructed adapter (defaults `predictor = 1, columns = 1`),
-    // making that trailing check false either way. This assertion is what
-    // fails if an adapter is ever reused across specs.
+    // making that trailing check false either way.
     assert!(FlateLzwStreamFilter::new(false).set_decode_params(&DecodeParams::Present(Vec::new())));
     assert!(FlateLzwStreamFilter::new(true).set_decode_params(&DecodeParams::Present(Vec::new())));
 }
 ```
+
+> **Do not claim this test guards against adapter reuse.** An earlier draft
+> ended the comment with "this assertion is what fails if an adapter is ever
+> reused across specs". It does not: the test constructs its own fresh
+> `FlateLzwStreamFilter`, so it stays green no matter what production does.
+> Task 2's code review caught this by mutation testing. The property is
+> pinned instead by Task 3's `a_dirtied_adapter_shows_why_absent_short_circuits_and_present_does_not`.
 
 **Step 2: Run it to verify it fails**
 
@@ -402,6 +408,58 @@ Expected: FAIL — closure bound is `FnMut(Option<&Object>, &[u8])`.
 `F: FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>`.** The default provider at
 `filters.rs:334-338` keeps returning
 `Error::Unsupported("unsupported stream filter: Crypt")` verbatim.
+
+**Step 3b: Fold in Task 2's code-review follow-ups**
+
+Task 2's review approved but left four items for this task, which edits the
+same file. The first is mandatory before Task 5.
+
+- **Split `clamped_int_param` (MANDATORY before Task 5).** It currently fuses
+  shape-specific integer extraction (`Object::as_integer`) with the
+  shape-independent saturation that *is* the `getIntValueAsInt` parity
+  (`QPDFObjectHandle.cc:526-543`). Task 5's handle reader enters from
+  `try_as_integer`, so leaving it fused makes that reader duplicate the
+  parity-critical clamp — the exact duplication this plan exists to prevent.
+  Extract `fn clamp_to_i32(value: i64) -> i32` and have both shape readers
+  call it.
+- **Pin the `is_absent()` early return.** The review deleted it and the whole
+  suite stayed green (3116 passed), because every caller applies params to a
+  freshly constructed adapter. Add the test below, which the reviewer verified
+  goes red when the early return is removed:
+
+```rust
+#[test]
+fn a_dirtied_adapter_shows_why_absent_short_circuits_and_present_does_not() {
+    let mut filter = FlateLzwStreamFilter::new(false);
+    // Assignment precedes the range check, so predictor=12, columns=0 stick.
+    assert!(!filter.set_decode_params(&neutral_params(&[
+        ("Predictor", ParamValue::Int(12)),
+        ("Columns", ParamValue::Int(0)),
+    ])));
+    assert_eq!((filter.predictor, filter.columns), (12, 0));
+    // SF_FlateLzwDecode.cc:24-26 returns true for isNull() regardless of
+    // prior state. Removing the early return fails only this line.
+    assert!(filter.set_decode_params(&DecodeParams::Absent));
+    // Present-but-empty does not short-circuit: it reaches :68-70 still
+    // carrying the old geometry.
+    assert!(!filter.set_decode_params(&DecodeParams::Present(Vec::new())));
+}
+```
+
+- **State the `ParamValue` invariant.** Its doc explains `Other` by reference
+  to what `clamped_int_param` *used to* reject, which no filter calls any
+  more. Replace that with the invariant a reader can check against qpdf:
+  `ParamValue::Int` appears if and only if `QPDFObjectHandle::isInteger()`
+  would be true; `Name` and `Other` are qpdf's `else` branch.
+- **Rename `flate_lzw_filter_retains_only_the_qpdf_parameter_set`.** The
+  property it was named for (not retaining a reference to the caller's
+  object) became structurally impossible when `FilterSpec` lost its lifetime.
+  Rename to what it now pins, or merge it into
+  `flate_factory_treats_non_dictionary_decode_params_as_empty_like_qpdf`.
+
+Watch for `-D warnings`: removing `decode_params_to_object` leaves
+`stream_filter.rs:11`'s `Dictionary` import with no production user (the test
+module has its own `use`), so clippy will fail on the unused import.
 
 **Step 4: Run the tests**
 
