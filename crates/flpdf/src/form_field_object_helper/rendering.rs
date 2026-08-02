@@ -1268,7 +1268,16 @@ pub(crate) fn render_choice_field<R: Read + Seek>(
 
     if is_combo {
         generate_combo_appearance(
-            pdf, field_ref, widget_ref, bbox_w, bbox_h, &da, font_info, quadding,
+            pdf,
+            field_ref,
+            ComboAppearanceParams {
+                widget_ref,
+                bbox_w,
+                bbox_h,
+                da: &da,
+                font: font_info,
+                quadding,
+            },
         )
     } else {
         generate_list_appearance(pdf, field_ref, widget_ref, bbox_w, bbox_h, &da, font_info)
@@ -1285,16 +1294,21 @@ struct ChFontInfo {
     std_font: StandardFont,
 }
 
+/// Parameters for rendering a combo-box appearance.
+struct ComboAppearanceParams<'a> {
+    widget_ref: ObjectRef,
+    bbox_w: f64,
+    bbox_h: f64,
+    da: &'a crate::default_appearance::DefaultAppearance,
+    font: ChFontInfo,
+    quadding: i64,
+}
+
 /// Render a Combo-box appearance: the selected `/V` value as a single-line text.
 fn generate_combo_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
-    widget_ref: ObjectRef,
-    bbox_w: f64,
-    bbox_h: f64,
-    da: &crate::default_appearance::DefaultAppearance,
-    font: ChFontInfo,
-    quadding: i64,
+    combo: ComboAppearanceParams<'_>,
 ) -> Result<Option<ObjectRef>> {
     // Read /V — combo boxes have a single String value.
     // Resolve the raw value through any indirect reference (review-pattern #2).
@@ -1321,33 +1335,33 @@ fn generate_combo_appearance<R: Read + Seek>(
     let text_bytes = resolve_combo_display(pdf, field_ref, text_bytes);
 
     // Font size: same single-line heuristic as Tx.
-    let font_size = if da.auto_size {
-        (bbox_h - 2.0).clamp(4.0, 12.0)
+    let font_size = if combo.da.auto_size {
+        (combo.bbox_h - 2.0).clamp(4.0, 12.0)
     } else {
-        da.font_size
+        combo.da.font_size
     };
 
     let params = TextAppearanceParams {
         text_bytes,
-        font_resource_name: font.resource_name.clone(),
+        font_resource_name: combo.font.resource_name.clone(),
         font_size,
-        color: da.color.clone(),
-        bbox_w,
-        bbox_h,
-        quadding,
+        color: combo.da.color.clone(),
+        bbox_w: combo.bbox_w,
+        bbox_h: combo.bbox_h,
+        quadding: combo.quadding,
         multiline: false,
-        std_font: Some(font.std_font),
+        std_font: Some(combo.font.std_font),
     };
     let content = build_text_appearance_content(&params);
 
     let font_obj_ref = next_object_ref(pdf)?;
     let xobj_ref = install_normal_appearance(
         pdf,
-        widget_ref,
+        combo.widget_ref,
         content,
-        bbox_w,
-        bbox_h,
-        Some((font.resource_name, font.base_name, font_obj_ref)),
+        combo.bbox_w,
+        combo.bbox_h,
+        Some((combo.font.resource_name, combo.font.base_name, font_obj_ref)),
     )?;
 
     Ok(Some(xobj_ref))

@@ -3364,6 +3364,15 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             }
         };
         if has_normal {
+            // qpdf does not synthesize button appearances.  It re-applies the
+            // current `/V` instead, allowing the field helper to select the
+            // matching pre-existing normal-appearance state for `/AS`.
+            let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+            if helper.is_checkbox()? || helper.is_radio_button()? {
+                if let Some(value) = helper.value()? {
+                    helper.set_value(value, false)?;
+                }
+            }
             continue;
         }
 

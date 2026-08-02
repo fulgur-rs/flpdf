@@ -1,6 +1,6 @@
 //! Integration tests: AcroForm/annotation transform observable equivalence
 //!
-//! Covers: generate-appearances (Tx value→Tj, checkbox/radio state-dict,
+//! Covers: generate-appearances (Tx value→Tj, checkbox/radio state sync,
 //! combo value→Tj), flatten=all (Do in page content, Annots empty),
 //! flatten=print (Print-bit annot removed, non-Print annot kept),
 //! flatten-rotation (CLI e2e).
@@ -162,6 +162,34 @@ fn checkbox_widget_without_ap() -> Vec<u8> {
           /Rect [100 700 120 720] /P 3 0 R >>\nendobj\n"
             .to_vec(),
         b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
+/// Checkbox whose existing state appearances disagree with its `/V`.
+/// qpdf 11.9.0 leaves those appearances in place and resets `/AS` to `/V`.
+fn checkbox_widget_with_ap_needing_appearances() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Btn /T (cb1) /Ff 0 /V /Yes /AS /Off /Rect [100 700 120 720] /P 3 0 R /AP << /N << /Off 6 0 R /Yes 7 0 R >> >> >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
+/// Direct radio widget with an existing appearance. qpdf only synchronizes
+/// radio widgets selected through a field `/Kids` array.
+fn direct_radio_widget_with_ap_needing_appearances() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Btn /T (rd1) /Ff 32768 /V /Yes /AS /Off /Rect [100 700 120 720] /P 3 0 R /AP << /N << /Off 6 0 R /Yes 7 0 R >> >> >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"6 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec(),
+        b"7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 20 20] /Length 0 >>\nstream\n\nendstream\nendobj\n".to_vec(),
     ])
 }
 
@@ -359,11 +387,9 @@ fn generate_appearances_tx_skips_existing_ap() {
     );
 }
 
-/// `--generate-appearances` on a checkbox widget installs `/AP/N` as a state
-/// dictionary (with at least one non-Off key) — observable equivalence for
-/// on/off checkbox rendering.
+/// qpdf does not synthesize button appearances when none exists.
 #[test]
-fn generate_appearances_checkbox_creates_state_dict() {
+fn generate_appearances_checkbox_without_ap_leaves_ap_absent() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("cb.pdf");
     let output = temp.path().join("out.pdf");
@@ -379,49 +405,16 @@ fn generate_appearances_checkbox_creates_state_dict() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let n_val = {
-        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
-        let ap = helper
-            .appearance()
-            .unwrap()
-            .expect("checkbox widget should have /AP after --generate-appearances");
-        ap.get("N").cloned().expect("/AP should have /N entry")
-    };
-
-    // For checkbox/radio the /AP/N value must be a Dictionary (state dict),
-    // not a stream directly.  It contains at least an "Off" state key and an
-    // on-state key (e.g. "Yes").
-    let n_obj = resolve_one(&mut pdf, n_val).unwrap();
-    let state_dict = n_obj
-        .as_dict()
-        .expect("/AP/N for checkbox must be a state dictionary, not a bare stream");
-
-    // "Off" key must be present (empty/transparent appearance for unchecked state).
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
     assert!(
-        state_dict.get("Off").is_some(),
-        "checkbox /AP/N state dict must have an 'Off' entry"
-    );
-
-    // At least one non-Off key must exist (the checked-state appearance).
-    let has_on_state = state_dict.iter().any(|(k, _)| k != b"Off");
-    assert!(
-        has_on_state,
-        "checkbox /AP/N state dict must have a non-Off (on-state) entry"
-    );
-
-    // Confirm at least 2 total entries (on-state + Off).
-    let entry_count = state_dict.iter().count();
-    assert!(
-        entry_count >= 2,
-        "checkbox /AP/N state dict should have >=2 entries (on-state + Off), got {}",
-        entry_count
+        helper.appearance().unwrap().is_none(),
+        "qpdf leaves a button without /AP unchanged"
     );
 }
 
-/// `--generate-appearances` on a radio button widget installs `/AP/N` as a
-/// state dictionary — same structural requirement as checkbox.
+/// qpdf does not synthesize radio appearances when none exists.
 #[test]
-fn generate_appearances_radio_creates_state_dict() {
+fn generate_appearances_radio_without_ap_leaves_ap_absent() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("rd.pdf");
     let output = temp.path().join("out.pdf");
@@ -437,30 +430,64 @@ fn generate_appearances_radio_creates_state_dict() {
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let widget_ref = first_widget_ref(&mut pdf);
-    let n_val = {
-        let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
-        let ap = helper
-            .appearance()
-            .unwrap()
-            .expect("radio widget should have /AP after --generate-appearances");
-        ap.get("N").cloned().expect("/AP should have /N entry")
-    };
-
-    let n_obj = resolve_one(&mut pdf, n_val).unwrap();
-    let state_dict = n_obj
-        .as_dict()
-        .expect("/AP/N for radio must be a state dictionary");
-
-    let entry_count = state_dict.iter().count();
+    let mut helper = AnnotationObjectHelper::new(widget_ref, &mut pdf);
     assert!(
-        entry_count >= 2,
-        "radio /AP/N state dict should have >=2 entries, got {}",
-        entry_count
+        helper.appearance().unwrap().is_none(),
+        "qpdf leaves a radio button without /AP unchanged"
     );
-    assert!(
-        state_dict.get("Off").is_some(),
-        "radio /AP/N state dict must have an 'Off' entry"
-    );
+}
+
+/// Existing checkbox appearances are preserved while `/AS` is synchronized to `/V`.
+#[test]
+fn generate_appearances_checkbox_with_ap_synchronizes_as_to_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("cb-existing-ap.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, checkbox_widget_with_ap_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let widget_ref = first_widget_ref(&mut pdf);
+    let widget = pdf.resolve(widget_ref).unwrap();
+    let widget = widget.as_dict().unwrap();
+    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Yes"));
+    let ap = widget.get("AP").and_then(Object::as_dict).unwrap();
+    let normal = ap.get("N").and_then(Object::as_dict).unwrap();
+    assert!(normal.get("Off").is_some() && normal.get("Yes").is_some());
+}
+
+/// A direct radio widget retains `/AS`; qpdf requires a parent field `/Kids`
+/// array before it can identify and synchronize its child widget.
+#[test]
+fn generate_appearances_direct_radio_with_ap_leaves_as_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("rd-existing-ap.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, direct_radio_widget_with_ap_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let widget_ref = first_widget_ref(&mut pdf);
+    let widget = pdf.resolve(widget_ref).unwrap();
+    let widget = widget.as_dict().unwrap();
+    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
+    let ap = widget.get("AP").and_then(Object::as_dict).unwrap();
+    let normal = ap.get("N").and_then(Object::as_dict).unwrap();
+    assert!(normal.get("Off").is_some() && normal.get("Yes").is_some());
 }
 
 /// `--generate-appearances` on a combo-box widget adds `/AP/N`, and the
