@@ -290,7 +290,7 @@ fn field_type_direct_on_widget() {
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(
         field.field_type().expect("field_type()"),
-        Some(b"Tx".to_vec())
+        Some(b"/Tx".to_vec())
     );
 }
 
@@ -501,7 +501,7 @@ fn field_type_resolves_indirect_reference() {
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(
         field.field_type().expect("field_type()"),
-        Some(b"Tx".to_vec())
+        Some(b"/Tx".to_vec())
     );
 }
 
@@ -551,7 +551,7 @@ fn field_type_indirect_null_treated_as_absent_inherits_parent() {
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(
         child.field_type().expect("field_type()"),
-        Some(b"Tx".to_vec())
+        Some(b"/Tx".to_vec())
     );
 }
 
@@ -600,7 +600,7 @@ fn field_type_inherited_from_parent() {
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(
         child.field_type().expect("field_type()"),
-        Some(b"Tx".to_vec())
+        Some(b"/Tx".to_vec())
     );
 }
 
@@ -655,7 +655,7 @@ fn field_type_child_overrides_parent() {
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
     assert_eq!(
         child.field_type().expect("field_type()"),
-        Some(b"Btn".to_vec())
+        Some(b"/Btn".to_vec())
     );
 }
 

@@ -103,6 +103,7 @@ pub mod error;
 pub mod filespec_helper;
 pub mod filters;
 pub mod fonts;
+pub mod form_field_object_helper;
 pub mod json;
 pub mod json_inspect;
 pub mod linearization;
@@ -181,7 +182,7 @@ pub use acroform_field_prune::{
     prune_acroform_after_subset, prune_acroform_after_subset_with_max_depth,
     DEFAULT_MAX_ACROFORM_DEPTH,
 };
-pub use annotation_helper::{AnnotationObjectHelper, FormFieldObjectHelper};
+pub use annotation_helper::AnnotationObjectHelper;
 pub use appearance::{
     generate_button_field_appearance, generate_choice_field_appearance,
     generate_text_field_appearance,
@@ -209,6 +210,7 @@ pub use filespec_helper::{
     extract_attachment_to_path, format_pdf_date, md5_checksum, write_attachment,
     EmbeddedFileStream, FileParamDates, FileSpec, FileSpecBuilder,
 };
+pub use form_field_object_helper::FormFieldObjectHelper;
 pub use matrix::{Matrix, Rectangle};
 pub use name_number_tree::{
     build_name_tree, build_number_tree, read_name_tree, read_number_tree, DEFAULT_MAX_TREE_DEPTH,

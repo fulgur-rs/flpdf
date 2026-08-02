@@ -323,7 +323,7 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
     let mut to_remove: Vec<ObjectRef> = Vec::new();
     for field_ref in form_fields {
         let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
-        if field_type.as_deref() != Some(b"Sig") {
+        if field_type.as_deref() != Some(b"/Sig") {
             continue;
         }
         // qpdf records every /Sig form field in `to_remove` unconditionally,

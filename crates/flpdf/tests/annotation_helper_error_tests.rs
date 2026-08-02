@@ -131,14 +131,14 @@ fn field_type_wrong_value_type_skipped_returns_none() {
 }
 
 #[test]
-fn field_type_parent_not_dictionary_errors() {
+fn field_type_parent_not_dictionary_returns_none() {
     let bytes = doc(vec![
         (10, "<< /Type /Annot /Parent 11 0 R >>".into()),
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(field.field_type());
+    assert_eq!(field.field_type().unwrap(), None);
 }
 
 // ===========================================================================
@@ -162,14 +162,14 @@ fn field_value_direct_null_inherits_parent() {
 }
 
 #[test]
-fn field_value_parent_not_dictionary_errors() {
+fn field_value_parent_not_dictionary_returns_none() {
     let bytes = doc(vec![
         (10, "<< /Type /Annot /Parent 11 0 R >>".into()),
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(field.field_value());
+    assert_eq!(field.field_value().unwrap(), None);
 }
 
 #[test]
@@ -188,12 +188,12 @@ fn field_value_cycle_returns_none() {
 // ===========================================================================
 
 #[test]
-fn field_flags_wrong_value_type_skipped_returns_none() {
-    // /Ff is a name (not an integer): skipped, and with no parent → None.
+fn field_flags_wrong_value_type_returns_zero() {
+    // qpdf's getFlags converts a present non-integer /Ff to zero.
     let bytes = doc(vec![(10, "<< /Type /Annot /Ff /Nope >>".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_flags().unwrap(), None);
+    assert_eq!(field.field_flags().unwrap(), Some(0));
 }
 
 #[test]
@@ -208,14 +208,14 @@ fn field_flags_direct_null_inherits_parent() {
 }
 
 #[test]
-fn field_flags_parent_not_dictionary_errors() {
+fn field_flags_parent_not_dictionary_returns_none() {
     let bytes = doc(vec![
         (10, "<< /Type /Annot /Parent 11 0 R >>".into()),
         (11, "42".into()),
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(field.field_flags());
+    assert_eq!(field.field_flags().unwrap(), None);
 }
 
 #[test]
