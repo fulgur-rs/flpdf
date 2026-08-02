@@ -8,21 +8,63 @@ use crate::pipeline::lzw::LzwDecoder;
 use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
 use crate::pipeline::run_length::{RunLength, RunLengthAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
-use crate::{Error, Object, Result};
+use crate::{Dictionary, Error, Object, Result};
 use std::cell::Cell;
 use std::rc::Rc;
 
 pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds configured limit of";
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FilterSpec<'a> {
-    pub(crate) name: &'a [u8],
-    pub(crate) decode_params: Option<&'a Object>,
+/// Bounded `/DecodeParms` view: everything `StreamFilter::set_decode_params`
+/// needs, with no `Object` or `ObjectHandle` left in it.
+///
+/// `Absent` covers both a missing key and an explicit null, matching
+/// `QPDF_Stream::filterable`'s treatment of a null `/DecodeParms`.
+/// `Present` carries the dictionary's entries in iteration order; a present
+/// non-dictionary yields `Present` with no entries, mirroring
+/// `SF_FlateLzwDecode::setDecodeParms`, which warns and treats a
+/// non-dictionary as an empty dictionary while remaining filterable.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DecodeParams {
+    Absent,
+    Present(Vec<(Vec<u8>, ParamValue)>),
 }
 
-impl FilterSpec<'_> {
+/// A `/DecodeParms` value reduced to the bounded scalars any filter reads.
+///
+/// `Int` carries `getIntValueAsInt`'s saturating clamp. `Name` exists for
+/// `Crypt`'s `/Name`, which selects the crypt filter — carrying it now keeps
+/// Phase 3's AES/Crypt cutover from having to widen this shared type.
+/// `Other` is every remaining shape, which every current filter rejects the
+/// same way `clamped_int_param` rejected a non-integer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ParamValue {
+    Int(i32),
+    Name(Vec<u8>),
+    Other,
+}
+
+impl DecodeParams {
+    pub(crate) fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    pub(crate) fn entries(&self) -> &[(Vec<u8>, ParamValue)] {
+        match self {
+            Self::Absent => &[],
+            Self::Present(entries) => entries,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FilterSpec {
+    pub(crate) name: Vec<u8>,
+    pub(crate) decode_params: DecodeParams,
+}
+
+impl FilterSpec {
     pub(crate) fn normalized_name(&self) -> &[u8] {
-        normalize_filter_name(self.name)
+        normalize_filter_name(&self.name)
     }
 }
 
@@ -39,10 +81,10 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
-pub(crate) fn decode_filter_specs<'a>(
-    filter: Option<&'a Object>,
-    decode_params: Option<&'a Object>,
-) -> Result<Vec<FilterSpec<'a>>> {
+pub(crate) fn decode_filter_specs_from_object(
+    filter: Option<&Object>,
+    decode_params: Option<&Object>,
+) -> Result<Vec<FilterSpec>> {
     let names: Vec<&[u8]> = match filter {
         None | Some(Object::Null) => return Ok(Vec::new()),
         Some(Object::Name(name)) => vec![name],
@@ -86,10 +128,68 @@ pub(crate) fn decode_filter_specs<'a>(
         .into_iter()
         .zip(params)
         .map(|(name, decode_params)| FilterSpec {
-            name,
-            decode_params,
+            name: name.to_vec(),
+            decode_params: decode_params_from_object(decode_params),
         })
         .collect())
+}
+
+fn decode_params_from_object(params: Option<&Object>) -> DecodeParams {
+    match params {
+        None | Some(Object::Null) => DecodeParams::Absent,
+        Some(object) => DecodeParams::Present(match object.as_dict() {
+            Some(dict) => dict
+                .iter()
+                .map(|(key, value)| (key.to_vec(), param_value_from_object(value)))
+                .collect(),
+            None => Vec::new(),
+        }),
+    }
+}
+
+fn param_value_from_object(value: &Object) -> ParamValue {
+    match clamped_int_param(value) {
+        Some(int) => ParamValue::Int(int),
+        None => match value.as_name() {
+            Some(name) => ParamValue::Name(name.to_vec()),
+            None => ParamValue::Other,
+        },
+    }
+}
+
+/// Re-materialize the `Object` shape `StreamFilter::set_decode_params` still
+/// takes, bridging the shape-neutral `FilterSpec` to the not-yet-migrated
+/// filters. Removed once `set_decode_params` and the Crypt stage provider take
+/// `&DecodeParams` directly.
+///
+/// The round trip is lossy in exactly one way: a present *non-dictionary*
+/// reduces to `Present(vec![])` and comes back as an empty dictionary, so
+/// `SF_FlateLzwDecode::setDecodeParms`'s early `return true` for a
+/// non-dictionary becomes a fall-through to its trailing
+/// `(predictor > 1) && (columns == 0)` check. Both answer `true` only because
+/// every caller applies the parameters to a freshly constructed filter, whose
+/// defaults are `predictor = 1, columns = 1`. Reusing one adapter across specs
+/// would break that equivalence.
+pub(crate) fn decode_params_to_object(params: &DecodeParams) -> Option<Object> {
+    if params.is_absent() {
+        return None;
+    }
+    let mut dictionary = Dictionary::new();
+    for (key, value) in params.entries() {
+        dictionary.insert(key, param_value_to_object(value));
+    }
+    Some(Object::Dictionary(dictionary))
+}
+
+fn param_value_to_object(value: &ParamValue) -> Object {
+    match value {
+        ParamValue::Int(int) => Object::Integer(i64::from(*int)),
+        ParamValue::Name(name) => Object::Name(name.clone()),
+        // Every filter reads a parameter through `clamped_int_param`, which
+        // answers `None` for any non-integer, so the simplest non-integer
+        // object stands in for every remaining shape.
+        ParamValue::Other => Object::Null,
+    }
 }
 
 struct OutputBuffer {
@@ -813,9 +913,10 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs, decode_flate, decode_flate_chunks, encode_flate, encode_run_length,
-        ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
-        FlateLzwStreamFilter, OutputBuffer, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        decode_filter_specs_from_object, decode_flate, decode_flate_chunks, encode_flate,
+        encode_run_length, ignore_codec_warning, ignore_warning, normalize_filter_name,
+        stream_filter_for, DecodeParams, FlateLzwStreamFilter, OutputBuffer, ParamValue, Pipeline,
+        StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::pipeline::lzw::pack_codes;
     use crate::{Dictionary, Error, Object};
@@ -832,13 +933,14 @@ mod tests {
             Object::Name(b"FlateDecode".to_vec()),
             Object::Name(b"ASCII85Decode".to_vec()),
         ]);
-        let params = Object::Dictionary(Dictionary::new());
+        let decode_parms = params(&[("Columns", Object::Integer(7))]);
 
-        let specs = decode_filter_specs(Some(&filter), Some(&params)).unwrap();
+        let specs = decode_filter_specs_from_object(Some(&filter), Some(&decode_parms)).unwrap();
 
+        let replicated = DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(7))]);
         assert_eq!(specs.len(), 2);
-        assert!(std::ptr::eq(specs[0].decode_params.unwrap(), &params));
-        assert!(std::ptr::eq(specs[1].decode_params.unwrap(), &params));
+        assert_eq!(specs[0].decode_params, replicated);
+        assert_eq!(specs[1].decode_params, replicated);
     }
 
     #[test]
@@ -849,7 +951,7 @@ mod tests {
         ]);
         let params = Object::Array(vec![Object::Null]);
 
-        let error = decode_filter_specs(Some(&filter), Some(&params)).unwrap_err();
+        let error = decode_filter_specs_from_object(Some(&filter), Some(&params)).unwrap_err();
 
         assert!(matches!(error, Error::Unsupported(_)));
         assert_eq!(
@@ -863,17 +965,17 @@ mod tests {
         let filter = Object::Name(b"Fl".to_vec());
         let params = Object::Array(Vec::new());
 
-        let specs = decode_filter_specs(Some(&filter), Some(&params)).unwrap();
+        let specs = decode_filter_specs_from_object(Some(&filter), Some(&params)).unwrap();
 
         assert_eq!(specs[0].normalized_name(), b"FlateDecode");
-        assert!(specs[0].decode_params.is_none());
+        assert!(specs[0].decode_params.is_absent());
     }
 
     #[test]
     fn no_filter_ignores_decode_parms() {
         let params = Object::Array(vec![Object::Integer(1)]);
 
-        let specs = decode_filter_specs(None, Some(&params)).unwrap();
+        let specs = decode_filter_specs_from_object(None, Some(&params)).unwrap();
 
         assert!(specs.is_empty());
     }
@@ -882,7 +984,7 @@ mod tests {
     fn non_name_filter_item_is_rejected_before_decode() {
         let filter = Object::Array(vec![Object::Integer(1)]);
 
-        let error = decode_filter_specs(Some(&filter), None).unwrap_err();
+        let error = decode_filter_specs_from_object(Some(&filter), None).unwrap_err();
 
         assert!(matches!(error, Error::Unsupported(_)));
         assert_eq!(
@@ -893,7 +995,7 @@ mod tests {
 
     #[test]
     fn scalar_non_name_filter_is_rejected_before_decode() {
-        let error = decode_filter_specs(Some(&Object::Integer(1)), None).unwrap_err();
+        let error = decode_filter_specs_from_object(Some(&Object::Integer(1)), None).unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -906,9 +1008,52 @@ mod tests {
         let filter = Object::Array(Vec::new());
         let params = Object::Array(vec![Object::Integer(1)]);
 
-        assert!(decode_filter_specs(Some(&filter), Some(&params))
-            .unwrap()
-            .is_empty());
+        assert!(
+            decode_filter_specs_from_object(Some(&filter), Some(&params))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn object_shape_reader_distinguishes_absent_null_and_present_non_dictionary() {
+        let name = Object::Name(b"FlateDecode".to_vec());
+
+        let absent = decode_filter_specs_from_object(Some(&name), None).unwrap();
+        assert!(matches!(absent[0].decode_params, DecodeParams::Absent));
+        assert!(absent[0].decode_params.entries().is_empty());
+
+        let null = decode_filter_specs_from_object(Some(&name), Some(&Object::Null)).unwrap();
+        assert!(matches!(null[0].decode_params, DecodeParams::Absent));
+
+        let scalar = Object::Integer(1);
+        let present = decode_filter_specs_from_object(Some(&name), Some(&scalar)).unwrap();
+        // qpdf's SF_FlateLzwDecode treats a non-dictionary as an empty
+        // dictionary, but the default StreamFilter::set_decode_params rejects
+        // any non-null.
+        assert!(matches!(present[0].decode_params, DecodeParams::Present(_)));
+        assert!(present[0].decode_params.entries().is_empty());
+    }
+
+    #[test]
+    fn object_shape_reader_reduces_each_parameter_value_to_its_bounded_shape() {
+        let name = Object::Name(b"FlateDecode".to_vec());
+        let dictionary = params(&[
+            ("Columns", Object::Integer(i64::from(i32::MAX) + 10)),
+            ("Name", Object::Name(b"Identity".to_vec())),
+            ("Whatever", Object::Null),
+        ]);
+
+        let specs = decode_filter_specs_from_object(Some(&name), Some(&dictionary)).unwrap();
+
+        assert_eq!(
+            specs[0].decode_params.entries().to_vec(),
+            vec![
+                (b"Columns".to_vec(), ParamValue::Int(i32::MAX)),
+                (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
+                (b"Whatever".to_vec(), ParamValue::Other),
+            ]
+        );
     }
 
     #[test]
@@ -919,13 +1064,15 @@ mod tests {
     #[test]
     fn one_element_decode_parms_array_aligns_with_name_filter() {
         let filter = Object::Name(b"FlateDecode".to_vec());
-        let params_item = Object::Dictionary(Dictionary::new());
-        let params = Object::Array(vec![params_item.clone()]);
+        let decode_parms = Object::Array(vec![params(&[("Columns", Object::Integer(7))])]);
 
-        let specs = decode_filter_specs(Some(&filter), Some(&params)).unwrap();
+        let specs = decode_filter_specs_from_object(Some(&filter), Some(&decode_parms)).unwrap();
 
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].decode_params, Some(&params_item));
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(7))])
+        );
     }
 
     #[test]
@@ -943,7 +1090,7 @@ mod tests {
 
         for &(abbreviation, expected) in cases {
             let filter = Object::Name(abbreviation.to_vec());
-            let specs = decode_filter_specs(Some(&filter), None).unwrap();
+            let specs = decode_filter_specs_from_object(Some(&filter), None).unwrap();
             assert_eq!(specs[0].normalized_name(), expected);
         }
     }

@@ -7,8 +7,8 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs, encode_flate, encode_run_length, stream_filter_for, FilterDecodePhase,
-    DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs_from_object, decode_params_to_object, encode_flate, encode_run_length,
+    stream_filter_for, DecodeParams, FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -353,7 +353,7 @@ where
     if let Some(Object::Array(filters)) = filter {
         validate_filter_chain_count(filters.len(), limits.max_filter_chain)?;
     }
-    let specs = decode_filter_specs(filter, decode_params)?;
+    let specs = decode_filter_specs_from_object(filter, decode_params)?;
     validate_filter_chain_count(specs.len(), limits.max_filter_chain)?;
     let prepared = prepare_decode_filters(specs)?;
     let stage_count = prepared.len();
@@ -366,7 +366,8 @@ where
         let is_last_stage = stage_index + 1 == stage_count;
         let next = match &mut stage.stage {
             PreparedStage::Crypt { decode_params } => {
-                let data = decrypt_crypt(*decode_params, decoded.as_ref())?;
+                let bridged = decode_params_to_object(decode_params);
+                let data = decrypt_crypt(bridged.as_ref(), decoded.as_ref())?;
                 append_final_crypt_events(
                     is_last_stage,
                     &mut events,
@@ -380,7 +381,7 @@ where
             PreparedStage::Codec { adapter } => {
                 let mut next_pending_data_boundary = pending_data_boundary.map(|boundary| {
                     let prefix_data = &decoded[..boundary.0];
-                    let prefix = decode_codec_prefix(stage.spec, prefix_data, limits);
+                    let prefix = decode_codec_prefix(&stage.spec, prefix_data, limits);
                     let input_end = if boundary.1 {
                         prefix.data.len()
                     } else {
@@ -503,40 +504,38 @@ where
 ///
 /// Every name flpdf decodes resolves to a registered `StreamFilter`;
 /// `Crypt` is the one stage the caller decrypts instead.
-enum PreparedStage<'a> {
+enum PreparedStage {
     Crypt {
-        decode_params: Option<&'a Object>,
+        decode_params: DecodeParams,
     },
     Codec {
         adapter: Box<dyn crate::stream_filter::StreamFilter>,
     },
 }
 
-struct PreparedDecodeFilter<'a> {
-    spec: crate::stream_filter::FilterSpec<'a>,
-    stage: PreparedStage<'a>,
+struct PreparedDecodeFilter {
+    spec: crate::stream_filter::FilterSpec,
+    stage: PreparedStage,
 }
 
-fn prepare_decode_filters<'a>(
-    specs: Vec<crate::stream_filter::FilterSpec<'a>>,
-) -> Result<Vec<PreparedDecodeFilter<'a>>> {
+fn prepare_decode_filters(
+    specs: Vec<crate::stream_filter::FilterSpec>,
+) -> Result<Vec<PreparedDecodeFilter>> {
     let mut prepared = Vec::with_capacity(specs.len());
     for spec in specs {
-        let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
+        let filter_name = spec.normalized_name();
         if filter_name == b"Crypt" {
-            prepared.push(PreparedDecodeFilter {
-                spec,
-                stage: PreparedStage::Crypt {
-                    decode_params: spec.decode_params,
-                },
-            });
+            let stage = PreparedStage::Crypt {
+                decode_params: spec.decode_params.clone(),
+            };
+            prepared.push(PreparedDecodeFilter { spec, stage });
             continue;
         }
 
         let Some(mut adapter) = stream_filter_for(filter_name) else {
             return Err(undecodable_filter_error(filter_name));
         };
-        if !adapter.set_decode_params(spec.decode_params) {
+        if !adapter.set_decode_params(decode_params_to_object(&spec.decode_params).as_ref()) {
             return Err(Error::Unsupported(format!(
                 "stream filter {} does not support supplied /DecodeParms",
                 String::from_utf8_lossy(filter_name)
@@ -666,14 +665,14 @@ fn append_positioned_events(
 }
 
 fn decode_codec_prefix(
-    spec: crate::stream_filter::FilterSpec<'_>,
+    spec: &crate::stream_filter::FilterSpec,
     data: &[u8],
     limits: DecodeLimits,
 ) -> crate::stream_filter::FilterDecodeOutcome {
-    let filter_name = crate::stream_filter::normalize_filter_name(spec.name);
+    let filter_name = spec.normalized_name();
     let mut adapter =
         stream_filter_for(filter_name).expect("a prepared codec has a registered prefix decoder");
-    debug_assert!(adapter.set_decode_params(spec.decode_params));
+    debug_assert!(adapter.set_decode_params(decode_params_to_object(&spec.decode_params).as_ref()));
     adapter
         .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
         .expect("preflighted codec prefix pipeline is infallible")
@@ -697,13 +696,13 @@ fn encode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    let specs = decode_filter_specs(filter, decode_params)?;
+    let specs = decode_filter_specs_from_object(filter, decode_params)?;
     // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
     // order, so encoding must apply them in reverse for round-tripping.
     let mut encoded = stream_data.to_vec();
     for spec in specs.into_iter().rev() {
         let after_predictor =
-            apply_encode_params(spec.normalized_name(), spec.decode_params, &encoded)?;
+            apply_encode_params(spec.normalized_name(), &spec.decode_params, &encoded)?;
         encoded = if spec.normalized_name() == b"FlateDecode" {
             encode_flate(&after_predictor)?
         } else {
@@ -717,10 +716,11 @@ fn encode_stream_data_with_filters(
 /// Apply the PNG predictor selected by `/DecodeParms`, if any.
 fn apply_encode_params(
     filter_name: &[u8],
-    decode_params: Option<&Object>,
+    decode_params: &DecodeParams,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    match crate::stream_filter::png_encode_geometry(filter_name, decode_params)? {
+    let decode_params = decode_params_to_object(decode_params);
+    match crate::stream_filter::png_encode_geometry(filter_name, decode_params.as_ref())? {
         None => Ok(stream_data.to_vec()),
         Some((columns, colors, bits_per_component)) => crate::stream_filter::encode_png_predictor(
             stream_data,
@@ -2252,6 +2252,36 @@ mod tests {
         let encoded = flate_only(&[0, 0x41, 0, 0x42]);
 
         assert_eq!(decode_stream_data(&dict, &encoded).unwrap(), b"AB");
+    }
+
+    /// A `/DecodeParms` value that is not an integer must still reach the
+    /// filter as a non-integer once the shape-neutral `FilterSpec` has reduced
+    /// it to `ParamValue::Name` or `ParamValue::Other`, so the stream stays
+    /// unfilterable on both the decode and the encode side.
+    #[test]
+    fn non_integer_decode_params_values_remain_unfilterable() {
+        for value in [Object::Name(b"12".to_vec()), Object::Null] {
+            let mut parms = Dictionary::new();
+            parms.insert("Predictor", value.clone());
+            let mut dict = Dictionary::new();
+            dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+            dict.insert("DecodeParms", Object::Dictionary(parms));
+
+            let expected =
+                "unsupported PDF feature: stream filter FlateDecode does not support supplied /DecodeParms";
+            assert_eq!(
+                decode_stream_data(&dict, b"not deflate data")
+                    .unwrap_err()
+                    .to_string(),
+                expected,
+                "decode {value:?}"
+            );
+            assert_eq!(
+                encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+                expected,
+                "encode {value:?}"
+            );
+        }
     }
 
     #[test]
