@@ -192,6 +192,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             return Ok(false);
         };
         if !delete_embedded_file(self.pdf, key)? {
+            // cov:ignore: the same exclusive helper borrow just found this key
             return Ok(false);
         }
         if let Object::Reference(object_ref) = removed {

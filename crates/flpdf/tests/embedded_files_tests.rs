@@ -21,8 +21,9 @@
 //!   W8. Round-trip: insert → list_embedded_files → same sorted keys.
 
 use flpdf::{
-    delete_embedded_file, insert_embedded_file, list_embedded_files, EmbeddedFileDocumentHelper,
-    EmbeddedFileStream, FileSpec, Object, ObjectHandle, ObjectRef, Pdf, LEAF_MAX,
+    delete_embedded_file, insert_embedded_file, list_embedded_files, Dictionary,
+    EmbeddedFileDocumentHelper, EmbeddedFileStream, FileSpec, Object, ObjectHandle, ObjectRef, Pdf,
+    LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -1377,6 +1378,46 @@ fn helper_absent_tree_has_no_entries_or_lookup() {
         .get_embedded_file(b"missing")
         .expect("lookup")
         .is_none());
+}
+
+#[test]
+fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
+    let mut no_root = open(build_no_root_pdf());
+    assert!(!no_root
+        .embedded_files()
+        .has_embedded_files()
+        .expect("missing root"));
+
+    let mut non_dict_catalog = open(build_single_level_pdf());
+    let catalog_ref = non_dict_catalog.root_ref().expect("root");
+    non_dict_catalog.set_object(catalog_ref, Object::Integer(7));
+    assert!(!non_dict_catalog
+        .embedded_files()
+        .has_embedded_files()
+        .expect("non-dict catalog"));
+
+    let mut non_dict_names = open(build_non_dict_names_pdf());
+    assert!(!non_dict_names
+        .embedded_files()
+        .has_embedded_files()
+        .expect("non-dict names"));
+
+    let mut non_dict_embedded_files = open(build_no_embedded_files_pdf());
+    let catalog_ref = non_dict_embedded_files.root_ref().expect("root");
+    let mut catalog = non_dict_embedded_files
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dict")
+        .clone();
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles".to_string(), Object::Integer(7));
+    catalog.insert("Names".to_string(), Object::Dictionary(names));
+    non_dict_embedded_files.set_object(catalog_ref, Object::Dictionary(catalog));
+    assert!(!non_dict_embedded_files
+        .embedded_files()
+        .has_embedded_files()
+        .expect("non-dict embedded files"));
 }
 
 #[test]
