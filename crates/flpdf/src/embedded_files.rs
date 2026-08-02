@@ -163,6 +163,17 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         Ok(())
     }
 
+    fn store_embedded_files_root_if_changed(
+        &mut self,
+        original_root: &Object,
+        root: Object,
+    ) -> Result<()> {
+        if &root != original_root {
+            self.store_embedded_files_root(root)?;
+        }
+        Ok(())
+    }
+
     fn live_embedded_file(
         &mut self,
         path: &[usize],
@@ -237,16 +248,17 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.name_tree()? else {
             return Ok(BTreeMap::new());
         };
+        let original_root = tree.root().clone();
         let mut entries = Vec::new();
         let mut cursor = match tree.begin(self.pdf) {
             Ok(cursor) => cursor,
             Err(error) => {
-                self.store_embedded_files_root(tree.into_root())?;
+                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
                 return Err(error);
             }
         };
         if cursor.positioned() && cursor.current().is_none() {
-            self.store_embedded_files_root(tree.into_root())?;
+            self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
             return Err(Error::Internal(
                 "attempt made to dereference an invalid name/number tree iterator".to_string(),
             ));
@@ -257,11 +269,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 .flatten();
             entries.push((key, value, position));
             if let Err(error) = cursor.next(&mut tree, self.pdf) {
-                self.store_embedded_files_root(tree.into_root())?;
+                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
                 return Err(error);
             }
         }
-        self.store_embedded_files_root(tree.into_root())?;
+        self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
         let mut result = BTreeMap::new();
         for (key, value, direct_path) in entries {
             let handle = match value {
@@ -294,10 +306,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         let Some(mut tree) = self.name_tree()? else {
             return Ok(None);
         };
+        let original_root = tree.root().clone();
         let cursor = tree.find(self.pdf, key, false)?;
         let value = cursor.current().map(|(_, value)| value.clone());
         let direct_path = cursor.selected_path();
-        self.store_embedded_files_root(tree.into_root())?;
+        self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
         match value {
             Some(Object::Reference(object_ref)) => Ok(Some(self.pdf.get_object_handle(object_ref))), // cov:ignore: LLVM assigns the exercised indirect arm to the surrounding match
             Some(_) => match direct_path {
@@ -950,6 +963,35 @@ mod tests {
         Pdf::open(std::io::Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
     }
 
+    fn indirect_names_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Names 4 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /EmbeddedFiles << /Names [ (entry) 5 0 R ] >> >>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n<< /Type /Filespec /F (entry.txt) >>\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n0000000000 65535 f \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n{:010} 00000 n \n",
+            off1, off2, off3, off4, off5,
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
     // ── Test: add 2, remove 1, check list has 1 ──────────────────────────────
 
     #[test]
@@ -979,6 +1021,29 @@ mod tests {
         // Deleted key must not appear
         let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
         assert!(!keys.contains(&b"a.txt".as_ref()), "a.txt must be gone");
+    }
+
+    #[test]
+    fn helper_reads_do_not_dirty_an_unchanged_indirect_names_dictionary() {
+        let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
+        let names_ref = ObjectRef::new(4, 0);
+        assert!(!pdf.is_dirty(names_ref));
+
+        assert_eq!(
+            pdf.embedded_files()
+                .get_embedded_files()
+                .expect("list")
+                .len(),
+            1
+        );
+        assert!(!pdf.is_dirty(names_ref));
+
+        assert!(pdf
+            .embedded_files()
+            .get_embedded_file(b"entry")
+            .expect("lookup")
+            .is_some());
+        assert!(!pdf.is_dirty(names_ref));
     }
 
     // ── Test: transitively-unreachable subgraph is swept (flpdf-eg3) ─────────
