@@ -3324,8 +3324,8 @@ fn run_rewrite(
 /// (`--generate-appearances`).
 ///
 /// Walks every page's `/Annots`, keeps only Widget annotations whose `/AP` `/N`
-/// is missing, and renders an appearance from the field's `/FT` (`Tx` → text,
-/// `Btn` → button, `Ch` → choice). Widgets that already carry an `/AP` `/N` are
+/// is missing, and renders an appearance from the terminal field's `/FT`
+/// (`Tx` → text, `Ch` → choice). Widgets that already carry an `/AP` `/N` are
 /// left untouched, matching qpdf which only fills in *missing* appearances.
 ///
 /// Review-pattern compliance:
@@ -3340,16 +3340,16 @@ fn run_rewrite(
 /// per-widget mutation loop holds a single `&mut pdf` borrow at a time.
 fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
     // Collect candidate widget refs first (the enumeration borrows `pdf`).
-    let mut candidates: Vec<ObjectRef> = Vec::new();
+    let mut candidates: Vec<(ObjectRef, ObjectRef)> = Vec::new();
     for (_page_ref, annots) in enumerate_document_annotations(pdf)? {
         for annot in annots {
-            if annot.is_widget {
-                candidates.push(annot.annot_ref);
+            if let Some(field_ref) = annot.field_ref.filter(|_| annot.is_widget) {
+                candidates.push((field_ref, annot.annot_ref));
             }
         }
     }
 
-    for widget_ref in candidates {
+    for (field_ref, widget_ref) in candidates {
         // Skip widgets that already have a normal appearance (/AP /N). qpdf
         // only synthesizes appearances for fields that lack them.
         let has_normal = {
@@ -3367,22 +3367,7 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             continue;
         }
 
-        // Dispatch on the inherited /FT (resolved through the field tree). The
-        // generate_* helpers each re-verify /FT and return None on a mismatch,
-        // so this is a fast-path filter that avoids three speculative calls.
-        let field_type = {
-            let mut helper = FormFieldObjectHelper::new(widget_ref, pdf);
-            helper.field_type()?
-        };
-        match field_type.as_deref() {
-            Some(b"/Tx") | Some(b"/Ch") => {
-                FormFieldObjectHelper::new(widget_ref, pdf).generate_appearance()?;
-            }
-            Some(b"/Btn") => {
-                FormFieldObjectHelper::new(widget_ref, pdf).generate_button_appearance()?;
-            }
-            _ => {}
-        }
+        FormFieldObjectHelper::new(field_ref, pdf).generate_appearance_for(widget_ref)?;
     }
 
     Ok(())

@@ -798,6 +798,15 @@ fn generates_a_field_value_on_its_separate_widget() {
         .generate_appearance_for(ObjectRef::new(11, 0))
         .unwrap()
         .is_some());
+    assert!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AP")
+            .is_none(),
+        "terminal field must not receive its widget's appearance"
+    );
     assert!(pdf
         .resolve(ObjectRef::new(11, 0))
         .unwrap()
