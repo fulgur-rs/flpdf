@@ -172,7 +172,7 @@ Move only the public field orchestration out of `appearance.rs`; keep pure drawi
 
 - [ ] **Step 5: Run mutation and appearance suites**
 
-Run: `cargo test -p flpdf --test form_field_object_helper_tests && cargo test -p flpdf appearance::tests`
+Run: `cargo test -p flpdf --test form_field_object_helper_tests && cargo test -p flpdf --lib form_field_object_helper::rendering::tests`
 
 Expected: PASS.
 
@@ -239,7 +239,7 @@ Use tiny synthetic PDFs to compare qpdf 11.9.0 behavior for indirect field scala
 
 - [ ] **Step 2: Run all focused suites**
 
-Run: `cargo test -p flpdf --test form_field_object_helper_tests && cargo test -p flpdf --test annotation_helper_tests && cargo test -p flpdf --test annotation_helper_error_tests && cargo test -p flpdf --lib appearance::tests && cargo test -p flpdf-cli --test cli_tests appearance`
+Run: `cargo test -p flpdf --test form_field_object_helper_tests && cargo test -p flpdf --test annotation_helper_tests && cargo test -p flpdf --test annotation_helper_error_tests && cargo test -p flpdf --lib form_field_object_helper::rendering::tests && cargo test -p flpdf-cli --test cli_tests appearance`
 
 Expected: PASS.
 

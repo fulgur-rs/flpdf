@@ -79,6 +79,84 @@ fn reads_indirect_field_attributes_and_names() {
 }
 
 #[test]
+fn typed_inheritable_values_follow_terminal_holder_chains_without_losing_raw_identity() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /V 20 0 R /DV 23 0 R /Ff 26 0 R /Parent 11 0 R >>".into(),
+        ),
+        (11, "<< /V (parent) /DV (parent-default) /Ff 1 >>".into()),
+        (20, "null".into()),
+        (21, "null".into()),
+        (22, "(current)".into()),
+        (23, "null".into()),
+        (24, "null".into()),
+        (25, "(default)".into()),
+        (26, "null".into()),
+        (27, "null".into()),
+        (28, "4097".into()),
+    ]);
+    let mut pdf = open(bytes);
+    for (from, to) in [(20, 21), (21, 22), (23, 24), (24, 25), (26, 27), (27, 28)] {
+        pdf.set_object(
+            ObjectRef::new(from, 0),
+            Object::Reference(ObjectRef::new(to, 0)),
+        );
+    }
+
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    assert_eq!(
+        field.field_value().unwrap(),
+        Some(Object::String(b"current".to_vec()))
+    );
+    assert_eq!(
+        field.field_default_value().unwrap(),
+        Some(Object::String(b"default".to_vec()))
+    );
+    assert_eq!(field.field_flags().unwrap(), Some(4097));
+    assert_eq!(
+        field.field_value_handle().unwrap().unwrap().object_ref(),
+        Some(ObjectRef::new(20, 0)),
+        "the typed terminal value must not replace qpdf's raw indirect handle identity"
+    );
+}
+
+#[test]
+fn field_name_accessors_follow_terminal_holder_chains() {
+    let bytes = doc(vec![
+        (10, "<< /T 20 0 R /TU 23 0 R /TM 26 0 R >>".into()),
+        (20, "null".into()),
+        (21, "null".into()),
+        (22, "(partial)".into()),
+        (23, "null".into()),
+        (24, "null".into()),
+        (25, "(alternative)".into()),
+        (26, "null".into()),
+        (27, "null".into()),
+        (28, "(mapping)".into()),
+    ]);
+    let mut pdf = open(bytes);
+    for (from, to) in [(20, 21), (21, 22), (23, 24), (24, 25), (26, 27), (27, 28)] {
+        pdf.set_object(
+            ObjectRef::new(from, 0),
+            Object::Reference(ObjectRef::new(to, 0)),
+        );
+    }
+
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+    assert_eq!(field.partial_name().unwrap(), Some(b"partial".to_vec()));
+    assert_eq!(
+        field.fully_qualified_name().unwrap(),
+        Some(b"partial".to_vec())
+    );
+    assert_eq!(
+        field.alternative_name().unwrap(),
+        Some(b"alternative".to_vec())
+    );
+    assert_eq!(field.mapping_name().unwrap(), Some(b"mapping".to_vec()));
+}
+
+#[test]
 fn qualifies_names_from_the_parent_chain() {
     let bytes = doc(vec![
         (10, "<< /T (child) /Parent 11 0 R >>".into()),
@@ -459,6 +537,22 @@ fn set_field_attribute_string_writes_a_qpdf_unicode_string_on_the_field() {
             "日本語".as_bytes()
         )))
     );
+}
+
+#[test]
+fn set_field_attribute_preserves_non_utf8_key_bytes() {
+    let bytes = doc(vec![(10, "<< /FT /Tx >>".into())]);
+    let mut pdf = open(bytes);
+    let raw_key = b"Custom\xffKey";
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_field_attribute(raw_key, Object::Integer(42))
+        .unwrap();
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    let field = field.as_dict().unwrap();
+    assert_eq!(field.get(raw_key), Some(&Object::Integer(42)));
+    assert_eq!(field.get("Custom\u{fffd}Key"), None);
 }
 
 #[test]

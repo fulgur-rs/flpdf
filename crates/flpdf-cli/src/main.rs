@@ -3323,10 +3323,10 @@ fn run_rewrite(
 /// Generate `/AP` `/N` appearance streams for widget annotations that lack one
 /// (`--generate-appearances`).
 ///
-/// Walks every page's `/Annots`, keeps only Widget annotations whose `/AP` `/N`
-/// is missing, and renders an appearance from the terminal field's `/FT`
-/// (`Tx` → text, `Ch` → choice). Widgets that already carry an `/AP` `/N` are
-/// left untouched, matching qpdf which only fills in *missing* appearances.
+/// Walks every page's `/Annots`. Every button field re-applies its current
+/// value so `/AS` stays synchronized with `/V`; non-button widgets whose
+/// `/AP` `/N` is missing render from the terminal field's `/FT` (`Tx` → text,
+/// `Ch` → choice). Existing non-button `/AP` `/N` streams stay untouched.
 ///
 /// Review-pattern compliance:
 /// - #2 (indirect references): `/FT` is read via [`FormFieldObjectHelper::field_type`]
@@ -3350,8 +3350,22 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
     }
 
     for (field_ref, widget_ref) in candidates {
-        // Skip widgets that already have a normal appearance (/AP /N). qpdf
-        // only synthesizes appearances for fields that lack them.
+        // qpdf routes every /Btn through setV(getValue()), regardless of
+        // whether /AP/N exists. set_value owns checkbox/radio synchronization
+        // and intentionally ignores pushbuttons and invalid values.
+        let is_button = FormFieldObjectHelper::new(field_ref, pdf)
+            .field_type()?
+            .as_deref()
+            == Some(b"/Btn");
+        if is_button {
+            let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+            let value = helper.value()?.unwrap_or(Object::Null);
+            helper.set_value(value, false)?;
+            continue;
+        }
+
+        // Skip non-button widgets that already have a normal appearance
+        // (/AP /N). qpdf only synthesizes Tx/Ch appearances when missing.
         let has_normal = {
             let mut helper = AnnotationObjectHelper::new(widget_ref, pdf);
             // Treat /AP/N == null the same as absent. The flattening pass
@@ -3364,15 +3378,6 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             }
         };
         if has_normal {
-            // qpdf does not synthesize button appearances.  It re-applies the
-            // current `/V` instead, allowing the field helper to select the
-            // matching pre-existing normal-appearance state for `/AS`.
-            let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
-            if helper.is_checkbox()? || helper.is_radio_button()? {
-                if let Some(value) = helper.value()? {
-                    helper.set_value(value, false)?;
-                }
-            }
             continue;
         }
 

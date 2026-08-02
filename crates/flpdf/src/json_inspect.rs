@@ -1586,7 +1586,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     // Compute fullname: parent.T or just T at root.
     let t_string = match field_dict.get(b"T".as_slice()) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            let handle = pdf.resolve_object_handle_to_terminal(handle)?;
             handle
                 .as_string()
                 .map(|bytes| {
@@ -1623,16 +1623,17 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /V — value, run through pdf_object_to_json. Inherited from /Parent.
-    let value = match FormFieldObjectHelper::new(field_ref, pdf).field_value()? {
-        Some(v) => lift_and_convert_to_json(pdf, &v)?,
+    let value = match FormFieldObjectHelper::new(field_ref, pdf).field_value_handle()? {
+        Some(value) => pdf_object_to_json(&value)?,
         None => Json::make_null(),
     };
 
     // /DV — default value. Inherited from /Parent.
-    let defaultvalue = match FormFieldObjectHelper::new(field_ref, pdf).field_default_value()? {
-        Some(v) => lift_and_convert_to_json(pdf, &v)?,
-        None => Json::make_null(),
-    };
+    let defaultvalue =
+        match FormFieldObjectHelper::new(field_ref, pdf).field_default_value_handle()? {
+            Some(value) => pdf_object_to_json(&value)?,
+            None => Json::make_null(),
+        };
 
     // /Ff — field flags integer. Inherited from /Parent.
     let fieldflags = match FormFieldObjectHelper::new(field_ref, pdf).field_flags()? {
@@ -1643,7 +1644,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /TU — alternate name.
     let alternatename = match field_dict.get(b"TU".as_slice()) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            let handle = pdf.resolve_object_handle_to_terminal(handle)?;
             handle
                 .as_string()
                 .map(|bytes| {
@@ -1659,7 +1660,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /TM — mapping name.
     let mappingname = match field_dict.get(b"TM".as_slice()) {
         Some(handle) => {
-            pdf.resolve_object_handle(handle)?;
+            let handle = pdf.resolve_object_handle_to_terminal(handle)?;
             handle
                 .as_string()
                 .map(|bytes| {
@@ -9106,6 +9107,99 @@ mod tests {
             entry[9].1,
             serde_json::Value::String("u:John".to_string()),
             "value must be u:John"
+        );
+    }
+
+    #[test]
+    fn acroform_value_and_default_value_preserve_indirect_handle_identity() {
+        let mut pdf = load_one_page_pdf();
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+        let value_ref = crate::ObjectRef::new(202, 0);
+        let default_ref = crate::ObjectRef::new(203, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("FT", Object::Name(b"Tx".to_vec()));
+        field.insert("V", Object::Reference(value_ref));
+        field.insert("DV", Object::Reference(default_ref));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+        pdf.set_object(value_ref, Object::String(b"current".to_vec()));
+        pdf.set_object(default_ref, Object::String(b"default".to_vec()));
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let fields = top[0].1.as_array().expect("fields must be Array");
+        let entry = object_pairs(&fields[0]);
+        assert_eq!(
+            value_for_key(&entry, "value"),
+            &serde_json::Value::String("202 0 R".to_string())
+        );
+        assert_eq!(
+            value_for_key(&entry, "defaultvalue"),
+            &serde_json::Value::String("203 0 R".to_string())
+        );
+    }
+
+    #[test]
+    fn acroform_name_fields_follow_terminal_holder_chains() {
+        let mut pdf = load_one_page_pdf();
+        let acroform_ref = crate::ObjectRef::new(200, 0);
+        let field_ref = crate::ObjectRef::new(201, 0);
+
+        let mut acroform = Dictionary::new();
+        acroform.insert("Fields", Object::Array(vec![Object::Reference(field_ref)]));
+        patch_acroform(&mut pdf, acroform_ref, acroform);
+
+        let mut field = Dictionary::new();
+        field.insert("T", Object::Reference(crate::ObjectRef::new(202, 0)));
+        field.insert("TU", Object::Reference(crate::ObjectRef::new(205, 0)));
+        field.insert("TM", Object::Reference(crate::ObjectRef::new(208, 0)));
+        pdf.set_object(field_ref, Object::Dictionary(field));
+        for (from, to) in [
+            (202, 203),
+            (203, 204),
+            (205, 206),
+            (206, 207),
+            (208, 209),
+            (209, 210),
+        ] {
+            pdf.set_object(
+                crate::ObjectRef::new(from, 0),
+                Object::Reference(crate::ObjectRef::new(to, 0)),
+            );
+        }
+        pdf.set_object(
+            crate::ObjectRef::new(204, 0),
+            Object::String(b"partial".to_vec()),
+        );
+        pdf.set_object(
+            crate::ObjectRef::new(207, 0),
+            Object::String(b"alternative".to_vec()),
+        );
+        pdf.set_object(
+            crate::ObjectRef::new(210, 0),
+            Object::String(b"mapping".to_vec()),
+        );
+
+        let result = build_acroform_section(&mut pdf).expect("build_acroform_section failed");
+        let top = object_pairs(&result);
+        let fields = top[0].1.as_array().expect("fields must be Array");
+        let entry = object_pairs(&fields[0]);
+        assert_eq!(
+            value_for_key(&entry, "fullname"),
+            &serde_json::Value::String("partial".to_string())
+        );
+        assert_eq!(
+            value_for_key(&entry, "alternatename"),
+            &serde_json::Value::String("alternative".to_string())
+        );
+        assert_eq!(
+            value_for_key(&entry, "mappingname"),
+            &serde_json::Value::String("mapping".to_string())
         );
     }
 

@@ -1071,12 +1071,16 @@ fn walk_signature_field<R: Read + Seek>(
     };
     let field_dict = field_dict.clone();
 
-    let field_name = join_field_name(parent_name, text_entry(pdf, &field_dict, "T")?);
-    if FormFieldObjectHelper::new(field_ref, pdf)
-        .field_type()?
-        .as_deref()
-        == Some(b"/Sig")
-    {
+    let (partial_name, is_signature) = {
+        let mut field = FormFieldObjectHelper::new(field_ref, pdf);
+        let partial_name = field
+            .partial_name()?
+            .map(|name| String::from_utf8_lossy(&name).into_owned());
+        let is_signature = field.field_type()?.as_deref() == Some(b"/Sig");
+        (partial_name, is_signature)
+    };
+    let field_name = join_field_name(parent_name, partial_name);
+    if is_signature {
         if let Some(info) = signature_info_for_field(pdf, field_ref, &field_name)? {
             output.push(info);
         }
@@ -1119,12 +1123,12 @@ fn signature_info_for_field<R: Read + Seek>(
     field_ref: ObjectRef,
     field_name: &str,
 ) -> Result<Option<SignatureInfo>> {
-    let mut field = FormFieldObjectHelper::new(field_ref, pdf);
-    let signature_ref = field.field_value_reference()?;
-    let Some(value) = field.field_value()? else {
+    let Some(value) = FormFieldObjectHelper::new(field_ref, pdf).field_value_handle()? else {
         return Ok(None);
     };
-    let Some(signature_dict) = resolve_dictionary(pdf, value)? else {
+    let signature_ref = value.object_ref().or_else(|| value.as_reference());
+    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    let Object::Dictionary(signature_dict) = value.materialize() else {
         return Ok(None);
     };
     let Some(byte_range_obj) = signature_dict.get("ByteRange").cloned() else {

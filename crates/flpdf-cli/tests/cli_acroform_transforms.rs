@@ -165,6 +165,20 @@ fn checkbox_widget_without_ap() -> Vec<u8> {
     ])
 }
 
+/// Checkbox whose non-`/Off` value has no normal appearance dictionary.
+/// qpdf still routes every `/Btn` through `setV(getValue())`, normalizing the
+/// fallback on-state to `/Yes` even though it cannot update `/AS` without an
+/// identifiable appearance-bearing widget.
+fn checkbox_widget_with_value_without_ap_needing_appearances() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> >> >>\nendobj\n".to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Btn /T (cb1) /Ff 0 /V /On /AS /Off /Rect [100 700 120 720] /P 3 0 R >>\nendobj\n".to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
 /// Checkbox whose existing state appearances disagree with its `/V`.
 /// qpdf 11.9.0 leaves those appearances in place and resets `/AS` to `/V`.
 fn checkbox_widget_with_ap_needing_appearances() -> Vec<u8> {
@@ -410,6 +424,34 @@ fn generate_appearances_checkbox_without_ap_leaves_ap_absent() {
         helper.appearance().unwrap().is_none(),
         "qpdf leaves a button without /AP unchanged"
     );
+}
+
+#[test]
+fn generate_appearances_routes_checkbox_without_ap_through_set_value() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("cb-value-no-ap.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(
+        &input,
+        checkbox_widget_with_value_without_ap_needing_appearances(),
+    )
+    .unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--generate-appearances", "--compress-streams=n"])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let widget_ref = first_widget_ref(&mut pdf);
+    let widget = pdf.resolve(widget_ref).unwrap();
+    let widget = widget.as_dict().unwrap();
+    assert!(matches!(widget.get("V"), Some(Object::Name(name)) if name == b"Yes"));
+    assert!(matches!(widget.get("AS"), Some(Object::Name(name)) if name == b"Off"));
+    assert!(widget.get("AP").is_none());
 }
 
 /// qpdf does not synthesize radio appearances when none exists.

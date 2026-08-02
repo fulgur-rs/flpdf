@@ -5,7 +5,7 @@
 
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
@@ -101,20 +101,34 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         self.resolve_inherited_object(b"V")
     }
 
+    /// Return the inheritable `/V` handle without discarding indirect identity.
+    ///
+    /// Typed consumers should use [`Self::field_value`]. JSON and signature
+    /// inspection use this handle-aware boundary because qpdf's `getValue()`
+    /// keeps the selected `QPDFObjectHandle` indirect while its typed accessors
+    /// transparently dereference the terminal value.
+    pub fn field_value_handle(&mut self) -> Result<Option<ObjectHandle>> {
+        self.resolve_inherited_handle(b"V")
+    }
+
     /// Return the indirect object reference used by the inherited `/V`, when
     /// the selected value is indirect. This preserves the signature
     /// inspector's observable reference reporting without giving consumers a
     /// second parent-chain walker.
     pub fn field_value_reference(&mut self) -> Result<Option<ObjectRef>> {
-        Ok(match self.resolve_inherited_raw(b"V")? {
-            Some(Object::Reference(reference)) => Some(reference),
-            _ => None,
-        })
+        Ok(self
+            .field_value_handle()?
+            .and_then(|value| value.object_ref().or_else(|| value.as_reference())))
     }
 
     /// Return the inheritable `/DV` field default value.
     pub fn field_default_value(&mut self) -> Result<Option<Object>> {
         self.resolve_inherited_object(b"DV")
+    }
+
+    /// Return the inheritable `/DV` handle without discarding indirect identity.
+    pub fn field_default_value_handle(&mut self) -> Result<Option<ObjectHandle>> {
+        self.resolve_inherited_handle(b"DV")
     }
 
     /// Return the inheritable `/V` field value.
@@ -159,17 +173,16 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let mut parts = Vec::new();
 
         while seen.insert(current) {
-            let node_obj = self.pdf.resolve_borrowed(current)?;
-            let Some(dict) = node_obj.as_dict() else {
+            let node = self.pdf.get_object_handle(current);
+            let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
+            let Some(dict) = node.as_dictionary() else {
                 break;
             };
-            let name = dict.get("T").cloned();
-            let parent = match dict.get("Parent") {
-                Some(Object::Reference(parent)) => Some(*parent),
-                _ => None,
-            };
-            let _ = node_obj;
-            if let Some(name) = self.resolve_string(name)? {
+            let name = dict.get(b"T".as_slice()).cloned();
+            let parent = dict
+                .get(b"Parent".as_slice())
+                .and_then(|parent| parent.object_ref().or_else(|| parent.as_reference()));
+            if let Some(name) = self.resolve_string_handle(name)? {
                 parts.push(name);
             }
             match parent {
@@ -323,7 +336,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(mut field) = field.as_dict().cloned() else {
             return Ok(());
         };
-        field.insert(String::from_utf8_lossy(key).into_owned(), value);
+        field.insert(key, value);
         self.pdf
             .set_object(self.field_ref, Object::Dictionary(field));
         Ok(())
@@ -800,10 +813,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn resolve_object(&mut self, value: Object) -> Result<Object> {
-        match value {
-            Object::Reference(reference) => self.pdf.resolve(reference),
-            value => Ok(value),
-        }
+        Ok(resolve_ref_chain(self.pdf, &value)?.0)
     }
 
     /// qpdf's `getKey` returns a null handle for an absent key, an explicit
@@ -861,6 +871,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn resolve_inherited_name(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(value) = self.resolve_inherited_handle(key)? else {
+            return Ok(None);
+        };
+        let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+        Ok(value.as_name())
+    }
+
+    fn resolve_inherited_handle(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
         let mut seen = BTreeSet::new();
         let mut current = self.field_ref;
         let mut depth = 0;
@@ -874,23 +892,19 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             if !seen.insert(current) {
                 return Ok(None);
             }
-            let node_obj = self.pdf.resolve_borrowed(current)?;
-            let Some(dict) = node_obj.as_dict() else {
+            let node = self.pdf.get_object_handle(current);
+            let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
+            let Some(dict) = node.as_dictionary() else {
                 return Ok(None);
             };
             let found = dict.get(key).cloned();
-            let parent_ref = match dict.get("Parent") {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            };
-            let _ = node_obj;
+            let parent_ref = dict
+                .get(b"Parent".as_slice())
+                .and_then(|parent| parent.object_ref().or_else(|| parent.as_reference()));
             if let Some(value) = found {
-                let resolved = resolve_ref_chain(self.pdf, &value)?.0;
-                if let Object::Name(bytes) = resolved {
-                    return Ok(Some(bytes));
-                }
-                if !matches!(resolved, Object::Null) {
-                    return Ok(None);
+                let terminal = self.pdf.resolve_object_handle_to_terminal(&value)?;
+                if !terminal.is_null() {
+                    return Ok(Some(value));
                 }
             }
             match parent_ref {
@@ -904,159 +918,40 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn resolve_inherited_object(&mut self, key: &[u8]) -> Result<Option<Object>> {
-        let mut seen = BTreeSet::new();
-        let mut current = self.field_ref;
-        let mut depth = 0;
-        loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "field tree depth exceeds maximum of {} at {}",
-                    DEFAULT_MAX_PAGE_TREE_DEPTH, current
-                )));
-            }
-            if !seen.insert(current) {
-                return Ok(None);
-            }
-            let node_obj = self.pdf.resolve_borrowed(current)?;
-            let Some(dict) = node_obj.as_dict() else {
-                return Ok(None);
-            };
-            let found = dict.get(key).cloned();
-            let parent_ref = match dict.get("Parent") {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            };
-            let _ = node_obj;
-            if let Some(value) = found {
-                match value {
-                    Object::Null => {}
-                    Object::Reference(r) => match self.pdf.resolve(r)? {
-                        Object::Null => {}
-                        resolved => return Ok(Some(resolved)),
-                    },
-                    other => return Ok(Some(other)),
-                }
-            }
-            match parent_ref {
-                Some(parent) => {
-                    current = parent;
-                    depth += 1;
-                }
-                None => return Ok(None),
-            }
-        }
-    }
-
-    fn resolve_inherited_raw(&mut self, key: &[u8]) -> Result<Option<Object>> {
-        let mut seen = BTreeSet::new();
-        let mut current = self.field_ref;
-        let mut depth = 0;
-        loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "field tree depth exceeds maximum of {} at {}",
-                    DEFAULT_MAX_PAGE_TREE_DEPTH, current
-                )));
-            }
-            if !seen.insert(current) {
-                return Ok(None);
-            }
-            let node_obj = self.pdf.resolve_borrowed(current)?;
-            let Some(dict) = node_obj.as_dict() else {
-                return Ok(None);
-            };
-            let found = dict.get(key).cloned();
-            let parent_ref = match dict.get("Parent") {
-                Some(Object::Reference(reference)) => Some(*reference),
-                _ => None,
-            };
-            let _ = node_obj;
-            if let Some(value) = found {
-                match &value {
-                    Object::Null => {}
-                    Object::Reference(reference)
-                        if matches!(self.pdf.resolve(*reference)?, Object::Null) => {}
-                    _ => return Ok(Some(value)),
-                }
-            }
-            match parent_ref {
-                Some(parent) => {
-                    current = parent;
-                    depth += 1;
-                }
-                None => return Ok(None),
-            }
-        }
+        let Some(value) = self.resolve_inherited_handle(key)? else {
+            return Ok(None);
+        };
+        let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+        Ok(Some(value.materialize()))
     }
 
     fn resolve_inherited_integer(&mut self, key: &[u8]) -> Result<Option<i64>> {
-        let mut seen = BTreeSet::new();
-        let mut current = self.field_ref;
-        let mut depth = 0;
-        loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "field tree depth exceeds maximum of {} at {}",
-                    DEFAULT_MAX_PAGE_TREE_DEPTH, current
-                )));
-            }
-            if !seen.insert(current) {
-                return Ok(None);
-            }
-            let node_obj = self.pdf.resolve_borrowed(current)?;
-            let Some(dict) = node_obj.as_dict() else {
-                return Ok(None);
-            };
-            let found = dict.get(key).cloned();
-            let parent_ref = match dict.get("Parent") {
-                Some(Object::Reference(r)) => Some(*r),
-                _ => None,
-            };
-            let _ = node_obj;
-            if let Some(value) = found {
-                let resolved = match value {
-                    Object::Reference(r) => self.pdf.resolve(r)?,
-                    other => other,
-                };
-                match resolved {
-                    Object::Null => {}
-                    Object::Integer(value) => return Ok(Some(value)),
-                    _ => return Ok(Some(0)),
-                }
-            }
-            match parent_ref {
-                Some(parent) => {
-                    current = parent;
-                    depth += 1;
-                }
-                None => return Ok(None),
-            }
-        }
+        let Some(value) = self.resolve_inherited_handle(key)? else {
+            return Ok(None);
+        };
+        let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+        Ok(Some(value.as_integer().unwrap_or(0)))
     }
 
     fn string_key(&mut self, field_ref: ObjectRef, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let node_obj = self.pdf.resolve_borrowed(field_ref)?;
-        let Some(dict) = node_obj.as_dict() else {
+        let node = self.pdf.get_object_handle(field_ref);
+        let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
+        let Some(dict) = node.as_dictionary() else {
             return Ok(None);
         };
         let value = dict.get(key).cloned();
-        let _ = node_obj;
-        self.resolve_string(value)
+        self.resolve_string_handle(value)
     }
 
-    fn resolve_string(&mut self, value: Option<Object>) -> Result<Option<Vec<u8>>> {
-        let value = match value {
-            Some(Object::Reference(reference)) => self.pdf.resolve(reference)?,
-            Some(value) => value,
-            None => return Ok(None),
+    fn resolve_string_handle(&mut self, value: Option<ObjectHandle>) -> Result<Option<Vec<u8>>> {
+        let Some(value) = value else {
+            return Ok(None);
         };
-        Ok(match value {
-            Object::String(value) => Some(
-                crate::pdf_string::decode_pdf_text_string(&value)
-                    .unwrap_or_else(|| String::from_utf8_lossy(&value).into_owned())
-                    .into_bytes(),
-            ),
-            _ => None,
-        })
+        let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+        Ok(value.as_string().map(|value| {
+            crate::pdf_string::decode_pdf_text_string(&value)
+                .unwrap_or_else(|| String::from_utf8_lossy(&value).into_owned())
+                .into_bytes()
+        }))
     }
 }
