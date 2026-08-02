@@ -79,3 +79,25 @@ The final change must pass formatting, workspace clippy with all features,
 relevant focused suites, workspace tests, and per-PR changed-line coverage at
 100 percent. Completion additionally requires mechanical proof that the old
 form-field implementation was removed rather than retained as an adapter.
+
+## Approved API correction: field and widget are separate
+
+qpdf 11.9.0 exposes appearance generation as
+`generateAppearance(QPDFAnnotationObjectHelper&)`: the
+`QPDFFormFieldObjectHelper` supplies inherited field state while the annotation
+helper supplies the target widget's `/Rect` and `/AP` storage. Rust follows
+that ownership boundary directly.
+
+`FormFieldObjectHelper` is constructed for the field dictionary and exposes
+`generate_appearance_for(widget_ref)`. It resolves `/FT`, `/V`, `/DA`, `/DR`,
+`/Q`, `/Ff`, and choice data from the field tree, while the supplied widget is
+the only object read or written for widget geometry and appearance streams.
+The legacy no-argument `generate_appearance()` and
+`generate_button_appearance()` APIs are removed; backward compatibility is
+explicitly out of scope. CLI callers and tests migrate atomically to the new
+API. The renderer remains crate-private and receives already separated field
+and widget inputs rather than performing its own field-tree traversal.
+
+Regression coverage must include a terminal field without `/Rect` whose child
+widget owns `/Rect` and `/AP`, proving that values come from the field and the
+new appearance stream is installed on that child widget.
