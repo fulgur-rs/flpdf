@@ -14,10 +14,9 @@
 //! the `/Names /EmbeddedFiles` name tree using
 //! [`crate::embedded_files::insert_embedded_file`].
 //!
-//! [`FileSpec`] owns the `/Filespec` object reference and resolves its
-//! dictionary from the live document on each operation. [`EmbeddedFileStream`]
-//! owns the terminal `/EmbeddedFile` reference plus a retained stream snapshot;
-//! its setters write changes back through that reference, including an indirect
+//! [`FileSpec`] and [`EmbeddedFileStream`] own qpdf-shaped object handles and
+//! resolve dictionaries from the live document on each operation. Their
+//! setters mutate those dictionary handles in place, including an indirect
 //! `/Params` dictionary when one is present.
 //!
 //! # Design
@@ -149,7 +148,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         Self::create(pdf, std::fs::read(path)?)
     }
 
-    fn new(stream: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+    /// Construct a wrapper for a direct or indirect `/EmbeddedFile` stream
+    /// handle, matching qpdf's `QPDFEFStreamObjectHelper(QPDFObjectHandle)`
+    /// constructor.
+    pub fn new(stream: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
         Self {
             stream,
             pdf: RefCell::new(pdf),
@@ -318,7 +320,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         Ok(self.checksum()?.unwrap_or_default())
     }
 
-    fn set_param(&mut self, key: &str, value: Object) -> Result<()> {
+    fn set_param(&mut self, key: &str, value: Vec<u8>) -> Result<()> {
         let Some(stream_dict) = self.stream_dict()? else {
             return Ok(());
         };
@@ -337,13 +339,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 }
                 None => resolved,
             };
-            target.replace_key(
-                key.as_bytes(),
-                ObjectHandle::string(match value {
-                    Object::String(value) => value,
-                    _ => unreachable!("EmbeddedFileStream::set_param only writes strings"),
-                }),
-            );
+            target.replace_key(key.as_bytes(), ObjectHandle::string(value));
             if let Some(object_ref) = terminal_ref {
                 self.pdf.borrow_mut().mark_object_dirty(object_ref);
             } else if let Some(object_ref) = self.stream.object_ref() {
@@ -354,13 +350,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
         stream_dict.replace_key(
             b"Params",
-            ObjectHandle::dictionary(vec![(
-                key.as_bytes().to_vec(),
-                ObjectHandle::string(match value {
-                    Object::String(value) => value,
-                    _ => unreachable!("EmbeddedFileStream::set_param only writes strings"),
-                }),
-            )]),
+            ObjectHandle::dictionary(vec![(key.as_bytes().to_vec(), ObjectHandle::string(value))]),
         );
         if let Some(object_ref) = self.stream.object_ref() {
             self.pdf.borrow_mut().mark_object_dirty(object_ref);
@@ -370,12 +360,12 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
     /// Set `/Params /CreationDate` to a raw PDF date string.
     pub fn set_creation_date(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
-        self.set_param("CreationDate", Object::String(value.as_ref().to_vec()))
+        self.set_param("CreationDate", value.as_ref().to_vec())
     }
 
     /// Set `/Params /ModDate` to a raw PDF date string.
     pub fn set_modification_date(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
-        self.set_param("ModDate", Object::String(value.as_ref().to_vec()))
+        self.set_param("ModDate", value.as_ref().to_vec())
     }
 
     /// Set `/Subtype` to a MIME type represented as logical PDF Name bytes.
@@ -469,20 +459,17 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         }
     }
 
-    /// Resolve the `/Filespec` dictionary, returning an error when the
-    /// object does not exist or is not a dictionary.
-    fn resolve_dict(&mut self) -> Result<Dictionary> {
+    /// Resolve the `/Filespec` dictionary. qpdf treats a non-dictionary
+    /// helper object as its null dictionary, so callers receive their usual
+    /// empty-value defaults rather than a type error.
+    fn resolve_dict(&mut self) -> Result<Option<Dictionary>> {
         let Some(dictionary) = self.filespec_dict()? else {
-            return Err(Error::Unsupported(
-                "expected a /Filespec dictionary object".to_string(),
-            ));
+            return Ok(None);
         };
         let Object::Dictionary(dict) = dictionary.materialize() else {
-            return Err(Error::Unsupported(
-                "expected a /Filespec dictionary object".to_string(),
-            ));
+            return Ok(None);
         };
-        Ok(dict)
+        Ok(Some(dict))
     }
 
     fn resolved_string_value(&mut self, value: Option<&Object>) -> Result<Option<Vec<u8>>> {
@@ -540,11 +527,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn filename(&mut self) -> Result<Option<Vec<u8>>> {
-        let dict = self.resolve_dict()?;
-        Ok(dict
-            .get("F")
-            .and_then(Object::as_string)
-            .map(ToOwned::to_owned))
+        Ok(self.resolve_dict()?.and_then(|dict| {
+            dict.get("F")
+                .and_then(Object::as_string)
+                .map(ToOwned::to_owned)
+        }))
     }
 
     /// Return `/UF` — the Unicode-encoded file name as raw PDF string bytes.
@@ -557,11 +544,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn uf(&mut self) -> Result<Option<Vec<u8>>> {
-        let dict = self.resolve_dict()?;
-        Ok(dict
-            .get("UF")
-            .and_then(Object::as_string)
-            .map(ToOwned::to_owned))
+        Ok(self.resolve_dict()?.and_then(|dict| {
+            dict.get("UF")
+                .and_then(Object::as_string)
+                .map(ToOwned::to_owned)
+        }))
     }
 
     /// Return `/Desc` — the file description as raw PDF string bytes.
@@ -570,11 +557,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn description(&mut self) -> Result<Option<Vec<u8>>> {
-        let dict = self.resolve_dict()?;
-        Ok(dict
-            .get("Desc")
-            .and_then(Object::as_string)
-            .map(ToOwned::to_owned))
+        Ok(self.resolve_dict()?.and_then(|dict| {
+            dict.get("Desc")
+                .and_then(Object::as_string)
+                .map(ToOwned::to_owned)
+        }))
     }
 
     /// Return `/AFRelationship` — the associated-file relationship as raw
@@ -584,11 +571,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// Propagates any error from resolving the `/Filespec` object.
     pub fn af_relationship(&mut self) -> Result<Option<Vec<u8>>> {
-        let dict = self.resolve_dict()?;
-        Ok(dict
-            .get("AFRelationship")
-            .and_then(Object::as_name)
-            .map(ToOwned::to_owned))
+        Ok(self.resolve_dict()?.and_then(|dict| {
+            dict.get("AFRelationship")
+                .and_then(Object::as_name)
+                .map(ToOwned::to_owned)
+        }))
     }
 
     /// Return `/Desc` through qpdf's UTF-8 string view.
@@ -596,7 +583,9 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
     /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
     pub fn get_description(&mut self) -> Result<Vec<u8>> {
-        let dict = self.resolve_dict()?;
+        let Some(dict) = self.resolve_dict()? else {
+            return Ok(Vec::new());
+        };
         Ok(self
             .resolved_string_value(dict.get("Desc"))?
             .map(|value| utf8_value(&value))
@@ -606,7 +595,9 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Return the preferred file name using qpdf's `/UF`, `/F`, `/Unix`,
     /// `/DOS`, `/Mac` priority order and UTF-8 value conversion.
     pub fn get_filename(&mut self) -> Result<Vec<u8>> {
-        let dict = self.resolve_dict()?;
+        let Some(dict) = self.resolve_dict()? else {
+            return Ok(Vec::new());
+        };
         for key in NAME_KEYS {
             if let Some(value) = self.resolved_string_value(dict.get(key))? {
                 return Ok(utf8_value(&value));
@@ -619,7 +610,9 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// Keys retain qpdf's leading slash, e.g. `"/UF"`.
     pub fn get_filenames(&mut self) -> Result<BTreeMap<String, Vec<u8>>> {
-        let dict = self.resolve_dict()?;
+        let Some(dict) = self.resolve_dict()? else {
+            return Ok(BTreeMap::new());
+        };
         let mut filenames = BTreeMap::new();
         for key in NAME_KEYS {
             if let Some(value) = self.resolved_string_value(dict.get(key))? {
@@ -664,8 +657,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     pub fn get_embedded_file_streams(&mut self) -> Result<Object> {
         Ok(self
             .resolve_dict()?
-            .get("EF")
-            .cloned()
+            .and_then(|dict| dict.get("EF").cloned())
             .unwrap_or(Object::Null))
     }
 

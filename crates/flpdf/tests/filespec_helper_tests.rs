@@ -161,6 +161,40 @@ fn filespec_helper_accepts_a_direct_dictionary_handle() {
 }
 
 #[test]
+fn qpdf_helpers_treat_a_nonmatching_direct_handle_as_empty_or_noop() {
+    // qpdf helpers accept any ObjectHandle. Its null-dictionary semantics make
+    // all Filespec getters empty and its setters no-ops; an EF helper similarly
+    // has no metadata and rejects payload access when its handle is not a
+    // stream.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut filespec = FileSpec::new(ObjectHandle::null(), &mut pdf);
+    assert_eq!(filespec.filename().unwrap(), None);
+    assert_eq!(filespec.uf().unwrap(), None);
+    assert_eq!(filespec.description().unwrap(), None);
+    assert_eq!(filespec.af_relationship().unwrap(), None);
+    assert_eq!(filespec.get_description().unwrap(), Vec::<u8>::new());
+    assert_eq!(filespec.get_filename().unwrap(), Vec::<u8>::new());
+    assert!(filespec.get_filenames().unwrap().is_empty());
+    assert_eq!(filespec.get_embedded_file_streams().unwrap(), Object::Null);
+    assert_eq!(filespec.get_embedded_file_stream("").unwrap(), Object::Null);
+    assert!(filespec.embedded_file().unwrap().is_none());
+    filespec.set_description("ignored").unwrap();
+    filespec.set_filename("ignored", None).unwrap();
+    drop(filespec);
+
+    let mut embedded = EmbeddedFileStream::new(ObjectHandle::null(), &mut pdf);
+    assert!(embedded.payload().is_err());
+    assert_eq!(embedded.mimetype().unwrap(), None);
+    assert_eq!(embedded.creation_date().unwrap(), None);
+    assert_eq!(embedded.modification_date().unwrap(), None);
+    assert_eq!(embedded.checksum().unwrap(), None);
+    assert_eq!(embedded.size().unwrap(), None);
+    embedded.set_creation_date(b"ignored").unwrap();
+    embedded.set_modification_date(b"ignored").unwrap();
+    embedded.set_subtype(b"ignored").unwrap();
+}
+
+#[test]
 fn get_filenames_returns_only_string_name_keys_as_utf8() {
     // This fails if a non-string name key leaks into qpdf's getFilenames
     // result, or if the qpdf UTF-8 text conversion is skipped.
