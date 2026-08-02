@@ -5941,6 +5941,29 @@ mod tests {
     }
 
     #[test]
+    fn mark_object_handle_dirty_rejects_a_foreign_direct_child() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Child << /Value 1 >> >>\nendobj\n"],
+            object_ref,
+        );
+        let mut source = Pdf::open_mem_owned(bytes.clone()).expect("open source");
+        let source_owner = source.get_object_handle(object_ref);
+        source.resolve_object_handle(&source_owner).unwrap();
+        let foreign = source_owner.get_key(b"Child");
+        assert!(foreign.is_direct());
+        let mut destination = Pdf::open_mem_owned(bytes).expect("open destination");
+
+        assert_eq!(
+            destination
+                .mark_object_handle_dirty(&foreign)
+                .expect_err("foreign direct child must not select a destination owner")
+                .to_string(),
+            "unsupported PDF feature: ObjectHandle belongs to another Pdf"
+        );
+    }
+
+    #[test]
     fn mark_object_handle_dirty_finds_a_nested_direct_owner() {
         let object_ref = ObjectRef::new(1, 0);
         let bytes =

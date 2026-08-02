@@ -3504,6 +3504,13 @@ mod mutation_tests {
     }
 
     #[test]
+    fn an_indirect_handle_has_no_direct_containment_owner() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
+
+        assert!(handle.containing_object_refs_for_pdf(1).is_empty());
+    }
+
+    #[test]
     fn replacing_a_contained_direct_value_propagates_its_owner_to_new_children() {
         // A preserved direct stream dictionary is replaced in place by
         // Pdf::set_object. New direct descendants must inherit the same
