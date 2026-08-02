@@ -235,6 +235,9 @@ impl ObjectHandle {
     /// Construct a canonical unresolved slot attached to its owning document
     /// resolver. This is the qpdf-native constructor; the resolver link is
     /// weak so a surviving handle cannot keep its document alive.
+    #[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5;
+                        // this primitive slice exercises the constructor with
+                        // sealed resolver unit tests only
     pub(crate) fn new_indirect_with_resolver(
         object_ref: ObjectRef,
         offset: i64,
