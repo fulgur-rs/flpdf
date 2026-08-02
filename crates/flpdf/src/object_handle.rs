@@ -1826,6 +1826,26 @@ mod identity_tests {
     }
 
     #[test]
+    fn fallible_dictionary_accessors_cover_resolved_and_non_dictionary_values() {
+        let resolver = Rc::new(RecordingResolver::default());
+        let erased: Rc<dyn DocumentResolver> = resolver;
+        let dict = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(11, 0),
+            NO_PARSED_OFFSET,
+            Rc::downgrade(&erased),
+        );
+
+        let entries = dict
+            .try_as_dictionary()
+            .unwrap()
+            .expect("recording resolver installs a dictionary");
+        assert_eq!(entries.get(b"A".as_slice()).unwrap().as_integer(), Some(1));
+
+        let scalar = ObjectHandle::integer(1);
+        assert!(!scalar.try_has_key(b"A").unwrap());
+    }
+
+    #[test]
     fn direct_handle_clone_shares_identity_not_a_deep_copy() {
         let handle = ObjectHandle::integer(42);
         let clone = handle.clone();
