@@ -1728,9 +1728,11 @@ mod tests {
         helper.set_description("terminal description").unwrap();
         drop(helper);
 
-        let Object::Dictionary(filespec) = pdf.resolve(filespec_ref).unwrap() else {
-            panic!("terminal object must be a Filespec dictionary");
-        };
+        let filespec = pdf
+            .resolve(filespec_ref)
+            .unwrap()
+            .into_dict()
+            .expect("terminal object must be a Filespec dictionary");
         assert_eq!(
             filespec.get("Desc"),
             Some(&Object::String(b"terminal description".to_vec()))

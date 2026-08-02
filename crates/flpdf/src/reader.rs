@@ -5776,6 +5776,53 @@ mod tests {
     }
 
     #[test]
+    fn mark_object_handle_dirty_rejects_a_foreign_indirect_handle() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n1\nendobj\n"], object_ref);
+        let mut source = Pdf::open_mem_owned(bytes.clone()).expect("open source");
+        let foreign = source.get_object_handle(object_ref);
+        let mut destination = Pdf::open_mem_owned(bytes).expect("open destination");
+
+        assert_eq!(
+            destination
+                .mark_object_handle_dirty(&foreign)
+                .expect_err("foreign handle must not select a same-number destination object")
+                .to_string(),
+            "unsupported PDF feature: ObjectHandle belongs to another Pdf"
+        );
+    }
+
+    #[test]
+    fn mark_object_handle_dirty_finds_a_nested_direct_owner() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes =
+            classic_pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"], object_ref);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let owner = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&owner).unwrap();
+        let inner = ObjectHandle::integer(42);
+        let container = ObjectHandle::dictionary(vec![(b"Inner".to_vec(), inner.clone())]);
+        owner.replace_key(b"Container", container);
+        pdf.clear_dirty(object_ref);
+
+        pdf.mark_object_handle_dirty(&inner).unwrap();
+        assert!(pdf.is_dirty(object_ref));
+    }
+
+    #[test]
+    fn direct_owner_search_stops_at_the_inline_depth_limit() {
+        let root = ObjectHandle::dictionary(Vec::new());
+        assert!(Pdf::<Cursor<Vec<u8>>>::contains_direct_handle(
+            &root, &root, 0
+        ));
+        assert!(!Pdf::<Cursor<Vec<u8>>>::contains_direct_handle(
+            &root,
+            &ObjectHandle::integer(1),
+            crate::object::MAX_INLINE_DEPTH,
+        ));
+    }
+
+    #[test]
     fn borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone() {
         let mut pdf = Pdf::open_mem_owned(top_level_bare_reference_pdf()).expect("open fixture");
         let live_ref = ObjectRef::new(8, 0);
