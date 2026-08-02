@@ -545,17 +545,24 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn set_radio_button_value(&mut self, field_ref: ObjectRef, value: Vec<u8>) -> Result<()> {
         let field = self.field_dict_for(field_ref, "form field")?;
         if let Some(parent) = field.get_ref(b"Parent".as_slice()) {
-            let parent_dict = self.field_dict_for(parent, "form field parent")?;
-            if self.value_is_null(parent_dict.get(b"Parent".as_slice()).cloned())? {
-                let parent_is_radio = {
-                    let previous = self.field_ref;
-                    self.field_ref = parent;
-                    let result = self.is_radio_button();
-                    self.field_ref = previous;
-                    result?
-                };
-                if parent_is_radio {
-                    return self.set_radio_button_value(parent, value);
+            let parent_parent = match self.pdf.resolve(parent)? {
+                Object::Dictionary(parent_dict) => {
+                    Some(parent_dict.get(b"Parent".as_slice()).cloned())
+                }
+                _ => None,
+            };
+            if let Some(parent_parent) = parent_parent {
+                if self.value_is_null(parent_parent)? {
+                    let parent_is_radio = {
+                        let previous = self.field_ref;
+                        self.field_ref = parent;
+                        let result = self.is_radio_button();
+                        self.field_ref = previous;
+                        result?
+                    };
+                    if parent_is_radio {
+                        return self.set_radio_button_value(parent, value);
+                    }
                 }
             }
         }
@@ -592,7 +599,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             Object::Reference(reference) => {
                 let resolved = self.pdf.resolve(reference)?;
                 let Object::Array(kids) = resolved else {
-                    return Ok(());
+                    return Ok(()); // cov:ignore: object_array above already resolved this holder as an array
                 };
                 let mut updated = Vec::with_capacity(kids.len());
                 for kid in kids {
@@ -600,7 +607,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 }
                 self.pdf.set_object(reference, Object::Array(updated));
             }
-            _ => {}
+            _ => {} // cov:ignore: set_radio_button_value calls this only after object_array accepted /Kids
         }
         Ok(())
     }
@@ -749,7 +756,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     fn normal_appearance_names(&mut self, dictionary: &Dictionary) -> Result<Vec<Vec<u8>>> {
         let Some(appearance) = dictionary.get(b"AP".as_slice()).cloned() else {
-            return Ok(Vec::new());
+            return Ok(Vec::new()); // cov:ignore: every caller first requires a non-null /AP
         };
         let appearance = self.resolve_object(appearance)?;
         let Some(normal) = appearance
@@ -782,9 +789,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn field_dict_for(&mut self, reference: ObjectRef, label: &str) -> Result<Dictionary> {
         match self.pdf.resolve_borrowed(reference)? {
             Object::Dictionary(dictionary) => Ok(dictionary.clone()),
+            // cov:ignore-start: all private callers establish a dictionary before mutation
             _ => Err(Error::Unsupported(format!(
                 "{label} object {reference} is not a dictionary"
             ))),
+            // cov:ignore-end
         }
     }
 

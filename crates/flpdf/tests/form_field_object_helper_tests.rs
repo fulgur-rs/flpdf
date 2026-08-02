@@ -1342,3 +1342,258 @@ fn text_appearance_uses_standard_font_fallback_without_acroform_resources() {
         .unwrap()
         .is_some());
 }
+
+#[test]
+fn radio_value_with_a_non_dictionary_parent_is_a_qpdf_noop() {
+    // qpdf 11.9.0 QPDFFormFieldObjectHelper.cc:358-373 checks that /Parent
+    // is a dictionary before recursing and otherwise leaves this child alone.
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 11 0 R /Kids [12 0 R] >>".into(),
+        ),
+        (11, "42".into()),
+        (12, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("qpdf ignores a non-dictionary radio parent");
+
+    assert!(pdf
+        .resolve(ObjectRef::new(10, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("V")
+        .is_none());
+}
+
+#[test]
+fn value_updates_cover_non_button_and_checkbox_document_boundaries() {
+    let bytes = doc_with_acroform(vec![(10, "<< /FT /Tx >>".into()), (20, "42".into())]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"raw".to_vec()), true)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"raw".to_vec()))
+    );
+
+    let bytes = doc(vec![(10, "<< /FT /Tx >>".into()), (20, "<< >>".into())]);
+    let mut pdf = open(bytes);
+    let root = pdf.root_ref().unwrap();
+    let acroform = pdf.resolve(ObjectRef::new(20, 0)).unwrap();
+    let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+    catalog.insert("AcroForm", acroform);
+    pdf.set_object(root, Object::Dictionary(catalog));
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"raw".to_vec()), true)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(root)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AcroForm")
+            .and_then(Object::as_dict)
+            .and_then(|acroform| acroform.get("NeedAppearances")),
+        Some(&Object::Boolean(true))
+    );
+
+    let bytes = doc(vec![(10, "<< /FT /Btn >>".into())]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Yes".to_vec()))
+    );
+}
+
+#[test]
+fn clear_need_appearances_handles_direct_and_non_dictionary_catalog_values() {
+    let bytes = doc(vec![(20, "<< /NeedAppearances true >>".into())]);
+    let mut pdf = open(bytes);
+    let root = pdf.root_ref().unwrap();
+    let acroform = pdf.resolve(ObjectRef::new(20, 0)).unwrap();
+    let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+    catalog.insert("AcroForm", acroform);
+    pdf.set_object(root, Object::Dictionary(catalog));
+    FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
+    assert!(pdf
+        .resolve(root)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("AcroForm")
+        .and_then(Object::as_dict)
+        .unwrap()
+        .get("NeedAppearances")
+        .is_none());
+
+    let bytes = doc(vec![(10, "<< >>".into())]);
+    let mut pdf = open(bytes);
+    let root = pdf.root_ref().unwrap();
+    pdf.set_object(root, Object::Null);
+    FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
+}
+
+#[test]
+fn radio_updates_preserve_all_unselectable_kid_shapes() {
+    // qpdf only updates a widget whose /AP is non-null; scalar children and
+    // child /Kids holders of the wrong type remain untouched.
+    for kids in [
+        "[42]",
+        "[<< /Kids [42] >>]",
+        "[<< /Kids 12 0 R >>]",
+        "[<< /Kids 42 >>]",
+        "[12 0 R]",
+    ] {
+        let bytes = doc(vec![
+            (10, format!("<< /FT /Btn /Ff 32768 /Kids {kids} >>")),
+            (12, "42".into()),
+        ]);
+        let mut pdf = open(bytes);
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .set_value(Object::Name(b"On".to_vec()), false)
+            .unwrap();
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(10, 0))
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("V"),
+            Some(&Object::Name(b"On".to_vec()))
+        );
+    }
+
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Ff 32768 /Kids [12 0 R] >>".into()),
+        (12, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert!(pdf
+        .resolve(ObjectRef::new(12, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("AS")
+        .is_none());
+
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 11 0 R /Kids [12 0 R] >>".into(),
+        ),
+        (11, "<< /FT /Tx >>".into()),
+        (12, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert!(pdf
+        .resolve(ObjectRef::new(10, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("V")
+        .is_none());
+}
+
+#[test]
+fn raw_value_reference_skips_null_cycles_and_non_dictionary_fields() {
+    let bytes = doc(vec![
+        (10, "<< /V null /Parent 11 0 R >>".into()),
+        (11, "<< /V 12 0 R >>".into()),
+        (12, "(value)".into()),
+    ]);
+    let mut pdf = open(bytes);
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .field_value_reference()
+            .unwrap(),
+        Some(ObjectRef::new(12, 0))
+    );
+
+    let bytes = doc(vec![
+        (10, "<< /Parent 11 0 R >>".into()),
+        (11, "<< /Parent 10 0 R >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .field_value_reference()
+            .unwrap(),
+        None
+    );
+
+    let bytes = doc(vec![(10, "null".into())]);
+    let mut pdf = open(bytes);
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .field_value_reference()
+            .unwrap(),
+        None
+    );
+
+    let bytes = String::from_utf8(doc(vec![(10, "<< >>".into())]))
+        .unwrap()
+        .replace(" /Root 1 0 R", "")
+        .into_bytes();
+    let mut pdf = open(bytes);
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .default_resources()
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn unknown_da_font_falls_back_without_acroform_resources() {
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Tx /V (value) /Rect [0 0 100 20] /DA (/F1 12 Tf 0 g) >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .generate_appearance_for(ObjectRef::new(10, 0))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn checkbox_uses_an_indirect_widget_appearance_annotation() {
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids [11 0 R] >>".into()),
+        (11, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+}
