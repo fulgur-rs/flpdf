@@ -30,8 +30,10 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static NULL_OBJECT: Object = Object::Null;
+static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Lazily parsed PDF document handle.
 ///
@@ -54,6 +56,8 @@ static NULL_OBJECT: Object = Object::Null;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct Pdf<R: Read + Seek> {
+    /// Stable per-document identity used by qpdf-style foreign object copiers.
+    unique_id: u64,
     reader: R,
     /// Physical byte position corresponding to qpdf's logical input offset 0.
     /// This is nonzero only when repair found a valid header after leading
@@ -75,6 +79,8 @@ pub struct Pdf<R: Read + Seek> {
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
     handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
+    /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
+    foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
     /// repeated [`Pdf::trailer_handle`] calls return the same shared handle
     /// rather than re-deriving a fresh one from `self.trailer` each time.
@@ -636,6 +642,7 @@ impl<R: Read + Seek> Pdf<R> {
         sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
         let mut pdf = Self {
+            unique_id: NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed),
             reader,
             header_offset: loaded_state.header_offset,
             version: loaded.version,
@@ -645,6 +652,7 @@ impl<R: Read + Seek> Pdf<R> {
             repair_diagnostics: loaded.repair_diagnostics,
             cache,
             handle_registry: BTreeMap::new(),
+            foreign_object_maps: BTreeMap::new(),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
             compressed_member_parents: BTreeMap::new(),
@@ -1661,20 +1669,11 @@ impl<R: Read + Seek> Pdf<R> {
                 "cannot make an already-indirect ObjectHandle indirect".to_string(),
             ));
         };
-        let next_number = self
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .chain(self.handle_registry.keys().map(|r| r.number))
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-        let new_ref = ObjectRef::new(next_number, 0);
+        let new_ref = self.next_available_object_ref()?;
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);
         // QPDF::makeIndirectFromQPDFObject installs the same shared object
-        // pointer in `obj_cache`. `handle_registry` is this port's shared
+        // pointer in obj_cache. `handle_registry` is this port's shared
         // state, and `prepare_qpdf_json_objects` recognizes its resolved
         // cache-miss handles directly; materializing here would duplicate a
         // direct stream's payload into the legacy `Object` cache.
@@ -1684,6 +1683,43 @@ impl<R: Read + Seek> Pdf<R> {
         // own doc comment for the full explanation.
         self.mark_object_dirty(new_ref);
         Ok(indirect)
+    }
+
+    /// Return an unused generation-zero object reference.
+    ///
+    /// Both the legacy object cache and the canonical handle registry own
+    /// object numbers. A number absent from `object_refs()` may therefore
+    /// still belong to an unmaterialized [`ObjectHandle`].
+    pub(crate) fn next_available_object_ref(&self) -> Result<ObjectRef> {
+        let next_number = self
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .chain(self.handle_registry.keys().map(|r| r.number))
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+        Ok(ObjectRef::new(next_number, 0))
+    }
+
+    pub(crate) fn unique_id(&self) -> u64 {
+        self.unique_id
+    }
+
+    pub(crate) fn foreign_object_map(&self, source_id: u64) -> BTreeMap<ObjectRef, ObjectRef> {
+        self.foreign_object_maps
+            .get(&source_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_foreign_object_map(
+        &mut self,
+        source_id: u64,
+        map: BTreeMap<ObjectRef, ObjectRef>,
+    ) {
+        self.foreign_object_maps.insert(source_id, map);
     }
 
     /// Mark `object_ref` dirty, so the next default (incremental) call to

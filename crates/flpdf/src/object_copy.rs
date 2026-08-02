@@ -113,6 +113,44 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     Ok(map)
 }
 
+/// Copy foreign objects while retaining qpdf's per-source object identity map.
+///
+/// `QPDF::copyForeignObject` stores its map on the destination `QPDF`, keyed
+/// by the source document's unique identity. Page insertion uses this variant;
+/// the public [`copy_objects`] helper intentionally remains a fresh-copy API.
+pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    refs: &BTreeSet<ObjectRef>,
+) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
+    let source_id = source.unique_id();
+    let mut map = target.foreign_object_map(source_id);
+    let mut to_copy = Vec::new();
+
+    for &source_ref in refs {
+        if let std::collections::btree_map::Entry::Vacant(entry) = map.entry(source_ref) {
+            let target_ref = target.next_available_object_ref()?;
+            // Reserve before resolving any source object so cycles can be
+            // rewritten through the complete map, as qpdf does.
+            target.set_object(target_ref, Object::Null);
+            entry.insert(target_ref);
+            to_copy.push(source_ref);
+        }
+    }
+
+    for source_ref in to_copy {
+        let mut object = source.resolve(source_ref)?;
+        rewrite_refs(&mut object, 0, &map)?;
+        target.set_object(map[&source_ref], object);
+    }
+
+    target.set_foreign_object_map(source_id, map.clone());
+    Ok(refs
+        .iter()
+        .map(|source_ref| (*source_ref, map[source_ref]))
+        .collect())
+}
+
 /// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
 /// `map` are remapped, refs outside `map` become [`Object::Null`].  Stream byte
 /// payloads are left untouched (never cloned); scalars are unchanged.
