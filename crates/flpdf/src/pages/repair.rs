@@ -23,10 +23,21 @@ const MAX_DEPTH: usize = crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 pub struct PreparedPages {
     /// The effective `/Pages` root, after correcting a catalog whose `/Pages` points
     /// into the tree instead of at the true root.
-    pub root: ObjectRef,
+    pub root: PageTreeRoot,
     /// Every `Page` leaf in document order, with qpdf's `getAllPagesInternal` repairs
     /// applied (see [`prepare_for_optimization`]).
     pub pages: Vec<ObjectRef>,
+}
+
+/// Location of the repaired `/Pages` root.
+///
+/// qpdf's object handles preserve a direct `/Pages` dictionary embedded in the
+/// catalog. `Direct` therefore records its catalog owner instead of minting an
+/// object for the page-tree root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageTreeRoot {
+    Indirect(ObjectRef),
+    Direct { catalog: ObjectRef },
 }
 
 /// Repair the `/Pages` tree and return its effective root and leaf order.
@@ -40,11 +51,18 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };
-    let Some(mut pages_ref) = (match pdf.resolve_borrowed(root_ref)? {
-        Object::Dictionary(d) => d.get_ref("Pages"),
+    let pages = match pdf.resolve_borrowed(root_ref)? {
+        Object::Dictionary(d) => d.get("Pages").cloned(),
         _ => None,
-    }) else {
+    };
+    let Some(pages) = pages else {
         return Ok(None);
+    };
+
+    let (mut pages_ref, direct_root) = match pages {
+        Object::Reference(pages_ref) => (pages_ref, None),
+        Object::Dictionary(pages) => (ObjectRef::new(0, 0), Some(pages)),
+        _ => return Ok(None),
     };
 
     // qpdf's `pushInheritedAttributesToPage` calls `getAllPages` first
@@ -70,7 +88,7 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
     let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
     let mut corrected = pages_ref;
     let mut changed_pages = false;
-    loop {
+    while direct_root.is_none() {
         let parent = match pdf.resolve_borrowed(corrected)? {
             Object::Dictionary(d) => match d.get("Parent") {
                 Some(Object::Reference(r)) => Some(*r),
@@ -109,10 +127,23 @@ pub fn prepare_for_optimization<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Opti
         next_clone: next_object_ref(pdf)?,
         pages: Vec::new(),
     };
-    repair_page_tree(pdf, pages_ref, &mut state, 0, false)?;
+    let page_root = if let Some(mut direct_root) = direct_root {
+        repair_direct_page_tree(pdf, &mut direct_root, &mut state, 0, false)?;
+        let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
+            // cov:ignore-start: root_ref was resolved as a catalog dictionary before reading /Pages
+            return Ok(None);
+            // cov:ignore-end
+        };
+        catalog.insert("Pages", Object::Dictionary(direct_root));
+        pdf.set_object(root_ref, Object::Dictionary(catalog));
+        PageTreeRoot::Direct { catalog: root_ref }
+    } else {
+        repair_page_tree(pdf, pages_ref, &mut state, 0, false)?;
+        PageTreeRoot::Indirect(pages_ref)
+    };
 
     Ok(Some(PreparedPages {
-        root: pages_ref,
+        root: page_root,
         pages: state.pages,
     }))
 }
