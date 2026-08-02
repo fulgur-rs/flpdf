@@ -36,9 +36,9 @@ pub(crate) enum DecodeParams {
 
 /// A `/DecodeParms` value reduced to the bounded scalars any filter reads.
 ///
-/// **Invariant:** `Int` appears if and only if `QPDFObjectHandle::isInteger`
-/// would answer true — it is exactly `obj->getTypeCode() == ::ot_integer`
-/// (`QPDFObjectHandle.cc:358-362`) — and carries the value already put through
+/// **Invariant:** `Int` appears exactly where `QPDFObjectHandle::isInteger`
+/// admits a value — `obj->getTypeCode() == ::ot_integer`
+/// (`QPDFObjectHandle.cc:358-362`) — carrying it already put through
 /// `getIntValueAsInt`'s both-ends saturation (`:526-543`). `Name` and `Other`
 /// are qpdf's `else` branch: `SF_FlateLzwDecode::setDecodeParms` reaches
 /// `getIntValueAsInt` only behind an `isInteger()` guard
@@ -46,7 +46,14 @@ pub(crate) enum DecodeParams {
 /// otherwise, so a filter matching on those two variants reproduces that
 /// branch without re-inspecting the value.
 ///
-/// The split between them is flpdf's, not qpdf's: `Name` exists for `Crypt`'s
+/// `isInteger` also `dereference()`s first, and honoring that is each shape
+/// reader's job rather than this type's: `param_value_from_object` classifies
+/// whatever `Object` it is handed, so an indirect integer inside a
+/// `/DecodeParms` dictionary reduces to `Other` there. A handle-shaped reader
+/// entering through the resolving accessors is what closes that gap (plan
+/// decision D1 of `flpdf-25kg.3.4`); this enum is the same either way.
+///
+/// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for `Crypt`'s
 /// `/Name`, which selects the crypt filter, so carrying it now keeps Phase 3's
 /// AES/Crypt cutover from having to widen this shared type. Every
 /// `StreamFilter` still treats the two identically; only the Crypt stage's
