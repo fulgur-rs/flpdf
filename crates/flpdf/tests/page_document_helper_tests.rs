@@ -613,6 +613,35 @@ fn remove_unreferenced_resources_prunes_unused_font_on_page() {
 }
 
 #[test]
+fn remove_unreferenced_resources_preserves_non_dictionary_category() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"q Q".to_vec())),
+    );
+    let mut resources = Dictionary::new();
+    resources.insert("Font", Object::Integer(42));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert("Resources", Object::Dictionary(resources));
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_unreferenced_resources()
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must remain a dictionary");
+    };
+    let Some(Object::Dictionary(resources)) = page.get("Resources") else {
+        panic!("page resources must remain a dictionary");
+    };
+    assert_eq!(resources.get("Font"), Some(&Object::Integer(42)));
+}
+
+#[test]
 fn helper_resource_pruning_accepts_pages_without_content_or_resources() {
     let mut no_content = open(build_n_page_pdf(1));
     PageDocumentHelper::new(&mut no_content)
