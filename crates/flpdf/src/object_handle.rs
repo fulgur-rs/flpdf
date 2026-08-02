@@ -167,7 +167,13 @@ struct DirectSlot {
     /// one shared QPDFObject payload, so direct mutation has no document-wide
     /// owner-discovery phase. The Rust port records the same containment at
     /// insertion/resolution time for incremental-write dirty tracking.
-    containing_object_refs: std::collections::BTreeSet<ObjectRef>,
+    containing_object_refs: std::collections::BTreeSet<ContainmentOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ContainmentOwner {
+    pdf_unique_id: Option<u64>,
+    object_ref: ObjectRef,
 }
 
 /// The resolution state of an indirect handle's backing slot.
@@ -195,6 +201,7 @@ pub(crate) enum IndirectState {
 
 struct IndirectSlot {
     object_ref: ObjectRef,
+    pdf_unique_id: Option<u64>,
     #[allow(dead_code)] // read through the flpdf-25kg.3.5 resolver cutover
     resolver: Option<Weak<dyn DocumentResolver>>,
     state: IndirectState,
@@ -243,10 +250,28 @@ impl ObjectHandle {
     // Used by this module's identity tests, and by `Pdf::get_object_handle`
     // (reader.rs) to lazily create the canonical handle it registers into
     // `handle_registry` the first time a given ref is requested.
+    #[cfg(test)]
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
+        Self::new_indirect_unresolved_with_identity(object_ref, offset, None)
+    }
+
+    pub(crate) fn new_indirect_unresolved_for_pdf(
+        object_ref: ObjectRef,
+        offset: i64,
+        pdf_unique_id: u64,
+    ) -> Self {
+        Self::new_indirect_unresolved_with_identity(object_ref, offset, Some(pdf_unique_id))
+    }
+
+    fn new_indirect_unresolved_with_identity(
+        object_ref: ObjectRef,
+        offset: i64,
+        pdf_unique_id: Option<u64>,
+    ) -> Self {
         let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
+            pdf_unique_id,
             resolver: None,
             state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
@@ -265,6 +290,7 @@ impl ObjectHandle {
     ) -> Self {
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
+            pdf_unique_id: None,
             resolver: Some(resolver),
             state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
@@ -348,8 +374,14 @@ impl ObjectHandle {
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if let Repr::Indirect(slot) = &self.0 {
-            let object_ref = slot.borrow().object_ref;
-            Self::associate_value_with_owners(&value, &[object_ref], 0);
+            let owner = {
+                let slot = slot.borrow();
+                ContainmentOwner {
+                    pdf_unique_id: slot.pdf_unique_id,
+                    object_ref: slot.object_ref,
+                }
+            };
+            Self::associate_value_with_owners(&value, &[owner], 0);
             slot.borrow_mut().state = IndirectState::Resolved(value);
         }
     }
@@ -357,15 +389,42 @@ impl ObjectHandle {
     /// Return the canonical indirect objects that contain this direct handle.
     /// Indirect handles own themselves and are intentionally excluded: callers
     /// that need that case already use [`Self::object_ref`].
+    #[cfg(test)]
     pub(crate) fn containing_object_refs(&self) -> Vec<ObjectRef> {
         match &self.0 {
             Repr::Direct(slot) => slot
                 .borrow()
                 .containing_object_refs
                 .iter()
-                .copied()
+                .map(|owner| owner.object_ref)
                 .collect(),
             Repr::Indirect(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn containing_object_refs_for_pdf(&self, pdf_unique_id: u64) -> Vec<ObjectRef> {
+        match &self.0 {
+            Repr::Direct(slot) => slot
+                .borrow()
+                .containing_object_refs
+                .iter()
+                .filter(|owner| owner.pdf_unique_id == Some(pdf_unique_id))
+                .map(|owner| owner.object_ref)
+                .collect(),
+            Repr::Indirect(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
+        match &self.0 {
+            Repr::Indirect(slot) => slot.borrow().pdf_unique_id == Some(pdf_unique_id),
+            Repr::Direct(slot) => {
+                let owners = &slot.borrow().containing_object_refs;
+                owners.is_empty()
+                    || owners
+                        .iter()
+                        .any(|owner| owner.pdf_unique_id == Some(pdf_unique_id))
+            }
         }
     }
 
@@ -838,7 +897,7 @@ impl ObjectHandle {
     /// An indirect parent is its own containment root; a direct parent can be
     /// shared by more than one indirect root and therefore propagates all of
     /// its recorded owners.
-    fn child_owner_refs(&self) -> Vec<ObjectRef> {
+    fn child_owner_refs(&self) -> Vec<ContainmentOwner> {
         match &self.0 {
             Repr::Direct(slot) => slot
                 .borrow()
@@ -846,11 +905,17 @@ impl ObjectHandle {
                 .iter()
                 .copied()
                 .collect(),
-            Repr::Indirect(slot) => vec![slot.borrow().object_ref],
+            Repr::Indirect(slot) => {
+                let slot = slot.borrow();
+                vec![ContainmentOwner {
+                    pdf_unique_id: slot.pdf_unique_id,
+                    object_ref: slot.object_ref,
+                }]
+            }
         }
     }
 
-    fn associate_value_with_owners(value: &ObjectValue, owners: &[ObjectRef], depth: usize) {
+    fn associate_value_with_owners(value: &ObjectValue, owners: &[ContainmentOwner], depth: usize) {
         let children = match value {
             ObjectValue::Array(children) => children.clone(),
             ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
@@ -862,7 +927,7 @@ impl ObjectHandle {
         }
     }
 
-    fn associate_with_owners(&self, owners: &[ObjectRef], depth: usize) {
+    fn associate_with_owners(&self, owners: &[ContainmentOwner], depth: usize) {
         if !self.is_direct() || owners.is_empty() || depth >= crate::object::MAX_INLINE_DEPTH {
             return;
         }
@@ -1370,7 +1435,7 @@ impl ObjectHandle {
     /// dictionary handle's already-recorded `<<`-start parsed offset
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
-        let owner_refs = self.containing_object_refs();
+        let owner_refs = self.child_owner_refs();
         if let Repr::Direct(slot) = &self.0 {
             slot.borrow_mut().value = value;
             self.with_value(|value| {

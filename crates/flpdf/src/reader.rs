@@ -1605,7 +1605,13 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn get_object_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
         self.handle_registry
             .entry(object_ref)
-            .or_insert_with(|| ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET))
+            .or_insert_with(|| {
+                ObjectHandle::new_indirect_unresolved_for_pdf(
+                    object_ref,
+                    NO_PARSED_OFFSET,
+                    self.unique_id,
+                )
+            })
             .clone()
     }
 
@@ -1759,7 +1765,12 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(());
         }
 
-        for object_ref in handle.containing_object_refs() {
+        if !handle.belongs_to_pdf(self.unique_id) {
+            return Err(Error::Unsupported(
+                "ObjectHandle belongs to another Pdf".to_string(),
+            ));
+        }
+        for object_ref in handle.containing_object_refs_for_pdf(self.unique_id) {
             self.mark_object_handle_mutated(object_ref);
         }
         Ok(())
