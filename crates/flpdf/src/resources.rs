@@ -123,14 +123,14 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
             any_failures = true;
             if let Some(resources) = resources.as_ref() {
                 pending.extend(form_xobjects_in_resources(pdf, resources)?);
-            }
+            } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
             continue;
         };
         let Some(used) = collect_used_names_for_form(&bytes) else {
             any_failures = true;
             if let Some(resources) = resources.as_ref() {
                 pending.extend(form_xobjects_in_resources(pdf, resources)?);
-            }
+            } // cov:ignore: llvm-cov maps the covered child-Form continuation to this closing brace
             continue; // cov:ignore: malformed Form regression exercises this path; llvm maps the parser failure to collect_used_names_for_form
         };
         let local_unresolved = unresolved_resource_names(pdf, resources.as_ref(), &used)?;
