@@ -41,10 +41,11 @@
 //! # Missing keys
 //!
 //! Any of `/Root`, `/Names`, `/EmbeddedFiles`, or the name-tree root being absent
-//! results in an empty list (`Ok(vec![])`) rather than an error.  Two error
-//! kinds can be returned: I/O errors propagated from [`Pdf::resolve`], and
-//! [`crate::Error::Unsupported`] when the underlying name-tree walker detects
-//! a structural cycle.
+//! results in an empty list (`Ok(vec![])`) rather than an error. I/O errors
+//! propagate from [`Pdf::resolve`], [`crate::Error::Unsupported`] reports a
+//! structural cycle from the name-tree walker, and [`crate::Error::Internal`]
+//! reports an invalid first name-tree key, matching qpdf's iterator
+//! dereference failure.
 //!
 //! # Value types
 //!
@@ -238,6 +239,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         let mut entries = Vec::new();
         let mut cursor = tree.begin(self.pdf)?;
+        if cursor.positioned() && cursor.current().is_none() {
+            return Err(Error::Internal(
+                "attempt made to dereference an invalid name/number tree iterator".to_string(),
+            ));
+        }
         while let Some((key, value)) = cursor.current() {
             let position = (!matches!(value, Object::Reference(_)))
                 .then(|| cursor.selected_path())

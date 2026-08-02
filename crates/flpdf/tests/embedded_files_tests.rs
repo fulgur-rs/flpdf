@@ -22,8 +22,8 @@
 
 use flpdf::{
     delete_embedded_file, insert_embedded_file, list_embedded_files, Dictionary,
-    EmbeddedFileDocumentHelper, EmbeddedFileStream, FileSpec, Object, ObjectHandle, ObjectRef, Pdf,
-    LEAF_MAX,
+    EmbeddedFileDocumentHelper, EmbeddedFileStream, Error, FileSpec, Object, ObjectHandle,
+    ObjectRef, Pdf, LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -1411,6 +1411,39 @@ fn helper_lookup_returns_none_for_missing_key_in_existing_tree() {
         .get_embedded_file(b"missing")
         .expect("lookup")
         .is_none());
+}
+
+#[test]
+fn helper_listing_rejects_a_first_non_string_name_tree_key() {
+    let mut pdf = open(build_no_names_pdf());
+    let filespec = make_filespec(&mut pdf, b"valid.txt");
+    let mut tree = Dictionary::new();
+    tree.insert(
+        "Names",
+        Object::Array(vec![
+            Object::Name(b"not-a-string".to_vec()),
+            filespec.materialize(),
+            Object::String(b"valid".to_vec()),
+            filespec.materialize(),
+        ]),
+    );
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Dictionary(tree));
+    let catalog_ref = pdf.root_ref().expect("root");
+    let mut catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary")
+        .clone();
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    assert!(matches!(
+        pdf.embedded_files().get_embedded_files(),
+        Err(Error::Internal(message))
+            if message == "attempt made to dereference an invalid name/number tree iterator"
+    ));
 }
 
 #[test]

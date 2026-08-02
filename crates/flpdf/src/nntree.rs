@@ -478,6 +478,11 @@ impl NameTreeCursor {
         self.inner.selected_path()
     }
 
+    /// Whether traversal selected an array slot, even if its key is malformed.
+    pub(crate) fn positioned(&self) -> bool {
+        self.inner.positioned()
+    }
+
     /// Whether the cursor points to a valid key/value pair.
     pub fn valid(&self) -> bool {
         self.inner.current().is_some()
