@@ -1,8 +1,9 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle`
-//! (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
+//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership.
+//!
+//! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
 //! (`libqpdf/qpdf/QPDFValue.hh`).
 
