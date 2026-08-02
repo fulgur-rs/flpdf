@@ -163,6 +163,11 @@ pub(crate) enum ObjectValue {
 struct DirectSlot {
     value: ObjectValue,
     parsed_offset: i64,
+    /// Canonical indirect objects that contain this direct value. qpdf keeps
+    /// one shared QPDFObject payload, so direct mutation has no document-wide
+    /// owner-discovery phase. The Rust port records the same containment at
+    /// insertion/resolution time for incremental-write dirty tracking.
+    containing_object_refs: std::collections::BTreeSet<ObjectRef>,
 }
 
 /// The resolution state of an indirect handle's backing slot.
@@ -270,6 +275,7 @@ impl ObjectHandle {
         Self(Repr::Direct(Rc::new(RefCell::new(DirectSlot {
             value,
             parsed_offset,
+            containing_object_refs: Default::default(),
         }))))
     }
 
@@ -342,7 +348,24 @@ impl ObjectHandle {
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if let Repr::Indirect(slot) = &self.0 {
+            let object_ref = slot.borrow().object_ref;
+            Self::associate_value_with_owners(&value, &[object_ref], 0);
             slot.borrow_mut().state = IndirectState::Resolved(value);
+        }
+    }
+
+    /// Return the canonical indirect objects that contain this direct handle.
+    /// Indirect handles own themselves and are intentionally excluded: callers
+    /// that need that case already use [`Self::object_ref`].
+    pub(crate) fn containing_object_refs(&self) -> Vec<ObjectRef> {
+        match &self.0 {
+            Repr::Direct(slot) => slot
+                .borrow()
+                .containing_object_refs
+                .iter()
+                .copied()
+                .collect(),
+            Repr::Indirect(_) => Vec::new(),
         }
     }
 
@@ -787,11 +810,17 @@ impl ObjectHandle {
         if self.is_same_direct_handle(&value) {
             return;
         }
-        self.with_value_mut(|v| {
+        let owner_refs = self.child_owner_refs();
+        let inserted = self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
-                entries.insert(key.to_vec(), value);
+                entries.insert(key.to_vec(), value.clone());
+                return true;
             }
+            false
         });
+        if inserted {
+            value.associate_with_owners(&owner_refs, 0);
+        }
     }
 
     /// True if `self` and `other` are both direct handles sharing the same
@@ -803,6 +832,57 @@ impl ObjectHandle {
     /// indirect-boundary stop.
     fn is_same_direct_handle(&self, other: &Self) -> bool {
         matches!((&self.0, &other.0), (Repr::Direct(a), Repr::Direct(b)) if Rc::ptr_eq(a, b))
+    }
+
+    /// The indirect object refs inherited by a newly inserted direct child.
+    /// An indirect parent is its own containment root; a direct parent can be
+    /// shared by more than one indirect root and therefore propagates all of
+    /// its recorded owners.
+    fn child_owner_refs(&self) -> Vec<ObjectRef> {
+        match &self.0 {
+            Repr::Direct(slot) => slot
+                .borrow()
+                .containing_object_refs
+                .iter()
+                .copied()
+                .collect(),
+            Repr::Indirect(slot) => vec![slot.borrow().object_ref],
+        }
+    }
+
+    fn associate_value_with_owners(value: &ObjectValue, owners: &[ObjectRef], depth: usize) {
+        let children = match value {
+            ObjectValue::Array(children) => children.clone(),
+            ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
+            ObjectValue::Stream { dict, .. } => vec![dict.clone()],
+            _ => return,
+        };
+        for child in children {
+            child.associate_with_owners(owners, depth + 1);
+        }
+    }
+
+    fn associate_with_owners(&self, owners: &[ObjectRef], depth: usize) {
+        if !self.is_direct() || owners.is_empty() || depth >= crate::object::MAX_INLINE_DEPTH {
+            return;
+        }
+        let Repr::Direct(slot) = &self.0 else {
+            // cov:ignore: is_direct guard above excludes Indirect
+            return;
+        };
+        let children = {
+            let mut slot = slot.borrow_mut();
+            slot.containing_object_refs.extend(owners.iter().copied());
+            match &slot.value {
+                ObjectValue::Array(children) => children.clone(),
+                ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
+                ObjectValue::Stream { dict, .. } => vec![dict.clone()],
+                _ => Vec::new(),
+            }
+        };
+        for child in children {
+            child.associate_with_owners(owners, depth + 1);
+        }
     }
 
     /// Remove `key` from this handle's dictionary if present, mutating the
@@ -1291,8 +1371,14 @@ impl ObjectHandle {
     /// dictionary handle's already-recorded `<<`-start parsed offset
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
+        let owner_refs = self.containing_object_refs();
         if let Repr::Direct(slot) = &self.0 {
             slot.borrow_mut().value = value;
+            self.with_value(|value| {
+                if let Some(value) = value {
+                    Self::associate_value_with_owners(value, &owner_refs, 0);
+                }
+            });
         }
     }
 
@@ -3335,6 +3421,60 @@ mod mutation_tests {
         assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
         indirect.remove_key(b"A");
         assert!(indirect.get_key(b"A").is_null());
+    }
+
+    #[test]
+    fn resolving_an_indirect_dictionary_records_its_direct_child_owner() {
+        // This fails if resolution leaves a direct child detached from the
+        // canonical indirect object that contains it. Pdf's incremental
+        // writer then has no local owner to schedule after the child mutates.
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let child = ObjectHandle::dictionary(vec![]);
+
+        owner.set_resolved(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+            (b"Child".to_vec(), child.clone()),
+        ])));
+
+        assert_eq!(child.containing_object_refs(), vec![owner_ref]);
+    }
+
+    #[test]
+    fn replacing_a_contained_direct_value_propagates_its_owner_to_new_children() {
+        // A preserved direct stream dictionary is replaced in place by
+        // Pdf::set_object. New direct descendants must inherit the same
+        // incremental-write owner rather than requiring a later graph scan.
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let direct = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+            (b"Direct".to_vec(), direct.clone()),
+        ])));
+        let child = ObjectHandle::integer(42);
+
+        direct.replace_direct_value(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+            (b"Child".to_vec(), child.clone()),
+        ])));
+
+        assert_eq!(child.containing_object_refs(), vec![owner_ref]);
+    }
+
+    #[test]
+    fn associating_direct_owners_stops_at_an_indirect_child() {
+        // Direct containment ends at indirect identity. Propagating owner 7
+        // through this boundary would incorrectly make object 9's payload a
+        // direct child of object 7.
+        let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
+        let direct = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+            (b"Direct".to_vec(), direct.clone()),
+        ])));
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+
+        direct.replace_key(b"Indirect", indirect.clone());
+
+        assert!(direct.get_key(b"Indirect").is_same_object_as(&indirect));
+        assert!(indirect.containing_object_refs().is_empty());
     }
 
     #[test]

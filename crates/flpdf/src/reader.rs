@@ -1744,10 +1744,10 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.insert(object_ref);
     }
 
-    /// Mark the indirect object that owns `handle` dirty after an in-place
-    /// ObjectHandle mutation. A direct handle may be a live child of an
-    /// indirect object, so every owner whose direct object graph contains it
-    /// is marked as well.
+    /// Mark the canonical owner of `handle` dirty after an in-place
+    /// [`ObjectHandle`] mutation. Direct children carry their indirect
+    /// containment refs from resolution/insertion, so this never resolves
+    /// unrelated objects merely to rediscover an owner.
     pub(crate) fn mark_object_handle_dirty(&mut self, handle: &ObjectHandle) -> Result<()> {
         if let Some(object_ref) = handle.object_ref() {
             if !self.is_canonical_object_handle(handle) {
@@ -1759,40 +1759,10 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(());
         }
 
-        let mut owners = Vec::new();
-        for owner in self.get_all_object_handles()? {
-            self.resolve_object_handle(&owner)?;
-            if Self::contains_direct_handle(&owner, handle, 0) {
-                if let Some(object_ref) = owner.object_ref() {
-                    owners.push(object_ref);
-                }
-            }
-        }
-        for object_ref in owners {
+        for object_ref in handle.containing_object_refs() {
             self.mark_object_handle_mutated(object_ref);
         }
         Ok(())
-    }
-
-    fn contains_direct_handle(root: &ObjectHandle, target: &ObjectHandle, depth: usize) -> bool {
-        if root.is_same_object_as(target) {
-            return true;
-        }
-        if depth >= crate::object::MAX_INLINE_DEPTH {
-            return false;
-        }
-        let children = root
-            .as_dictionary()
-            .map(|entries| entries.into_values().collect::<Vec<_>>())
-            .or_else(|| root.as_array())
-            .or_else(|| root.as_stream_dict().map(|dictionary| vec![dictionary]));
-        children.is_some_and(|children| {
-            children.into_iter().any(|child| {
-                child.is_same_object_as(target)
-                    || (child.is_direct()
-                        && Self::contains_direct_handle(&child, target, depth + 1))
-            })
-        })
     }
 
     // This implements the ordering/registration contract of qpdf's
@@ -5974,19 +5944,6 @@ mod tests {
 
         pdf.mark_object_handle_dirty(&inner).unwrap();
         assert!(pdf.is_dirty(object_ref));
-    }
-
-    #[test]
-    fn direct_owner_search_stops_at_the_inline_depth_limit() {
-        let root = ObjectHandle::dictionary(Vec::new());
-        assert!(Pdf::<Cursor<Vec<u8>>>::contains_direct_handle(
-            &root, &root, 0
-        ));
-        assert!(!Pdf::<Cursor<Vec<u8>>>::contains_direct_handle(
-            &root,
-            &ObjectHandle::integer(1),
-            crate::object::MAX_INLINE_DEPTH,
-        ));
     }
 
     #[test]
