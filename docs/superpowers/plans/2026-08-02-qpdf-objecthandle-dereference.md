@@ -101,8 +101,8 @@ all applicable members and records decoded-stream-relative offsets.
   (156/156 executable lines, 100%).
 - [x] Record exact results in `flpdf-25kg.3.3`.
 - [x] Commit the responsibility correction.
-- [ ] Push Beads and git.
-- [ ] Open the pull request for the primitive slice.
+- [x] Push Beads and git.
+- [x] Open pull request #620 for the primitive slice.
 
 Commands:
 
