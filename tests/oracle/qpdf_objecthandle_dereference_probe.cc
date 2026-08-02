@@ -19,12 +19,14 @@ main(int argc, char* argv[])
         auto root = qpdf.getTrailer().getKey("/Root");
         std::cout << "root-indirect\t" << root.isIndirect() << '\n';
         std::cout << "root-dictionary\t" << root.isDictionary() << '\n';
+        std::cout << "root-parsed-offset\t" << root.getParsedOffset() << '\n';
         std::cout << "root-has-pages\t" << root.hasKey("/Pages") << '\n';
 
         auto pages = root.getKey("/Pages");
         std::cout << "root-still-indirect\t" << root.isIndirect() << '\n';
         std::cout << "pages-indirect\t" << pages.isIndirect() << '\n';
         std::cout << "pages-dictionary\t" << pages.isDictionary() << '\n';
+        std::cout << "pages-parsed-offset\t" << pages.getParsedOffset() << '\n';
         std::cout << "pages-still-indirect\t" << pages.isIndirect() << '\n';
         return 0;
     } catch (std::exception const& e) {
