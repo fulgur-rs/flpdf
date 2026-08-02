@@ -351,7 +351,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             } else if self.is_radio_button()? {
                 if let Object::Name(name) = value {
                     self.set_radio_button_value(self.field_ref, name)?;
-                }
+                } // cov:ignore: llvm-cov attributes the covered radio dispatch edge to the closing brace
             }
             // qpdf intentionally ignores both invalid button input and
             // pushbutton values after issuing a warning when available.
@@ -367,7 +367,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         self.set_field_attribute(b"V", value)?;
         if need_appearances {
             self.set_need_appearances()?;
-        }
+        } // cov:ignore: llvm-cov attributes the covered NeedAppearances branch edge to the closing brace
         Ok(())
     }
 

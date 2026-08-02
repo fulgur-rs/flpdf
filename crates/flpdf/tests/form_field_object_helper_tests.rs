@@ -1517,6 +1517,30 @@ fn radio_updates_preserve_all_unselectable_kid_shapes() {
 }
 
 #[test]
+fn radio_skips_an_indirect_grandchild_without_appearance() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Kids [ << /Kids [11 0 R 12 0 R] >> ] >>".into(),
+        ),
+        (11, "<< /Subtype /Widget >>".into()),
+        (12, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("skip the first grandchild and update the usable widget");
+    let widget = pdf.resolve(ObjectRef::new(12, 0)).expect("widget");
+    let Object::Dictionary(widget) = widget else {
+        panic!("widget must be a dictionary");
+    };
+    assert_eq!(
+        widget.get(b"AS".as_slice()),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+}
+
+#[test]
 fn raw_value_reference_skips_null_cycles_and_non_dictionary_fields() {
     let bytes = doc(vec![
         (10, "<< /V null /Parent 11 0 R >>".into()),
