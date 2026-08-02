@@ -9,6 +9,20 @@ use crate::object::{Dictionary, Object, ObjectRef};
 use crate::ref_chain::terminal_ref_of_chain;
 use crate::{Error, Pdf, Result};
 
+/// Raw-`Object` counterpart of qpdf's null-aware dictionary `hasKey` test.
+///
+/// TODO(flpdf-25kg.3.5): delete this adapter when page-tree repair consumes
+/// resolver-backed `ObjectHandle`s and can call `ObjectHandle::try_has_key`.
+fn raw_object_key_is_visible<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: Option<&Object>,
+) -> Result<bool> {
+    match value {
+        Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
+        None => Ok(false),
+    }
+}
+
 /// The effective `/Pages` root and leaf order after qpdf-compatible repair.
 ///
 /// Returned by [`prepare_for_optimization`]; see that function for what "repair" covers.
@@ -110,6 +124,9 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
         let Some(parent) = parent else {
             break;
         };
+        if !raw_object_key_is_visible(pdf, Some(&parent))? {
+            break;
+        }
         match parent {
             Object::Reference(parent_ref) => {
                 pages_ref = parent_ref;
@@ -131,14 +148,17 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
         changed_pages = true;
     }
     if changed_pages {
-        if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
-            let corrected = match &direct_root {
-                Some(root) => Object::Dictionary(root.clone()),
-                None => Object::Reference(pages_ref),
-            };
-            root_dict.insert("Pages", corrected);
-            pdf.set_object(root_ref, Object::Dictionary(root_dict));
-        }
+        let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? else {
+            // cov:ignore-start: root_ref was resolved as a catalog dictionary before reading /Pages
+            return Ok(None);
+            // cov:ignore-end
+        };
+        let corrected = match &direct_root {
+            Some(root) => Object::Dictionary(root.clone()),
+            None => Object::Reference(pages_ref),
+        };
+        root_dict.insert("Pages", corrected);
+        pdf.set_object(root_ref, Object::Dictionary(root_dict));
     }
 
     // Compute the first free object number once and carry it through the
@@ -281,7 +301,7 @@ fn repair_page_tree<R: Read + Seek>(
             // classifies interior-vs-leaf by `kid.hasKey("/Kids")` before any
             // direct→indirect conversion (QPDF_pages.cc:100-118), so branch the
             // same way here.
-            if d.get("Kids").is_some() {
+            if raw_object_key_is_visible(pdf, d.get("Kids"))? {
                 // (1i) Direct *interior* node (a direct dict WITH /Kids). qpdf
                 // recurses into it in place (:101-102) and keeps the node direct;
                 // only direct leaves are materialized.
@@ -317,10 +337,11 @@ fn repair_page_tree<R: Read + Seek>(
         // snapshot its own /MediaBox value — all in a scope that ends the
         // immutable borrow of `pdf` before we mutate it. `leaf_media_box` is
         // unused for an interior node (the snapshot is a small scalar/array/ref).
-        let (has_kids, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
-            Object::Dictionary(d) => (d.get("Kids").is_some(), d.get("MediaBox").cloned()),
+        let (kids_value, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
+            Object::Dictionary(d) => (d.get("Kids").cloned(), d.get("MediaBox").cloned()),
             _ => continue, // Reference to a non-dictionary: skip, as push does.
         };
+        let has_kids = raw_object_key_is_visible(pdf, kids_value.as_ref())?;
         if has_kids {
             // Interior /Pages node: descend, threading the /MediaBox flag.
             repair_page_tree(pdf, kid_ref, state, depth + 1, media_box, max_depth)?;
@@ -434,7 +455,7 @@ fn repair_direct_page_tree<R: Read + Seek>(
         let kid_ref = if let Object::Reference(reference) = &*kid {
             *reference
         } else if let Object::Dictionary(child) = &mut *kid {
-            if child.get("Kids").is_some() {
+            if raw_object_key_is_visible(pdf, child.get("Kids"))? {
                 repair_direct_page_tree(pdf, child, state, depth + 1, media_box, max_depth)?;
                 changed = true;
                 continue;
@@ -456,10 +477,11 @@ fn repair_direct_page_tree<R: Read + Seek>(
             continue;
         };
 
-        let (has_kids, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
-            Object::Dictionary(leaf) => (leaf.get("Kids").is_some(), leaf.get("MediaBox").cloned()),
+        let (kids_value, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
+            Object::Dictionary(leaf) => (leaf.get("Kids").cloned(), leaf.get("MediaBox").cloned()),
             _ => continue,
         };
+        let has_kids = raw_object_key_is_visible(pdf, kids_value.as_ref())?;
         if has_kids {
             repair_page_tree(pdf, kid_ref, state, depth + 1, media_box, max_depth)?;
             continue;
@@ -2642,6 +2664,35 @@ mod tests {
     }
 
     #[test]
+    fn null_kids_is_absent_when_classifying_an_indirect_leaf() {
+        for (label, kids) in [
+            ("direct null", Object::Null),
+            ("indirect null", Object::Reference(ObjectRef::new(4, 0))),
+        ] {
+            let mut pdf =
+                Pdf::open(Cursor::new(pdf_with_no_inheritable_keys())).expect("valid PDF");
+            pdf.set_object(ObjectRef::new(4, 0), Object::Null);
+            let mut leaf = pdf
+                .resolve(ObjectRef::new(3, 0))
+                .expect("leaf resolves")
+                .into_dict()
+                .expect("leaf is a dictionary");
+            leaf.insert("Kids", kids);
+            pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(leaf));
+
+            let prepared = prepare_for_optimization(&mut pdf)
+                .expect("page preparation must succeed")
+                .expect("fixture has a page tree");
+
+            assert_eq!(
+                prepared.pages,
+                vec![ObjectRef::new(3, 0)],
+                "qpdf hasKey treats {label} as an absent /Kids"
+            );
+        }
+    }
+
+    #[test]
     fn correct_types_unchanged_no_mint() {
         // A well-formed tree (root /Pages, leaf /Page): the /Type-override pass
         // is a complete no-op — no /Type is mutated and no object is minted.
@@ -3559,6 +3610,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn null_kids_is_absent_when_classifying_a_direct_leaf() {
+        for (label, kids) in [
+            ("direct null", Object::Null),
+            ("indirect null", Object::Reference(ObjectRef::new(4, 0))),
+        ] {
+            let mut pdf = Pdf::open(Cursor::new(pdf_with_direct_leaf_kid())).expect("valid PDF");
+            pdf.set_object(ObjectRef::new(4, 0), Object::Null);
+            let mut pages = pdf
+                .resolve(ObjectRef::new(2, 0))
+                .expect("pages resolves")
+                .into_dict()
+                .expect("pages is a dictionary");
+            let mut kids_array = pages
+                .remove("Kids")
+                .and_then(Object::into_array)
+                .expect("/Kids is an array");
+            let direct_leaf = kids_array[0]
+                .as_dict_mut()
+                .expect("/Kids[0] is a direct dictionary");
+            direct_leaf.insert("Kids", kids);
+            pages.insert("Kids", Object::Array(kids_array));
+            pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+
+            let prepared = prepare_for_optimization(&mut pdf)
+                .expect("page preparation must succeed")
+                .expect("fixture has a page tree");
+
+            assert_eq!(
+                prepared.pages.len(),
+                1,
+                "qpdf hasKey treats {label} as an absent /Kids on a direct leaf"
+            );
+        }
+    }
+
     /// A DIRECT (inline) `/Page` leaf with NO `/MediaBox` and no ancestor
     /// `/MediaBox`. Object layout: 1 Catalog, 2 Pages (holding the inline leaf in
     /// `/Kids`), 3 the leaf's `/Contents` target.
@@ -3696,6 +3783,63 @@ mod tests {
             matches!(kids.first(), Some(Object::Dictionary(_))),
             "qpdf keeps a direct interior node direct while traversing it"
         );
+    }
+
+    #[test]
+    fn direct_interior_classifies_null_kids_children_as_leaves() {
+        let mut pdf = Pdf::open(Cursor::new(pdf_with_direct_interior_node())).expect("valid PDF");
+        pdf.set_object(ObjectRef::new(4, 0), Object::Null);
+
+        let mut indirect_leaf = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .expect("leaf resolves")
+            .into_dict()
+            .expect("leaf is a dictionary");
+        indirect_leaf.insert("Kids", Object::Null);
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(indirect_leaf));
+
+        let mut pages = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .expect("pages resolves")
+            .into_dict()
+            .expect("pages is a dictionary");
+        let mut root_kids = pages
+            .remove("Kids")
+            .and_then(Object::into_array)
+            .expect("root /Kids is an array");
+        let interior = root_kids[0]
+            .as_dict_mut()
+            .expect("root /Kids[0] is a direct dictionary");
+        interior.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Dictionary({
+                    let mut leaf = Dictionary::new();
+                    leaf.insert("Type", Object::Name(b"Page".to_vec()));
+                    leaf.insert(
+                        "MediaBox",
+                        Object::Array(vec![
+                            Object::Integer(0),
+                            Object::Integer(0),
+                            Object::Integer(612),
+                            Object::Integer(792),
+                        ]),
+                    );
+                    leaf.insert("Kids", Object::Reference(ObjectRef::new(4, 0)));
+                    leaf
+                }),
+            ]),
+        );
+        pages.insert("Kids", Object::Array(root_kids));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("page preparation must succeed")
+            .expect("fixture has a page tree");
+
+        assert_eq!(prepared.pages.len(), 2);
+        assert_eq!(prepared.pages[0], ObjectRef::new(3, 0));
     }
 
     /// A `/Pages` node whose single `/Kids` entry is a DIRECT non-dictionary
@@ -3914,6 +4058,46 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(2, 0))),
             "a catalog /Pages already at the true root must be left unchanged"
         );
+    }
+
+    #[test]
+    fn null_parent_is_absent_during_root_correction() {
+        for (label, parent) in [
+            ("direct null", Object::Null),
+            ("indirect null", Object::Reference(ObjectRef::new(4, 0))),
+        ] {
+            let mut pdf =
+                Pdf::open(Cursor::new(pdf_with_no_inheritable_keys())).expect("valid PDF");
+            pdf.set_object(ObjectRef::new(4, 0), Object::Null);
+            let mut pages = pdf
+                .resolve(ObjectRef::new(2, 0))
+                .expect("pages resolves")
+                .into_dict()
+                .expect("pages is a dictionary");
+            pages.insert("Parent", parent);
+            pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(pages));
+
+            let prepared = prepare_for_optimization(&mut pdf)
+                .expect("page preparation must succeed")
+                .expect("null /Parent must not discard the page tree");
+
+            assert_eq!(
+                prepared.root,
+                PageTreeRoot::Indirect(ObjectRef::new(2, 0)),
+                "{label}"
+            );
+            assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)], "{label}");
+            let catalog = pdf
+                .resolve(ObjectRef::new(1, 0))
+                .expect("catalog resolves")
+                .into_dict()
+                .expect("catalog is a dictionary");
+            assert_eq!(
+                catalog.get("Pages"),
+                Some(&Object::Reference(ObjectRef::new(2, 0))),
+                "qpdf hasKey treats {label} as an absent /Parent"
+            );
+        }
     }
 
     /// The catalog's `/Pages` (node A, obj 2) has a `/Parent` cycle: A's `/Parent`
