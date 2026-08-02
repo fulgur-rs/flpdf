@@ -238,8 +238,15 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             return Ok(BTreeMap::new());
         };
         let mut entries = Vec::new();
-        let mut cursor = tree.begin(self.pdf)?;
+        let mut cursor = match tree.begin(self.pdf) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                self.store_embedded_files_root(tree.into_root())?;
+                return Err(error);
+            }
+        };
         if cursor.positioned() && cursor.current().is_none() {
+            self.store_embedded_files_root(tree.into_root())?;
             return Err(Error::Internal(
                 "attempt made to dereference an invalid name/number tree iterator".to_string(),
             ));
@@ -249,7 +256,10 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 .then(|| cursor.selected_path())
                 .flatten();
             entries.push((key, value, position));
-            cursor.next(&mut tree, self.pdf)?;
+            if let Err(error) = cursor.next(&mut tree, self.pdf) {
+                self.store_embedded_files_root(tree.into_root())?;
+                return Err(error);
+            }
         }
         self.store_embedded_files_root(tree.into_root())?;
         let mut result = BTreeMap::new();
