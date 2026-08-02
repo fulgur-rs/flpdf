@@ -52,6 +52,18 @@ path used by optimization.  It then delegates mutations to existing primitives;
 there is no cached page list, so callers must enumerate again after mutation,
 as in qpdf.
 
+### Direct catalog `/Pages` root
+
+qpdf's `QPDF::flattenPagesTree`, `insertPage`, and `removePage` operate on a
+`QPDFObjectHandle`, so a direct `/Pages` dictionary embedded in the catalog
+remains direct during non-final insertion and removal. Rust's rebuild boundary
+therefore receives the repaired root location as either an indirect object or
+the catalog-owned direct dictionary; it must not mint a replacement indirect
+root. The direct branch rewrites the catalog's `/Pages` dictionary in place and
+reparents every flattened leaf to the final direct root value. The same
+selection, cloning, and inherited-attribute materialization logic is shared
+with the indirect-root branch.
+
 ### Fresh-document extraction boundary
 
 `page_extract.rs` retains ownership of `extract_pages` and `extract_page`.
@@ -73,7 +85,10 @@ without mutating the document.
 1. Add focused unit/integration tests for repair-aware enumeration, front/end
    insertion, before/after insertion, removal, and facade routing of resource
    pruning and annotation flattening.
-2. Compare the new behavior with qpdf 11.9.0 probes where method semantics are
+2. Exercise front/end insertion and non-final removal against a direct catalog
+   `/Pages` dictionary; assert that it stays direct while `/Kids`, `/Count`,
+   and each flattened leaf's `/Parent` match qpdf's direct-handle semantics.
+3. Compare the new behavior with qpdf 11.9.0 probes where method semantics are
    ambiguous.
-3. Run the affected `flpdf` tests, formatting, workspace clippy, workspace
+4. Run the affected `flpdf` tests, formatting, workspace clippy, workspace
    tests, and changed-line coverage.
