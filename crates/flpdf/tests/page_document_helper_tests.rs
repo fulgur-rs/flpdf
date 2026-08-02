@@ -507,7 +507,7 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     let mut appearance = Dictionary::new();
     appearance.insert("Type", Object::Name(b"XObject".to_vec()));
     appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
-    appearance.insert("Resources", Object::Dictionary(appearance_resources));
+    appearance.insert("Resources", Object::Reference(ObjectRef::new(12, 0)));
     appearance.insert(
         "BBox",
         Object::Array(vec![
@@ -528,6 +528,14 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
         Object::Reference(ObjectRef::new(8, 0)),
     );
     pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(existing_fonts));
+    pdf.set_object(
+        ObjectRef::new(12, 0),
+        Object::Reference(ObjectRef::new(13, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(13, 0),
+        Object::Dictionary(appearance_resources),
+    );
     let mut ap = Dictionary::new();
     ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
     let mut widget = Dictionary::new();
@@ -830,12 +838,16 @@ fn helper_flatten_annotations_follows_chained_appearance_holders() {
     pdf.set_object(
         ObjectRef::new(10, 0),
         Object::Array(vec![
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(100),
-            Object::Integer(20),
+            Object::Reference(ObjectRef::new(13, 0)),
+            Object::Reference(ObjectRef::new(14, 0)),
+            Object::Reference(ObjectRef::new(15, 0)),
+            Object::Reference(ObjectRef::new(16, 0)),
         ]),
     );
+    pdf.set_object(ObjectRef::new(13, 0), Object::Integer(0));
+    pdf.set_object(ObjectRef::new(14, 0), Object::Integer(0));
+    pdf.set_object(ObjectRef::new(15, 0), Object::Integer(100));
+    pdf.set_object(ObjectRef::new(16, 0), Object::Integer(20));
     pdf.set_object(
         ObjectRef::new(11, 0),
         Object::Reference(ObjectRef::new(12, 0)),
@@ -843,14 +855,20 @@ fn helper_flatten_annotations_follows_chained_appearance_holders() {
     pdf.set_object(
         ObjectRef::new(12, 0),
         Object::Array(vec![
-            Object::Integer(1),
-            Object::Integer(0),
-            Object::Integer(0),
-            Object::Integer(1),
-            Object::Integer(0),
-            Object::Integer(0),
+            Object::Reference(ObjectRef::new(17, 0)),
+            Object::Reference(ObjectRef::new(18, 0)),
+            Object::Reference(ObjectRef::new(19, 0)),
+            Object::Reference(ObjectRef::new(20, 0)),
+            Object::Reference(ObjectRef::new(21, 0)),
+            Object::Reference(ObjectRef::new(22, 0)),
         ]),
     );
+    pdf.set_object(ObjectRef::new(17, 0), Object::Integer(1));
+    pdf.set_object(ObjectRef::new(18, 0), Object::Integer(0));
+    pdf.set_object(ObjectRef::new(19, 0), Object::Integer(0));
+    pdf.set_object(ObjectRef::new(20, 0), Object::Integer(1));
+    pdf.set_object(ObjectRef::new(21, 0), Object::Integer(0));
+    pdf.set_object(ObjectRef::new(22, 0), Object::Integer(0));
     pdf.set_object(
         ObjectRef::new(8, 0),
         Object::Stream(Stream::new(appearance, Vec::new())),

@@ -564,13 +564,9 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
         let Some(resources) = appearance.dict.get("Resources").cloned() else {
             continue; // cov:ignore: qpdf mergeResources no-ops without appearance resources
         };
-        let mut resources = match resources {
+        let mut resources = match resolve_ref_chain(pdf, &resources)?.0 {
             Object::Dictionary(dict) => dict,
-            Object::Reference(reference) => match pdf.resolve(reference)? {
-                Object::Dictionary(dict) => dict,
-                _ => continue, // cov:ignore: malformed indirect appearance resources are ignored
-            },
-            _ => continue, // cov:ignore: malformed direct appearance resources are ignored
+            _ => continue, // cov:ignore: malformed appearance resources are ignored
         };
         for (category, source) in default_resources.iter() {
             let (source, _) = resolve_ref_chain(pdf, source)?;
@@ -785,9 +781,10 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
     }
     let mut bbox_vals = [0.0f64; 4];
     for (i, elem) in bbox_arr.iter().take(4).enumerate() {
+        let (elem, _) = resolve_ref_chain(pdf, elem)?;
         bbox_vals[i] = match elem {
-            Object::Integer(n) => *n as f64,
-            Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
+            Object::Integer(n) => n as f64,
+            Object::Real(r) | Object::RealLiteral { value: r, .. } => r,
             _ => return Ok((None, identity)),
         };
     }
@@ -802,9 +799,10 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
                 let mut m = [0.0f64; 6];
                 let mut valid = true;
                 for (i, elem) in a.iter().take(6).enumerate() {
+                    let (elem, _) = resolve_ref_chain(pdf, elem)?;
                     m[i] = match elem {
-                        Object::Integer(n) => *n as f64,
-                        Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
+                        Object::Integer(n) => n as f64,
+                        Object::Real(r) | Object::RealLiteral { value: r, .. } => r,
                         _ => {
                             valid = false;
                             break;
