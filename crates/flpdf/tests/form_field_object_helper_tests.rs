@@ -989,3 +989,356 @@ fn consumer_clear_need_appearances_uses_the_form_field_helper_boundary() {
     };
     assert_eq!(acroform.get(b"NeedAppearances".as_slice()), None);
 }
+
+#[test]
+fn field_accessors_return_qpdf_defaults_for_missing_or_wrong_typed_values() {
+    // qpdf's string/name/choice accessors return their empty defaults rather
+    // than coercing an object of the wrong PDF type.
+    let bytes = doc_with_acroform(vec![
+        (10, "<< /CustomString /NotAString /CustomName (not-a-name) /FT /Ch /Opt 42 /Q /Bad /T /NotAString >>".into()),
+        (20, "<< /Q /AlsoBad >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert_eq!(field.inheritable_string(b"CustomString").unwrap(), "");
+    assert_eq!(field.inheritable_name(b"CustomName").unwrap(), b"");
+    assert_eq!(field.partial_name().unwrap(), None);
+    assert_eq!(field.choices().unwrap(), Vec::<String>::new());
+    assert_eq!(field.quadding().unwrap(), 0);
+
+    let bytes = doc(vec![(10, "<< /FT /Ch >>".into())]);
+    let mut pdf = open(bytes);
+    assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .choices()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn button_values_ignore_non_names_and_malformed_widget_containers() {
+    // qpdf 11.9.0 `setV` (QPDFFormFieldObjectHelper.cc:306-330) ignores
+    // non-name button values. Its radio helper also leaves a non-array /Kids
+    // container untouched rather than creating a field value.
+    let bytes = doc_with_acroform(vec![
+        (
+            10,
+            "<< /FT /Btn /AP << /N << /Off null /On null >> >> >>".into(),
+        ),
+        (20, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    let before = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::String(b"not-a-name".to_vec()), true)
+        .unwrap();
+    assert_eq!(pdf.resolve(ObjectRef::new(10, 0)).unwrap(), before);
+    assert!(pdf
+        .resolve(ObjectRef::new(20, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("NeedAppearances")
+        .is_none());
+
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Btn /Ff 32768 /Kids /NotAnArray >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert!(pdf
+        .resolve(ObjectRef::new(10, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("V")
+        .is_none());
+}
+
+#[test]
+fn checkbox_defaults_to_yes_when_no_usable_widget_appearance_exists() {
+    // qpdf chooses /Yes when a checkbox is set on but neither the field nor a
+    // direct widget offers a usable normal-appearance on-state.
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Btn /Kids [42 << /AP null >>] >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    let field = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    assert_eq!(
+        field.as_dict().unwrap().get("V"),
+        Some(&Object::Name(b"Yes".to_vec()))
+    );
+}
+
+#[test]
+fn checkbox_updates_a_direct_widget_through_an_indirect_kids_array() {
+    // qpdf's object handles dereference the /Kids holder before selecting the
+    // first direct widget with a non-null /AP.
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids 11 0 R >>".into()),
+        (
+            11,
+            "[<< /AP << /N << /Off null /Chosen null >> >> >>]".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+
+    let kids_holder = pdf.resolve(ObjectRef::new(11, 0)).unwrap();
+    let Object::Array(kids) = kids_holder else {
+        panic!("/Kids holder must remain an array");
+    };
+    let Object::Dictionary(widget) = &kids[0] else {
+        panic!("first /Kids item must remain a direct widget");
+    };
+    assert_eq!(widget.get("AS"), Some(&Object::Name(b"Chosen".to_vec())));
+}
+
+#[test]
+fn radio_updates_parent_group_and_preserves_malformed_children() {
+    // qpdf 11.9.0 `setRadioButtonValue` recurses to a top-level radio parent
+    // (cc:348-365), then only changes child widgets that have a non-null /AP.
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Ff 32768 /Parent 11 0 R >>".into()),
+        (
+            11,
+            "<< /FT /Btn /Ff 32768 /Kids [10 0 R 12 0 R 13 0 R] >>".into(),
+        ),
+        (12, "42".into()),
+        (
+            13,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .unwrap();
+
+    let parent = pdf.resolve(ObjectRef::new(11, 0)).unwrap();
+    assert_eq!(
+        parent.as_dict().unwrap().get("V"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        Object::Integer(42)
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(13, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+}
+
+#[test]
+fn radio_keeps_direct_children_without_appearance_or_grandchildren() {
+    // A direct child that has neither /AP nor /Kids is not a selectable radio
+    // widget; qpdf retains it while updating later selectable siblings.
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Btn /Ff 32768 /Kids [ << /T (group-only) >> << /AP << /N << /Off null /On null >> >> >> ] >>"
+            .into(),
+    )]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    let kids = field
+        .as_dict()
+        .unwrap()
+        .get("Kids")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(kids[0].as_dict().unwrap().get("AS"), None);
+    assert_eq!(
+        kids[1].as_dict().unwrap().get("AS"),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+}
+
+#[test]
+fn field_tree_depth_limits_apply_to_top_level_and_reference_accessors() {
+    let mut objects = Vec::new();
+    for number in 10..=111 {
+        let dictionary = if number == 111 {
+            "<< /V 112 0 R >>".to_string()
+        } else {
+            format!("<< /Parent {} 0 R >>", number + 1)
+        };
+        objects.push((number, dictionary));
+    }
+    objects.push((112, "(value)".into()));
+    let mut pdf = open(doc(objects));
+
+    let top_level = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .top_level_field()
+        .unwrap_err();
+    assert!(top_level
+        .to_string()
+        .contains("field tree depth exceeds maximum"));
+
+    let field_value_reference = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .field_value_reference()
+        .unwrap_err();
+    assert!(field_value_reference
+        .to_string()
+        .contains("field tree depth exceeds maximum"));
+}
+
+#[test]
+fn clear_need_appearances_leaves_non_true_and_malformed_acroforms_unchanged() {
+    for acroform in ["<< /NeedAppearances false >>", "42"] {
+        let bytes = doc_with_acroform(vec![(10, "<< /FT /Tx >>".into()), (20, acroform.into())]);
+        let mut pdf = open(bytes);
+        let before = pdf.resolve(ObjectRef::new(20, 0)).unwrap();
+        FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
+        assert_eq!(pdf.resolve(ObjectRef::new(20, 0)).unwrap(), before);
+    }
+
+    let bytes = doc(vec![(10, "<< /FT /Tx >>".into())]);
+    let mut pdf = open(bytes);
+    let root = pdf.root_ref().unwrap();
+    FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
+    assert!(pdf
+        .resolve(root)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("AcroForm")
+        .is_none());
+}
+
+#[test]
+fn form_field_operations_are_noops_without_a_catalog_root() {
+    // The public parser accepts a trailer without /Root. qpdf's document
+    // helpers treat that shape as a no-op for document-level AcroForm work.
+    let bytes = String::from_utf8(doc(vec![(10, "<< /FT /Tx >>".into())]))
+        .unwrap()
+        .replace(" /Root 1 0 R", "")
+        .into_bytes();
+    let mut pdf = open(bytes);
+    assert_eq!(pdf.root_ref(), None);
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"RawName".to_vec()), true)
+        .unwrap();
+    FormFieldObjectHelper::clear_need_appearances_after_generation(&mut pdf).unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"RawName".to_vec()))
+    );
+}
+
+#[test]
+fn checkbox_keeps_unusable_kids_and_radio_stops_at_non_top_level_fields() {
+    // A checkbox whose indirect /Kids holder is not an array falls back to
+    // /Yes. A radio child whose parent is not top-level leaves its own value
+    // alone, matching qpdf's setRadioButtonValue parent guard.
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids 11 0 R >>".into()),
+        (11, "42".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Yes".to_vec()))
+    );
+
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 11 0 R /Kids [12 0 R] >>".into(),
+        ),
+        (11, "<< /Parent 13 0 R >>".into()),
+        (12, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+        (13, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert!(pdf
+        .resolve(ObjectRef::new(10, 0))
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get("V")
+        .is_none());
+}
+
+#[test]
+fn radio_preserves_unselectable_direct_and_indirect_grandchildren() {
+    // qpdf only selects the first grandchild with a usable /AP. Malformed
+    // direct objects, indirect non-dictionaries, and dictionaries without
+    // /AP remain in the original /Kids structure.
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Ff 32768 /Kids [11 0 R] >>".into()),
+        (11, "<< /Kids 12 0 R >>".into()),
+        (12, "[42 13 0 R << /T (no-appearance) >> 14 0 R]".into()),
+        (13, "null".into()),
+        (14, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+
+    let widget = pdf.resolve(ObjectRef::new(14, 0)).unwrap();
+    assert_eq!(
+        widget.as_dict().unwrap().get("AS"),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+    let holder = pdf.resolve(ObjectRef::new(12, 0)).unwrap();
+    assert!(matches!(holder.as_array().unwrap()[0], Object::Integer(42)));
+    assert!(matches!(
+        holder.as_array().unwrap()[1],
+        Object::Reference(_)
+    ));
+    assert_eq!(
+        holder.as_array().unwrap()[2].as_dict().unwrap().get("AS"),
+        None
+    );
+}
+
+#[test]
+fn text_appearance_uses_standard_font_fallback_without_acroform_resources() {
+    // qpdf can generate a text appearance from /DA even when the catalog has
+    // no /AcroForm /DR font dictionary; standard-14 metrics provide the
+    // fallback. This exercises the helper's absent-default-resources path.
+    let bytes = doc(vec![(
+        10,
+        "<< /FT /Tx /V (value) /Rect [0 0 100 20] /DA (/Helv 12 Tf 0 g) >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    assert!(FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .generate_appearance_for(ObjectRef::new(10, 0))
+        .unwrap()
+        .is_some());
+}
