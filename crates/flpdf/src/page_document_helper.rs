@@ -7,7 +7,7 @@
 //! flattening. The helper holds no copied page-tree state.
 
 use crate::page_tree_rebuild::{rebuild_page_tree, RebuildResult};
-use crate::{Error, ObjectRef, Pdf, Result};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
@@ -18,6 +18,43 @@ use std::io::{Read, Seek};
 /// operations. No page-tree state is cached inside this struct.
 pub struct PageDocumentHelper<'a, R: Read + Seek> {
     pdf: &'a mut Pdf<R>,
+}
+
+/// An input page for [`PageDocumentHelper::add_page`] and
+/// [`PageDocumentHelper::add_page_at`].
+///
+/// qpdf accepts a `QPDFObjectHandle`, which can be direct, target-owned, or
+/// owned by another `QPDF`. Rust's handles do not retain an owning-document
+/// borrow, so the foreign case explicitly carries its source document.
+pub enum PageInput<'a, R: Read + Seek> {
+    /// A direct page handle, which qpdf turns into a fresh indirect object.
+    Direct(ObjectHandle),
+    /// An indirect page already owned by the target document.
+    Existing(ObjectRef),
+    /// An indirect page owned by another document.
+    Foreign {
+        source: &'a mut Pdf<R>,
+        page: ObjectRef,
+    },
+}
+
+impl PageInput<'static, std::io::Cursor<Vec<u8>>> {
+    /// Construct a direct page input.
+    pub fn direct(page: ObjectHandle) -> Self {
+        Self::Direct(page)
+    }
+
+    /// Construct an input for a page already owned by the target document.
+    pub fn existing(page: ObjectRef) -> Self {
+        Self::Existing(page)
+    }
+}
+
+impl<'a, R: Read + Seek> PageInput<'a, R> {
+    /// Construct an input page from another document.
+    pub fn foreign(source: &'a mut Pdf<R>, page: ObjectRef) -> Self {
+        Self::Foreign { source, page }
+    }
 }
 
 impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
@@ -55,7 +92,11 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// Mirrors `QPDFPageDocumentHelper::addPage`. If `page` already occurs in
     /// the page tree, rebuilding creates a shallow duplicate for its later
     /// occurrence, retaining shared page sub-objects.
-    pub fn add_page(&mut self, page: ObjectRef, first: bool) -> Result<RebuildResult> {
+    pub fn add_page<RS: Read + Seek>(
+        &mut self,
+        page: PageInput<'_, RS>,
+        first: bool,
+    ) -> Result<RebuildResult> {
         let index = if first {
             0
         } else {
@@ -69,9 +110,9 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// Mirrors `QPDFPageDocumentHelper::addPageAt`. The reference page must
     /// be present in the repaired current page list; a non-member is rejected
     /// before the page tree is mutated.
-    pub fn add_page_at(
+    pub fn add_page_at<RS: Read + Seek>(
         &mut self,
-        page: ObjectRef,
+        page: PageInput<'_, RS>,
         before: bool,
         reference_page: ObjectRef,
     ) -> Result<RebuildResult> {
@@ -94,7 +135,11 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] when `idx > page_count`.
     /// - Any error from [`rebuild_page_tree`] (e.g. `page` is not a `/Page` dict).
-    fn insert_page(&mut self, idx: usize, page: ObjectRef) -> Result<RebuildResult> {
+    fn insert_page<RS: Read + Seek>(
+        &mut self,
+        idx: usize,
+        page: PageInput<'_, RS>,
+    ) -> Result<RebuildResult> {
         let mut refs = self.get_all_pages()?;
         if idx > refs.len() {
             return Err(Error::Unsupported(format!(
@@ -102,8 +147,39 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
                 refs.len()
             )));
         }
-        refs.insert(idx, page);
+        let page = self.materialize_page_input(page)?;
+        if refs.contains(&page) {
+            let copy = self.pdf.resolve(page)?;
+            let duplicate = self.pdf.next_available_object_ref()?;
+            self.pdf.set_object(duplicate, copy);
+            refs.insert(idx, duplicate);
+        } else {
+            refs.insert(idx, page);
+        }
         rebuild_page_tree(self.pdf, &refs)
+    }
+
+    fn materialize_page_input<RS: Read + Seek>(
+        &mut self,
+        input: PageInput<'_, RS>,
+    ) -> Result<ObjectRef> {
+        match input {
+            PageInput::Direct(handle) => {
+                let indirect = self.pdf.make_indirect_object_handle(handle)?;
+                Ok(indirect
+                    .object_ref()
+                    .expect("make_indirect_object_handle always returns an indirect handle"))
+            }
+            PageInput::Existing(page) => Ok(page),
+            PageInput::Foreign { source, page } => {
+                PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
+                let closure = crate::page_closure::foreign_page_object_closure(source, page)?;
+                let copied = crate::object_copy::copy_foreign_objects(source, self.pdf, &closure)?;
+                copied.get(&page).copied().ok_or(Error::Missing(
+                    "foreign page was not present in the copied object graph",
+                ))
+            }
+        }
     }
 
     /// Remove the page at 0-based position `idx`.
