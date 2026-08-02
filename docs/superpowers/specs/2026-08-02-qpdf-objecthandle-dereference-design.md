@@ -76,7 +76,7 @@ with C++ exceptions:
 impl ObjectHandle {
     pub fn try_dereference(&self) -> Result<()>;
     pub fn try_is_null(&self) -> Result<bool>;
-    pub fn try_as_dictionary(&self) -> Result<Option<DictionaryHandle>>;
+    pub fn try_as_dictionary(&self) -> Result<Option<BTreeMap<Vec<u8>, ObjectHandle>>>;
     pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle>;
     pub fn try_has_key(&self, key: &[u8]) -> Result<bool>;
 }
