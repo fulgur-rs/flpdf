@@ -740,6 +740,49 @@ fn helper_flatten_annotations_expands_indirect_contents_and_wraps_empty_output()
 }
 
 #[test]
+fn helper_flatten_annotations_wraps_when_non_null_ap_has_no_normal_stream() {
+    let mut pdf = open(build_n_page_pdf(1));
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        Object::Stream(Stream::new(Dictionary::new(), b"existing\n".to_vec())),
+    );
+
+    // qpdf removes an annotation when /AP is non-null even if it does not
+    // contain a selectable normal-appearance stream. This specifically takes
+    // the no-placement branch, which must still add q/Q page-content wrappers.
+    let mut annot = Dictionary::new();
+    annot.insert("AP", Object::Integer(1));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(annot));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert("Contents", Object::Reference(ObjectRef::new(4, 0)));
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(5, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(page.get("Annots").is_none());
+    let Some(Object::Array(contents)) = page.get("Contents") else {
+        panic!("qpdf addPageContents always writes a direct contents array");
+    };
+    assert_eq!(contents.len(), 3, "before, original stream, after");
+    assert_eq!(contents[1], Object::Reference(ObjectRef::new(4, 0)));
+    assert_eq!(
+        flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+        b"q\nexisting\n\nQ\n"
+    );
+}
+
+#[test]
 fn helper_flatten_annotations_applies_no_rotate_using_leaf_rotate() {
     let mut pdf = open(build_n_page_pdf(1));
     let mut appearance = Dictionary::new();
