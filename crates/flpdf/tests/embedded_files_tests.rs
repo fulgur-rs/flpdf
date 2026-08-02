@@ -1440,6 +1440,79 @@ fn helper_replace_rejects_foreign_indirect_filespec_without_mutation() {
 }
 
 #[test]
+fn helper_replace_rejects_foreign_direct_filespec_without_mutation() {
+    let mut source = open(build_no_names_pdf());
+    let owner_ref = ObjectRef::new(500, 0);
+    let mut filespec = Dictionary::new();
+    filespec.insert("F", Object::String(b"foreign.txt".to_vec()));
+    let mut owner_dict = Dictionary::new();
+    owner_dict.insert("FS", Object::Dictionary(filespec));
+    source.set_object(owner_ref, Object::Dictionary(owner_dict));
+    let owner = source.get_object_handle(owner_ref);
+    source.resolve_object_handle(&owner).expect("resolve owner");
+    let foreign = owner.get_key(b"FS");
+
+    let mut destination = open(build_no_names_pdf());
+    assert!(destination
+        .embedded_files()
+        .replace_embedded_file(b"foreign", foreign)
+        .is_err());
+    assert!(destination
+        .embedded_files()
+        .get_embedded_files()
+        .expect("list")
+        .is_empty());
+}
+
+#[test]
+fn helper_returns_a_live_direct_filespec_handle() {
+    let mut pdf = open(build_no_names_pdf());
+    let mut direct_filespec = Dictionary::new();
+    direct_filespec.insert("F", Object::String(b"direct.txt".to_vec()));
+    let mut tree = Dictionary::new();
+    tree.insert(
+        "Names",
+        Object::Array(vec![
+            Object::String(b"direct".to_vec()),
+            Object::Dictionary(direct_filespec),
+        ]),
+    );
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Dictionary(tree));
+    let catalog_ref = pdf.root_ref().expect("root");
+    let mut catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary")
+        .clone();
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    let handle = pdf
+        .embedded_files()
+        .get_embedded_file(b"direct")
+        .expect("get")
+        .expect("direct filespec");
+    FileSpec::new(handle, &mut pdf)
+        .expect("filespec")
+        .set_description(b"live")
+        .expect("set description");
+    let handle = pdf
+        .embedded_files()
+        .get_embedded_file(b"direct")
+        .expect("get again")
+        .expect("direct filespec");
+    assert_eq!(
+        FileSpec::new(handle, &mut pdf)
+            .expect("filespec")
+            .get_description()
+            .expect("description"),
+        b"live"
+    );
+}
+
+#[test]
 fn helper_remove_nulls_indirect_filespec_without_attachment_gc() {
     let mut pdf = open(build_no_names_pdf());
     let filespec = make_filespec(&mut pdf, b"remove.txt");

@@ -162,6 +162,49 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         Ok(())
     }
 
+    fn live_embedded_file(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(None);
+        };
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        self.pdf.resolve_object_handle(&catalog)?;
+        let names = catalog.get_key(b"Names");
+        if names.is_indirect() {
+            self.pdf.resolve_object_handle(&names)?;
+        }
+        let root = names.get_key(b"EmbeddedFiles");
+        if root.is_indirect() {
+            self.pdf.resolve_object_handle(&root)?;
+        }
+        Self::find_live_name_tree_value(self.pdf, root, key)
+    }
+
+    fn find_live_name_tree_value(
+        pdf: &mut Pdf<R>,
+        node: ObjectHandle,
+        key: &[u8],
+    ) -> Result<Option<ObjectHandle>> {
+        if let Some(pairs) = node.get_key(b"Names").as_array() {
+            for pair in pairs.chunks_exact(2) {
+                if matches!(pair[0].materialize(), Object::String(ref value) if crate::pdf_string::utf8_value(value) == key)
+                {
+                    return Ok(Some(pair[1].clone()));
+                }
+            }
+        }
+        if let Some(kids) = node.get_key(b"Kids").as_array() {
+            for kid in kids {
+                if kid.is_indirect() {
+                    pdf.resolve_object_handle(&kid)?;
+                }
+                if let Some(value) = Self::find_live_name_tree_value(pdf, kid, key)? {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Return whether this document has an `/EmbeddedFiles` name tree.
     pub fn has_embedded_files(&mut self) -> Result<bool> {
         Ok(self.embedded_files_root()?.is_some())
@@ -178,10 +221,17 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         let entries = tree.as_map(self.pdf)?;
         self.store_embedded_files_root(tree.into_root())?;
-        entries
-            .into_iter()
-            .map(|(key, value)| Ok((key, self.pdf.lift_object_to_handle(&value)?)))
-            .collect()
+        let mut result = BTreeMap::new();
+        for (key, value) in entries {
+            let handle = match value {
+                Object::Reference(_) => self.pdf.lift_object_to_handle(&value)?,
+                _ => self.live_embedded_file(&key)?.ok_or_else(|| {
+                    Error::Unsupported("embedded-files tree changed during enumeration".to_string())
+                })?,
+            };
+            result.insert(key, handle);
+        }
+        Ok(result)
     }
 
     /// Return the Filespec handle stored under `key`, if present.
@@ -191,9 +241,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         let value = tree.find_object(self.pdf, key)?;
         self.store_embedded_files_root(tree.into_root())?;
-        value
-            .map(|value| self.pdf.lift_object_to_handle(&value))
-            .transpose()
+        match value {
+            Some(Object::Reference(object_ref)) => Ok(Some(self.pdf.get_object_handle(object_ref))),
+            Some(_) => self.live_embedded_file(key),
+            None => Ok(None),
+        }
     }
 
     /// Add or replace the Filespec stored under `key`.
@@ -210,7 +262,12 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                     "filespec handle belongs to another Pdf".to_string(),
                 ));
             }
-            None => filespec.materialize(),
+            None if filespec.belongs_to_pdf(self.pdf.unique_id()) => filespec.materialize(),
+            None => {
+                return Err(Error::Unsupported(
+                    "filespec handle belongs to another Pdf".to_string(),
+                ));
+            }
         };
         insert_embedded_file_value(self.pdf, key, value)
     }
