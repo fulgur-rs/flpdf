@@ -1661,19 +1661,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`crate::write_pdf`] includes an updated body and xref entry for it.
     ///
     /// [`Self::set_object`] and [`Self::delete_object`] already do this
-    /// internally. If `set_object` had to retain a legacy-only value because
-    /// it cannot be represented by an `ObjectHandle`, preserve that override:
-    /// merely marking it dirty must not discard the value the caller just set.
-    ///
-    /// `ObjectHandle` mutation uses the narrower internal
-    /// `mark_object_handle_mutated` path, which invalidates a materialized
-    /// legacy snapshot before scheduling the updated live handle for writing.
+    /// internally. Calling this after an in-place [`ObjectHandle`] mutation
+    /// invalidates any materialized snapshot before scheduling the canonical
+    /// live handle for writing, matching qpdf's single shared object state.
     pub fn mark_object_dirty(&mut self, object_ref: ObjectRef) {
-        if self.legacy_materialized_memo.contains_key(&object_ref) {
-            self.dirty_object_refs.insert(object_ref);
-        } else {
-            self.mark_object_handle_mutated(object_ref);
-        }
+        self.mark_object_handle_mutated(object_ref);
     }
 
     pub(crate) fn mark_object_handle_mutated(&mut self, object_ref: ObjectRef) {
@@ -5768,7 +5760,7 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle).unwrap();
         handle.replace_key(b"Value", ObjectHandle::integer(2));
-        pdf.mark_object_handle_mutated(object_ref);
+        pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
             pdf.resolve_qpdf_json_object(object_ref)
@@ -5789,18 +5781,34 @@ mod tests {
     }
 
     #[test]
-    fn marking_dirty_preserves_a_legacy_only_set_object_override() {
+    fn marking_dirty_invalidates_an_ordinary_handle_materialization() {
         let object_ref = ObjectRef::new(1, 0);
-        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n0\nendobj\n"], object_ref);
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Value 1 >>\nendobj\n"],
+            object_ref,
+        );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
-        let mut deep = Object::Null;
-        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
-            deep = Object::Array(vec![deep]);
-        }
-        pdf.set_object(object_ref, deep.clone());
+        assert_eq!(
+            pdf.resolve(object_ref)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("Value"),
+            Some(&Object::Integer(1))
+        );
+
+        let handle = pdf.get_object_handle(object_ref);
+        handle.replace_key(b"Value", ObjectHandle::integer(2));
         pdf.mark_object_dirty(object_ref);
 
-        assert_eq!(pdf.resolve(object_ref).unwrap(), deep);
+        assert_eq!(
+            pdf.resolve(object_ref)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("Value"),
+            Some(&Object::Integer(2))
+        );
     }
 
     #[test]
