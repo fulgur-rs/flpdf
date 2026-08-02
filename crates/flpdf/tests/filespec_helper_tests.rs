@@ -233,6 +233,77 @@ fn qpdf_public_helper_surface_uses_object_handles_and_fluent_setters() {
 }
 
 #[test]
+fn factories_allocate_after_handle_only_objects() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let handle_only = pdf
+        .make_indirect_object_handle(ObjectHandle::integer(17))
+        .unwrap();
+    let handle_only_ref = handle_only.object_ref().unwrap();
+
+    let embedded = EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").unwrap();
+    assert_ne!(embedded.object_ref(), Some(handle_only_ref));
+    assert_eq!(
+        pdf.resolve(handle_only_ref).unwrap(),
+        Object::Integer(17),
+        "factory allocation must not clobber a handle-only object"
+    );
+}
+
+#[test]
+fn filespec_factory_indirectizes_a_direct_embedded_stream() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let direct_stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"payload".to_vec());
+    let filespec_handle =
+        FileSpec::create_file_spec(&mut pdf, "direct.bin", direct_stream).unwrap();
+
+    let mut filespec = FileSpec::new(filespec_handle, &mut pdf);
+    let stream_handle = filespec.get_embedded_file_stream("F").unwrap();
+    assert!(stream_handle.object_ref().is_some());
+    assert_eq!(
+        filespec
+            .embedded_file()
+            .unwrap()
+            .unwrap()
+            .payload()
+            .unwrap(),
+        b"payload"
+    );
+}
+
+#[test]
+fn filespec_factory_rejects_an_indirect_handle_from_another_pdf() {
+    let mut source = open(build_attachment_pdf("", "", b"source"));
+    let foreign = EmbeddedFileStream::create_ef_stream(&mut source, b"payload").unwrap();
+    let mut destination = open(build_attachment_pdf("", "", b"destination"));
+
+    assert!(matches!(
+        FileSpec::create_file_spec(&mut destination, "foreign.bin", foreign),
+        Err(Error::Unsupported(message)) if message == "embedded-file handle belongs to another Pdf"
+    ));
+}
+
+#[test]
+fn embedded_file_helper_chases_a_reference_holder_to_the_terminal_stream() {
+    let mut pdf = open(build_attachment_pdf("", "", b"payload"));
+    let stream_ref = ObjectRef::new(6, 0);
+    let holder_ref = ObjectRef::new(7, 0);
+    pdf.set_object(holder_ref, Object::Reference(stream_ref));
+    let holder = pdf.get_object_handle(holder_ref);
+    let mut embedded = EmbeddedFileStream::new(holder, &mut pdf);
+
+    assert_eq!(embedded.payload().unwrap(), b"payload");
+    embedded.set_subtype(b"application/pdf").unwrap();
+    drop(embedded);
+    let Object::Stream(stream) = pdf.resolve(stream_ref).unwrap() else {
+        panic!("expected stream");
+    };
+    assert_eq!(
+        stream.dict.get("Subtype"),
+        Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
+#[test]
 fn get_filenames_returns_only_string_name_keys_as_utf8() {
     // This fails if a non-string name key leaks into qpdf's getFilenames
     // result, or if the qpdf UTF-8 text conversion is skipped.

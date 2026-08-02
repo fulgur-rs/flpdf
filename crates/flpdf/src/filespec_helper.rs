@@ -93,10 +93,11 @@ use std::path::Path;
 
 const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 
-fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
+fn next_object_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
     let next = pdf
-        .object_refs()
+        .get_all_object_handles()?
         .iter()
+        .filter_map(ObjectHandle::object_ref)
         .map(|object_ref| object_ref.number)
         .max()
         .unwrap_or(0)
@@ -164,9 +165,23 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         }
     }
 
-    fn stream_dict(&self) -> Result<Option<ObjectHandle>> {
-        self.pdf.borrow_mut().resolve_object_handle(&self.stream)?;
-        Ok(self.stream.as_stream_dict())
+    fn resolved_stream(&self) -> Result<Option<(ObjectHandle, ObjectHandle, Option<ObjectRef>)>> {
+        let (stream, terminal_ref) = self
+            .pdf
+            .borrow_mut()
+            .resolve_object_handle_to_terminal_ref(&self.stream)?;
+        let stream = match terminal_ref {
+            Some(object_ref) => {
+                let mut pdf = self.pdf.borrow_mut();
+                let stream = pdf.get_object_handle(object_ref);
+                pdf.resolve_object_handle(&stream)?;
+                stream
+            }
+            None => stream,
+        };
+        Ok(stream
+            .as_stream_dict()
+            .map(|dictionary| (stream, dictionary, terminal_ref)))
     }
 
     fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
@@ -177,7 +192,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     fn param_value(&self, key: &[u8]) -> Result<ObjectHandle> {
-        let Some(stream_dict) = self.stream_dict()? else {
+        let Some((_, stream_dict, _)) = self.resolved_stream()? else {
             return Ok(ObjectHandle::null());
         };
         let params = self.resolved_key(&stream_dict, b"Params")?;
@@ -212,7 +227,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn payload(&self) -> Result<Vec<u8>> {
-        let Some(stream_dict) = self.stream_dict()? else {
+        let Some((stream, stream_dict, _)) = self.resolved_stream()? else {
             return Err(Error::Unsupported(
                 "expected an /EmbeddedFile stream object".to_string(),
             ));
@@ -224,8 +239,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             .materialize()
             .into_dict()
             .expect("stream dictionary handle must materialize as a dictionary");
-        let data = self
-            .stream
+        let data = stream
             .as_stream_data()
             .expect("stream dictionary handle must have stream data");
         decode_stream_data(&dictionary, &data)
@@ -240,7 +254,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases; never errors.
     pub fn mimetype(&self) -> Result<Option<Vec<u8>>> {
-        let Some(stream_dict) = self.stream_dict()? else {
+        let Some((_, stream_dict, _)) = self.resolved_stream()? else {
             return Ok(None);
         };
         Ok(self.resolved_key(&stream_dict, b"Subtype")?.as_name())
@@ -330,7 +344,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     fn set_param(&mut self, key: &str, value: Vec<u8>) -> Result<()> {
-        let Some(stream_dict) = self.stream_dict()? else {
+        let Some((_, stream_dict, stream_ref)) = self.resolved_stream()? else {
             return Ok(());
         };
         let params = stream_dict.get_key(b"Params");
@@ -351,7 +365,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             target.replace_key(key.as_bytes(), ObjectHandle::string(value));
             if let Some(object_ref) = terminal_ref {
                 self.pdf.borrow_mut().mark_object_dirty(object_ref);
-            } else if let Some(object_ref) = self.stream.object_ref() {
+            } else if let Some(object_ref) = stream_ref {
                 self.pdf.borrow_mut().mark_object_dirty(object_ref);
             }
             return Ok(());
@@ -361,7 +375,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             b"Params",
             ObjectHandle::dictionary(vec![(key.as_bytes().to_vec(), ObjectHandle::string(value))]),
         );
-        if let Some(object_ref) = self.stream.object_ref() {
+        if let Some(object_ref) = stream_ref {
             self.pdf.borrow_mut().mark_object_dirty(object_ref);
         }
         Ok(())
@@ -381,11 +395,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
     /// Set `/Subtype` to a MIME type represented as logical PDF Name bytes.
     pub fn set_subtype(&mut self, value: impl AsRef<[u8]>) -> Result<&mut Self> {
-        let Some(stream_dict) = self.stream_dict()? else {
+        let Some((_, stream_dict, stream_ref)) = self.resolved_stream()? else {
             return Ok(self);
         };
         stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
-        if let Some(object_ref) = self.stream.object_ref() {
+        if let Some(object_ref) = stream_ref {
             self.pdf.borrow_mut().mark_object_dirty(object_ref);
         }
         Ok(self)
@@ -420,10 +434,22 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ) -> Result<ObjectHandle> {
         let name = new_unicode_string(filename.as_ref());
         let mut ef = Dictionary::new();
-        let embedded_file = embedded_file
-            .object_ref()
-            .map(Object::Reference)
-            .unwrap_or_else(|| embedded_file.materialize());
+        let embedded_file = if let Some(object_ref) = embedded_file.object_ref() {
+            let canonical = pdf.get_object_handle(object_ref);
+            if !canonical.ptr_eq(&embedded_file) {
+                return Err(Error::Unsupported(
+                    "embedded-file handle belongs to another Pdf".to_string(),
+                ));
+            }
+            embedded_file
+        } else {
+            pdf.make_indirect_object_handle(embedded_file)?
+        };
+        let embedded_file = Object::Reference(
+            embedded_file
+                .object_ref()
+                .expect("make_indirect_object_handle must return an indirect handle"),
+        );
         ef.insert("F", embedded_file.clone());
         ef.insert("UF", embedded_file);
 
