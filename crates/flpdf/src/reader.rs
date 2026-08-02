@@ -1707,10 +1707,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.unique_id
     }
 
-    pub(crate) fn foreign_object_map(&self, source_id: u64) -> BTreeMap<ObjectRef, ObjectRef> {
+    pub(crate) fn take_foreign_object_map(
+        &mut self,
+        source_id: u64,
+    ) -> BTreeMap<ObjectRef, ObjectRef> {
         self.foreign_object_maps
-            .get(&source_id)
-            .cloned()
+            .remove(&source_id)
             .unwrap_or_default()
     }
 

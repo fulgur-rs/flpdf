@@ -124,12 +124,21 @@ pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
     refs: &BTreeSet<ObjectRef>,
 ) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
     let source_id = source.unique_id();
-    let mut map = target.foreign_object_map(source_id);
+    let mut map = target.take_foreign_object_map(source_id);
     let mut to_copy = Vec::new();
+    let mut base = None;
 
     for &source_ref in refs {
         if let std::collections::btree_map::Entry::Vacant(entry) = map.entry(source_ref) {
-            let target_ref = target.next_available_object_ref()?;
+            let base = match base {
+                Some(base) => base,
+                None => {
+                    let first = target.next_available_object_ref()?.number;
+                    base = Some(first);
+                    first
+                }
+            };
+            let target_ref = ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
             // Reserve before resolving any source object so cycles can be
             // rewritten through the complete map, as qpdf does.
             target.set_object(target_ref, Object::Null);
@@ -144,11 +153,12 @@ pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
         target.set_object(map[&source_ref], object);
     }
 
-    target.set_foreign_object_map(source_id, map.clone());
-    Ok(refs
+    let copied = refs
         .iter()
         .map(|source_ref| (*source_ref, map[source_ref]))
-        .collect())
+        .collect();
+    target.set_foreign_object_map(source_id, map);
+    Ok(copied)
 }
 
 /// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
