@@ -558,6 +558,45 @@ mod tests {
     }
 
     #[test]
+    fn direct_catalog_root_stays_direct_after_rebuild_and_round_trips() {
+        let mut pdf = open(build_nested_pdf());
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("catalog must be a dictionary");
+        };
+        catalog.insert("Pages", Object::Dictionary(root));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(4, 0)]).unwrap();
+        assert_eq!(result.new_kids.len(), 2);
+
+        let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("catalog must remain a dictionary");
+        };
+        let Some(Object::Dictionary(root)) = catalog.get("Pages") else {
+            panic!("catalog /Pages must remain direct");
+        };
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        let expected_parent = Object::Dictionary(root.clone());
+        for page_ref in result.new_kids {
+            let page = dict_of(&mut pdf, page_ref);
+            assert_eq!(page.get("Parent"), Some(&expected_parent));
+        }
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).unwrap();
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("direct-root output must parse");
+        assert_eq!(
+            crate::PageDocumentHelper::new(&mut reopened)
+                .get_all_pages()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn inherited_attrs_materialized_on_leaf() {
         // Page 1 (obj 4) inherits everything from intermediate node 3.
         let mut pdf = open(build_nested_pdf());
