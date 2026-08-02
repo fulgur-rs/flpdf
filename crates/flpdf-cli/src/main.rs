@@ -1127,7 +1127,7 @@ struct RewriteCommand {
     ///
     /// MODE is `all`, `screen`, or `print`:
     /// - `all`: bake every visible annotation into the page content stream.
-    /// - `screen`: only annotations that render on screen (not when printed).
+    /// - `screen`: annotations that render on screen, including printable annotations.
     /// - `print`: only annotations flagged for printing.
     ///
     /// Combine with `--generate-appearances` to first synthesize missing
@@ -1274,7 +1274,7 @@ impl From<CliStreamDataMode> for StreamDataMode {
 /// Selects which annotations are baked into page content by
 /// [`flatten_annotations`]:
 /// - `all`: every visible annotation.
-/// - `screen`: annotations that render on screen but not when printed.
+/// - `screen`: annotations that render on screen, including printable annotations.
 /// - `print`: annotations flagged for printing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CliFlattenMode {
@@ -3211,6 +3211,7 @@ fn run_rewrite(
         // generate first, flatten second).
         if generate_appearances {
             generate_missing_appearances(&mut pdf)?;
+            clear_need_appearances_after_generation(&mut pdf)?;
         }
 
         // Step 5: flatten annotations into page content (--flatten-annotations).
@@ -3388,6 +3389,53 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
     }
 
     Ok(())
+}
+
+/// qpdf clears `/NeedAppearances` after it has generated appearance streams.
+/// Keep an absent or already-false key unchanged, so the explicit CLI pass
+/// does not introduce a catalog mutation when qpdf would have returned early.
+fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(());
+    };
+    let Object::Dictionary(mut root) = pdf.resolve(root_ref)? else {
+        return Ok(());
+    };
+    let Some(acroform) = root.get("AcroForm").cloned() else {
+        return Ok(());
+    };
+    let (acroform, terminal_ref) = resolve_acroform_reference_chain(pdf, acroform)?;
+    let Object::Dictionary(mut acroform) = acroform else {
+        return Ok(());
+    };
+    if !matches!(acroform.get("NeedAppearances"), Some(Object::Boolean(true))) {
+        return Ok(());
+    }
+    acroform.insert("NeedAppearances", Object::Boolean(false));
+    if let Some(acroform_ref) = terminal_ref {
+        pdf.set_object(acroform_ref, Object::Dictionary(acroform));
+    } else {
+        root.insert("AcroForm", Object::Dictionary(acroform));
+        pdf.set_object(root_ref, Object::Dictionary(root));
+    }
+    Ok(())
+}
+
+/// Follow an AcroForm holder chain without exposing flpdf's internal generic
+/// reference-chain module through the CLI crate boundary.
+fn resolve_acroform_reference_chain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    mut object: Object,
+) -> CliResult<(Object, Option<ObjectRef>)> {
+    let mut terminal_ref = None;
+    for _ in 0..64 {
+        let Object::Reference(reference) = object else {
+            break;
+        };
+        terminal_ref = Some(reference);
+        object = pdf.resolve(reference)?;
+    }
+    Ok((object, terminal_ref))
 }
 
 // ===========================================================================

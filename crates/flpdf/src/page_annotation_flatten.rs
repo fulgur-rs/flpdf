@@ -16,6 +16,7 @@
 
 use crate::page_annotation_enum::enumerate_page_annotations;
 use crate::pages::{coalesce_page_contents, page_content_bytes, resolve_inherited_resources};
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Matrix, Object, ObjectRef, Pdf, Rectangle, Result, Stream};
 use std::io::{Read, Seek};
 
@@ -392,10 +393,12 @@ fn add_qpdf_flatten_contents<R: Read + Seek>(
     let mut contents = vec![Object::Reference(before)];
     match old {
         Some(Object::Array(items)) => contents.extend(items), // cov:ignore: direct and indirect arrays share qpdf expansion; indirect holder is covered
-        Some(Object::Reference(reference)) => match pdf.resolve(reference)? {
-            Object::Array(items) => contents.extend(items),
-            _ => contents.push(Object::Reference(reference)),
-        },
+        Some(Object::Reference(reference)) => {
+            match resolve_ref_chain(pdf, &Object::Reference(reference))?.0 {
+                Object::Array(items) => contents.extend(items),
+                _ => contents.push(Object::Reference(reference)),
+            }
+        }
         Some(value) => contents.push(value), // cov:ignore: malformed direct Contents retained conservatively
         None => {}
     }
@@ -578,6 +581,7 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
             _ => continue, // cov:ignore: malformed direct appearance resources are ignored
         };
         for (category, source) in default_resources.iter() {
+            let (source, _) = resolve_ref_chain(pdf, source)?;
             let Object::Dictionary(source) = source else {
                 continue; // cov:ignore: qpdf ignores non-dictionary default resource categories
             };
@@ -625,13 +629,10 @@ fn acroform_need_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let Some(value) = acroform.get("NeedAppearances").cloned() else {
         return Ok(false);
     };
-    match value {
-        Object::Boolean(value) => Ok(value),
-        Object::Reference(reference) => {
-            Ok(matches!(pdf.resolve(reference)?, Object::Boolean(true)))
-        }
-        _ => Ok(false), // cov:ignore: non-boolean NeedAppearances is false
-    }
+    Ok(matches!(
+        resolve_ref_chain(pdf, &value)?.0,
+        Object::Boolean(true)
+    ))
 }
 
 fn remove_acroform<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
@@ -981,6 +982,126 @@ mod tests {
         pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
 
         assert!(acroform_need_appearances(&mut pdf).unwrap());
+    }
+
+    #[test]
+    fn qpdf_flatten_expands_a_multihop_contents_array() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
+        };
+        page.insert("Contents", Object::Reference(ObjectRef::new(6, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+        pdf.set_object(
+            ObjectRef::new(6, 0),
+            Object::Reference(ObjectRef::new(7, 0)),
+        );
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(8, 0)),
+                Object::Reference(ObjectRef::new(9, 0)),
+            ]),
+        );
+        pdf.set_object(
+            ObjectRef::new(8, 0),
+            Object::Stream(Stream::new(Dictionary::new(), b"BT ET\n".to_vec())),
+        );
+        pdf.set_object(
+            ObjectRef::new(9, 0),
+            Object::Stream(Stream::new(Dictionary::new(), b"q Q\n".to_vec())),
+        );
+
+        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must be a dictionary"); // cov:ignore: fixture invariant
+        };
+        add_qpdf_flatten_contents(&mut pdf, &mut page, Vec::new()).unwrap();
+
+        assert!(matches!(
+            page.get("Contents"),
+            Some(Object::Array(items))
+                if items.len() == 4
+                    && items[1] == Object::Reference(ObjectRef::new(8, 0))
+                    && items[2] == Object::Reference(ObjectRef::new(9, 0))
+        ));
+    }
+
+    #[test]
+    fn qpdf_flatten_merges_an_indirect_default_resource_category() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+        let mut appearance = Dictionary::new();
+        appearance.insert("Resources", Object::Dictionary(appearance_resources));
+        pdf.set_object(
+            ObjectRef::new(5, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+        let mut ap = Dictionary::new();
+        ap.insert("N", Object::Reference(ObjectRef::new(5, 0)));
+        let mut widget = Dictionary::new();
+        widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        widget.insert("AP", Object::Dictionary(ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+        let mut font_category = Dictionary::new();
+        font_category.insert("F1", Object::Reference(ObjectRef::new(7, 0)));
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(font_category));
+        pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(Dictionary::new()));
+        let mut default_resources = Dictionary::new();
+        default_resources.insert("Font", Object::Reference(ObjectRef::new(6, 0)));
+
+        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
+            .unwrap();
+
+        let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+            panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+            panic!("fixture appearance must retain resources"); // cov:ignore: fixture invariant
+        };
+        let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+            panic!("fixture appearance must retain Font resources"); // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            fonts.get("F1"),
+            Some(&Object::Reference(ObjectRef::new(7, 0)))
+        );
+    }
+
+    #[test]
+    fn acroform_need_appearances_resolves_a_multihop_boolean() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("", &[]))).unwrap();
+        let mut acroform = Dictionary::new();
+        acroform.insert("NeedAppearances", Object::Reference(ObjectRef::new(4, 0)));
+        let mut catalog = Dictionary::new();
+        catalog.insert("AcroForm", Object::Dictionary(acroform));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+        pdf.set_object(
+            ObjectRef::new(4, 0),
+            Object::Reference(ObjectRef::new(5, 0)),
+        );
+        pdf.set_object(ObjectRef::new(5, 0), Object::Boolean(true));
+
+        assert!(acroform_need_appearances(&mut pdf).unwrap());
+    }
+
+    #[test]
+    fn qpdf_flatten_wraps_content_when_dropping_an_unselected_appearance() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf("/Annots [4 0 R]", &[]))).unwrap();
+        let mut annotation = Dictionary::new();
+        annotation.insert("AP", Object::Dictionary(Dictionary::new()));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annotation));
+
+        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+
+        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must remain a dictionary"); // cov:ignore: fixture invariant
+        };
+        assert!(page.get("Annots").is_none());
+        assert!(matches!(
+            page.get("Contents"),
+            Some(Object::Array(items)) if items.len() == 2
+        ));
     }
 
     #[test]
