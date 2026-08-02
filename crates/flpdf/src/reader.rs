@@ -1671,6 +1671,58 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.insert(object_ref);
     }
 
+    /// Mark the indirect object that owns `handle` dirty after an in-place
+    /// ObjectHandle mutation. A direct handle may be a live child of an
+    /// indirect object, so every owner whose direct object graph contains it
+    /// is marked as well.
+    pub(crate) fn mark_object_handle_dirty(&mut self, handle: &ObjectHandle) -> Result<()> {
+        if let Some(object_ref) = handle.object_ref() {
+            let canonical = self.get_object_handle(object_ref);
+            if !canonical.ptr_eq(handle) {
+                return Err(Error::Unsupported(
+                    "ObjectHandle belongs to another Pdf".to_string(),
+                ));
+            }
+            self.mark_object_dirty(object_ref);
+            return Ok(());
+        }
+
+        let mut owners = Vec::new();
+        for owner in self.get_all_object_handles()? {
+            self.resolve_object_handle(&owner)?;
+            if Self::contains_direct_handle(&owner, handle, 0) {
+                if let Some(object_ref) = owner.object_ref() {
+                    owners.push(object_ref);
+                }
+            }
+        }
+        for object_ref in owners {
+            self.mark_object_dirty(object_ref);
+        }
+        Ok(())
+    }
+
+    fn contains_direct_handle(root: &ObjectHandle, target: &ObjectHandle, depth: usize) -> bool {
+        if root.ptr_eq(target) {
+            return true;
+        }
+        if depth >= crate::object::MAX_INLINE_DEPTH {
+            return false;
+        }
+        let children = root
+            .as_dictionary()
+            .map(|entries| entries.into_values().collect::<Vec<_>>())
+            .or_else(|| root.as_array())
+            .or_else(|| root.as_stream_dict().map(|dictionary| vec![dictionary]));
+        children.is_some_and(|children| {
+            children.into_iter().any(|child| {
+                child.ptr_eq(target)
+                    || (child.is_direct()
+                        && Self::contains_direct_handle(&child, target, depth + 1))
+            })
+        })
+    }
+
     // This implements the ordering/registration contract of qpdf's
     // `getAllObjects()` (`libqpdf/QPDF.cc:1285-1294`) only. qpdf's own
     // dangling-reference preparation additionally walks every live object's
@@ -2579,6 +2631,11 @@ impl<R: Read + Seek> Pdf<R> {
 
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         if self.resolve_to_cache(object_ref)? {
+            if self.handle_mutated_object_refs.contains(&object_ref) {
+                let handle = self.get_object_handle(object_ref);
+                self.resolve_object_handle(&handle)?;
+                return Ok(handle.materialize());
+            }
             if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
                 return Ok(object.clone());
             }
@@ -2601,6 +2658,16 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
     ) -> Result<&Object> {
         self.resolve_to_cache(object_ref)?;
+        if self.handle_mutated_object_refs.contains(&object_ref) {
+            let handle = self.get_object_handle(object_ref);
+            self.resolve_object_handle(&handle)?;
+            self.legacy_materialized_memo
+                .insert(object_ref, handle.materialize());
+            return Ok(self
+                .legacy_materialized_memo
+                .get(&object_ref)
+                .expect("inserted materialized ObjectHandle value"));
+        }
         match self.cache.entry(object_ref) {
             Some(CacheEntry::Resolved(object)) => Ok(object),
             _ => Ok(self
@@ -5665,6 +5732,47 @@ mod tests {
             b"abc"
         );
         assert_eq!(pdf.repair_diagnostics().entries().len(), 3);
+    }
+
+    #[test]
+    fn qpdf_json_resolution_observes_a_handle_dictionary_mutation() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Value 1 >>\nendobj\n"],
+            object_ref,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+
+        // Populate the legacy qpdf-JSON cache before the live handle changes.
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("Value"),
+            Some(&Object::Integer(1))
+        );
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle).unwrap();
+        handle.replace_key(b"Value", ObjectHandle::integer(2));
+        pdf.mark_object_dirty(object_ref);
+
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("Value"),
+            Some(&Object::Integer(2))
+        );
+        assert_eq!(
+            pdf.resolve_qpdf_json_object_borrowed(object_ref)
+                .unwrap()
+                .as_dict()
+                .unwrap()
+                .get("Value"),
+            Some(&Object::Integer(2))
+        );
     }
 
     #[test]

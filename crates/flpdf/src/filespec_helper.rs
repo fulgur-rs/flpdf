@@ -42,7 +42,7 @@
 //!
 //! // Assume we know the /Filespec object reference (e.g. from walking /Names).
 //! let filespec_ref = ObjectRef::new(5, 0);
-//! let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf);
+//! let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
 //!
 //! if let Some(name) = fs.filename()? {
 //!     println!("filename: {}", String::from_utf8_lossy(&name));
@@ -63,7 +63,7 @@
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
 //! let filespec_ref = ObjectRef::new(5, 0);
-//! let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf);
+//! let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
 //!
 //! if let Some(mut ef) = fs.embedded_file()? {
 //!     if let Some(mime) = ef.mimetype()? {
@@ -104,6 +104,24 @@ fn next_object_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<ObjectRef> {
         .checked_add(1)
         .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
     Ok(ObjectRef::new(next, 0))
+}
+
+fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
+    handle: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+    kind: &str,
+) -> Result<()> {
+    let Some(object_ref) = handle.object_ref() else {
+        return Ok(());
+    };
+    let canonical = pdf.get_object_handle(object_ref);
+    if canonical.ptr_eq(handle) {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "{kind} handle belongs to another Pdf"
+        )))
+    }
 }
 
 // ── EmbeddedFileStream ────────────────────────────────────────────────────────
@@ -157,12 +175,19 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
     /// Construct a wrapper for a direct or indirect `/EmbeddedFile` stream
     /// handle, matching qpdf's `QPDFEFStreamObjectHelper(QPDFObjectHandle)`
-    /// constructor.
-    pub fn new(stream: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
-        Self {
+    /// constructor. An indirect handle must be the canonical handle of `pdf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for an indirect handle owned by another
+    /// [`Pdf`]. Rust makes qpdf's document ownership explicit here rather than
+    /// silently resolving the same object number in the supplied document.
+    pub fn new(stream: ObjectHandle, pdf: &'a mut Pdf<R>) -> Result<Self> {
+        ensure_indirect_handle_belongs_to_pdf(&stream, pdf, "embedded-file")?;
+        Ok(Self {
             stream,
             pdf: RefCell::new(pdf),
-        }
+        })
     }
 
     fn resolved_stream(&self) -> Result<Option<(ObjectHandle, ObjectHandle, Option<ObjectRef>)>> {
@@ -219,7 +244,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// # use std::fs::File;
     /// # use std::io::BufReader;
     /// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// # let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf);
+    /// # let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     /// if let Some(mut ef) = fs.embedded_file()? {
     ///     let data: Vec<u8> = ef.payload()?;
     ///     assert!(!data.is_empty());
@@ -363,11 +388,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 None => resolved,
             };
             target.replace_key(key.as_bytes(), ObjectHandle::string(value));
-            if let Some(object_ref) = terminal_ref {
-                self.pdf.borrow_mut().mark_object_dirty(object_ref);
-            } else if let Some(object_ref) = stream_ref {
-                self.pdf.borrow_mut().mark_object_dirty(object_ref);
-            }
+            self.pdf.borrow_mut().mark_object_handle_dirty(&target)?;
             return Ok(());
         }
 
@@ -375,9 +396,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             b"Params",
             ObjectHandle::dictionary(vec![(key.as_bytes().to_vec(), ObjectHandle::string(value))]),
         );
-        if let Some(object_ref) = stream_ref {
-            self.pdf.borrow_mut().mark_object_dirty(object_ref);
-        }
+        let _ = stream_ref;
+        self.pdf
+            .borrow_mut()
+            .mark_object_handle_dirty(&stream_dict)?;
         Ok(())
     }
 
@@ -399,9 +421,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(self);
         };
         stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
-        if let Some(object_ref) = stream_ref {
-            self.pdf.borrow_mut().mark_object_dirty(object_ref);
-        }
+        let _ = stream_ref;
+        self.pdf
+            .borrow_mut()
+            .mark_object_handle_dirty(&stream_dict)?;
         Ok(self)
     }
 }
@@ -477,20 +500,31 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Construct a new wrapper for a `/Filespec` dictionary handle.
     ///
     /// The handle may be direct or indirect, matching qpdf's
-    /// `QPDFFileSpecObjectHelper(QPDFObjectHandle)` constructor.
-    pub fn new(filespec: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
-        Self { filespec, pdf }
+    /// `QPDFFileSpecObjectHelper(QPDFObjectHandle)` constructor. An indirect
+    /// handle must be the canonical handle of `pdf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] for an indirect handle owned by another
+    /// [`Pdf`], preventing a same-number object in `pdf` from being selected.
+    pub fn new(filespec: ObjectHandle, pdf: &'a mut Pdf<R>) -> Result<Self> {
+        ensure_indirect_handle_belongs_to_pdf(&filespec, pdf, "Filespec")?;
+        Ok(Self { filespec, pdf })
     }
 
     fn filespec_dict(&mut self) -> Result<Option<ObjectHandle>> {
-        self.pdf.resolve_object_handle(&self.filespec)?;
-        Ok(self.filespec.as_dictionary().map(|_| self.filespec.clone()))
-    }
-
-    fn mark_filespec_dirty(&mut self) {
-        if let Some(object_ref) = self.filespec.object_ref() {
-            self.pdf.mark_object_dirty(object_ref);
-        }
+        let (filespec, terminal_ref) = self
+            .pdf
+            .resolve_object_handle_to_terminal_ref(&self.filespec)?;
+        let filespec = match terminal_ref {
+            Some(object_ref) => {
+                let filespec = self.pdf.get_object_handle(object_ref);
+                self.pdf.resolve_object_handle(&filespec)?;
+                filespec
+            }
+            None => filespec,
+        };
+        Ok(filespec.as_dictionary().map(|_| filespec))
     }
 
     /// Resolve the `/Filespec` dictionary. qpdf treats a non-dictionary
@@ -524,7 +558,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             b"Desc",
             ObjectHandle::string(new_unicode_string(description.as_ref())),
         );
-        self.mark_filespec_dirty();
+        self.pdf.mark_object_handle_dirty(&dict)?;
         Ok(self)
     }
 
@@ -550,7 +584,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             b"F",
             ObjectHandle::string(compatibility_name.unwrap_or(unicode_name)),
         );
-        self.mark_filespec_dirty();
+        self.pdf.mark_object_handle_dirty(&dict)?;
         Ok(self)
     }
 
@@ -726,7 +760,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// # use std::fs::File;
     /// # use std::io::BufReader;
     /// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf);
+    /// let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     /// if let Some(mut ef) = fs.embedded_file()? {
     ///     let bytes = ef.payload()?;
     ///     println!("{} bytes", bytes.len());
@@ -742,7 +776,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let stream = terminal_ref
             .map(|object_ref| self.pdf.get_object_handle(object_ref))
             .unwrap_or(stream);
-        Ok(Some(EmbeddedFileStream::new(stream, self.pdf)))
+        Ok(Some(EmbeddedFileStream::new(stream, self.pdf)?))
     }
 }
 
@@ -1007,7 +1041,7 @@ impl FileSpecBuilder {
             .object_ref()
             .expect("create_file_spec must create an indirect Filespec");
         {
-            let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf);
+            let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
             filespec.set_filename(&uf_filename, Some(self.filename.as_slice()))?;
             if let Some(description) = self.description {
                 filespec.set_description(description)?;
@@ -1219,7 +1253,7 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
     };
 
     // Resolve the filespec and decode its embedded file stream.
-    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
     let ef = fs.embedded_file()?.ok_or_else(|| {
         Error::Unsupported(format!(
             "extract_attachment: key {:?} has no resolvable /EmbeddedFile stream \
@@ -1665,6 +1699,74 @@ mod tests {
 
     fn open_minimal() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
+    }
+
+    #[test]
+    fn builder_rejects_a_non_utf8_filename_without_a_unicode_override() {
+        let mut pdf = open_minimal();
+        let error = FileSpecBuilder::new(b"\xff.txt", b"payload".as_slice())
+            .build(&mut pdf)
+            .expect_err("/UF requires an explicit Unicode filename for non-UTF-8 bytes");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF"
+        );
+    }
+
+    #[test]
+    fn filespec_helper_chases_a_reference_holder_to_the_terminal_dictionary() {
+        let mut pdf = open_minimal();
+        let filespec_ref = ObjectRef::new(5, 0);
+        let holder_ref = ObjectRef::new(6, 0);
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"terminal.txt".to_vec()));
+        pdf.set_object(filespec_ref, Object::Dictionary(filespec));
+        pdf.set_object(holder_ref, Object::Reference(filespec_ref));
+
+        let mut helper = FileSpec::new(pdf.get_object_handle(holder_ref), &mut pdf).unwrap();
+        assert_eq!(helper.get_filename().unwrap(), b"terminal.txt");
+        helper.set_description("terminal description").unwrap();
+        drop(helper);
+
+        let Object::Dictionary(filespec) = pdf.resolve(filespec_ref).unwrap() else {
+            panic!("terminal object must be a Filespec dictionary");
+        };
+        assert_eq!(
+            filespec.get("Desc"),
+            Some(&Object::String(b"terminal description".to_vec()))
+        );
+    }
+
+    #[test]
+    fn filespec_helper_marks_an_indirect_owner_of_a_direct_dictionary_dirty() {
+        let mut pdf = open_minimal();
+        let owner_ref = ObjectRef::new(5, 0);
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"direct.txt".to_vec()));
+        let mut owner = Dictionary::new();
+        owner.insert("FS", Object::Dictionary(filespec));
+        pdf.set_object(owner_ref, Object::Dictionary(owner));
+        let owner = pdf.get_object_handle(owner_ref);
+        pdf.resolve_object_handle(&owner).unwrap();
+        let direct_filespec = owner.get_key(b"FS");
+        pdf.clear_dirty(owner_ref);
+
+        let mut helper = FileSpec::new(direct_filespec, &mut pdf).unwrap();
+        helper.set_description("persisted through owner").unwrap();
+        drop(helper);
+
+        assert!(pdf.is_dirty(owner_ref));
+    }
+
+    #[test]
+    fn helper_constructors_reject_indirect_handles_from_another_pdf() {
+        let mut source = open_minimal();
+        let foreign_filespec = source.get_object_handle(ObjectRef::new(1, 0));
+        let foreign_stream = source.get_object_handle(ObjectRef::new(2, 0));
+        let mut destination = open_minimal();
+
+        assert!(FileSpec::new(foreign_filespec, &mut destination).is_err());
+        assert!(EmbeddedFileStream::new(foreign_stream, &mut destination).is_err());
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -2190,7 +2292,7 @@ mod tests {
         assert!(!extracted.is_empty(), "extracted bytes must be non-empty");
 
         // The fixture reports /Params /Size 95 — the extracted bytes must match.
-        let mut fs = FileSpec::new(pdf.get_object_handle(entries[0].1), &mut pdf);
+        let mut fs = FileSpec::new(pdf.get_object_handle(entries[0].1), &mut pdf).unwrap();
         let ef = fs
             .embedded_file()
             .expect("embedded_file")
