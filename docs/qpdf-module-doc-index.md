@@ -6,8 +6,7 @@
 |---|---|---|
 | `crates/flpdf/src/acroform_document_helper.rs` | correspondence | QPDFAcroFormDocumentHelper.cc responsibilities shared with overlay and signature modules |
 | `crates/flpdf/src/acroform_field_prune.rs` | correspondence | QPDFJob.cc removal of unreferenced form fields after page selection |
-| `crates/flpdf/src/annotation_helper.rs` | correspondence | QPDFAnnotationObjectHelper.cc and QPDFFormFieldObjectHelper.cc responsibilities split across helper modules |
-| `crates/flpdf/src/appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc appearance generation shared with annotation helpers |
+| `crates/flpdf/src/annotation_helper.rs` | correspondence | \`QPDFAnnotationObjectHelper.cc\` |
 | `crates/flpdf/src/ascii85.rs` | correspondence | flpdf-specific ASCII85 encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCII85Decoder but no matching encoder component |
 | `crates/flpdf/src/ascii_hex.rs` | correspondence | flpdf-specific ASCIIHex encoder for PDF stream write paths; qpdf 11.9.0 has Pl_ASCIIHexDecoder but no matching encoder component |
 | `crates/flpdf/src/attachment_list.rs` | correspondence | QPDFJob.cc attachment enumeration and display formatting |
@@ -25,6 +24,8 @@
 | `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
+| `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
+| `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
 | `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities |
