@@ -80,6 +80,10 @@ pub struct Pdf<R: Read + Seek> {
     /// rather than re-deriving a fresh one from `self.trailer` each time.
     /// Populated lazily on first request.
     trailer_handle_memo: Option<ObjectHandle>,
+    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: delete with
+    /// [`Pdf::resolve_borrowed`] after its callers move to canonical handle
+    /// accessors. Do not use this memo from the new resolver path.
+    ///
     /// Memoized [`Object`] materialization of an already-resolved
     /// [`ObjectHandle`] (`ObjectHandle::materialize`), keyed by `ObjectRef`.
     /// This is [`Pdf::resolve_borrowed`]'s own cache, distinct from
@@ -1696,6 +1700,10 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(self.handle_registry.values().cloned().collect())
     }
 
+    // qpdf-cutover-delete(flpdf-25kg.3.3): one-hop legacy bridge. Delete
+    // after all callers use ObjectHandle's slot-resident dereference; the new
+    // primitive must not delegate here.
+    //
     // Bridge implementation: delegates to the existing *private*
     // `resolve_to_cache` engine (unchanged) rather than reimplementing
     // decryption, ObjStm decoding, or the cyclic `/Length` guard it already
@@ -1897,6 +1905,9 @@ impl<R: Read + Seek> Pdf<R> {
     /// that same ref returns, silently discarding the redirect
     /// `Pdf::set_object` recorded.
     ///
+    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: terminal-clone legacy API.
+    /// Delete with `ObjectValue::Reference`; do not call from new code.
+    ///
     /// A self- or mutually-cyclic redirect chain is bounded by
     /// `ref_chain::MAX_REF_CHAIN_DEPTH` — this crate's one shared hop-count
     /// bound for exactly this kind of chase, also used by
@@ -1926,6 +1937,9 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(self.resolve_object_handle_to_terminal_ref(handle)?.0)
     }
 
+    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: terminal-ref legacy API.
+    /// Delete with `ObjectValue::Reference`; do not call from new code.
+    ///
     /// Same chase as [`Pdf::resolve_object_handle_to_terminal`], additionally
     /// returning the object reference the terminal value was actually read
     /// from. This is `None` exactly when the returned handle is direct with
@@ -2292,10 +2306,17 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// An unknown, freed, or compressed-but-broken reference is **not** an error;
     /// it resolves to [`Object::Null`].
+    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: owned raw-`Object` resolver.
+    /// Delete after its callers use canonical handle accessors; do not use it
+    /// from the new resolver path.
     pub fn resolve(&mut self, object_ref: ObjectRef) -> Result<Object> {
         Ok(self.resolve_borrowed(object_ref)?.clone())
     }
 
+    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: borrowed raw-`Object` resolver
+    /// and its materialization memo are legacy-only. Delete after callers
+    /// migrate; do not preserve this signature as a new design constraint.
+    ///
     /// Resolve `object_ref` and borrow the cached concrete value.
     ///
     /// This has the same resolution behavior as [`Pdf::resolve`] but avoids cloning

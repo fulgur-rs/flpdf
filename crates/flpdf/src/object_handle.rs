@@ -120,6 +120,10 @@ pub(crate) enum ObjectValue {
         dict: ObjectHandle,
         data: Vec<u8>,
     },
+    // qpdf-cutover-delete(flpdf-25kg.3.3): qpdf cannot store an indirect
+    // handle as another indirect object's replacement value. Delete this
+    // legacy redirect variant after `set_object` and ref-chain consumers move
+    // to canonical in-place slot replacement.
     // An indirect object whose own resolved value is *itself* a bare
     // reference to another object (e.g. `4 0 obj\n5 0 R\nendobj`, or a
     // reference redirected in place via `Pdf::set_object`) -- never seen
