@@ -234,7 +234,7 @@ pub use page_annotation_enum::{
 };
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
-pub use page_document_helper::PageDocumentHelper;
+pub use page_document_helper::{PageDocumentHelper, PageInput};
 pub use page_extract::{extract_page, extract_pages};
 pub use page_label_document_helper::{
     merge_adjacent_ranges, LabelRange, LabelStyle, PageLabelDocumentHelper,

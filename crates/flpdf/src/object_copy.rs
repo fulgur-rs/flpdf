@@ -113,6 +113,56 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     Ok(map)
 }
 
+/// Copy foreign objects while retaining qpdf's per-source object identity map.
+///
+/// `QPDF::copyForeignObject` stores its map on the destination `QPDF`, keyed
+/// by the source document's unique identity. Page insertion uses this variant;
+/// the public [`copy_objects`] helper intentionally remains a fresh-copy API.
+pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
+    source: &mut Pdf<RS>,
+    target: &mut Pdf<RT>,
+    refs: &BTreeSet<ObjectRef>,
+) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
+    let source_id = source.unique_id();
+    let mut map = target.take_foreign_object_map(source_id);
+    let copied = (|| {
+        let mut to_copy = Vec::new();
+        let mut base = None;
+
+        for &source_ref in refs {
+            if let std::collections::btree_map::Entry::Vacant(entry) = map.entry(source_ref) {
+                let base = match base {
+                    Some(base) => base,
+                    None => {
+                        let first = target.next_available_object_ref()?.number;
+                        base = Some(first);
+                        first
+                    }
+                };
+                let target_ref = ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
+                // Reserve before resolving any source object so cycles can be
+                // rewritten through the complete map, as qpdf does.
+                target.set_object(target_ref, Object::Null);
+                entry.insert(target_ref);
+                to_copy.push(source_ref);
+            }
+        }
+
+        for source_ref in to_copy {
+            let mut object = source.resolve(source_ref)?;
+            rewrite_refs(&mut object, 0, &map)?;
+            target.set_object(map[&source_ref], object);
+        }
+
+        Ok(refs
+            .iter()
+            .map(|source_ref| (*source_ref, map[source_ref]))
+            .collect())
+    })();
+    target.set_foreign_object_map(source_id, map);
+    copied
+}
+
 /// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
 /// `map` are remapped, refs outside `map` become [`Object::Null`].  Stream byte
 /// payloads are left untouched (never cloned); scalars are unchanged.
@@ -189,6 +239,27 @@ fn alloc_target_number(base: u32, offset: usize) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::object::MAX_INLINE_DEPTH;
+    use std::io::Cursor;
+
+    fn minimal_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).unwrap()
+    }
 
     fn nested_arrays(depth: usize) -> Object {
         let mut o = Object::Null;
@@ -242,5 +313,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn foreign_copy_restores_existing_map_after_rewrite_failure() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let source_id = source.unique_id();
+        copy_foreign_objects(
+            &mut source,
+            &mut target,
+            &BTreeSet::from([ObjectRef::new(3, 0)]),
+        )
+        .unwrap();
+
+        source.set_object(ObjectRef::new(4, 0), nested_arrays(MAX_INLINE_DEPTH + 5));
+        assert!(copy_foreign_objects(
+            &mut source,
+            &mut target,
+            &BTreeSet::from([ObjectRef::new(4, 0)]),
+        )
+        .is_err());
+
+        assert!(target
+            .take_foreign_object_map(source_id)
+            .contains_key(&ObjectRef::new(3, 0)));
     }
 }
