@@ -22,7 +22,7 @@
 
 use flpdf::{
     delete_embedded_file, insert_embedded_file, list_embedded_files, EmbeddedFileDocumentHelper,
-    FileSpec, Object, ObjectRef, Pdf, LEAF_MAX,
+    EmbeddedFileStream, FileSpec, Object, ObjectHandle, ObjectRef, Pdf, LEAF_MAX,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -48,6 +48,11 @@ fn finish_pdf(out: &mut Vec<u8>, offsets: &BTreeMap<u32, u64>, n: u32, root_obj:
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("Pdf::open")
+}
+
+fn make_filespec(pdf: &mut Pdf<Cursor<Vec<u8>>>, filename: &[u8]) -> ObjectHandle {
+    let embedded_file = EmbeddedFileStream::create_ef_stream(pdf, b"payload").expect("stream");
+    FileSpec::create_file_spec(pdf, filename, embedded_file).expect("filespec")
 }
 
 // ── Test 1: single-level /Names leaf ─────────────────────────────────────────
@@ -1372,4 +1377,39 @@ fn helper_absent_tree_has_no_entries_or_lookup() {
         .get_embedded_file(b"missing")
         .expect("lookup")
         .is_none());
+}
+
+#[test]
+fn helper_replace_creates_and_replaces_name_tree_entry() {
+    let mut pdf = open(build_no_names_pdf());
+    let first = make_filespec(&mut pdf, b"first.txt");
+    let second = make_filespec(&mut pdf, b"second.txt");
+
+    let mut helper = pdf.embedded_files();
+    helper
+        .replace_embedded_file(b"entry", first)
+        .expect("insert");
+    helper
+        .replace_embedded_file(b"entry", second.clone())
+        .expect("replace");
+
+    assert!(helper.has_embedded_files().expect("has"));
+    assert!(helper
+        .get_embedded_file(b"entry")
+        .expect("lookup")
+        .expect("entry")
+        .is_same_object_as(&second));
+}
+
+#[test]
+fn helper_replace_rejects_foreign_indirect_filespec_without_mutation() {
+    let mut pdf = open(build_no_names_pdf());
+    let mut foreign_pdf = open(build_no_names_pdf());
+    let foreign = make_filespec(&mut foreign_pdf, b"foreign.txt");
+
+    assert!(pdf
+        .embedded_files()
+        .replace_embedded_file(b"foreign", foreign)
+        .is_err());
+    assert!(list_embedded_files(&mut pdf).expect("list").is_empty());
 }

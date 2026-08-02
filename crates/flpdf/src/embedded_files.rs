@@ -78,7 +78,7 @@
 //! ```
 
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Object, ObjectHandle, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek};
 
@@ -156,6 +156,25 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         tree.find_object(self.pdf, key)?
             .map(|value| self.pdf.lift_object_to_handle(&value))
             .transpose()
+    }
+
+    /// Add or replace the Filespec stored under `key`.
+    ///
+    /// An indirect handle must be the canonical handle of this document;
+    /// direct handles are stored directly in the name tree.
+    pub fn replace_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
+        let value = match filespec.object_ref() {
+            Some(object_ref) if self.pdf.is_canonical_object_handle(&filespec) => {
+                Object::Reference(object_ref)
+            }
+            Some(_) => {
+                return Err(Error::Unsupported(
+                    "filespec handle belongs to another Pdf".to_string(),
+                ));
+            }
+            None => filespec.materialize(),
+        };
+        insert_embedded_file_value(self.pdf, key, value)
     }
 }
 
@@ -570,6 +589,14 @@ pub fn insert_embedded_file<R: Read + Seek>(
     key: &[u8],
     filespec_ref: ObjectRef,
 ) -> Result<()> {
+    insert_embedded_file_value(pdf, key, Object::Reference(filespec_ref))
+}
+
+fn insert_embedded_file_value<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    key: &[u8],
+    value: Object,
+) -> Result<()> {
     let Some(catalog_ref) = pdf.root_ref() else {
         return Ok(());
     };
@@ -603,7 +630,7 @@ pub fn insert_embedded_file<R: Read + Seek>(
         None => crate::NameTree::new_empty(pdf, true)?,
     };
     tree.set_max_depth(DEFAULT_MAX_EMBEDDED_FILES_DEPTH);
-    tree.insert(pdf, key, Object::Reference(filespec_ref))?;
+    tree.insert(pdf, key, value)?;
     tree.make_root_indirect(pdf)?;
     names.insert("EmbeddedFiles", tree.into_root());
 
