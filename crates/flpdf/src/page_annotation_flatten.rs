@@ -950,6 +950,94 @@ mod tests {
         assert!(matches!(page.get("Resources"), Some(Object::Dictionary(_))));
     }
 
+    #[test]
+    fn qpdf_document_flatten_covers_widget_resources_and_removal_paths() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf(
+            "/Rotate 90 /Annots [4 0 R 5 0 R 6 0 R]",
+            &[],
+        )))
+        .unwrap();
+
+        let mut appearance_resources = Dictionary::new();
+        appearance_resources.insert("Font", Object::Reference(ObjectRef::new(8, 0)));
+        let mut appearance = Dictionary::new();
+        appearance.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(20),
+            ]),
+        );
+        appearance.insert("Resources", Object::Reference(ObjectRef::new(7, 0)));
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(Dictionary::new()));
+        pdf.set_object(
+            ObjectRef::new(7, 0),
+            Object::Dictionary(appearance_resources),
+        );
+        pdf.set_object(ObjectRef::new(8, 0), Object::Dictionary(Dictionary::new()));
+        pdf.set_object(
+            ObjectRef::new(12, 0),
+            Object::Stream(Stream::new(appearance, Vec::new())),
+        );
+
+        let mut selected_ap = Dictionary::new();
+        selected_ap.insert("N", Object::Reference(ObjectRef::new(12, 0)));
+        let mut selected = Dictionary::new();
+        selected.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        selected.insert("F", Object::Integer(0x10));
+        selected.insert(
+            "Rect",
+            Object::Array(vec![
+                Object::Integer(10),
+                Object::Integer(20),
+                Object::Integer(110),
+                Object::Integer(40),
+            ]),
+        );
+        selected.insert("AP", Object::Dictionary(selected_ap));
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(selected));
+
+        let mut unselected = Dictionary::new();
+        unselected.insert("Subtype", Object::Name(b"Widget".to_vec()));
+        unselected.insert("AP", Object::Dictionary(Dictionary::new()));
+        pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(unselected));
+        let mut link = Dictionary::new();
+        link.insert("Subtype", Object::Name(b"Link".to_vec()));
+        pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(link));
+
+        let mut dr_fonts = Dictionary::new();
+        dr_fonts.insert("Helv", Object::Integer(42));
+        let mut dr = Dictionary::new();
+        dr.insert("Font", Object::Dictionary(dr_fonts));
+        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(dr));
+        let mut acroform = Dictionary::new();
+        acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
+        pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
+        let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("fixture root must be a dictionary");
+        };
+        root.insert("AcroForm", Object::Reference(ObjectRef::new(9, 0)));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(root));
+
+        flatten_annotations_qpdf(&mut pdf, &[ObjectRef::new(3, 0)], 0, 0x3).unwrap();
+        let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("fixture page must be a dictionary");
+        };
+        assert_eq!(
+            page.get("Annots"),
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                6, 0
+            ))]))
+        );
+        assert!(page.get("Contents").is_some());
+        let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("fixture root must be a dictionary");
+        };
+        assert!(root.get("AcroForm").is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Minimal PDF builder
     // -----------------------------------------------------------------------
