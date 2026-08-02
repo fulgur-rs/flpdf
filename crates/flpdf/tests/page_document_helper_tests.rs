@@ -622,6 +622,9 @@ fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
     );
     let mut malformed_resources = Dictionary::new();
     malformed_resources.insert("Font", Object::Integer(42));
+    let mut bad_form_xobjects = Dictionary::new();
+    bad_form_xobjects.insert("Child", Object::Reference(ObjectRef::new(11, 0)));
+    malformed_resources.insert("XObject", Object::Dictionary(bad_form_xobjects));
     let mut undecodable_form = Dictionary::new();
     undecodable_form.insert("Subtype", Object::Name(b"Form".to_vec()));
     undecodable_form.insert("Resources", Object::Dictionary(malformed_resources));
@@ -636,6 +639,18 @@ fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
     pdf.set_object(
         ObjectRef::new(10, 0),
         Object::Stream(Stream::new(valid_form, b"q Q".to_vec())),
+    );
+    let mut child_fonts = Dictionary::new();
+    child_fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    child_fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut child_resources = Dictionary::new();
+    child_resources.insert("Font", Object::Dictionary(child_fonts));
+    let mut child_form = Dictionary::new();
+    child_form.insert("Subtype", Object::Name(b"Form".to_vec()));
+    child_form.insert("Resources", Object::Dictionary(child_resources));
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Stream(Stream::new(child_form, b"BT /F1 12 Tf ET".to_vec())),
     );
     let mut xobjects = Dictionary::new();
     xobjects.insert("Direct", Object::Integer(0));
@@ -680,6 +695,18 @@ fn helper_resource_pruning_keeps_page_resources_after_undecodable_form() {
     );
     assert!(xobjects.get("Good").is_some());
     assert!(xobjects.get("Bad").is_some());
+
+    let Object::Stream(child) = pdf.resolve(ObjectRef::new(11, 0)).unwrap() else {
+        panic!("child Form must remain a stream");
+    };
+    let Some(Object::Dictionary(child_resources)) = child.dict.get("Resources") else {
+        panic!("child Form resources must be materialized");
+    };
+    let Some(Object::Dictionary(child_fonts)) = child_resources.get("Font") else {
+        panic!("child Form must retain its font dictionary");
+    };
+    assert!(child_fonts.get("F1").is_some());
+    assert!(child_fonts.get("F2").is_none());
 }
 
 #[test]
@@ -694,12 +721,27 @@ fn helper_resource_pruning_keeps_a_form_resources_after_a_content_parse_error() 
     form_fonts.insert("F2", Object::Dictionary(Dictionary::new()));
     let mut form_resources = Dictionary::new();
     form_resources.insert("Font", Object::Dictionary(form_fonts));
+    let mut form_xobjects = Dictionary::new();
+    form_xobjects.insert("Child", Object::Reference(ObjectRef::new(7, 0)));
+    form_resources.insert("XObject", Object::Dictionary(form_xobjects));
     let mut form_dict = Dictionary::new();
     form_dict.insert("Subtype", Object::Name(b"Form".to_vec()));
     form_dict.insert("Resources", Object::Dictionary(form_resources));
     pdf.set_object(
         ObjectRef::new(6, 0),
         Object::Stream(Stream::new(form_dict, b"<0g>".to_vec())),
+    );
+    let mut child_fonts = Dictionary::new();
+    child_fonts.insert("F1", Object::Dictionary(Dictionary::new()));
+    child_fonts.insert("F2", Object::Dictionary(Dictionary::new()));
+    let mut child_resources = Dictionary::new();
+    child_resources.insert("Font", Object::Dictionary(child_fonts));
+    let mut child_form = Dictionary::new();
+    child_form.insert("Subtype", Object::Name(b"Form".to_vec()));
+    child_form.insert("Resources", Object::Dictionary(child_resources));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::Stream(Stream::new(child_form, b"BT /F1 12 Tf ET".to_vec())),
     );
     let mut xobjects = Dictionary::new();
     xobjects.insert("Fm0", Object::Reference(ObjectRef::new(6, 0)));
@@ -728,6 +770,18 @@ fn helper_resource_pruning_keeps_a_form_resources_after_a_content_parse_error() 
     };
     assert!(fonts.get("F1").is_some());
     assert!(fonts.get("F2").is_some());
+
+    let Object::Stream(child) = pdf.resolve(ObjectRef::new(7, 0)).unwrap() else {
+        panic!("child Form must remain a stream");
+    };
+    let Some(Object::Dictionary(child_resources)) = child.dict.get("Resources") else {
+        panic!("child Form resources must be materialized");
+    };
+    let Some(Object::Dictionary(child_fonts)) = child_resources.get("Font") else {
+        panic!("child Form must retain its font dictionary");
+    };
+    assert!(child_fonts.get("F1").is_some());
+    assert!(child_fonts.get("F2").is_none());
 }
 
 #[test]
