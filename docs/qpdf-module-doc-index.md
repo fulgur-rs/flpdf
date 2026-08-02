@@ -52,7 +52,7 @@
 | `crates/flpdf/src/nntree.rs` | correspondence | NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries |
 | `crates/flpdf/src/object.rs` | correspondence | QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model |
 | `crates/flpdf/src/object_copy.rs` | correspondence | QPDF.cc copyForeignObject responsibility split into copy and closure modules |
-| `crates/flpdf/src/object_handle.rs` | correspondence | \`QPDFObjectHandle\` (\`include/qpdf/QPDFObjectHandle.hh\`) and its backing \`QPDFValue\` (\`libqpdf/qpdf/QPDFValue.hh\`) |
+| `crates/flpdf/src/object_handle.rs` | correspondence | \`QPDFObjectHandle\`, \`QPDFObject\`, and \`QPDFValue\` identity and payload ownership |
 | `crates/flpdf/src/objr_obj_annot_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations |
 | `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding |
 | `crates/flpdf/src/optimization/inherited_attrs.rs` | correspondence | QPDF_optimization.cc inherited-page-attribute push |
