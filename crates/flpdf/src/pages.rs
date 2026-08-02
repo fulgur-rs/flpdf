@@ -856,6 +856,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn page_parent_cursor_handles_direct_and_non_dictionary_parents() {
+        assert_eq!(
+            PageParentCursor::Direct(Dictionary::new()).to_string(),
+            "direct page-tree dictionary"
+        );
+        assert!(next_page_parent(Object::Integer(42)).is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Minimal PDF builder helpers
     // -----------------------------------------------------------------------
@@ -1556,6 +1565,21 @@ mod tests {
             result.is_none(),
             "expected Ok(None) when no /Resources anywhere in the parent chain"
         );
+    }
+
+    #[test]
+    fn resolve_inherited_resources_non_dictionary_parent_terminates_chain() {
+        let bytes = build_pdf_no_resources();
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("page must be a dictionary");
+        };
+        page.insert("Parent", Object::Integer(42));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+        assert!(resolve_inherited_resources(&mut pdf, ObjectRef::new(3, 0))
+            .unwrap()
+            .is_none());
     }
 
     // -----------------------------------------------------------------------

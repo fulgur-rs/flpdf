@@ -764,7 +764,7 @@ mod tests {
         pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(second));
 
         let Object::Dictionary(mut leaf) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
-            panic!("selected object must be a page");
+            panic!("selected object must be a page"); // cov:ignore: build_nested_pdf fixes object 4 as a page dictionary
         };
         leaf.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
         leaf.insert("Rotate", Object::Integer(0));
@@ -787,5 +787,20 @@ mod tests {
         assert!(matches!(error, Error::Unsupported(_)), "got {error:?}");
         assert_eq!(dict_of(&mut pdf, ObjectRef::new(2, 0)), before_root);
         assert_eq!(dict_of(&mut pdf, ObjectRef::new(11, 0)), before_second);
+    }
+
+    #[test]
+    fn raw_inherited_lookup_stops_at_a_parent_cycle() {
+        let mut pdf = open(build_nested_pdf());
+        let Object::Dictionary(mut parent) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+            panic!("intermediate node must be a dictionary");
+        };
+        parent.insert("Parent", Object::Reference(ObjectRef::new(4, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "BleedBox", 10).unwrap(),
+            None
+        );
     }
 }

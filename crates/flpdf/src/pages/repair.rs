@@ -112,11 +112,15 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
             Object::Dictionary(parent) => {
                 direct_root = Some(parent);
             }
-            // qpdf would replace catalog `/Pages` with this non-dictionary
-            // handle and then enumerate no pages. The repair result has no
-            // page-tree owner for that malformed shape, so retain the current
-            // root rather than pretending a scalar is a `/Pages` dictionary.
-            _ => break,
+            // qpdf replaces catalog `/Pages` with any parent handle, including
+            // a scalar, then finds no dictionary tree to enumerate.
+            parent => {
+                if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
+                    root_dict.insert("Pages", parent);
+                    pdf.set_object(root_ref, Object::Dictionary(root_dict));
+                }
+                return Ok(None);
+            }
         }
         changed_pages = true;
     }
@@ -4038,5 +4042,25 @@ mod tests {
             Some(&Object::Dictionary(Dictionary::new())),
             "a direct /Parent must become the repaired catalog /Pages value"
         );
+    }
+
+    #[test]
+    fn root_pages_scalar_parent_replaces_catalog_root_and_yields_no_tree() {
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_non_reference_parent())).expect("valid PDF");
+        let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+            panic!("pages root must be a dictionary");
+        };
+        root.insert("Parent", Object::Integer(42));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+        assert!(
+            prepare_for_optimization(&mut pdf).unwrap().is_none(),
+            "a scalar parent leaves qpdf with no dictionary page tree to enumerate"
+        );
+        let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("catalog must be a dictionary");
+        };
+        assert_eq!(catalog.get("Pages"), Some(&Object::Integer(42)));
     }
 }

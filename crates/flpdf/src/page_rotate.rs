@@ -937,6 +937,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_defaults_to_zero_for_a_parent_cycle() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let Object::Dictionary(mut parent) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+            panic!("parent must be a dictionary");
+        };
+        parent.insert("Parent", Object::Reference(ObjectRef::new(3, 0)));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn resolve_normalizes_non_standard_value() {
         // /Rotate 45 on page — invalid per spec, but we normalize.
         let bytes = build_single_page_pdf(Some(45), None);
