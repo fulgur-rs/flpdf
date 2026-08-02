@@ -319,7 +319,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// This is qpdf's `setFieldAttribute(key, value)`: inherited attributes
     /// are never modified on an ancestor.
     pub fn set_field_attribute(&mut self, key: &[u8], value: Object) -> Result<()> {
-        let mut field = self.field_dict()?;
+        let field = self.pdf.resolve_borrowed(self.field_ref)?;
+        let Some(mut field) = field.as_dict().cloned() else {
+            return Ok(());
+        };
         field.insert(String::from_utf8_lossy(key).into_owned(), value);
         self.pdf
             .set_object(self.field_ref, Object::Dictionary(field));
@@ -446,16 +449,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         else {
             return Ok(());
         };
-        let acroform_ref = match acroform {
-            Object::Reference(reference) => Some(reference),
-            _ => None,
-        };
-        let acroform = resolve_ref_chain(self.pdf, &acroform)?.0;
+        let (acroform, terminal_ref) = resolve_ref_chain(self.pdf, &acroform)?;
         let Some(mut acroform) = acroform.as_dict().cloned() else {
             return Ok(());
         };
         acroform.insert("NeedAppearances", Object::Boolean(true));
-        if let Some(reference) = acroform_ref {
+        if let Some(reference) = terminal_ref {
             self.pdf.set_object(reference, Object::Dictionary(acroform));
         } else {
             let mut root = self.field_dict_for(root_ref, "catalog")?;
@@ -727,7 +726,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             let Object::Reference(kid_ref) = kid else {
                 continue;
             };
-            let kid = self.field_dict_for(*kid_ref, "widget")?;
+            let kid = self.pdf.resolve(*kid_ref)?;
+            let Some(kid) = kid.as_dict().cloned() else {
+                continue;
+            };
             if self.has_non_null_appearance(&kid)? {
                 return Ok(Some((*kid_ref, kid)));
             }
@@ -872,10 +874,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             };
             let _ = node_obj;
             if let Some(value) = found {
-                let resolved = match value {
-                    Object::Reference(r) => self.pdf.resolve(r)?,
-                    other => other,
-                };
+                let resolved = resolve_ref_chain(self.pdf, &value)?.0;
                 if let Object::Name(bytes) = resolved {
                     return Ok(Some(bytes));
                 }

@@ -156,6 +156,21 @@ fn non_dictionary_field_has_no_readable_attributes() {
 }
 
 #[test]
+fn mutating_a_non_dictionary_field_is_a_qpdf_style_no_op() {
+    // QPDFObjectHandle::replaceKey warns and returns when the target is not a
+    // dictionary; public field mutation follows the same no-op boundary.
+    let bytes = doc(vec![(10, "42".into())]);
+    let mut pdf = open(bytes);
+    let before = pdf.resolve(ObjectRef::new(10, 0)).expect("field");
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value_string("value", true)
+        .expect("non-dictionary field mutation is ignored");
+
+    assert_eq!(pdf.resolve(ObjectRef::new(10, 0)).expect("field"), before);
+}
+
+#[test]
 fn field_type_wrong_type_on_child_stops_parent_inheritance() {
     // qpdf's getInheritableFieldValue stops at a present, non-null `/FT` even
     // when getFieldType then rejects the value for not being a name.
@@ -166,6 +181,26 @@ fn field_type_wrong_type_on_child_stops_parent_inheritance() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
     assert_eq!(field.field_type().unwrap(), None);
+}
+
+#[test]
+fn field_type_follows_multi_hop_reference_holders_before_testing_its_type() {
+    // qpdf's `getKey` dereferences an indirect holder chain before
+    // `getFieldType` decides whether the inherited value is a name.
+    let bytes = doc(vec![
+        (10, "<< /FT 20 0 R /Parent 11 0 R >>".into()),
+        (11, "<< /FT /Ch >>".into()),
+        (20, "null".into()),
+        (21, "/Tx".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert_eq!(field.field_type().unwrap(), Some(b"/Tx".to_vec()));
 }
 
 #[test]
@@ -460,6 +495,38 @@ fn set_value_marks_text_and_choice_fields_as_needing_appearances() {
 }
 
 #[test]
+fn set_value_marks_the_terminal_acroform_reference_as_needing_appearances() {
+    // qpdf mutates the AcroForm dictionary reached through its indirect
+    // holder, leaving the holder itself intact.
+    let bytes = doc_with_acroform(vec![
+        (10, "<< /FT /Tx >>".into()),
+        (20, "null".into()),
+        (21, "<< >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value_string("value", true)
+        .expect("set text value");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(20, 0)).expect("AcroForm holder"),
+        Object::Reference(ObjectRef::new(21, 0))
+    );
+    let acroform = pdf.resolve(ObjectRef::new(21, 0)).expect("AcroForm");
+    assert_eq!(
+        acroform
+            .as_dict()
+            .and_then(|dictionary| dictionary.get("NeedAppearances")),
+        Some(&Object::Boolean(true))
+    );
+}
+
+#[test]
 fn set_value_updates_checkbox_and_radio_widget_states_without_need_appearances() {
     let bytes = doc_with_acroform(vec![
         (
@@ -625,6 +692,33 @@ fn set_value_preserves_kids_order_when_direct_widget_precedes_a_reference() {
         panic!("indirect widget must be a dictionary");
     };
     assert_eq!(indirect.get(b"AS".as_slice()), None);
+}
+
+#[test]
+fn set_value_skips_non_dictionary_indirect_checkbox_kids_before_a_valid_widget() {
+    // qpdf's `getKey` on a malformed indirect kid yields null; it continues
+    // scanning `/Kids` and updates a later widget dictionary.
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids [11 0 R 12 0 R] >>".into()),
+        (11, "null".into()),
+        (12, "<< /AP << /N << /Off null /Chosen null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("set checkbox value");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("field");
+    assert_eq!(
+        field.as_dict().and_then(|dictionary| dictionary.get("V")),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+    let widget = pdf.resolve(ObjectRef::new(12, 0)).expect("widget");
+    assert_eq!(
+        widget.as_dict().and_then(|dictionary| dictionary.get("AS")),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
 }
 
 #[test]
