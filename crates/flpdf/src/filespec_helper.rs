@@ -43,7 +43,7 @@
 //!
 //! // Assume we know the /Filespec object reference (e.g. from walking /Names).
 //! let filespec_ref = ObjectRef::new(5, 0);
-//! let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+//! let mut fs = FileSpec::from_ref(filespec_ref, &mut pdf);
 //!
 //! if let Some(name) = fs.filename()? {
 //!     println!("filename: {}", String::from_utf8_lossy(&name));
@@ -64,7 +64,7 @@
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("with-attachment.pdf")?))?;
 //! let filespec_ref = ObjectRef::new(5, 0);
-//! let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+//! let mut fs = FileSpec::from_ref(filespec_ref, &mut pdf);
 //!
 //! if let Some(mut ef) = fs.embedded_file()? {
 //!     if let Some(mime) = ef.mimetype()? {
@@ -84,9 +84,10 @@
 use crate::filters::{decode_stream_data, encode_stream_data};
 use crate::object::{Dictionary, Object, Stream};
 use crate::pdf_string::{new_unicode_string, utf8_value};
-use crate::ref_chain::resolve_ref_chain;
-use crate::{Error, ObjectRef, Pdf, Result};
+use crate::ref_chain::{resolve_ref_chain, terminal_ref_of_chain};
+use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use md5::{Digest, Md5};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
@@ -114,20 +115,13 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 /// All accessors are cheap: only [`payload`](EmbeddedFileStream::payload)
 /// performs I/O (decoding the filter chain).
 pub struct EmbeddedFileStream<'a, R: Read + Seek> {
-    /// The terminal indirect reference of the `/EmbeddedFile` stream. Setters
-    /// write the changed stream back through this object identity.
-    stream_ref: ObjectRef,
-    /// The resolved `/EmbeddedFile` stream.  Stored by value because `Stream`
-    /// owns its data, and we need the dict reference to survive across calls.
-    stream: Stream,
-    /// The `/Params` sub-dictionary, resolved at construction time so that
-    /// metadata accessors stay `&self`.  `/Params` may be given as an
-    /// indirect reference, which is dereferenced here.
-    params: Option<Dictionary>,
-    /// Kept to hold the document borrow for the wrapper's lifetime,
-    /// mirroring [`FileSpec`]'s exclusive-borrow semantics.
-    #[allow(dead_code)]
-    pdf: &'a mut Pdf<R>,
+    /// qpdf's shared `/EmbeddedFile` object handle. Unlike a copied
+    /// [`crate::Stream`], this preserves identity and lets metadata setters
+    /// update its dictionary without cloning its payload.
+    stream: ObjectHandle,
+    // The wrapper still owns the document's exclusive borrow. RefCell only
+    // permits qpdf-shaped read accessors to perform explicit resolution.
+    pdf: RefCell<&'a mut Pdf<R>>,
 }
 
 impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
@@ -155,25 +149,34 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         Self::create(pdf, std::fs::read(path)?)
     }
 
-    fn new(stream_ref: ObjectRef, stream: Stream, pdf: &'a mut Pdf<R>) -> Result<Self> {
-        let params = match stream.dict.get("Params") {
-            Some(Object::Dictionary(d)) => Some(d.clone()),
-            Some(Object::Reference(r)) => {
-                // /Params may be reached through more than one indirect hop
-                // (ref -> ref -> dict); follow the chain to its terminal.
-                match resolve_ref_chain(pdf, &Object::Reference(*r))?.0 {
-                    Object::Dictionary(d) => Some(d),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        Ok(Self {
-            stream_ref,
+    fn new(stream: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+        Self {
             stream,
-            params,
-            pdf,
-        })
+            pdf: RefCell::new(pdf),
+        }
+    }
+
+    fn stream_dict(&self) -> Result<Option<ObjectHandle>> {
+        self.pdf.borrow_mut().resolve_object_handle(&self.stream)?;
+        Ok(self.stream.as_stream_dict())
+    }
+
+    fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
+        let value = dictionary.get_key(key);
+        self.pdf
+            .borrow_mut()
+            .resolve_object_handle_to_terminal(&value)
+    }
+
+    fn param_value(&self, key: &[u8]) -> Result<ObjectHandle> {
+        let Some(stream_dict) = self.stream_dict()? else {
+            return Ok(ObjectHandle::null());
+        };
+        let params = self.resolved_key(&stream_dict, b"Params")?;
+        if params.as_dictionary().is_none() {
+            return Ok(ObjectHandle::null());
+        }
+        self.resolved_key(&params, key)
     }
 
     /// Decode and return the raw payload bytes.
@@ -193,7 +196,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// # use std::fs::File;
     /// # use std::io::BufReader;
     /// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// # let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    /// # let mut fs = FileSpec::from_ref(ObjectRef::new(5, 0), &mut pdf);
     /// if let Some(mut ef) = fs.embedded_file()? {
     ///     let data: Vec<u8> = ef.payload()?;
     ///     assert!(!data.is_empty());
@@ -201,7 +204,20 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn payload(&self) -> Result<Vec<u8>> {
-        decode_stream_data(&self.stream.dict, &self.stream.data)
+        let Some(stream_dict) = self.stream_dict()? else {
+            return Err(Error::Unsupported(
+                "expected an /EmbeddedFile stream object".to_string(),
+            ));
+        };
+        let Object::Dictionary(dictionary) = stream_dict.materialize() else {
+            return Err(Error::Unsupported(
+                "embedded-file stream has a non-dictionary stream dictionary".to_string(),
+            ));
+        };
+        let data = self.stream.as_stream_data().ok_or_else(|| {
+            Error::Unsupported("expected an /EmbeddedFile stream object".to_string())
+        })?;
+        decode_stream_data(&dictionary, &data)
     }
 
     /// Return the MIME type from `/Subtype`, as raw bytes.
@@ -213,20 +229,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases; never errors.
     pub fn mimetype(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .stream
-            .dict
-            .get("Subtype")
-            .and_then(Object::as_name)
-            .map(ToOwned::to_owned))
-    }
-
-    /// Return the `/Params` sub-dictionary, if present.
-    ///
-    /// Resolved at construction time, so an indirect `/Params` reference is
-    /// already dereferenced here.
-    fn params(&self) -> Option<&Dictionary> {
-        self.params.as_ref()
+        let Some(stream_dict) = self.stream_dict()? else {
+            return Ok(None);
+        };
+        Ok(self.resolved_key(&stream_dict, b"Subtype")?.as_name())
     }
 
     /// Return `/Params /CreationDate` as a raw PDF date byte sequence.
@@ -238,11 +244,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn creation_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .params()
-            .and_then(|p| p.get("CreationDate"))
-            .and_then(Object::as_string)
-            .map(ToOwned::to_owned))
+        Ok(self.param_value(b"CreationDate")?.as_string())
     }
 
     /// Return `/Params /ModDate` as a raw PDF date byte sequence.
@@ -251,11 +253,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn modification_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .params()
-            .and_then(|p| p.get("ModDate"))
-            .and_then(Object::as_string)
-            .map(ToOwned::to_owned))
+        Ok(self.param_value(b"ModDate")?.as_string())
     }
 
     /// Return `/Params /CheckSum` as raw bytes (typically a 16-byte MD5 hash).
@@ -264,11 +262,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn checksum(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .params()
-            .and_then(|p| p.get("CheckSum"))
-            .and_then(Object::as_string)
-            .map(ToOwned::to_owned))
+        Ok(self.param_value(b"CheckSum")?.as_string())
     }
 
     /// Return `/Params /Size` — the uncompressed file size in bytes.
@@ -277,23 +271,26 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     ///
     /// Returns `Ok(None)` for all missing/wrong-type cases.
     pub fn size(&self) -> Result<Option<i64>> {
-        Ok(self
-            .params()
-            .and_then(|p| p.get("Size"))
-            .and_then(Object::as_integer))
+        Ok(self.param_value(b"Size")?.as_integer())
     }
 
     /// Return `/Params /CreationDate` through qpdf's UTF-8 string view.
     ///
     /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
     /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
-    pub fn get_creation_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.creation_date()?.map(|value| utf8_value(&value)))
+    pub fn get_creation_date(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .creation_date()?
+            .map(|value| utf8_value(&value))
+            .unwrap_or_default())
     }
 
     /// Return `/Params /ModDate` through qpdf's UTF-8 string view.
-    pub fn get_modification_date(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.modification_date()?.map(|value| utf8_value(&value)))
+    pub fn get_modification_date(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .modification_date()?
+            .map(|value| utf8_value(&value))
+            .unwrap_or_default())
     }
 
     /// Return `/Params /Size`, or qpdf's `0` default when it is absent,
@@ -309,50 +306,65 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     /// Return `/Subtype` as a MIME-type string, without a leading slash.
-    pub fn get_subtype(&self) -> Result<Option<Vec<u8>>> {
-        Ok(self.mimetype()?.filter(|value| !value.is_empty()))
+    pub fn get_subtype(&self) -> Result<Vec<u8>> {
+        Ok(self
+            .mimetype()?
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default())
     }
 
     /// Return `/Params /CheckSum` as qpdf's binary string value.
-    pub fn get_checksum(&self) -> Result<Option<Vec<u8>>> {
-        self.checksum()
+    pub fn get_checksum(&self) -> Result<Vec<u8>> {
+        Ok(self.checksum()?.unwrap_or_default())
     }
 
     fn set_param(&mut self, key: &str, value: Object) -> Result<()> {
-        let params_value = self.stream.dict.get("Params").cloned();
-        let mut params = match params_value {
-            Some(Object::Dictionary(params)) => params,
-            Some(Object::Reference(reference)) => {
-                let (terminal, terminal_ref) =
-                    resolve_ref_chain(self.pdf, &Object::Reference(reference))?;
-                let Object::Dictionary(mut params) = terminal else {
-                    let mut params = Dictionary::new();
-                    params.insert(key, value.clone());
-                    self.stream
-                        .dict
-                        .insert("Params", Object::Dictionary(params.clone()));
-                    self.params = Some(params);
-                    self.pdf
-                        .set_object(self.stream_ref, Object::Stream(self.stream.clone()));
-                    return Ok(());
-                };
-                params.insert(key, value.clone());
-                let terminal_ref = terminal_ref
-                    .expect("a reference-chain lookup always retains its terminal reference");
-                self.pdf
-                    .set_object(terminal_ref, Object::Dictionary(params.clone()));
-                self.params = Some(params);
-                return Ok(());
-            }
-            _ => Dictionary::new(),
+        let Some(stream_dict) = self.stream_dict()? else {
+            return Ok(());
         };
-        params.insert(key, value);
-        self.stream
-            .dict
-            .insert("Params", Object::Dictionary(params.clone()));
-        self.params = Some(params);
-        self.pdf
-            .set_object(self.stream_ref, Object::Stream(self.stream.clone()));
+        let params = stream_dict.get_key(b"Params");
+        let (resolved, terminal_ref) = self
+            .pdf
+            .borrow_mut()
+            .resolve_object_handle_to_terminal_ref(&params)?;
+        if resolved.as_dictionary().is_some() {
+            let target = match terminal_ref {
+                Some(object_ref) => {
+                    let mut pdf = self.pdf.borrow_mut();
+                    let target = pdf.get_object_handle(object_ref);
+                    pdf.resolve_object_handle(&target)?;
+                    target
+                }
+                None => resolved,
+            };
+            target.replace_key(
+                key.as_bytes(),
+                ObjectHandle::string(match value {
+                    Object::String(value) => value,
+                    _ => unreachable!("EmbeddedFileStream::set_param only writes strings"),
+                }),
+            );
+            if let Some(object_ref) = terminal_ref {
+                self.pdf.borrow_mut().mark_object_dirty(object_ref);
+            } else if let Some(object_ref) = self.stream.object_ref() {
+                self.pdf.borrow_mut().mark_object_dirty(object_ref);
+            }
+            return Ok(());
+        }
+
+        stream_dict.replace_key(
+            b"Params",
+            ObjectHandle::dictionary(vec![(
+                key.as_bytes().to_vec(),
+                ObjectHandle::string(match value {
+                    Object::String(value) => value,
+                    _ => unreachable!("EmbeddedFileStream::set_param only writes strings"),
+                }),
+            )]),
+        );
+        if let Some(object_ref) = self.stream.object_ref() {
+            self.pdf.borrow_mut().mark_object_dirty(object_ref);
+        }
         Ok(())
     }
 
@@ -368,11 +380,13 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 
     /// Set `/Subtype` to a MIME type represented as logical PDF Name bytes.
     pub fn set_subtype(&mut self, value: impl AsRef<[u8]>) -> Result<()> {
-        self.stream
-            .dict
-            .insert("Subtype", Object::Name(value.as_ref().to_vec()));
-        self.pdf
-            .set_object(self.stream_ref, Object::Stream(self.stream.clone()));
+        let Some(stream_dict) = self.stream_dict()? else {
+            return Ok(());
+        };
+        stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
+        if let Some(object_ref) = self.stream.object_ref() {
+            self.pdf.borrow_mut().mark_object_dirty(object_ref);
+        }
         Ok(())
     }
 }
@@ -388,7 +402,8 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 /// cheap dictionary lookups that return `Ok(None)` when the key is absent.
 /// [`embedded_file`](FileSpec::embedded_file) resolves the `/EF /F` (or `/EF /UF`) indirect reference.
 pub struct FileSpec<'a, R: Read + Seek> {
-    filespec_ref: ObjectRef,
+    /// qpdf's Filespec object handle. It may be direct or indirect.
+    filespec: ObjectHandle,
     pdf: &'a mut Pdf<R>,
 }
 
@@ -426,29 +441,48 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         Self::create(pdf, filename, embedded_file_ref)
     }
 
-    /// Construct a new wrapper for the `/Filespec` dictionary at `filespec_ref`.
+    /// Construct a new wrapper for a `/Filespec` dictionary handle.
     ///
-    /// The constructor does **not** resolve the reference — call individual
-    /// accessors to fetch specific fields.
-    pub fn new(filespec_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
-        Self { filespec_ref, pdf }
+    /// The handle may be direct or indirect, matching qpdf's
+    /// `QPDFFileSpecObjectHelper(QPDFObjectHandle)` constructor.
+    pub fn new(filespec: ObjectHandle, pdf: &'a mut Pdf<R>) -> Self {
+        Self { filespec, pdf }
+    }
+
+    /// Construct a Filespec helper for an indirect object in `pdf`.
+    ///
+    /// This is a Rust convenience for callers that start from an object
+    /// number; [`Self::new`] is the qpdf-shaped constructor.
+    pub fn from_ref(filespec_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
+        let filespec = pdf.get_object_handle(filespec_ref);
+        Self::new(filespec, pdf)
+    }
+
+    fn filespec_dict(&mut self) -> Result<Option<ObjectHandle>> {
+        self.pdf.resolve_object_handle(&self.filespec)?;
+        Ok(self.filespec.as_dictionary().map(|_| self.filespec.clone()))
+    }
+
+    fn mark_filespec_dirty(&mut self) {
+        if let Some(object_ref) = self.filespec.object_ref() {
+            self.pdf.mark_object_dirty(object_ref);
+        }
     }
 
     /// Resolve the `/Filespec` dictionary, returning an error when the
     /// object does not exist or is not a dictionary.
     fn resolve_dict(&mut self) -> Result<Dictionary> {
-        match self.pdf.resolve_borrowed(self.filespec_ref)? {
-            Object::Dictionary(d) => Ok(d.clone()),
-            _ => Err(Error::Unsupported(format!(
-                "expected /Filespec dictionary at {}, got a non-dictionary object",
-                self.filespec_ref
-            ))),
-        }
-    }
-
-    fn replace_dict(&mut self, dict: Dictionary) {
-        self.pdf
-            .set_object(self.filespec_ref, Object::Dictionary(dict));
+        let Some(dictionary) = self.filespec_dict()? else {
+            return Err(Error::Unsupported(
+                "expected a /Filespec dictionary object".to_string(),
+            ));
+        };
+        let Object::Dictionary(dict) = dictionary.materialize() else {
+            return Err(Error::Unsupported(
+                "expected a /Filespec dictionary object".to_string(),
+            ));
+        };
+        Ok(dict)
     }
 
     fn resolved_string_value(&mut self, value: Option<&Object>) -> Result<Option<Vec<u8>>> {
@@ -461,12 +495,14 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
 
     /// Set `/Desc` with qpdf's `newUnicodeString` storage semantics.
     pub fn set_description(&mut self, description: impl AsRef<[u8]>) -> Result<()> {
-        let mut dict = self.resolve_dict()?;
-        dict.insert(
-            "Desc",
-            Object::String(new_unicode_string(description.as_ref())),
+        let Some(dict) = self.filespec_dict()? else {
+            return Ok(());
+        };
+        dict.replace_key(
+            b"Desc",
+            ObjectHandle::string(new_unicode_string(description.as_ref())),
         );
-        self.replace_dict(dict);
+        self.mark_filespec_dirty();
         Ok(())
     }
 
@@ -480,17 +516,19 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         unicode_name: impl AsRef<[u8]>,
         compatibility_name: Option<&[u8]>,
     ) -> Result<()> {
-        let mut dict = self.resolve_dict()?;
+        let Some(dict) = self.filespec_dict()? else {
+            return Ok(());
+        };
         let unicode_name = new_unicode_string(unicode_name.as_ref());
-        dict.insert("UF", Object::String(unicode_name.clone()));
+        dict.replace_key(b"UF", ObjectHandle::string(unicode_name.clone()));
         let compatibility_name = compatibility_name
             .map(ToOwned::to_owned)
             .filter(|name| !name.is_empty());
-        dict.insert(
-            "F",
-            Object::String(compatibility_name.unwrap_or(unicode_name)),
+        dict.replace_key(
+            b"F",
+            ObjectHandle::string(compatibility_name.unwrap_or(unicode_name)),
         );
-        self.replace_dict(dict);
+        self.mark_filespec_dirty();
         Ok(())
     }
 
@@ -557,23 +595,24 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     ///
     /// The byte vector mirrors qpdf's `std::string`: an explicit UTF-8 BOM
     /// may be followed by invalid UTF-8, which Rust's [`String`] cannot hold.
-    pub fn get_description(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn get_description(&mut self) -> Result<Vec<u8>> {
         let dict = self.resolve_dict()?;
         Ok(self
             .resolved_string_value(dict.get("Desc"))?
-            .map(|value| utf8_value(&value)))
+            .map(|value| utf8_value(&value))
+            .unwrap_or_default())
     }
 
     /// Return the preferred file name using qpdf's `/UF`, `/F`, `/Unix`,
     /// `/DOS`, `/Mac` priority order and UTF-8 value conversion.
-    pub fn get_filename(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn get_filename(&mut self) -> Result<Vec<u8>> {
         let dict = self.resolve_dict()?;
         for key in NAME_KEYS {
             if let Some(value) = self.resolved_string_value(dict.get(key))? {
-                return Ok(Some(utf8_value(&value)));
+                return Ok(utf8_value(&value));
             }
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     /// Return every recognized Filespec name key whose value is a string.
@@ -660,7 +699,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// # use std::fs::File;
     /// # use std::io::BufReader;
     /// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
-    /// let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    /// let mut fs = FileSpec::from_ref(ObjectRef::new(5, 0), &mut pdf);
     /// if let Some(mut ef) = fs.embedded_file()? {
     ///     let bytes = ef.payload()?;
     ///     println!("{} bytes", bytes.len());
@@ -669,13 +708,15 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// ```
     pub fn embedded_file(&mut self) -> Result<Option<EmbeddedFileStream<'_, R>>> {
         let candidate = self.get_embedded_file_stream("")?;
-        let (terminal, terminal_ref) = resolve_ref_chain(self.pdf, &candidate)?;
-        match (terminal, terminal_ref) {
-            (Object::Stream(stream), Some(stream_ref)) => {
-                EmbeddedFileStream::new(stream_ref, stream, self.pdf).map(Some)
-            }
-            _ => Ok(None),
-        }
+        let Object::Reference(first_ref) = candidate else {
+            return Ok(None);
+        };
+        let stream_ref = terminal_ref_of_chain(self.pdf, first_ref)?;
+        let stream = self.pdf.get_object_handle(stream_ref);
+        self.pdf.resolve_object_handle(&stream)?;
+        Ok(stream
+            .as_stream_dict()
+            .map(|_| EmbeddedFileStream::new(stream, self.pdf)))
     }
 }
 
@@ -934,7 +975,7 @@ impl FileSpecBuilder {
 
         let filespec_ref = FileSpec::create(pdf, &uf_filename, stream_ref)?;
         {
-            let mut filespec = FileSpec::new(filespec_ref, pdf);
+            let mut filespec = FileSpec::from_ref(filespec_ref, pdf);
             filespec.set_filename(&uf_filename, Some(self.filename.as_slice()))?;
             if let Some(description) = self.description {
                 filespec.set_description(description)?;
@@ -1146,7 +1187,7 @@ pub fn extract_attachment<R: Read + Seek>(pdf: &mut Pdf<R>, key: &[u8]) -> Resul
     };
 
     // Resolve the filespec and decode its embedded file stream.
-    let mut fs = FileSpec::new(filespec_ref, pdf);
+    let mut fs = FileSpec::from_ref(filespec_ref, pdf);
     let ef = fs.embedded_file()?.ok_or_else(|| {
         Error::Unsupported(format!(
             "extract_attachment: key {:?} has no resolvable /EmbeddedFile stream \
@@ -2117,7 +2158,7 @@ mod tests {
         assert!(!extracted.is_empty(), "extracted bytes must be non-empty");
 
         // The fixture reports /Params /Size 95 — the extracted bytes must match.
-        let mut fs = FileSpec::new(entries[0].1, &mut pdf);
+        let mut fs = FileSpec::from_ref(entries[0].1, &mut pdf);
         let ef = fs
             .embedded_file()
             .expect("embedded_file")

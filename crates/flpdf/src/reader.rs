@@ -1655,6 +1655,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// of those methods is silently dropped by a default incremental write
     /// unless the caller also calls this method for the mutated ref.
     pub fn mark_object_dirty(&mut self, object_ref: ObjectRef) {
+        // ObjectHandle mutation happens below the legacy materialization
+        // bridge. Discard any snapshot previously returned by resolve so the
+        // next resolve and the writer materialize the changed live handle.
+        self.legacy_materialized_memo.remove(&object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
 
@@ -2394,7 +2398,13 @@ impl<R: Read + Seek> Pdf<R> {
             // that breaks this pairing would only be caught by the
             // no-extra-clone regression test above if it also happened to
             // change the pointer; a value-only divergence would not be.
-            if handle.get_parsed_offset() < 0 {
+            // `mark_object_dirty` deliberately invalidates that invariant
+            // after an in-place ObjectHandle mutation (for example an
+            // EmbeddedFile `/Subtype` update): the cache still holds the
+            // old stream while the live handle holds the new dictionary.
+            // In that case materialize only on the next observation instead
+            // of copying attachment data at mutation time.
+            if handle.get_parsed_offset() < 0 && !self.dirty_object_refs.contains(&object_ref) {
                 if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
                     self.cache.entry(object_ref)
                 {

@@ -11,7 +11,9 @@
 ## Global Constraints
 
 - qpdf 11.9.0 is the behavioral oracle.
-- Do not retain compatibility-only `ObjectRef` or `Option` aliases.
+- Keep `FileSpec::from_ref` only as a document-ownership convenience; its
+  primary constructor is `FileSpec::new(ObjectHandle, ...)`. Keep optional
+  raw inspection separately from qpdf-shaped getters.
 - Every production change starts with a focused failing integration test.
 - Patch coverage must remain 100 percent against `origin/main`.
 
