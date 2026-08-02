@@ -1470,7 +1470,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// for JSON metadata without exposing placeholders through the public
     /// object enumeration APIs.
     pub(crate) fn prepare_qpdf_json_objects(&mut self) -> Result<QpdfPreparedObjects> {
-        let live_snapshot = self.live_object_refs();
+        let live_snapshot = self.qpdf_json_live_object_refs();
         let mut discovered = self.qpdf_trailer_references.clone();
         discovered.extend(self.qpdf_parsed_xref_streams.keys().copied());
 
@@ -1486,7 +1486,7 @@ impl<R: Read + Seek> Pdf<R> {
             {
                 continue;
             }
-            let has_live_target = matches!(
+            let has_cached_target = matches!(
                 self.cache.entry(object_ref),
                 Some(
                     CacheEntry::Unresolved { .. }
@@ -1494,7 +1494,12 @@ impl<R: Read + Seek> Pdf<R> {
                         | CacheEntry::Resolved(_)
                 )
             );
-            if !has_live_target {
+            let has_handle_only_target = self.cache.entry(object_ref).is_none()
+                && self
+                    .handle_registry
+                    .get(&object_ref)
+                    .is_some_and(ObjectHandle::is_resolved);
+            if !(has_cached_target || has_handle_only_target) {
                 self.qpdf_dangling_refs.insert(object_ref);
                 if self.cache.entry(object_ref).is_none() {
                     self.cache.set_missing(object_ref);
@@ -1502,7 +1507,7 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
 
-        let mut refs = self.live_object_refs();
+        let mut refs = self.qpdf_json_live_object_refs();
         refs.extend(self.qpdf_dangling_refs.iter().copied());
         refs.retain(|object_ref| !self.qpdf_removed_refs.contains(object_ref));
         refs.sort_unstable();
@@ -1517,6 +1522,26 @@ impl<R: Read + Seek> Pdf<R> {
             refs,
             max_object_id,
         })
+    }
+
+    /// qpdf's `obj_cache` owns both parsed objects and objects created with
+    /// `makeIndirectObject`. During the ObjectHandle cutover, the latter live
+    /// solely in `handle_registry`: including resolved cache-miss handles here
+    /// preserves that visibility without cloning their stream payloads into
+    /// the legacy `Object` cache.
+    fn qpdf_json_live_object_refs(&self) -> Vec<ObjectRef> {
+        let mut refs = self.live_object_refs();
+        refs.extend(
+            self.handle_registry
+                .iter()
+                .filter_map(|(object_ref, handle)| {
+                    (self.cache.entry(*object_ref).is_none() && handle.is_resolved())
+                        .then_some(*object_ref)
+                }),
+        );
+        refs.sort_unstable();
+        refs.dedup();
+        refs
     }
 
     /// `/Root` as listed in the trailer, when present.
@@ -1545,15 +1570,14 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         Ok(match linearized {
-            Object::Integer(value) if *value > 0 => Some(candidate),
-            // cov:ignore-start: rustfmt parks the match-arm guard on its own line, and llvm-cov instruments the guard head separately from the arm body — the body IS exercised (see linearized_hint_ref_accepts_real_literal_value) but the guard-only line always shows zero hits.
+            // QPDF::isLinearized accepts only a numeric /Linearized value
+            // whose floor is one (QPDF_linearization.cc:139-141).
+            Object::Integer(1) => Some(candidate),
             Object::Real(value) | Object::RealLiteral { value, .. }
-                if value.is_finite() && *value > 0.0 =>
+                if value.is_finite() && value.floor() == 1.0 =>
             {
                 Some(candidate)
             }
-            // cov:ignore-end
-            Object::Boolean(value) if *value => Some(candidate),
             _ => None,
         })
     }
@@ -1649,13 +1673,11 @@ impl<R: Read + Seek> Pdf<R> {
         let new_ref = ObjectRef::new(next_number, 0);
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);
-        // QPDF::makeIndirectFromQPDFObject installs the new object in
-        // `obj_cache` before returning its indirect handle. Keep the legacy
-        // bridge equally populated so qpdf JSON preparation recognizes a
-        // newly indirectized object as a live target instead of a dangling
-        // reference. Direct ObjectHandle mutation remains authoritative after
-        // `mark_object_dirty` below.
-        self.cache.set_resolved(new_ref, indirect.materialize());
+        // QPDF::makeIndirectFromQPDFObject installs the same shared object
+        // pointer in `obj_cache`. `handle_registry` is this port's shared
+        // state, and `prepare_qpdf_json_objects` recognizes its resolved
+        // cache-miss handles directly; materializing here would duplicate a
+        // direct stream's payload into the legacy `Object` cache.
         // A new object left out of the dirty set would never get its own
         // body or xref entry written by a default incremental write,
         // leaving any reference to it dangling — see `mark_object_dirty`'s
@@ -2642,6 +2664,15 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
+        if self.cache.entry(object_ref).is_none() {
+            if let Some(handle) = self
+                .handle_registry
+                .get(&object_ref)
+                .filter(|handle| handle.is_resolved())
+            {
+                return Ok(handle.materialize());
+            }
+        }
         if self.resolve_to_cache(object_ref)? {
             if self.handle_mutated_object_refs.contains(&object_ref) {
                 let handle = self.get_object_handle(object_ref);
@@ -5009,24 +5040,57 @@ mod tests {
     }
 
     #[test]
-    fn make_indirect_object_handle_is_visible_to_qpdf_json_preparation() {
-        // qpdf's QPDF::makeIndirectFromQPDFObject puts the new object in
-        // obj_cache immediately. JSON preparation must therefore see an
-        // indirect object created solely through the ObjectHandle API.
+    fn make_indirect_object_handle_is_visible_to_qpdf_json_without_materializing_cache() {
+        // qpdf's QPDF::makeIndirectFromQPDFObject stores the same shared
+        // QPDFObject in obj_cache. The handle registry is Rust's equivalent
+        // shared state, so JSON preparation must see the new object without
+        // cloning a stream payload into the legacy Object cache.
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let indirect = pdf
-            .make_indirect_object_handle(ObjectHandle::integer(777))
+            .make_indirect_object_handle(ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![]),
+                b"stream payload must remain handle-owned".to_vec(),
+            ))
             .expect("make indirect");
         let object_ref = indirect.object_ref().expect("indirect ref");
+        assert!(
+            pdf.cache.entry(object_ref).is_none(),
+            "a handle-created object must not be materialized into the legacy cache"
+        );
 
         let prepared = pdf
             .prepare_qpdf_json_objects()
             .expect("prepare qpdf JSON objects");
         assert!(prepared.refs.contains(&object_ref));
+        let object = pdf
+            .resolve_qpdf_json_object(object_ref)
+            .expect("resolve qpdf JSON object");
         assert_eq!(
-            pdf.resolve_qpdf_json_object(object_ref)
-                .expect("resolve qpdf JSON object"),
-            Object::Integer(777)
+            object.as_stream().expect("handle-created stream").data,
+            b"stream payload must remain handle-owned"
+        );
+    }
+
+    #[test]
+    fn qpdf_json_borrowed_resolution_materializes_a_handle_only_object_on_demand() {
+        // The borrowed JSON path needs a stable Object reference, but a
+        // handle-created object must still avoid a cache payload clone until
+        // a caller actually asks to inspect it.
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let indirect = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(778))
+            .expect("make indirect");
+        let object_ref = indirect.object_ref().expect("indirect ref");
+
+        assert!(pdf.cache.entry(object_ref).is_none());
+        assert_eq!(
+            pdf.resolve_qpdf_json_object_borrowed(object_ref)
+                .expect("borrow qpdf JSON object"),
+            &Object::Integer(778)
+        );
+        assert!(
+            pdf.cache.entry(object_ref).is_none(),
+            "on-demand borrowing must not populate the legacy cache"
         );
     }
 
@@ -6264,15 +6328,14 @@ mod tests {
     }
 
     /// Build a minimal PDF whose object `(1, 0)` is a linearization
-    /// parameter dictionary with `/Linearized` written as `.9` — a
-    /// non-canonical literal that the parser stores as
-    /// [`Object::RealLiteral`]. Exercises `linearized_hint_ref`'s
-    /// `RealLiteral` arm.
-    fn linearized_like_pdf_bytes_real_literal() -> Vec<u8> {
+    /// parameter dictionary with the supplied `/Linearized` literal.
+    fn linearized_like_pdf_bytes_real_literal(linearized: &[u8]) -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len() as u64;
-        pdf.extend_from_slice(b"1 0 obj\n<< /Linearized .9 >>\nendobj\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Linearized ");
+        pdf.extend_from_slice(linearized);
+        pdf.extend_from_slice(b" >>\nendobj\n");
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
         let off3 = pdf.len() as u64;
@@ -6292,16 +6355,21 @@ mod tests {
         pdf
     }
 
-    /// `linearized_hint_ref` recognizes a `/Linearized` value stored as
-    /// [`Object::RealLiteral`] (non-canonical source literal like `.9`) and
-    /// returns `Some((1, 0))`. Regression guard for the
-    /// `Object::Real | Object::RealLiteral` arm.
+    /// qpdf accepts `/Linearized` only when its numeric floor is exactly
+    /// one. In particular, `.9` is not a linearization marker while `1.9`
+    /// is, even though both are parsed as [`Object::RealLiteral`].
     #[test]
-    fn linearized_hint_ref_accepts_real_literal_value() {
-        let bytes = linearized_like_pdf_bytes_real_literal();
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open should succeed");
-        let hint = pdf.linearized_hint_ref().expect("must succeed");
-        assert_eq!(hint, Some(ObjectRef::new(1, 0)));
+    fn linearized_hint_ref_uses_qpdf_numeric_floor() {
+        let mut below_one = Pdf::open_mem_owned(linearized_like_pdf_bytes_real_literal(b".9"))
+            .expect("open .9 PDF");
+        assert_eq!(below_one.linearized_hint_ref().expect("check .9"), None);
+
+        let mut one_or_above = Pdf::open_mem_owned(linearized_like_pdf_bytes_real_literal(b"1.9"))
+            .expect("open 1.9 PDF");
+        assert_eq!(
+            one_or_above.linearized_hint_ref().expect("check 1.9"),
+            Some(ObjectRef::new(1, 0))
+        );
     }
 
     // ------------------------------------------------------------------
