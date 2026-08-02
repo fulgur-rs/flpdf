@@ -428,15 +428,15 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn field_dict(&mut self) -> Result<Dictionary> {
+        // cov:ignore-start: is_checkbox established this same field_ref is a dictionary before this private call
         match self.pdf.resolve_borrowed(self.field_ref)? {
             Object::Dictionary(field) => Ok(field.clone()),
-            // cov:ignore-start: is_checkbox established this same field_ref is a dictionary before this private call
             _ => Err(Error::Unsupported(format!(
                 "form field object {} is not a dictionary",
                 self.field_ref
             ))),
-            // cov:ignore-end
         }
+        // cov:ignore-end
     }
 
     fn set_need_appearances(&mut self) -> Result<()> {
