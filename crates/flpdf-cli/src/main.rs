@@ -5690,7 +5690,6 @@ fn run_add_attachment(
 
     let mut builder = FileSpecBuilder::new(ascii_filename_fallback(&filename), payload)
         .uf_filename(&filename)
-        .compress(true)
         .dates(dates);
     if let Some(mime) = args.mimetype {
         builder = builder.mimetype(mime);

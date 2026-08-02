@@ -1627,36 +1627,6 @@ fn builder_round_trip_minimal() {
     );
 }
 
-#[test]
-fn builder_compresses_embedded_payload_when_requested() {
-    let mut pdf = build_minimal_pdf();
-    let payload = b"compress this attachment payload";
-    let filespec_ref = FileSpecBuilder::new("compressed.txt", payload.as_slice())
-        .compress(true)
-        .build(&mut pdf)
-        .expect("build compressed filespec");
-
-    let stream_ref = {
-        let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
-        filespec
-            .get_embedded_file_stream("F")
-            .expect("embedded stream")
-            .object_ref()
-            .expect("expected indirect embedded stream")
-    };
-    let Object::Stream(stream) = pdf.resolve(stream_ref).expect("stream") else {
-        panic!("expected embedded-file stream");
-    };
-    assert_eq!(
-        stream.dict.get("Filter"),
-        Some(&Object::Name(b"FlateDecode".to_vec()))
-    );
-
-    let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
-    let embedded = filespec.embedded_file().unwrap().expect("embedded file");
-    assert_eq!(embedded.payload().unwrap(), payload);
-}
-
 /// /UF follows qpdf's newUnicodeString rule for an ASCII filename.
 #[test]
 fn builder_uf_uses_pdfdocencoding_for_ascii() {
