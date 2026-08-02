@@ -523,7 +523,7 @@ fn materialize_page_resources<R: Read + Seek>(pdf: &mut Pdf<R>, page_ref: Object
     Ok(())
 }
 
-fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Dictionary>> {
+fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option<Object>> {
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None); // cov:ignore: a parsed Pdf always has a root reference
     };
@@ -537,19 +537,13 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
         Object::Dictionary(dict) => dict,
         _ => return Ok(None), // cov:ignore: malformed AcroForm is ignored like qpdf
     };
-    let Some(resources) = acroform.get("DR").cloned() else {
-        return Ok(None);
-    };
-    match resolve_ref_chain(pdf, &resources)?.0 {
-        Object::Dictionary(dict) => Ok(Some(dict)),
-        _ => Ok(None), // cov:ignore: malformed DR is ignored like qpdf
-    }
+    Ok(acroform.get("DR").cloned())
 }
 
 fn merge_widget_default_resources_on_page<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
-    default_resources: &Dictionary,
+    default_resources: &Object,
 ) -> Result<()> {
     for annotation in enumerate_page_annotations(pdf, page_ref)? {
         if !annotation.is_widget {
@@ -567,6 +561,10 @@ fn merge_widget_default_resources_on_page<R: Read + Seek>(
         let mut resources = match resolve_ref_chain(pdf, &resources)?.0 {
             Object::Dictionary(dict) => dict,
             _ => continue, // cov:ignore: malformed appearance resources are ignored
+        };
+        let default_resources = match resolve_ref_chain(pdf, default_resources)?.0 {
+            Object::Dictionary(dict) => dict,
+            _ => continue, // cov:ignore: malformed DR is ignored like qpdf
         };
         for (category, source) in default_resources.iter() {
             let (source, _) = resolve_ref_chain(pdf, source)?;
@@ -690,7 +688,8 @@ fn resolve_ap_n<R: Read + Seek>(
         None | Some(Object::Null) => return Ok(None),
         Some(v) => v,
     };
-    let ap_dict: Dictionary = match resolve_ref_chain(pdf, &ap_val)?.0 {
+    let (ap_value, ap_ref) = resolve_ref_chain(pdf, &ap_val)?;
+    let mut ap_dict: Dictionary = match ap_value {
         Object::Dictionary(d) => d,
         _ => return Ok(None),
     };
@@ -711,9 +710,11 @@ fn resolve_ap_n<R: Read + Seek>(
             // Inline stream in malformed PDF — materialize as new indirect object.
             let new_ref = next_object_ref(pdf)?;
             pdf.set_object(new_ref, Object::Stream(s));
+            ap_dict.insert("N", Object::Reference(new_ref));
+            replace_appearance_dictionary(pdf, annot_ref, ap_ref, ap_dict)?;
             Ok(Some(new_ref))
         }
-        Object::Dictionary(state_dict) => {
+        Object::Dictionary(mut state_dict) => {
             // Sub-dictionary: select stream by annotation's /AS name.
             let as_name: Vec<u8> = {
                 let obj = pdf.resolve_borrowed(annot_ref)?;
@@ -740,6 +741,13 @@ fn resolve_ap_n<R: Read + Seek>(
                     // Inline stream in state dict of malformed PDF.
                     let new_ref = next_object_ref(pdf)?;
                     pdf.set_object(new_ref, Object::Stream(s));
+                    state_dict.insert(as_name, Object::Reference(new_ref));
+                    if let Some(state_ref) = n_terminal_ref {
+                        pdf.set_object(state_ref, Object::Dictionary(state_dict));
+                    } else {
+                        ap_dict.insert("N", Object::Dictionary(state_dict));
+                        replace_appearance_dictionary(pdf, annot_ref, ap_ref, ap_dict)?;
+                    }
                     Ok(Some(new_ref))
                 }
                 _ => Ok(None),
@@ -747,6 +755,29 @@ fn resolve_ap_n<R: Read + Seek>(
         }
         _ => Ok(None),
     }
+}
+
+/// Replace the terminal `/AP` dictionary after materializing an inline stream.
+///
+/// qpdf mutates the selected `QPDFObjectHandle` in place. Rust values are
+/// owned, so retain the same object identity by replacing the terminal indirect
+/// dictionary, or the annotation's direct `/AP` value when it is inline.
+fn replace_appearance_dictionary<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    annot_ref: ObjectRef,
+    ap_ref: Option<ObjectRef>,
+    ap_dict: Dictionary,
+) -> Result<()> {
+    if let Some(ap_ref) = ap_ref {
+        pdf.set_object(ap_ref, Object::Dictionary(ap_dict));
+        return Ok(());
+    }
+    let Object::Dictionary(mut annotation) = pdf.resolve(annot_ref)? else {
+        return Ok(()); // cov:ignore: enumeration guarantees an annotation dictionary
+    };
+    annotation.insert("AP", Object::Dictionary(ap_dict));
+    pdf.set_object(annot_ref, Object::Dictionary(annotation));
+    Ok(())
 }
 
 /// Read `/BBox` and `/Matrix` from a Form XObject stream dictionary.
@@ -983,8 +1014,12 @@ mod tests {
         let mut default_resources = Dictionary::new();
         default_resources.insert("Font", Object::Reference(ObjectRef::new(6, 0)));
 
-        merge_widget_default_resources_on_page(&mut pdf, ObjectRef::new(3, 0), &default_resources)
-            .unwrap();
+        merge_widget_default_resources_on_page(
+            &mut pdf,
+            ObjectRef::new(3, 0),
+            &Object::Dictionary(default_resources),
+        )
+        .unwrap();
 
         let Object::Stream(appearance) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
             panic!("fixture appearance must remain a stream"); // cov:ignore: fixture invariant
@@ -2730,6 +2765,11 @@ mod tests {
             result.is_some(),
             "direct stream /N should be materialized and returned"
         );
+        assert_eq!(
+            resolve_ap_n(&mut pdf, annot_ref).unwrap(),
+            result,
+            "repeated resolution must reuse the materialized /AP/N stream"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2771,6 +2811,11 @@ mod tests {
         assert!(
             result.is_some(),
             "state dict direct stream entry should be materialized"
+        );
+        assert_eq!(
+            resolve_ap_n(&mut pdf, annot_ref).unwrap(),
+            result,
+            "repeated resolution must reuse the materialized state stream"
         );
     }
 

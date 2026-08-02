@@ -134,6 +134,34 @@ fn pdf_with_catalog_pages_pointing_to_leaf() -> Vec<u8> {
     out
 }
 
+fn pdf_with_need_appearances_and_unread_default_resources() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    for (number, body) in [
+        (1, "<< /Type /Catalog /Pages 2 0 R /AcroForm 4 0 R >>"),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [5 0 R] >>",
+        ),
+        (4, "<< /NeedAppearances true /DR 6 0 R >>"),
+        (5, "<< /Type /Annot /Subtype /Widget >>"),
+        (6, "not-a-pdf-object"),
+    ] {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for number in 1..=6 {
+        out.extend_from_slice(format!("{:010} 00000 n \n", offsets[&number]).as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 // ---------------------------------------------------------------------------
 // getAllPages() / pushInheritedAttributesToPages()
 // ---------------------------------------------------------------------------
@@ -596,6 +624,106 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
         panic!("appearance must retain font resources");
     };
     assert_eq!(fonts.get("F1"), Some(&Object::Integer(41)));
+    assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
+}
+
+#[test]
+fn helper_flatten_annotations_keeps_need_appearances_with_unread_dr() {
+    let mut pdf = open(pdf_with_need_appearances_and_unread_default_resources());
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    assert!(
+        page.get("Annots").is_some(),
+        "qpdf skips widgets before it needs their malformed /AcroForm/DR"
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_reuses_a_materialized_inline_appearance() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut appearance_resources = Dictionary::new();
+    appearance_resources.insert("Font", Object::Dictionary(Dictionary::new()));
+    let mut appearance = Dictionary::new();
+    appearance.insert("Type", Object::Name(b"XObject".to_vec()));
+    appearance.insert("Subtype", Object::Name(b"Form".to_vec()));
+    appearance.insert("Resources", Object::Dictionary(appearance_resources));
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Stream(Stream::new(appearance, Vec::new())));
+    let mut widget = Dictionary::new();
+    widget.insert("Subtype", Object::Name(b"Widget".to_vec()));
+    widget.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    widget.insert("AP", Object::Dictionary(ap));
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(widget));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    let mut fonts = Dictionary::new();
+    fonts.insert("Helv", Object::Integer(42));
+    let mut dr = Dictionary::new();
+    dr.insert("Font", Object::Dictionary(fonts));
+    let mut acroform = Dictionary::new();
+    acroform.insert("DR", Object::Dictionary(dr));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(acroform));
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("AcroForm", Object::Reference(ObjectRef::new(5, 0)));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let Object::Dictionary(page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    let Some(Object::Dictionary(resources)) = page.get("Resources") else {
+        panic!("page must retain resources");
+    };
+    let Some(Object::Dictionary(xobjects)) = resources.get("XObject") else {
+        panic!("flattened appearance must be registered as an XObject");
+    };
+    let Some(Object::Reference(xobject_ref)) = xobjects.get("Fxo1") else {
+        panic!("flattened appearance must use an indirect XObject");
+    };
+    let Object::Stream(appearance) = pdf.resolve(*xobject_ref).unwrap() else {
+        panic!("registered XObject must be the materialized appearance");
+    };
+    let Some(Object::Dictionary(resources)) = appearance.dict.get("Resources") else {
+        panic!("appearance must retain resources");
+    };
+    let Some(Object::Dictionary(fonts)) = resources.get("Font") else {
+        panic!("appearance must retain font resources");
+    };
     assert_eq!(fonts.get("Helv"), Some(&Object::Integer(42)));
 }
 
