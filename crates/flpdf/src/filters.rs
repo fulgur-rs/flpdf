@@ -535,7 +535,7 @@ fn prepare_decode_filters(
         let Some(mut adapter) = stream_filter_for(filter_name) else {
             return Err(undecodable_filter_error(filter_name));
         };
-        if !adapter.set_decode_params(decode_params_to_object(&spec.decode_params).as_ref()) {
+        if !adapter.set_decode_params(&spec.decode_params) {
             return Err(Error::Unsupported(format!(
                 "stream filter {} does not support supplied /DecodeParms",
                 String::from_utf8_lossy(filter_name)
@@ -676,7 +676,7 @@ fn decode_codec_prefix(
     // on, so applying the parameters *inside* the assertion silently skipped
     // the predictor in release builds and produced a different prefix length,
     // a different event boundary, and ultimately a different public error.
-    let applied = adapter.set_decode_params(decode_params_to_object(&spec.decode_params).as_ref());
+    let applied = adapter.set_decode_params(&spec.decode_params);
     debug_assert!(applied);
     adapter
         .pipe_decode_recovering(data, limits.max_output, &mut |_, _, _, _| Ok(()))
@@ -724,8 +724,7 @@ fn apply_encode_params(
     decode_params: &DecodeParams,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    let decode_params = decode_params_to_object(decode_params);
-    match crate::stream_filter::png_encode_geometry(filter_name, decode_params.as_ref())? {
+    match crate::stream_filter::png_encode_geometry(filter_name, decode_params)? {
         None => Ok(stream_data.to_vec()),
         Some((columns, colors, bits_per_component)) => crate::stream_filter::encode_png_predictor(
             stream_data,

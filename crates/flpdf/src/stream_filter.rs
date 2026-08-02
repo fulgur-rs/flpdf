@@ -163,34 +163,25 @@ fn param_value_from_object(value: &Object) -> ParamValue {
     }
 }
 
-/// Re-materialize the `Object` shape `StreamFilter::set_decode_params` still
-/// takes, bridging the shape-neutral `FilterSpec` to the not-yet-migrated
-/// filters.
+/// Re-materialize the `Object` shape the Crypt stage provider still takes,
+/// bridging the shape-neutral `FilterSpec` to the one caller that has not been
+/// migrated.
 ///
-/// Expiry is mechanical: moving `set_decode_params` onto `&DecodeParams`
-/// removes the `prepare_decode_filters`, `decode_codec_prefix`, and
-/// `apply_encode_params`/`png_encode_geometry` call sites in `filters.rs`;
-/// moving the Crypt stage provider onto `&DecodeParams` removes the last one,
-/// in the Crypt arm of `decode_stream_data_with_filters_and_crypt`. Note that
-/// `png_encode_geometry` below also calls `set_decode_params`, so that
-/// migration must cover this module too, not just `filters.rs`.
+/// Every `StreamFilter` now reads `&DecodeParams` directly, so the sole
+/// remaining caller is the `PreparedStage::Crypt` arm of
+/// `decode_stream_data_with_filters_and_crypt`; moving that provider closure
+/// onto `&DecodeParams` retires this function entirely.
 ///
-/// The round trip loses information in two places.
+/// The round trip loses information in two places, both of which now reach
+/// only that closure.
 ///
 /// 1. A present *non-dictionary* reduces to `Present(vec![])` and comes back
-///    as an empty dictionary. That converges *toward* qpdf rather than away
-///    from it: `SF_FlateLzwDecode::setDecodeParms` early-returns only for null
-///    (`SF_FlateLzwDecode.cc:24-26`); a non-dictionary reaches `getKeys`, gets
-///    an empty key set, and falls through to the trailing
-///    `(predictor > 1) && (columns == 0)` check at `:68-70`. The early
-///    `return true` for a non-dictionary is flpdf's own shortcut in
-///    `FlateLzwStreamFilter::set_decode_params` below. Both answer `true` only
-///    because every caller applies the parameters to a freshly constructed
-///    filter, whose defaults are `predictor = 1, columns = 1`; reusing one
-///    adapter across specs would break that equivalence.
+///    as an empty dictionary, so a provider cannot tell the two apart. For the
+///    codec filters that merge was a convergence toward qpdf — see
+///    `FlateLzwStreamFilter::set_decode_params` below — but a crypt provider
+///    reading its own shapes would have to reckon with it.
 /// 2. `ParamValue::Other` flattens to `Object::Null`, so a reconstruction
-///    cannot report which non-integer shape the source held. Unlike (1) this
-///    reaches a caller-supplied closure — the Crypt stage provider — and is
+///    cannot report which non-integer shape the source held. This is
 ///    unobservable today only because the sole production provider ignores its
 ///    argument and returns `Unsupported`. `ParamValue::Name` does survive the
 ///    round trip, so plan decision D2 (a Crypt provider reading `/Name`) is
@@ -210,12 +201,12 @@ fn param_value_to_object(value: &ParamValue) -> Object {
     match value {
         ParamValue::Int(int) => Object::Integer(i64::from(*int)),
         ParamValue::Name(name) => Object::Name(name.clone()),
-        // Every filter reads a parameter through `clamped_int_param`, which
-        // answers `None` for any non-integer, so the simplest non-integer
-        // object stands in for every remaining shape. This holds only for a
-        // value *inside* the parameter dictionary: at the top level `Null`
-        // means absent (see `FlateLzwStreamFilter::set_decode_params` below),
-        // so reusing this mapping for a whole params object would invert the
+        // `Other` is the shape `param_value_from_object` reaches only after
+        // both `clamped_int_param` and `as_name` decline, so the simplest
+        // non-integer, non-name object stands in for every remaining shape.
+        // This holds only for a value *inside* the parameter dictionary: at
+        // the top level `Null` means absent (`DecodeParams::Absent`), so
+        // reusing this mapping for a whole params object would invert the
         // meaning of `Other`.
         ParamValue::Other => Object::Null,
     }
@@ -410,8 +401,8 @@ pub(crate) fn expect_first_filter_input(data: &[u8]) {
 /// pipeline. A whole-buffer result keeps flpdf's public API stable while the
 /// individual codecs are migrated to incremental `Pipeline` stages.
 pub(crate) trait StreamFilter {
-    fn set_decode_params(&mut self, decode_params: Option<&Object>) -> bool {
-        decode_params.is_none_or(|params| matches!(params, Object::Null))
+    fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
+        decode_params.is_absent()
     }
 
     /// Build the filter's decode pipeline without decoding anything.
@@ -484,10 +475,14 @@ impl FlateLzwStreamFilter {
     }
 }
 
-/// Read an integer parameter the way qpdf's `getIntValueAsInt` does.
+/// Reduce a `/DecodeParms` value to an integer the way qpdf's
+/// `getIntValueAsInt` does.
 ///
 /// Values outside the 32-bit range saturate rather than failing, so a
-/// `/Columns` far beyond `INT_MAX` behaves as `INT_MAX` does.
+/// `/Columns` far beyond `INT_MAX` behaves as `INT_MAX` does. The filters no
+/// longer call this: it runs once per value in `param_value_from_object`, so
+/// the clamp is applied while the `Object` shape is read and every filter sees
+/// only the already-clamped `ParamValue::Int`.
 fn clamped_int_param(value: &Object) -> Option<i32> {
     value
         .as_integer()
@@ -504,55 +499,48 @@ fn to_uint(value: i32) -> Result<u32> {
 }
 
 impl StreamFilter for FlateLzwStreamFilter {
-    fn set_decode_params(&mut self, decode_params: Option<&Object>) -> bool {
-        let Some(params) = decode_params else {
-            return true;
-        };
-        if matches!(params, Object::Null) {
+    fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
+        // The one early return SF_FlateLzwDecode::setDecodeParms has
+        // (SF_FlateLzwDecode.cc:24-26), for a null /DecodeParms. Every other
+        // shape walks the keys and then falls through to the trailing check at
+        // :68-70, which a present-but-empty parameter set reaches.
+        if decode_params.is_absent() {
             return true;
         }
-        // SF_FlateLzwDecode::setDecodeParms asks getKeys() for every non-null
-        // object, and QPDFObjectHandle::getKeys warns and hands back an empty
-        // key set for a non-dictionary, so it remains filterable. qpdf then
-        // still runs the trailing (predictor > 1) && (columns == 0) check; the
-        // early return here is flpdf's own shortcut, equivalent only because
-        // every caller applies parameters to a freshly constructed filter.
-        let Some(params) = params.as_dict() else {
-            return true;
-        };
 
         let mut filterable = true;
-        for (key, value) in params.iter() {
+        for (key, value) in decode_params.entries() {
+            let key = key.as_slice();
             match key {
-                b"Predictor" => match clamped_int_param(value) {
-                    Some(predictor) => {
+                b"Predictor" => match *value {
+                    ParamValue::Int(predictor) => {
                         self.predictor = predictor;
                         if !((predictor == 1) || (predictor == 2) || (10..=15).contains(&predictor))
                         {
                             filterable = false;
                         }
                     }
-                    None => filterable = false,
+                    ParamValue::Name(_) | ParamValue::Other => filterable = false,
                 },
-                b"Columns" | b"Colors" | b"BitsPerComponent" => match clamped_int_param(value) {
+                b"Columns" | b"Colors" | b"BitsPerComponent" => match *value {
                     // qpdf stores these without range validation and defers
                     // rejection to pipeline construction.
-                    Some(parameter) => match key {
+                    ParamValue::Int(parameter) => match key {
                         b"Columns" => self.columns = parameter,
                         b"Colors" => self.colors = parameter,
                         _ => self.bits_per_component = parameter,
                     },
-                    None => filterable = false,
+                    ParamValue::Name(_) | ParamValue::Other => filterable = false,
                 },
                 // qpdf consults /EarlyChange only for LZW streams.
-                b"EarlyChange" if self.lzw => match clamped_int_param(value) {
-                    Some(early_change) => {
+                b"EarlyChange" if self.lzw => match *value {
+                    ParamValue::Int(early_change) => {
                         self.early_code_change = early_change == 1;
                         if !((early_change == 0) || (early_change == 1)) {
                             filterable = false;
                         }
                     }
-                    None => filterable = false,
+                    ParamValue::Name(_) | ParamValue::Other => filterable = false,
                 },
                 _ => {}
             }
@@ -892,7 +880,7 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
 /// decode path uses, so both directions accept exactly the same dictionaries.
 pub(crate) fn png_encode_geometry(
     filter_name: &[u8],
-    decode_params: Option<&Object>,
+    decode_params: &DecodeParams,
 ) -> Result<Option<(u32, u32, u32)>> {
     let mut filter = FlateLzwStreamFilter::new(filter_name == b"LZWDecode");
     if !filter.set_decode_params(decode_params) {
@@ -945,10 +933,11 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs_from_object, decode_flate, decode_flate_chunks, encode_flate,
-        encode_run_length, ignore_codec_warning, ignore_warning, normalize_filter_name,
-        stream_filter_for, DecodeParams, FlateLzwStreamFilter, OutputBuffer, ParamValue, Pipeline,
-        StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        decode_filter_specs_from_object, decode_flate, decode_flate_chunks,
+        decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
+        ignore_warning, normalize_filter_name, stream_filter_for, Ascii85StreamFilter,
+        DecodeParams, FlateLzwStreamFilter, OutputBuffer, ParamValue, Pipeline, StreamFilter,
+        DECODE_OUTPUT_LIMIT_PREFIX,
     };
     use crate::pipeline::lzw::pack_codes;
     use crate::{Dictionary, Error, Object};
@@ -1215,7 +1204,7 @@ mod tests {
     fn flate_factory_exposes_qpdf_stream_filter_contract() {
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
 
-        assert!(filter.set_decode_params(None));
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
         assert!(!filter.is_specialized_compression());
         assert!(!filter.is_lossy_compression());
 
@@ -1226,21 +1215,24 @@ mod tests {
         assert_eq!(decoded, b"factory pipeline");
     }
 
+    /// Crosses the shape seam deliberately: a present non-dictionary is only
+    /// visible as an `Object`, and the property under test is that reading it
+    /// leaves the filter filterable the way `getKeys`' empty key set does.
     #[test]
     fn flate_factory_treats_non_dictionary_decode_params_as_empty_like_qpdf() {
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
 
-        assert!(filter.set_decode_params(Some(&Object::Integer(1))));
+        assert!(filter.set_decode_params(&decode_params_from_object(Some(&Object::Integer(1)))));
     }
 
     #[test]
     fn flate_lzw_filter_retains_only_the_qpdf_parameter_set() {
-        // The adapter keeps the five scalar parameters qpdf keeps, not a
-        // reference to the caller's object.
+        // The adapter keeps the five scalar parameters qpdf keeps; an
+        // arbitrarily large source object contributes none of them.
         let params = Object::String(vec![b'x'; 64 * 1024]);
         let mut filter = FlateLzwStreamFilter::new(false);
 
-        assert!(filter.set_decode_params(Some(&params)));
+        assert!(filter.set_decode_params(&decode_params_from_object(Some(&params))));
         assert_eq!(
             (
                 filter.predictor,
@@ -1275,36 +1267,96 @@ mod tests {
         Object::Dictionary(dictionary)
     }
 
-    fn accepts(lzw: bool, entries: &[(&str, Object)]) -> bool {
-        FlateLzwStreamFilter::new(lzw).set_decode_params(Some(&params(entries)))
+    /// Build the `/DecodeParms` shape `StreamFilter::set_decode_params` reads.
+    ///
+    /// The filters no longer see an `Object`, so a filter test states the
+    /// bounded values directly; the `Object` -> `ParamValue` reduction is
+    /// `param_value_from_object`'s contract and is pinned by
+    /// `object_shape_reader_reduces_each_parameter_value_to_its_bounded_shape`.
+    fn neutral_params(entries: &[(&str, ParamValue)]) -> DecodeParams {
+        DecodeParams::Present(
+            entries
+                .iter()
+                .map(|(key, value)| (key.as_bytes().to_vec(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn accepts(lzw: bool, entries: &[(&str, ParamValue)]) -> bool {
+        FlateLzwStreamFilter::new(lzw).set_decode_params(&neutral_params(entries))
     }
 
     #[test]
     fn flate_lzw_filter_accepts_absent_and_null_decode_params() {
         let mut filter = FlateLzwStreamFilter::new(true);
-        assert!(filter.set_decode_params(None));
-        assert!(filter.set_decode_params(Some(&Object::Null)));
+        // A missing key and an explicit null both reduce to `Absent`.
+        assert!(filter.set_decode_params(&decode_params_from_object(None)));
+        assert!(filter.set_decode_params(&decode_params_from_object(Some(&Object::Null))));
         assert!(!filter.is_specialized_compression());
         assert!(!filter.is_lossy_compression());
+    }
+
+    #[test]
+    fn flate_filter_reads_predictor_geometry_from_neutral_params() {
+        let mut filter = FlateLzwStreamFilter::new(false);
+        let params = DecodeParams::Present(vec![
+            (b"Predictor".to_vec(), ParamValue::Int(12)),
+            (b"Columns".to_vec(), ParamValue::Int(4)),
+        ]);
+        assert!(filter.set_decode_params(&params));
+        assert_eq!(filter.predictor, 12);
+        assert_eq!(filter.columns, 4);
+    }
+
+    #[test]
+    fn non_null_params_still_make_a_parameterless_filter_unfilterable() {
+        let mut filter = Ascii85StreamFilter;
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        assert!(!filter.set_decode_params(&DecodeParams::Present(Vec::new())));
+    }
+
+    #[test]
+    fn a_fresh_flate_filter_accepts_both_present_shapes_the_neutral_form_merges() {
+        // The neutral form collapses "present non-dictionary" and "present empty
+        // dictionary" into `Present(vec![])`, removing flpdf's own early
+        // `return true` for a non-dictionary. That shortcut was never qpdf's:
+        // `SF_FlateLzwDecode::setDecodeParms` (`libqpdf/SF_FlateLzwDecode.cc:21-73`)
+        // early-returns only for `isNull()` (`:24-26`); a present non-dictionary
+        // reaches `getKeys()`, which warns `typeWarning("dictionary", "treating as
+        // empty")` (`libqpdf/QPDFObjectHandle.cc:997-1009`, warning at `:1005`),
+        // yields an empty set, and falls through to the trailing
+        // `(predictor > 1) && (columns == 0)` check at `:68-70`. So this merge is a
+        // CONVERGENCE toward qpdf, not a tolerated loss.
+        //
+        // Both shapes still answer `true` because every caller applies params to a
+        // freshly constructed adapter (defaults `predictor = 1, columns = 1`),
+        // making that trailing check false either way. This assertion is what fails
+        // if an adapter is ever reused across specs.
+        assert!(
+            FlateLzwStreamFilter::new(false).set_decode_params(&DecodeParams::Present(Vec::new()))
+        );
+        assert!(
+            FlateLzwStreamFilter::new(true).set_decode_params(&DecodeParams::Present(Vec::new()))
+        );
     }
 
     #[test]
     fn predictor_values_outside_the_supported_set_are_not_filterable() {
         for predictor in [1, 2, 10, 11, 12, 13, 14, 15] {
             assert!(
-                accepts(false, &[("Predictor", Object::Integer(predictor))]),
+                accepts(false, &[("Predictor", ParamValue::Int(predictor))]),
                 "predictor {predictor}"
             );
         }
         for predictor in [-1, 0, 3, 9, 16, 100] {
             assert!(
-                !accepts(false, &[("Predictor", Object::Integer(predictor))]),
+                !accepts(false, &[("Predictor", ParamValue::Int(predictor))]),
                 "predictor {predictor}"
             );
         }
         assert!(!accepts(
             false,
-            &[("Predictor", Object::Name(b"12".to_vec()))]
+            &[("Predictor", ParamValue::Name(b"12".to_vec()))]
         ));
     }
 
@@ -1313,22 +1365,22 @@ mod tests {
         assert!(!accepts(
             false,
             &[
-                ("Predictor", Object::Integer(12)),
-                ("Columns", Object::Integer(0)),
+                ("Predictor", ParamValue::Int(12)),
+                ("Columns", ParamValue::Int(0)),
             ]
         ));
         assert!(accepts(
             false,
             &[
-                ("Predictor", Object::Integer(1)),
-                ("Columns", Object::Integer(0)),
+                ("Predictor", ParamValue::Int(1)),
+                ("Columns", ParamValue::Int(0)),
             ]
         ));
         assert!(accepts(
             false,
             &[
-                ("Predictor", Object::Integer(12)),
-                ("Columns", Object::Integer(4)),
+                ("Predictor", ParamValue::Int(12)),
+                ("Columns", ParamValue::Int(4)),
             ]
         ));
     }
@@ -1336,58 +1388,67 @@ mod tests {
     #[test]
     fn geometry_parameters_are_retained_without_range_validation() {
         let mut filter = FlateLzwStreamFilter::new(false);
-        assert!(filter.set_decode_params(Some(&params(&[
-            ("Predictor", Object::Integer(12)),
-            ("Columns", Object::Integer(-4)),
-            ("Colors", Object::Integer(-1)),
-            ("BitsPerComponent", Object::Integer(99)),
-        ]))));
+        assert!(filter.set_decode_params(&neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(-4)),
+            ("Colors", ParamValue::Int(-1)),
+            ("BitsPerComponent", ParamValue::Int(99)),
+        ])));
         assert_eq!(
             (filter.columns, filter.colors, filter.bits_per_component),
             (-4, -1, 99)
         );
-        assert!(!accepts(false, &[("Columns", Object::Null)]));
-        assert!(!accepts(false, &[("Colors", Object::Null)]));
-        assert!(!accepts(false, &[("BitsPerComponent", Object::Null)]));
+        assert!(!accepts(false, &[("Columns", ParamValue::Other)]));
+        assert!(!accepts(false, &[("Colors", ParamValue::Other)]));
+        assert!(!accepts(false, &[("BitsPerComponent", ParamValue::Other)]));
     }
 
+    /// Crosses the shape seam deliberately: the clamp now happens while the
+    /// `Object` is read, so only an out-of-range `Object::Integer` can show
+    /// that a `/Columns` beyond `INT_MAX` still reaches the filter as
+    /// `INT_MAX`.
     #[test]
     fn integer_parameters_saturate_at_the_32_bit_boundary() {
         let mut filter = FlateLzwStreamFilter::new(false);
-        assert!(filter.set_decode_params(Some(&params(&[
-            ("Predictor", Object::Integer(12)),
-            ("Columns", Object::Integer(i64::from(i32::MAX) + 10)),
-            ("Colors", Object::Integer(i64::from(i32::MIN) - 10)),
-        ]))));
+        assert!(
+            filter.set_decode_params(&decode_params_from_object(Some(&params(&[
+                ("Predictor", Object::Integer(12)),
+                ("Columns", Object::Integer(i64::from(i32::MAX) + 10)),
+                ("Colors", Object::Integer(i64::from(i32::MIN) - 10)),
+            ]))))
+        );
         assert_eq!((filter.columns, filter.colors), (i32::MAX, i32::MIN));
     }
 
     #[test]
     fn early_change_is_read_only_for_lzw_streams() {
         let mut lzw = FlateLzwStreamFilter::new(true);
-        assert!(lzw.set_decode_params(Some(&params(&[("EarlyChange", Object::Integer(0))]))));
+        assert!(lzw.set_decode_params(&neutral_params(&[("EarlyChange", ParamValue::Int(0))])));
         assert!(!lzw.early_code_change);
 
         let mut lzw = FlateLzwStreamFilter::new(true);
-        assert!(lzw.set_decode_params(Some(&params(&[("EarlyChange", Object::Integer(1))]))));
+        assert!(lzw.set_decode_params(&neutral_params(&[("EarlyChange", ParamValue::Int(1))])));
         assert!(lzw.early_code_change);
 
         // A value outside {0, 1} makes an LZW stream unfilterable.
-        assert!(!accepts(true, &[("EarlyChange", Object::Integer(7))]));
+        assert!(!accepts(true, &[("EarlyChange", ParamValue::Int(7))]));
         assert!(!accepts(
             true,
-            &[("EarlyChange", Object::Name(b"1".to_vec()))]
+            &[("EarlyChange", ParamValue::Name(b"1".to_vec()))]
         ));
 
         // The same parameters are ignored entirely on a Flate stream.
         let mut flate = FlateLzwStreamFilter::new(false);
-        assert!(flate.set_decode_params(Some(&params(&[("EarlyChange", Object::Integer(7))]))));
+        assert!(flate.set_decode_params(&neutral_params(&[("EarlyChange", ParamValue::Int(7))])));
         assert!(flate.early_code_change);
     }
 
     #[test]
     fn unrecognized_decode_params_keys_are_ignored() {
-        assert!(accepts(true, &[("Whatever", Object::Name(b"x".to_vec()))]));
+        assert!(accepts(
+            true,
+            &[("Whatever", ParamValue::Name(b"x".to_vec()))]
+        ));
     }
 
     #[test]
@@ -1407,7 +1468,7 @@ mod tests {
     fn lzw_early_change_zero_changes_the_decoded_bytes() {
         let stream: &[u8] = &[0x80, 0x10, 0x48, 0x50, 0x28, 0x24, 0x0e, 0x0d, 0x01];
         let mut filter = stream_filter_for(b"LZWDecode").expect("registered LZW filter");
-        assert!(filter.set_decode_params(Some(&params(&[("EarlyChange", Object::Integer(0))]))));
+        assert!(filter.set_decode_params(&neutral_params(&[("EarlyChange", ParamValue::Int(0))])));
 
         let decoded = filter
             .pipe_decode(stream, None, &mut ignore_warning)
@@ -1429,10 +1490,10 @@ mod tests {
     #[test]
     fn tiff_predictor_is_reported_at_pipeline_construction() {
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(filter.set_decode_params(Some(&params(&[
-            ("Predictor", Object::Integer(2)),
-            ("Columns", Object::Integer(4)),
-        ]))));
+        assert!(filter.set_decode_params(&neutral_params(&[
+            ("Predictor", ParamValue::Int(2)),
+            ("Columns", ParamValue::Int(4)),
+        ])));
 
         let error = filter
             .pipe_decode(b"", None, &mut ignore_warning)
@@ -1448,11 +1509,11 @@ mod tests {
     fn negative_geometry_is_rejected_when_the_predictor_pipeline_is_built() {
         for (key, value) in [("Columns", -4), ("Colors", -1), ("BitsPerComponent", -8)] {
             let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-            assert!(filter.set_decode_params(Some(&params(&[
-                ("Predictor", Object::Integer(12)),
-                ("Columns", Object::Integer(4)),
-                (key, Object::Integer(value)),
-            ]))));
+            assert!(filter.set_decode_params(&neutral_params(&[
+                ("Predictor", ParamValue::Int(12)),
+                ("Columns", ParamValue::Int(4)),
+                (key, ParamValue::Int(value)),
+            ])));
 
             let error = filter
                 .pipe_decode(b"", None, &mut ignore_warning)
@@ -1472,11 +1533,11 @@ mod tests {
     #[test]
     fn invalid_predictor_geometry_is_reported_before_any_codec_write() {
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(filter.set_decode_params(Some(&params(&[
-            ("Predictor", Object::Integer(12)),
-            ("Columns", Object::Integer(4)),
-            ("BitsPerComponent", Object::Integer(3)),
-        ]))));
+        assert!(filter.set_decode_params(&neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(4)),
+            ("BitsPerComponent", ParamValue::Int(3)),
+        ])));
 
         // The input is not valid deflate data, so reaching the codec at all
         // would produce a different error.
@@ -1496,10 +1557,10 @@ mod tests {
         let rows: &[u8] = &[2, 0x01, 0x02, 0x03, 0x04, 2, 0x01, 0x01, 0x01, 0x01];
         let encoded = encode_flate(rows).expect("flate encode");
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(filter.set_decode_params(Some(&params(&[
-            ("Predictor", Object::Integer(12)),
-            ("Columns", Object::Integer(4)),
-        ]))));
+        assert!(filter.set_decode_params(&neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(4)),
+        ])));
 
         let decoded = filter
             .pipe_decode(&encoded, None, &mut ignore_warning)
@@ -1515,13 +1576,13 @@ mod tests {
     fn the_output_limit_applies_to_post_predictor_bytes() {
         let rows: &[u8] = &[2, 0x01, 0x02, 0x03, 0x04, 2, 0x01, 0x01, 0x01, 0x01];
         let encoded = encode_flate(rows).expect("flate encode");
-        let predicted = params(&[
-            ("Predictor", Object::Integer(12)),
-            ("Columns", Object::Integer(4)),
+        let predicted = neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(4)),
         ]);
 
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(filter.set_decode_params(Some(&predicted)));
+        assert!(filter.set_decode_params(&predicted));
         assert_eq!(
             filter
                 .pipe_decode(&encoded, Some(8), &mut ignore_warning)
@@ -1531,7 +1592,7 @@ mod tests {
         );
 
         let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(filter.set_decode_params(Some(&predicted)));
+        assert!(filter.set_decode_params(&predicted));
         let error = filter
             .pipe_decode(&encoded, Some(7), &mut ignore_warning)
             .unwrap_err();
@@ -1556,13 +1617,13 @@ mod tests {
 
     #[test]
     fn flate_and_lzw_predictor_finish_output_keeps_its_cleanup_boundary() {
-        let predictor = params(&[
-            ("Predictor", Object::Integer(12)),
-            ("Columns", Object::Integer(2)),
+        let predictor = neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(2)),
         ]);
 
         let mut flate = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(flate.set_decode_params(Some(&predictor)));
+        assert!(flate.set_decode_params(&predictor));
         let mut flate_payload = encode_flate(&[0, b'A']).expect("encode predicted bytes");
         flate_payload.truncate(flate_payload.len() - 4);
         let mut warnings = Vec::new();
@@ -1589,7 +1650,7 @@ mod tests {
         );
 
         let mut lzw = stream_filter_for(b"LZWDecode").expect("registered LZW filter");
-        assert!(lzw.set_decode_params(Some(&predictor)));
+        assert!(lzw.set_decode_params(&predictor));
         let lzw_outcome = lzw
             .pipe_decode_recovering(
                 &pack_codes(&[256, 0, u32::from(b'A'), 257], true),
@@ -1634,14 +1695,9 @@ mod tests {
         ] {
             let mut filter = stream_filter_for(name).expect("registered stream filter");
 
-            assert!(filter.set_decode_params(None), "{name:?}");
-            assert!(filter.set_decode_params(Some(&Object::Null)), "{name:?}");
+            assert!(filter.set_decode_params(&DecodeParams::Absent), "{name:?}");
             assert!(
-                !filter.set_decode_params(Some(&Object::Dictionary(Dictionary::new()))),
-                "{name:?}"
-            );
-            assert!(
-                !filter.set_decode_params(Some(&Object::Integer(1))),
+                !filter.set_decode_params(&DecodeParams::Present(Vec::new())),
                 "{name:?}"
             );
             assert_eq!(filter.is_specialized_compression(), specialized, "{name:?}");
@@ -1699,9 +1755,9 @@ mod tests {
     fn default_stream_filter_contract_accepts_only_null_params() {
         let mut filter = stream_filter_for(b"TestRejectDecode").expect("test filter");
 
-        assert!(filter.set_decode_params(None));
-        assert!(filter.set_decode_params(Some(&Object::Null)));
-        assert!(!filter.set_decode_params(Some(&Object::Integer(1))));
+        // `Absent` is how a missing key and an explicit null both arrive.
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        assert!(!filter.set_decode_params(&DecodeParams::Present(Vec::new())));
         assert_eq!(
             filter
                 .pipe_decode(b"test filter", None, &mut ignore_warning)
