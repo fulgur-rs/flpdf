@@ -43,9 +43,12 @@ scripts/qpdf-objecthandle-dereference-diff.sh /tmp/flpdf-objecthandle-objstm.pdf
 - [x] Add the crate-private `DocumentResolver` callback.
 - [x] Store an optional weak resolver link in an indirect slot without
   changing the existing legacy constructor's behavior.
+- [x] Match `QPDF_Unresolved` construction: accept identity and resolver only,
+  and leave parsed offset at `-1` until parsing installs real provenance.
 - [x] Implement `try_dereference`, releasing the slot borrow before resolver
   entry and updating the supplied same handle in place.
-- [x] Implement fallible null and dictionary accessors.
+- [x] Implement fallible null and dictionary accessors, keeping them
+  crate-private until the complete resolver cutover in `flpdf-25kg.3.5`.
 - [x] Prove resolver errors propagate unchanged through every accessor.
 - [x] Prove a present child resolving to null is absent under `try_has_key`.
 - [x] Add qpdf's public identity predicate as `is_same_object_as`.
@@ -93,12 +96,12 @@ all applicable members and records decoded-stream-relative offsets.
 
 ## Task 5: Verify and publish the primitive slice
 
-- [x] Run the focused primitive tests (128 passed).
+- [x] Run the focused primitive tests (129 passed).
 - [x] Run the oracle runner and runner contract (minimal offsets 17/66;
   generated ObjStm offsets 9/43).
 - [x] Run the full flpdf and workspace suites (zero failures).
 - [x] Run format, clippy with warnings denied, and fresh changed-line coverage
-  (156/156 executable lines, 100%).
+  (160/160 executable lines, 100%).
 - [x] Record exact results in `flpdf-25kg.3.3`.
 - [x] Commit the responsibility correction.
 - [x] Push Beads and git.

@@ -87,6 +87,11 @@ the reference and resolver link out of the slot before calling the resolver,
 so no `RefCell` borrow crosses resolver entry. The resolver receives the same
 handle and must update that slot in place.
 
+Like qpdf's `QPDF_Unresolved(QPDF*, QPDFObjGen)` constructor, creating a
+resolver-bearing unresolved slot accepts identity and resolver only. Its
+parsed offset starts at qpdf's `-1` sentinel; only parsing the resolved value
+may install the actual source or decoded-stream-relative offset.
+
 The optional resolver is required temporarily because the existing legacy
 constructor still creates unattached handles. New production code must not use
 that constructor as a qpdf-native resolver substitute; it is marked for later
@@ -95,15 +100,18 @@ cutover with the other legacy routes.
 ## API
 
 The primitive adds qpdf-shaped fallible accessors because qpdf reports
-resolution failures with exceptions:
+resolution failures with exceptions. They remain crate-private until
+`flpdf-25kg.3.5` attaches the complete qpdf-native resolver to every
+document-created handle; publishing them sooner would make a live `Pdf`
+incorrectly appear dropped. The complete identity predicate is public now:
 
 ```rust
 impl ObjectHandle {
-    pub fn try_dereference(&self) -> Result<()>;
-    pub fn try_is_null(&self) -> Result<bool>;
-    pub fn try_as_dictionary(&self) -> Result<Option<BTreeMap<Vec<u8>, ObjectHandle>>>;
-    pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle>;
-    pub fn try_has_key(&self, key: &[u8]) -> Result<bool>;
+    pub(crate) fn try_dereference(&self) -> Result<()>;
+    pub(crate) fn try_is_null(&self) -> Result<bool>;
+    pub(crate) fn try_as_dictionary(&self) -> Result<Option<BTreeMap<Vec<u8>, ObjectHandle>>>;
+    pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle>;
+    pub(crate) fn try_has_key(&self, key: &[u8]) -> Result<bool>;
     pub fn is_same_object_as(&self, other: &ObjectHandle) -> bool;
 }
 ```

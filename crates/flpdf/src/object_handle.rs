@@ -32,6 +32,7 @@ pub type ResourceConflicts =
 /// The document-owned resolver qpdf's `QPDFObject` calls through its owning
 /// `QPDF*` and object identity. Kept crate-private so only the canonical
 /// document implementation can resolve an indirect slot.
+#[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 }
@@ -41,6 +42,15 @@ pub(crate) trait DocumentResolver {
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
 /// every clone of an indirect handle shares the same canonical identity and
 /// resolution state.
+///
+/// Lazy dereference stays crate-internal until every document-created handle
+/// is attached to the complete qpdf-native resolver.
+///
+/// ```compile_fail
+/// let handle = flpdf::ObjectHandle::integer(1);
+/// handle.try_dereference()?;
+/// # Ok::<(), flpdf::Error>(())
+/// ```
 #[derive(Clone)]
 pub struct ObjectHandle(Repr);
 
@@ -180,6 +190,7 @@ pub(crate) enum IndirectState {
 
 struct IndirectSlot {
     object_ref: ObjectRef,
+    #[allow(dead_code)] // read through the flpdf-25kg.3.5 resolver cutover
     resolver: Option<Weak<dyn DocumentResolver>>,
     state: IndirectState,
     parsed_offset: i64,
@@ -245,14 +256,13 @@ impl ObjectHandle {
                         // sealed resolver unit tests only
     pub(crate) fn new_indirect_with_resolver(
         object_ref: ObjectRef,
-        offset: i64,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
             resolver: Some(resolver),
             state: IndirectState::NotYetResolved,
-            parsed_offset: offset,
+            parsed_offset: NO_PARSED_OFFSET,
         }))))
     }
 
@@ -417,7 +427,8 @@ impl ObjectHandle {
     ///
     /// Direct and already-terminal handles are no-ops. An unresolved handle
     /// whose document has been dropped returns an error and stays unresolved.
-    pub fn try_dereference(&self) -> Result<()> {
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_dereference(&self) -> Result<()> {
         let (object_ref, resolver) = match &self.0 {
             Repr::Direct(_) => return Ok(()),
             Repr::Indirect(slot) => {
@@ -439,13 +450,15 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
-    pub fn try_is_null(&self) -> Result<bool> {
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_is_null(&self) -> Result<bool> {
         self.try_dereference()?;
         Ok(self.is_null())
     }
 
     /// qpdf-compatible dictionary inspection with lazy dereference.
-    pub fn try_as_dictionary(
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_as_dictionary(
         &self,
     ) -> Result<Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>>> {
         self.try_dereference()?;
@@ -454,14 +467,16 @@ impl ObjectHandle {
 
     /// qpdf-compatible dictionary lookup. The holder dictionary is resolved;
     /// the returned child retains its own direct/indirect identity.
-    pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
         Ok(self.get_key(key))
     }
 
     /// qpdf-compatible visible-key test. A present value that resolves to
     /// null is treated as absent, matching `QPDF_Dictionary::hasKey`.
-    pub fn try_has_key(&self, key: &[u8]) -> Result<bool> {
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_has_key(&self, key: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         let child = self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
@@ -1751,11 +1766,8 @@ mod identity_tests {
     fn try_get_key_resolves_the_same_indirect_slot_once() {
         let resolver = Rc::new(RecordingResolver::default());
         let erased: Rc<dyn DocumentResolver> = resolver.clone();
-        let handle = ObjectHandle::new_indirect_with_resolver(
-            ObjectRef::new(7, 0),
-            NO_PARSED_OFFSET,
-            Rc::downgrade(&erased),
-        );
+        let handle =
+            ObjectHandle::new_indirect_with_resolver(ObjectRef::new(7, 0), Rc::downgrade(&erased));
         let clone = handle.clone();
 
         assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
@@ -1770,7 +1782,6 @@ mod identity_tests {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(8, 0),
-            NO_PARSED_OFFSET,
             Rc::downgrade(&resolver),
         );
         drop(resolver);
@@ -1781,11 +1792,21 @@ mod identity_tests {
     }
 
     #[test]
+    fn resolver_bearing_indirect_slot_starts_without_a_parsed_offset() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(12, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
     fn missing_indirect_slot_resolves_in_place_to_null() {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(MissingResolver);
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(9, 0),
-            NO_PARSED_OFFSET,
             Rc::downgrade(&resolver),
         );
 
@@ -1799,7 +1820,6 @@ mod identity_tests {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(10, 0),
-            NO_PARSED_OFFSET,
             Rc::downgrade(&resolver),
         );
 
@@ -1834,11 +1854,8 @@ mod identity_tests {
     fn fallible_dictionary_accessors_cover_resolved_and_non_dictionary_values() {
         let resolver = Rc::new(RecordingResolver::default());
         let erased: Rc<dyn DocumentResolver> = resolver;
-        let dict = ObjectHandle::new_indirect_with_resolver(
-            ObjectRef::new(11, 0),
-            NO_PARSED_OFFSET,
-            Rc::downgrade(&erased),
-        );
+        let dict =
+            ObjectHandle::new_indirect_with_resolver(ObjectRef::new(11, 0), Rc::downgrade(&erased));
 
         let entries = dict
             .try_as_dictionary()
