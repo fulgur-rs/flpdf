@@ -1399,6 +1399,21 @@ fn helper_replace_creates_and_replaces_name_tree_entry() {
 }
 
 #[test]
+fn helper_lookup_returns_none_for_missing_key_in_existing_tree() {
+    let mut pdf = open(build_no_names_pdf());
+    let filespec = make_filespec(&mut pdf, b"present.txt");
+    pdf.embedded_files()
+        .replace_embedded_file(b"present", filespec)
+        .expect("insert");
+
+    assert!(pdf
+        .embedded_files()
+        .get_embedded_file(b"missing")
+        .expect("lookup")
+        .is_none());
+}
+
+#[test]
 fn helper_replace_keeps_direct_names_dictionary_direct() {
     let mut pdf = open(build_no_embedded_files_pdf());
     let filespec = make_filespec(&mut pdf, b"direct-names.txt");
@@ -1509,6 +1524,81 @@ fn helper_returns_a_live_direct_filespec_handle() {
             .get_description()
             .expect("description"),
         b"live"
+    );
+}
+
+#[test]
+fn helper_reads_a_direct_filespec_below_indirect_kids() {
+    let mut pdf = open(build_no_names_pdf());
+    let indirect_leaf_ref = ObjectRef::new(499, 0);
+    let leaf_ref = ObjectRef::new(500, 0);
+    let root_ref = ObjectRef::new(501, 0);
+    let names_ref = ObjectRef::new(502, 0);
+    let indirect_filespec_ref = ObjectRef::new(503, 0);
+
+    let mut filespec = Dictionary::new();
+    filespec.insert("F", Object::String(b"nested.txt".to_vec()));
+    let mut leaf = Dictionary::new();
+    leaf.insert(
+        "Names",
+        Object::Array(vec![
+            Object::String(b"earlier".to_vec()),
+            Object::Dictionary(Dictionary::new()),
+            Object::String(b"nested".to_vec()),
+            Object::Dictionary(filespec),
+        ]),
+    );
+    pdf.set_object(leaf_ref, Object::Dictionary(leaf));
+    let mut first_leaf = Dictionary::new();
+    first_leaf.insert(
+        "Names",
+        Object::Array(vec![
+            Object::String(b"indirect".to_vec()),
+            Object::Reference(indirect_filespec_ref),
+        ]),
+    );
+    pdf.set_object(indirect_leaf_ref, Object::Dictionary(first_leaf));
+    pdf.set_object(indirect_filespec_ref, Object::Dictionary(Dictionary::new()));
+
+    let mut root = Dictionary::new();
+    root.insert(
+        "Kids",
+        Object::Array(vec![
+            Object::Reference(indirect_leaf_ref),
+            Object::Reference(leaf_ref),
+        ]),
+    );
+    pdf.set_object(root_ref, Object::Dictionary(root));
+
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Reference(root_ref));
+    pdf.set_object(names_ref, Object::Dictionary(names));
+
+    let catalog_ref = pdf.root_ref().expect("root");
+    let mut catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary")
+        .clone();
+    catalog.insert("Names", Object::Reference(names_ref));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    let files = pdf
+        .embedded_files()
+        .get_embedded_files()
+        .expect("read direct filespec");
+    let nested = files
+        .get(b"nested".as_slice())
+        .expect("nested filespec")
+        .clone();
+    drop(files);
+    assert_eq!(
+        FileSpec::new(nested, &mut pdf)
+            .expect("filespec")
+            .get_filename()
+            .expect("filename"),
+        b"nested.txt"
     );
 }
 
