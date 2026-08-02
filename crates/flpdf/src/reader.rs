@@ -114,6 +114,11 @@ pub struct Pdf<R: Read + Seek> {
     source_xref_offsets: Vec<(ObjectRef, u64)>,
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
     dirty_object_refs: BTreeSet<ObjectRef>,
+    /// Dirty objects whose live ObjectHandle graph was changed directly, so
+    /// the legacy object cache may no longer agree with it. `set_object`
+    /// updates both representations and retains the stream zero-copy fast
+    /// path in `resolve_borrowed`.
+    handle_mutated_object_refs: BTreeSet<ObjectRef>,
     /// Exact source framing EOLs removed while a line-anchored `endstream`
     /// scan remained authoritative. Rewriting restores this private metadata
     /// before applying the selected stream policy, matching qpdf's recovered
@@ -648,6 +653,7 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_offsets,
             source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
+            handle_mutated_object_refs: BTreeSet::new(),
             recovered_stream_eols: BTreeMap::new(),
             transformed_stream_refs: BTreeSet::new(),
             qpdf_dangling_refs: BTreeSet::new(),
@@ -1309,6 +1315,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         self.cache.set_resolved(object_ref, object);
+        self.handle_mutated_object_refs.remove(&object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
 
@@ -1367,6 +1374,7 @@ impl<R: Read + Seek> Pdf<R> {
         // correctness would then depend on `Pdf::resolve_object_handle`'s
         // fallback arm staying a wildcard forever.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.handle_mutated_object_refs.remove(&object_ref);
         self.get_object_handle(object_ref).set_missing();
 
         if matches!(
@@ -1659,6 +1667,7 @@ impl<R: Read + Seek> Pdf<R> {
         // bridge. Discard any snapshot previously returned by resolve so the
         // next resolve and the writer materialize the changed live handle.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.handle_mutated_object_refs.insert(object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
 
@@ -2404,7 +2413,9 @@ impl<R: Read + Seek> Pdf<R> {
             // old stream while the live handle holds the new dictionary.
             // In that case materialize only on the next observation instead
             // of copying attachment data at mutation time.
-            if handle.get_parsed_offset() < 0 && !self.dirty_object_refs.contains(&object_ref) {
+            if handle.get_parsed_offset() < 0
+                && !self.handle_mutated_object_refs.contains(&object_ref)
+            {
                 if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
                     self.cache.entry(object_ref)
                 {
