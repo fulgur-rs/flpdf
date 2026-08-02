@@ -556,9 +556,18 @@ fn helper_flatten_annotations_merges_acroform_dr_into_widget_appearance() {
     fonts.insert("Helv", Object::Integer(42));
     let mut dr = Dictionary::new();
     dr.insert("Font", Object::Dictionary(fonts));
+    pdf.set_object(
+        ObjectRef::new(10, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
+    pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(dr));
     let mut acroform = Dictionary::new();
-    acroform.insert("DR", Object::Dictionary(dr));
-    pdf.set_object(ObjectRef::new(6, 0), Object::Dictionary(acroform));
+    acroform.insert("DR", Object::Reference(ObjectRef::new(10, 0)));
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Reference(ObjectRef::new(9, 0)),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), Object::Dictionary(acroform));
     let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
         panic!("catalog must be a dictionary");
     };
@@ -812,13 +821,34 @@ fn helper_flatten_annotations_wraps_when_non_null_ap_has_no_normal_stream() {
 fn helper_flatten_annotations_follows_chained_appearance_holders() {
     let mut pdf = open(build_n_page_pdf(1));
     let mut appearance = Dictionary::new();
-    appearance.insert(
-        "BBox",
+    appearance.insert("BBox", Object::Reference(ObjectRef::new(9, 0)));
+    appearance.insert("Matrix", Object::Reference(ObjectRef::new(11, 0)));
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Reference(ObjectRef::new(10, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(10, 0),
         Object::Array(vec![
             Object::Integer(0),
             Object::Integer(0),
             Object::Integer(100),
             Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(12, 0),
+        Object::Array(vec![
+            Object::Integer(1),
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(1),
+            Object::Integer(0),
+            Object::Integer(0),
         ]),
     );
     pdf.set_object(
@@ -865,6 +895,60 @@ fn helper_flatten_annotations_follows_chained_appearance_holders() {
     assert!(
         String::from_utf8_lossy(&content).contains("/Fxo1 Do"),
         "terminal /AP/N stream must be drawn"
+    );
+}
+
+#[test]
+fn helper_flatten_annotations_looks_up_non_utf8_appearance_state_bytes() {
+    let mut pdf = open(build_n_page_pdf(1));
+    let mut appearance = Dictionary::new();
+    appearance.insert(
+        "BBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        Object::Stream(Stream::new(appearance, Vec::new())),
+    );
+    let mut states = Dictionary::new();
+    states.insert(vec![0xff], Object::Reference(ObjectRef::new(6, 0)));
+    let mut ap = Dictionary::new();
+    ap.insert("N", Object::Dictionary(states));
+    let mut annot = Dictionary::new();
+    annot.insert("AP", Object::Dictionary(ap));
+    annot.insert("AS", Object::Name(vec![0xff]));
+    annot.insert(
+        "Rect",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(100),
+            Object::Integer(20),
+        ]),
+    );
+    pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(annot));
+    let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("page must be a dictionary");
+    };
+    page.insert(
+        "Annots",
+        Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+    );
+    pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    PageDocumentHelper::new(&mut pdf)
+        .flatten_annotations(0, 0x3)
+        .unwrap();
+
+    let content = flpdf::pages::page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+    assert!(
+        String::from_utf8_lossy(&content).contains("/Fxo1 Do"),
+        "a raw non-UTF-8 /AS name must select the matching /AP/N state"
     );
 }
 

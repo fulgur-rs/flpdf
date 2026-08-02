@@ -533,24 +533,16 @@ fn acroform_default_resources<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Option
     let Some(acroform) = root.get("AcroForm").cloned() else {
         return Ok(None);
     };
-    let acroform = match acroform {
+    let acroform = match resolve_ref_chain(pdf, &acroform)?.0 {
         Object::Dictionary(dict) => dict,
-        Object::Reference(reference) => match pdf.resolve(reference)? {
-            Object::Dictionary(dict) => dict,
-            _ => return Ok(None), // cov:ignore: malformed indirect AcroForm is ignored like qpdf
-        },
-        _ => return Ok(None), // cov:ignore: malformed direct AcroForm is ignored like qpdf
+        _ => return Ok(None), // cov:ignore: malformed AcroForm is ignored like qpdf
     };
     let Some(resources) = acroform.get("DR").cloned() else {
         return Ok(None);
     };
-    match resources {
+    match resolve_ref_chain(pdf, &resources)?.0 {
         Object::Dictionary(dict) => Ok(Some(dict)),
-        Object::Reference(reference) => match pdf.resolve(reference)? {
-            Object::Dictionary(dict) => Ok(Some(dict)),
-            _ => Ok(None), // cov:ignore: malformed indirect DR is ignored like qpdf
-        },
-        _ => Ok(None), // cov:ignore: malformed direct DR is ignored like qpdf
+        _ => Ok(None), // cov:ignore: malformed DR is ignored like qpdf
     }
 }
 
@@ -740,8 +732,7 @@ fn resolve_ap_n<R: Read + Seek>(
                     _ => return Ok(None),
                 }
             };
-            let as_key = String::from_utf8_lossy(&as_name).into_owned();
-            let Some(state_value) = state_dict.get(as_key.as_str()).cloned() else {
+            let Some(state_value) = state_dict.get(as_name.as_slice()).cloned() else {
                 return Ok(None);
             };
             let (state_value, state_terminal_ref) = resolve_ref_chain(pdf, &state_value)?;
@@ -785,12 +776,8 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
         None | Some(Object::Null) => return Ok((None, identity)),
         Some(v) => v,
     };
-    let bbox_arr = match bbox {
+    let bbox_arr = match resolve_ref_chain(pdf, &bbox)?.0 {
         Object::Array(a) => a,
-        Object::Reference(r) => match pdf.resolve(r)? {
-            Object::Array(a) => a,
-            _ => return Ok((None, identity)),
-        },
         _ => return Ok((None, identity)),
     };
     if bbox_arr.len() != 4 {
@@ -810,26 +797,7 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
     let matrix_val = stream_dict.get("Matrix").cloned();
     let ap_matrix = match matrix_val {
         None | Some(Object::Null) => identity,
-        Some(Object::Array(a)) if a.len() == 6 => {
-            let mut m = [0.0f64; 6];
-            let mut valid = true;
-            for (i, elem) in a.iter().take(6).enumerate() {
-                m[i] = match elem {
-                    Object::Integer(n) => *n as f64,
-                    Object::Real(r) | Object::RealLiteral { value: r, .. } => *r,
-                    _ => {
-                        valid = false;
-                        break;
-                    }
-                };
-            }
-            if valid {
-                Matrix::from(m)
-            } else {
-                identity
-            }
-        }
-        Some(Object::Reference(r)) => match pdf.resolve(r)? {
+        Some(matrix) => match resolve_ref_chain(pdf, &matrix)?.0 {
             Object::Array(a) if a.len() == 6 => {
                 let mut m = [0.0f64; 6];
                 let mut valid = true;
@@ -851,7 +819,6 @@ fn read_xobj_bbox_and_matrix<R: Read + Seek>(
             }
             _ => identity,
         },
-        _ => identity,
     };
 
     Ok((Some(Rectangle::from(bbox_vals)), ap_matrix))
