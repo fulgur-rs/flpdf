@@ -7,9 +7,9 @@
 // std::shared_ptr<QPDFValue> — internal structure only, does not affect
 // output bytes (see docs/qpdf-correspondence.md).
 
-use crate::{Dictionary, Object, ObjectRef, Stream};
+use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 /// The no-offset sentinel qpdf uses for values that were not parsed from a
 /// source position (`QPDFValue`'s parsed offset starts at `-1` and is set
@@ -23,6 +23,13 @@ pub(crate) const NO_PARSED_OFFSET: i64 = -1;
 /// `std::map<std::string, std::map<std::string, std::string>>` parameter.
 pub type ResourceConflicts =
     std::collections::BTreeMap<Vec<u8>, std::collections::BTreeMap<Vec<u8>, Vec<u8>>>;
+
+/// The document-owned resolver qpdf's `QPDFObject` calls through its owning
+/// `QPDF*` and object identity. Kept crate-private so only the canonical
+/// document implementation can resolve an indirect slot.
+pub(crate) trait DocumentResolver {
+    fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
+}
 
 /// A shared, cloneable handle to a PDF object.
 ///
@@ -166,9 +173,9 @@ pub(crate) enum IndirectState {
     Destroyed,
 }
 
-#[derive(Debug)]
 struct IndirectSlot {
     object_ref: ObjectRef,
+    resolver: Option<Weak<dyn DocumentResolver>>,
     state: IndirectState,
     parsed_offset: i64,
 }
@@ -213,8 +220,25 @@ impl ObjectHandle {
         let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
+            resolver: None,
             state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
+        }))))
+    }
+
+    /// Construct a canonical unresolved slot attached to its owning document
+    /// resolver. This is the qpdf-native constructor; the resolver link is
+    /// weak so a surviving handle cannot keep its document alive.
+    pub(crate) fn new_indirect_with_resolver(
+        object_ref: ObjectRef,
+        offset: i64,
+        resolver: Weak<dyn DocumentResolver>,
+    ) -> Self {
+        Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
+            object_ref,
+            resolver: Some(resolver),
+            state: IndirectState::NotYetResolved,
+            parsed_offset: offset,
         }))))
     }
 
@@ -371,6 +395,67 @@ impl ObjectHandle {
         match &self.0 {
             Repr::Direct(_) => true,
             Repr::Indirect(slot) => !matches!(slot.borrow().state, IndirectState::NotYetResolved),
+        }
+    }
+
+    /// Resolve this handle's own canonical slot in place, mirroring
+    /// `QPDFObjectHandle::dereference` → `QPDFObject::resolve`.
+    ///
+    /// Direct and already-terminal handles are no-ops. An unresolved handle
+    /// whose document has been dropped returns an error and stays unresolved.
+    pub fn try_dereference(&self) -> Result<()> {
+        let (object_ref, resolver) = match &self.0 {
+            Repr::Direct(_) => return Ok(()),
+            Repr::Indirect(slot) => {
+                let slot = slot.borrow();
+                if !matches!(slot.state, IndirectState::NotYetResolved) {
+                    return Ok(());
+                }
+                (slot.object_ref, slot.resolver.clone())
+            }
+        };
+
+        let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
+            return Err(Error::Internal(format!(
+                "object {} {} belongs to a dropped PDF",
+                object_ref.number, object_ref.generation
+            )));
+        };
+        resolver.resolve_indirect(object_ref, self)
+    }
+
+    /// qpdf-compatible null inspection with lazy dereference.
+    pub fn try_is_null(&self) -> Result<bool> {
+        self.try_dereference()?;
+        Ok(self.is_null())
+    }
+
+    /// qpdf-compatible dictionary inspection with lazy dereference.
+    pub fn try_as_dictionary(
+        &self,
+    ) -> Result<Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>>> {
+        self.try_dereference()?;
+        Ok(self.as_dictionary())
+    }
+
+    /// qpdf-compatible dictionary lookup. The holder dictionary is resolved;
+    /// the returned child retains its own direct/indirect identity.
+    pub fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
+        self.try_dereference()?;
+        Ok(self.get_key(key))
+    }
+
+    /// qpdf-compatible visible-key test. A present value that resolves to
+    /// null is treated as absent, matching `QPDF_Dictionary::hasKey`.
+    pub fn try_has_key(&self, key: &[u8]) -> Result<bool> {
+        self.try_dereference()?;
+        let child = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+            _ => None,
+        });
+        match child {
+            Some(child) => Ok(!child.try_is_null()?),
+            None => Ok(false),
         }
     }
 
@@ -1601,6 +1686,135 @@ fn drain_dictionary_onto(dict: &mut Dictionary, stack: &mut Vec<Object>) {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingResolver {
+        calls: RefCell<Vec<ObjectRef>>,
+    }
+
+    impl DocumentResolver for RecordingResolver {
+        fn resolve_indirect(
+            &self,
+            object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            self.calls.borrow_mut().push(object_ref);
+            handle.set_resolved(ObjectValue::Dictionary(
+                [(b"A".to_vec(), ObjectHandle::integer(1))]
+                    .into_iter()
+                    .collect(),
+            ));
+            Ok(())
+        }
+    }
+
+    struct MissingResolver;
+
+    impl DocumentResolver for MissingResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            handle.set_missing();
+            Ok(())
+        }
+    }
+
+    struct ErrorResolver;
+
+    impl DocumentResolver for ErrorResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            Err(Error::System("resolver failed".to_string()))
+        }
+    }
+
+    #[test]
+    fn try_get_key_resolves_the_same_indirect_slot_once() {
+        let resolver = Rc::new(RecordingResolver::default());
+        let erased: Rc<dyn DocumentResolver> = resolver.clone();
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(7, 0),
+            NO_PARSED_OFFSET,
+            Rc::downgrade(&erased),
+        );
+        let clone = handle.clone();
+
+        assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
+        assert!(clone.try_has_key(b"A").unwrap());
+        assert_eq!(*resolver.calls.borrow(), vec![ObjectRef::new(7, 0)]);
+        assert!(handle.ptr_eq(&clone));
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(7, 0)));
+    }
+
+    #[test]
+    fn try_dereference_reports_a_dropped_document_without_reconnecting() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(8, 0),
+            NO_PARSED_OFFSET,
+            Rc::downgrade(&resolver),
+        );
+        drop(resolver);
+
+        let error = handle.try_dereference().unwrap_err();
+        assert_eq!(error.to_string(), "object 8 0 belongs to a dropped PDF");
+        assert!(!handle.is_resolved());
+    }
+
+    #[test]
+    fn missing_indirect_slot_resolves_in_place_to_null() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(MissingResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(9, 0),
+            NO_PARSED_OFFSET,
+            Rc::downgrade(&resolver),
+        );
+
+        assert!(handle.try_is_null().unwrap());
+        assert!(handle.is_resolved());
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(9, 0)));
+    }
+
+    #[test]
+    fn every_fallible_accessor_propagates_the_resolver_error() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(10, 0),
+            NO_PARSED_OFFSET,
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(
+            handle.try_is_null().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
+            handle.try_as_dictionary().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
+            handle.try_get_key(b"A").unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
+            handle.try_has_key(b"A").unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert!(!handle.is_resolved());
+    }
+
+    #[test]
+    fn try_has_key_treats_a_present_null_value_as_absent() {
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
+
+        assert!(!dict.try_has_key(b"A").unwrap());
+        assert!(!dict.try_has_key(b"Missing").unwrap());
+    }
 
     #[test]
     fn direct_handle_clone_shares_identity_not_a_deep_copy() {
