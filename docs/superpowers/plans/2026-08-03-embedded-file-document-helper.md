@@ -39,6 +39,16 @@ fn helper_reads_named_filespecs_as_handles() {
 
 Add an absent-tree test asserting `has_embedded_files() == false`, an empty map, and `None` lookup.
 
+Add this shared test helper before the new tests; it creates an indirect
+Filespec using the already-public factory:
+
+```rust
+fn make_filespec(pdf: &mut Pdf<Cursor<Vec<u8>>>, filename: &[u8]) -> ObjectHandle {
+    let ef = EmbeddedFileStream::create_ef_stream(pdf, b"payload").unwrap();
+    FileSpec::create_file_spec(pdf, filename, ef).unwrap()
+}
+```
+
 - [ ] **Step 2: Verify RED**
 
 Run: `cargo test -p flpdf --test embedded_files_tests helper_`
@@ -64,7 +74,7 @@ Resolve `/Root /Names /EmbeddedFiles` through existing ref-chain helpers. Lift r
 
 - [ ] **Step 4: Verify GREEN and commit**
 
-Run: `cargo test -p flpdf --test embedded_files_tests helper_reads_named_filespecs_as_handles helper_absent_tree_has_no_entries_or_lookup`
+Run: `cargo test -p flpdf --test embedded_files_tests helper_`
 
 Expected: both tests pass.
 
