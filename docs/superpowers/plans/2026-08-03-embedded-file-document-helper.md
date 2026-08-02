@@ -4,7 +4,7 @@
 
 **Goal:** Implement the five qpdf 11.9.0 `QPDFEmbeddedFileDocumentHelper` operations without changing the later JSON Job-layer scope.
 
-**Architecture:** Add a document helper that owns `&mut Pdf`, matching current document helpers. Read APIs return a sorted `ObjectHandle` map: indirect values preserve canonical identity and direct Filespecs are lifted to direct handles. Existing free functions remain compatibility APIs; helper removal nulls only the removed indirect Filespec and never invokes the stronger `remove_attachment` cleanup/GC path.
+**Architecture:** Add a document helper that owns `&mut Pdf`, matching current document helpers. Read APIs return a sorted `ObjectHandle` map: indirect values preserve canonical identity and direct Filespecs are lifted to direct handles. Match qpdf object topology and repair behavior: retain direct `/Names`, retain an empty `/EmbeddedFiles` tree after final removal, and use no artificial numeric depth cap. Helper removal nulls only the removed indirect Filespec and never invokes the stronger `remove_attachment` cleanup/GC path.
 
 **Tech Stack:** Rust, `Pdf`, `ObjectHandle`, `NameTree`, qpdf 11.9.0 source, Cargo.
 

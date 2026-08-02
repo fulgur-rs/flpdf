@@ -44,15 +44,24 @@ indirect and direct Filespec values.
   object with `null`, matching qpdf. It does not run flpdf's broader attachment
   cleanup/GC policy; that remains `remove_attachment`'s distinct API.
 
-## Compatibility and scope
+## qpdf fidelity and scope
 
 The source oracle is qpdf 11.9.0:
 `QPDFEmbeddedFileDocumentHelper.hh:45-65` and
 `QPDFEmbeddedFileDocumentHelper.cc:48-121`.
 
-Existing free functions stay as compatibility APIs. Their stronger
-`remove_attachment` semantics (AF cleanup and document-wide sweep) remain
-unchanged and are explicitly not substituted for `remove_embedded_file`.
+The helper preserves qpdf's object topology: a direct `/Names` dictionary
+stays direct, and removing the final name-tree item leaves an empty
+`/EmbeddedFiles` tree in place. It constructs `NameTree` with repair enabled,
+matching qpdf's default `QPDFNameTreeObjectHelper` mode. There is no embedded
+files-specific numeric depth cap: qpdf detects cycles structurally rather than
+rejecting an otherwise valid deep tree.
+
+The legacy free functions are not a compatibility boundary for this work.
+`delete_embedded_file` adopts the same name-tree removal semantics. The
+broader `remove_attachment` operation remains separate because its `/AF`
+cleanup and reachability sweep are deliberately beyond qpdf's
+`removeEmbeddedFile` responsibility.
 
 ## Tests
 

@@ -833,8 +833,8 @@ fn make_filespec(
 /// Starting from a no-attachment PDF, `insert_embedded_file(b"new.txt", fs)`
 /// rebuilds the name tree from one entry (<= LEAF_MAX), emitting a single root
 /// node `<< /Names [(new.txt) fs] >>` (the root omits `/Limits` per ISO 32000-2
-/// 7.9.6), a fresh `/Names` dict `<< /EmbeddedFiles <leaf_ref> >>`, and catalog
-/// `/Names -> <names_ref>`. The manual path reproduces that exact graph
+/// 7.9.6), a direct `/Names` dict `<< /EmbeddedFiles <leaf_ref> >>` on the
+/// catalog. The manual path reproduces that exact graph
 /// (filespec created identically on both sides via `make_filespec`);
 /// `full_rewrite` renumbers Catalog-first so the differing fresh object numbers
 /// converge ⇒ byte-identity.
@@ -854,7 +854,6 @@ fn attachment_insert_embedded_file_matches_manual_name_tree() {
             let fs_ref = make_filespec(pdf, 70, key);
             let next = next_free_number(pdf);
             let leaf_ref = ObjectRef::new(next, 0);
-            let names_ref = ObjectRef::new(next + 1, 0);
 
             let mut leaf = Dictionary::new();
             leaf.insert(
@@ -868,11 +867,9 @@ fn attachment_insert_embedded_file_matches_manual_name_tree() {
 
             let mut names_dict = Dictionary::new();
             names_dict.insert("EmbeddedFiles", Object::Reference(leaf_ref));
-            pdf.set_object(names_ref, Object::Dictionary(names_dict));
-
             let root = pdf.root_ref().unwrap();
             let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
-            catalog.insert("Names", Object::Reference(names_ref));
+            catalog.insert("Names", Object::Dictionary(names_dict));
             pdf.set_object(root, Object::Dictionary(catalog));
         },
     );
@@ -946,26 +943,26 @@ fn acroform_fix_appearance_inheritance_matches_manual_da_copy() {
 /// Attachment `delete_embedded_file` parity (byte-identity).
 ///
 /// In `attachment_smoke_pdf` the catalog `/Names` (3 0 R) holds ONLY
-/// `/EmbeddedFiles`. Deleting the sole entry "hello.txt" empties the tree, so
-/// `rebuild_embedded_files_tree` removes `/EmbeddedFiles` from the `/Names`
-/// dict; that leaves it empty, so `/Names` is removed from the catalog and the
-/// `/Names` object (3 0 R) is `delete_object`-ed. The filespec (5 0 R) and its
-/// `/EmbeddedFile` stream (6 0 R) become unreachable. The manual path just
-/// removes `/Names` from the catalog; `full_rewrite` emits only reachable
-/// objects, so the now-orphan name dict, filespec, and stream are dropped
-/// symmetrically on both sides ⇒ byte-identity.
+/// `/EmbeddedFiles`. qpdf's tree removal leaves that direct root as
+/// `<< /Names [] >>`; it does not delete `/Names` or `/EmbeddedFiles`. The
+/// filespec (5 0 R) and its `/EmbeddedFile` stream (6 0 R) become unreachable.
+/// The manual path retains the same empty tree, so canonical rewrite drops only
+/// those unreachable attachments ⇒ byte-identity.
 #[test]
-fn attachment_delete_embedded_file_matches_manual_names_drop() {
+fn attachment_delete_embedded_file_matches_manual_empty_tree() {
     roundtrip_eq(
         || attachment_smoke_pdf(b"hello world\n"),
         |pdf| {
             assert!(flpdf::delete_embedded_file(pdf, b"hello.txt").unwrap());
         },
         |pdf| {
-            let root = pdf.root_ref().unwrap();
-            let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
-            catalog.remove("Names");
-            pdf.set_object(root, flpdf::Object::Dictionary(catalog));
+            use flpdf::{Dictionary, Object, ObjectRef};
+            let names_ref = ObjectRef::new(3, 0);
+            let mut names = pdf.resolve(names_ref).unwrap().into_dict().unwrap();
+            let mut empty_tree = Dictionary::new();
+            empty_tree.insert("Names", Object::Array(vec![]));
+            names.insert("EmbeddedFiles", Object::Dictionary(empty_tree));
+            pdf.set_object(names_ref, Object::Dictionary(names));
         },
     );
 }
