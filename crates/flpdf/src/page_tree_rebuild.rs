@@ -506,6 +506,19 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
     }
 
+    #[test]
+    fn rebuild_marks_qpdf_get_all_pages_observation() {
+        let mut pdf = open(build_nested_pdf());
+        assert!(!pdf.ever_called_get_all_pages());
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)]).unwrap();
+
+        assert!(
+            pdf.ever_called_get_all_pages(),
+            "qpdf rebuild preparation enumerates pages through getAllPages"
+        );
+    }
+
     fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
         match pdf.resolve_borrowed(r).unwrap() {
             Object::Dictionary(d) => d.clone(),

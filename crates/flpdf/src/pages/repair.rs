@@ -50,6 +50,12 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Option<PreparedPages>> {
+    // This function is flpdf's repair-and-enumerate counterpart to
+    // QPDF::getAllPages(). qpdf records the observation before it looks up
+    // the catalog /Pages value (QPDF_pages.cc:40-48), so missing or malformed
+    // roots still count as an attempted complete page-tree enumeration.
+    pdf.mark_get_all_pages_called();
+
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };

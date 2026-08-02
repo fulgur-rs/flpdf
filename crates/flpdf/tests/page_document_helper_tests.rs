@@ -311,6 +311,41 @@ fn get_all_pages_rejects_a_pages_tree_cycle() {
 }
 
 #[test]
+fn get_all_pages_rejects_a_revisited_pages_subtree_like_qpdf() {
+    let mut pdf = open(build_n_page_pdf(1));
+
+    let mut interior = Dictionary::new();
+    interior.insert("Type", Object::Name(b"Pages".to_vec()));
+    interior.insert(
+        "Kids",
+        Object::Array(vec![Object::Reference(ObjectRef::new(3, 0))]),
+    );
+    interior.insert("Count", Object::Integer(1));
+    pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(interior));
+
+    let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    root.insert(
+        "Kids",
+        Object::Array(vec![
+            Object::Reference(ObjectRef::new(11, 0)),
+            Object::Reference(ObjectRef::new(11, 0)),
+        ]),
+    );
+    root.insert("Count", Object::Integer(2));
+    pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+    let error = PageDocumentHelper::new(&mut pdf)
+        .get_all_pages()
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cycle"),
+        "qpdf's traversal-global visited set rejects a repeated /Pages node: {error}"
+    );
+}
+
+#[test]
 fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     let mut pdf = open(build_n_page_pdf(1));
     let mut indirect_interior = Dictionary::new();
