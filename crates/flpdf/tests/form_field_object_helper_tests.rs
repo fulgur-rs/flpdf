@@ -787,8 +787,9 @@ fn generates_a_field_value_on_its_separate_widget() {
         ),
         (
             11,
-            "<< /Subtype /Widget /Parent 10 0 R /Rect [0 0 100 20] >>".into(),
+            "<< /Subtype /Widget /Parent 12 0 R /Rect [0 0 100 20] >>".into(),
         ),
+        (12, "<< /FT /Tx /V (wrong widget value) >>".into()),
         (20, "<< >>".into()),
     ]);
     let mut pdf = open(bytes);
@@ -804,6 +805,26 @@ fn generates_a_field_value_on_its_separate_widget() {
         .unwrap()
         .get("AP")
         .is_some());
+
+    let widget = pdf.resolve(ObjectRef::new(11, 0)).unwrap();
+    let ap_ref = widget
+        .as_dict()
+        .and_then(|widget| widget.get("AP"))
+        .and_then(|ap| ap.as_dict())
+        .and_then(|ap| ap.get_ref("N"))
+        .expect("widget normal appearance reference");
+    let appearance = pdf.resolve(ap_ref).unwrap();
+    let Object::Stream(appearance) = appearance else {
+        panic!("normal appearance must be a stream");
+    };
+    assert!(appearance
+        .data
+        .windows(b"(value)".len())
+        .any(|w| w == b"(value)"));
+    assert!(!appearance
+        .data
+        .windows(b"(wrong widget value)".len())
+        .any(|w| w == b"(wrong widget value)"));
 }
 
 #[test]

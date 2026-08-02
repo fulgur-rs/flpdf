@@ -247,8 +247,8 @@ pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8>
 
 // ── Public document API ──────────────────────────────────────────────────────
 
-/// Generate and install a normal appearance stream for the Tx (text) widget
-/// at `widget_ref`.
+/// Generate and install a normal appearance stream for `widget_ref` using the
+/// inheritable field attributes rooted at `field_ref`.
 ///
 /// Returns `Ok(Some(xobj_ref))` on success, `Ok(None)` when the widget should
 /// be skipped (not a Tx field, missing /V, or degenerate bounding box).
@@ -259,19 +259,20 @@ pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8>
 /// or an object is structurally invalid.
 ///
 /// This is an internal renderer. Public callers use
-/// [`crate::FormFieldObjectHelper::generate_appearance`] instead.
+/// [`crate::FormFieldObjectHelper::generate_appearance_for`] instead.
 pub(crate) fn render_text_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     // ── 1. Verify /FT is Tx ────────────────────────────────────────────────
-    let ft = field_name(pdf, widget_ref, b"FT")?;
+    let ft = field_name(pdf, field_ref, b"FT")?;
     if ft.as_deref() != Some(b"Tx") {
         return Ok(None);
     }
 
     // ── 2. /V — field value ────────────────────────────────────────────────
-    let raw_value = field_object(pdf, widget_ref, b"V")?;
+    let raw_value = field_object(pdf, field_ref, b"V")?;
     let value_bytes: Option<Vec<u8>> = match raw_value {
         None => None,
         Some(Object::String(bytes)) => decode_pdf_text_string(&bytes)
@@ -314,17 +315,17 @@ pub(crate) fn render_text_field<R: Read + Seek>(
 
     // ── 4. /DA — default appearance ───────────────────────────────────────
     // Walk /Parent chain first; if absent, fall back to /AcroForm /DA.
-    let da_bytes = resolve_da(pdf, widget_ref)?;
+    let da_bytes = resolve_da(pdf, field_ref)?;
     let da = parse_default_appearance(da_bytes.as_deref().unwrap_or(b""));
 
     // ── 5. /Q — quadding (0 = left, 1 = centre, 2 = right) ───────────────
-    let quadding = field_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
+    let quadding = field_integer(pdf, field_ref, b"Q")?.unwrap_or(0);
 
     // ── 6. /Ff — field flags (bit 13 = multiline, 0-indexed) ─────────────
     // A negative or out-of-range /Ff is malformed; treat it as "no flags". A
     // bare `as u32` would wrap a negative value to a large unsigned int and
     // could spuriously set the multiline bit (review pattern #3).
-    let ff = u32::try_from(field_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
+    let ff = u32::try_from(field_integer(pdf, field_ref, b"Ff")?.unwrap_or(0)).unwrap_or(0);
     let multiline = (ff >> 12) & 1 != 0; // bit 13 (1-indexed) = bit 12 (0-indexed)
 
     // ── 7. Font resolution — DA font name → standard font ─────────────────
@@ -335,8 +336,9 @@ pub(crate) fn render_text_field<R: Read + Seek>(
 
     let std_font = match StandardFont::from_base_name(&font_name_bytes) {
         Some(sf) => sf,
-        None => lookup_dr_basefont(pdf, widget_ref, &font_name_bytes)?
-            .unwrap_or(StandardFont::Helvetica),
+        None => {
+            lookup_dr_basefont(pdf, field_ref, &font_name_bytes)?.unwrap_or(StandardFont::Helvetica)
+        }
     };
     let base_font_name = official_base_name(std_font).to_vec();
     let font_obj_ref = next_object_ref(pdf)?;
@@ -1182,7 +1184,8 @@ fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
 
 // ── Ch (choice: combo/list) appearance ───────────────────────────────────────
 
-/// Generate and install a normal appearance stream for a Ch (choice) widget.
+/// Generate and install a normal appearance stream for `widget_ref` from the
+/// inheritable choice-field attributes rooted at `field_ref`.
 ///
 /// Handles two Ch sub-types determined by `/Ff` bit 18 (1-indexed, `0x20000`):
 ///
@@ -1211,19 +1214,20 @@ fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
 /// or an object is structurally invalid.
 ///
 /// This is an internal renderer. Public callers use
-/// [`crate::FormFieldObjectHelper::generate_appearance`] instead.
+/// [`crate::FormFieldObjectHelper::generate_appearance_for`] instead.
 pub(crate) fn render_choice_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
     widget_ref: ObjectRef,
 ) -> Result<Option<ObjectRef>> {
     // ── 1. Verify /FT is Ch ───────────────────────────────────────────────────
-    let ft = field_name(pdf, widget_ref, b"FT")?;
+    let ft = field_name(pdf, field_ref, b"FT")?;
     if ft.as_deref() != Some(b"Ch") {
         return Ok(None);
     }
 
     // ── 2. /Ff — field flags; bit 18 (1-indexed) = Combo ─────────────────────
-    let ff = field_integer(pdf, widget_ref, b"Ff")?.unwrap_or(0);
+    let ff = field_integer(pdf, field_ref, b"Ff")?.unwrap_or(0);
     let is_combo = ff & 0x20000 != 0; // bit 18 (1-indexed)
 
     // ── 3. /Rect — bounding box ───────────────────────────────────────────────
@@ -1241,14 +1245,15 @@ pub(crate) fn render_choice_field<R: Read + Seek>(
     };
 
     // ── 4. /DA → parse → font resolution (same pattern as Tx) ────────────────
-    let da_bytes = resolve_da(pdf, widget_ref)?;
+    let da_bytes = resolve_da(pdf, field_ref)?;
     let da = parse_default_appearance(da_bytes.as_deref().unwrap_or(b""));
 
     let font_name_bytes: Vec<u8> = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
     let std_font = match StandardFont::from_base_name(&font_name_bytes) {
         Some(sf) => sf,
-        None => lookup_dr_basefont(pdf, widget_ref, &font_name_bytes)?
-            .unwrap_or(StandardFont::Helvetica),
+        None => {
+            lookup_dr_basefont(pdf, field_ref, &font_name_bytes)?.unwrap_or(StandardFont::Helvetica)
+        }
     };
     let base_font_name = official_base_name(std_font).to_vec();
     let font_resource_name = font_name_bytes.clone();
@@ -1259,12 +1264,14 @@ pub(crate) fn render_choice_field<R: Read + Seek>(
     };
 
     // ── 5. /Q — quadding ──────────────────────────────────────────────────────
-    let quadding = field_integer(pdf, widget_ref, b"Q")?.unwrap_or(0);
+    let quadding = field_integer(pdf, field_ref, b"Q")?.unwrap_or(0);
 
     if is_combo {
-        generate_combo_appearance(pdf, widget_ref, bbox_w, bbox_h, &da, font_info, quadding)
+        generate_combo_appearance(
+            pdf, field_ref, widget_ref, bbox_w, bbox_h, &da, font_info, quadding,
+        )
     } else {
-        generate_list_appearance(pdf, widget_ref, bbox_w, bbox_h, &da, font_info)
+        generate_list_appearance(pdf, field_ref, widget_ref, bbox_w, bbox_h, &da, font_info)
     }
 }
 
@@ -1281,6 +1288,7 @@ struct ChFontInfo {
 /// Render a Combo-box appearance: the selected `/V` value as a single-line text.
 fn generate_combo_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
     widget_ref: ObjectRef,
     bbox_w: f64,
     bbox_h: f64,
@@ -1290,7 +1298,7 @@ fn generate_combo_appearance<R: Read + Seek>(
 ) -> Result<Option<ObjectRef>> {
     // Read /V — combo boxes have a single String value.
     // Resolve the raw value through any indirect reference (review-pattern #2).
-    let raw_value = field_object(pdf, widget_ref, b"V")?;
+    let raw_value = field_object(pdf, field_ref, b"V")?;
     let text_bytes: Vec<u8> = match raw_value {
         None => Vec::new(),
         Some(Object::String(bytes)) => decode_pdf_text_string(&bytes)
@@ -1310,7 +1318,7 @@ fn generate_combo_appearance<R: Read + Seek>(
 
     // Best-effort: if /Opt has [export,display] entries and /V matches an
     // export string, use the display string instead.
-    let text_bytes = resolve_combo_display(pdf, widget_ref, text_bytes);
+    let text_bytes = resolve_combo_display(pdf, field_ref, text_bytes);
 
     // Font size: same single-line heuristic as Tx.
     let font_size = if da.auto_size {
@@ -1353,12 +1361,10 @@ fn generate_combo_appearance<R: Read + Seek>(
 /// (review-pattern #2).
 fn resolve_combo_display<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    widget_ref: ObjectRef,
+    field_ref: ObjectRef,
     value: Vec<u8>,
 ) -> Vec<u8> {
-    // /Opt may live on a parent field (child widget carries only /Parent), so
-    // walk the field inheritance chain like /FT, /V, and /DA do.
-    let opt_val = field_object(pdf, widget_ref, b"Opt").ok().flatten();
+    let opt_val = field_object(pdf, field_ref, b"Opt").ok().flatten();
     let opt_arr = match resolve_opt_array(pdf, opt_val) {
         Some(a) => a,
         None => return value,
@@ -1436,16 +1442,15 @@ fn resolve_string_elem<R: Read + Seek>(pdf: &mut Pdf<R>, val: Option<Object>) ->
 /// Render a List-box appearance: each option as a row, selected rows highlighted.
 fn generate_list_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
     widget_ref: ObjectRef,
     bbox_w: f64,
     bbox_h: f64,
     da: &crate::default_appearance::DefaultAppearance,
     font: ChFontInfo,
 ) -> Result<Option<ObjectRef>> {
-    // ── Collect options from /Opt (inherited from a parent field if needed) ──
-    // /Opt may sit on a parent field (child widget carries only /Parent) and may
-    // itself be an indirect reference (review-pattern #2).
-    let opt_val = field_object(pdf, widget_ref, b"Opt")?;
+    // ── Collect options from /Opt ─────────────────────────────────────────────
+    let opt_val = field_object(pdf, field_ref, b"Opt")?;
     let opt_arr = resolve_opt_array(pdf, opt_val).unwrap_or_default();
     let n_opts = opt_arr.len();
 
@@ -1494,9 +1499,7 @@ fn generate_list_appearance<R: Read + Seek>(
     // ── Determine selected indices ─────────────────────────────────────────────
     // /I (integer array) takes priority; missing/invalid → fall back to /V.
     let selected: std::collections::BTreeSet<usize> = {
-        // /I may live on a parent field (like /Opt, /V); walk the inheritance
-        // chain so a /Parent-only widget still highlights the selected rows.
-        let i_val = field_object(pdf, widget_ref, b"I")?;
+        let i_val = field_object(pdf, field_ref, b"I")?;
         let i_arr = resolve_opt_array(pdf, i_val);
 
         if let Some(arr) = i_arr {
@@ -1522,7 +1525,7 @@ fn generate_list_appearance<R: Read + Seek>(
             // single string or an array (multi-select), and either form may
             // arrive indirectly — resolve a top-level reference first so the
             // indirect array case is handled identically to the direct one.
-            let v_val = match field_object(pdf, widget_ref, b"V")? {
+            let v_val = match field_object(pdf, field_ref, b"V")? {
                 Some(Object::Reference(r)) => Some(pdf.resolve(r)?),
                 other => other,
             };
@@ -1561,8 +1564,9 @@ fn generate_list_appearance<R: Read + Seek>(
     };
 
     // ── /TI — top index (first visible option) ────────────────────────────────
-    // Inherited like /Opt and /I; non-negative and in-bounds (review-pattern #3).
-    let ti_val = field_object(pdf, widget_ref, b"TI")?;
+    // Inherited with the other choice-field attributes; non-negative and
+    // in-bounds (review-pattern #3).
+    let ti_val = field_object(pdf, field_ref, b"TI")?;
     let ti: usize = match ti_val {
         Some(Object::Reference(r)) => {
             let resolved = pdf.resolve(r)?;
@@ -1695,6 +1699,22 @@ mod tests {
     use crate::writer::write_pdf;
     use crate::Pdf;
     use std::io::Cursor;
+
+    // Existing renderer unit tests exercise merged field/widget dictionaries.
+    // Keep that setup concise while the production boundary receives both refs.
+    fn render_text_field<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        widget_ref: ObjectRef,
+    ) -> Result<Option<ObjectRef>> {
+        super::render_text_field(pdf, widget_ref, widget_ref)
+    }
+
+    fn render_choice_field<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        widget_ref: ObjectRef,
+    ) -> Result<Option<ObjectRef>> {
+        super::render_choice_field(pdf, widget_ref, widget_ref)
+    }
 
     #[derive(Default)]
     struct StrictAppearanceOperationCallbacks {
