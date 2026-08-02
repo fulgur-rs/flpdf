@@ -125,7 +125,7 @@ fn remove_unreferenced_resources_in_form_xobjects<R: Read + Seek>(
         let Ok(bytes) = decode_stream_data(&form.dict, &form.data) else {
             continue;
         };
-        let Some(used) = collect_used_names_for_form(pdf, form_ref, &bytes, &resources)? else {
+        let Some(used) = collect_used_names_for_form(&bytes) else {
             continue;
         };
         prune_font_and_xobject_dictionaries(pdf, &mut resources, &used)?;
@@ -164,35 +164,29 @@ fn form_xobjects_in_resources<R: Read + Seek>(
     Ok(forms)
 }
 
-/// Collect names used by a Form under its own resources scope. Resource-less
-/// child Forms retain the same owner and therefore contribute names that the
-/// parent must keep; child Forms with their own `/Resources` remain isolated.
-fn collect_used_names_for_form<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    form_ref: ObjectRef,
-    stream_bytes: &[u8],
-    resources: &Dictionary,
-) -> Result<Option<UsedNames>> {
+/// Collect only the names used directly by a Form's content stream.
+///
+/// qpdf's `removeUnreferencedResourcesHelper` parses each Form independently.
+/// Its resource-less descendants contribute unresolved names only to the
+/// containing page's protection set; they do not keep entries in this Form's
+/// own `/Font` or `/XObject` dictionaries.
+fn collect_used_names_for_form(stream_bytes: &[u8]) -> Option<UsedNames> {
     let mut used = BTreeMap::new();
-    let mut visited_forms = BTreeSet::new();
-    let complete = {
-        let mut ctx = CollectCtx {
-            pdf,
-            used: &mut used,
-            visited: &mut visited_forms,
-        };
-        collect_from_stream(
-            &mut ctx,
-            stream_bytes,
-            Scope {
-                resources: Some(resources),
-                record_direct: true,
-                owner: form_ref,
-            },
-            0,
-        )? // cov:ignore: continuation of the covered collect_from_stream expression has no independent execution path
+    let mut callbacks = ResourceCallbacks {
+        finder: ResourceFinder::default(),
+        inline_header: None,
+        valid_xobjects: BTreeMap::new(),
+        complete: true,
     };
-    Ok(complete.then_some(used))
+    let complete = parse_content_stream_data(stream_bytes, &mut callbacks).is_ok()
+        && !callbacks.finder.had_diagnostics()
+        && callbacks.complete;
+    if complete {
+        record_direct_names(&mut used, callbacks.finder.names_by_resource_type(), true);
+        Some(used)
+    } else {
+        None
+    }
 }
 
 /// Shallow-copy qpdf's mutable resource categories then remove names not used
