@@ -7,8 +7,8 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error,
-    FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, write_pdf, Dictionary, EmbeddedFileStream,
+    Error, FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -307,11 +307,10 @@ fn filespec_factory_indirectizes_a_direct_embedded_stream() {
 }
 
 #[test]
-fn filespec_direct_setter_does_not_mutate_before_owner_discovery_succeeds() {
-    // qpdf's direct ObjectHandle mutation cannot fail after changing the
-    // object: it has no separate dirty-owner discovery phase. In Rust that
-    // discovery is needed for incremental writing, so it must happen before
-    // changing a direct Filespec child.
+fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
+    // This fails if a direct Filespec child needs a document-wide owner scan:
+    // object 7 is malformed but unrelated to the owner at object 8. qpdf
+    // mutates the shared direct child without touching it.
     let mut pdf = open(attachment_pdf_with_malformed_unrelated_object());
     let owner_ref = ObjectRef::new(8, 0);
     let mut owner_dict = Dictionary::new();
@@ -322,11 +321,24 @@ fn filespec_direct_setter_does_not_mutate_before_owner_discovery_succeeds() {
     let direct_filespec = owner.get_key(b"Filespec");
 
     let mut filespec = FileSpec::new(direct_filespec.clone(), &mut pdf).unwrap();
-    assert!(filespec.set_description("new description").is_err());
+    filespec.set_description("new description").unwrap();
+    drop(filespec);
 
-    assert!(
-        direct_filespec.get_key(b"Desc").is_null(),
-        "a failed owner lookup must not leave a direct Filespec changed but unmarked"
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).expect("incremental write");
+
+    let mut reopened = open(out);
+    let Object::Dictionary(owner) = reopened.resolve(owner_ref).unwrap() else {
+        panic!("expected owner dictionary");
+    };
+    let Some(Object::Dictionary(filespec)) = owner.get("Filespec") else {
+        panic!("expected direct Filespec dictionary");
+    };
+
+    assert_eq!(
+        filespec.get("Desc"),
+        Some(&Object::String(b"new description".to_vec())),
+        "the direct Filespec mutation must be emitted in the incremental revision"
     );
 }
 
