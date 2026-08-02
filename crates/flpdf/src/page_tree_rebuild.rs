@@ -578,10 +578,9 @@ mod tests {
             panic!("catalog /Pages must remain direct");
         };
         assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
-        let expected_parent = Object::Dictionary(root.clone());
         for page_ref in result.new_kids {
             let page = dict_of(&mut pdf, page_ref);
-            assert_eq!(page.get("Parent"), Some(&expected_parent));
+            assert_eq!(page.get("Parent"), Some(&Object::Dictionary(root.clone())));
         }
 
         let mut out = Vec::new();
