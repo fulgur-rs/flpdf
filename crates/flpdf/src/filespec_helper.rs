@@ -111,11 +111,10 @@ fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     kind: &str,
 ) -> Result<()> {
-    let Some(object_ref) = handle.object_ref() else {
+    if handle.object_ref().is_none() {
         return Ok(());
-    };
-    let canonical = pdf.get_object_handle(object_ref);
-    if canonical.ptr_eq(handle) {
+    }
+    if pdf.is_canonical_object_handle(handle) {
         Ok(())
     } else {
         Err(Error::Unsupported(format!(
@@ -388,7 +387,12 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 None => resolved,
             };
             target.replace_key(key.as_bytes(), ObjectHandle::string(value));
-            self.pdf.borrow_mut().mark_object_handle_dirty(&target)?;
+            let mut pdf = self.pdf.borrow_mut();
+            if let Some(object_ref) = terminal_ref.or(stream_ref) {
+                pdf.mark_object_handle_mutated(object_ref);
+            } else {
+                pdf.mark_object_handle_dirty(&target)?;
+            }
             return Ok(());
         }
 
@@ -396,10 +400,12 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             b"Params",
             ObjectHandle::dictionary(vec![(key.as_bytes().to_vec(), ObjectHandle::string(value))]),
         );
-        let _ = stream_ref;
-        self.pdf
-            .borrow_mut()
-            .mark_object_handle_dirty(&stream_dict)?;
+        let mut pdf = self.pdf.borrow_mut();
+        if let Some(object_ref) = stream_ref {
+            pdf.mark_object_handle_mutated(object_ref);
+        } else {
+            pdf.mark_object_handle_dirty(&stream_dict)?;
+        }
         Ok(())
     }
 
@@ -421,10 +427,13 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             return Ok(self);
         };
         stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
-        let _ = stream_ref;
-        self.pdf
-            .borrow_mut()
-            .mark_object_handle_dirty(&stream_dict)?;
+        let mut pdf = self.pdf.borrow_mut();
+        if let Some(object_ref) = stream_ref {
+            pdf.mark_object_handle_mutated(object_ref);
+        } else {
+            pdf.mark_object_handle_dirty(&stream_dict)?;
+        }
+        drop(pdf);
         Ok(self)
     }
 }
@@ -1769,6 +1778,21 @@ mod tests {
 
         assert!(FileSpec::new(foreign_filespec, &mut destination).is_err());
         assert!(EmbeddedFileStream::new(foreign_stream, &mut destination).is_err());
+    }
+
+    #[test]
+    fn rejecting_a_foreign_handle_does_not_reserve_its_object_number() {
+        let mut source = open_minimal();
+        let foreign = source.get_object_handle(ObjectRef::new(99, 0));
+        let mut destination = open_minimal();
+
+        assert!(FileSpec::new(foreign, &mut destination).is_err());
+        assert_eq!(
+            EmbeddedFileStream::create_ef_stream(&mut destination, b"payload")
+                .unwrap()
+                .object_ref(),
+            Some(ObjectRef::new(4, 0))
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

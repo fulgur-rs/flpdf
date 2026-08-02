@@ -271,6 +271,38 @@ fn filespec_factory_indirectizes_a_direct_embedded_stream() {
 }
 
 #[test]
+fn direct_embedded_stream_metadata_setters_update_existing_and_new_params() {
+    // qpdf's helpers also accept direct stream handles. Exercise both direct
+    // /Params update and creation: neither path has an indirect owner to mark.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let direct_params = ObjectHandle::dictionary(vec![(
+        b"Params".to_vec(),
+        ObjectHandle::dictionary(vec![(
+            b"CreationDate".to_vec(),
+            ObjectHandle::string(b"old".to_vec()),
+        )]),
+    )]);
+    let mut existing = EmbeddedFileStream::new(
+        ObjectHandle::stream(direct_params, b"existing".to_vec()),
+        &mut pdf,
+    )
+    .unwrap();
+    existing.set_creation_date(b"new").unwrap();
+    assert_eq!(existing.creation_date().unwrap(), Some(b"new".to_vec()));
+
+    let mut absent = EmbeddedFileStream::new(
+        ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"absent".to_vec()),
+        &mut pdf,
+    )
+    .unwrap();
+    absent.set_mod_date(b"created").unwrap();
+    assert_eq!(
+        absent.modification_date().unwrap(),
+        Some(b"created".to_vec())
+    );
+}
+
+#[test]
 fn filespec_factory_rejects_an_indirect_handle_from_another_pdf() {
     let mut source = open(build_attachment_pdf("", "", b"source"));
     let foreign = EmbeddedFileStream::create_ef_stream(&mut source, b"payload").unwrap();
