@@ -1597,3 +1597,62 @@ fn checkbox_uses_an_indirect_widget_appearance_annotation() {
         Some(&Object::Name(b"On".to_vec()))
     );
 }
+
+#[test]
+fn set_value_dispatches_radio_and_non_button_appearance_updates() {
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Ff 32768 /Kids [11 0 R 12 0 R] >>".into()),
+        (11, "<< >>".into()),
+        (
+            12,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+
+    let bytes = doc_with_acroform(vec![(10, "<< /FT /Tx >>".into()), (20, "<< >>".into())]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"raw-name".to_vec()), true)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(20, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("NeedAppearances"),
+        Some(&Object::Boolean(true))
+    );
+}
+
+#[test]
+fn checkbox_selects_an_indirect_widget_after_unselectable_kids() {
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids [11 0 R 12 0 R] >>".into()),
+        (11, "<< >>".into()),
+        (12, "<< /AP << /N << /Off null /On null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"On".to_vec()))
+    );
+}
