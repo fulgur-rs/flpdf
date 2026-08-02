@@ -1,117 +1,21 @@
 //! qpdf correspondence: QPDFPageDocumentHelper.cc responsibilities split with page extraction.
 //! High-level page-document helper, mirroring qpdf's `QPDFPageDocumentHelper`.
 //!
-//! [`PageDocumentHelper`] wraps a `&mut Pdf<R>` and exposes an ergonomic API for
-//! traversing and mutating a document's page list without requiring callers to
-//! interact with raw [`ObjectRef`]s or the underlying page-tree internals.
-//!
-//! # Design
-//!
-//! The helper is a thin borrowing wrapper — it holds **no copied state**.  Every
-//! method re-derives the page list from the live document via the existing
-//! infrastructure:
-//!
-//! - [`pages`](PageDocumentHelper::pages) / [`iter`](PageDocumentHelper::iter)
-//!   / [`get`](PageDocumentHelper::get) delegate to [`crate::pages::page_refs`].
-//! - [`rotate`](PageDocumentHelper::rotate) builds a [`RotateOp`] and calls
-//!   [`crate::page_rotate::apply_rotate_to_pages`].
-//! - [`insert`](PageDocumentHelper::insert) / [`remove`](PageDocumentHelper::remove)
-//!   splice the ordered page list and call
-//!   [`crate::page_tree_rebuild::rebuild_page_tree`].
-//!
-//! # Examples
-//!
-//! ## Traverse pages
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{Pdf, PageDocumentHelper};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let mut helper = PageDocumentHelper::new(&mut pdf);
-//! let all_pages = helper.pages()?;
-//! println!("{} pages", all_pages.len());
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## Rotate a range of pages
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{Pdf, PageDocumentHelper, PageRange, RotateMode, write_pdf};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let mut helper = PageDocumentHelper::new(&mut pdf);
-//!
-//! // Rotate pages 1 and 3 by +90° (additive).
-//! let range = PageRange::parse("1,3")?;
-//! helper.rotate(&range, 90, RotateMode::Add)?;
-//! drop(helper);
-//!
-//! let mut out = File::create("output.pdf")?;
-//! write_pdf(&mut pdf, &mut out)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## Remove a page
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{Pdf, PageDocumentHelper, write_pdf};
-//!
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let mut helper = PageDocumentHelper::new(&mut pdf);
-//!
-//! // Remove the second page (0-based index 1).
-//! helper.remove(1)?;
-//! drop(helper);
-//!
-//! let mut out = File::create("output.pdf")?;
-//! write_pdf(&mut pdf, &mut out)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## Insert a page
-//!
-//! ```no_run
-//! use std::fs::File;
-//! use std::io::BufReader;
-//! use flpdf::{Pdf, PageDocumentHelper, ObjectRef, write_pdf};
-//!
-//! // Assume `page_ref` is a valid /Page ObjectRef already in the document.
-//! let mut pdf = Pdf::open(BufReader::new(File::open("input.pdf")?))?;
-//! let page_ref: ObjectRef = {
-//!     let mut h = PageDocumentHelper::new(&mut pdf);
-//!     *h.pages()?.first().expect("at least one page")
-//! };
-//!
-//! let mut helper = PageDocumentHelper::new(&mut pdf);
-//! // Insert the page as a duplicate at index 0 (prepend).
-//! helper.insert(0, page_ref)?;
-//! drop(helper);
-//!
-//! let mut out = File::create("output.pdf")?;
-//! write_pdf(&mut pdf, &mut out)?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
+//! The public surface mirrors qpdf 11.9.0's seven
+//! `QPDFPageDocumentHelper` operations: page enumeration, inherited-attribute
+//! materialization, page insertion/removal, resource pruning, and annotation
+//! flattening. The helper holds no copied page-tree state.
 
-use crate::page_rotate::{apply_rotate_to_pages, RotateMode, RotateOp};
 use crate::page_tree_rebuild::{rebuild_page_tree, RebuildResult};
-use crate::pages::page_refs;
-use crate::{Error, ObjectRef, PageRange, Pdf, Result};
+use crate::{Error, ObjectRef, Pdf, Result};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 /// High-level page-document helper.
 ///
 /// Construct with [`PageDocumentHelper::new`], then use the provided methods to
-/// traverse or mutate the document's page list.  All operations are delegated to
-/// the underlying `Pdf<R>` infrastructure; no page-tree state is cached inside
-/// this struct.
-///
-/// For a runnable walkthrough see `examples/reorder_pages.rs`.
+/// traverse or mutate the document's page list through qpdf-corresponding
+/// operations. No page-tree state is cached inside this struct.
 pub struct PageDocumentHelper<'a, R: Read + Seek> {
     pdf: &'a mut Pdf<R>,
 }
@@ -122,39 +26,61 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         Self { pdf }
     }
 
-    /// Return all leaf page `ObjectRef`s in document order.
+    /// Return qpdf's repaired leaf-page list in document order.
     ///
-    /// This is the primary accessor. Every other method that needs the full
-    /// page list calls this internally.
-    ///
-    /// # Errors
-    ///
-    /// Propagates errors from [`crate::pages::page_refs`] (e.g. missing catalog,
-    /// page-tree depth exceeded).
-    pub fn pages(&mut self) -> Result<Vec<ObjectRef>> {
-        page_refs(self.pdf)
+    /// This mirrors `QPDFPageDocumentHelper::getAllPages()`: qpdf repairs the
+    /// effective `/Pages` root and malformed leaf nodes before returning the
+    /// current page list. The returned vector is an owned snapshot, so a later
+    /// page insertion or removal requires a fresh call.
+    pub fn get_all_pages(&mut self) -> Result<Vec<ObjectRef>> {
+        Ok(crate::pages::repair::prepare_for_optimization(self.pdf)?
+            .map(|prepared| prepared.pages)
+            .unwrap_or_default())
     }
 
-    /// Return an iterator over all leaf page `ObjectRef`s in document order.
+    /// Materialize inherited page attributes on each leaf page.
     ///
-    /// The iterator owns its elements (collected into a `Vec` first) to avoid
-    /// holding a borrow on `self` across the iteration.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::pages`].
-    pub fn iter(&mut self) -> Result<std::vec::IntoIter<ObjectRef>> {
-        Ok(self.pages()?.into_iter())
+    /// Mirrors `QPDFPageDocumentHelper::pushInheritedAttributesToPage()` by
+    /// first applying qpdf-compatible page-tree repair, then pushing
+    /// `/CropBox`, `/MediaBox`, `/Resources`, and `/Rotate` onto leaf pages.
+    pub fn push_inherited_attributes_to_pages(&mut self) -> Result<()> {
+        if let Some(prepared) = crate::pages::repair::prepare_for_optimization(self.pdf)? {
+            crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, false)?;
+        } // cov:ignore: closing brace is the already-covered successful push join
+        Ok(())
     }
 
-    /// Return the page `ObjectRef` at 0-based `idx`, or `Ok(None)` if `idx` is
-    /// out of bounds.
+    /// Add `page` at the beginning (`first == true`) or end of the document.
     ///
-    /// # Errors
+    /// Mirrors `QPDFPageDocumentHelper::addPage`. If `page` already occurs in
+    /// the page tree, rebuilding creates a shallow duplicate for its later
+    /// occurrence, retaining shared page sub-objects.
+    pub fn add_page(&mut self, page: ObjectRef, first: bool) -> Result<RebuildResult> {
+        let index = if first {
+            0
+        } else {
+            self.get_all_pages()?.len()
+        };
+        self.insert_page(index, page)
+    }
+
+    /// Add `page` immediately before or after `reference_page`.
     ///
-    /// Same as [`Self::pages`].
-    pub fn get(&mut self, idx: usize) -> Result<Option<ObjectRef>> {
-        Ok(self.pages()?.get(idx).copied())
+    /// Mirrors `QPDFPageDocumentHelper::addPageAt`. The reference page must
+    /// be present in the repaired current page list; a non-member is rejected
+    /// before the page tree is mutated.
+    pub fn add_page_at(
+        &mut self,
+        page: ObjectRef,
+        before: bool,
+        reference_page: ObjectRef,
+    ) -> Result<RebuildResult> {
+        let pages = self.get_all_pages()?;
+        let index = pages
+            .iter()
+            .position(|&candidate| candidate == reference_page)
+            .ok_or(Error::Missing("reference page is not in the document"))?;
+        self.insert_page(index + usize::from(!before), page)
     }
 
     /// Insert `page` at 0-based position `idx`, shifting existing pages to the
@@ -168,8 +94,8 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     ///
     /// - [`Error::Unsupported`] when `idx > page_count`.
     /// - Any error from [`rebuild_page_tree`] (e.g. `page` is not a `/Page` dict).
-    pub fn insert(&mut self, idx: usize, page: ObjectRef) -> Result<RebuildResult> {
-        let mut refs = page_refs(self.pdf)?;
+    fn insert_page(&mut self, idx: usize, page: ObjectRef) -> Result<RebuildResult> {
+        let mut refs = self.get_all_pages()?;
         if idx > refs.len() {
             return Err(Error::Unsupported(format!(
                 "insert index {idx} is out of bounds (page count {})",
@@ -185,10 +111,9 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// # Errors
     ///
     /// - [`Error::Unsupported`] when `idx >= page_count`.
-    /// - [`Error::Missing`] when removing the last remaining page (the result
-    ///   would be an empty document, which is not allowed by [`rebuild_page_tree`]).
-    pub fn remove(&mut self, idx: usize) -> Result<RebuildResult> {
-        let mut refs = page_refs(self.pdf)?;
+    /// - Any error from [`rebuild_page_tree`] when pages remain after removal.
+    fn remove_page_at(&mut self, idx: usize) -> Result<RebuildResult> {
+        let mut refs = self.get_all_pages()?;
         if idx >= refs.len() {
             return Err(Error::Unsupported(format!(
                 "remove index {idx} is out of bounds (page count {})",
@@ -197,41 +122,100 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         }
         refs.remove(idx);
         if refs.is_empty() {
-            return Err(Error::Missing(
-                "cannot remove the only remaining page: result would be an empty document",
-            ));
+            return self.clear_page_tree();
         }
         rebuild_page_tree(self.pdf, &refs)
     }
 
-    /// Apply a rotation to the pages selected by `range`.
+    /// Remove the specified page from the document.
     ///
-    /// `degrees` and `mode` are forwarded to [`RotateOp`] and
-    /// [`apply_rotate_to_pages`].  The rotation is materialized explicitly on
-    /// every selected leaf page (inherited `/Rotate` is resolved first and then
-    /// written explicitly on the leaf).
-    ///
-    /// An all-pages [`PageRange`] (constructed from an empty string) rotates
-    /// every page in document order.
-    ///
-    /// # Errors
-    ///
-    /// - Any error from [`crate::pages::page_refs`].
-    /// - [`Error::Parse`] / range resolution errors when `range` refers to
-    ///   page numbers beyond the document's page count.
-    /// - Any error from [`apply_rotate_to_pages`].
-    pub fn rotate(&mut self, range: &PageRange, degrees: i32, mode: RotateMode) -> Result<()> {
-        let all_refs = page_refs(self.pdf)?;
-        let page_count = all_refs.len() as u32;
+    /// Mirrors `QPDFPageDocumentHelper::removePage`. qpdf permits removal of
+    /// the final page, leaving an empty `/Pages` `/Kids` array and `/Count 0`.
+    pub fn remove_page(&mut self, page: ObjectRef) -> Result<RebuildResult> {
+        let index = self
+            .get_all_pages()?
+            .iter()
+            .position(|&candidate| candidate == page)
+            .ok_or(Error::Missing("page is not in the document"))?;
+        self.remove_page_at(index)
+    }
 
-        // Resolve the range to 1-based page numbers, then convert to ObjectRefs.
-        let page_numbers = range.resolve(page_count)?;
-        let selected: Vec<ObjectRef> = page_numbers
-            .into_iter()
-            .filter_map(|n| all_refs.get((n - 1) as usize).copied())
-            .collect();
+    /// Remove unused `/Font` and `/XObject` resources from each page.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::removeUnreferencedResources` by
+    /// invoking qpdf-style page-scoped pruning once for every current page.
+    pub fn remove_unreferenced_resources(&mut self) -> Result<()> {
+        for page in self.get_all_pages()? {
+            crate::resources::remove_unreferenced_resources_on_page(self.pdf, page)?;
+        }
+        Ok(())
+    }
 
-        let op = RotateOp { mode, degrees };
-        apply_rotate_to_pages(self.pdf, &selected, &op)
+    /// Flatten annotations into their containing pages.
+    ///
+    /// Mirrors `QPDFPageDocumentHelper::flattenAnnotations` through flpdf's
+    /// existing qpdf-oriented annotation-flattening primitive.
+    pub fn flatten_annotations(&mut self, mode: crate::FlattenMode) -> Result<usize> {
+        // qpdf's document helper obtains `getAllPages()` before flattening.
+        // This repairs a catalog /Pages pointer that lands on a leaf, so the
+        // lower-level document primitive subsequently sees every page.
+        self.get_all_pages()?;
+        crate::flatten_annotations(self.pdf, mode)
+    }
+
+    /// Clear the live document's root page tree after qpdf-style final-page
+    /// removal. `rebuild_page_tree` intentionally rejects an empty selection
+    /// because page-selection callers use that as invalid input, while qpdf's
+    /// `removePage` permits an empty document.
+    fn clear_page_tree(&mut self) -> Result<RebuildResult> {
+        let removed_pages: BTreeSet<ObjectRef> = self.get_all_pages()?.into_iter().collect();
+        let catalog_ref = self.pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+        let crate::Object::Dictionary(mut catalog) = self.pdf.resolve(catalog_ref)? else {
+            // cov:ignore-start: remove obtains pages through get_all_pages, which proves /Root is a dictionary before clear_page_tree runs
+            return Err(Error::Unsupported(format!(
+                "document catalog {catalog_ref} is not a dictionary"
+            )));
+            // cov:ignore-end
+        };
+        let pages = catalog
+            .get("Pages")
+            .cloned()
+            .ok_or(Error::Missing("/Pages"))?;
+        let (mut root, indirect_root) = match pages {
+            crate::Object::Reference(pages_root_ref) => {
+                let crate::Object::Dictionary(root) = self.pdf.resolve(pages_root_ref)? else {
+                    // cov:ignore-start: remove obtains pages through get_all_pages, which proves the selected /Pages root is a dictionary before clear_page_tree runs
+                    return Err(Error::Unsupported(format!(
+                        "document /Pages root {pages_root_ref} is not a dictionary"
+                    )));
+                    // cov:ignore-end
+                };
+                (root, Some(pages_root_ref))
+            }
+            crate::Object::Dictionary(root) => (root, None),
+            // cov:ignore-start: remove_page first obtains a repaired, dictionary /Pages root
+            _ => {
+                return Err(Error::Unsupported(
+                    "document /Pages root is not a dictionary".into(),
+                ))
+            } // cov:ignore-end
+        };
+        root.insert("Type", crate::Object::Name(b"Pages".to_vec()));
+        root.insert("Kids", crate::Object::Array(Vec::new()));
+        root.insert("Count", crate::Object::Integer(0));
+        root.remove("Parent");
+        if let Some(pages_root_ref) = indirect_root {
+            self.pdf
+                .set_object(pages_root_ref, crate::Object::Dictionary(root));
+        } else {
+            catalog.insert("Pages", crate::Object::Dictionary(root));
+            self.pdf
+                .set_object(catalog_ref, crate::Object::Dictionary(catalog));
+        }
+        Ok(RebuildResult {
+            new_kids: Vec::new(),
+            ref_map: BTreeMap::new(),
+            removed_pages,
+        })
     }
 }

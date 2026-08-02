@@ -13,11 +13,12 @@
 //!   `/Rotate`) that were inherited from an ancestor `/Pages` node are
 //!   *materialized* (written explicitly) onto each leaf **before** the leaf is
 //!   reparented, so the leaf no longer depends on the old ancestor chain.
-//! - Every leaf's `/Parent` is repointed at the (stable) root `/Pages` object.
+//! - Every leaf's `/Parent` is repointed at the stable root `/Pages` value.
 //!
 //! The result is a **flat** qpdf-style page tree: no intermediate `/Pages`
-//! nodes are created; the root `/Pages` object's `ObjectRef` is preserved so
-//! the catalog's `/Pages` reference does not need patching.
+//! nodes are created. An indirect root preserves its `ObjectRef`; a direct
+//! root remains embedded in the catalog, matching qpdf's object-handle
+//! ownership.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
@@ -65,8 +66,9 @@
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::{
-    page_refs_with_max_depth, resolve_inherited_resources_with_max_depth,
-    DEFAULT_MAX_PAGE_TREE_DEPTH,
+    next_page_parent, page_parent_entries,
+    repair::{prepare_for_optimization_with_max_depth, PageTreeRoot},
+    resolve_inherited_resources_with_max_depth, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,7 +134,7 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     use std::collections::BTreeSet;
 
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = page_ref;
+    let mut current = PageParentCursor::Reference(page_ref);
     let mut depth: usize = 0;
 
     loop {
@@ -141,16 +143,18 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
                 "page tree depth exceeds maximum of {max_depth} at {current}"
             )));
         }
-        if !seen.insert(current) {
-            // Cycle — treat the attribute as absent.
-            return Ok(None);
+        if let PageParentCursor::Reference(reference) = &current {
+            if !seen.insert(*reference) {
+                // Cycle — treat the attribute as absent.
+                return Ok(None);
+            }
         }
 
-        let Object::Dictionary(dict) = pdf.resolve_borrowed(current)? else {
+        let Some((value, parent)) = page_parent_entries(pdf, &current, key)? else {
             return Ok(None);
         };
 
-        if let Some(val) = dict.get(key).cloned() {
+        if let Some(val) = value {
             match val {
                 // null == absent (§7.3.9): keep walking.
                 Object::Null => {}
@@ -161,18 +165,15 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
             }
         }
 
-        let parent_val = match dict.get("Parent").cloned() {
+        let parent_val = match parent {
             Some(Object::Null) | None => return Ok(None),
             Some(v) => v,
         };
-        match parent_val {
-            Object::Reference(r) => {
-                current = r;
-                depth += 1;
-            }
-            // Non-reference /Parent is non-standard; treat as chain end.
-            _ => return Ok(None),
-        }
+        let Some(parent) = next_page_parent(parent_val) else {
+            return Ok(None);
+        };
+        current = parent;
+        depth += 1;
     }
 }
 
@@ -193,9 +194,10 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 /// [`crate::page_combine::CombinedPlan`]). Duplicate refs are permitted and
 /// produce duplicate output pages, matching qpdf.
 ///
-/// On success the in-memory document is mutated so that the (unchanged) root
-/// `/Pages` object lists exactly the selected pages, each with inheritable
-/// attributes materialized and `/Parent` repointed at the root. Serialize the
+/// On success the in-memory document is mutated so that its root `/Pages`
+/// value lists exactly the selected pages, each with inheritable attributes
+/// materialized and `/Parent` repointed at that root. An indirect root keeps
+/// its object reference; a direct catalog root remains direct. Serialize the
 /// result with [`crate::write_pdf`].
 ///
 /// The `selected` refs it consumes are produced by
@@ -205,8 +207,8 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 ///
 /// # Errors
 ///
-/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` reference is
-///   absent, or `selected` is empty.
+/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` value is absent,
+///   or `selected` is empty.
 /// - [`Error::Unsupported`] when the catalog / a selected ref is not a
 ///   dictionary, the page-tree depth limit is exceeded, or an object-number
 ///   overflow occurs while allocating clones for duplicate selections.
@@ -224,7 +226,7 @@ pub fn rebuild_page_tree<R: Read + Seek>(
 /// # Errors
 ///
 /// - [`Error::Missing`] when `selected` is empty, or when `/Root` or the
-///   catalog `/Pages` reference is absent.
+///   catalog `/Pages` value is absent.
 /// - [`Error::Unsupported`] when the catalog, a selected ref, or the `/Pages`
 ///   root is not a dictionary, a selected object is not a `/Page` dictionary,
 ///   the page-tree depth limit (`max_depth`) is exceeded, or an object-number
@@ -240,21 +242,18 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         return Err(Error::Missing("page-tree rebuild: empty selection"));
     }
 
-    // Locate the root /Pages object; keep its ObjectRef stable so the
-    // catalog's /Pages reference never needs patching.
-    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let Object::Dictionary(catalog) = pdf.resolve_borrowed(catalog_ref)? else {
-        return Err(Error::Unsupported(format!(
-            "document catalog {catalog_ref} is not a dictionary"
-        )));
-    };
-    let pages_root_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
+    // qpdf obtains the effective /Pages handle through getAllPages before
+    // flattening it. That handle can be either an indirect root or a direct
+    // dictionary embedded in the catalog. Keep the ownership boundary through
+    // this rebuild instead of requiring catalog.get_ref("Pages").
+    let _catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+    let prepared =
+        prepare_for_optimization_with_max_depth(pdf, max_depth)?.ok_or(Error::Missing("/Pages"))?;
+    let page_root = prepared.root;
 
-    // Enumerate the original page-tree leaves (qpdf `getAllPages`) BEFORE the
-    // loop reparents leaves and rewrites the root /Kids — afterwards the
-    // original membership is unrecoverable. Any leaf absent from the final
-    // `ref_map` is a removed page; this is the exact set qpdf nulls.
-    let original_pages: Vec<ObjectRef> = page_refs_with_max_depth(pdf, max_depth)?;
+    // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
+    // Any original leaf absent from ref_map is a removed page.
+    let original_pages = prepared.pages;
 
     // Next free object number, for cloning duplicate-selection leaves.
     let mut next_num: u32 = pdf
@@ -266,6 +265,8 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
 
     let mut new_kids: Vec<ObjectRef> = Vec::with_capacity(selected.len());
     let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+    let mut pending_leaves: Vec<(ObjectRef, crate::Dictionary)> =
+        Vec::with_capacity(selected.len());
     // Tracks whether a given source ref has already consumed its in-place slot.
     let mut materialized: BTreeMap<ObjectRef, ()> = BTreeMap::new();
 
@@ -324,12 +325,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             leaf.insert("Rotate", Object::Integer(inherited_rotate as i64));
         }
 
-        // Reparent to the (stable) root /Pages object.
-        leaf.insert("Parent", Object::Reference(pages_root_ref));
-
         let target_ref = if materialized.insert(src, ()).is_none() {
-            // First occurrence: mutate the existing object in place.
-            pdf.set_object(src, Object::Dictionary(leaf));
             src
         } else {
             // Duplicate occurrence: allocate a fresh object holding a clone of
@@ -342,21 +338,46 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                         .to_string(),
                 )
             })?;
-            let clone_ref = ObjectRef::new(next_num, 0);
-            pdf.set_object(clone_ref, Object::Dictionary(leaf));
-            clone_ref
+            ObjectRef::new(next_num, 0)
         };
 
         new_kids.push(target_ref);
         ref_map.entry(src).or_default().push(target_ref);
+        pending_leaves.push((target_ref, leaf));
     }
 
     // Rewrite the root /Pages node: flat /Kids in selection order, /Count =
-    // selection length, /Type /Pages. Other root entries are preserved.
-    let Object::Dictionary(mut root_dict) = pdf.resolve_borrowed(pages_root_ref)?.clone() else {
-        return Err(Error::Unsupported(format!(
-            "document /Pages root {pages_root_ref} is not a dictionary"
-        )));
+    // selection length, /Type /Pages. Other root entries are preserved. For
+    // a direct root, qpdf keeps the dictionary embedded in the catalog rather
+    // than materializing a replacement indirect object.
+    let (mut root_dict, direct_catalog) = match page_root {
+        PageTreeRoot::Indirect(root_ref) => {
+            let Object::Dictionary(root_dict) = pdf.resolve_borrowed(root_ref)?.clone() else {
+                // cov:ignore-start: prepare_for_optimization just repaired this same indirect root as a dictionary
+                return Err(Error::Unsupported(format!(
+                    "document /Pages root {root_ref} is not a dictionary"
+                )));
+                // cov:ignore-end
+            };
+            (root_dict, None)
+        }
+        PageTreeRoot::Direct { catalog } => {
+            let Object::Dictionary(catalog_dict) = pdf.resolve_borrowed(catalog)?.clone() else {
+                // cov:ignore-start: prepare_for_optimization just resolved this catalog dictionary to obtain Direct
+                return Err(Error::Unsupported(format!(
+                    "document catalog {catalog} is not a dictionary"
+                )));
+                // cov:ignore-end
+            };
+            let Some(Object::Dictionary(root_dict)) = catalog_dict.get("Pages").cloned() else {
+                // cov:ignore-start: prepare_for_optimization produced Direct only after retaining this direct Pages dictionary
+                return Err(Error::Unsupported(
+                    "document catalog /Pages root is not a dictionary".into(),
+                ));
+                // cov:ignore-end
+            };
+            (root_dict, Some((catalog, catalog_dict)))
+        }
     };
     root_dict.insert("Type", Object::Name(b"Pages".to_vec()));
     root_dict.insert(
@@ -368,7 +389,31 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // tree is well-formed even if the original root was itself an interior
     // node of a degenerate tree.
     root_dict.remove("Parent");
-    pdf.set_object(pages_root_ref, Object::Dictionary(root_dict));
+
+    let parent = match page_root {
+        PageTreeRoot::Indirect(root_ref) => {
+            pdf.set_object(root_ref, Object::Dictionary(root_dict));
+            Object::Reference(root_ref)
+        }
+        PageTreeRoot::Direct { .. } => {
+            let Some((catalog, mut catalog_dict)) = direct_catalog else {
+                // cov:ignore-start: direct_catalog is populated by the matching Direct branch immediately above
+                unreachable!("direct root supplies its catalog owner");
+                // cov:ignore-end
+            };
+            catalog_dict.insert("Pages", Object::Dictionary(root_dict.clone()));
+            pdf.set_object(catalog, Object::Dictionary(catalog_dict));
+            Object::Dictionary(root_dict)
+        }
+    };
+
+    // For a direct root, qpdf's QPDFObjectHandle points at the final shared
+    // dictionary. Rust values have no direct-object identity, so clone that
+    // final dictionary into each leaf's /Parent after /Kids is complete.
+    for (target_ref, mut leaf) in pending_leaves {
+        leaf.insert("Parent", parent.clone());
+        pdf.set_object(target_ref, Object::Dictionary(leaf));
+    }
 
     // A removed page is an original leaf that no selection kept (absent from
     // `ref_map`). New refs minted for duplicate selections are fresh object
@@ -461,6 +506,19 @@ mod tests {
         Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
     }
 
+    #[test]
+    fn rebuild_marks_qpdf_get_all_pages_observation() {
+        let mut pdf = open(build_nested_pdf());
+        assert!(!pdf.ever_called_get_all_pages());
+
+        rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0)]).unwrap();
+
+        assert!(
+            pdf.ever_called_get_all_pages(),
+            "qpdf rebuild preparation enumerates pages through getAllPages"
+        );
+    }
+
     fn dict_of(pdf: &mut Pdf<Cursor<Vec<u8>>>, r: ObjectRef) -> crate::Dictionary {
         match pdf.resolve_borrowed(r).unwrap() {
             Object::Dictionary(d) => d.clone(),
@@ -510,6 +568,44 @@ mod tests {
                 Object::Reference(ObjectRef::new(6, 0)),
                 Object::Reference(ObjectRef::new(4, 0)),
             ]
+        );
+    }
+
+    #[test]
+    fn direct_catalog_root_stays_direct_after_rebuild_and_round_trips() {
+        let mut pdf = open(build_nested_pdf());
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("catalog must be a dictionary"); // cov:ignore: build_nested_pdf fixes object 1 as the catalog dictionary
+        };
+        catalog.insert("Pages", Object::Dictionary(root));
+        pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+
+        let result =
+            rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(4, 0)]).unwrap();
+        assert_eq!(result.new_kids.len(), 2);
+
+        let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+            panic!("catalog must remain a dictionary"); // cov:ignore: only this test writes object 1 as a catalog dictionary
+        };
+        let Some(Object::Dictionary(root)) = catalog.get("Pages") else {
+            panic!("catalog /Pages must remain direct"); // cov:ignore: direct-root preservation is asserted by the successful rebuild above
+        };
+        assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+        for page_ref in result.new_kids {
+            let page = dict_of(&mut pdf, page_ref);
+            assert_eq!(page.get("Parent"), Some(&Object::Dictionary(root.clone())));
+        }
+
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).unwrap();
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("direct-root output must parse");
+        assert_eq!(
+            crate::PageDocumentHelper::new(&mut reopened)
+                .get_all_pages()
+                .unwrap()
+                .len(),
+            2
         );
     }
 
@@ -645,5 +741,98 @@ mod tests {
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("should parse");
         let refs = page_refs(&mut pdf2).expect("walk");
         assert_eq!(refs.len(), 3, "duplicate selection → 3 enumerated pages");
+    }
+
+    #[test]
+    fn rebuild_honors_repair_depth_limit() {
+        let mut pdf = open(build_nested_pdf());
+
+        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        root.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(10, 0))]),
+        );
+        root.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+        let mut first = crate::Dictionary::new();
+        first.insert("Type", Object::Name(b"Pages".to_vec()));
+        first.insert("Parent", Object::Reference(ObjectRef::new(2, 0)));
+        first.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(11, 0))]),
+        );
+        first.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(first));
+
+        // The missing /Type is deliberately below the supplied bound. The old
+        // default-bound preparation silently repairs it before rebuilding.
+        let mut second = crate::Dictionary::new();
+        second.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
+        second.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+        );
+        second.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(second));
+
+        let Object::Dictionary(mut leaf) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+            panic!("selected object must be a page"); // cov:ignore: build_nested_pdf fixes object 4 as a page dictionary
+        };
+        leaf.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
+        leaf.insert("Rotate", Object::Integer(0));
+        leaf.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
+        leaf.insert(
+            "CropBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(200),
+                Object::Integer(300),
+            ]),
+        );
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(leaf));
+
+        let before_root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let before_second = dict_of(&mut pdf, ObjectRef::new(11, 0));
+        let error = rebuild_page_tree_with_max_depth(&mut pdf, &[ObjectRef::new(4, 0)], 2)
+            .expect_err("repair must use the caller-supplied depth limit");
+        assert!(matches!(error, Error::Unsupported(_)), "got {error:?}");
+        assert_eq!(dict_of(&mut pdf, ObjectRef::new(2, 0)), before_root);
+        assert_eq!(dict_of(&mut pdf, ObjectRef::new(11, 0)), before_second);
+    }
+
+    #[test]
+    fn raw_inherited_lookup_stops_at_a_parent_cycle() {
+        let mut pdf = open(build_nested_pdf());
+        let mut parent = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("intermediate node must be a dictionary");
+        parent.insert("Parent", Object::Reference(ObjectRef::new(4, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "BleedBox", 10).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_inherited_lookup_stops_at_a_non_dictionary_parent() {
+        let mut pdf = open(build_nested_pdf());
+        let mut parent = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("intermediate node must be a dictionary");
+        parent.insert("Parent", Object::Integer(42));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "BleedBox", 10).unwrap(),
+            None
+        );
     }
 }

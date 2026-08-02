@@ -35,7 +35,9 @@
 //!   goal. qpdf exposes `flattenRotation` only through its C++ API (no CLI), so
 //!   there is no qpdf oracle; correctness is asserted via invariants in tests.
 
-use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::pages::{
+    next_page_parent, page_parent_entries, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
+};
 use crate::{
     Dictionary, Error, Matrix, Object, ObjectRef, PageBox, Pdf, Rectangle, Result, Stream,
 };
@@ -169,7 +171,7 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<i32> {
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = page_ref;
+    let mut current = PageParentCursor::Reference(page_ref);
     let mut depth: usize = 0;
 
     loop {
@@ -180,19 +182,17 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
         }
 
         // Cycle guard.
-        if !seen.insert(current) {
-            // We hit a cycle before finding /Rotate — default to 0.
-            return Ok(0);
+        if let PageParentCursor::Reference(reference) = &current {
+            if !seen.insert(*reference) {
+                // We hit a cycle before finding /Rotate — default to 0.
+                return Ok(0);
+            }
         }
 
-        let node_obj = pdf.resolve_borrowed(current)?;
-        let Object::Dictionary(dict) = node_obj else {
+        let Some((rotate_val, parent_val)) = page_parent_entries(pdf, &current, "Rotate")? else {
             // Not a dictionary — cannot walk further; use default.
             return Ok(0);
         };
-
-        let rotate_val = dict.get("Rotate").cloned();
-        let parent_val = dict.get("Parent").cloned();
 
         // Check for /Rotate on this node.
         // Per ISO 32000-1 §7.3.9, a null value is equivalent to absent.
@@ -227,14 +227,11 @@ pub fn resolve_inherited_rotate_with_max_depth<R: Read + Seek>(
             Some(v) => v,
         };
 
-        match parent_val {
-            Object::Reference(r) => {
-                current = r;
-                depth += 1;
-            }
-            // Non-reference /Parent is non-standard; treat as absent.
-            _ => return Ok(0),
-        }
+        let Some(parent) = next_page_parent(parent_val) else {
+            return Ok(0);
+        };
+        current = parent;
+        depth += 1;
     }
 }
 
@@ -937,6 +934,42 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
         let page_ref = ObjectRef::new(3, 0);
         assert_eq!(resolve_inherited_rotate(&mut pdf, page_ref).unwrap(), 0);
+    }
+
+    #[test]
+    fn resolve_defaults_to_zero_for_a_parent_cycle() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let mut parent = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .unwrap()
+            .into_dict()
+            .expect("parent must be a dictionary");
+        parent.insert("Parent", Object::Reference(ObjectRef::new(3, 0)));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn resolve_defaults_to_zero_for_a_non_dictionary_parent() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let mut page = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Parent", Object::Integer(42));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+        assert_eq!(
+            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            0
+        );
     }
 
     #[test]

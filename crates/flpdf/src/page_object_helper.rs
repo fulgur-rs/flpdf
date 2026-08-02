@@ -315,8 +315,7 @@ impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// always normalized to one of `{0, 90, 180, 270}`.
     ///
     /// This is a **getter** — it does not mutate the document. To rotate pages,
-    /// use [`crate::page_rotate::apply_rotate_to_pages`] or
-    /// [`crate::PageDocumentHelper::rotate`].
+    /// use [`crate::page_rotate::apply_rotate_to_pages`].
     ///
     /// # Errors
     ///
