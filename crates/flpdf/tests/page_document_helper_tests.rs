@@ -5,8 +5,8 @@
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
 use flpdf::{
-    write_pdf_with_options, Dictionary, FlattenMode, Object, ObjectHandle, ObjectRef,
-    PageDocumentHelper, PageInput, Pdf, Stream, WriteOptions,
+    write_pdf_with_options, Dictionary, Object, ObjectHandle, ObjectRef, PageDocumentHelper,
+    PageInput, Pdf, Stream, WriteOptions,
 };
 use std::collections::BTreeMap;
 use std::fs;
