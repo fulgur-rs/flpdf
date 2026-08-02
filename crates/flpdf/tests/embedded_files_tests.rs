@@ -1412,8 +1412,8 @@ fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
         .expect("catalog dict")
         .clone();
     let mut names = Dictionary::new();
-    names.insert("EmbeddedFiles".to_string(), Object::Integer(7));
-    catalog.insert("Names".to_string(), Object::Dictionary(names));
+    names.insert("EmbeddedFiles", Object::Integer(7));
+    catalog.insert("Names", Object::Dictionary(names));
     non_dict_embedded_files.set_object(catalog_ref, Object::Dictionary(catalog));
     assert!(!non_dict_embedded_files
         .embedded_files()
