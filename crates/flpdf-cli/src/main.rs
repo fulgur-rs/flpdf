@@ -3359,9 +3359,10 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             // (resolve_ap_n) skips a null /N, so counting it as "has normal"
             // here would skip generation too — silently dropping the widget's
             // value from both passes.
-            helper
-                .appearance()?
-                .is_some_and(|ap| ap.get("N").is_some_and(|val| !matches!(val, Object::Null)))
+            match helper.appearance()?.and_then(|ap| ap.get("N").cloned()) {
+                Some(normal) => !matches!(resolve_reference_chain(pdf, normal)?.0, Object::Null),
+                None => false,
+            }
         };
         if has_normal {
             continue;
@@ -3404,14 +3405,14 @@ fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
     let Some(acroform) = root.get("AcroForm").cloned() else {
         return Ok(());
     };
-    let (acroform, terminal_ref) = resolve_acroform_reference_chain(pdf, acroform)?;
+    let (acroform, terminal_ref) = resolve_reference_chain(pdf, acroform)?;
     let Object::Dictionary(mut acroform) = acroform else {
         return Ok(());
     };
     let Some(need_appearances) = acroform.get("NeedAppearances").cloned() else {
         return Ok(());
     };
-    let (need_appearances, _) = resolve_acroform_reference_chain(pdf, need_appearances)?;
+    let (need_appearances, _) = resolve_reference_chain(pdf, need_appearances)?;
     if !matches!(need_appearances, Object::Boolean(true)) {
         return Ok(());
     }
@@ -3425,9 +3426,9 @@ fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> 
     Ok(())
 }
 
-/// Follow an AcroForm holder chain without exposing flpdf's internal generic
-/// reference-chain module through the CLI crate boundary.
-fn resolve_acroform_reference_chain<R: Read + Seek>(
+/// Follow an indirect-object holder chain without exposing flpdf's internal
+/// generic reference-chain module through the CLI crate boundary.
+fn resolve_reference_chain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     mut object: Object,
 ) -> CliResult<(Object, Option<ObjectRef>)> {

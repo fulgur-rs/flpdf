@@ -100,6 +100,27 @@ fn tx_widget_without_ap_needing_appearances() -> Vec<u8> {
     ])
 }
 
+/// Same as [`tx_widget_without_ap_needing_appearances`], except `/AP/N` is an
+/// indirect null. qpdf treats that as a missing normal appearance and replaces
+/// it while generating appearances.
+fn tx_widget_with_null_ap_n_needing_appearances() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) \
+          /V (Hello) /DA (/Helv 12 Tf 0 g) \
+          /Rect [100 700 300 720] /P 3 0 R /AP << /N 6 0 R >> >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"6 0 obj\nnull\nendobj\n".to_vec(),
+    ])
+}
+
 /// Single-page AcroForm PDF with a Tx widget that has `/V` AND an existing
 /// `/AP/N` Form XObject containing the literal value bytes.
 /// Objects: 1=Catalog, 2=Pages, 3=Page, 4=Widget, 5=Contents, 6=AP/N XObject
@@ -597,6 +618,42 @@ fn generate_then_flatten_clears_need_appearances() {
             .unwrap()
             .is_empty(),
         "generated widget must be flattened after qpdf clears NeedAppearances"
+    );
+}
+
+#[test]
+fn generate_then_flatten_replaces_indirect_null_normal_appearance() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("tx_null_ap_n.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_widget_with_null_ap_n_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--generate-appearances",
+            "--flatten-annotations=all",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    assert!(
+        flpdf::enumerate_page_annotations(&mut pdf, page_ref)
+            .unwrap()
+            .is_empty(),
+        "generated widget must be flattened after qpdf clears NeedAppearances"
+    );
+    let content = flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+    assert!(
+        content.windows(2).any(|window| window == b"Do"),
+        "an indirect null /AP/N must be regenerated before flattening; content={:?}",
+        std::str::from_utf8(&content).unwrap_or("<non-utf8>")
     );
 }
 
