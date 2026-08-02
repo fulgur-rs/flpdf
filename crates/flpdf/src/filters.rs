@@ -2730,9 +2730,9 @@ mod tests {
     /// `/DecodeParms /Name`, so a name must survive the neutral spec as a name
     /// rather than collapsing into the `ParamValue::Other` stand-in.
     ///
-    /// This is also what pins the Crypt arm to *its own* stage's parameters:
-    /// the assertion fails for any provider argument that is not
-    /// `stage.spec.decode_params`.
+    /// It is also what pins the Crypt arm to its stage's own parameters:
+    /// substituting any constant for `stage.spec.decode_params` turns this
+    /// assertion red.
     #[test]
     fn crypt_stage_receives_the_name_parameter_a_provider_selects_on() {
         let filter = Object::Name(b"Crypt".to_vec());
