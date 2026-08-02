@@ -782,7 +782,7 @@ impl ObjectHandle {
     /// True if `self` and `other` are both direct handles sharing the same
     /// underlying storage — i.e. `other` is `self` itself (or a clone of
     /// it), not merely a distinct direct handle with an equal value. Unlike
-    /// [`Self::ptr_eq`], an indirect/indirect match returns `false` here:
+    /// [`Self::is_same_object_as`], an indirect/indirect match returns `false` here:
     /// an indirect handle referencing itself is not a direct cycle and is
     /// already handled correctly by every recursive walker's
     /// indirect-boundary stop.
