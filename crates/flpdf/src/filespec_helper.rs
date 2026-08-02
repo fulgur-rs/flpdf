@@ -386,26 +386,30 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 }
                 None => resolved,
             };
-            target.replace_key(key.as_bytes(), ObjectHandle::string(value));
-            let mut pdf = self.pdf.borrow_mut();
-            if let Some(object_ref) = terminal_ref.or(stream_ref) {
-                pdf.mark_object_handle_mutated(object_ref);
-            } else {
-                pdf.mark_object_handle_dirty(&target)?;
+            {
+                let mut pdf = self.pdf.borrow_mut();
+                if let Some(object_ref) = terminal_ref.or(stream_ref) {
+                    pdf.mark_object_handle_mutated(object_ref);
+                } else {
+                    pdf.mark_object_handle_dirty(&target)?;
+                }
             }
+            target.replace_key(key.as_bytes(), ObjectHandle::string(value));
             return Ok(());
         }
 
+        {
+            let mut pdf = self.pdf.borrow_mut();
+            if let Some(object_ref) = stream_ref {
+                pdf.mark_object_handle_mutated(object_ref);
+            } else {
+                pdf.mark_object_handle_dirty(&stream_dict)?;
+            }
+        }
         stream_dict.replace_key(
             b"Params",
             ObjectHandle::dictionary(vec![(key.as_bytes().to_vec(), ObjectHandle::string(value))]),
         );
-        let mut pdf = self.pdf.borrow_mut();
-        if let Some(object_ref) = stream_ref {
-            pdf.mark_object_handle_mutated(object_ref);
-        } else {
-            pdf.mark_object_handle_dirty(&stream_dict)?;
-        }
         Ok(())
     }
 
@@ -426,14 +430,15 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let Some((_, stream_dict, stream_ref)) = self.resolved_stream()? else {
             return Ok(self);
         };
-        stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
-        let mut pdf = self.pdf.borrow_mut();
-        if let Some(object_ref) = stream_ref {
-            pdf.mark_object_handle_mutated(object_ref);
-        } else {
-            pdf.mark_object_handle_dirty(&stream_dict)?;
+        {
+            let mut pdf = self.pdf.borrow_mut();
+            if let Some(object_ref) = stream_ref {
+                pdf.mark_object_handle_mutated(object_ref);
+            } else {
+                pdf.mark_object_handle_dirty(&stream_dict)?;
+            }
         }
-        drop(pdf);
+        stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
         Ok(self)
     }
 }
@@ -563,11 +568,11 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let Some(dict) = self.filespec_dict()? else {
             return Ok(self);
         };
+        self.pdf.mark_object_handle_dirty(&dict)?;
         dict.replace_key(
             b"Desc",
             ObjectHandle::string(new_unicode_string(description.as_ref())),
         );
-        self.pdf.mark_object_handle_dirty(&dict)?;
         Ok(self)
     }
 
@@ -584,6 +589,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let Some(dict) = self.filespec_dict()? else {
             return Ok(self);
         };
+        self.pdf.mark_object_handle_dirty(&dict)?;
         let unicode_name = new_unicode_string(unicode_name.as_ref());
         dict.replace_key(b"UF", ObjectHandle::string(unicode_name.clone()));
         let compatibility_name = compatibility_name
@@ -593,7 +599,6 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             b"F",
             ObjectHandle::string(compatibility_name.unwrap_or(unicode_name)),
         );
-        self.pdf.mark_object_handle_dirty(&dict)?;
         Ok(self)
     }
 

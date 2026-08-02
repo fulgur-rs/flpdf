@@ -1649,6 +1649,13 @@ impl<R: Read + Seek> Pdf<R> {
         let new_ref = ObjectRef::new(next_number, 0);
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);
+        // QPDF::makeIndirectFromQPDFObject installs the new object in
+        // `obj_cache` before returning its indirect handle. Keep the legacy
+        // bridge equally populated so qpdf JSON preparation recognizes a
+        // newly indirectized object as a live target instead of a dangling
+        // reference. Direct ObjectHandle mutation remains authoritative after
+        // `mark_object_dirty` below.
+        self.cache.set_resolved(new_ref, indirect.materialize());
         // A new object left out of the dirty set would never get its own
         // body or xref entry written by a default incremental write,
         // leaving any reference to it dangling — see `mark_object_dirty`'s
@@ -4998,6 +5005,28 @@ mod tests {
             reopened.resolve(new_ref).expect("resolve new object"),
             Object::Integer(777),
             "new object must not be dangling after an incremental write"
+        );
+    }
+
+    #[test]
+    fn make_indirect_object_handle_is_visible_to_qpdf_json_preparation() {
+        // qpdf's QPDF::makeIndirectFromQPDFObject puts the new object in
+        // obj_cache immediately. JSON preparation must therefore see an
+        // indirect object created solely through the ObjectHandle API.
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let indirect = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(777))
+            .expect("make indirect");
+        let object_ref = indirect.object_ref().expect("indirect ref");
+
+        let prepared = pdf
+            .prepare_qpdf_json_objects()
+            .expect("prepare qpdf JSON objects");
+        assert!(prepared.refs.contains(&object_ref));
+        assert_eq!(
+            pdf.resolve_qpdf_json_object(object_ref)
+                .expect("resolve qpdf JSON object"),
+            Object::Integer(777)
         );
     }
 

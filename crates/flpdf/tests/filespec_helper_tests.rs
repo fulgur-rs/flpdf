@@ -80,6 +80,42 @@ fn build_attachment_pdf(filespec_extras: &str, ef_params: &str, payload: &[u8]) 
     out
 }
 
+/// Add an unrelated xref entry whose body is malformed. This lets a helper
+/// setter exercise the failure path in Pdf's direct-owner discovery without
+/// making the Filespec owner itself malformed.
+fn attachment_pdf_with_malformed_unrelated_object() -> Vec<u8> {
+    let mut out = build_attachment_pdf("", "", b"data");
+    let xref_start = out
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("fixture has xref");
+    out.truncate(xref_start);
+
+    let mut offsets = Vec::new();
+    for number in 1..=6 {
+        let header = format!("{number} 0 obj\n");
+        offsets.push(
+            out.windows(header.len())
+                .position(|window| window == header.as_bytes())
+                .expect("fixture object header") as u64,
+        );
+    }
+    let malformed_offset = out.len() as u64;
+    out.extend_from_slice(b"7 0 obj\n<< /Broken [ >>\nendobj\n");
+
+    let rebuilt_xref = out.len();
+    out.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("{malformed_offset:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{rebuilt_xref}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 #[test]
 fn embedded_file_resolves_indirect_ef_dictionary() {
     let mut pdf = open(build_attachment_pdf("", "", b"payload"));
@@ -267,6 +303,30 @@ fn filespec_factory_indirectizes_a_direct_embedded_stream() {
             .payload()
             .unwrap(),
         b"payload"
+    );
+}
+
+#[test]
+fn filespec_direct_setter_does_not_mutate_before_owner_discovery_succeeds() {
+    // qpdf's direct ObjectHandle mutation cannot fail after changing the
+    // object: it has no separate dirty-owner discovery phase. In Rust that
+    // discovery is needed for incremental writing, so it must happen before
+    // changing a direct Filespec child.
+    let mut pdf = open(attachment_pdf_with_malformed_unrelated_object());
+    let owner_ref = ObjectRef::new(8, 0);
+    let mut owner_dict = Dictionary::new();
+    owner_dict.insert("Filespec", Object::Dictionary(Dictionary::new()));
+    pdf.set_object(owner_ref, Object::Dictionary(owner_dict));
+    let owner = pdf.get_object_handle(owner_ref);
+    pdf.resolve_object_handle(&owner).unwrap();
+    let direct_filespec = owner.get_key(b"Filespec");
+
+    let mut filespec = FileSpec::new(direct_filespec.clone(), &mut pdf).unwrap();
+    assert!(filespec.set_description("new description").is_err());
+
+    assert!(
+        direct_filespec.get_key(b"Desc").is_null(),
+        "a failed owner lookup must not leave a direct Filespec changed but unmarked"
     );
 }
 
