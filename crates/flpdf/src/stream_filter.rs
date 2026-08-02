@@ -1209,8 +1209,18 @@ mod tests {
         // `dyn StreamFilter` above can report only the `bool`, not which
         // parameters survived.
         let params = Object::String(b"not a dictionary".to_vec());
+        let neutral = decode_params_from_object(Some(&params));
+        // Pin the reduction itself, not only its effect: "empty like qpdf"
+        // means `Present` with no entries. Reducing a non-dictionary to
+        // `Absent` instead would take `SF_FlateLzwDecode`'s `isNull()` early
+        // return (`SF_FlateLzwDecode.cc:24-26`), which qpdf reaches only for a
+        // real null — yet a freshly constructed adapter answers `true` and
+        // keeps its defaults either way, so the assertions below cannot tell
+        // the two apart on their own.
+        assert!(matches!(neutral, DecodeParams::Present(_)));
+
         let mut flate = FlateLzwStreamFilter::new(false);
-        assert!(flate.set_decode_params(&decode_params_from_object(Some(&params))));
+        assert!(flate.set_decode_params(&neutral));
         assert_eq!(
             (
                 flate.predictor,
