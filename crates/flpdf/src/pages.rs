@@ -1571,9 +1571,11 @@ mod tests {
     fn resolve_inherited_resources_non_dictionary_parent_terminates_chain() {
         let bytes = build_pdf_no_resources();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
-        let Object::Dictionary(mut page) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("page must be a dictionary");
-        };
+        let mut page = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
         page.insert("Parent", Object::Integer(42));
         pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
 
