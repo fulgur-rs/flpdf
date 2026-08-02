@@ -101,14 +101,57 @@ use `try_*`, not the non-resolving `as_*`.
   `ParamValue::Name` exists so that provider can eventually read Crypt's
   `/Name` without widening this shared type during Phase 3's AES/Crypt cutover;
   nothing reads it yet.
-- **D3 — unfilterable outcome channel.** flpdf's legacy path returns
-  `Err(Error::Unsupported("stream filter type is not name or array"))` where
-  qpdf `filterable()` *warns* and returns false, and only the caller
-  (`getStreamData`) turns that into a `logic_error`. **Verify with a live probe
-  in Task 5 before choosing**; the native reader's consumer in `.3.5` is
-  `getStreamData`-shaped, so `Err` is the expected answer, but the message
-  channel divergence must be measured, not assumed, and recorded in the beads
-  issue either way.
+- **D3 — unfilterable outcome channel. MEASURED 2026-08-03, decided.** Probe:
+  a stream whose `/Filter` is the integer `3`, against qpdf 11.9.0.
+
+  ```
+  qpdf --show-object=4 --filtered-stream-data d3-filter-is-integer.pdf
+    WARNING: (offset 250): stream filter type is not name or array
+    WARNING: stream object 4 0: unable to filter stream data
+    qpdf: unable to get object 4,0
+    exit=2
+  qpdf --show-object=4 --raw-stream-data d3-filter-is-integer.pdf
+    exit=0
+  ```
+
+  So qpdf emits the warning **and then fails** on the `getStreamData` path.
+  `Err` is confirmed as the right outcome for the native reader, and flpdf's
+  message text already matches. The remaining divergence is only the
+  *channel*: flpdf raises the text as an error and emits no accompanying
+  warning. Do not "fix" that here — the native reader keeps flpdf's existing
+  `Err`, and the channel gap is recorded in the beads issue.
+
+- **D4 — null-valued `/DecodeParms` keys. MEASURED 2026-08-03, NOT fixed here
+  (`flpdf-h8mv`).** `QPDF_Dictionary::getKeys` (`QPDF_Dictionary.cc:118-127`)
+  skips every entry whose value `isNull()`, and
+  `SF_FlateLzwDecode::setDecodeParms` iterates exactly that set
+  (`SF_FlateLzwDecode.cc:29-31`). flpdf iterates unfiltered, so a null value
+  arrives as `ParamValue::Other` and is rejected. Probe:
+
+  ```
+  /DecodeParms << /Predictor null >>  → qpdf exit=0 (filterable)
+  /DecodeParms << /Predictor 5 >>     → qpdf exit=2 (control: really rejects)
+  ```
+
+  So qpdf tolerates it and flpdf errors. Pre-existing — the pre-Task-1 code
+  reached the same rejection through `clamped_int_param`'s `None`. Fixing it
+  changes public `decode_stream_data` behavior and must land in **both**
+  readers at once (qpdf's `isNull()` dereferences, entangling it with D1), so
+  it is tracked separately as `flpdf-h8mv`.
+
+  **Both readers must keep flpdf's current behavior here**, so Task 7's
+  equivalence gate still holds. Include the row in the corpus anyway, with a
+  comment pointing at `flpdf-h8mv` — measuring the shape is what acceptance
+  criterion 3 asks for; two readers agreeing is not evidence either is right.
+
+- **D1 — indirect `/DecodeParms` values. MEASURED 2026-08-03, confirmed.**
+  Probe: `/DecodeParms << /Predictor 12 /Columns 5 0 R >>` with object 5 = `4`,
+  over two PNG `None`-filtered rows, compared against a direct `/Columns 4`.
+  Both produced identical filtered bytes `[1,2,3,4,5,6,7,8]`, exit 0. A
+  non-dereferencing reader would have fallen back to `columns = 1` and emitted
+  5 bytes, so this discriminates. **qpdf dereferences**, which is why the
+  native reader must use `try_*` and why the legacy `as_*` reader is the one
+  that diverges here.
 
 ---
 
@@ -570,34 +613,36 @@ git commit -m "feat: add lazily-dereferencing ObjectHandle value accessors"
 - Modify: `crates/flpdf/src/stream_filter.rs`
 - Test: `crates/flpdf/src/stream_filter.rs` tests
 
-**Step 0: Settle D3 with a live probe before writing the reader**
+**Step 0: DONE — D1 and D3 are measured.** See "Decisions recorded up front"
+above for the probe commands, outputs, and what they settled. The probe
+generator is `scratchpad/make_probe.py`; re-run it if a corpus row needs a
+fresh observation.
 
-```bash
-Q="$(scripts/fetch-qpdf-source.sh --print-path)"
-sed -n '379,420p' "$Q/libqpdf/QPDF_Stream.cc"
-sed -n '345,360p' "$Q/libqpdf/QPDF_Stream.cc"   # getStreamData's logic_error
-```
+For the record, since it is easy to get wrong: **do not probe via
+`--json=2 --json-stream-data=inline`.** `QPDF_Stream::writeStreamJSON`
+(`QPDF_Stream.cc:252-262`) retries with `decode_level = qpdf_dl_none` when the
+first `pipeStreamData` attempt fails and then emits raw bytes, so a broken
+`/Filter` comes back looking *tolerated*. The `getStreamData` path
+(`:345-358`) is the one that fails, and `--show-object=N
+--filtered-stream-data` is what exercises it.
 
-Build a PDF with a stream whose `/Filter` is `3` (a non-name, non-array), then
-probe the **`getStreamData` path**:
+**Step 0b: D1's acceptance test lives here, not in Task 7**
 
-```bash
-qpdf --show-object=N --filtered-stream-data broken.pdf ; echo "exit=$?"
-qpdf --show-object=N --raw-stream-data      broken.pdf ; echo "exit=$?"
-```
+Dereferencing is the entire reason the native reader exists, so it needs a
+focused test next to the reader — and Task 7's equivalence gate structurally
+cannot provide one (see the note in Task 7).
 
-D3 turns on the divergence between those two exit codes and their stderr.
+Write a test that gives the native reader an **indirect** `/Filter` and an
+**indirect** `/DecodeParms` value through the `RecordingResolver` harness
+Task 4 extended (`object_handle.rs:1897-1946`), and asserts the reader resolves
+them the way `QPDF_Stream::filterable`'s `getKey`/`getArrayItem` do
+(`QPDF_Stream.cc:386`, `:403`, `:440`). Cover at least: an indirect name
+`/Filter`; an indirect array item; an indirect integer `/DecodeParms` value;
+and a handle whose document was dropped, which must surface
+`try_dereference`'s existing `Error::Internal` rather than silently reading as
+absent.
 
-**Do not probe via `--json=2 --json-stream-data=inline`.**
-`QPDF_Stream::writeStreamJSON` (`QPDF_Stream.cc:252-262`) retries with
-`decode_level = qpdf_dl_none` when the first `pipeStreamData` attempt fails and
-then emits raw bytes, so a broken `/Filter` comes back looking *tolerated*.
-Encoding "qpdf warns and continues" from that observation would be wrong:
-`getStreamData` (`:345-358`) throws instead.
-
-Write the observed strings and exit codes into the beads issue notes before
-continuing. If the observation contradicts D3, stop and re-plan rather than
-encoding a guess.
+This is what makes decision D1 real. Without it, D1 ships untested.
 
 **Step 1: Write the failing test**
 
@@ -703,6 +748,19 @@ fn decode_prepared_specs(
 native entry point is `decode_filter_specs_from_handle(...)` +
 `decode_prepared_specs(...)`, so both share one staging/warning-order engine.
 
+**Expose the native path at BOTH levels.** A strict
+`decode_stream_data_from_handle(...) -> Result<Vec<u8>>` alone cannot carry a
+warning sequence, and Task 7 has to compare warnings — messages, codes, and
+order — or acceptance criterion 3's "warning order against qpdf" goes
+untested and that gate silently degrades into a bytes-only comparison. Since
+`decode_prepared_specs` already returns `StreamDecodeOutcome`, also add an
+outcome-level `pub(crate)` variant mirroring
+`decode_stream_data_recovering_with_limits` /
+`decode_stream_data_with_limits_and_warnings`, and let the strict `Vec<u8>`
+form sit on top of it through `replay_strict_decode_event`, exactly as the
+legacy strict path does. `flpdf-25kg.3.5` only needs the strict
+`getStreamData`-shaped one, so the outcome-level variant stays `pub(crate)`.
+
 **Do not mirror the raw-array chain-count pre-check — move it into the shape
 readers.** `filters.rs:353-355` currently runs
 `validate_filter_chain_count(filters.len(), ...)` on the raw `Object::Array`
@@ -742,6 +800,22 @@ git commit -m "feat: decode stream data from an ObjectHandle dictionary"
 
 **Files:**
 - Create: `crates/flpdf/tests/objecthandle_stream_decode_equivalence.rs`
+
+> **This gate covers a DIRECT-ONLY corpus, and that limit is load-bearing.**
+> Decision D1 makes the two readers *deliberately* disagree on an indirect
+> child: the legacy `as_*` reader turns `Object::Reference` into
+> `ParamValue::Other` (so `filterable = false`), while the native `try_*`
+> reader dereferences and sees the real value — which the 2026-08-03 probe
+> confirmed is what qpdf does. Asserting strict equivalence over an indirect
+> case would therefore assert the wrong thing.
+>
+> The trap is the *other* direction: if `shape_corpus()` builds handles with
+> `ObjectHandle::dictionary(...)` and direct children — the obvious way to
+> write it — then `try_dereference` short-circuits on `Repr::Direct`, no
+> indirect case is ever reached, this gate passes, and D1 ships untested.
+> That is why D1's acceptance test is Task 5 Step 0b, next to the reader it
+> validates. State the exclusion in this file's header comment so a later
+> reader does not "fix" the gap by widening the corpus here.
 
 **Step 1: Write the test**
 
