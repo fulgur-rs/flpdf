@@ -13,11 +13,12 @@
 //!   `/Rotate`) that were inherited from an ancestor `/Pages` node are
 //!   *materialized* (written explicitly) onto each leaf **before** the leaf is
 //!   reparented, so the leaf no longer depends on the old ancestor chain.
-//! - Every leaf's `/Parent` is repointed at the (stable) root `/Pages` object.
+//! - Every leaf's `/Parent` is repointed at the stable root `/Pages` value.
 //!
 //! The result is a **flat** qpdf-style page tree: no intermediate `/Pages`
-//! nodes are created; the root `/Pages` object's `ObjectRef` is preserved so
-//! the catalog's `/Pages` reference does not need patching.
+//! nodes are created. An indirect root preserves its `ObjectRef`; a direct
+//! root remains embedded in the catalog, matching qpdf's object-handle
+//! ownership.
 //!
 //! # qpdf 11.9.0 observed behaviour (truth source `/usr/bin/qpdf`)
 //!
@@ -65,8 +66,8 @@
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::{
-    page_refs_with_max_depth, resolve_inherited_resources_with_max_depth,
-    DEFAULT_MAX_PAGE_TREE_DEPTH,
+    repair::{prepare_for_optimization, PageTreeRoot},
+    resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -193,9 +194,10 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 /// [`crate::page_combine::CombinedPlan`]). Duplicate refs are permitted and
 /// produce duplicate output pages, matching qpdf.
 ///
-/// On success the in-memory document is mutated so that the (unchanged) root
-/// `/Pages` object lists exactly the selected pages, each with inheritable
-/// attributes materialized and `/Parent` repointed at the root. Serialize the
+/// On success the in-memory document is mutated so that its root `/Pages`
+/// value lists exactly the selected pages, each with inheritable attributes
+/// materialized and `/Parent` repointed at that root. An indirect root keeps
+/// its object reference; a direct catalog root remains direct. Serialize the
 /// result with [`crate::write_pdf`].
 ///
 /// The `selected` refs it consumes are produced by
@@ -205,8 +207,8 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 ///
 /// # Errors
 ///
-/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` reference is
-///   absent, or `selected` is empty.
+/// - [`Error::Missing`] when `/Root` or the catalog `/Pages` value is absent,
+///   or `selected` is empty.
 /// - [`Error::Unsupported`] when the catalog / a selected ref is not a
 ///   dictionary, the page-tree depth limit is exceeded, or an object-number
 ///   overflow occurs while allocating clones for duplicate selections.
@@ -224,7 +226,7 @@ pub fn rebuild_page_tree<R: Read + Seek>(
 /// # Errors
 ///
 /// - [`Error::Missing`] when `selected` is empty, or when `/Root` or the
-///   catalog `/Pages` reference is absent.
+///   catalog `/Pages` value is absent.
 /// - [`Error::Unsupported`] when the catalog, a selected ref, or the `/Pages`
 ///   root is not a dictionary, a selected object is not a `/Page` dictionary,
 ///   the page-tree depth limit (`max_depth`) is exceeded, or an object-number
@@ -240,21 +242,17 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
         return Err(Error::Missing("page-tree rebuild: empty selection"));
     }
 
-    // Locate the root /Pages object; keep its ObjectRef stable so the
-    // catalog's /Pages reference never needs patching.
-    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let Object::Dictionary(catalog) = pdf.resolve_borrowed(catalog_ref)? else {
-        return Err(Error::Unsupported(format!(
-            "document catalog {catalog_ref} is not a dictionary"
-        )));
-    };
-    let pages_root_ref = catalog.get_ref("Pages").ok_or(Error::Missing("/Pages"))?;
+    // qpdf obtains the effective /Pages handle through getAllPages before
+    // flattening it. That handle can be either an indirect root or a direct
+    // dictionary embedded in the catalog. Keep the ownership boundary through
+    // this rebuild instead of requiring catalog.get_ref("Pages").
+    let _catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
+    let prepared = prepare_for_optimization(pdf)?.ok_or(Error::Missing("/Pages"))?;
+    let page_root = prepared.root;
 
-    // Enumerate the original page-tree leaves (qpdf `getAllPages`) BEFORE the
-    // loop reparents leaves and rewrites the root /Kids — afterwards the
-    // original membership is unrecoverable. Any leaf absent from the final
-    // `ref_map` is a removed page; this is the exact set qpdf nulls.
-    let original_pages: Vec<ObjectRef> = page_refs_with_max_depth(pdf, max_depth)?;
+    // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
+    // Any original leaf absent from ref_map is a removed page.
+    let original_pages = prepared.pages;
 
     // Next free object number, for cloning duplicate-selection leaves.
     let mut next_num: u32 = pdf
@@ -266,6 +264,8 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
 
     let mut new_kids: Vec<ObjectRef> = Vec::with_capacity(selected.len());
     let mut ref_map: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+    let mut pending_leaves: Vec<(ObjectRef, crate::Dictionary)> =
+        Vec::with_capacity(selected.len());
     // Tracks whether a given source ref has already consumed its in-place slot.
     let mut materialized: BTreeMap<ObjectRef, ()> = BTreeMap::new();
 
@@ -324,12 +324,7 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
             leaf.insert("Rotate", Object::Integer(inherited_rotate as i64));
         }
 
-        // Reparent to the (stable) root /Pages object.
-        leaf.insert("Parent", Object::Reference(pages_root_ref));
-
         let target_ref = if materialized.insert(src, ()).is_none() {
-            // First occurrence: mutate the existing object in place.
-            pdf.set_object(src, Object::Dictionary(leaf));
             src
         } else {
             // Duplicate occurrence: allocate a fresh object holding a clone of
@@ -342,21 +337,40 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
                         .to_string(),
                 )
             })?;
-            let clone_ref = ObjectRef::new(next_num, 0);
-            pdf.set_object(clone_ref, Object::Dictionary(leaf));
-            clone_ref
+            ObjectRef::new(next_num, 0)
         };
 
         new_kids.push(target_ref);
         ref_map.entry(src).or_default().push(target_ref);
+        pending_leaves.push((target_ref, leaf));
     }
 
     // Rewrite the root /Pages node: flat /Kids in selection order, /Count =
-    // selection length, /Type /Pages. Other root entries are preserved.
-    let Object::Dictionary(mut root_dict) = pdf.resolve_borrowed(pages_root_ref)?.clone() else {
-        return Err(Error::Unsupported(format!(
-            "document /Pages root {pages_root_ref} is not a dictionary"
-        )));
+    // selection length, /Type /Pages. Other root entries are preserved. For
+    // a direct root, qpdf keeps the dictionary embedded in the catalog rather
+    // than materializing a replacement indirect object.
+    let (mut root_dict, direct_catalog) = match page_root {
+        PageTreeRoot::Indirect(root_ref) => {
+            let Object::Dictionary(root_dict) = pdf.resolve_borrowed(root_ref)?.clone() else {
+                return Err(Error::Unsupported(format!(
+                    "document /Pages root {root_ref} is not a dictionary"
+                )));
+            };
+            (root_dict, None)
+        }
+        PageTreeRoot::Direct { catalog } => {
+            let Object::Dictionary(catalog_dict) = pdf.resolve_borrowed(catalog)?.clone() else {
+                return Err(Error::Unsupported(format!(
+                    "document catalog {catalog} is not a dictionary"
+                )));
+            };
+            let Some(Object::Dictionary(root_dict)) = catalog_dict.get("Pages").cloned() else {
+                return Err(Error::Unsupported(
+                    "document catalog /Pages root is not a dictionary".into(),
+                ));
+            };
+            (root_dict, Some((catalog, catalog_dict)))
+        }
     };
     root_dict.insert("Type", Object::Name(b"Pages".to_vec()));
     root_dict.insert(
@@ -368,7 +382,29 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // tree is well-formed even if the original root was itself an interior
     // node of a degenerate tree.
     root_dict.remove("Parent");
-    pdf.set_object(pages_root_ref, Object::Dictionary(root_dict));
+
+    let parent = match page_root {
+        PageTreeRoot::Indirect(root_ref) => {
+            pdf.set_object(root_ref, Object::Dictionary(root_dict));
+            Object::Reference(root_ref)
+        }
+        PageTreeRoot::Direct { .. } => {
+            let Some((catalog, mut catalog_dict)) = direct_catalog else {
+                unreachable!("direct root supplies its catalog owner");
+            };
+            catalog_dict.insert("Pages", Object::Dictionary(root_dict.clone()));
+            pdf.set_object(catalog, Object::Dictionary(catalog_dict));
+            Object::Dictionary(root_dict)
+        }
+    };
+
+    // For a direct root, qpdf's QPDFObjectHandle points at the final shared
+    // dictionary. Rust values have no direct-object identity, so clone that
+    // final dictionary into each leaf's /Parent after /Kids is complete.
+    for (target_ref, mut leaf) in pending_leaves {
+        leaf.insert("Parent", parent.clone());
+        pdf.set_object(target_ref, Object::Dictionary(leaf));
+    }
 
     // A removed page is an original leaf that no selection kept (absent from
     // `ref_map`). New refs minted for duplicate selections are fresh object

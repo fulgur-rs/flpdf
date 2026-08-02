@@ -67,6 +67,44 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
     Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
 }
 
+/// Embed the existing page-tree root directly in the catalog, as qpdf permits.
+fn make_catalog_pages_root_direct(pdf: &mut Pdf<Cursor<Vec<u8>>>) {
+    let Object::Dictionary(pages) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
+        panic!("pages root must be a dictionary");
+    };
+    let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must be a dictionary");
+    };
+    catalog.insert("Pages", Object::Dictionary(pages));
+    pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
+}
+
+fn assert_direct_catalog_pages_root(pdf: &mut Pdf<Cursor<Vec<u8>>>, expected_count: i64) {
+    let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
+        panic!("catalog must remain a dictionary");
+    };
+    let Some(Object::Dictionary(pages)) = catalog.get("Pages") else {
+        panic!("catalog /Pages must remain direct");
+    };
+    assert_eq!(pages.get("Count"), Some(&Object::Integer(expected_count)));
+    let Some(Object::Array(kids)) = pages.get("Kids") else {
+        panic!("direct pages root must retain /Kids");
+    };
+    assert_eq!(kids.len(), expected_count as usize);
+    let expected_parent = Object::Dictionary(pages.clone());
+
+    for page in PageDocumentHelper::new(pdf).get_all_pages().unwrap() {
+        let Object::Dictionary(page) = pdf.resolve(page).unwrap() else {
+            panic!("page must remain a dictionary");
+        };
+        assert_eq!(
+            page.get("Parent"),
+            Some(&expected_parent),
+            "qpdf keeps the final direct root as each flattened leaf's /Parent"
+        );
+    }
+}
+
 /// A one-page PDF whose catalog incorrectly points `/Pages` at the leaf.
 /// qpdf walks `/Parent` to repair the catalog before `getAllPages()` returns.
 fn pdf_with_catalog_pages_pointing_to_leaf() -> Vec<u8> {
@@ -1059,6 +1097,18 @@ fn remove_page_removes_the_selected_page() {
 }
 
 #[test]
+fn remove_page_preserves_direct_catalog_pages_root() {
+    let mut pdf = open(build_n_page_pdf(3));
+    make_catalog_pages_root_direct(&mut pdf);
+
+    PageDocumentHelper::new(&mut pdf)
+        .remove_page(ObjectRef::new(4, 0))
+        .unwrap();
+
+    assert_direct_catalog_pages_root(&mut pdf, 2);
+}
+
+#[test]
 fn remove_page_rejects_a_non_member() {
     let mut pdf = open(build_n_page_pdf(2));
     let err = PageDocumentHelper::new(&mut pdf)
@@ -1098,6 +1148,18 @@ fn add_page_last_appends_page() {
     let pages = PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap();
     assert_eq!(pages.len(), 4);
     assert_eq!(pages[3], ObjectRef::new(6, 0));
+}
+
+#[test]
+fn add_page_preserves_direct_catalog_pages_root() {
+    let mut pdf = open(build_n_page_pdf(2));
+    make_catalog_pages_root_direct(&mut pdf);
+
+    PageDocumentHelper::new(&mut pdf)
+        .add_page(ObjectRef::new(3, 0), false)
+        .unwrap();
+
+    assert_direct_catalog_pages_root(&mut pdf, 3);
 }
 
 #[test]
