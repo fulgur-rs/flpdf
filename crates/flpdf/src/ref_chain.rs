@@ -8,6 +8,10 @@
 //! node dropped, an array carrier treated as empty, a copy-map lookup missed).
 //! This module owns that one bounded follow-the-chain primitive so every
 //! consumer shares a single implementation.
+//!
+//! `qpdf-cutover-delete(flpdf-25kg.3.3)`: qpdf has no holder-chain primitive.
+//! Delete this module after each qpdf component uses canonical
+//! `ObjectHandle` accessors; do not add new callers.
 
 use crate::{Object, ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
