@@ -10,11 +10,12 @@ the crate's shared `ObjectHandle` representation.  qpdf helpers are wrappers
 over `QPDFObjectHandle`, so indirect-reference transparency and in-place
 dictionary mutation are helper responsibilities, not caller conveniences.
 
-`FileSpec::new` is handle-first. `FileSpec::from_ref` remains a Rust
-document-ownership convenience, while `ObjectRef` is no longer the helper's
-only constructor contract. The public qpdf-shaped getters use qpdf's
-empty-string or zero defaults; lower-level optional inspection remains a
-separately named API and does not duplicate qpdf lookup rules.
+`FileSpec::new` is handle-first; there is no `ObjectRef` constructor
+compatibility shim. qpdf-shaped factories and embedded-stream getters return
+`ObjectHandle`, and setters return `&mut Self` through `Result` for fluent
+calls. The public qpdf-shaped getters use qpdf's empty-string or zero defaults;
+lower-level optional inspection remains a separately named API and does not
+duplicate qpdf lookup rules.
 
 ## Boundaries
 

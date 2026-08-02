@@ -138,7 +138,7 @@ fn collect_one<R: Read + Seek>(
     key: Vec<u8>,
     filespec_ref: ObjectRef,
 ) -> Result<AttachmentInfo> {
-    let mut fs = FileSpec::from_ref(filespec_ref, pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf);
 
     // ── Display name: /UF preferred, fall back to /F ─────────────────────
     let display_name: Option<String> = {
