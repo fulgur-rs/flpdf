@@ -66,8 +66,9 @@
 
 use crate::page_rotate::resolve_inherited_rotate_with_max_depth;
 use crate::pages::{
-    repair::{prepare_for_optimization, PageTreeRoot},
-    resolve_inherited_resources_with_max_depth, DEFAULT_MAX_PAGE_TREE_DEPTH,
+    next_page_parent, page_parent_entries,
+    repair::{prepare_for_optimization_with_max_depth, PageTreeRoot},
+    resolve_inherited_resources_with_max_depth, PageParentCursor, DEFAULT_MAX_PAGE_TREE_DEPTH,
 };
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -133,7 +134,7 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
     use std::collections::BTreeSet;
 
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = page_ref;
+    let mut current = PageParentCursor::Reference(page_ref);
     let mut depth: usize = 0;
 
     loop {
@@ -142,16 +143,18 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
                 "page tree depth exceeds maximum of {max_depth} at {current}"
             )));
         }
-        if !seen.insert(current) {
-            // Cycle — treat the attribute as absent.
-            return Ok(None);
+        if let PageParentCursor::Reference(reference) = &current {
+            if !seen.insert(*reference) {
+                // Cycle — treat the attribute as absent.
+                return Ok(None);
+            }
         }
 
-        let Object::Dictionary(dict) = pdf.resolve_borrowed(current)? else {
+        let Some((value, parent)) = page_parent_entries(pdf, &current, key)? else {
             return Ok(None);
         };
 
-        if let Some(val) = dict.get(key).cloned() {
+        if let Some(val) = value {
             match val {
                 // null == absent (§7.3.9): keep walking.
                 Object::Null => {}
@@ -162,18 +165,15 @@ pub(crate) fn resolve_inherited_raw<R: Read + Seek>(
             }
         }
 
-        let parent_val = match dict.get("Parent").cloned() {
+        let parent_val = match parent {
             Some(Object::Null) | None => return Ok(None),
             Some(v) => v,
         };
-        match parent_val {
-            Object::Reference(r) => {
-                current = r;
-                depth += 1;
-            }
-            // Non-reference /Parent is non-standard; treat as chain end.
-            _ => return Ok(None),
-        }
+        let Some(parent) = next_page_parent(parent_val) else {
+            return Ok(None);
+        };
+        current = parent;
+        depth += 1;
     }
 }
 
@@ -247,7 +247,8 @@ pub fn rebuild_page_tree_with_max_depth<R: Read + Seek>(
     // dictionary embedded in the catalog. Keep the ownership boundary through
     // this rebuild instead of requiring catalog.get_ref("Pages").
     let _catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let prepared = prepare_for_optimization(pdf)?.ok_or(Error::Missing("/Pages"))?;
+    let prepared =
+        prepare_for_optimization_with_max_depth(pdf, max_depth)?.ok_or(Error::Missing("/Pages"))?;
     let page_root = prepared.root;
 
     // Capture qpdf's repaired leaf order before changing /Kids or /Parent.
@@ -727,5 +728,64 @@ mod tests {
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("should parse");
         let refs = page_refs(&mut pdf2).expect("walk");
         assert_eq!(refs.len(), 3, "duplicate selection → 3 enumerated pages");
+    }
+
+    #[test]
+    fn rebuild_honors_repair_depth_limit() {
+        let mut pdf = open(build_nested_pdf());
+
+        let mut root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        root.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(10, 0))]),
+        );
+        root.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
+
+        let mut first = crate::Dictionary::new();
+        first.insert("Type", Object::Name(b"Pages".to_vec()));
+        first.insert("Parent", Object::Reference(ObjectRef::new(2, 0)));
+        first.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(11, 0))]),
+        );
+        first.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(10, 0), Object::Dictionary(first));
+
+        // The missing /Type is deliberately below the supplied bound. The old
+        // default-bound preparation silently repairs it before rebuilding.
+        let mut second = crate::Dictionary::new();
+        second.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
+        second.insert(
+            "Kids",
+            Object::Array(vec![Object::Reference(ObjectRef::new(4, 0))]),
+        );
+        second.insert("Count", Object::Integer(1));
+        pdf.set_object(ObjectRef::new(11, 0), Object::Dictionary(second));
+
+        let Object::Dictionary(mut leaf) = pdf.resolve(ObjectRef::new(4, 0)).unwrap() else {
+            panic!("selected object must be a page");
+        };
+        leaf.insert("Parent", Object::Reference(ObjectRef::new(10, 0)));
+        leaf.insert("Rotate", Object::Integer(0));
+        leaf.insert("Resources", Object::Dictionary(crate::Dictionary::new()));
+        leaf.insert(
+            "CropBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(200),
+                Object::Integer(300),
+            ]),
+        );
+        pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(leaf));
+
+        let before_root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        let before_second = dict_of(&mut pdf, ObjectRef::new(11, 0));
+        let error = rebuild_page_tree_with_max_depth(&mut pdf, &[ObjectRef::new(4, 0)], 2)
+            .expect_err("repair must use the caller-supplied depth limit");
+        assert!(matches!(error, Error::Unsupported(_)), "got {error:?}");
+        assert_eq!(dict_of(&mut pdf, ObjectRef::new(2, 0)), before_root);
+        assert_eq!(dict_of(&mut pdf, ObjectRef::new(11, 0)), before_second);
     }
 }

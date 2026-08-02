@@ -16,6 +16,7 @@ use crate::filters::decode_stream_data;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::io::{Read, Seek};
 
 /// Default recursion limit for [`page_refs`].
@@ -24,6 +25,49 @@ use std::io::{Read, Seek};
 /// generous enough for legitimate documents while still preventing pathological inputs
 /// from causing unbounded recursion.
 pub const DEFAULT_MAX_PAGE_TREE_DEPTH: usize = 100;
+
+/// A qpdf-style page-tree dictionary handle while following `/Parent`.
+///
+/// `QPDFObjectHandle` keeps direct dictionaries addressable just like indirect
+/// objects. Rust has no shared direct-object identity, so a direct parent is
+/// carried by value while reference parents retain their object identity for
+/// cycle detection.
+#[derive(Debug, Clone)]
+pub(crate) enum PageParentCursor {
+    Reference(ObjectRef),
+    Direct(Dictionary),
+}
+
+impl fmt::Display for PageParentCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reference(reference) => write!(f, "{reference}"),
+            Self::Direct(_) => f.write_str("direct page-tree dictionary"),
+        }
+    }
+}
+
+/// Snapshot `key` and `/Parent` from a page-tree dictionary cursor.
+pub(crate) fn page_parent_entries<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    cursor: &PageParentCursor,
+    key: &str,
+) -> Result<Option<(Option<Object>, Option<Object>)>> {
+    let dict = match cursor {
+        PageParentCursor::Reference(reference) => pdf.resolve_borrowed(*reference)?.as_dict(),
+        PageParentCursor::Direct(dict) => Some(dict),
+    };
+    Ok(dict.map(|dict| (dict.get(key).cloned(), dict.get("Parent").cloned())))
+}
+
+/// Advance a page-tree parent cursor when `/Parent` is a dictionary handle.
+pub(crate) fn next_page_parent(parent: Object) -> Option<PageParentCursor> {
+    match parent {
+        Object::Reference(reference) => Some(PageParentCursor::Reference(reference)),
+        Object::Dictionary(dict) => Some(PageParentCursor::Direct(dict)),
+        _ => None,
+    }
+}
 
 /// Return every `Page` object in document order using [`DEFAULT_MAX_PAGE_TREE_DEPTH`].
 ///
@@ -576,7 +620,7 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
     max_depth: usize,
 ) -> Result<Option<Dictionary>> {
     let mut seen: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut current = page_ref;
+    let mut current = PageParentCursor::Reference(page_ref);
     let mut depth: usize = 0;
 
     loop {
@@ -587,18 +631,17 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
         }
 
         // Cycle guard: if we have already visited this node, stop.
-        if !seen.insert(current) {
-            return Ok(None);
+        if let PageParentCursor::Reference(reference) = &current {
+            if !seen.insert(*reference) {
+                return Ok(None);
+            }
         }
 
-        let node_obj = pdf.resolve_borrowed(current)?;
-        let Some(dict) = node_obj.as_dict() else {
+        let Some((resources_val, parent_val)) = page_parent_entries(pdf, &current, "Resources")?
+        else {
             // Not a dictionary — cannot walk further.
             return Ok(None);
         };
-
-        let resources_val = dict.get("Resources").cloned();
-        let parent_val = dict.get("Parent").cloned();
 
         // Check for /Resources on this node. Per PDF §7.3.9, a null value is
         // equivalent to the key being absent — so Object::Null (and references
@@ -633,14 +676,11 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
             Some(v) => v,
         };
 
-        match parent_val {
-            Object::Reference(r) => {
-                current = r;
-                depth += 1;
-            }
-            // Direct dictionary as /Parent is non-standard; treat as absent.
-            _ => return Ok(None),
-        }
+        let Some(parent) = next_page_parent(parent_val) else {
+            return Ok(None);
+        };
+        current = parent;
+        depth += 1;
     }
 }
 
