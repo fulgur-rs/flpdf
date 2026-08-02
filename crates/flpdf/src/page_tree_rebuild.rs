@@ -562,7 +562,7 @@ mod tests {
         let mut pdf = open(build_nested_pdf());
         let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
         let Object::Dictionary(mut catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("catalog must be a dictionary");
+            panic!("catalog must be a dictionary"); // cov:ignore: build_nested_pdf fixes object 1 as the catalog dictionary
         };
         catalog.insert("Pages", Object::Dictionary(root));
         pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(catalog));
@@ -572,10 +572,10 @@ mod tests {
         assert_eq!(result.new_kids.len(), 2);
 
         let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("catalog must remain a dictionary");
+            panic!("catalog must remain a dictionary"); // cov:ignore: only this test writes object 1 as a catalog dictionary
         };
         let Some(Object::Dictionary(root)) = catalog.get("Pages") else {
-            panic!("catalog /Pages must remain direct");
+            panic!("catalog /Pages must remain direct"); // cov:ignore: direct-root preservation is asserted by the successful rebuild above
         };
         assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
         for page_ref in result.new_kids {
