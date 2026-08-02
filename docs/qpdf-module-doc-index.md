@@ -22,7 +22,7 @@
 | `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
-| `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc partial helper surface; public APIs are incomplete |
+| `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |

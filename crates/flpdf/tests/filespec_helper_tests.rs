@@ -7,8 +7,8 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, FileParamDates, FileSpec, FileSpecBuilder,
-    Object, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error,
+    FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -80,6 +80,42 @@ fn build_attachment_pdf(filespec_extras: &str, ef_params: &str, payload: &[u8]) 
     out
 }
 
+/// Add an unrelated xref entry whose body is malformed. This lets a helper
+/// setter exercise the failure path in Pdf's direct-owner discovery without
+/// making the Filespec owner itself malformed.
+fn attachment_pdf_with_malformed_unrelated_object() -> Vec<u8> {
+    let mut out = build_attachment_pdf("", "", b"data");
+    let xref_start = out
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("fixture has xref");
+    out.truncate(xref_start);
+
+    let mut offsets = Vec::new();
+    for number in 1..=6 {
+        let header = format!("{number} 0 obj\n");
+        offsets.push(
+            out.windows(header.len())
+                .position(|window| window == header.as_bytes())
+                .expect("fixture object header") as u64,
+        );
+    }
+    let malformed_offset = out.len() as u64;
+    out.extend_from_slice(b"7 0 obj\n<< /Broken [ >>\nendobj\n");
+
+    let rebuilt_xref = out.len();
+    out.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for offset in offsets {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("{malformed_offset:010} 00000 n \n").as_bytes());
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{rebuilt_xref}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 #[test]
 fn embedded_file_resolves_indirect_ef_dictionary() {
     let mut pdf = open(build_attachment_pdf("", "", b"payload"));
@@ -90,7 +126,7 @@ fn embedded_file_resolves_indirect_ef_dictionary() {
     pdf.set_object(ObjectRef::new(7, 0), ef_dict);
     fs_dict.insert("EF", Object::Reference(ObjectRef::new(7, 0)));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(fs_dict));
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
 
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
 
@@ -109,9 +145,421 @@ fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
 fn filename_returns_f_bytes() {
     let bytes = build_attachment_pdf("", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let name = fs.filename().expect("filename()");
     assert_eq!(name, Some(b"attachment.txt".to_vec()));
+}
+
+// ── qpdf-shaped FileSpec getters ────────────────────────────────────────────
+
+#[test]
+fn get_filename_prefers_uf_and_decodes_pdf_text() {
+    // This fails if lookup uses alphabetical order, if it chooses /F before
+    // /UF, or if it exposes the stored UTF-16BE bytes rather than qpdf's
+    // getUTF8Value() result.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("F", Object::String(b"fallback.txt".to_vec()));
+    filespec.insert("UF", Object::String(encode_utf16be("東京.txt")));
+    filespec.insert("Unix", Object::String(b"unix.txt".to_vec()));
+    filespec.insert("DOS", Object::String(b"dos.txt".to_vec()));
+    filespec.insert("Mac", Object::String(b"mac.txt".to_vec()));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    assert_eq!(fs.get_filename().unwrap(), "東京.txt".as_bytes().to_vec());
+}
+
+#[test]
+fn filespec_helper_accepts_a_direct_dictionary_handle() {
+    // QPDFFileSpecObjectHelper accepts QPDFObjectHandle, not only an
+    // indirect object number. A direct dictionary must therefore participate
+    // in the same preferred filename lookup.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let direct = ObjectHandle::dictionary(vec![(
+        b"UF".to_vec(),
+        ObjectHandle::string(encode_utf16be("直接.txt")),
+    )]);
+    let mut filespec = FileSpec::new(direct, &mut pdf).unwrap();
+
+    filespec.set_description("direct description").unwrap();
+
+    assert_eq!(
+        filespec.get_filename().unwrap(),
+        "直接.txt".as_bytes().to_vec()
+    );
+    assert_eq!(
+        filespec.get_description().unwrap(),
+        b"direct description".to_vec()
+    );
+}
+
+#[test]
+fn qpdf_helpers_treat_a_nonmatching_direct_handle_as_empty_or_noop() {
+    // qpdf helpers accept any ObjectHandle. Its null-dictionary semantics make
+    // all Filespec getters empty and its setters no-ops; an EF helper similarly
+    // has no metadata and rejects payload access when its handle is not a
+    // stream.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut filespec = FileSpec::new(ObjectHandle::null(), &mut pdf).unwrap();
+    assert_eq!(filespec.filename().unwrap(), None);
+    assert_eq!(filespec.uf().unwrap(), None);
+    assert_eq!(filespec.description().unwrap(), None);
+    assert_eq!(filespec.af_relationship().unwrap(), None);
+    assert_eq!(filespec.get_description().unwrap(), Vec::<u8>::new());
+    assert_eq!(filespec.get_filename().unwrap(), Vec::<u8>::new());
+    assert!(filespec.get_filenames().unwrap().is_empty());
+    assert!(filespec.get_embedded_file_streams().unwrap().is_null());
+    assert!(filespec.get_embedded_file_stream("").unwrap().is_null());
+    assert!(filespec.embedded_file().unwrap().is_none());
+    filespec.set_description("ignored").unwrap();
+    filespec.set_filename("ignored", None).unwrap();
+    drop(filespec);
+
+    let mut embedded = EmbeddedFileStream::new(ObjectHandle::null(), &mut pdf).unwrap();
+    assert!(embedded.payload().is_err());
+    assert_eq!(embedded.mimetype().unwrap(), None);
+    assert_eq!(embedded.creation_date().unwrap(), None);
+    assert_eq!(embedded.modification_date().unwrap(), None);
+    assert_eq!(embedded.checksum().unwrap(), None);
+    assert_eq!(embedded.size().unwrap(), None);
+    embedded.set_creation_date(b"ignored").unwrap();
+    embedded.set_mod_date(b"ignored").unwrap();
+    embedded.set_subtype(b"ignored").unwrap();
+}
+
+#[test]
+fn qpdf_public_helper_surface_uses_object_handles_and_fluent_setters() {
+    // The qpdf headers expose object-handle factories/getters and fluent
+    // setters. Keep that boundary in the Rust translation instead of leaking
+    // ObjectRef or raw Object through the qpdf-shaped methods.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let embedded_handle = EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").unwrap();
+    assert!(embedded_handle.object_ref().is_some());
+    let filespec_handle =
+        FileSpec::create_file_spec(&mut pdf, "handle.txt", embedded_handle.clone()).unwrap();
+    assert!(filespec_handle.object_ref().is_some());
+
+    let mut filespec = FileSpec::new(filespec_handle, &mut pdf).unwrap();
+    filespec
+        .set_description("description")
+        .unwrap()
+        .set_filename("handle.txt", None)
+        .unwrap();
+    let stream_handle = filespec.get_embedded_file_stream("F").unwrap();
+    assert_eq!(stream_handle.object_ref(), embedded_handle.object_ref());
+    assert!(filespec
+        .get_embedded_file_streams()
+        .unwrap()
+        .as_dictionary()
+        .is_some());
+    drop(filespec);
+
+    let mut embedded = EmbeddedFileStream::new(embedded_handle, &mut pdf).unwrap();
+    embedded
+        .set_creation_date(b"D:20260101000000Z")
+        .unwrap()
+        .set_mod_date(b"D:20260202000000Z")
+        .unwrap()
+        .set_subtype(b"text/plain")
+        .unwrap();
+    assert_eq!(embedded.get_subtype().unwrap(), b"text/plain");
+}
+
+#[test]
+fn factories_allocate_after_handle_only_objects() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let handle_only = pdf
+        .make_indirect_object_handle(ObjectHandle::integer(17))
+        .unwrap();
+    let handle_only_ref = handle_only.object_ref().unwrap();
+
+    let embedded = EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").unwrap();
+    assert_ne!(embedded.object_ref(), Some(handle_only_ref));
+    assert_eq!(
+        pdf.resolve(handle_only_ref).unwrap(),
+        Object::Integer(17),
+        "factory allocation must not clobber a handle-only object"
+    );
+}
+
+#[test]
+fn filespec_factory_indirectizes_a_direct_embedded_stream() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let direct_stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"payload".to_vec());
+    let filespec_handle =
+        FileSpec::create_file_spec(&mut pdf, "direct.bin", direct_stream).unwrap();
+
+    let mut filespec = FileSpec::new(filespec_handle, &mut pdf).unwrap();
+    let stream_handle = filespec.get_embedded_file_stream("F").unwrap();
+    assert!(stream_handle.object_ref().is_some());
+    assert_eq!(
+        filespec
+            .embedded_file()
+            .unwrap()
+            .unwrap()
+            .payload()
+            .unwrap(),
+        b"payload"
+    );
+}
+
+#[test]
+fn filespec_direct_setter_does_not_mutate_before_owner_discovery_succeeds() {
+    // qpdf's direct ObjectHandle mutation cannot fail after changing the
+    // object: it has no separate dirty-owner discovery phase. In Rust that
+    // discovery is needed for incremental writing, so it must happen before
+    // changing a direct Filespec child.
+    let mut pdf = open(attachment_pdf_with_malformed_unrelated_object());
+    let owner_ref = ObjectRef::new(8, 0);
+    let mut owner_dict = Dictionary::new();
+    owner_dict.insert("Filespec", Object::Dictionary(Dictionary::new()));
+    pdf.set_object(owner_ref, Object::Dictionary(owner_dict));
+    let owner = pdf.get_object_handle(owner_ref);
+    pdf.resolve_object_handle(&owner).unwrap();
+    let direct_filespec = owner.get_key(b"Filespec");
+
+    let mut filespec = FileSpec::new(direct_filespec.clone(), &mut pdf).unwrap();
+    assert!(filespec.set_description("new description").is_err());
+
+    assert!(
+        direct_filespec.get_key(b"Desc").is_null(),
+        "a failed owner lookup must not leave a direct Filespec changed but unmarked"
+    );
+}
+
+#[test]
+fn direct_embedded_stream_metadata_setters_update_existing_and_new_params() {
+    // qpdf's helpers also accept direct stream handles. Exercise both direct
+    // /Params update and creation: neither path has an indirect owner to mark.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let direct_params = ObjectHandle::dictionary(vec![(
+        b"Params".to_vec(),
+        ObjectHandle::dictionary(vec![(
+            b"CreationDate".to_vec(),
+            ObjectHandle::string(b"old".to_vec()),
+        )]),
+    )]);
+    let mut existing = EmbeddedFileStream::new(
+        ObjectHandle::stream(direct_params, b"existing".to_vec()),
+        &mut pdf,
+    )
+    .unwrap();
+    existing.set_creation_date(b"new").unwrap();
+    existing.set_subtype(b"application/test").unwrap();
+    assert_eq!(existing.creation_date().unwrap(), Some(b"new".to_vec()));
+    assert_eq!(
+        existing.mimetype().unwrap(),
+        Some(b"application/test".to_vec())
+    );
+
+    let mut absent = EmbeddedFileStream::new(
+        ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"absent".to_vec()),
+        &mut pdf,
+    )
+    .unwrap();
+    absent.set_mod_date(b"created").unwrap();
+    assert_eq!(
+        absent.modification_date().unwrap(),
+        Some(b"created".to_vec())
+    );
+}
+
+#[test]
+fn filespec_factory_rejects_an_indirect_handle_from_another_pdf() {
+    let mut source = open(build_attachment_pdf("", "", b"source"));
+    let foreign = EmbeddedFileStream::create_ef_stream(&mut source, b"payload").unwrap();
+    let mut destination = open(build_attachment_pdf("", "", b"destination"));
+
+    assert!(matches!(
+        FileSpec::create_file_spec(&mut destination, "foreign.bin", foreign),
+        Err(Error::Unsupported(message)) if message == "embedded-file handle belongs to another Pdf"
+    ));
+}
+
+#[test]
+fn embedded_file_helper_chases_a_reference_holder_to_the_terminal_stream() {
+    let mut pdf = open(build_attachment_pdf("", "", b"payload"));
+    let stream_ref = ObjectRef::new(6, 0);
+    let holder_ref = ObjectRef::new(7, 0);
+    pdf.set_object(holder_ref, Object::Reference(stream_ref));
+    let holder = pdf.get_object_handle(holder_ref);
+    let mut embedded = EmbeddedFileStream::new(holder, &mut pdf).unwrap();
+
+    assert_eq!(embedded.payload().unwrap(), b"payload");
+    embedded.set_subtype(b"application/pdf").unwrap();
+    drop(embedded);
+    let Object::Stream(stream) = pdf.resolve(stream_ref).unwrap() else {
+        panic!("expected stream");
+    };
+    assert_eq!(
+        stream.dict.get("Subtype"),
+        Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
+#[test]
+fn get_filenames_returns_only_string_name_keys_as_utf8() {
+    // This fails if a non-string name key leaks into qpdf's getFilenames
+    // result, or if the qpdf UTF-8 text conversion is skipped.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("UF", Object::String(encode_utf16be("日本語.txt")));
+    filespec.insert("F", Object::String(b"fallback.txt".to_vec()));
+    filespec.insert("Unix", Object::Integer(7));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    assert_eq!(
+        fs.get_filenames().unwrap(),
+        BTreeMap::from([
+            ("/F".to_string(), b"fallback.txt".to_vec()),
+            ("/UF".to_string(), "日本語.txt".as_bytes().to_vec()),
+        ])
+    );
+}
+
+#[test]
+fn get_filename_returns_none_when_no_recognized_entry_is_a_string() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("UF", Object::Integer(7));
+    filespec.insert("F", Object::Name(b"not-a-string".to_vec()));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    assert_eq!(fs.get_filename().unwrap(), Vec::<u8>::new());
+}
+
+#[test]
+fn get_embedded_file_stream_returns_requested_entry_and_ef_dictionary() {
+    // This fails if a named request applies the preferred-key stream filter,
+    // or if the raw /EF dictionary is reconstructed instead of returned.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+
+    assert_eq!(
+        fs.get_embedded_file_stream("F").unwrap().object_ref(),
+        Some(ObjectRef::new(6, 0))
+    );
+    let entries = fs
+        .get_embedded_file_streams()
+        .unwrap()
+        .as_dictionary()
+        .expect("expected /EF dictionary");
+    assert_eq!(
+        entries
+            .get(b"F".as_slice())
+            .and_then(ObjectHandle::object_ref),
+        Some(ObjectRef::new(6, 0))
+    );
+    assert_eq!(
+        entries
+            .get(b"UF".as_slice())
+            .and_then(ObjectHandle::object_ref),
+        Some(ObjectRef::new(6, 0))
+    );
+}
+
+#[test]
+fn get_embedded_file_stream_accepts_qpdf_filename_keys() {
+    // qpdf's getFilenames() returns slash-prefixed keys, and each must be
+    // directly usable as getEmbeddedFileStream(key).
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+
+    assert_eq!(
+        fs.get_embedded_file_stream("/F").unwrap().object_ref(),
+        Some(ObjectRef::new(6, 0))
+    );
+}
+
+#[test]
+fn get_embedded_file_stream_returns_null_when_no_candidate_is_a_stream() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    let mut entries = Dictionary::new();
+    entries.insert("UF", Object::Integer(3));
+    filespec.insert("EF", Object::Dictionary(entries));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    assert!(fs.get_embedded_file_stream("").unwrap().is_null());
+}
+
+#[test]
+fn qpdf_string_getters_preserve_invalid_utf8_bytes_without_panicking() {
+    // QPDFObjectHandle::getUTF8Value() returns std::string, whose bytes need
+    // not be valid UTF-8 when a stored string uses an explicit UTF-8 BOM.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("Desc", Object::String(vec![0xef, 0xbb, 0xbf, 0xff]));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    assert_eq!(fs.get_description().unwrap(), vec![0xff]);
+}
+
+#[test]
+fn qpdf_string_getters_resolve_indirect_strings_before_selecting_names() {
+    // QPDFObjectHandle::isString() dereferences its object handle, so a
+    // higher-priority indirect /UF must win over a direct /F. The same holds
+    // for getDescription() and every value returned by getFilenames().
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        Object::String(encode_utf16be("東京.txt")),
+    );
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::String(b"fallback.txt".to_vec()),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), Object::String(encode_utf16be("概要")));
+    let Object::Dictionary(mut filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected filespec dictionary");
+    };
+    filespec.insert("UF", Object::Reference(ObjectRef::new(7, 0)));
+    filespec.insert("F", Object::Reference(ObjectRef::new(8, 0)));
+    filespec.insert("Desc", Object::Reference(ObjectRef::new(9, 0)));
+    pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(filespec));
+
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    assert_eq!(fs.get_description().unwrap(), "概要".as_bytes().to_vec());
+    assert_eq!(fs.get_filename().unwrap(), "東京.txt".as_bytes().to_vec());
+    assert_eq!(
+        fs.get_filenames().unwrap(),
+        BTreeMap::from([
+            ("/F".to_string(), b"fallback.txt".to_vec()),
+            ("/UF".to_string(), "東京.txt".as_bytes().to_vec()),
+        ])
+    );
+}
+
+#[test]
+fn filespec_factories_reject_exhausted_object_number_space() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
+    let embedded_file = pdf.get_object_handle(ObjectRef::new(6, 0));
+
+    for result in [
+        EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").map(|_| ()),
+        FileSpec::create_file_spec(&mut pdf, b"report.txt", embedded_file).map(|_| ()),
+    ] {
+        assert!(
+            matches!(result, Err(Error::Unsupported(message)) if message == "object-number space exhausted"),
+            "factory must return an allocation error instead of wrapping object 0"
+        );
+    }
 }
 
 // ── FileSpec::uf ──────────────────────────────────────────────────────────────
@@ -120,7 +568,7 @@ fn filename_returns_f_bytes() {
 fn uf_returns_uf_bytes() {
     let bytes = build_attachment_pdf("", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let uf = fs.uf().expect("uf()");
     assert_eq!(uf, Some(b"attachment.txt".to_vec()));
 }
@@ -131,7 +579,7 @@ fn uf_returns_uf_bytes() {
 fn description_returns_desc_when_present() {
     let bytes = build_attachment_pdf("/Desc (A test file)", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let desc = fs.description().expect("description()");
     assert_eq!(desc, Some(b"A test file".to_vec()));
 }
@@ -140,7 +588,7 @@ fn description_returns_desc_when_present() {
 fn description_returns_none_when_absent() {
     let bytes = build_attachment_pdf("", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     assert_eq!(fs.description().expect("description()"), None);
 }
 
@@ -150,7 +598,7 @@ fn description_returns_none_when_absent() {
 fn af_relationship_returns_name_when_present() {
     let bytes = build_attachment_pdf("/AFRelationship /Source", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let rel = fs.af_relationship().expect("af_relationship()");
     assert_eq!(rel, Some(b"Source".to_vec()));
 }
@@ -159,7 +607,7 @@ fn af_relationship_returns_name_when_present() {
 fn af_relationship_returns_none_when_absent() {
     let bytes = build_attachment_pdf("", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     assert_eq!(fs.af_relationship().expect("af_relationship()"), None);
 }
 
@@ -170,7 +618,7 @@ fn payload_returns_raw_decoded_bytes() {
     let expected = b"Hello, world!\n";
     let bytes = build_attachment_pdf("", "", expected);
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()");
     let ef = ef.expect("Some(EmbeddedFileStream)");
     let payload = ef.payload().expect("payload()");
@@ -183,7 +631,7 @@ fn payload_returns_raw_decoded_bytes() {
 fn mimetype_returns_subtype_name() {
     let bytes = build_attachment_pdf("", "/Subtype /application#2fplain", b"text");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     // /Subtype is stored as raw name bytes (no leading /); the `#2f`
     // name escape decodes to `/`.
@@ -197,7 +645,7 @@ fn mimetype_returns_subtype_name() {
 fn mimetype_returns_none_when_absent() {
     let bytes = build_attachment_pdf("", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.mimetype().expect("mimetype()"), None);
 }
@@ -214,7 +662,7 @@ fn build_pdf_with_params(params_body: &str, payload: &[u8]) -> Vec<u8> {
 fn creation_date_returns_raw_pdf_date() {
     let bytes = build_pdf_with_params("/CreationDate (D:20260101000000Z)", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let date = ef.creation_date().expect("creation_date()");
     assert_eq!(date, Some(b"D:20260101000000Z".to_vec()));
@@ -224,7 +672,7 @@ fn creation_date_returns_raw_pdf_date() {
 fn modification_date_returns_raw_pdf_date() {
     let bytes = build_pdf_with_params("/ModDate (D:20260202120000+09'00')", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let date = ef.modification_date().expect("modification_date()");
     assert_eq!(date, Some(b"D:20260202120000+09'00'".to_vec()));
@@ -235,7 +683,7 @@ fn checksum_returns_raw_bytes() {
     // 16-byte MD5 checksum as a PDF hex string
     let bytes = build_pdf_with_params("/CheckSum <542266a1f565c3e5d8cfbd55eb7dfa40>", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(
         ef.checksum().expect("checksum()"),
@@ -250,22 +698,411 @@ fn checksum_returns_raw_bytes() {
 fn size_returns_integer() {
     let bytes = build_pdf_with_params("/Size 95", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let sz = ef.size().expect("size()");
     assert_eq!(sz, Some(95));
 }
 
 #[test]
+fn qpdf_size_clamps_to_unsigned_int_range() {
+    let bytes = build_pdf_with_params("/Size 4294967296", b"data");
+    let mut pdf = open(bytes);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.get_size().unwrap(), u32::MAX as usize);
+}
+
+#[test]
+fn qpdf_size_returns_zero_for_negative_integer() {
+    let bytes = build_pdf_with_params("/Size -1", b"data");
+    let mut pdf = open(bytes);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
+    assert_eq!(ef.get_size().unwrap(), 0);
+}
+
+#[test]
+fn indirect_metadata_scalars_are_dereferenced() {
+    // qpdf's QPDFObjectHandle dereferences every value before `isString`,
+    // `isInteger`, or `isName` inspects it. /Params itself is not the only
+    // indirection point: each scalar and /Subtype may be a holder reference.
+    let mut pdf = open(build_pdf_with_params(
+        "/CreationDate (D:20260101000000Z) /ModDate (D:20260202000000Z) /Size 95 /CheckSum <00112233445566778899aabbccddeeff>",
+        b"data",
+    ));
+    let Object::Stream(mut stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    let Object::Dictionary(mut params) = stream.dict.remove("Params").unwrap() else {
+        panic!("expected /Params dictionary");
+    };
+
+    for (key, object_ref) in [
+        ("CreationDate", ObjectRef::new(7, 0)),
+        ("ModDate", ObjectRef::new(8, 0)),
+        ("Size", ObjectRef::new(9, 0)),
+        ("CheckSum", ObjectRef::new(10, 0)),
+    ] {
+        let value = params.remove(key).expect("fixture metadata value");
+        pdf.set_object(object_ref, value);
+        params.insert(key, Object::Reference(object_ref));
+    }
+    stream.dict.insert("Params", Object::Dictionary(params));
+    pdf.set_object(
+        ObjectRef::new(12, 0),
+        Object::Name(b"application/pdf".to_vec()),
+    );
+    stream
+        .dict
+        .insert("Subtype", Object::Reference(ObjectRef::new(11, 0)));
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+    pdf.set_object(ObjectRef::new(6, 0), Object::Stream(stream));
+
+    let mut filespec =
+        FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    let embedded = filespec.embedded_file().unwrap().expect("embedded file");
+    assert_eq!(
+        embedded.mimetype().unwrap(),
+        Some(b"application/pdf".to_vec())
+    );
+    assert_eq!(
+        embedded.creation_date().unwrap(),
+        Some(b"D:20260101000000Z".to_vec())
+    );
+    assert_eq!(
+        embedded.modification_date().unwrap(),
+        Some(b"D:20260202000000Z".to_vec())
+    );
+    assert_eq!(embedded.size().unwrap(), Some(95));
+    assert_eq!(
+        embedded.checksum().unwrap(),
+        Some(vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ])
+    );
+}
+
+// ── qpdf-shaped EmbeddedFileStream metadata and mutation ────────────────────
+
+#[test]
+fn embedded_file_setters_update_the_live_stream_and_qpdf_getters() {
+    // This fails if a setter only changes a retained stream copy, if /Params
+    // is not created, or if qpdf's UTF-8 string view is skipped on readback.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        let mut ef = fs.embedded_file().unwrap().expect("embedded file");
+        ef.set_creation_date(b"D:20260101000000Z").unwrap();
+        ef.set_mod_date(b"D:20260202000000Z").unwrap();
+        ef.set_subtype(b"application/pdf").unwrap();
+
+        assert_eq!(
+            ef.get_creation_date().unwrap(),
+            b"D:20260101000000Z".to_vec()
+        );
+        assert_eq!(ef.get_mod_date().unwrap(), b"D:20260202000000Z".to_vec());
+        assert_eq!(ef.get_subtype().unwrap(), b"application/pdf".to_vec());
+        assert_eq!(ef.get_size().unwrap(), 0);
+        assert_eq!(ef.get_checksum().unwrap(), Vec::<u8>::new());
+    }
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    let Object::Dictionary(params) = stream.dict.get("Params").unwrap() else {
+        panic!("expected /Params dictionary");
+    };
+    assert_eq!(
+        params.get("CreationDate"),
+        Some(&Object::String(b"D:20260101000000Z".to_vec()))
+    );
+    assert_eq!(
+        params.get("ModDate"),
+        Some(&Object::String(b"D:20260202000000Z".to_vec()))
+    );
+    assert_eq!(
+        stream.dict.get("Subtype"),
+        Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
+#[test]
+fn metadata_setter_invalidates_a_previously_materialized_stream() {
+    // A qpdf object handle is the live value. Once metadata changes through
+    // that handle, a later legacy resolve and the writer must not reuse the
+    // pre-mutation materialized stream dictionary.
+    let mut pdf = open(build_attachment_pdf("", "", b"payload"));
+    let Object::Stream(before) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    assert!(before.dict.get("Subtype").is_none());
+
+    {
+        let mut filespec =
+            FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        let mut embedded = filespec.embedded_file().unwrap().expect("embedded file");
+        embedded.set_subtype(b"application/pdf").unwrap();
+    }
+
+    let Object::Stream(after) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    assert_eq!(
+        after.dict.get("Subtype"),
+        Some(&Object::Name(b"application/pdf".to_vec()))
+    );
+}
+
+#[test]
+fn embedded_file_setter_updates_indirect_params_dictionary() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut params = Dictionary::new();
+    params.insert("Size", Object::Integer(4));
+    pdf.set_object(ObjectRef::new(7, 0), Object::Dictionary(params));
+    let Object::Stream(mut stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    stream
+        .dict
+        .insert("Params", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Stream(stream));
+
+    {
+        let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        fs.embedded_file()
+            .unwrap()
+            .unwrap()
+            .set_creation_date(b"D:20260101000000Z")
+            .unwrap();
+    }
+
+    let Object::Dictionary(params) = pdf.resolve(ObjectRef::new(7, 0)).unwrap() else {
+        panic!("expected indirect /Params dictionary");
+    };
+    assert_eq!(
+        params.get("CreationDate"),
+        Some(&Object::String(b"D:20260101000000Z".to_vec()))
+    );
+}
+
+#[test]
+fn embedded_file_setter_replaces_non_dictionary_indirect_params() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    pdf.set_object(ObjectRef::new(7, 0), Object::Integer(4));
+    let Object::Stream(mut stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    stream
+        .dict
+        .insert("Params", Object::Reference(ObjectRef::new(7, 0)));
+    pdf.set_object(ObjectRef::new(6, 0), Object::Stream(stream));
+
+    {
+        let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        fs.embedded_file()
+            .unwrap()
+            .unwrap()
+            .set_mod_date(b"D:20260202000000Z")
+            .unwrap();
+    }
+
+    let Object::Stream(stream) = pdf.resolve(ObjectRef::new(6, 0)).unwrap() else {
+        panic!("expected embedded-file stream");
+    };
+    let Object::Dictionary(params) = stream.dict.get("Params").unwrap() else {
+        panic!("expected replacement /Params dictionary");
+    };
+    assert_eq!(
+        params.get("ModDate"),
+        Some(&Object::String(b"D:20260202000000Z".to_vec()))
+    );
+}
+
+#[test]
+fn qpdf_factories_create_filespec_and_embedded_file_objects() {
+    // This fails if either factory omits qpdf's /Type, computed EF parameters,
+    // shared /EF references, or newUnicodeString filename storage.
+    let mut pdf = open(build_attachment_pdf("", "", b"seed"));
+    let ef_handle = EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").unwrap();
+    let ef_ref = ef_handle.object_ref().unwrap();
+    let filespec_handle = FileSpec::create_file_spec(&mut pdf, "report.txt", ef_handle).unwrap();
+    let filespec_ref = filespec_handle.object_ref().unwrap();
+
+    let Object::Stream(ef) = pdf.resolve(ef_ref).unwrap() else {
+        panic!("expected EmbeddedFile stream");
+    };
+    assert_eq!(
+        ef.dict.get("Type"),
+        Some(&Object::Name(b"EmbeddedFile".to_vec()))
+    );
+    let Object::Dictionary(params) = ef.dict.get("Params").unwrap() else {
+        panic!("expected /Params");
+    };
+    assert_eq!(params.get("Size"), Some(&Object::Integer(7)));
+    assert_eq!(
+        params.get("CheckSum"),
+        Some(&Object::String(md5_checksum(b"payload")))
+    );
+
+    let Object::Dictionary(filespec) = pdf.resolve(filespec_ref).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("Type"),
+        Some(&Object::Name(b"Filespec".to_vec()))
+    );
+    assert_eq!(
+        filespec.get("F"),
+        Some(&Object::String(b"report.txt".to_vec()))
+    );
+    assert_eq!(
+        filespec.get("UF"),
+        Some(&Object::String(b"report.txt".to_vec()))
+    );
+    let Object::Dictionary(ef_entries) = filespec.get("EF").unwrap() else {
+        panic!("expected /EF");
+    };
+    assert_eq!(ef_entries.get("F"), Some(&Object::Reference(ef_ref)));
+    assert_eq!(ef_entries.get("UF"), Some(&Object::Reference(ef_ref)));
+}
+
+#[test]
+fn filespec_setters_use_qpdf_unicode_and_compatibility_rules() {
+    // This fails if description/filename writes bypass newUnicodeString, or
+    // if a non-empty compatibility name does not replace /F alone.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        fs.set_description("概要").unwrap();
+        fs.set_filename("東京.txt", Some(b"fallback.txt".as_slice()))
+            .unwrap();
+    }
+
+    let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("Desc"),
+        Some(&Object::String(encode_utf16be("概要")))
+    );
+    assert_eq!(
+        filespec.get("UF"),
+        Some(&Object::String(encode_utf16be("東京.txt")))
+    );
+    assert_eq!(
+        filespec.get("F"),
+        Some(&Object::String(b"fallback.txt".to_vec()))
+    );
+}
+
+#[test]
+fn filespec_set_filename_preserves_non_utf8_compatibility_bytes() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        fs.set_filename("東京.txt", Some(&[0x80, 0xff][..]))
+            .unwrap();
+    }
+
+    let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(filespec.get("F"), Some(&Object::String(vec![0x80, 0xff])));
+}
+
+#[test]
+fn filespec_set_filename_normalizes_non_utf8_unicode_bytes_like_qpdf() {
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    {
+        let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+        fs.set_filename([0xff], None).unwrap();
+    }
+
+    let Object::Dictionary(filespec) = pdf.resolve(ObjectRef::new(5, 0)).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("UF"),
+        Some(&Object::String(encode_utf16be("�")))
+    );
+    assert_eq!(filespec.get("F"), filespec.get("UF"));
+}
+
+#[test]
+fn builder_composes_helpers_for_qpdf_unicode_description() {
+    let mut pdf = open(build_attachment_pdf("", "", b"seed"));
+    let filespec_ref = FileSpecBuilder::new("report.txt", b"payload".as_slice())
+        .description("概要")
+        .build(&mut pdf)
+        .unwrap();
+
+    let Object::Dictionary(filespec) = pdf.resolve(filespec_ref).unwrap() else {
+        panic!("expected Filespec dictionary");
+    };
+    assert_eq!(
+        filespec.get("Desc"),
+        Some(&Object::String(encode_utf16be("概要")))
+    );
+}
+
+#[test]
+fn qpdf_path_factories_read_payload_and_make_filespec() {
+    // This fails if the Rust path equivalents of qpdf's file-provider
+    // overloads fail to preserve the file's decoded bytes.
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), b"from-path").unwrap();
+    let mut pdf = open(build_attachment_pdf("", "", b"seed"));
+
+    let ef_ref = EmbeddedFileStream::create_ef_stream_from_path(&mut pdf, file.path())
+        .unwrap()
+        .object_ref()
+        .unwrap();
+    let fs_ref = FileSpec::create_file_spec_from_path(&mut pdf, "path.txt", file.path())
+        .unwrap()
+        .object_ref()
+        .unwrap();
+    assert_eq!(
+        pdf.resolve(ef_ref).unwrap().as_stream().unwrap().data,
+        b"from-path"
+    );
+    let mut fs = FileSpec::new(pdf.get_object_handle(fs_ref), &mut pdf).unwrap();
+    assert_eq!(
+        fs.embedded_file().unwrap().unwrap().payload().unwrap(),
+        b"from-path"
+    );
+}
+
+#[test]
 fn params_absent_returns_none_for_all_fields() {
     let bytes = build_attachment_pdf("", "", b"data");
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.creation_date().expect("creation_date"), None);
     assert_eq!(ef.modification_date().expect("modification_date"), None);
     assert_eq!(ef.checksum().expect("checksum"), None);
     assert_eq!(ef.size().expect("size"), None);
+}
+
+#[test]
+fn qpdf_getters_use_empty_defaults_for_missing_string_values() {
+    // qpdf's std::string getters cannot distinguish an absent field from an
+    // empty string. The Rust qpdf-shaped surface mirrors that observable
+    // contract; raw optional accessors remain the inspection-level API.
+    let mut pdf = open(build_attachment_pdf("", "", b"data"));
+    let mut filespec =
+        FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
+    let embedded = filespec.embedded_file().unwrap().expect("embedded file");
+
+    assert_eq!(embedded.get_creation_date().unwrap(), Vec::<u8>::new());
+    assert_eq!(embedded.get_mod_date().unwrap(), Vec::<u8>::new());
+    assert_eq!(embedded.get_subtype().unwrap(), Vec::<u8>::new());
+    assert_eq!(embedded.get_checksum().unwrap(), Vec::<u8>::new());
 }
 
 // ── embedded_file returns None when /EF is missing ───────────────────────────
@@ -295,7 +1132,7 @@ fn embedded_file_returns_none_when_ef_absent() {
     );
 
     let mut pdf = open(out);
-    let mut fs = FileSpec::new(ObjectRef::new(4, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(4, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()");
     assert!(ef.is_none(), "expected None when /EF absent");
 }
@@ -319,7 +1156,7 @@ fn fixture_attachment_two_page() {
     // In attachment-two-page.pdf:
     //   5 0 R  Filespec  (/F (attachment.txt) /UF (attachment.txt) /EF << /F 8 0 R /UF 8 0 R >>)
     //   8 0 R  EmbeddedFile stream (FlateDecode, /Params /Size 95)
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
 
     // filename
     let name = fs.filename().expect("filename()");
@@ -425,7 +1262,7 @@ fn embedded_file_prefers_uf_over_f() {
     // /F and /UF point at different streams; /UF must win.
     let bytes = build_pdf_with_ef_keys(&[("F", b"from-F"), ("UF", b"from-UF")]);
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), b"from-UF".to_vec());
 }
@@ -435,7 +1272,7 @@ fn embedded_file_falls_back_to_platform_keys() {
     // Only /Unix present — must still resolve via the fallback chain.
     let bytes = build_pdf_with_ef_keys(&[("Unix", b"unix-payload")]);
     let mut pdf = open(bytes);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), b"unix-payload".to_vec());
 }
@@ -492,7 +1329,7 @@ fn params_indirect_reference_resolves() {
     );
 
     let mut pdf = open(out);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.size().expect("size()"), Some(15));
     assert_eq!(
@@ -555,7 +1392,7 @@ fn embedded_file_skips_non_stream_higher_priority_key() {
     );
 
     let mut pdf = open(out);
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
 }
@@ -671,27 +1508,17 @@ fn builder_round_trip_all_fields() {
         .expect("build()");
 
     // ── /F (filename) ────────────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let fname = fs.filename().expect("filename()");
     assert_eq!(fname, Some(b"report.txt".to_vec()), "/F mismatch");
 
-    // ── /UF (UTF-16BE with BOM) ───────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    // ── /UF (qpdf newUnicodeString) ──────────────────────────────────────────
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let uf = fs.uf().expect("uf()").expect("/UF should be present");
-    assert!(
-        uf.starts_with(&[0xFE, 0xFF]),
-        "/UF must start with BOM FE FF"
-    );
-    // Decode UF back: skip BOM, read u16 pairs
-    let units: Vec<u16> = uf[2..]
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    let decoded = String::from_utf16(&units).expect("UTF-16BE decode");
-    assert_eq!(decoded, "report.txt", "/UF decoded filename mismatch");
+    assert_eq!(uf, b"report.txt", "ASCII /UF must be PDFDocEncoding");
 
     // ── /Desc ────────────────────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let desc = fs.description().expect("description()");
     assert_eq!(
         desc,
@@ -700,12 +1527,12 @@ fn builder_round_trip_all_fields() {
     );
 
     // ── /AFRelationship ───────────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let rel = fs.af_relationship().expect("af_relationship()");
     assert_eq!(rel, Some(b"Data".to_vec()), "/AFRelationship mismatch");
 
     // ── /EmbeddedFile payload ─────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs
         .embedded_file()
         .expect("embedded_file()")
@@ -714,7 +1541,7 @@ fn builder_round_trip_all_fields() {
     assert_eq!(got_payload, payload.to_vec(), "payload mismatch");
 
     // ── MIME type (round-trips through name escape) ───────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let mime = ef.mimetype().expect("mimetype()");
     assert_eq!(
@@ -724,13 +1551,13 @@ fn builder_round_trip_all_fields() {
     );
 
     // ── /Params /Size ─────────────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let sz = ef.size().expect("size()");
     assert_eq!(sz, Some(payload.len() as i64), "/Params /Size mismatch");
 
     // ── /Params /CheckSum (MD5 of payload) ───────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let cs = ef.checksum().expect("checksum()").expect("Some checksum");
     assert_eq!(cs.len(), 16, "checksum must be 16 bytes");
@@ -741,7 +1568,7 @@ fn builder_round_trip_all_fields() {
     );
 
     // ── /Params /CreationDate ─────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let cdate = ef.creation_date().expect("creation_date()");
     assert_eq!(
@@ -751,7 +1578,7 @@ fn builder_round_trip_all_fields() {
     );
 
     // ── /Params /ModDate ──────────────────────────────────────────────────────
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let mdate = ef.modification_date().expect("modification_date()");
     assert_eq!(
@@ -771,23 +1598,23 @@ fn builder_round_trip_minimal() {
         .build(&mut pdf)
         .expect("build()");
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     assert_eq!(
         fs.filename().expect("filename()"),
         Some(b"tiny.bin".to_vec())
     );
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let uf = fs.uf().expect("uf()").expect("/UF present");
-    assert!(uf.starts_with(&[0xFE, 0xFF]), "/UF BOM missing");
+    assert_eq!(uf, b"tiny.bin", "ASCII /UF must be PDFDocEncoding");
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     assert_eq!(fs.description().expect("description()"), None);
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     assert_eq!(fs.af_relationship().expect("af_relationship()"), None);
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(ef.payload().expect("payload()"), payload.to_vec());
     assert_eq!(ef.mimetype().expect("mimetype()"), None);
@@ -800,27 +1627,49 @@ fn builder_round_trip_minimal() {
     );
 }
 
-/// /UF is UTF-16BE encoded with BOM for a Unicode filename.
 #[test]
-fn builder_uf_is_utf16be_with_bom() {
+fn builder_compresses_embedded_payload_when_requested() {
+    let mut pdf = build_minimal_pdf();
+    let payload = b"compress this attachment payload";
+    let filespec_ref = FileSpecBuilder::new("compressed.txt", payload.as_slice())
+        .compress(true)
+        .build(&mut pdf)
+        .expect("build compressed filespec");
+
+    let stream_ref = {
+        let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
+        filespec
+            .get_embedded_file_stream("F")
+            .expect("embedded stream")
+            .object_ref()
+            .expect("expected indirect embedded stream")
+    };
+    let Object::Stream(stream) = pdf.resolve(stream_ref).expect("stream") else {
+        panic!("expected embedded-file stream");
+    };
+    assert_eq!(
+        stream.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+
+    let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
+    let embedded = filespec.embedded_file().unwrap().expect("embedded file");
+    assert_eq!(embedded.payload().unwrap(), payload);
+}
+
+/// /UF follows qpdf's newUnicodeString rule for an ASCII filename.
+#[test]
+fn builder_uf_uses_pdfdocencoding_for_ascii() {
     let mut pdf = build_minimal_pdf();
     let payload = b"data";
     let filespec_ref = FileSpecBuilder::new("ascii.txt", payload.as_slice())
         .build(&mut pdf)
         .expect("build()");
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let uf = fs.uf().expect("uf()").expect("/UF present");
 
-    // BOM must be first two bytes.
-    assert_eq!(&uf[..2], &[0xFE, 0xFF], "BOM missing");
-
-    // Decode and verify filename.
-    let units: Vec<u16> = uf[2..]
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
-        .collect();
-    assert_eq!(String::from_utf16(&units).expect("utf16"), "ascii.txt");
+    assert_eq!(uf, b"ascii.txt");
 }
 
 /// /Params date format must follow D:YYYYMMDDHHmmSSZ.
@@ -836,7 +1685,7 @@ fn builder_params_date_format_is_pdf_date() {
         .build(&mut pdf)
         .expect("build()");
 
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(filespec_ref), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     let cdate = ef.creation_date().expect("creation_date()").expect("Some");
     // D:YYYYMMDDHHmmSSZ
@@ -880,7 +1729,7 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
 
     // Reopen the serialized bytes and read /Subtype back.
     let mut pdf2 = open(serialized);
-    let mut fs = FileSpec::new(filespec_ref, &mut pdf2);
+    let mut fs = FileSpec::new(pdf2.get_object_handle(filespec_ref), &mut pdf2).unwrap();
     let ef = fs
         .embedded_file()
         .expect("embedded_file()")
@@ -923,7 +1772,7 @@ fn params_follows_holder_chain() {
         .insert("Params", Object::Reference(ObjectRef::new(8, 0)));
     pdf.set_object(ObjectRef::new(6, 0), Object::Stream(ef_stream));
 
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(
         ef.size().expect("size()"),
@@ -951,7 +1800,7 @@ fn embedded_file_ef_dict_follows_holder_chain() {
     fs_dict.insert("EF", Object::Reference(ObjectRef::new(7, 0)));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(fs_dict));
 
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(
         ef.payload().expect("payload()"),
@@ -984,7 +1833,7 @@ fn embedded_file_stream_entry_follows_holder_chain() {
     fs_dict.insert("EF", Object::Dictionary(ef_dict));
     pdf.set_object(ObjectRef::new(5, 0), Object::Dictionary(fs_dict));
 
-    let mut fs = FileSpec::new(ObjectRef::new(5, 0), &mut pdf);
+    let mut fs = FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).unwrap();
     let ef = fs.embedded_file().expect("embedded_file()").expect("Some");
     assert_eq!(
         ef.payload().expect("payload()"),
