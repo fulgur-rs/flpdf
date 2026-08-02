@@ -940,11 +940,31 @@ mod tests {
     fn resolve_defaults_to_zero_for_a_parent_cycle() {
         let bytes = build_single_page_pdf(None, None);
         let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
-        let Object::Dictionary(mut parent) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
-            panic!("parent must be a dictionary");
-        };
+        let mut parent = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .unwrap()
+            .into_dict()
+            .expect("parent must be a dictionary");
         parent.insert("Parent", Object::Reference(ObjectRef::new(3, 0)));
         pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn resolve_defaults_to_zero_for_a_non_dictionary_parent() {
+        let bytes = build_single_page_pdf(None, None);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+        let mut page = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("page must be a dictionary");
+        page.insert("Parent", Object::Integer(42));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
 
         assert_eq!(
             resolve_inherited_rotate(&mut pdf, ObjectRef::new(3, 0)).unwrap(),

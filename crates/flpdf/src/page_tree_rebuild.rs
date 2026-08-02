@@ -792,10 +792,29 @@ mod tests {
     #[test]
     fn raw_inherited_lookup_stops_at_a_parent_cycle() {
         let mut pdf = open(build_nested_pdf());
-        let Object::Dictionary(mut parent) = pdf.resolve(ObjectRef::new(3, 0)).unwrap() else {
-            panic!("intermediate node must be a dictionary");
-        };
+        let mut parent = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("intermediate node must be a dictionary");
         parent.insert("Parent", Object::Reference(ObjectRef::new(4, 0)));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent));
+
+        assert_eq!(
+            resolve_inherited_raw(&mut pdf, ObjectRef::new(4, 0), "BleedBox", 10).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn raw_inherited_lookup_stops_at_a_non_dictionary_parent() {
+        let mut pdf = open(build_nested_pdf());
+        let mut parent = pdf
+            .resolve(ObjectRef::new(3, 0))
+            .unwrap()
+            .into_dict()
+            .expect("intermediate node must be a dictionary");
+        parent.insert("Parent", Object::Integer(42));
         pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(parent));
 
         assert_eq!(

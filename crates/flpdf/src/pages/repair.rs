@@ -4048,9 +4048,11 @@ mod tests {
     fn root_pages_scalar_parent_replaces_catalog_root_and_yields_no_tree() {
         let mut pdf =
             Pdf::open(Cursor::new(pdf_with_root_pages_non_reference_parent())).expect("valid PDF");
-        let Object::Dictionary(mut root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {
-            panic!("pages root must be a dictionary");
-        };
+        let mut root = pdf
+            .resolve(ObjectRef::new(2, 0))
+            .unwrap()
+            .into_dict()
+            .expect("pages root must be a dictionary");
         root.insert("Parent", Object::Integer(42));
         pdf.set_object(ObjectRef::new(2, 0), Object::Dictionary(root));
 
@@ -4058,9 +4060,11 @@ mod tests {
             prepare_for_optimization(&mut pdf).unwrap().is_none(),
             "a scalar parent leaves qpdf with no dictionary page tree to enumerate"
         );
-        let Object::Dictionary(catalog) = pdf.resolve(ObjectRef::new(1, 0)).unwrap() else {
-            panic!("catalog must be a dictionary");
-        };
+        let catalog = pdf
+            .resolve(ObjectRef::new(1, 0))
+            .unwrap()
+            .into_dict()
+            .expect("catalog must be a dictionary");
         assert_eq!(catalog.get("Pages"), Some(&Object::Integer(42)));
     }
 }
