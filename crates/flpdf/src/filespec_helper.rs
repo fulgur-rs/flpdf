@@ -80,7 +80,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::filters::{decode_stream_data, encode_stream_data};
+use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
@@ -1127,26 +1127,6 @@ where
     let filespec_ref = FileSpecBuilder::new(ascii_filename_fallback(basename), raw)
         .uf_filename(basename)
         .build(pdf)?;
-    let stream_ref = {
-        let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
-        filespec
-            .get_embedded_file_stream("F")?
-            .object_ref()
-            .expect("FileSpecBuilder must create an indirect embedded-file stream")
-    };
-    let Object::Stream(mut stream) = pdf.resolve(stream_ref)? else {
-        unreachable!("FileSpecBuilder must create an embedded-file stream");
-    };
-    let mut encode_dict = Dictionary::new();
-    encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    stream.data = encode_stream_data(&encode_dict, &stream.data)?;
-    stream
-        .dict
-        .insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-    stream
-        .dict
-        .insert("Length", Object::Integer(stream.data.len() as i64));
-    pdf.set_object(stream_ref, Object::Stream(stream));
     crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
 
     Ok(filespec_ref)
@@ -1978,16 +1958,15 @@ mod tests {
         assert_eq!(entries[0].0, b"hello.txt");
         assert_eq!(entries[0].1, fs_ref);
 
-        // The high-level helper deliberately adds compression after the qpdf
-        // factory has created the raw stream.
+        // qpdf's addAttachments delegates to createFileSpec/createEFStream;
+        // stream compression is selected later by the writer, not this helper.
         let stream = resolve_ef_stream(&mut pdf, fs_ref);
         assert_eq!(
             stream.dict.get("Filter"),
-            Some(&Object::Name(b"FlateDecode".to_vec())),
-            "high-level attachment helper must use FlateDecode"
+            None,
+            "attachment construction must not install a helper-local filter"
         );
-        let decoded = decode_stream_data(&stream.dict, &stream.data).expect("decode");
-        assert_eq!(decoded.as_slice(), raw.as_ref());
+        assert_eq!(stream.data, raw);
     }
 
     #[test]
