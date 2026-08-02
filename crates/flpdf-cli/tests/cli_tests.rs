@@ -6762,6 +6762,17 @@ fn rewrite_flatten_annotations_rejects_invalid_mode() {
         .stderr(predicate::str::contains("flatten-annotations"));
 }
 
+#[test]
+fn rewrite_help_describes_screen_mode_as_including_printable_annotations() {
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["rewrite", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("including printable annotations"))
+        .stdout(predicate::str::contains("not when printed").not());
+}
+
 /// Combining `--linearize` with the flatten/generate passes is rejected loudly
 /// rather than silently dropping the requested transformation (the passes only
 /// run on the non-linearize rewrite branch).

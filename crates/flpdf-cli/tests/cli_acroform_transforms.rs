@@ -81,6 +81,46 @@ fn tx_widget_without_ap() -> Vec<u8> {
     ])
 }
 
+/// Same fixture as [`tx_widget_without_ap`], but requires viewer-side
+/// appearance generation until the CLI's generation pass clears the flag.
+fn tx_widget_without_ap_needing_appearances() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) \
+          /V (Hello) /DA (/Helv 12 Tf 0 g) \
+          /Rect [100 700 300 720] /P 3 0 R >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+    ])
+}
+
+/// Same as [`tx_widget_without_ap_needing_appearances`], except `/AP/N` is an
+/// indirect null. qpdf treats that as a missing normal appearance and replaces
+/// it while generating appearances.
+fn tx_widget_with_null_ap_n_needing_appearances() -> Vec<u8> {
+    assemble_pdf(&[
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+          /AcroForm << /Fields [4 0 R] /NeedAppearances true /DR << >> /DA (/Helv 12 Tf 0 g) >> >>\nendobj\n"
+            .to_vec(),
+        b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n".to_vec(),
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Contents 5 0 R /Annots [4 0 R] >>\nendobj\n"
+            .to_vec(),
+        b"4 0 obj\n<< /Type /Annot /Subtype /Widget /FT /Tx /T (name1) \
+          /V (Hello) /DA (/Helv 12 Tf 0 g) \
+          /Rect [100 700 300 720] /P 3 0 R /AP << /N 6 0 R >> >>\nendobj\n"
+            .to_vec(),
+        b"5 0 obj\n<< /Length 14 >>\nstream\nBT (pg) Tj ET\nendstream\nendobj\n".to_vec(),
+        b"6 0 obj\nnull\nendobj\n".to_vec(),
+    ])
+}
+
 /// Single-page AcroForm PDF with a Tx widget that has `/V` AND an existing
 /// `/AP/N` Form XObject containing the literal value bytes.
 /// Objects: 1=Catalog, 2=Pages, 3=Page, 4=Widget, 5=Contents, 6=AP/N XObject
@@ -549,12 +589,80 @@ fn generate_then_flatten_all_do_in_content() {
     );
 }
 
+/// qpdf clears `/NeedAppearances` after generating widget appearances, so the
+/// immediately following flatten pass must not preserve those widgets.
+#[test]
+fn generate_then_flatten_clears_need_appearances() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("tx_need_appearances.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_widget_without_ap_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--generate-appearances",
+            "--flatten-annotations=all",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    assert!(
+        flpdf::enumerate_page_annotations(&mut pdf, page_ref)
+            .unwrap()
+            .is_empty(),
+        "generated widget must be flattened after qpdf clears NeedAppearances"
+    );
+}
+
+#[test]
+fn generate_then_flatten_replaces_indirect_null_normal_appearance() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("tx_null_ap_n.pdf");
+    let output = temp.path().join("out.pdf");
+    std::fs::write(&input, tx_widget_with_null_ap_n_needing_appearances()).unwrap();
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--generate-appearances",
+            "--flatten-annotations=all",
+            "--compress-streams=n",
+        ])
+        .arg(&input)
+        .arg(&output)
+        .assert()
+        .success();
+
+    let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
+    let page_ref = flpdf::pages::page_refs(&mut pdf).unwrap()[0];
+    assert!(
+        flpdf::enumerate_page_annotations(&mut pdf, page_ref)
+            .unwrap()
+            .is_empty(),
+        "generated widget must be flattened after qpdf clears NeedAppearances"
+    );
+    let content = flpdf::pages::page_content_bytes(&mut pdf, page_ref).unwrap();
+    assert!(
+        content.windows(2).any(|window| window == b"Do"),
+        "an indirect null /AP/N must be regenerated before flattening; content={:?}",
+        std::str::from_utf8(&content).unwrap_or("<non-utf8>")
+    );
+}
+
 // ── Tests: flatten=print ──────────────────────────────────────────────────────
 
-/// `--flatten-annotations=print` removes only annotations with the Print bit
-/// (bit 3, /F & 0x4 != 0) and leaves annotations without it in `/Annots`.
+/// `--flatten-annotations=print` draws only Print annotations, but qpdf drops
+/// every annotation that has a selected appearance stream.
 #[test]
-fn flatten_print_removes_print_bit_annot_only() {
+fn flatten_print_draws_print_bit_annot_and_removes_all_selected_appearances() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("two_annots.pdf");
     let output = temp.path().join("out.pdf");
@@ -575,33 +683,8 @@ fn flatten_print_removes_print_bit_annot_only() {
     let mut pdf = Pdf::open(BufReader::new(File::open(&output).unwrap())).unwrap();
     let page_refs = flpdf::pages::page_refs(&mut pdf).unwrap();
 
-    // Exactly one annotation must remain (the non-Print one).
     let annots = flpdf::enumerate_page_annotations(&mut pdf, page_refs[0]).unwrap();
-    assert_eq!(
-        annots.len(),
-        1,
-        "flatten=print must leave exactly 1 annotation (the non-Print one), found {}",
-        annots.len()
-    );
-
-    // The surviving annotation must be the non-Print widget. Identify it by
-    // the behavioral property (Print bit clear in /F) rather than its object
-    // number, which is unstable under the Catalog-first renumber. An absent /F
-    // means no flags set, i.e. no Print bit — that is exactly the survivor.
-    let survivor = pdf.resolve(annots[0].annot_ref).unwrap();
-    let survivor_dict = survivor
-        .as_dict()
-        .expect("surviving annotation must resolve to a dictionary");
-    // An absent /F means no flags set, i.e. no Print bit — that is the survivor.
-    let f = survivor_dict
-        .get("F")
-        .and_then(|o| o.as_integer())
-        .unwrap_or(0);
-    assert_eq!(
-        f & 0x4,
-        0,
-        "surviving annotation must be the non-Print widget (Print bit clear in /F), got /F={f}"
-    );
+    assert!(annots.is_empty());
 
     // Page content must have a Do (from the Print-bit annotation being flattened).
     let content = flpdf::pages::page_content_bytes(&mut pdf, page_refs[0]).unwrap();

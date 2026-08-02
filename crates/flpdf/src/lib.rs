@@ -122,7 +122,7 @@ pub(crate) mod overlay;
 pub(crate) mod overlay_annotations;
 pub(crate) mod overlay_appearance_stream;
 pub mod page_annotation_enum;
-pub mod page_annotation_flatten;
+mod page_annotation_flatten;
 pub mod page_closure;
 pub mod page_collate;
 pub mod page_combine;
@@ -232,7 +232,6 @@ pub use overlay::{
 pub use page_annotation_enum::{
     enumerate_document_annotations, enumerate_page_annotations, EnumeratedAnnotation,
 };
-pub use page_annotation_flatten::{flatten_annotations, flatten_annotations_on_page, FlattenMode};
 pub use page_collate::collate;
 pub use page_combine::{CombinedPage, CombinedPlan, InputSpec};
 pub use page_document_helper::PageDocumentHelper;

@@ -78,6 +78,7 @@
 
 use crate::page_object_helper::PageBox;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
+use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -152,8 +153,11 @@ impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// ```
     pub fn subtype(&mut self) -> Result<Option<Vec<u8>>> {
         let dict = self.resolve_dict()?;
-        Ok(match dict.get("Subtype") {
-            Some(Object::Name(bytes)) => Some(bytes.clone()),
+        Ok(match dict.get("Subtype").cloned() {
+            Some(value) => match resolve_ref_chain(self.pdf, &value)?.0 {
+                Object::Name(bytes) => Some(bytes),
+                _ => None,
+            },
             _ => None,
         })
     }

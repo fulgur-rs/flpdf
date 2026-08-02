@@ -44,6 +44,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// first applying qpdf-compatible page-tree repair, then pushing
     /// `/CropBox`, `/MediaBox`, `/Resources`, and `/Rotate` onto leaf pages.
     pub fn push_inherited_attributes_to_pages(&mut self) -> Result<()> {
+        self.pdf.mark_get_all_pages_called();
         if let Some(prepared) = crate::pages::repair::prepare_for_optimization(self.pdf)? {
             crate::optimization::inherited_attrs::push(self.pdf, &prepared, true, false)?;
         } // cov:ignore: closing brace is the already-covered successful push join
@@ -153,14 +154,23 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
 
     /// Flatten annotations into their containing pages.
     ///
-    /// Mirrors `QPDFPageDocumentHelper::flattenAnnotations` through flpdf's
-    /// existing qpdf-oriented annotation-flattening primitive.
-    pub fn flatten_annotations(&mut self, mode: crate::FlattenMode) -> Result<usize> {
+    /// Mirrors `QPDFPageDocumentHelper::flattenAnnotations`.
+    ///
+    /// An annotation is drawn only when all `required_flags` are set and none
+    /// of `forbidden_flags` are set. As in qpdf, annotations with an
+    /// appearance dictionary are removed even if no selected appearance can
+    /// be drawn; annotations without one are retained.
+    pub fn flatten_annotations(&mut self, required_flags: i64, forbidden_flags: i64) -> Result<()> {
         // qpdf's document helper obtains `getAllPages()` before flattening.
         // This repairs a catalog /Pages pointer that lands on a leaf, so the
         // lower-level document primitive subsequently sees every page.
-        self.get_all_pages()?;
-        crate::flatten_annotations(self.pdf, mode)
+        let pages = self.get_all_pages()?;
+        crate::page_annotation_flatten::flatten_annotations_qpdf(
+            self.pdf,
+            &pages,
+            required_flags,
+            forbidden_flags,
+        )
     }
 
     /// Clear the live document's root page tree after qpdf-style final-page
