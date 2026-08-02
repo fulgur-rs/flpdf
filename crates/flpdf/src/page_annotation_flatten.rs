@@ -2752,12 +2752,14 @@ mod tests {
         );
         let inline_stream = Object::Stream(Stream::new(xobj_dict, b"q Q".to_vec()));
 
-        // obj 10 = annotation dict with /AP/N as direct stream
+        // obj 10 = annotation dict with indirect /AP and direct /N stream
         let annot_ref = ObjectRef::new(10, 0);
         let mut annot_dict = Dictionary::new();
         let mut ap_dict = Dictionary::new();
         ap_dict.insert("N", inline_stream);
-        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        let ap_ref = ObjectRef::new(11, 0);
+        pdf.set_object(ap_ref, Object::Dictionary(ap_dict));
+        annot_dict.insert("AP", Object::Reference(ap_ref));
         pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
 
         let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
@@ -2816,6 +2818,42 @@ mod tests {
             resolve_ap_n(&mut pdf, annot_ref).unwrap(),
             result,
             "repeated resolution must reuse the materialized state stream"
+        );
+    }
+
+    #[test]
+    fn resolve_ap_n_indirect_state_dict_direct_stream_entry_materializes() {
+        let bytes = build_pdf("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let mut xobj_dict = Dictionary::new();
+        xobj_dict.insert(
+            "BBox",
+            Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(0),
+                Object::Integer(20),
+                Object::Integer(20),
+            ]),
+        );
+        let mut state_dict = Dictionary::new();
+        state_dict.insert("On", Object::Stream(Stream::new(xobj_dict, Vec::new())));
+        let state_ref = ObjectRef::new(11, 0);
+        pdf.set_object(state_ref, Object::Dictionary(state_dict));
+
+        let annot_ref = ObjectRef::new(10, 0);
+        let mut annot_dict = Dictionary::new();
+        let mut ap_dict = Dictionary::new();
+        ap_dict.insert("N", Object::Reference(state_ref));
+        annot_dict.insert("AP", Object::Dictionary(ap_dict));
+        annot_dict.insert("AS", Object::Name(b"On".to_vec()));
+        pdf.set_object(annot_ref, Object::Dictionary(annot_dict));
+
+        let result = resolve_ap_n(&mut pdf, annot_ref).unwrap();
+        assert_eq!(
+            resolve_ap_n(&mut pdf, annot_ref).unwrap(),
+            result,
+            "indirect state holder must retain the materialized stream reference"
         );
     }
 
