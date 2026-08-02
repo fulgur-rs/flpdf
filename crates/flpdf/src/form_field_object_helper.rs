@@ -725,6 +725,16 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(None);
         };
         for kid in &kids {
+            if let Object::Dictionary(widget) = kid {
+                // A direct widget is an array item in its own right. Return
+                // control to the direct-child updater here so it is selected
+                // at this exact `/Kids` position rather than after later
+                // indirect widgets.
+                if self.has_non_null_appearance(widget)? {
+                    return Ok(None);
+                }
+                continue;
+            }
             let Object::Reference(kid_ref) = kid else {
                 continue;
             };

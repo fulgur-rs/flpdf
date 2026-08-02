@@ -585,6 +585,49 @@ fn set_value_updates_a_checkbox_direct_kid_widget() {
 }
 
 #[test]
+fn set_value_preserves_kids_order_when_direct_widget_precedes_a_reference() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Kids [ << /AP << /N << /Off null /Direct null >> >> >> 11 0 R ] >>"
+                .into(),
+        ),
+        (
+            11,
+            "<< /AP << /N << /Off null /Indirect null >> >> >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("set checkbox value");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).expect("field");
+    let Object::Dictionary(field) = field else {
+        panic!("field must be a dictionary");
+    };
+    assert_eq!(
+        field.get(b"V".as_slice()),
+        Some(&Object::Name(b"Direct".to_vec()))
+    );
+    let Some(Object::Array(kids)) = field.get(b"Kids".as_slice()) else {
+        panic!("kids must be an array");
+    };
+    let Object::Dictionary(direct) = &kids[0] else {
+        panic!("first kid must stay direct");
+    };
+    assert_eq!(
+        direct.get(b"AS".as_slice()),
+        Some(&Object::Name(b"Direct".to_vec()))
+    );
+    let indirect = pdf.resolve(ObjectRef::new(11, 0)).expect("indirect widget");
+    let Object::Dictionary(indirect) = indirect else {
+        panic!("indirect widget must be a dictionary");
+    };
+    assert_eq!(indirect.get(b"AS".as_slice()), None);
+}
+
+#[test]
 fn set_value_updates_checkbox_state_for_a_non_dictionary_direct_appearance() {
     // qpdf treats any non-null field-level `/AP` as the annotation to update;
     // only its on-state lookup requires a dictionary, so `/Yes` is the
