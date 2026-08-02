@@ -468,7 +468,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let mut ef = Dictionary::new();
         let embedded_file = if let Some(object_ref) = embedded_file.object_ref() {
             let canonical = pdf.get_object_handle(object_ref);
-            if !canonical.ptr_eq(&embedded_file) {
+            if !canonical.is_same_object_as(&embedded_file) {
                 return Err(Error::Unsupported(
                     "embedded-file handle belongs to another Pdf".to_string(),
                 ));

@@ -1581,7 +1581,7 @@ impl<R: Read + Seek> Pdf<R> {
         handle.object_ref().is_some_and(|object_ref| {
             self.handle_registry
                 .get(&object_ref)
-                .is_some_and(|canonical| canonical.ptr_eq(handle))
+                .is_some_and(|canonical| canonical.is_same_object_as(handle))
         })
     }
 
@@ -1716,7 +1716,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn contains_direct_handle(root: &ObjectHandle, target: &ObjectHandle, depth: usize) -> bool {
-        if root.ptr_eq(target) {
+        if root.is_same_object_as(target) {
             return true;
         }
         if depth >= crate::object::MAX_INLINE_DEPTH {
@@ -1729,7 +1729,7 @@ impl<R: Read + Seek> Pdf<R> {
             .or_else(|| root.as_stream_dict().map(|dictionary| vec![dictionary]));
         children.is_some_and(|children| {
             children.into_iter().any(|child| {
-                child.ptr_eq(target)
+                child.is_same_object_as(target)
                     || (child.is_direct()
                         && Self::contains_direct_handle(&child, target, depth + 1))
             })
