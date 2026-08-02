@@ -1878,3 +1878,34 @@ fn helper_remove_direct_filespec_does_not_null_an_indirect_object() {
         .expect("list")
         .is_empty());
 }
+
+#[test]
+fn helper_replace_keeps_direct_filespec_handle_live() {
+    let mut pdf = open(build_no_names_pdf());
+    let direct = ObjectHandle::dictionary(vec![
+        (b"Type".to_vec(), ObjectHandle::name(b"Filespec".to_vec())),
+        (b"F".to_vec(), ObjectHandle::string(b"direct.txt".to_vec())),
+    ]);
+    let retained = direct.clone();
+
+    pdf.embedded_files()
+        .replace_embedded_file(b"direct", direct)
+        .expect("insert direct filespec");
+    FileSpec::new(retained, &mut pdf)
+        .expect("filespec")
+        .set_description(b"live")
+        .expect("set description");
+
+    let inserted = pdf
+        .embedded_files()
+        .get_embedded_file(b"direct")
+        .expect("lookup")
+        .expect("inserted filespec");
+    assert_eq!(
+        FileSpec::new(inserted, &mut pdf)
+            .expect("filespec")
+            .get_description()
+            .expect("description"),
+        b"live"
+    );
+}

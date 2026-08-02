@@ -167,6 +167,19 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         path: &[usize],
         item_number: usize,
     ) -> Result<Option<ObjectHandle>> {
+        let Some((pairs, value_index)) = self.live_embedded_file_slot(path, item_number)? else {
+            return Ok(None); // cov:ignore: caller obtained this selected slot from the unchanged tree
+        };
+        Ok(pairs
+            .as_array()
+            .and_then(|pairs| pairs.get(value_index).cloned()))
+    }
+
+    fn live_embedded_file_slot(
+        &mut self,
+        path: &[usize],
+        item_number: usize,
+    ) -> Result<Option<(ObjectHandle, usize)>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None); // cov:ignore: live lookup follows a successful name_tree root lookup
         };
@@ -202,9 +215,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         if pairs.is_indirect() {
             self.pdf.resolve_object_handle(&pairs)?; // cov:ignore: resolving a leaf lifts its /Names child handle
         }
+        let value_index = item_number + 1;
         Ok(pairs
             .as_array()
-            .and_then(|pairs| pairs.get(item_number + 1).cloned()))
+            .is_some_and(|items| items.get(value_index).is_some())
+            .then_some((pairs, value_index)))
     }
 
     /// Return whether this document has an `/EmbeddedFiles` name tree.
@@ -293,7 +308,9 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                     "filespec handle belongs to another Pdf".to_string(),
                 ));
             }
-            None if filespec.belongs_to_pdf(self.pdf.unique_id()) => filespec.materialize(),
+            None if filespec.belongs_to_pdf(self.pdf.unique_id()) => {
+                return self.replace_direct_embedded_file(key, filespec);
+            }
             None => {
                 return Err(Error::Unsupported(
                     "filespec handle belongs to another Pdf".to_string(),
@@ -301,6 +318,24 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             }
         };
         insert_embedded_file_value(self.pdf, key, value)
+    }
+
+    fn replace_direct_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
+        insert_embedded_file_value(self.pdf, key, filespec.materialize())?;
+        let Some(mut tree) = self.name_tree()? else {
+            return Ok(()); // cov:ignore: insertion above creates the tree
+        };
+        let cursor = tree.find(self.pdf, key, false)?;
+        let position = cursor.selected_path();
+        self.store_embedded_files_root(tree.into_root())?;
+        let Some((path, item_number)) = position else {
+            return Ok(()); // cov:ignore: insertion above selects its key
+        };
+        let Some((pairs, value_index)) = self.live_embedded_file_slot(&path, item_number)? else {
+            return Ok(()); // cov:ignore: insertion above creates the selected value slot
+        };
+        pairs.replace_array_item(value_index, filespec);
+        Ok(())
     }
 
     /// Remove the Filespec stored under `key`.

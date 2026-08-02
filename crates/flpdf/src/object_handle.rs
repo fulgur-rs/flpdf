@@ -882,6 +882,30 @@ impl ObjectHandle {
         }
     }
 
+    /// Replace an existing array item with `value`, preserving `value`'s
+    /// shared handle identity. Returns `false` when this handle is not an
+    /// array or `index` is out of bounds.
+    pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
+        if self.is_same_direct_handle(&value) {
+            return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
+        }
+        let owner_refs = self.child_owner_refs();
+        let replaced = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
+            };
+            let Some(item) = items.get_mut(index) else {
+                return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
+            };
+            *item = value.clone();
+            true
+        });
+        if replaced {
+            value.associate_with_owners(&owner_refs, 0);
+        }
+        replaced
+    }
+
     /// True if `self` and `other` are both direct handles sharing the same
     /// underlying storage — i.e. `other` is `self` itself (or a clone of
     /// it), not merely a distinct direct handle with an equal value. Unlike
@@ -3147,6 +3171,22 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(1);
         scalar.replace_key(b"A", ObjectHandle::integer(2));
         assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_array_item_preserves_identity_and_rejects_invalid_slots() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let replacement = ObjectHandle::dictionary(vec![]);
+        let retained = replacement.clone();
+
+        assert!(array.replace_array_item(0, replacement));
+        retained.replace_key(b"K", ObjectHandle::integer(9));
+        let inserted = array.as_array().expect("array")[0].clone();
+        assert_eq!(inserted.get_key(b"K").as_integer(), Some(9));
+
+        assert!(!array.replace_array_item(1, ObjectHandle::integer(2)));
+        assert!(!ObjectHandle::integer(1).replace_array_item(0, ObjectHandle::integer(2)));
+        assert!(!array.replace_array_item(0, array.clone()));
     }
 
     #[test]
