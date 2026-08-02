@@ -378,7 +378,7 @@ fn crypt_stage_receives_neutral_decode_params() {
         dict.get("DecodeParms"),
         b"payload",
         DecodeLimits::default(),
-        DataEventMode::None,
+        DataEventMode::Suppress, // the enum has only Record and Suppress
         &mut |params: &DecodeParams, data: &[u8]| {
             seen_absent = params.is_absent();
             Ok(data.to_vec())
@@ -607,14 +607,15 @@ fn handle_reader_matches_object_reader_for_every_filter_shape() {
     for (filter, parms) in shape_corpus() {
         let from_object = decode_filter_specs_from_object(filter.as_object(), parms.as_object());
         let from_handle = decode_filter_specs_from_handle(&filter.as_handle(), &parms.as_handle());
-        assert_eq!(
-            format!("{from_object:?}"),
-            format!("{from_handle:?}"),
-            "shape {filter:?} / {parms:?} diverged",
-        );
+        assert_eq!(from_object, from_handle, "shape {filter:?} / {parms:?} diverged");
     }
 }
 ```
+
+> `FilterSpec` derives `PartialEq` (added in Task 2 and, as Task 3's review
+> noted, still without a user), so compare the values directly. An earlier
+> draft compared `format!("{:?}")` strings; that is strictly weaker and its
+> failure output is unreadable.
 
 `shape_corpus()` must cover, at minimum: absent `/Filter`; `Null`; a name; an
 abbreviation (`Fl`, `AHx`); an array of names; an array containing a non-name;
@@ -623,6 +624,13 @@ misaligned array; a scalar `/DecodeParms` replicated across two filters; a
 `/DecodeParms` dictionary with `Predictor`/`Columns`/`Colors`/`BitsPerComponent`/
 `EarlyChange`; a non-integer value for each of those; a `Crypt` filter; and an
 unknown filter name.
+
+Add one case the earlier draft missed, since Step 3 moves the chain-count
+pre-check into the readers: **an over-long filter array whose last element is
+also a non-name** (e.g. 17 entries with a trailing integer). That is the
+`max_filter_chain`-before-malformed-item precedence rule, pinned for the
+legacy path by `decode_rejects_overlong_filter_chain_before_malformed_item`
+(`filters.rs:2678`) and otherwise unpinned for the native one.
 
 **Step 2: Run it to verify it fails**
 
@@ -695,9 +703,27 @@ fn decode_prepared_specs(
 native entry point is `decode_filter_specs_from_handle(...)` +
 `decode_prepared_specs(...)`, so both share one staging/warning-order engine.
 
-Mirror the `validate_filter_chain_count` call that runs on the raw array length
-*before* spec construction (`filters.rs:353-357`) — the native reader needs the
-array length from `try_as_array` for the same pre-check.
+**Do not mirror the raw-array chain-count pre-check — move it into the shape
+readers.** `filters.rs:353-355` currently runs
+`validate_filter_chain_count(filters.len(), ...)` on the raw `Object::Array`
+*before* building specs, so an over-long chain is reported ahead of a
+non-name item or a `/DecodeParms` length mismatch. That precedence rule is
+pinned by `decode_rejects_overlong_filter_chain_before_malformed_item`
+(`filters.rs:2678`); Task 3's review confirmed it by deleting the block and
+watching only that test go red.
+
+It is also the **last `Object`-shaped assumption sitting above `FilterSpec`**.
+An earlier draft of this task told the native reader to mirror it from
+`try_as_array` — which would have created exactly the second copy this plan
+exists to prevent, this time for error precedence rather than warning order,
+and Task 7's corpus does not cover it.
+
+Push it down instead: give each shape reader the limit and let it perform
+both counts, e.g.
+`decode_filter_specs_from_object(filter, params, max_filter_chain)` and
+`decode_filter_specs_from_handle(filter, params, max_filter_chain)`. After
+that, nothing above `FilterSpec` is shape-dependent and
+`decode_prepared_specs` needs no pre-check of its own.
 
 **Step 4: Run the tests**
 
