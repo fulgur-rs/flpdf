@@ -1885,7 +1885,7 @@ fn drain_dictionary_onto(dict: &mut Dictionary, stack: &mut Vec<Object>) {
 }
 
 #[cfg(test)]
-mod identity_tests {
+pub(crate) mod identity_tests {
     use super::*;
 
     struct RecordingResolver {
@@ -1933,7 +1933,13 @@ mod identity_tests {
     }
 
     /// An unresolved indirect handle whose resolver installs `value`.
-    fn resolver_bearing_handle(value: ObjectValue) -> (ObjectHandle, Rc<dyn DocumentResolver>) {
+    ///
+    /// `pub(crate)` so `stream_filter.rs`'s handle-shape reader tests can
+    /// build an indirect child without a second harness; the returned
+    /// resolver is erased, so `RecordingResolver` itself stays private here.
+    pub(crate) fn resolver_bearing_handle(
+        value: ObjectValue,
+    ) -> (ObjectHandle, Rc<dyn DocumentResolver>) {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::installing(value));
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(20, 0),

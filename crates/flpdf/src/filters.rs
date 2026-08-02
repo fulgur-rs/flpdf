@@ -8,7 +8,7 @@ use crate::pipeline::{PipelineError, PipelineResult};
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs_from_object, encode_flate, encode_run_length, stream_filter_for,
-    DecodeParams, FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
+    validate_filter_chain_count, DecodeParams, FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -22,15 +22,6 @@ const MAX_FILTER_CHAIN_LEN: usize = 16;
 
 pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
     validate_filter_chain_count(filters.len(), Some(MAX_FILTER_CHAIN_LEN))
-}
-
-fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
-    if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
-        return Err(Error::Unsupported(format!(
-            "filter chain length {count} exceeds maximum of {maximum}"
-        )));
-    }
-    Ok(())
 }
 
 /// Return a human-readable codec label if `filter_name` is an image/binary
@@ -350,11 +341,7 @@ fn decode_stream_data_with_filters_and_crypt<F>(
 where
     F: FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>,
 {
-    if let Some(Object::Array(filters)) = filter {
-        validate_filter_chain_count(filters.len(), limits.max_filter_chain)?;
-    }
-    let specs = decode_filter_specs_from_object(filter, decode_params)?;
-    validate_filter_chain_count(specs.len(), limits.max_filter_chain)?;
+    let specs = decode_filter_specs_from_object(filter, decode_params, limits.max_filter_chain)?;
     let prepared = prepare_decode_filters(specs)?;
     let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
@@ -700,7 +687,9 @@ fn encode_stream_data_with_filters(
     decode_params: Option<&Object>,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    let specs = decode_filter_specs_from_object(filter, decode_params)?;
+    // The encode path is writer output rather than untrusted input, so it is
+    // uncapped — see `MAX_FILTER_CHAIN_LEN`'s own doc.
+    let specs = decode_filter_specs_from_object(filter, decode_params, None)?;
     // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
     // order, so encoding must apply them in reverse for round-tripping.
     let mut encoded = stream_data.to_vec();

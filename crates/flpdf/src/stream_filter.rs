@@ -1,5 +1,6 @@
 //! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities.
 
+use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85::Ascii85Decoder;
 use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
@@ -116,26 +117,53 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
+/// `QPDF_Stream::filterable`'s `warn("stream filter type is not name or
+/// array")` (`libqpdf/QPDF_Stream.cc:413`). flpdf raises the same text as an
+/// error instead of a warning; see plan decision D3 of `flpdf-25kg.3.4`.
+const FILTER_TYPE_ERROR: &str = "stream filter type is not name or array";
+
+/// `QPDF_Stream::filterable`'s `warn("stream /DecodeParms length is
+/// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised the
+/// same way.
+const DECODE_PARMS_LENGTH_ERROR: &str = "stream /DecodeParms length is inconsistent with filters";
+
+/// Reject a `/Filter` chain longer than `maximum`.
+///
+/// Unlike qpdf, which caps nothing here, flpdf refuses pathological chains on
+/// the decode path; `filters::MAX_FILTER_CHAIN_LEN` documents that divergence.
+/// Both shape readers call this so the cap — and, more importantly, its
+/// position *before* per-item validation — has exactly one definition.
+pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
+    if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
+        return Err(Error::Unsupported(format!(
+            "filter chain length {count} exceeds maximum of {maximum}"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn decode_filter_specs_from_object(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
+    max_filter_chain: Option<usize>,
 ) -> Result<Vec<FilterSpec>> {
     let names: Vec<&[u8]> = match filter {
         None | Some(Object::Null) => return Ok(Vec::new()),
         Some(Object::Name(name)) => vec![name],
-        Some(Object::Array(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_name().ok_or_else(|| {
-                    Error::Unsupported("stream filter type is not name or array".to_string())
+        Some(Object::Array(items)) => {
+            // Counted on the array as parsed, so an over-long chain is
+            // reported ahead of a malformed item or a `/DecodeParms` length
+            // mismatch.
+            validate_filter_chain_count(items.len(), max_filter_chain)?;
+            items
+                .iter()
+                .map(|item| {
+                    item.as_name()
+                        .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
                 })
-            })
-            .collect::<Result<_>>()?,
-        Some(_) => {
-            return Err(Error::Unsupported(
-                "stream filter type is not name or array".to_string(),
-            ))
+                .collect::<Result<_>>()?
         }
+        Some(_) => return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string())),
     };
 
     if names.is_empty() {
@@ -147,9 +175,7 @@ pub(crate) fn decode_filter_specs_from_object(
         Some(Object::Array(items)) if items.is_empty() => vec![None; names.len()],
         Some(Object::Array(items)) => {
             if items.len() != names.len() {
-                return Err(Error::Unsupported(
-                    "stream /DecodeParms length is inconsistent with filters".to_string(),
-                ));
+                return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
             }
             items
                 .iter()
@@ -159,6 +185,8 @@ pub(crate) fn decode_filter_specs_from_object(
         Some(item) => vec![Some(item); names.len()],
     };
 
+    validate_filter_chain_count(names.len(), max_filter_chain)?;
+
     Ok(names
         .into_iter()
         .zip(params)
@@ -167,6 +195,116 @@ pub(crate) fn decode_filter_specs_from_object(
             decode_params: decode_params_from_object(decode_params),
         })
         .collect())
+}
+
+/// The same read as [`decode_filter_specs_from_object`], entered through the
+/// resolving `try_*` accessors.
+///
+/// `QPDF_Stream::filterable` reaches `/Filter` and `/DecodeParms` through
+/// `stream_dict.getKey` (`libqpdf/QPDF_Stream.cc:386`, `:441`) and their
+/// members through `getArrayItem` (`:400`, `:448`), then inspects each with
+/// `isNull`/`isName`/`isArray`/`isInteger` — every one of which dereferences
+/// through the owning `QPDF` first. So an indirect child is read as the object
+/// it points at, which a `&Object` walk cannot do and which the 2026-08-03
+/// live-qpdf probe recorded in plan decision D1 of `flpdf-25kg.3.4`.
+///
+/// A missing key arrives here as a null handle, exactly as `getKey` hands one
+/// back (`libqpdf/QPDFObjectHandle.cc:979-988`), so absent and null share the
+/// `isNull` branch just as they do in qpdf.
+///
+/// This deliberately does not share a body with the `Object` reader: the two
+/// differ only in *how* a value is inspected, and hiding that behind a trait
+/// would reintroduce the shape wrapper this seam exists to avoid. Everything
+/// downstream of [`FilterSpec`] — the codec stack, predictor geometry, limits,
+/// and warning ordering — stays a single copy.
+#[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+pub(crate) fn decode_filter_specs_from_handle(
+    filter: &ObjectHandle,
+    decode_params: &ObjectHandle,
+    max_filter_chain: Option<usize>,
+) -> Result<Vec<FilterSpec>> {
+    let names: Vec<Vec<u8>> = if filter.try_is_null()? {
+        return Ok(Vec::new());
+    } else if let Some(name) = filter.try_as_name()? {
+        vec![name]
+    } else if let Some(items) = filter.try_as_array()? {
+        validate_filter_chain_count(items.len(), max_filter_chain)?;
+        items
+            .iter()
+            .map(|item| {
+                item.try_as_name()?
+                    .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
+            })
+            .collect::<Result<_>>()?
+    } else {
+        return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string()));
+    };
+
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let params: Vec<DecodeParams> = if decode_params.try_is_null()? {
+        absent_params(names.len())
+    } else if let Some(items) = decode_params.try_as_array()? {
+        if items.is_empty() {
+            absent_params(names.len())
+        } else {
+            if items.len() != names.len() {
+                return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
+            }
+            items
+                .iter()
+                .map(decode_params_from_handle)
+                .collect::<Result<_>>()?
+        }
+    } else {
+        // Replicated for every filter, so it is read once per filter exactly
+        // as the `Object` reader re-reads the one borrowed object.
+        names
+            .iter()
+            .map(|_| decode_params_from_handle(decode_params))
+            .collect::<Result<_>>()?
+    };
+
+    validate_filter_chain_count(names.len(), max_filter_chain)?;
+
+    Ok(names
+        .into_iter()
+        .zip(params)
+        .map(|(name, decode_params)| FilterSpec {
+            name,
+            decode_params,
+        })
+        .collect())
+}
+
+fn absent_params(count: usize) -> Vec<DecodeParams> {
+    (0..count).map(|_| DecodeParams::Absent).collect()
+}
+
+fn decode_params_from_handle(params: &ObjectHandle) -> Result<DecodeParams> {
+    if params.try_is_null()? {
+        return Ok(DecodeParams::Absent);
+    }
+    let Some(entries) = params.try_as_dictionary()? else {
+        return Ok(DecodeParams::Present(Vec::new()));
+    };
+    entries
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), param_value_from_handle(value)?)))
+        .collect::<Result<Vec<_>>>()
+        .map(DecodeParams::Present)
+}
+
+fn param_value_from_handle(value: &ObjectHandle) -> Result<ParamValue> {
+    if let Some(int) = value.try_as_integer()? {
+        return Ok(ParamValue::Int(clamp_to_i32(int)));
+    }
+    Ok(match value.try_as_name()? {
+        Some(name) => ParamValue::Name(name),
+        None => ParamValue::Other,
+    })
 }
 
 fn decode_params_from_object(params: Option<&Object>) -> DecodeParams {
@@ -933,14 +1071,16 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_filter_specs_from_object, decode_flate, decode_flate_chunks,
-        decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
-        ignore_warning, normalize_filter_name, stream_filter_for, DecodeParams,
-        FlateLzwStreamFilter, OutputBuffer, ParamValue, Pipeline, StreamFilter,
-        DECODE_OUTPUT_LIMIT_PREFIX,
+        decode_filter_specs_from_handle, decode_filter_specs_from_object, decode_flate,
+        decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
+        ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
+        DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
+        Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
     };
+    use crate::object_handle::identity_tests::resolver_bearing_handle;
+    use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
-    use crate::{Dictionary, Error, Object};
+    use crate::{Dictionary, Error, Object, Result};
     use std::cell::{Cell, RefCell};
 
     #[test]
@@ -956,7 +1096,8 @@ mod tests {
         ]);
         let decode_parms = params(&[("Columns", Object::Integer(7))]);
 
-        let specs = decode_filter_specs_from_object(Some(&filter), Some(&decode_parms)).unwrap();
+        let specs =
+            decode_filter_specs_from_object(Some(&filter), Some(&decode_parms), None).unwrap();
 
         let replicated = DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(7))]);
         assert_eq!(specs.len(), 2);
@@ -972,7 +1113,8 @@ mod tests {
         ]);
         let params = Object::Array(vec![Object::Null]);
 
-        let error = decode_filter_specs_from_object(Some(&filter), Some(&params)).unwrap_err();
+        let error =
+            decode_filter_specs_from_object(Some(&filter), Some(&params), None).unwrap_err();
 
         assert!(matches!(error, Error::Unsupported(_)));
         assert_eq!(
@@ -986,7 +1128,7 @@ mod tests {
         let filter = Object::Name(b"Fl".to_vec());
         let params = Object::Array(Vec::new());
 
-        let specs = decode_filter_specs_from_object(Some(&filter), Some(&params)).unwrap();
+        let specs = decode_filter_specs_from_object(Some(&filter), Some(&params), None).unwrap();
 
         assert_eq!(specs[0].normalized_name(), b"FlateDecode");
         assert!(specs[0].decode_params.is_absent());
@@ -996,7 +1138,7 @@ mod tests {
     fn no_filter_ignores_decode_parms() {
         let params = Object::Array(vec![Object::Integer(1)]);
 
-        let specs = decode_filter_specs_from_object(None, Some(&params)).unwrap();
+        let specs = decode_filter_specs_from_object(None, Some(&params), None).unwrap();
 
         assert!(specs.is_empty());
     }
@@ -1005,7 +1147,7 @@ mod tests {
     fn non_name_filter_item_is_rejected_before_decode() {
         let filter = Object::Array(vec![Object::Integer(1)]);
 
-        let error = decode_filter_specs_from_object(Some(&filter), None).unwrap_err();
+        let error = decode_filter_specs_from_object(Some(&filter), None, None).unwrap_err();
 
         assert!(matches!(error, Error::Unsupported(_)));
         assert_eq!(
@@ -1016,7 +1158,8 @@ mod tests {
 
     #[test]
     fn scalar_non_name_filter_is_rejected_before_decode() {
-        let error = decode_filter_specs_from_object(Some(&Object::Integer(1)), None).unwrap_err();
+        let error =
+            decode_filter_specs_from_object(Some(&Object::Integer(1)), None, None).unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -1030,7 +1173,7 @@ mod tests {
         let params = Object::Array(vec![Object::Integer(1)]);
 
         assert!(
-            decode_filter_specs_from_object(Some(&filter), Some(&params))
+            decode_filter_specs_from_object(Some(&filter), Some(&params), None)
                 .unwrap()
                 .is_empty()
         );
@@ -1040,15 +1183,15 @@ mod tests {
     fn object_shape_reader_distinguishes_absent_null_and_present_non_dictionary() {
         let name = Object::Name(b"FlateDecode".to_vec());
 
-        let absent = decode_filter_specs_from_object(Some(&name), None).unwrap();
+        let absent = decode_filter_specs_from_object(Some(&name), None, None).unwrap();
         assert!(matches!(absent[0].decode_params, DecodeParams::Absent));
         assert!(absent[0].decode_params.entries().is_empty());
 
-        let null = decode_filter_specs_from_object(Some(&name), Some(&Object::Null)).unwrap();
+        let null = decode_filter_specs_from_object(Some(&name), Some(&Object::Null), None).unwrap();
         assert!(matches!(null[0].decode_params, DecodeParams::Absent));
 
         let scalar = Object::Integer(1);
-        let present = decode_filter_specs_from_object(Some(&name), Some(&scalar)).unwrap();
+        let present = decode_filter_specs_from_object(Some(&name), Some(&scalar), None).unwrap();
         // Both halves of this contrast are qpdf's.
         // `SF_FlateLzwDecode::setDecodeParms` reads a non-dictionary through
         // `getKeys()`, which treats it as empty and leaves the filter
@@ -1072,7 +1215,7 @@ mod tests {
             ("Whatever", Object::Null),
         ]);
 
-        let specs = decode_filter_specs_from_object(Some(&name), Some(&dictionary)).unwrap();
+        let specs = decode_filter_specs_from_object(Some(&name), Some(&dictionary), None).unwrap();
 
         assert_eq!(
             specs[0].decode_params.entries().to_vec(),
@@ -1085,6 +1228,461 @@ mod tests {
         );
     }
 
+    // ----- flpdf-25kg.3.4 Task 5: the ObjectHandle-native shape reader -----
+
+    /// Every `/Filter` + `/DecodeParms` shape `QPDF_Stream::filterable`
+    /// (`libqpdf/QPDF_Stream.cc:379-484`) distinguishes, written once and fed
+    /// to both shape readers.
+    ///
+    /// **This corpus is DIRECT-ONLY, and that limit is load-bearing.** Plan
+    /// decision D1 of `flpdf-25kg.3.4` makes the two readers *deliberately*
+    /// disagree on an indirect child: the `Object` reader classifies
+    /// `Object::Reference` as `ParamValue::Other` (or as a non-name filter
+    /// item), while the handle reader dereferences it, which the 2026-08-03
+    /// live-qpdf probe confirmed is what qpdf does. Adding an indirect row
+    /// here would therefore assert the wrong thing; indirect coverage lives in
+    /// the `handle_reader_dereferences_*` /
+    /// `handle_reader_surfaces_a_dropped_document_*` tests below.
+    fn shape_corpus() -> Vec<(&'static str, Option<Object>, Option<Object>)> {
+        let flate = || Object::Name(b"FlateDecode".to_vec());
+        let ascii85 = || Object::Name(b"ASCII85Decode".to_vec());
+        let two_filters = || Object::Array(vec![flate(), ascii85()]);
+        let geometry = || {
+            params(&[
+                ("BitsPerComponent", Object::Integer(8)),
+                ("Colors", Object::Integer(3)),
+                ("Columns", Object::Integer(4)),
+                ("EarlyChange", Object::Integer(0)),
+                ("Predictor", Object::Integer(12)),
+            ])
+        };
+        let mut overlong = vec![flate(); 16];
+        overlong.push(Object::Integer(1));
+
+        vec![
+            ("absent /Filter", None, None),
+            ("null /Filter", Some(Object::Null), None),
+            ("name /Filter", Some(flate()), None),
+            ("abbreviation Fl", Some(Object::Name(b"Fl".to_vec())), None),
+            (
+                "abbreviation AHx",
+                Some(Object::Name(b"AHx".to_vec())),
+                None,
+            ),
+            ("array of names", Some(two_filters()), None),
+            (
+                "array with a non-name item",
+                Some(Object::Array(vec![flate(), Object::Integer(1)])),
+                None,
+            ),
+            (
+                "non-name non-array scalar /Filter",
+                Some(Object::Integer(1)),
+                None,
+            ),
+            (
+                "empty /Filter array ignores /DecodeParms",
+                Some(Object::Array(Vec::new())),
+                Some(Object::Array(vec![Object::Integer(1)])),
+            ),
+            (
+                "empty /DecodeParms array",
+                Some(flate()),
+                Some(Object::Array(Vec::new())),
+            ),
+            ("null /DecodeParms", Some(flate()), Some(Object::Null)),
+            (
+                "aligned /DecodeParms array",
+                Some(two_filters()),
+                Some(Object::Array(vec![geometry(), geometry()])),
+            ),
+            (
+                "aligned /DecodeParms array with a null item",
+                Some(two_filters()),
+                Some(Object::Array(vec![geometry(), Object::Null])),
+            ),
+            (
+                "misaligned /DecodeParms array",
+                Some(two_filters()),
+                Some(Object::Array(vec![Object::Null])),
+            ),
+            // The one row where the *trailing* chain count competes with the
+            // `/DecodeParms` mismatch: a scalar `/Filter` never reaches the
+            // array arm's count, so under `Some(0)` only a reader that still
+            // counts last reports the mismatch.
+            (
+                "scalar /Filter with a misaligned /DecodeParms array",
+                Some(flate()),
+                Some(Object::Array(vec![geometry(), geometry()])),
+            ),
+            (
+                "scalar /DecodeParms replicated across two filters",
+                Some(two_filters()),
+                Some(geometry()),
+            ),
+            (
+                "present non-dictionary /DecodeParms",
+                Some(flate()),
+                Some(Object::Integer(1)),
+            ),
+            ("full parameter dictionary", Some(flate()), Some(geometry())),
+            (
+                "a non-integer value for each parameter",
+                Some(flate()),
+                Some(params(&[
+                    ("BitsPerComponent", Object::Boolean(true)),
+                    ("Colors", Object::Real(3.5)),
+                    ("Columns", Object::String(b"4".to_vec())),
+                    ("EarlyChange", Object::Array(Vec::new())),
+                    ("Predictor", Object::Name(b"Up".to_vec())),
+                ])),
+            ),
+            // Decision D4: qpdf's `QPDF_Dictionary::getKeys`
+            // (`libqpdf/QPDF_Dictionary.cc:118-127`) skips every null-valued
+            // entry, so qpdf tolerates this while flpdf rejects it. Both
+            // readers must keep flpdf's current behavior; the divergence is
+            // tracked as beads `flpdf-h8mv`, not fixed here.
+            (
+                "null-valued /DecodeParms key (flpdf-h8mv)",
+                Some(flate()),
+                Some(params(&[("Predictor", Object::Null)])),
+            ),
+            (
+                "Crypt filter",
+                Some(Object::Name(b"Crypt".to_vec())),
+                Some(params(&[("Name", Object::Name(b"Identity".to_vec()))])),
+            ),
+            (
+                "unknown filter name",
+                Some(Object::Name(b"NoSuchDecode".to_vec())),
+                None,
+            ),
+            (
+                "over-long chain whose last item is also a non-name",
+                Some(Object::Array(overlong)),
+                None,
+            ),
+        ]
+    }
+
+    /// The direct handle form of a corpus `Object`. It covers exactly the
+    /// shapes [`shape_corpus`] uses and panics on the rest, so `Reference` —
+    /// the one shape the direct-only rule genuinely forbids — cannot slip into
+    /// a row by accident. The other rejected shapes (`Stream`, `RealLiteral`,
+    /// `Operator`, `InlineImage`) are direct and merely unused; widening this
+    /// to admit one is fine, adding `Reference` is not.
+    fn handle_from_object(object: Option<&Object>) -> ObjectHandle {
+        match object {
+            None | Some(Object::Null) => ObjectHandle::null(),
+            Some(Object::Boolean(value)) => ObjectHandle::boolean(*value),
+            Some(Object::Integer(value)) => ObjectHandle::integer(*value),
+            Some(Object::Real(value)) => ObjectHandle::real(*value),
+            Some(Object::Name(name)) => ObjectHandle::name(name.clone()),
+            Some(Object::String(bytes)) => ObjectHandle::string(bytes.clone()),
+            Some(Object::Array(items)) => ObjectHandle::array(
+                items
+                    .iter()
+                    .map(|item| handle_from_object(Some(item)))
+                    .collect(),
+            ),
+            Some(Object::Dictionary(dictionary)) => ObjectHandle::dictionary(
+                dictionary
+                    .iter()
+                    .map(|(key, value)| (key.to_vec(), handle_from_object(Some(value))))
+                    .collect(),
+            ),
+            Some(other) => panic!(
+                "{other:?} is outside the shape corpus: `Reference` is barred \
+                 by the direct-only rule, and the rest are direct but have no \
+                 row here"
+            ),
+        }
+    }
+
+    /// `Error` is not `PartialEq`, so compare the message instead — the two
+    /// readers must agree on `Ok`/`Err` *and* on the exact text.
+    fn comparable(result: Result<Vec<FilterSpec>>) -> std::result::Result<Vec<FilterSpec>, String> {
+        result.map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn handle_reader_matches_object_reader_for_every_filter_shape() {
+        for (label, filter, parms) in shape_corpus() {
+            let filter_handle = handle_from_object(filter.as_ref());
+            let parms_handle = handle_from_object(parms.as_ref());
+            // Every limit, because the two chain counts only show up under a
+            // cap — `Some(16)` reaches the array arm's count, `Some(0)` also
+            // reaches the trailing one — while every other row must be
+            // unaffected by a cap at all.
+            for max_filter_chain in [None, Some(16), Some(0)] {
+                let from_object = comparable(decode_filter_specs_from_object(
+                    filter.as_ref(),
+                    parms.as_ref(),
+                    max_filter_chain,
+                ));
+                let from_handle = comparable(decode_filter_specs_from_handle(
+                    &filter_handle,
+                    &parms_handle,
+                    max_filter_chain,
+                ));
+
+                assert_eq!(
+                    from_object, from_handle,
+                    "shape {label:?} diverged at max_filter_chain {max_filter_chain:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn handle_reader_counts_the_raw_filter_array_before_inspecting_its_items() {
+        // The cap is checked on the array as parsed, so an over-long chain is
+        // reported ahead of the trailing non-name item — the same precedence
+        // `decode_rejects_overlong_filter_chain_before_malformed_item`
+        // (`filters.rs`) pins for the `Object` reader. Asserting the message
+        // (not just that the two readers agree) is what makes this absolute.
+        let mut items = vec![ObjectHandle::name(b"FlateDecode".to_vec()); 16];
+        items.push(ObjectHandle::integer(1));
+
+        let error = decode_filter_specs_from_handle(
+            &ObjectHandle::array(items),
+            &ObjectHandle::null(),
+            Some(16),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: filter chain length 17 exceeds maximum of 16"
+        );
+    }
+
+    #[test]
+    fn both_readers_count_a_scalar_filter_against_the_chain_cap_too() {
+        // The array arm's count never sees a scalar `/Filter`, so the count
+        // that runs after the `/DecodeParms` branch is the only one left to
+        // catch it. It carried over from `filters.rs`'s
+        // `validate_filter_chain_count(specs.len(), ...)`, which no reachable
+        // production limit could trip; pin it here so moving it into the
+        // readers did not silently drop it.
+        let name = Object::Name(b"FlateDecode".to_vec());
+        let expected = "unsupported PDF feature: filter chain length 1 exceeds maximum of 0";
+
+        assert_eq!(
+            decode_filter_specs_from_object(Some(&name), None, Some(0))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            decode_filter_specs_from_handle(
+                &ObjectHandle::name(b"FlateDecode".to_vec()),
+                &ObjectHandle::null(),
+                Some(0),
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+    }
+
+    // ----- Decision D1: the handle reader dereferences its children -----
+    //
+    // `QPDF_Stream::filterable` reaches every child through a
+    // `QPDFObjectHandle` accessor — `getKey("/Filter")` (`QPDF_Stream.cc:386`),
+    // `filter_obj.getArrayItem(i)` (`:400`), `getKey("/DecodeParms")` (`:441`),
+    // `decode_obj.getArrayItem(i)` (`:448`) — and each of `isNull`, `isName`,
+    // `isArray`, `isInteger` dereferences before it inspects. That is the whole
+    // reason this reader exists, and it is the one property Task 7's
+    // direct-only equivalence gate structurally cannot test.
+    //
+    // Each case below starts from an *unresolved* indirect handle in one child
+    // position, so the value that comes back proves that position resolved.
+    //
+    // **What that does and does not pin.** A per-site mutation matrix over all
+    // ten `try_*` calls in the reader kills four — the first accessor each
+    // child position reaches: `filter.try_is_null`, the `/Filter` item's
+    // `try_as_name`, `decode_params_from_handle`'s `try_is_null`, and
+    // `param_value_from_handle`'s `try_as_integer`. The other six survive
+    // individual mutation, for two distinct reasons, neither of them a bug:
+    //
+    // - Five are *already-resolved* sites. `try_dereference` is idempotent, so
+    //   `filter.try_as_name`/`try_as_array`, `decode_params.try_as_array`,
+    //   `try_as_dictionary`, and `param_value_from_handle`'s `try_as_name`
+    //   inspect a slot the preceding `try_*` at the same position resolved, and
+    //   behave identically to their non-resolving twins.
+    // - One is *convergent*: `decode_params.try_is_null` is first at its
+    //   position, yet swapping it changes nothing, because the fallthrough it
+    //   guards reaches the same answer anyway — a non-array indirect null drops
+    //   into the replicated branch, where `decode_params_from_handle`'s own
+    //   `try_is_null` yields the same `Absent` per filter, and a dropped
+    //   document surfaces the same error one call later. It mirrors the
+    //   `Object` reader's `None | Some(Object::Null)` arm and is kept for that
+    //   symmetry.
+    //
+    // All six stay `try_*` for uniformity and for robustness against a future
+    // reordering — not because a test can tell them apart today. Read the tests
+    // below as guarding every child *position*, not every call site.
+
+    #[test]
+    fn handle_reader_dereferences_an_indirect_filter_name() {
+        let (filter, _resolver) = resolver_bearing_handle(ObjectValue::Name(b"Fl".to_vec()));
+        assert!(!filter.is_resolved());
+
+        let specs = decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None).unwrap();
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].normalized_name(), b"FlateDecode");
+        assert!(filter.is_resolved());
+    }
+
+    #[test]
+    fn handle_reader_reads_an_indirect_filter_resolving_to_null_as_no_filters() {
+        // `filter_obj.isNull()` (`libqpdf/QPDF_Stream.cc:391`) dereferences, so
+        // a dangling `/Filter` reference reads as "no filters" rather than as
+        // a bad filter type. That is the shape a broken reference takes once
+        // `flpdf-25kg.3.5` wires the resolver: `set_missing` resolves the slot
+        // to null (pinned by `set_missing_marks_the_handle_resolved_to_null`,
+        // `object_handle.rs`).
+        let (filter, _resolver) = resolver_bearing_handle(ObjectValue::Null);
+
+        let specs = decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None).unwrap();
+
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn handle_reader_dereferences_an_indirect_filter_array_and_its_items() {
+        let (item, _item_resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"ASCII85Decode".to_vec()));
+        let (filter, _filter_resolver) = resolver_bearing_handle(ObjectValue::Array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            item,
+        ]));
+
+        let specs = decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None).unwrap();
+
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect::<Vec<_>>(),
+            vec![b"FlateDecode".to_vec(), b"ASCII85Decode".to_vec()]
+        );
+    }
+
+    #[test]
+    fn handle_reader_dereferences_an_indirect_decode_parms_dictionary_and_its_values() {
+        let (columns, _columns_resolver) = resolver_bearing_handle(ObjectValue::Integer(4));
+        let (parms, _parms_resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [
+                (b"Columns".to_vec(), columns),
+                (b"Predictor".to_vec(), ObjectHandle::integer(12)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![
+                (b"Columns".to_vec(), ParamValue::Int(4)),
+                (b"Predictor".to_vec(), ParamValue::Int(12)),
+            ])
+        );
+    }
+
+    #[test]
+    fn handle_reader_dereferences_an_indirect_decode_parms_array_and_its_items() {
+        let (item, _item_resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [(b"Columns".to_vec(), ObjectHandle::integer(7))]
+                .into_iter()
+                .collect(),
+        ));
+        let (parms, _parms_resolver) = resolver_bearing_handle(ObjectValue::Array(vec![item]));
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(7))])
+        );
+    }
+
+    #[test]
+    fn handle_reader_dereferences_a_decode_parms_array_item_that_resolves_to_null() {
+        // `SF_FlateLzwDecode::setDecodeParms` early-returns on `isNull()`
+        // (`libqpdf/SF_FlateLzwDecode.cc:24-26`), and `isNull` dereferences —
+        // so an indirect item pointing at a null object is `Absent`, not a
+        // present non-dictionary.
+        let (item, _item_resolver) = resolver_bearing_handle(ObjectValue::Null);
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &ObjectHandle::array(vec![item]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(specs[0].decode_params, DecodeParams::Absent);
+    }
+
+    #[test]
+    fn handle_reader_surfaces_a_dropped_document_from_every_child_position() {
+        // `try_dereference`'s `Error::Internal` has to reach the caller from
+        // each position; silently reading the severed handle as "absent" or
+        // "not a name" would hide a broken document behind a plausible answer.
+        let dropped = || {
+            let (handle, resolver) =
+                resolver_bearing_handle(ObjectValue::Name(b"FlateDecode".to_vec()));
+            drop(resolver);
+            handle
+        };
+        let flate = || ObjectHandle::name(b"FlateDecode".to_vec());
+        let cases: Vec<(&str, ObjectHandle, ObjectHandle)> = vec![
+            ("/Filter itself", dropped(), ObjectHandle::null()),
+            (
+                "a /Filter array item",
+                ObjectHandle::array(vec![dropped()]),
+                ObjectHandle::null(),
+            ),
+            ("/DecodeParms itself", flate(), dropped()),
+            (
+                "a /DecodeParms array item",
+                flate(),
+                ObjectHandle::array(vec![dropped()]),
+            ),
+            (
+                "a /DecodeParms dictionary value",
+                flate(),
+                ObjectHandle::dictionary(vec![(b"Columns".to_vec(), dropped())]),
+            ),
+        ];
+
+        for (label, filter, parms) in cases {
+            let error = decode_filter_specs_from_handle(&filter, &parms, None)
+                .expect_err(&format!("{label} must not read as absent"));
+
+            assert_eq!(
+                error.to_string(),
+                "object 20 0 belongs to a dropped PDF",
+                "{label}"
+            );
+        }
+    }
+
     #[test]
     fn output_buffer_has_qpdf_pipeline_identifier() {
         assert_eq!(OutputBuffer::new(None).identifier(), "stream data buffer");
@@ -1095,7 +1693,8 @@ mod tests {
         let filter = Object::Name(b"FlateDecode".to_vec());
         let decode_parms = Object::Array(vec![params(&[("Columns", Object::Integer(7))])]);
 
-        let specs = decode_filter_specs_from_object(Some(&filter), Some(&decode_parms)).unwrap();
+        let specs =
+            decode_filter_specs_from_object(Some(&filter), Some(&decode_parms), None).unwrap();
 
         assert_eq!(specs.len(), 1);
         assert_eq!(
@@ -1119,7 +1718,7 @@ mod tests {
 
         for &(abbreviation, expected) in cases {
             let filter = Object::Name(abbreviation.to_vec());
-            let specs = decode_filter_specs_from_object(Some(&filter), None).unwrap();
+            let specs = decode_filter_specs_from_object(Some(&filter), None, None).unwrap();
             assert_eq!(specs[0].normalized_name(), expected);
         }
     }
