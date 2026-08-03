@@ -10,7 +10,7 @@ use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
     encode_run_length, stream_filter_for, validate_filter_chain_count, DecodeParams,
-    FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
+    FilterDecodePhase, FilterSpec, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -480,7 +480,7 @@ type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u
 /// two shapes. Nothing in this body inspects a `/Filter` or `/DecodeParms`
 /// object of either shape.
 fn decode_prepared_specs(
-    specs: Vec<crate::stream_filter::FilterSpec>,
+    specs: Vec<FilterSpec>,
     stream_data: &[u8],
     limits: DecodeLimits,
     data_events: DataEventMode,
@@ -644,13 +644,11 @@ enum PreparedStage {
 }
 
 struct PreparedDecodeFilter {
-    spec: crate::stream_filter::FilterSpec,
+    spec: FilterSpec,
     stage: PreparedStage,
 }
 
-fn prepare_decode_filters(
-    specs: Vec<crate::stream_filter::FilterSpec>,
-) -> Result<Vec<PreparedDecodeFilter>> {
+fn prepare_decode_filters(specs: Vec<FilterSpec>) -> Result<Vec<PreparedDecodeFilter>> {
     let mut prepared = Vec::with_capacity(specs.len());
     for spec in specs {
         let filter_name = spec.normalized_name();
@@ -795,7 +793,7 @@ fn append_positioned_events(
 }
 
 fn decode_codec_prefix(
-    spec: &crate::stream_filter::FilterSpec,
+    spec: &FilterSpec,
     data: &[u8],
     limits: DecodeLimits,
 ) -> crate::stream_filter::FilterDecodeOutcome {
@@ -1249,7 +1247,7 @@ mod tests {
     /// returned a different error in release than in debug.
     #[test]
     fn codec_prefix_probe_applies_decode_params_in_every_build_profile() {
-        let spec = crate::stream_filter::FilterSpec {
+        let spec = FilterSpec {
             name: b"FlateDecode".to_vec(),
             decode_params: DecodeParams::Present(vec![
                 (b"Predictor".to_vec(), ParamValue::Int(12)),
@@ -3138,6 +3136,7 @@ mod tests {
         (encoded, raw, vec![1, 2, 3, 4, 5, 6, 7, 8])
     }
 
+    /// The `/DecodeParms` describing [`png_predicted_flate_fixture`]'s rows.
     fn png_predicted_parms_handle() -> ObjectHandle {
         ObjectHandle::dictionary(vec![
             (b"Predictor".to_vec(), ObjectHandle::integer(12)),
@@ -3304,6 +3303,67 @@ mod tests {
         assert_eq!(
             outcome_error.to_string(),
             "object 20 0 belongs to a dropped PDF"
+        );
+    }
+
+    #[test]
+    fn native_entry_point_decodes_through_a_live_indirect_stream_dictionary() {
+        // The shape `flpdf-25kg.3.5` will actually hand this entry point: an
+        // unresolved indirect stream dictionary whose document is still alive.
+        // `native_entry_point_dereferences_the_stream_dictionary_holder_itself`
+        // above covers only the dropped-document half of `try_get_key`, and
+        // every other handle test on this path passes a direct dictionary,
+        // where `try_dereference` short-circuits on `Repr::Direct`.
+        //
+        // `_resolver` must stay bound to a name: `resolver_bearing_handle`'s
+        // doc (`object_handle.rs`) records that binding it to `_` drops it at
+        // once, which would silently turn this into a second dropped-document
+        // test.
+        let (encoded, undecoded, predicted) = png_predicted_flate_fixture();
+        let (stream_dict, _resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (b"DecodeParms".to_vec(), png_predicted_parms_handle()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        let decoded =
+            decode_stream_data_from_handle(&stream_dict, &encoded, DecodeLimits::default())
+                .unwrap();
+
+        // Both keys had to come back off the *resolved* dictionary: a missing
+        // `/Filter` would leave the raw deflate bytes, and a missing
+        // `/DecodeParms` would leave `undecoded`.
+        assert_eq!(decoded, predicted);
+        assert_ne!(decoded, undecoded);
+        assert_ne!(decoded, encoded);
+    }
+
+    #[test]
+    fn native_entry_point_routes_a_crypt_stage_to_the_shared_provider() {
+        // Plan decision D2 of `flpdf-25kg.3.4` makes recognising a `Crypt`
+        // stage and routing it to a provider the native path's job, and
+        // `decode_stream_data_from_handle_with_mode` installs
+        // `reject_crypt_stage` for that. Replacing that argument with an
+        // identity closure leaves the whole suite green without this test:
+        // `decode_stream_data_rejects_crypt_filter` above covers only the
+        // legacy installation site.
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"Crypt".to_vec()),
+        )]);
+
+        let error =
+            decode_stream_data_from_handle(&dict, b"payload", DecodeLimits::default()).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: unsupported stream filter: Crypt"
         );
     }
 }
