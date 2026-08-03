@@ -562,6 +562,39 @@ impl ObjectHandle {
         Ok(self.as_array())
     }
 
+    /// qpdf-compatible array *length* with lazy dereference — the item count
+    /// without materializing the items.
+    ///
+    /// `QPDFObjectHandle::getArrayNItems` is `asArray()->size()`
+    /// (`libqpdf/QPDFObjectHandle.cc:758-768`), and `asArray` hands back a
+    /// borrowed `QPDF_Array*` (`:252-253`, declared
+    /// `include/qpdf/QPDFObjectHandle.hh:1366`), so qpdf reads the length in
+    /// place. `QPDF_Stream::filterable` uses exactly that to size its
+    /// `/Filter` and `/DecodeParms` loops (`libqpdf/QPDF_Stream.cc:398`,
+    /// `:443`, `:447`) before touching a single item. [`Self::try_as_array`]
+    /// cannot serve that caller: it snapshots the child vector, so a length
+    /// that is only going to be rejected still costs a `Vec` allocation and
+    /// one `Rc` clone per child.
+    ///
+    /// **Deliberately not qpdf's non-array answer.** `getArrayNItems` warns
+    /// `typeWarning("array", "treating as empty")` and returns 0 for a
+    /// non-array (`libqpdf/QPDFObjectHandle.cc:763-766`), so qpdf reads a
+    /// non-array as an empty one. This returns `None`, matching
+    /// [`Self::try_as_array`], and leaves the meaning of "not an array" to the
+    /// caller — for [`crate::stream_filter::decode_filter_specs_from_handle`]
+    /// that is the "stream filter type is not name or array" error. That
+    /// divergence predates this accessor and is not widened by it; folding
+    /// qpdf's treat-as-empty in here would silently turn a rejected `/Filter`
+    /// into an accepted unfiltered stream.
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_array_len(&self) -> Result<Option<usize>> {
+        self.try_dereference()?;
+        Ok(self.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => Some(children.len()),
+            _ => None,
+        }))
+    }
+
     /// qpdf-compatible integer inspection with lazy dereference.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_integer(&self) -> Result<Option<i64>> {
@@ -2102,6 +2135,10 @@ pub(crate) mod identity_tests {
             "resolver failed"
         );
         assert_eq!(
+            handle.try_array_len().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
             handle.try_as_integer().unwrap_err().to_string(),
             "resolver failed"
         );
@@ -2182,6 +2219,59 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn try_array_len_counts_in_place_and_keeps_none_for_a_non_array() {
+        // The count qpdf reads off the borrowed array
+        // (`getArrayNItems` → `asArray()->size()`,
+        // `libqpdf/QPDFObjectHandle.cc:758-768`), including the empty array
+        // `QPDF_Stream::filterable` special-cases at
+        // `libqpdf/QPDF_Stream.cc:443`.
+        let array = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"ASCII85Decode".to_vec()),
+        ]);
+        assert_eq!(array.try_array_len().unwrap(), Some(2));
+        // Counting must not consume or replace the value.
+        assert_eq!(array.as_array().map(|items| items.len()), Some(2));
+
+        assert_eq!(
+            ObjectHandle::array(Vec::new()).try_array_len().unwrap(),
+            Some(0)
+        );
+
+        // Deliberately *not* qpdf's non-array answer. `getArrayNItems` warns
+        // `typeWarning("array", "treating as empty")` and returns 0
+        // (`libqpdf/QPDFObjectHandle.cc:763-766`); returning `Some(0)` here
+        // would make `stream_filter::decode_filter_specs_from_handle` read a
+        // scalar `/Filter` as an empty chain — an accepted unfiltered stream —
+        // instead of raising its type error.
+        for non_array in [
+            ObjectHandle::null(),
+            ObjectHandle::integer(1),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]),
+        ] {
+            assert_eq!(non_array.try_array_len().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn try_array_len_resolves_an_indirect_array_through_its_document() {
+        let (handle, _resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::null()]));
+
+        // Nothing non-resolving can see through an unresolved handle, so
+        // dropping `try_dereference` from `try_array_len` reports this array
+        // as "not an array" — the mutation the `stream_filter` call sites
+        // cannot kill on their own, because a preceding `try_*` has already
+        // resolved the slot by the time they count it.
+        assert!(handle.as_array().is_none());
+        assert!(!handle.is_resolved());
+
+        assert_eq!(handle.try_array_len().unwrap(), Some(1));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
     fn every_value_accessor_reports_a_dropped_document_rather_than_none() {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         let handle = ObjectHandle::new_indirect_with_resolver(
@@ -2195,6 +2285,7 @@ pub(crate) mod identity_tests {
         for error in [
             handle.try_as_name().unwrap_err(),
             handle.try_as_array().unwrap_err(),
+            handle.try_array_len().unwrap_err(),
             handle.try_as_integer().unwrap_err(),
         ] {
             assert_eq!(error.to_string(), "object 21 0 belongs to a dropped PDF");

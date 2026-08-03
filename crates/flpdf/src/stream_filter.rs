@@ -259,10 +259,19 @@ pub(crate) fn decode_filter_specs_from_handle(
         return Ok(Vec::new());
     } else if let Some(name) = filter.try_as_name()? {
         vec![name]
-    } else if let Some(items) = filter.try_as_array()? {
-        validate_filter_chain_count(items.len(), max_filter_chain)?;
-        items
-            .iter()
+    } else if let Some(count) = filter.try_array_len()? {
+        // Counted through `try_array_len`, not `try_as_array`, so a chain the
+        // cap is about to reject is never snapshotted — qpdf sizes this loop
+        // with `getArrayNItems` (`libqpdf/QPDF_Stream.cc:398`), which reads
+        // the length off the borrowed array in place. The snapshot below
+        // therefore only happens once the count is known to be acceptable.
+        validate_filter_chain_count(count, max_filter_chain)?;
+        // `try_array_len` already answered `Some`, so this cannot be `None`;
+        // `flatten` states that without a panicking `expect`.
+        filter
+            .try_as_array()?
+            .into_iter()
+            .flatten()
             .map(|item| {
                 item.try_as_name()?
                     .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
@@ -278,18 +287,26 @@ pub(crate) fn decode_filter_specs_from_handle(
 
     let params: Vec<DecodeParams> = if decode_params.try_is_null()? {
         absent_params(names.len())
-    } else if let Some(items) = decode_params.try_as_array()? {
-        if items.is_empty() {
+    } else if let Some(count) = decode_params.try_array_len()? {
+        // Same length-before-snapshot shape as the `/Filter` arm: qpdf sizes
+        // this loop with `getArrayNItems` as well (`libqpdf/QPDF_Stream.cc:443`
+        // for the empty-array reduction, `:447` for the per-index walk), and
+        // both the empty reduction and the length mismatch are decided from
+        // the count alone — so a mismatched array is rejected without being
+        // snapshotted.
+        if count == 0 {
             absent_params(names.len())
         } else {
-            if items.len() != names.len() {
+            if count != names.len() {
                 return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
             }
-            items
-                .iter()
+            decode_params
+                .try_as_array()?
+                .into_iter()
+                .flatten()
                 .zip(&names)
                 .map(|(item, name)| {
-                    decode_params_from_handle(item, filter_reads_decode_params(name))
+                    decode_params_from_handle(&item, filter_reads_decode_params(name))
                 })
                 .collect::<Result<_>>()?
         }
@@ -1887,6 +1904,87 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn handle_reader_decides_both_array_rejections_from_the_length_alone() {
+        // Both array positions are settled by `try_array_len` — qpdf's
+        // `getArrayNItems`, read in place off the borrowed array
+        // (`libqpdf/QPDF_Stream.cc:398` for `/Filter`, `:443`/`:447` for
+        // `/DecodeParms`) — so a rejected array is never snapshotted.
+        //
+        // The *absence* of that snapshot is deliberately not asserted, because
+        // it is not observable from a test: cloning a `Vec<ObjectHandle>` runs
+        // no user code (it is `Rc` pointer clones only) and the clone is
+        // dropped before the error returns, so neither a resolver call count
+        // nor an `ObjectHandle::strong_count` sample can separate the two
+        // shapes. Only a `#[global_allocator]` probe could, and installing one
+        // across this crate's whole test binary is out of proportion to a
+        // resource fix. What this pins instead is the decision that makes
+        // dropping the snapshot legal — each rejection is reached from the
+        // count and from nothing else — at a length where the snapshot would
+        // actually have cost something.
+        let long_chain: Vec<ObjectHandle> = (0..4096)
+            .map(|_| ObjectHandle::name(b"FlateDecode".to_vec()))
+            .collect();
+
+        // The trailing non-name keeps this on the *array arm's* count: without
+        // it the count that runs after the `/DecodeParms` branch would produce
+        // the identical message, and the assertion would not pin which count
+        // ran — only that some count did.
+        let mut with_a_non_name = long_chain.clone();
+        with_a_non_name.push(ObjectHandle::integer(1));
+        assert_eq!(
+            decode_filter_specs_from_handle(
+                &ObjectHandle::array(with_a_non_name),
+                &ObjectHandle::null(),
+                Some(16),
+            )
+            .unwrap_err()
+            .to_string(),
+            "unsupported PDF feature: filter chain length 4097 exceeds maximum of 16"
+        );
+
+        assert_eq!(
+            decode_filter_specs_from_handle(
+                &ObjectHandle::name(b"FlateDecode".to_vec()),
+                &ObjectHandle::array(long_chain),
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+    }
+
+    #[test]
+    fn handle_reader_keeps_the_non_array_answer_its_length_accessor_gives_it() {
+        // `try_array_len` answers `None` for a non-array where qpdf's
+        // `getArrayNItems` warns and returns 0
+        // (`libqpdf/QPDFObjectHandle.cc:763-766`). Both call sites lean on
+        // that: `Some(0)` would turn a scalar `/Filter` into an empty chain —
+        // an accepted unfiltered stream in place of a rejected document — and
+        // would collapse a scalar `/DecodeParms` from `Present` to `Absent`,
+        // erasing the distinction `QPDFStreamFilter::setDecodeParms`
+        // (`libqpdf/QPDFStreamFilter.cc:3-7`) rejects on. The divergence is
+        // pre-existing — `try_as_array` already answered `None` — and is
+        // pinned here so the length accessor cannot quietly adopt qpdf's
+        // treat-as-empty while looking like a pure resource change.
+        assert_eq!(
+            decode_filter_specs_from_handle(&ObjectHandle::integer(1), &ObjectHandle::null(), None)
+                .unwrap_err()
+                .to_string(),
+            "unsupported PDF feature: stream filter type is not name or array"
+        );
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &ObjectHandle::integer(1),
+            None,
+        )
+        .expect("a non-array /DecodeParms is replicated per filter, not rejected");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
+    }
+
+    #[test]
     fn both_readers_count_a_scalar_filter_against_the_chain_cap_too() {
         // The array arm's count never sees a scalar `/Filter`, so the count
         // that runs after the `/DecodeParms` branch is the only one left to
@@ -1974,14 +2072,19 @@ pub(crate) mod tests {
     // resolving helpers kills four — the first accessor each child position
     // reaches: `filter.try_is_null`, the `/Filter` item's `try_as_name`,
     // `decode_params_from_handle`'s `try_is_null`, and
-    // `param_value_from_handle`'s `try_as_integer`. The other six survive
+    // `param_value_from_handle`'s `try_as_integer`. The other eight survive
     // individual mutation, for two distinct reasons, neither of them a bug:
     //
-    // - Five are *already-resolved* sites. `try_dereference` is idempotent, so
-    //   `filter.try_as_name`/`try_as_array`, `decode_params.try_as_array`,
-    //   `try_as_dictionary`, and `param_value_from_handle`'s `try_as_name`
-    //   inspect a slot the preceding `try_*` at the same position resolved, and
-    //   behave identically to their non-resolving twins.
+    // - Seven are *already-resolved* sites. `try_dereference` is idempotent, so
+    //   `filter.try_as_name`/`try_array_len`/`try_as_array`,
+    //   `decode_params.try_array_len`/`try_as_array`, `try_as_dictionary`, and
+    //   `param_value_from_handle`'s `try_as_name` inspect a slot the preceding
+    //   `try_*` at the same position resolved, and behave identically to their
+    //   non-resolving twins. The two `try_array_len` sites have no such twin to
+    //   swap in — the equivalent mutation is deleting `try_dereference` from
+    //   the accessor itself, which likewise survives here and is killed instead
+    //   by `object_handle`'s own
+    //   `try_array_len_resolves_an_indirect_array_through_its_document`.
     // - One is *convergent*: `decode_params.try_is_null` is first at its
     //   position, yet swapping it changes nothing, because the fallthrough it
     //   guards reaches the same answer anyway — a non-array indirect null drops
@@ -1991,7 +2094,7 @@ pub(crate) mod tests {
     //   `Object` reader's `None | Some(Object::Null)` arm and is kept for that
     //   symmetry.
     //
-    // That matrix covers only the ten `try_*` sites. It says nothing about
+    // That matrix covers only the twelve `try_*` sites. It says nothing about
     // `param_value_without_resolving`, which has no `try_*` to mutate: the
     // mutation that discriminates *it* is flipping `resolve_values` itself,
     // which the paired tests above cover in both directions.
