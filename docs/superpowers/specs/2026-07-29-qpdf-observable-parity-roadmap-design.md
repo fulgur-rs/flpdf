@@ -323,10 +323,10 @@ Existing work is not reparented or recreated.
 ### Existing dependency groups
 
 - observation: `flpdf-n9t0`, `flpdf-egzr`;
-- object/parser/repair: phase blocker `flpdf-9hc.17`; completion-gate blockers
-  `flpdf-ud7r`, `flpdf-xm72`, `flpdf-fmb9`, and `flpdf-4zt3`; `flpdf-mfir`
-  remains a non-blocking related refactor because accessor deduplication has no
-  observable parity contract;
+- object/parser/repair: **no phase blocker** (see the note below); completion-gate
+  blockers `flpdf-ud7r`, `flpdf-xm72`, `flpdf-fmb9`, and `flpdf-4zt3`;
+  `flpdf-9hc.17` and `flpdf-mfir` remain non-blocking related associations —
+  accessor deduplication has no observable parity contract;
 - stream/filter/crypto: phase blocker `flpdf-qynx.5`; completion-gate blockers
   `flpdf-qynx.8`, `flpdf-qynx.9`, and `flpdf-qynx.10`;
 - QPDFJob/CLI/transforms: phase blocker `flpdf-9hc.23`; completion-gate blockers
@@ -334,6 +334,33 @@ Existing work is not reparented or recreated.
 - writer: the completed children of `flpdf-9hc.20` as the existing floor,
   with `flpdf-9hc.20` as the phase blocker; completion-gate blockers
   `flpdf-9hc.42`, `flpdf-9hc.29`, `flpdf-cecz`, and `flpdf-j4ph`.
+
+#### Correction (2026-08-03): object/parser/repair has no phase blocker
+
+`flpdf-9hc.17` was a phase blocker on `flpdf-25kg.3` and has been demoted to
+`relates-to`. Beads propagates a blocked parent's state to its children — the
+policy above already says so — so that one edge held all twelve children of a
+P1 phase epic out of `bd ready`, including `flpdf-25kg.3.5`, on behalf of a P3
+epic. That contradicts "Phases 2, 3, and 4 may proceed independently after
+their measurement or helper prerequisites exist".
+
+It is `relates-to` rather than a completion-gate blocker because Beads rejects
+epic-to-task blocking (`tasks can only block other tasks, not epics`), and
+`flpdf-9hc.17` is an epic with eight children. The completion gate
+`flpdf-25kg.3.2` can only be blocked by non-epic work, which is why its four
+existing blockers are all tasks.
+
+Reviewing its children confirms it was never an implementation prerequisite:
+`--ignore-xref-streams`, `--suppress-recovery`, and the CLI slice are flags;
+trailer and page-tree rebuild are recovery routines; the diagnostic slice is
+wording. Only `flpdf-9hc.17.5` (object-stream resilience) touches the same
+territory as `flpdf-25kg.3.5`, and the natural order there is the reverse —
+canonical `resolveObjectsInStream` first, resilience on top of it.
+
+**`flpdf-25kg.5` and `flpdf-25kg.6` still carry the same shape**: P3 epics
+`flpdf-9hc.23` and `flpdf-9hc.20` gate a P2 and a P1 phase respectively. They
+were left alone here; decide them on their own evidence rather than by
+analogy.
 
 ### New gap issues
 
