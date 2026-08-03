@@ -1874,10 +1874,18 @@ mod tests {
     /// [`crate::ObjectHandle::set_missing`] takes `borrow_mut()` on the very
     /// slot the outer frame is part-way through resolving — a second
     /// `RefCell`, distinct from [`super::ResolverCore`]'s. That much is
-    /// latent rather than load-bearing: no code in this module can hold a
-    /// borrow of a handle's slot ([`crate::ObjectHandle`] hands none out), and
-    /// the one place that could — `try_dereference`'s own state check — fails
-    /// forty tests if it keeps its borrow, so it needs no fixture of its own.
+    /// latent rather than load-bearing, and the reason is checkable rather
+    /// than assumed: no [`crate::ObjectHandle`] method visible outside its own
+    /// module takes a caller closure or hands back a `std::cell::Ref`, so no
+    /// code *here* can be holding a slot borrow when the seam is crossed. The
+    /// two accessors that do run a closure under the borrow, `with_value` and
+    /// `with_value_mut`, are private to `object_handle.rs`, which confines the
+    /// hazard there — and the one place in that file which could hold a borrow
+    /// across resolution, `try_dereference`'s own state check, reddens tests
+    /// across the whole crate if it does, so it needs no fixture here. Should
+    /// a closure-scoped accessor ever become crate-visible, this is the
+    /// fixture positioned to catch a `read_stream` that wrapped the `/Length`
+    /// dereference in one.
     ///
     /// What this *does* catch today is the [`super::ResolverCore`] borrow its
     /// sibling catches, on the same terms: a borrow spanning the `/Length`
