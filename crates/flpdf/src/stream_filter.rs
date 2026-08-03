@@ -336,14 +336,18 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
 /// [`decode_params_from_handle`] for the one `/DecodeParms` handle a non-null,
 /// non-array value replicates across the whole chain.
 ///
-/// **Why not [`decode_params_from_handle`] in a loop.** That function opens
-/// with [`ObjectHandle::try_as_dictionary`], which hands back a *clone* of the
-/// whole `BTreeMap` — every key copied, one `Rc` bump per value. Calling it
-/// once per filter turned an oversized `/DecodeParms` into one full snapshot
-/// per stage, up to `max_filter_chain` of them, however few keys survive
-/// [`RETAINED_DECODE_PARAM_KEYS`] — the retention test runs inside the walk,
-/// after the snapshot. Taking the snapshot here instead costs one whatever the
-/// chain length is, and the per-filter walk then borrows it.
+/// **Why not [`decode_params_from_handle`] in a loop.** That function reaches
+/// [`ObjectHandle::try_as_dictionary`], which hands back a *clone* of the whole
+/// `BTreeMap` — every key copied, plus one `Rc` bump per value, `ObjectHandle`
+/// being a newtype over one. Calling it once per filter turned an oversized
+/// `/DecodeParms` into one full snapshot per stage — measured, sixteen for a
+/// sixteen-filter chain — however few keys survive
+/// [`RETAINED_DECODE_PARAM_KEYS`], because the retention test runs inside the
+/// walk, after the snapshot. Nor was the stage count capped in general:
+/// `max_filter_chain` bounds it only where [`crate::filters::DecodeLimits`]
+/// carries one, and that field is a `pub Option` its owner may leave `None`.
+/// Taking the snapshot here instead costs one whatever the chain length is,
+/// and the per-filter walk then borrows it.
 ///
 /// **The per-filter walk itself is deliberately kept.** qpdf calls
 /// `filter->setDecodeParms(decode_item)` once per filter
@@ -455,6 +459,14 @@ fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
 /// snapshot across the chain instead of taking one per filter; see that
 /// function for why the per-filter *walk* stays and the per-filter *snapshot*
 /// does not.
+///
+/// The array arm keeps a known residual of the same shape: `/DecodeParms
+/// [5 0 R 5 0 R ...]`, one object repeated at every index, still snapshots
+/// that dictionary once per index. Reading each index separately is qpdf's
+/// own shape — it pushes `getArrayItem(i)` per index (`QPDF_Stream.cc:447-449`)
+/// and hands each to that filter's `setDecodeParms` — so only the snapshot is
+/// flpdf's cost, and collapsing it needs identity-keyed sharing this seam does
+/// not have. Left unfixed deliberately, not overlooked.
 fn decode_params_from_handle(params: &ObjectHandle, resolve_values: bool) -> Result<DecodeParams> {
     if params.try_is_null()? {
         return Ok(DecodeParams::Absent);
