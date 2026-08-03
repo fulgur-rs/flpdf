@@ -1908,11 +1908,10 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        assert!(
-            calls.borrow().is_empty(),
-            "qpdf never fetches this object; flpdf resolved {:?}",
-            calls.borrow()
-        );
+        // Compared against an empty vector rather than asserted `is_empty()`,
+        // so a regression prints which object flpdf fetched. qpdf fetches
+        // none.
+        assert_eq!(*calls.borrow(), Vec::new());
         assert!(!value.is_resolved());
         // The entry is still *present*, so `set_decode_params`'s `is_absent()`
         // still rejects it exactly as qpdf's base implementation does. Only
@@ -2016,21 +2015,21 @@ pub(crate) mod tests {
             (b"Other".to_vec(), ParamValue::Other),
         ]);
 
-        for filter in [b"ASCIIHexDecode".to_vec(), b"FlateDecode".to_vec()] {
-            let specs = decode_filter_specs_from_handle(
-                &ObjectHandle::name(filter.clone()),
+        // Spelled out rather than looped so a failure names the filter by the
+        // line it is on, without a message argument that only runs on failure.
+        let read = |filter: &[u8]| {
+            decode_filter_specs_from_handle(
+                &ObjectHandle::name(filter.to_vec()),
                 &ObjectHandle::dictionary(entries()),
                 None,
             )
-            .unwrap();
+            .unwrap()
+            .swap_remove(0)
+            .decode_params
+        };
 
-            assert_eq!(
-                specs[0].decode_params,
-                expected,
-                "filter {}",
-                String::from_utf8_lossy(&filter)
-            );
-        }
+        assert_eq!(read(b"ASCIIHexDecode"), expected);
+        assert_eq!(read(b"FlateDecode"), expected);
     }
 
     #[test]
