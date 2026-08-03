@@ -87,7 +87,7 @@ use `try_*`, not the non-resolving `as_*`.
 
 - **D1 — indirect `/Filter` / `/DecodeParms`.** The native reader uses the
   crate-private `try_dereference`/`try_get_key`/`try_as_dictionary` family
-  (`object_handle.rs:507-602`) plus the new `try_as_*`/`try_array_len`
+  (`object_handle.rs:507-604`) plus the new `try_as_*`/`try_array_len`
   accessors from Task 4, so an indirect child resolves through its document
   exactly as qpdf's accessors do. Do **not** add a non-resolving fallback.
 
@@ -98,10 +98,12 @@ use `try_*`, not the non-resolving `as_*`.
 
   - `Error::Internal` comes from `try_dereference` on a handle that is still
     `NotYetResolved` and whose resolver `Weak` cannot be upgraded
-    (`object_handle.rs`, `try_dereference`). Today that also covers every
-    handle `Pdf::get_object_handle` hands out before it is resolved, because
-    `new_indirect_unresolved_for_pdf` leaves `resolver: None` until
-    `flpdf-25kg.3.5` wires the live link.
+    (`object_handle.rs:513-532`). Today that also covers every handle
+    `Pdf::get_object_handle` (`reader.rs:1605-1616`) hands out before it is
+    resolved, because `new_indirect_unresolved_for_pdf`
+    (`object_handle.rs:258-264`) delegates to
+    `new_indirect_unresolved_with_identity`, which leaves `resolver: None`
+    (`:275`) until `flpdf-25kg.3.5` wires the live link.
   - Production teardown is the other path: `impl Drop for Pdf`
     (`crates/flpdf/src/reader.rs:351-371`) calls `ObjectHandle::disconnect` on
     every registry entry, explicitly mirroring `QPDF::~QPDF`

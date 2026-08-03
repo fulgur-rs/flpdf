@@ -566,12 +566,13 @@ impl ObjectHandle {
     /// without materializing the items.
     ///
     /// `QPDFObjectHandle::getArrayNItems` is `asArray()->size()`
-    /// (`libqpdf/QPDFObjectHandle.cc:758-768`), and `asArray` hands back a
-    /// borrowed `QPDF_Array*` (`:252-253`, declared
-    /// `include/qpdf/QPDFObjectHandle.hh:1366`), so qpdf reads the length in
-    /// place. `QPDF_Stream::filterable` uses exactly that to size its
-    /// `/Filter` and `/DecodeParms` loops (`libqpdf/QPDF_Stream.cc:398`,
-    /// `:443`, `:447`) before touching a single item. [`Self::try_as_array`]
+    /// (`libqpdf/QPDFObjectHandle.cc:758-768`), and `asArray` is
+    /// `return dereference() ? obj->as<QPDF_Array>() : nullptr;` — a borrowed
+    /// `QPDF_Array*`, not a copy (`libqpdf/QPDFObjectHandle.cc:252-256`), so
+    /// qpdf reads the length in place. `QPDF_Stream::filterable` uses that to
+    /// size its `/Filter` and `/DecodeParms` loops
+    /// (`libqpdf/QPDF_Stream.cc:398`, `:443`, `:447`) before touching a single
+    /// item. [`Self::try_as_array`]
     /// cannot serve that caller: it snapshots the child vector, so a length
     /// that is only going to be rejected still costs a `Vec` allocation and
     /// one `Rc` clone per child.
