@@ -52,14 +52,31 @@
 //! nested `N G R` the parse mints a handle for; [`ResolverHandle::push_warning`]
 //! wherever a warning is raised.
 //!
-//! **This is pinned by a test now, not merely stated.**
-//! `a_streams_indirect_length_resolves_mid_parse_and_the_payload_is_read_from_the_restored_position`
-//! drives a real nested resolution through the `/Length` seam, so a borrow
-//! spanning it panics there instead of passing unnoticed. Verified by breaking
-//! it: holding [`ResolverHandle::xref_entry`]'s borrow across
-//! `read_object_at_offset` fails six tests with `RefCell already borrowed`,
-//! and wrapping a [`ResolverHandle::push_warning`] call in a borrow fails
-//! five.
+//! **This is pinned by tests now, not merely stated**, and the mutation that
+//! pins it is the one that actually reaches the seam. Taking a borrow inside
+//! [`ResolverHandle::read_stream`] that spans only the `/Length` dereference
+//! reddens every fixture that gives a stream an *indirect* `/Length` — six
+//! tests today, and by construction whichever tests have that shape later —
+//! each panicking `RefCell already borrowed` inside [`ResolveMark::begin`],
+//! which is the nested resolution's first borrow. A fixture whose `/Length`
+//! is a direct integer cannot catch it: nothing re-enters, so there is no
+//! second borrow for it to collide with.
+//!
+//! **A coarser mutation proves less than it looks, and an earlier revision of
+//! this comment mistook one for a verification.** It cited "holding
+//! [`ResolverHandle::xref_entry`]'s borrow across `read_object_at_offset`
+//! fails six tests". That borrow spans the whole read-and-parse phase, so it
+//! panics in [`ResolverHandle::seek`] on the very first input operation,
+//! before any nested resolution is reached — it shows that the input wrappers
+//! need the borrow free, not that the seam is guarded. Its count was wrong by
+//! construction, too: what that mutation reddens is *every* test that drives a
+//! real read through this resolver, so the number grows with every fixture
+//! added and "six" was already stale when this was read again. That is why the
+//! claim above is phrased as which fixtures fail rather than how many. The
+//! same revision claimed that wrapping a
+//! [`ResolverHandle::push_warning`] call in a borrow "fails five"; it named
+//! no call site and could not be reproduced, so it is withdrawn rather than
+//! restated.
 //!
 //! The warning sink stays the easiest way to get this wrong, because
 //! `push_warning` needs `borrow_mut` and the code that warns is the code that
@@ -1807,10 +1824,19 @@ mod tests {
     /// somewhere past the payload. Deleting the `seek(stream_offset)` restore
     /// makes this read the wrong bytes.
     ///
-    /// The `flpdf-25kg.3.5` slice plan's Task 5 adds the borrow-discipline
-    /// regression on top of this (a `RefCell` double-borrow rather than a
-    /// wrong value) and the self-referential `/Length` case; this one only
-    /// establishes that nested resolution mid-parse produces the right answer.
+    /// **What this guards is a `RefCell` double-borrow, not a wrong value.**
+    /// A wrong value is what deleting the restore produces; the failure this
+    /// test exists for is the other one. Any borrow of
+    /// [`super::ResolverCore`] left live across the `/Length` dereference
+    /// makes this test *panic* — `RefCell already borrowed`, raised inside
+    /// [`ResolveMark::begin`] as the nested resolution takes the very first
+    /// borrow of its own — rather than fail an assertion. The panic site names
+    /// the colliding borrow, so the message is the diagnosis.
+    ///
+    /// A fixture whose `/Length` is a direct integer cannot stand in for this
+    /// one, however similar it looks: nothing re-enters, so no borrow can
+    /// collide and the hazard passes unnoticed. That is the whole reason
+    /// object 5 exists.
     #[test]
     fn a_streams_indirect_length_resolves_mid_parse_and_the_payload_is_read_from_the_restored_position(
     ) {
@@ -1833,6 +1859,91 @@ mod tests {
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "both marks must be gone once the outer resolution returns"
+        );
+    }
+
+    /// A stream whose `/Length` points at the very object being resolved —
+    /// qpdf's own example of why the in-progress set exists: "an object
+    /// references itself directly or indirectly in some key that has to be
+    /// resolved during object parsing, such as stream length"
+    /// (`libqpdf/QPDF.cc:1706-1708`).
+    ///
+    /// **The only fixture where the nested resolution re-enters on the *same*
+    /// handle**, which is what makes it more than a restatement of the
+    /// sibling-`/Length` seam test above.
+    /// [`crate::ObjectHandle::set_missing`] takes `borrow_mut()` on the very
+    /// slot the outer frame is part-way through resolving — a second
+    /// `RefCell`, distinct from [`super::ResolverCore`]'s. That much is
+    /// latent rather than load-bearing: no code in this module can hold a
+    /// borrow of a handle's slot ([`crate::ObjectHandle`] hands none out), and
+    /// the one place that could — `try_dereference`'s own state check — fails
+    /// forty tests if it keeps its borrow, so it needs no fixture of its own.
+    ///
+    /// What this *does* catch today is the [`super::ResolverCore`] borrow its
+    /// sibling catches, on the same terms: a borrow spanning the `/Length`
+    /// dereference makes this panic `RefCell already borrowed` rather than
+    /// return a wrong value. And it is the only test that reaches the loop
+    /// guard through a production resolution — the three that assert the loop
+    /// branch's outcome all stage the mark by hand, so all three would still
+    /// pass if the guard were unreachable from the parse. Remove the guard and
+    /// this fixture recurses until the stack runs out, aborting the test
+    /// binary rather than failing a test.
+    ///
+    /// **flpdf diverges from qpdf on the outcome, deliberately.** qpdf's inner
+    /// call warns and caches null (`:1710-1711`); `readStream` then throws
+    /// `damagedPDF(offset, "stream dictionary lacks /Length key")`
+    /// (`:1373-1376`); `QPDF::resolve` catches that in
+    /// `catch (QPDFExc& e) { warn(e); }` (`:1737-1738`) and warns a *second*
+    /// time; and the resolve-to-null fallback at `:1745-1749` then does
+    /// nothing, because `isUnresolved(og)` is already false — the inner call
+    /// cached the null. So a qpdf caller sees **no error and two warnings**.
+    /// flpdf propagates the parse error and raises one, because that `catch`
+    /// arm and the fallback behind it are not ported in this slice; see
+    /// [`super::ResolverHandle`]'s `resolve_indirect`. The cached state
+    /// coincides — null at offset `-1` — but the observable outcome does not,
+    /// and the single warning asserted below is flpdf's count, not qpdf's.
+    #[test]
+    fn a_self_referential_length_takes_the_loop_branch_instead_of_recursing_forever() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 2 0 R >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let object_ref = ObjectRef::new(2, 0);
+        let handle = pdf.get_object_handle(object_ref);
+
+        let error = handle
+            .try_dereference()
+            .expect_err("a self-referential /Length leaves the stream with no usable length");
+        assert!(
+            matches!(&error, Error::Parse { message, .. }
+                if message == "stream dictionary lacks /Length key"),
+            "the loop must surface as qpdf's null-/Length message: {error:?}"
+        );
+
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            ["loop detected resolving object 2 0"],
+            "this fixture opens cleanly, so the loop is the only warning source"
+        );
+
+        assert!(
+            handle.is_null() && handle.is_resolved(),
+            "the inner call caches qpdf's loop null through the same slot the \
+             outer call was resolving"
+        );
+        handle
+            .try_dereference()
+            .expect("and that null is terminal, so nothing is re-read");
+        assert!(
+            pdf.resolver.core.borrow().resolving.is_empty(),
+            "the mark must be gone once the outer resolution returns its error"
         );
     }
 
