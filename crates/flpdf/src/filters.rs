@@ -3,12 +3,14 @@ use std::borrow::Cow;
 
 use crate::ascii85;
 use crate::ascii_hex;
+use crate::object_handle::ObjectHandle;
 use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs_from_object, encode_flate, encode_run_length, stream_filter_for,
-    validate_filter_chain_count, DecodeParams, FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
+    encode_run_length, stream_filter_for, validate_filter_chain_count, DecodeParams,
+    FilterDecodePhase, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -213,6 +215,19 @@ pub(crate) fn decode_stream_data_with_limits_and_warnings(
         limits,
         DataEventMode::Suppress,
     )?;
+    replay_strict_decode_outcome(outcome, warn)
+}
+
+/// Collapse a recovered outcome into the strict `getStreamData` shape: the
+/// first replayed error wins, otherwise the decoded bytes.
+///
+/// Shared by the legacy [`decode_stream_data_with_limits`] path and the
+/// `ObjectHandle`-native [`decode_stream_data_from_handle`], so "which event
+/// becomes the error" has one definition.
+fn replay_strict_decode_outcome(
+    outcome: StreamDecodeOutcome,
+    warn: &mut dyn FnMut(&str, i32) -> PipelineResult<()>,
+) -> Result<Vec<u8>> {
     let mut first_error = None;
     for event in outcome.events {
         let event_error = replay_strict_decode_event(event, warn);
@@ -322,12 +337,20 @@ fn decode_stream_data_with_filters(
         stream_data,
         limits,
         data_events,
-        &mut |_, _| {
-            Err(Error::Unsupported(
-                "unsupported stream filter: Crypt".to_string(),
-            ))
-        },
+        &mut reject_crypt_stage,
     )
+}
+
+/// The crypt provider every non-decrypting decode entry point installs.
+///
+/// Plan decision D2 of `flpdf-25kg.3.4` keeps decryption out of this layer, so
+/// a `Crypt` stage is recognised during staging and then refused here. Shared
+/// by the legacy and `ObjectHandle` entry points so the message has one
+/// definition rather than one literal per path.
+fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec<u8>> {
+    Err(Error::Unsupported(
+        "unsupported stream filter: Crypt".to_string(),
+    ))
 }
 
 fn decode_stream_data_with_filters_and_crypt<F>(
@@ -342,6 +365,121 @@ where
     F: FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>,
 {
     let specs = decode_filter_specs_from_object(filter, decode_params, limits.max_filter_chain)?;
+    decode_prepared_specs(specs, stream_data, limits, data_events, decrypt_crypt)
+}
+
+/// Decode a stream's data from its `ObjectHandle` stream dictionary — the
+/// `ObjectHandle`-native counterpart of [`decode_stream_data_with_limits`].
+///
+/// `/Filter` and `/DecodeParms` are read off `stream_dict` the way
+/// `QPDF_Stream::filterable` reads them, through `stream_dict.getKey`
+/// (`libqpdf/QPDF_Stream.cc:386`, `:441`); `try_get_key` dereferences the
+/// holder first, as qpdf's accessor does, and hands a missing key back as a
+/// null handle. Every child is then inspected through the resolving `try_*`
+/// accessors, so an indirect `/Filter` or `/DecodeParms` value is read as the
+/// object it points at — see plan decision D1 of `flpdf-25kg.3.4`, whose
+/// 2026-08-03 live-qpdf probe recorded that behavior.
+///
+/// `stream_data` is the stream's raw bytes; this entry point does not read
+/// them out of the handle, because `flpdf-25kg.3.5` already holds them from
+/// `readObjectAtOffset`.
+///
+/// # Errors
+///
+/// Returns [`Error::Unsupported`] on the same filter-chain, decode-parameter,
+/// and codec conditions as [`decode_stream_data_with_limits`], and
+/// [`Error::Internal`] when a child is indirect and its document has been
+/// dropped (`ObjectHandle::try_dereference`).
+///
+/// This mirrors `QPDF_Stream::getStreamData`'s *outcome* on an unfilterable
+/// stream — qpdf throws there too (`QPDF_Stream.cc:344-359`) — but not its
+/// diagnostic channel: qpdf first emits a warning and flpdf raises the same
+/// text as the error itself. That gap is plan decision D3, measured against
+/// qpdf 11.9.0 on 2026-08-03 and deliberately not closed here.
+#[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+pub(crate) fn decode_stream_data_from_handle(
+    stream_dict: &ObjectHandle,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<Vec<u8>> {
+    let outcome = decode_stream_data_from_handle_with_mode(
+        stream_dict,
+        stream_data,
+        limits,
+        DataEventMode::Suppress,
+    )?;
+    replay_strict_decode_outcome(outcome, &mut reject_decode_warning)
+}
+
+/// Decode a stream from its `ObjectHandle` stream dictionary while retaining
+/// ordered recovery events — the `ObjectHandle`-native counterpart of
+/// [`decode_stream_data_recovering_with_limits`].
+///
+/// [`decode_stream_data_from_handle`] is this function plus the same strict
+/// replay the legacy path applies, so the two agree on bytes and differ only
+/// in whether a warning is reported or raised.
+///
+/// # Errors
+///
+/// Returns an outer [`Error`] when the filter chain cannot be read or
+/// constructed, on the same terms as [`decode_stream_data_from_handle`].
+/// Runtime codec failures instead remain ordered [`StreamDecodeEvent::Error`]
+/// events alongside any recovered output.
+#[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+pub(crate) fn decode_stream_data_recovering_from_handle(
+    stream_dict: &ObjectHandle,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<StreamDecodeOutcome> {
+    decode_stream_data_from_handle_with_mode(
+        stream_dict,
+        stream_data,
+        limits,
+        DataEventMode::Record,
+    )
+}
+
+fn decode_stream_data_from_handle_with_mode(
+    stream_dict: &ObjectHandle,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    data_events: DataEventMode,
+) -> Result<StreamDecodeOutcome> {
+    let filter = stream_dict.try_get_key(b"Filter")?;
+    let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+    let specs = decode_filter_specs_from_handle(&filter, &decode_params, limits.max_filter_chain)?;
+    decode_prepared_specs(
+        specs,
+        stream_data,
+        limits,
+        data_events,
+        &mut reject_crypt_stage,
+    )
+}
+
+/// The provider a decode entry point installs to handle a `Crypt` stage,
+/// erased so both shape readers reach one engine rather than monomorphising a
+/// copy each. Plan decision D2 of `flpdf-25kg.3.4` keeps it an explicit
+/// parameter instead of a document hookup.
+type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>;
+
+/// Run the staging, codec, and warning-ordering engine over already-read
+/// filter specs.
+///
+/// Everything downstream of `FilterSpec` lives here in one copy: both shape
+/// readers — the `&Object` one behind the legacy `&Dictionary` entry points
+/// and the `ObjectHandle` one behind [`decode_stream_data_from_handle`] —
+/// funnel into this function, so filter-chain staging, predictor geometry,
+/// [`DecodeLimits`] enforcement, and event ordering cannot drift between the
+/// two shapes. Nothing in this body inspects a `/Filter` or `/DecodeParms`
+/// object of either shape.
+fn decode_prepared_specs(
+    specs: Vec<crate::stream_filter::FilterSpec>,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+    data_events: DataEventMode,
+    decrypt_crypt: CryptProvider<'_>,
+) -> Result<StreamDecodeOutcome> {
     let prepared = prepare_decode_filters(specs)?;
     let stage_count = prepared.len();
     let mut decoded = Cow::Borrowed(stream_data);
@@ -2977,5 +3115,144 @@ mod tests {
         // ...and a non-Unsupported error never matches.
         let parse = Error::parse(0, "boom");
         assert!(!is_decode_output_limit_error(&parse));
+    }
+
+    /// Two PNG `None`-filtered rows of four data bytes each, plus the
+    /// `/DecodeParms` that describe them.
+    ///
+    /// Without the predictor the same bytes decode to the ten raw bytes
+    /// including each row's leading filter-type byte, so any reader that fails
+    /// to pick `/DecodeParms` up off the dictionary produces a different
+    /// length as well as different content.
+    fn png_predicted_flate_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let raw = vec![0, 1, 2, 3, 4, 0, 5, 6, 7, 8];
+        let encoded = encode_flate(&raw).unwrap();
+        (encoded, raw, vec![1, 2, 3, 4, 5, 6, 7, 8])
+    }
+
+    fn png_predicted_parms_handle() -> ObjectHandle {
+        ObjectHandle::dictionary(vec![
+            (b"Predictor".to_vec(), ObjectHandle::integer(12)),
+            (b"Columns".to_vec(), ObjectHandle::integer(4)),
+        ])
+    }
+
+    #[test]
+    fn native_entry_point_decodes_a_flate_stream_from_a_handle() {
+        let payload = b"canonical resolver payload";
+        let encoded = crate::stream_filter::encode_flate(payload).unwrap();
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(encoded.len() as i64),
+            ),
+        ]);
+
+        let decoded =
+            decode_stream_data_from_handle(&dict, &encoded, DecodeLimits::default()).unwrap();
+
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn native_entry_point_reads_decode_parms_off_the_stream_dictionary() {
+        let (encoded, undecoded, predicted) = png_predicted_flate_fixture();
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"DecodeParms".to_vec(), png_predicted_parms_handle()),
+        ]);
+
+        let decoded =
+            decode_stream_data_from_handle(&dict, &encoded, DecodeLimits::default()).unwrap();
+
+        // `QPDF_Stream::filterable` reads `/DecodeParms` at
+        // `libqpdf/QPDF_Stream.cc:441`. Reading no key, or the wrong key,
+        // leaves the predictor at 1 and yields `undecoded` instead.
+        assert_eq!(decoded, predicted);
+        assert_ne!(decoded, undecoded);
+    }
+
+    #[test]
+    fn native_outcome_entry_point_carries_the_flate_warning_the_strict_form_raises() {
+        // The same truncated-Flate-under-a-predictor input as
+        // `recovering_final_flate_warning_precedes_predictor_finish_data`, so
+        // the outcome carries a warning *and* a recovered data chunk.
+        let mut encoded = encode_flate(b"\0A").unwrap();
+        encoded.truncate(encoded.len() - 4);
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (b"Predictor".to_vec(), ObjectHandle::integer(12)),
+                    (b"Columns".to_vec(), ObjectHandle::integer(2)),
+                ]),
+            ),
+        ]);
+
+        let outcome =
+            decode_stream_data_recovering_from_handle(&dict, &encoded, DecodeLimits::default())
+                .unwrap();
+
+        assert_eq!(outcome.data, b"A\0");
+        // The `Data` event is what separates this `Record`-mode entry point
+        // from the `Suppress`-mode strict one below; the `Warning` is what a
+        // bytes-only comparison would miss.
+        assert!(matches!(
+            &outcome.events[..],
+            [
+                StreamDecodeEvent::Warning(warning),
+                StreamDecodeEvent::Data(data),
+            ] if warning.message == "input stream is complete but output may still be valid"
+                && warning.code == -5
+                && data == b"A\0"
+        ));
+
+        // The strict form replays that same warning through
+        // `replay_strict_decode_event`, so it must not answer `Ok`.
+        let error =
+            decode_stream_data_from_handle(&dict, &encoded, DecodeLimits::default()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream inflate: \
+             input stream is complete but output may still be valid (zlib error -5)"
+        );
+    }
+
+    #[test]
+    fn native_entry_point_applies_the_caller_supplied_filter_chain_limit() {
+        // `max_filter_chain` is the one `DecodeLimits` field the entry point
+        // hands to the shape reader rather than to the shared engine, so it is
+        // the field a wiring slip would silently drop. Passing a literal
+        // `None` there leaves this the only red test.
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+        )]);
+        let limits = DecodeLimits {
+            max_output: None,
+            max_filter_chain: Some(0),
+        };
+
+        let error = decode_stream_data_from_handle(&dict, b">", limits).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: filter chain length 1 exceeds maximum of 0"
+        );
+
+        // The same limit reaches the outcome-level entry point, and the
+        // default limit admits this one-stage chain.
+        assert!(decode_stream_data_recovering_from_handle(&dict, b">", limits).is_err());
+        assert!(decode_stream_data_from_handle(&dict, b">", DecodeLimits::default()).is_ok());
     }
 }
