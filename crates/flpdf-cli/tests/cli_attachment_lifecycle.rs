@@ -755,7 +755,13 @@ fn lifecycle_6_qpdf_authored_readable_by_flpdf() {
 // single-line plain listing (QPDFJob::doListAttachments).
 // ---------------------------------------------------------------------------
 
-/// Run both tools with the same argv and require byte-identical stdout.
+/// Run both tools with the same argv and require identical stdout.
+///
+/// Line endings are normalized first: on Windows qpdf writes its info log
+/// through a text-mode stdout, so every line arrives CRLF-terminated, while
+/// flpdf writes LF on every platform. That difference spans the whole flpdf
+/// CLI rather than the listing, so it is normalized here instead of being
+/// asserted; everything else must match byte for byte.
 ///
 /// Skips (and says so) when qpdf is absent, like the other cross-checks here.
 fn assert_listing_matches_qpdf(pdf_path: &Path, args: &[&str]) -> Option<String> {
@@ -775,8 +781,8 @@ fn assert_listing_matches_qpdf(pdf_path: &Path, args: &[&str]) -> Option<String>
         .output()
         .unwrap();
     assert_eq!(
-        String::from_utf8_lossy(&flpdf_out.stdout),
-        String::from_utf8_lossy(&qpdf_out.stdout),
+        String::from_utf8_lossy(&flpdf_out.stdout).replace("\r\n", "\n"),
+        String::from_utf8_lossy(&qpdf_out.stdout).replace("\r\n", "\n"),
         "flpdf and qpdf must agree on `{args:?}` stdout for {pdf_path:?}",
     );
     Some(String::from_utf8(flpdf_out.stdout).expect("listing is not UTF-8"))
