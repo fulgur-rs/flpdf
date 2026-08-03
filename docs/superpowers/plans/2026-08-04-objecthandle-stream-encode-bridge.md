@@ -20,7 +20,7 @@
 
 ---
 
-### Task 1: Add all acceptance tests and verify RED
+### Task 1: Add acceptance tests, verify RED, implement the bridge, and verify GREEN
 
 **Files:**
 - Modify: `crates/flpdf/src/filters.rs` (`#[cfg(test)] mod tests`)
@@ -28,7 +28,7 @@
 
 **Interfaces:**
 - Consumes: existing `decode_filter_specs_from_handle`, `ObjectHandle`, `ObjectValue`, `resolver_bearing_handle`, `Pdf::get_object_handle`, `encode_stream_data`, and codec test helpers.
-- Produces: four failing tests specifying direct equivalence, absolute bytes, live indirect resolution, and dropped-resolver failure.
+- Produces: four acceptance tests specifying direct equivalence, absolute bytes, live indirect resolution, and dropped-resolver failure; `pub(crate) fn encode_stream_data_from_handle(&ObjectHandle, &[u8]) -> Result<Vec<u8>>`; and private `encode_stream_data_from_specs(Vec<FilterSpec>, &[u8]) -> Result<Vec<u8>>`.
 
 - [ ] **Step 1: Add direct-shape conversion and result comparison helpers**
 
@@ -258,17 +258,7 @@ Expected: compilation fails because `encode_stream_data_from_handle` is not defi
 
 ---
 
-### Task 2: Implement the ObjectHandle entry point and shared encode executor
-
-**Files:**
-- Modify: `crates/flpdf/src/filters.rs:312-325,837-861`
-- Test: `crates/flpdf/src/filters.rs`
-
-**Interfaces:**
-- Consumes: `decode_filter_specs_from_handle(&ObjectHandle, &ObjectHandle, Option<usize>) -> Result<Vec<FilterSpec>>`.
-- Produces: `pub(crate) fn encode_stream_data_from_handle(&ObjectHandle, &[u8]) -> Result<Vec<u8>>` and private `encode_stream_data_from_specs(Vec<FilterSpec>, &[u8]) -> Result<Vec<u8>>`.
-
-- [ ] **Step 1: Add the crate-private handle entry point with qpdf citations**
+- [ ] **Step 7: Add the crate-private handle entry point with qpdf citations**
 
 Place this immediately after the public Dictionary entry point:
 
@@ -303,7 +293,7 @@ pub(crate) fn encode_stream_data_from_handle(
 }
 ```
 
-- [ ] **Step 2: Extract the shape-neutral encode executor**
+- [ ] **Step 8: Extract the shape-neutral encode executor**
 
 Replace the body below the existing Object reader with this exact split:
 
@@ -340,7 +330,7 @@ fn encode_stream_data_from_specs(
 }
 ```
 
-- [ ] **Step 3: Run the focused tests and verify GREEN**
+- [ ] **Step 9: Run the focused tests and verify GREEN**
 
 Run:
 
@@ -350,7 +340,7 @@ cargo test -p flpdf --lib handle_encode -- --nocapture
 
 Expected: 4 tests pass, 0 fail.
 
-- [ ] **Step 4: Run all filter unit tests**
+- [ ] **Step 10: Run all filter unit tests**
 
 Run:
 
@@ -360,7 +350,7 @@ cargo test -p flpdf --lib filters::tests -- --nocapture
 
 Expected: all filter tests pass with no new warnings.
 
-- [ ] **Step 5: Format, inspect the source-only diff, and commit**
+- [ ] **Step 11: Format, inspect the source-only diff, and commit**
 
 ```bash
 cargo fmt --all
@@ -375,14 +365,14 @@ Expected source-only diff: `crates/flpdf/src/filters.rs`. Do not stage a consume
 
 ---
 
-### Task 3: Verify byte stability, workspace quality, and scope
+### Task 2: Verify byte stability, workspace quality, and scope
 
 **Files:**
 - Modify: none expected
 - Test: workspace and qpdf byte-comparison suites
 
 **Interfaces:**
-- Consumes: committed implementation from Task 2.
+- Consumes: committed implementation from Task 1.
 - Produces: exact test, byte-stability, lint, documentation, and scope evidence for the Bead.
 
 - [ ] **Step 1: Re-read the pinned source locations recorded by the new API**
@@ -438,14 +428,14 @@ Expected: the first two commands list only `crates/flpdf/src/filters.rs`; the fi
 
 ---
 
-### Task 4: Regenerate changed-line coverage and publish the verified branch
+### Task 3: Regenerate changed-line coverage and publish the verified branch
 
 **Files:**
 - Modify: tests only if a genuine uncovered behavior is found
 - Test: fresh LCOV plus committed-tree patch coverage
 
 **Interfaces:**
-- Consumes: fully verified Task 2 commit.
+- Consumes: the Task 1 implementation after Task 2's full verification.
 - Produces: 100% changed executable-line coverage, pushed Git branch, and persisted Beads evidence.
 
 - [ ] **Step 1: Generate fresh LCOV and run the patch gate**
