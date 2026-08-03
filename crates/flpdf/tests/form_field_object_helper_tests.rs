@@ -70,12 +70,9 @@ fn reads_indirect_field_attributes_and_names() {
         Some(Object::String(b"default".to_vec()))
     );
     assert_eq!(field.field_flags().unwrap(), Some(4097));
-    assert_eq!(field.partial_name().unwrap(), Some(b"partial".to_vec()));
-    assert_eq!(
-        field.alternative_name().unwrap(),
-        Some(b"alternative".to_vec())
-    );
-    assert_eq!(field.mapping_name().unwrap(), Some(b"mapping".to_vec()));
+    assert_eq!(field.partial_name().unwrap(), "partial");
+    assert_eq!(field.alternative_name().unwrap(), "alternative");
+    assert_eq!(field.mapping_name().unwrap(), "mapping");
 }
 
 #[test]
@@ -144,16 +141,10 @@ fn field_name_accessors_follow_terminal_holder_chains() {
     }
 
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.partial_name().unwrap(), Some(b"partial".to_vec()));
-    assert_eq!(
-        field.fully_qualified_name().unwrap(),
-        Some(b"partial".to_vec())
-    );
-    assert_eq!(
-        field.alternative_name().unwrap(),
-        Some(b"alternative".to_vec())
-    );
-    assert_eq!(field.mapping_name().unwrap(), Some(b"mapping".to_vec()));
+    assert_eq!(field.partial_name().unwrap(), "partial");
+    assert_eq!(field.fully_qualified_name().unwrap(), "partial");
+    assert_eq!(field.alternative_name().unwrap(), "alternative");
+    assert_eq!(field.mapping_name().unwrap(), "mapping");
 }
 
 #[test]
@@ -165,10 +156,7 @@ fn qualifies_names_from_the_parent_chain() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(
-        field.fully_qualified_name().unwrap(),
-        Some(b"top.group.child".to_vec())
-    );
+    assert_eq!(field.fully_qualified_name().unwrap(), "top.group.child");
 }
 
 #[test]
@@ -182,9 +170,23 @@ fn decodes_pdf_text_strings_in_field_names() {
     )]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.partial_name().unwrap(), Some("child".into()));
-    assert_eq!(field.alternative_name().unwrap(), Some("ユーザー".into()));
-    assert_eq!(field.mapping_name().unwrap(), Some("マップ".into()));
+    assert_eq!(field.partial_name().unwrap(), "child");
+    assert_eq!(field.alternative_name().unwrap(), "ユーザー");
+    assert_eq!(field.mapping_name().unwrap(), "マップ");
+}
+
+#[test]
+fn field_names_use_qpdf_lossy_text_string_conversion() {
+    let bytes = doc(vec![(
+        10,
+        "<< /T <7F> /TU <FEFFD800> /TM <FEFF004100> >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert_eq!(field.partial_name().unwrap(), "�");
+    assert_eq!(field.alternative_name().unwrap(), "");
+    assert_eq!(field.mapping_name().unwrap(), "A");
 }
 
 #[test]
@@ -195,14 +197,11 @@ fn mapping_name_falls_back_to_alternative_then_qualified_name() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(
-        field.mapping_name().unwrap(),
-        Some(b"parent.child".to_vec())
-    );
+    assert_eq!(field.mapping_name().unwrap(), "parent.child");
     let bytes = doc(vec![(10, "<< /T (child) /TU (alt) >>".into())]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.mapping_name().unwrap(), Some(b"alt".to_vec()));
+    assert_eq!(field.mapping_name().unwrap(), "alt");
 }
 
 #[test]
@@ -213,10 +212,7 @@ fn name_walkers_terminate_on_parent_cycles() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(
-        field.fully_qualified_name().unwrap(),
-        Some(b"parent.child".to_vec())
-    );
+    assert_eq!(field.fully_qualified_name().unwrap(), "parent.child");
 }
 
 #[test]
@@ -228,9 +224,9 @@ fn non_dictionary_field_has_no_readable_attributes() {
     assert_eq!(field.field_value().unwrap(), None);
     assert_eq!(field.field_default_value().unwrap(), None);
     assert_eq!(field.field_flags().unwrap(), None);
-    assert_eq!(field.fully_qualified_name().unwrap(), None);
-    assert_eq!(field.alternative_name().unwrap(), None);
-    assert_eq!(field.mapping_name().unwrap(), None);
+    assert_eq!(field.fully_qualified_name().unwrap(), "");
+    assert_eq!(field.alternative_name().unwrap(), "");
+    assert_eq!(field.mapping_name().unwrap(), "");
 }
 
 #[test]
@@ -1140,7 +1136,7 @@ fn field_accessors_return_qpdf_defaults_for_missing_or_wrong_typed_values() {
 
     assert_eq!(field.inheritable_string(b"CustomString").unwrap(), "");
     assert_eq!(field.inheritable_name(b"CustomName").unwrap(), b"");
-    assert_eq!(field.partial_name().unwrap(), None);
+    assert_eq!(field.partial_name().unwrap(), "");
     assert_eq!(field.choices().unwrap(), Vec::<String>::new());
     assert_eq!(field.quadding().unwrap(), 0);
 
@@ -2072,6 +2068,215 @@ fn radio_updates_a_widget_behind_a_multi_hop_child_holder() {
             .get("AS"),
         Some(&Object::Name(b"Selected".to_vec()))
     );
+}
+
+#[test]
+fn radio_delegates_through_a_multi_hop_parent_holder() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 20 0 R /AP << /N << /Off null /Selected null >> >> >>"
+                .into(),
+        ),
+        (20, "null".into()),
+        (21, "null".into()),
+        (
+            22,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids [10 0 R] >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(22, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("delegate radio value through parent holders");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(22, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(20, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(21, 0))
+    );
+}
+
+#[test]
+fn radio_with_a_terminal_non_radio_parent_is_a_noop() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 20 0 R /AP << /N << /Off null /Selected null >> >> >>"
+                .into(),
+        ),
+        (20, "<< /FT /Tx >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("ignore a radio child whose terminal parent is not radio");
+
+    let child = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    let child = child.as_dict().unwrap();
+    assert_eq!(child.get("V"), None);
+    assert_eq!(child.get("AS"), None);
+}
+
+#[test]
+fn radio_with_a_non_null_parent_marker_is_a_noop() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 20 0 R /AP << /N << /Off null /Selected null >> >> >>"
+                .into(),
+        ),
+        (20, "<< /FT /Btn /Ff 32768 /Parent /NotNull >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("ignore a radio child whose parent's parent marker is non-null");
+
+    let child = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    let child = child.as_dict().unwrap();
+    assert_eq!(child.get("V"), None);
+    assert_eq!(child.get("AS"), None);
+}
+
+#[test]
+fn radio_follows_a_multi_hop_nested_kids_holder() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids [11 0 R] >>".into(),
+        ),
+        (11, "<< /Kids 20 0 R >>".into()),
+        (
+            12,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+        (20, "null".into()),
+        (21, "null".into()),
+        (22, "[12 0 R]".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(22, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("set radio value through nested kids holders");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(20, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(21, 0))
+    );
+}
+
+#[test]
+fn radio_follows_a_multi_hop_nested_widget_holder() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids [11 0 R] >>".into(),
+        ),
+        (11, "<< /Kids [20 0 R] >>".into()),
+        (20, "null".into()),
+        (21, "null".into()),
+        (
+            22,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(22, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("set radio value through nested widget holders");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(22, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(20, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(21, 0))
+    );
+}
+
+#[test]
+fn checkbox_does_not_update_as_for_a_cyclic_appearance_holder() {
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /AP 20 0 R /AS /Off >>".into()),
+        (20, "null".into()),
+        (21, "null".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(20, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("set checkbox value with cyclic appearance holder");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    let field = field.as_dict().unwrap();
+    assert_eq!(field.get("V"), Some(&Object::Name(b"Yes".to_vec())));
+    assert_eq!(field.get("AS"), Some(&Object::Name(b"Off".to_vec())));
 }
 
 #[test]

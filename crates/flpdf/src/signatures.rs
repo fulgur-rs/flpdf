@@ -1072,9 +1072,8 @@ fn walk_signature_field<R: Read + Seek>(
 
     let (partial_name, is_signature) = {
         let mut field = FormFieldObjectHelper::new(field_ref, pdf);
-        let partial_name = field
-            .partial_name()?
-            .map(|name| String::from_utf8_lossy(&name).into_owned());
+        let partial_name = field.partial_name()?;
+        let partial_name = (!partial_name.is_empty()).then_some(partial_name);
         let is_signature = field.field_type()?.as_deref() == Some(b"/Sig");
         (partial_name, is_signature)
     };

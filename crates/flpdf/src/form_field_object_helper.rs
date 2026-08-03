@@ -163,13 +163,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         Ok(self.field_flags()?.unwrap_or(0))
     }
 
-    /// Return this field's `/T` partial name, if it is a string.
-    pub fn partial_name(&mut self) -> Result<Option<Vec<u8>>> {
-        self.string_key(self.field_ref, b"T")
+    /// Return this field's `/T` partial name as qpdf-style UTF-8 text.
+    pub fn partial_name(&mut self) -> Result<String> {
+        Ok(self.string_key(self.field_ref, b"T")?.unwrap_or_default())
     }
 
     /// Return the dotted `/T` name formed by this field and its parents.
-    pub fn fully_qualified_name(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn fully_qualified_name(&mut self) -> Result<String> {
         let mut seen = BTreeSet::new();
         let mut current = self.field_ref;
         let mut parts = Vec::new();
@@ -193,32 +193,22 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
         }
 
-        if parts.is_empty() {
-            return Ok(None);
-        }
         parts.reverse();
-        let mut result = Vec::new();
-        for (index, part) in parts.into_iter().enumerate() {
-            if index != 0 {
-                result.push(b'.');
-            }
-            result.extend(part);
-        }
-        Ok(Some(result))
+        Ok(parts.join("."))
     }
 
     /// Return `/TU`, or the fully qualified name when `/TU` is absent.
-    pub fn alternative_name(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn alternative_name(&mut self) -> Result<String> {
         match self.string_key(self.field_ref, b"TU")? {
-            Some(name) => Ok(Some(name)),
+            Some(name) => Ok(name),
             None => self.fully_qualified_name(),
         }
     }
 
     /// Return `/TM`, then `/TU`, then the fully qualified name.
-    pub fn mapping_name(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn mapping_name(&mut self) -> Result<String> {
         match self.string_key(self.field_ref, b"TM")? {
-            Some(name) => Ok(Some(name)),
+            Some(name) => Ok(name),
             None => self.alternative_name(),
         }
     }
@@ -543,24 +533,27 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn set_radio_button_value(&mut self, field_ref: ObjectRef, value: Vec<u8>) -> Result<()> {
         let field = self.field_dict_for(field_ref, "form field")?;
         if let Some(parent) = field.get_ref(b"Parent".as_slice()) {
-            let parent_parent = match self.pdf.resolve(parent)? {
-                Object::Dictionary(parent_dict) => {
-                    Some(parent_dict.get(b"Parent".as_slice()).cloned())
-                }
-                _ => None,
-            };
+            let parent_parent = self
+                .dictionary_handle_for(parent)?
+                .and_then(|parent| parent.as_dictionary())
+                .map(|parent| {
+                    parent
+                        .get(b"Parent".as_slice())
+                        .cloned()
+                        .map(|parent| parent.materialize())
+                });
             if let Some(parent_parent) = parent_parent {
-                if self.value_is_null(parent_parent)? {
-                    let parent_is_radio = {
-                        let previous = self.field_ref;
-                        self.field_ref = parent;
-                        let result = self.is_radio_button();
-                        self.field_ref = previous;
-                        result?
-                    };
-                    if parent_is_radio {
-                        return self.set_radio_button_value(parent, value);
-                    }
+                let parent_is_radio = if self.value_is_null(parent_parent)? {
+                    let previous = self.field_ref;
+                    self.field_ref = parent;
+                    let result = self.is_radio_button();
+                    self.field_ref = previous;
+                    result?
+                } else {
+                    false
+                };
+                if parent_is_radio {
+                    return self.set_radio_button_value(parent, value);
                 }
             }
         }
@@ -641,46 +634,48 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn update_first_radio_widget(&mut self, kids: Object, value: &[u8]) -> Result<(Object, bool)> {
-        match kids {
-            Object::Array(mut kids) => {
-                for kid in &mut kids {
-                    let (updated, found) = self.update_radio_widget(kid.clone(), value)?;
-                    *kid = updated;
-                    if found {
-                        return Ok((Object::Array(kids), true));
-                    }
-                }
-                Ok((Object::Array(kids), false))
+        let original_reference = kids.as_ref_id();
+        let Some((mut kids, terminal_ref)) = self.resolve_array_target(kids.clone())? else {
+            return Ok((kids, false));
+        };
+        let mut found = false;
+        for kid in &mut kids {
+            let (updated, updated_one) = self.update_radio_widget(kid.clone(), value)?;
+            *kid = updated;
+            if updated_one {
+                found = true;
+                break;
             }
-            Object::Reference(reference) => {
-                let resolved = self.pdf.resolve(reference)?;
-                let Object::Array(kids) = resolved else {
-                    return Ok((Object::Reference(reference), false));
-                };
-                let (updated, found) =
-                    self.update_first_radio_widget(Object::Array(kids), value)?;
-                if let Object::Array(updated) = updated {
-                    self.pdf.set_object(reference, Object::Array(updated));
-                }
-                Ok((Object::Reference(reference), found))
-            }
-            object => Ok((object, false)),
+        }
+        let updated = Object::Array(kids);
+        if let Some(reference) = terminal_ref {
+            self.pdf.set_object(reference, updated);
+            Ok((
+                Object::Reference(original_reference.unwrap_or(reference)),
+                found,
+            ))
+        } else {
+            Ok((updated, found))
         }
     }
 
     fn update_radio_widget(&mut self, widget: Object, value: &[u8]) -> Result<(Object, bool)> {
         match widget {
             Object::Reference(reference) => {
-                let object = self.pdf.resolve(reference)?;
-                let Object::Dictionary(mut dictionary) = object else {
+                let Some(dictionary) = self.dictionary_handle_for(reference)? else {
                     return Ok((Object::Reference(reference), false));
                 };
+                let terminal_ref = dictionary.object_ref().unwrap_or(reference);
+                let mut dictionary = dictionary
+                    .materialize()
+                    .into_dict()
+                    .expect("dictionary handle must materialize as a dictionary");
                 if !self.has_non_null_appearance(&dictionary)? {
                     return Ok((Object::Reference(reference), false));
                 }
                 dictionary.insert("AS", Object::Name(self.radio_state(&dictionary, value)?));
                 self.pdf
-                    .set_object(reference, Object::Dictionary(dictionary));
+                    .set_object(terminal_ref, Object::Dictionary(dictionary));
                 Ok((Object::Reference(reference), true))
             }
             Object::Dictionary(mut dictionary) => {
@@ -750,7 +745,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(value) = dictionary.get(b"AP".as_slice()).cloned() else {
             return Ok(false);
         };
-        Ok(!matches!(self.resolve_object(value)?, Object::Null))
+        let value = self.pdf.lift_object_to_handle(&value)?;
+        let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+        Ok(!value.is_null())
     }
 
     fn normal_appearance_names(&mut self, dictionary: &Dictionary) -> Result<Vec<Vec<u8>>> {
@@ -952,7 +949,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         Ok(Some(value.as_integer().unwrap_or(0)))
     }
 
-    fn string_key(&mut self, field_ref: ObjectRef, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn string_key(&mut self, field_ref: ObjectRef, key: &[u8]) -> Result<Option<String>> {
         let node = self.pdf.get_object_handle(field_ref);
         let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
         let Some(dict) = node.as_dictionary() else {
@@ -962,15 +959,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         self.resolve_string_handle(value)
     }
 
-    fn resolve_string_handle(&mut self, value: Option<ObjectHandle>) -> Result<Option<Vec<u8>>> {
+    fn resolve_string_handle(&mut self, value: Option<ObjectHandle>) -> Result<Option<String>> {
         let Some(value) = value else {
             return Ok(None);
         };
         let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
         Ok(value.as_string().map(|value| {
-            crate::pdf_string::decode_pdf_text_string(&value)
-                .unwrap_or_else(|| String::from_utf8_lossy(&value).into_owned())
-                .into_bytes()
+            String::from_utf8_lossy(&crate::pdf_string::utf8_value(&value)).into_owned()
         }))
     }
 }
