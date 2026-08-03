@@ -2790,17 +2790,19 @@ mod resolution_state_tests {
         assert_eq!(missing.unparse_resolved(), null.unparse_resolved());
         assert_eq!(missing.get_parsed_offset(), null.get_parsed_offset());
 
-        let variant = |handle: &ObjectHandle| match &handle.0 {
-            Repr::Indirect(slot) => match slot.borrow().state {
-                IndirectState::Missing => "Missing",
-                IndirectState::Resolved(_) => "Resolved",
-                IndirectState::NotYetResolved => "NotYetResolved",
-                IndirectState::Destroyed => "Destroyed",
-            },
-            Repr::Direct(_) => "Direct",
-        };
-        assert_eq!(variant(&missing), "Missing");
-        assert_eq!(variant(&null), "Resolved");
+        // Asserted with `matches!` rather than by mapping the state to a name:
+        // a mapping needs arms for the two variants neither handle can be in,
+        // and an arm nothing reaches is an uncovered line.
+        assert!(
+            matches!(&missing.0, Repr::Indirect(slot)
+                if matches!(slot.borrow().state, IndirectState::Missing)),
+            "`set_missing` must leave the slot in the `Missing` variant"
+        );
+        assert!(
+            matches!(&null.0, Repr::Indirect(slot)
+                if matches!(slot.borrow().state, IndirectState::Resolved(ObjectValue::Null))),
+            "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
+        );
     }
 
     #[test]
