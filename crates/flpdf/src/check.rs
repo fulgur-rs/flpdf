@@ -188,8 +188,10 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
         Pdf::open_with_options(reader, options)?
     };
 
-    let mut diagnostics = pdf.repair_diagnostics().clone();
-    let repair_diagnostics_start = pdf.repair_diagnostics().entries().len();
+    // `repair_diagnostics` already hands back an owned snapshot, so this is
+    // the copy — no second `.clone()` needed.
+    let mut diagnostics = pdf.repair_diagnostics();
+    let repair_diagnostics_start = diagnostics.entries().len();
     if pdf.uses_weak_crypto() {
         diagnostics.push(Diagnostic::warning(
             "encrypted PDF uses weak crypto; processing continued",

@@ -332,6 +332,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `RefCell` and a `&Diagnostics` cannot be handed out from one. See
     /// `Pdf::repair_diagnostics`, which is the public door onto this and
     /// carries the trade-off.
+    ///
+    /// **A snapshot is interchangeable with the borrow it replaced**, which is
+    /// what lets callers keep comparing a length captured earlier against a
+    /// later one and iterating with `.skip(start)` — `flpdf-cli`'s
+    /// `finish_lazy_warnings` and `emit_warnings_since`
+    /// (`crates/flpdf-cli/src/main.rs:5341-5364`) do exactly that.
+    /// [`Diagnostics`] is append-only: `push` and `push_encrypted` are its
+    /// only mutators and its entry vector is private, so an index valid in one
+    /// snapshot names the same entry in every later one. Nothing replaces the
+    /// collection wholesale either — `xref.rs` does that only on `LoadedXref`,
+    /// before the document exists. Were either to change, every
+    /// `diagnostics_start` in the CLI would quietly start meaning something
+    /// else.
     pub(crate) fn repair_diagnostics(&self) -> Diagnostics {
         self.core.borrow().repair_diagnostics.clone()
     }
