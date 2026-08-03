@@ -3922,10 +3922,12 @@ mod tests {
         /// the scalar `/DecodeParms` is replicated per stage.
         ///
         /// This is the empirical form of the claim `RETAINED_DECODE_PARAM_KEYS`
-        /// makes in prose. Restoring the dropped keys (deleting the
-        /// `retains_decode_param_key` filter in `decode_params_from_object`)
-        /// leaves it green, because they are genuinely inert — what it catches
-        /// is a consumer that starts reading a key the constant does not name.
+        /// makes in prose, and it is deliberately insensitive to retention
+        /// itself: measured, deleting the `retains_decode_param_key` test from
+        /// `decode_params_from_object` leaves it green, and so does deleting
+        /// the one in `decode_params_from_handle`. The dropped keys are
+        /// genuinely inert. What this catches is the opposite change — a
+        /// consumer that starts reading a key the constant does not name.
         #[test]
         fn a_dictionary_of_only_unread_keys_decodes_as_an_empty_one() {
             let plain = b"only-unread-keys payload".to_vec();
