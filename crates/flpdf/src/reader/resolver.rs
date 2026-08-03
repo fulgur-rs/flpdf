@@ -2434,14 +2434,12 @@ mod tests {
             b"2 0 obj\n<< /Length 9223372036854775807 >>\nstream\nabc\nendstream\nendobj\n",
             |_, outcome, _| {
                 let error = outcome.expect_err("that offset cannot be reached at all");
-                let Error::Parse { message, .. } = &error else {
-                    panic!("expected a parse error, got {error:?}");
-                };
                 assert!(
-                    message.starts_with("adding 9223372036854775807 to ")
-                        && message.ends_with(" would cause an integer overflow"),
+                    matches!(&error, Error::Parse { message, .. }
+                        if message.starts_with("adding 9223372036854775807 to ")
+                            && message.ends_with(" would cause an integer overflow")),
                     "the overflow refusal must stay distinct from `expected \
-                     endstream`, which is qpdf's recovery fork: {message:?}"
+                     endstream`, which is qpdf's recovery fork: {error:?}"
                 );
             },
         );
