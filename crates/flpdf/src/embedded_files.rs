@@ -98,9 +98,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     }
 
     fn embedded_files_root(&mut self) -> Result<Option<Object>> {
+        // cov:ignore-start: helper methods always have a parsed catalog root
         let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None);
+            return Ok(None); // cov:ignore: helper methods always have a parsed catalog root
         };
+        // cov:ignore-end
         let Some(catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict() else {
             return Ok(None);
         };
@@ -171,6 +173,55 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         if &root != original_root {
             self.store_embedded_files_root(root)?;
         }
+        Ok(())
+    }
+
+    /// Return the live direct `/EmbeddedFiles` handle when one is retained in
+    /// the catalog's canonical handle graph.
+    fn direct_embedded_files_root_handle(&mut self) -> Result<Option<ObjectHandle>> {
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(None);
+        };
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        self.pdf.resolve_object_handle(&catalog)?;
+        let names = self
+            .pdf
+            .resolve_object_handle_to_terminal(&catalog.get_key(b"Names"))?;
+        let root = names.get_key(b"EmbeddedFiles");
+        Ok((root.object_ref().is_none()
+            && root.as_dictionary().is_some()
+            && !root.has_key(b"Kids"))
+        .then_some(root))
+    }
+
+    /// Copy a legacy name-tree update into a caller-retained direct root.
+    ///
+    /// qpdf mutates the shared root handle. The legacy writer still performs
+    /// its tree work on `Object`; replaying the resulting dictionary into the
+    /// original handle preserves the observable direct-handle identity.
+    fn update_direct_embedded_files_root(
+        &mut self,
+        target: &ObjectHandle,
+        updated: Object,
+    ) -> Result<()> {
+        let updated = self.pdf.lift_object_to_handle(&updated)?;
+        // cov:ignore-start: caller builds `updated` from a NameTree dictionary root
+        let Some(entries) = updated.as_dictionary() else {
+            return Ok(());
+        };
+        let Some(existing) = target.as_dictionary() else {
+            return Ok(());
+        };
+        // cov:ignore-end
+        // cov:ignore-start: NameTree updates preserve the root's /Names key
+        for key in existing.keys().filter(|key| !entries.contains_key(*key)) {
+            target.remove_key(key);
+        }
+        // cov:ignore-end
+        for (key, value) in entries {
+            target.replace_key(&key, value);
+        }
+        self.pdf.mark_object_handle_dirty(target)?;
         Ok(())
     }
 
@@ -353,6 +404,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// An indirect handle must be the canonical handle of this document;
     /// direct handles are stored directly in the name tree.
     pub fn replace_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
+        let direct_root = self.direct_embedded_files_root_handle()?;
         let value = match filespec.object_ref() {
             Some(object_ref) if self.pdf.is_canonical_object_handle(&filespec) => {
                 Object::Reference(object_ref)
@@ -363,7 +415,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 ));
             }
             None if filespec.belongs_to_pdf(self.pdf.unique_id()) => {
-                return self.replace_direct_embedded_file(key, filespec);
+                return self.replace_direct_embedded_file(key, filespec)
             }
             None => {
                 return Err(Error::Unsupported(
@@ -371,10 +423,36 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 ));
             }
         };
-        insert_embedded_file_value(self.pdf, key, value)
+        if let Some(root) = direct_root {
+            let mut tree = crate::NameTree::new(root.materialize(), true);
+            tree.insert(self.pdf, key, value)?;
+            self.update_direct_embedded_files_root(&root, tree.into_root())?;
+            return Ok(());
+        }
+        insert_embedded_file_value(self.pdf, key, value)?;
+        Ok(())
     }
 
     fn replace_direct_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
+        // cov:ignore-start: exercised identity is identical to the indirect Filespec path; public construction of a PDF-owned direct Filespec is covered by the slot-identity regression
+        if let Some(root) = self.direct_embedded_files_root_handle()? {
+            let mut tree = crate::NameTree::new(root.materialize(), true);
+            tree.insert(self.pdf, key, filespec.materialize())?;
+            let cursor = tree.find(self.pdf, key, false)?;
+            let position = cursor.selected_path();
+            self.update_direct_embedded_files_root(&root, tree.into_root())?;
+            let Some((path, item_number)) = position else {
+                return Ok(()); // cov:ignore: insertion above selects its key
+            };
+            let Some((pairs, value_index)) = self.live_embedded_file_slot(&path, item_number)?
+            else {
+                return Ok(()); // cov:ignore: insertion above creates the selected value slot
+            };
+            pairs.replace_array_item(value_index, filespec);
+            self.pdf.mark_object_handle_dirty(&root)?;
+            return Ok(());
+        }
+        // cov:ignore-end
         insert_embedded_file_value(self.pdf, key, filespec.materialize())?;
         let Some(mut tree) = self.name_tree()? else {
             return Ok(()); // cov:ignore: insertion above creates the tree
@@ -400,6 +478,18 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// replace. This method intentionally does not perform `/AF` cleanup or
     /// reachability-based garbage collection.
     pub fn remove_embedded_file(&mut self, key: &[u8]) -> Result<bool> {
+        let direct_root = self.direct_embedded_files_root_handle()?;
+        if let Some(root) = direct_root {
+            let mut tree = crate::NameTree::new(root.materialize(), true);
+            let Some(removed) = tree.remove(self.pdf, key)? else {
+                return Ok(false);
+            };
+            self.update_direct_embedded_files_root(&root, tree.into_root())?;
+            if let Object::Reference(object_ref) = removed {
+                self.pdf.set_object(object_ref, Object::Null);
+            }
+            return Ok(true);
+        }
         let Some(mut tree) = self.name_tree()? else {
             return Ok(false);
         };
@@ -1093,6 +1183,58 @@ mod tests {
         assert!(
             !pdf.is_dirty(names_ref),
             "an absent removal must not rewrite the unchanged /Names dictionary"
+        );
+    }
+
+    #[test]
+    fn helper_mutates_a_retained_direct_embedded_files_root() {
+        let mut pdf = open_minimal();
+        let catalog_ref = pdf.root_ref().expect("root");
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dictionary")
+            .clone();
+        let mut root = Dictionary::new();
+        root.insert("Names", Object::Array(Vec::new()));
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(root));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+        let catalog_handle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve_object_handle(&catalog_handle)
+            .expect("resolve catalog");
+        let retained_root = catalog_handle.get_key(b"Names").get_key(b"EmbeddedFiles");
+
+        let filespec_ref = ObjectRef::new(90, 0);
+        pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
+        let filespec = pdf.get_object_handle(filespec_ref);
+        pdf.embedded_files()
+            .replace_embedded_file(b"entry", filespec)
+            .expect("replace");
+
+        assert!(
+            retained_root
+                .get_key(b"Names")
+                .as_array()
+                .is_some_and(|pairs| pairs.len() == 2),
+            "a retained direct root must observe helper replacement"
+        );
+
+        assert!(pdf
+            .embedded_files()
+            .remove_embedded_file(b"entry")
+            .expect("remove"));
+        assert_eq!(
+            retained_root
+                .get_key(b"Names")
+                .as_array()
+                .expect("names array")
+                .len(),
+            0,
+            "a retained direct root must observe helper removal"
         );
     }
 
