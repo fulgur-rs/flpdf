@@ -434,15 +434,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn field_dict(&mut self) -> Result<Dictionary> {
-        // cov:ignore-start: is_checkbox established this same field_ref is a dictionary before this private call
-        match self.pdf.resolve_borrowed(self.field_ref)? {
-            Object::Dictionary(field) => Ok(field.clone()),
-            _ => Err(Error::Unsupported(format!(
-                "form field object {} is not a dictionary",
-                self.field_ref
-            ))),
-        }
-        // cov:ignore-end
+        self.field_dict_for(self.field_ref, "form field")
     }
 
     fn set_need_appearances(&mut self) -> Result<()> {
@@ -731,12 +723,16 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             let Object::Reference(kid_ref) = kid else {
                 continue;
             };
-            let kid = self.pdf.resolve(*kid_ref)?;
-            let Some(kid) = kid.as_dict().cloned() else {
+            let Some(kid) = self.dictionary_handle_for(*kid_ref)? else {
                 continue;
             };
+            let annotation_ref = kid.object_ref().unwrap_or(*kid_ref);
+            let kid = kid
+                .materialize()
+                .into_dict()
+                .expect("dictionary handle must materialize as a dictionary");
             if self.has_non_null_appearance(&kid)? {
-                return Ok(Some((*kid_ref, kid)));
+                return Ok(Some((annotation_ref, kid)));
             }
         }
         Ok(None)

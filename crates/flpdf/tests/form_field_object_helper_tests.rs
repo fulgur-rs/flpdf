@@ -1739,6 +1739,45 @@ fn checkbox_uses_an_indirect_widget_appearance_annotation() {
 }
 
 #[test]
+fn checkbox_updates_a_widget_behind_a_multi_hop_kid_holder() {
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids [11 0 R] >>".into()),
+        (11, "null".into()),
+        (12, "<< /AP << /N << /Off null /Chosen null >> >> >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("set checkbox value through widget holder");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(12, 0))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Chosen".to_vec()))
+    );
+}
+
+#[test]
 fn set_value_dispatches_radio_and_non_button_appearance_updates() {
     let bytes = doc(vec![
         (10, "<< /FT /Btn /Ff 32768 /Kids [11 0 R 12 0 R] >>".into()),
@@ -1877,6 +1916,50 @@ fn set_value_mutates_the_terminal_field_dictionary_without_replacing_holders() {
             b"updated"
         )))
     );
+}
+
+#[test]
+fn checkbox_updates_a_direct_kid_when_the_field_is_behind_multi_hop_holders() {
+    let bytes = doc(vec![
+        (10, "null".into()),
+        (11, "null".into()),
+        (
+            12,
+            "<< /FT /Btn /Kids [ << /AP << /N << /Off null /Chosen null >> >> >> ] >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(10, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .expect("set checkbox value through field holders");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(11, 0))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(12, 0))
+    );
+    let field = pdf.resolve(ObjectRef::new(12, 0)).unwrap();
+    let field = field.as_dict().expect("terminal checkbox field");
+    assert_eq!(field.get("V"), Some(&Object::Name(b"Chosen".to_vec())));
+    let Object::Array(kids) = field.get("Kids").expect("checkbox kids") else {
+        panic!("checkbox kids must stay an array");
+    };
+    let Object::Dictionary(widget) = &kids[0] else {
+        panic!("checkbox widget must stay direct");
+    };
+    assert_eq!(widget.get("AS"), Some(&Object::Name(b"Chosen".to_vec())));
 }
 
 #[test]
