@@ -398,6 +398,17 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// recorded offset in place. The design's Parsed-Offset Contract names
     /// "cyclic" in the set `set_missing`'s own doc quotes.
     ///
+    /// The two routes really are different internal states, so the choice was
+    /// checked rather than assumed: `IndirectState::Missing` presents as null
+    /// through `with_value` but hands out no `&mut` through `with_value_mut`,
+    /// where `Resolved(ObjectValue::Null)` hands out one. Nothing can observe
+    /// that today — all six `with_value_mut` callers (`replace_key`,
+    /// `remove_key`, `replace_array_item`, `replace_array_items`,
+    /// `replace_stream_data`, `append_array_item`) match on a container
+    /// variant that `Null` is not, so both routes are the same no-op. Whoever
+    /// gives a null value a mutable meaning should re-check this against qpdf,
+    /// where the loop's cache entry is a live `QPDF_Null` in `m->obj_cache`.
+    ///
     /// *The canonical cache* is not written, because
     /// [`ResolverCore::object_cache`] has no writer and no reader anywhere in
     /// this slice; Task 4 introduces both together. Nothing observable turns
