@@ -810,11 +810,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// construction (`libqpdf/QPDF.cc:208`), so `readToken` at end of input
     /// returns `tt_eof` rather than the `tt_bad` "unexpected EOF" the
     /// un-permitted tokenizer would produce (`libqpdf/QPDFTokenizer.cc:930-939`).
-    /// That is what makes both of `readStream`'s checks report the framing
+    /// That is what makes both of the checks after it report the framing
     /// keyword they wanted — `expected endstream` at `:1386-1389`, `expected
     /// endobj` at `:1352-1355` — instead of complaining about the EOF, and it
     /// is the difference between a `/Length` that runs off the end of the
     /// input being diagnosed as qpdf diagnoses it or not.
+    ///
+    /// **Both halves are pinned, because each is a different outcome.** Delete
+    /// the `allow_eof` below and every fixture whose input ends where a
+    /// framing keyword was expected reddens. The `endstream` ones swap the
+    /// missing keyword for `unexpected EOF`, a wrong message;
+    /// `a_stream_ending_the_input_after_endstream_warns_and_still_resolves`,
+    /// the `endobj` half, stops *resolving at all* — there the difference is
+    /// not the message but whether the object comes back.
     ///
     /// One divergence stays: qpdf passes `allow_bad = true`
     /// (`QPDF::readToken`, `:1536-1539`), so a *malformed* token is returned
@@ -972,6 +980,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// wherever the nested resolution happened to finish. The second one, in
     /// front of the payload read, has nothing to do with re-entrancy: it
     /// rewinds from where the `endstream` check left the position.
+    ///
+    /// **The two are separately pinned, and the mutations were run rather than
+    /// reasoned.** Deleting the first reddens exactly the fixtures built on
+    /// `indirect_length_pdf_bytes` — the ones with something to restore from —
+    /// and nothing else; deleting the second reddens every fixture that
+    /// asserts a payload, direct `/Length` included, while leaving the
+    /// resolution-order assertions that carry no payload alone. Counts are
+    /// left out on purpose: both sets grow with the fixtures, and this file
+    /// has already carried one stale number.
     ///
     /// # The declared `/Length` is validated before it is believed
     ///
@@ -2601,6 +2618,53 @@ mod tests {
             Vec::<String>::new(),
             "qpdf returns silently on a premature EOF here"
         );
+    }
+
+    /// A stream whose `endstream` is the last thing in the input still
+    /// resolves, warning about the `endobj` that never arrives.
+    ///
+    /// The other half of [`super::ResolverHandle::read_token_from_input`]'s
+    /// `allow_eof`, and the half the `endstream` fixtures cannot reach —
+    /// they return at the check before it. qpdf takes the same two steps:
+    /// `readToken` gives back `tt_eof` rather than a bad token
+    /// (`libqpdf/QPDF.cc:208`), so `readObject`'s trailing check reports the
+    /// keyword it wanted and returns the object anyway
+    /// (`:1352-1355`) instead of failing on the EOF itself.
+    ///
+    /// Appended past `%%EOF` with a hand-written xref entry for the same
+    /// reason as the fixture above: a well-formed document always has a
+    /// trailer after its objects.
+    #[test]
+    fn a_stream_ending_the_input_after_endstream_warns_and_still_resolves() {
+        let mut bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec()]);
+        let appended_at = bytes.len() as u64;
+        bytes.extend_from_slice(b"9 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream");
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(9, 0),
+            crate::XrefEntry::Uncompressed {
+                offset: appended_at,
+            },
+        );
+        let handle = pdf.get_object_handle(ObjectRef::new(9, 0));
+
+        handle
+            .try_dereference()
+            .expect("a missing `endobj` warns rather than failing");
+
+        assert_eq!(
+            handle.as_stream_data().as_deref(),
+            Some(&b"abc"[..]),
+            "and the payload is still the declared three bytes"
+        );
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(messages, ["expected endobj"]);
     }
 
     /// An input source that starts failing part-way through a resolution
