@@ -478,13 +478,6 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         verbose.contains("D:20240316100000"),
         "copy: verbose listing must preserve mod date; got: {verbose}"
     );
-    // /Size should match original byte count (67 for our PNG-like blob).
-    let expected_size = png.len().to_string();
-    assert!(
-        verbose.contains(&expected_size),
-        "copy: verbose listing must preserve /Size={expected_size}; got: {verbose}"
-    );
-
     // /CheckSum must survive the copy (roborev #936 — the test claimed to
     // verify /CheckSum preservation but never asserted it). The verbose
     // listing prints the MD5 of the payload as lowercase hex; assert the
@@ -495,24 +488,36 @@ fn lifecycle_4_copy_preserves_payload_and_metadata() {
         .map(|b| format!("{b:02x}"))
         .collect();
     assert!(
-        verbose.contains(&expected_checksum_hex),
+        verbose.contains(&format!("      checksum: {expected_checksum_hex}\n")),
         "copy: verbose listing must preserve /CheckSum={expected_checksum_hex}; got: {verbose}"
     );
-    assert!(
-        !verbose.contains("checksum:        (none)"),
-        "copy: /CheckSum must not be dropped to (none); got: {verbose}"
-    );
 
-    // /Desc and /AFRelationship were set on the source attachment; the copy
-    // must preserve them too (roborev #936 follow-up — the test set these
-    // flags but never asserted their survival).
+    // /Desc survives too (roborev #936 follow-up — the test set these flags
+    // but never asserted their survival).
     assert!(
-        verbose.contains("Copy test image"),
+        verbose.contains("  description: Copy test image\n"),
         "copy: verbose listing must preserve /Desc 'Copy test image'; got: {verbose}"
     );
+
+    // /Size and /AFRelationship have no line in qpdf's doListAttachments
+    // output, so assert them where qpdf does report them: the JSON v2 dump.
+    let objects = String::from_utf8(
+        CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--json=2", dst_pdf.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
     assert!(
-        verbose.contains("Data"),
-        "copy: verbose listing must preserve /AFRelationship 'Data'; got: {verbose}"
+        objects.contains(&format!("\"/Size\": {}", png.len())),
+        "copy: /Size={} must be preserved; got: {objects}",
+        png.len()
+    );
+    assert!(
+        objects.contains("\"/AFRelationship\": \"/Data\""),
+        "copy: /AFRelationship 'Data' must be preserved; got: {objects}"
     );
 }
 
@@ -640,9 +645,21 @@ fn lifecycle_5_metadata_survives_plain_rewrite() {
         verbose.contains("Test description"),
         "rewrite: description must be preserved; got: {verbose}"
     );
+    // `--list-attachments` has no /AFRelationship line — qpdf's
+    // doListAttachments never emits one — so observe it where qpdf does, in
+    // the JSON v2 object dump.
+    let objects = String::from_utf8(
+        CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--json=2", rewritten.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
     assert!(
-        verbose.contains("Unspecified"),
-        "rewrite: afrelationship must be preserved; got: {verbose}"
+        objects.contains("\"/AFRelationship\": \"/Unspecified\""),
+        "rewrite: afrelationship must be preserved; got: {objects}"
     );
     assert!(
         verbose.contains("D:20231201080000"),
@@ -731,4 +748,117 @@ fn lifecycle_6_qpdf_authored_readable_by_flpdf() {
         qpdf_listing.contains("qpdfkey"),
         "qpdf sanity: 'qpdfkey' must appear in qpdf's own listing; got: {qpdf_listing}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// qpdf parity for the listing itself: the "no embedded files" branch and the
+// single-line plain listing (QPDFJob::doListAttachments).
+// ---------------------------------------------------------------------------
+
+/// Run both tools with the same argv and require byte-identical stdout.
+///
+/// Skips (and says so) when qpdf is absent, like the other cross-checks here.
+fn assert_listing_matches_qpdf(pdf_path: &Path, args: &[&str]) -> Option<String> {
+    if !support::is_qpdf_available() {
+        eprintln!("qpdf not available — skipping listing cross-check");
+        return None;
+    }
+    let qpdf_out = ShellCommand::new("qpdf")
+        .args(args)
+        .arg(pdf_path)
+        .output()
+        .expect("qpdf is available but failed to spawn");
+    let flpdf_out = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(pdf_path)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&flpdf_out.stdout),
+        String::from_utf8_lossy(&qpdf_out.stdout),
+        "flpdf and qpdf must agree on `{args:?}` stdout for {pdf_path:?}",
+    );
+    Some(String::from_utf8(flpdf_out.stdout).expect("listing is not UTF-8"))
+}
+
+#[test]
+fn listing_reports_documents_with_no_embedded_files() {
+    let input = minimal_pdf_temp();
+
+    let out = CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--list-attachments", input.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "listing must exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{} has no embedded files\n", input.path().display()),
+        "qpdf names the input file when there is no /Names /EmbeddedFiles tree",
+    );
+
+    assert_listing_matches_qpdf(input.path(), &["--list-attachments"]);
+}
+
+#[test]
+fn plain_listing_is_one_line_per_attachment() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = minimal_pdf_temp();
+    let att = temp.path().join("plain.txt");
+    std::fs::write(&att, b"plain listing payload").unwrap();
+    let with_attachment = temp.path().join("with_attachment.pdf");
+
+    CargoCommand::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            input.path().to_str().unwrap(),
+            "--add-attachment",
+            att.to_str().unwrap(),
+            "--key=plainkey",
+            "--mimetype=text/plain",
+            "--description=Plain listing",
+            "--creationdate=D:20240101000000",
+            "--",
+            with_attachment.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let listing = String::from_utf8(
+        CargoCommand::cargo_bin("flpdf")
+            .unwrap()
+            .args(["--list-attachments", with_attachment.to_str().unwrap()])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+
+    let lines: Vec<&str> = listing.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "qpdf writes the header line outside its verbose block: {listing:?}"
+    );
+    assert!(
+        lines[0].starts_with("plainkey -> "),
+        "the single line names the key: {listing:?}"
+    );
+    for absent in [
+        "preferred name:",
+        "display name:",
+        "size:",
+        "mime type:",
+        "creation date:",
+        "description:",
+    ] {
+        assert!(
+            !listing.contains(absent),
+            "plain listing must not include {absent:?}: {listing:?}"
+        );
+    }
+
+    assert_listing_matches_qpdf(&with_attachment, &["--list-attachments"]);
+    assert_listing_matches_qpdf(&with_attachment, &["--list-attachments", "--verbose"]);
 }

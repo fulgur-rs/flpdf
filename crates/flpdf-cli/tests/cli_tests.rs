@@ -5886,12 +5886,17 @@ fn remove_attachment_errors_on_missing_key() {
 fn list_attachments_empty_document() {
     let input = minimal_pdf_temp();
 
+    // qpdf names the input file when the catalog has no /Names /EmbeddedFiles
+    // tree (QPDFJob::doListAttachments), rather than printing nothing.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["--list-attachments", input.path().to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::is_empty());
+        .stdout(format!(
+            "{} has no embedded files\n",
+            input.path().display()
+        ));
 }
 
 #[test]

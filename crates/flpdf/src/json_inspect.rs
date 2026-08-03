@@ -2026,7 +2026,7 @@ fn parse_tz_offset(sign: char, rest: &str) -> Option<String> {
 }
 
 /// Convert raw bytes to lowercase hex string.
-fn checksum_to_hex(bytes: &[u8]) -> String {
+pub(crate) fn checksum_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
