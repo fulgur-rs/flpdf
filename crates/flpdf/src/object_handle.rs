@@ -2190,12 +2190,12 @@ pub(crate) mod identity_tests {
     /// [`ObjectHandle::containing_object_refs_for_pdf`] read — the
     /// foreign-object rejection and owner lookup in
     /// `Pdf::mark_object_handle_dirty`, `filespec_helper`, and
-    /// `embedded_files`. Measured: patching `new_indirect_unresolved_for_pdf`
-    /// — the constructor `Pdf::get_object_handle` uses today — to discard its
-    /// argument fails 61 tests in `cargo test -p flpdf --lib`. Breaking the
-    /// identity of *this* constructor instead fails exactly one test, this
-    /// one, because nothing outside this module calls it yet; the 61 is what
-    /// the same mistake will cost once `get_object_handle` switches over.
+    /// `embedded_files`. Measured against the current tree, not predicted:
+    /// this is now the constructor `Pdf::get_object_handle` uses — the
+    /// identity-only `new_indirect_unresolved_for_pdf` was deleted when it
+    /// switched over — and patching it to discard its `pdf_unique_id`
+    /// argument fails 62 tests in `cargo test -p flpdf --lib`, not just this
+    /// one.
     ///
     /// Note this is *not* what `Pdf::is_canonical_object_handle` compares on:
     /// that one looks the ref up in `handle_registry` and compares `Rc`

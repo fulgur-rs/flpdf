@@ -3104,9 +3104,11 @@ impl Pdf<Cursor<Arc<[u8]>>> {
     /// ```
     ///
     /// The document itself, by contrast, is not `Send` — the resolver every
-    /// handle points back at is an `Rc`. Only the `require_send` line differs
-    /// from the example above, so this cannot pass merely because the call
-    /// stopped compiling:
+    /// handle points back at is an `Rc`. `compile_fail` passes on *any* error,
+    /// so this one is only meaningful next to the example above: that one
+    /// builds the same `Arc<[u8]>` and calls the same `open_mem`, and it runs.
+    /// The bound `require_send` adds is therefore the only thing left to
+    /// reject:
     ///
     /// ```compile_fail
     /// use std::sync::Arc;
@@ -6514,9 +6516,13 @@ mod tests {
     /// Buffer is destroyed", `include/qpdf/Buffer.hh:42-45`).
     ///
     /// A strong count of 2 is only reachable if the document holds *this*
-    /// allocation. Reintroducing an internal copy — `Cursor::new(bytes.to_vec())`
-    /// — leaves the caller's count at 1 and fails here, which is the whole
-    /// point of the assertion.
+    /// allocation. The mutation this guards against has to stay type-correct
+    /// to be meaningful — `Cursor::new(bytes.to_vec())` merely fails to
+    /// compile, since `open_mem` lives in `impl Pdf<Cursor<Arc<[u8]>>>`, and a
+    /// compile error is not this test discriminating. The real one is
+    /// `Self::open(Cursor::new(Arc::from(&bytes[..])))`: same signature, same
+    /// bytes, fresh allocation. It fails the middle assertion below with
+    /// `left: 1, right: 2`, and fails nothing else.
     #[test]
     fn open_mem_shares_the_callers_buffer_rather_than_copying_it() {
         let bytes: Arc<[u8]> = Arc::from(&minimal_pdf_bytes()[..]);

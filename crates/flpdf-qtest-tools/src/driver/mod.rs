@@ -10,7 +10,6 @@ use std::ffi::CString;
 use flpdf::{Diagnostic, Error, Pdf, PdfOpenOptions};
 
 use crate::common::test_driver_program_name_bytes;
-use std::sync::Arc;
 
 pub(crate) mod handle;
 pub(crate) mod test_0_1;
@@ -51,7 +50,7 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         repair: n != 0,
         ..PdfOpenOptions::default()
     };
-    let mut pdf = match Pdf::open_mem_with_options(Arc::from(&bytes[..]), options) {
+    let mut pdf = match Pdf::open_mem_owned_with_options(bytes, options) {
         Ok(pdf) => pdf,
         Err(error) => {
             return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);

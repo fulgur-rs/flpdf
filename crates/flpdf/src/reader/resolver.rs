@@ -53,14 +53,26 @@ use std::io::{Read, Seek, SeekFrom};
 /// `foreign_object_maps`, dirty tracking, and every legacy field already
 /// carrying a `qpdf-cutover-delete` marker — stays on `Pdf`.
 ///
-/// **One member of that restriction is deliberately missing: the warning
-/// sink.** `QPDF::resolve` warns (`m->warnings`, `QPDF.hh:1475`) on a
-/// resolution loop and on a damaged object, so a complete resolver owns it.
-/// flpdf's sink is `Pdf::repair_diagnostics`, and `Pdf::repair_diagnostics()`
-/// hands out a `&Diagnostics` that cannot be returned from behind a
-/// `RefCell`. Nothing here warns yet, so moving it now would change a public
-/// signature for no exercised behaviour; it moves with the first code that
-/// writes a warning.
+/// **Two members of that restriction are deliberately missing.**
+///
+/// *The warning sink.* `QPDF::resolve` warns (`m->warnings`, `QPDF.hh:1475`)
+/// on a resolution loop and on a damaged object, so a complete resolver owns
+/// it. flpdf's sink is `Pdf::repair_diagnostics`, and
+/// `Pdf::repair_diagnostics()` hands out a `&Diagnostics` that cannot be
+/// returned from behind a `RefCell`. Nothing here warns yet, so moving it now
+/// would change a public signature for no exercised behaviour; it moves with
+/// the first code that writes a warning.
+///
+/// *The string decrypter's encryption parameters* (qpdf `m->encp`). qpdf
+/// builds a `StringDecrypter` per object inside `readObjectAtOffset`'s parse
+/// and passes it to `QPDFParser` only when the document is encrypted —
+/// `StringDecrypter* decrypter_ptr = m->encp->encrypted ? &decrypter : nullptr`
+/// (`libqpdf/QPDF.cc:1337-1339`). Encrypted documents are out of scope for
+/// this slice, so there is nothing here for `encp` to feed; the field arrives
+/// with the code that decrypts strings during resolution. `Pdf::encryption`
+/// holds flpdf's equivalent state meanwhile. Note this is *string*
+/// decryption only — stream decryption is not part of the resolver at all
+/// (qpdf decrypts streams at pipe time, `decryptStream`, `QPDF.cc:2491`).
 pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// qpdf `m->file` (`QPDF.hh:1456`).
     reader: R,
@@ -109,7 +121,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// the document was opened with, not whether recovery actually ran —
     /// qpdf's own flag is likewise setter-controlled, and it tracks a
     /// reconstruct that happened in a separate member
-    /// (`m->reconstructed_xref`, `QPDF.hh:1479`) that flpdf does not port
+    /// (`m->reconstructed_xref`, `QPDF.hh:1480`) that flpdf does not port
     /// here.
     #[allow(dead_code)] // read once resolution can fail and recover
     attempt_recovery: bool,
