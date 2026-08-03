@@ -27,7 +27,7 @@
 - Test: `crates/flpdf/src/filters.rs`
 
 **Interfaces:**
-- Consumes: existing `decode_filter_specs_from_handle`, `ObjectHandle`, `ObjectValue`, `resolver_bearing_handle`, `Pdf::get_object_handle`, `encode_stream_data`, and codec test helpers.
+- Consumes: existing `decode_filter_specs_from_handle`, `ObjectHandle`, `ObjectValue`, `resolver_bearing_handle`, `encode_stream_data`, and codec test helpers.
 - Produces: four acceptance tests specifying direct equivalence, absolute bytes, live indirect resolution, and dropped-resolver failure; `pub(crate) fn encode_stream_data_from_handle(&ObjectHandle, &[u8]) -> Result<Vec<u8>>`; and private `encode_stream_data_from_specs(Vec<FilterSpec>, &[u8]) -> Result<Vec<u8>>`.
 
 - [ ] **Step 1: Add direct-shape conversion and result comparison helpers**
@@ -168,55 +168,60 @@ fn handle_encode_has_absolute_missing_run_length_and_chain_outputs() {
 }
 ```
 
-- [ ] **Step 4: Add a real-PDF fixture whose holder, filter, parameters, and parameter value are indirect**
+- [ ] **Step 4: Add a synthetic live-resolver fixture whose holder, filter, parameters, and parameter value are indirect**
 
-Add the fixture builder and test below. The production change that makes this fail is replacing `try_get_key`/`decode_filter_specs_from_handle` with non-resolving access or Dictionary materialization.
+This fixture exercises the production `DocumentResolver` boundary without
+depending on the parsed-`Pdf` resolver wiring owned by `flpdf-25kg.3.5`. The
+production change that makes this fail is replacing
+`try_get_key`/`decode_filter_specs_from_handle` with non-resolving access or
+Dictionary materialization.
 
 ```rust
-fn pdf_with_indirect_encode_dictionary() -> Vec<u8> {
-    let bodies: [&[u8]; 5] = [
-        b"<< /Type /Catalog >>",
-        b"/FlateDecode",
-        b"<< /Predictor 12 /Columns 5 0 R >>",
-        b"<< /Filter 2 0 R /DecodeParms 3 0 R >>",
-        b"4",
-    ];
-    let mut pdf = b"%PDF-1.4\n".to_vec();
-    let mut offsets = Vec::new();
-    for (index, body) in bodies.iter().enumerate() {
-        offsets.push(pdf.len());
-        pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
-        pdf.extend_from_slice(body);
-        pdf.extend_from_slice(b"\nendobj\n");
-    }
-    let xref_start = pdf.len();
-    pdf.extend_from_slice(b"xref\n0 6\n0000000000 65535 f \n");
-    for offset in offsets {
-        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
-    }
-    pdf.extend_from_slice(
-        format!(
-            "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
-        )
-        .as_bytes(),
-    );
-    pdf
-}
-
 #[test]
-fn handle_encode_resolves_the_holder_filter_decode_parms_and_parameter_value() {
-    let mut pdf = crate::Pdf::open(std::io::Cursor::new(
-        pdf_with_indirect_encode_dictionary(),
-    ))
-    .expect("open indirect encode fixture");
-    let stream_dictionary = pdf.get_object_handle(crate::ObjectRef::new(4, 0));
+fn handle_encode_resolves_indirect_holder_filter_decode_parms_and_parameter_value() {
+    let (columns, columns_resolver) = resolver_bearing_handle(ObjectValue::Integer(4));
+    let (decode_params, decode_params_resolver) = resolver_bearing_handle(
+        ObjectValue::Dictionary(
+            [
+                (b"Predictor".to_vec(), ObjectHandle::integer(12)),
+                (b"Columns".to_vec(), columns.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    let (filter, filter_resolver) =
+        resolver_bearing_handle(ObjectValue::Name(b"FlateDecode".to_vec()));
+    let (stream_dictionary, dictionary_resolver) = resolver_bearing_handle(
+        ObjectValue::Dictionary(
+            [
+                (b"Filter".to_vec(), filter.clone()),
+                (b"DecodeParms".to_vec(), decode_params.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    let _resolvers = (
+        columns_resolver,
+        decode_params_resolver,
+        filter_resolver,
+        dictionary_resolver,
+    );
+
     assert!(!stream_dictionary.is_resolved());
+    assert!(!filter.is_resolved());
+    assert!(!decode_params.is_resolved());
+    assert!(!columns.is_resolved());
 
     let raw = sample_raw_4x2();
     let actual = encode_stream_data_from_handle(&stream_dictionary, &raw).unwrap();
     let expected = encode_stream_data(&png_predictor_dict(12, 4), &raw).unwrap();
 
     assert!(stream_dictionary.is_resolved());
+    assert!(filter.is_resolved());
+    assert!(decode_params.is_resolved());
+    assert!(columns.is_resolved());
     assert_eq!(actual, expected);
 }
 ```

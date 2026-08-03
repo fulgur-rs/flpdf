@@ -138,11 +138,16 @@ Independent assertions prevent equivalence from hiding shared defects:
 
 Resolver-specific tests cover:
 
-- indirect `/Filter` and indirect `/DecodeParms` values in a minimal parsed
-  PDF, including a parameter value reached through its document resolver;
+- indirect `/Filter` and indirect `/DecodeParms` values in a synthetic live
+  `DocumentResolver` fixture, including a parameter value reached through its
+  resolver;
 - an unresolved indirect stream dictionary with a live test resolver;
 - an unresolved indirect holder whose resolver is dropped, asserting the
   exact `Error::Internal` text.
+
+The synthetic fixture deliberately stops at the `DocumentResolver` boundary.
+Wiring parsed `Pdf` object handles to that resolver belongs to
+`flpdf-25kg.3.5`; this bridge must neither depend on nor reproduce that wiring.
 
 Verification records:
 
@@ -165,4 +170,3 @@ Verification records:
 - Adding resolver plumbing owned by `flpdf-25kg.3.5`.
 - Removing the Dictionary entry point or the legacy Object shape reader.
 - Closing pre-existing qpdf parity gaps outside the handle-reading seam.
-
