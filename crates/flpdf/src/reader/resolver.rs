@@ -39,18 +39,24 @@
 //! warning.
 //!
 //! This discipline is currently *stated and readable, not pinned by a test*.
-//! [`ResolverHandle::resolve_indirect`] now takes borrows of its own, but only
-//! the two [`ResolveMark`] takes — one inside `begin`, one inside `drop`, each
-//! confined to a single statement — so nothing yet holds a borrow across the
-//! body a nested resolution would run in. The other borrows in play are the
-//! ones `Pdf`'s legacy read helpers take, and those are exercised, including
-//! through the re-entrant indirect-`/Length` path (`reader.rs`'s
+//! [`ResolverHandle::resolve_indirect`] now takes borrows of its own — three
+//! of them, all short: the two [`ResolveMark`] takes (one inside `begin`, one
+//! inside `drop`) and the one [`ResolverHandle::push_warning`] takes on the
+//! loop branch. Each is confined to a single statement, so nothing yet holds a
+//! borrow across the body a nested resolution would run in.
+//!
+//! The warning sink is the newest way to get this wrong, and the way that will
+//! bite first: Task 4 warns on a damaged object *while* it has the xref entry
+//! in hand, so the push has to happen after that borrow is released, not
+//! inside it. The other borrows in play are the ones `Pdf`'s legacy read
+//! helpers take, and those are exercised, including through the re-entrant
+//! indirect-`/Length` path (`reader.rs`'s
 //! `qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors`). The
 //! regression that makes a borrow spanning a nested resolve fail loudly
 //! arrives with the resolver's own re-entrancy test.
 
 use crate::object_handle::DocumentResolver;
-use crate::{Error, ObjectHandle, ObjectRef, Result, XrefEntry};
+use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -64,17 +70,7 @@ use std::io::{Read, Seek, SeekFrom};
 /// `foreign_object_maps`, dirty tracking, and every legacy field already
 /// carrying a `qpdf-cutover-delete` marker — stays on `Pdf`.
 ///
-/// **Two members of that restriction are deliberately missing.**
-///
-/// *The warning sink.* `QPDF::resolve` warns (`m->warnings`,
-/// `include/qpdf/QPDF.hh:1475`) on a resolution loop and on a damaged object,
-/// so a complete resolver owns it. flpdf's sink is `Pdf::repair_diagnostics`,
-/// and `Pdf::repair_diagnostics()` hands out a `&Diagnostics` that cannot be
-/// returned from behind a `RefCell`. It is still absent, and that is now a
-/// live divergence rather than a deferral of dead code: the loop branch of
-/// [`ResolverHandle::resolve_indirect`] is a place qpdf warns and flpdf does
-/// not. That method's own doc carries the reasoning and the cost of moving
-/// the sink.
+/// **One member of that restriction is deliberately missing.**
 ///
 /// *The string decrypter's encryption parameters* (qpdf `m->encp`). qpdf
 /// builds a `StringDecrypter` per object inside `readObjectAtOffset`'s parse
@@ -145,6 +141,24 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// here.
     #[allow(dead_code)] // read once resolution can fail and recover
     attempt_recovery: bool,
+    /// qpdf `m->warnings` (`include/qpdf/QPDF.hh:1475`), the list `QPDF::warn`
+    /// appends to and `QPDF::getWarnings` hands back.
+    ///
+    /// It lives here rather than on `Pdf` because `QPDF::resolve` warns on a
+    /// resolution loop (`libqpdf/QPDF.cc:1710`) and on a damaged object
+    /// (`:1738`, `:1740`), and [`DocumentResolver::resolve_indirect`] reaches
+    /// its document through a `Weak` — it has no `&mut Pdf` to push into. Every
+    /// warning flpdf raises, from the resolver or from any `&mut Pdf` helper
+    /// walk, lands in this one collection, matching qpdf's single `m->warnings`;
+    /// `Pdf::push_warning` and `Pdf::repair_diagnostics` are its two doors.
+    ///
+    /// **Borrow discipline.** [`ResolverHandle::push_warning`] takes
+    /// `borrow_mut()` and [`ResolverHandle::repair_diagnostics`] takes
+    /// `borrow()`, so neither may be called while a borrow of this core is
+    /// already held. That is a real constraint on Task 4's read-and-parse
+    /// phase, which warns on a damaged object: the warning must be pushed
+    /// outside the borrow that read the xref entry, not inside it.
+    repair_diagnostics: Diagnostics,
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -272,6 +286,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         header_offset: usize,
         source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
         attempt_recovery: bool,
+        repair_diagnostics: Diagnostics,
     ) -> Self {
         Self {
             core: RefCell::new(ResolverCore {
@@ -282,8 +297,43 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
                 attempt_recovery,
+                repair_diagnostics,
             }),
         }
+    }
+
+    /// Append a warning to this document's one diagnostics collection —
+    /// the accumulating half of qpdf `QPDF::warn`
+    /// (`libqpdf/QPDF.cc:487-494`). qpdf's does two things: `push_back` onto
+    /// `m->warnings`, and — unless `m->suppress_warnings` — write
+    /// `"WARNING: " << e.what()` straight to its logger (`:492`). Only the
+    /// first half is here. flpdf accumulates and lets the front end decide;
+    /// `flpdf-cli` walks the collection and writes to stderr itself
+    /// (`crates/flpdf-cli/src/main.rs:5342`), which is why flpdf has no
+    /// `suppress_warnings` counterpart to port.
+    ///
+    /// Takes `&self`, which is the whole reason the sink moved here: the
+    /// resolver reaches its document through a `Weak` and never holds a
+    /// `&mut Pdf`. `Pdf::push_warning` is the same door for callers that do.
+    ///
+    /// Borrow discipline: the `borrow_mut()` is taken and dropped inside this
+    /// expression, so it composes with a nested resolution — but it must not
+    /// be called while a borrow of the core is already held.
+    pub(crate) fn push_warning(&self, message: impl Into<String>) {
+        self.core
+            .borrow_mut()
+            .repair_diagnostics
+            .push(Diagnostic::warning(message, None));
+    }
+
+    /// A snapshot of every warning raised on this document so far.
+    ///
+    /// Returns an owned clone because the collection lives behind a
+    /// `RefCell` and a `&Diagnostics` cannot be handed out from one. See
+    /// `Pdf::repair_diagnostics`, which is the public door onto this and
+    /// carries the trade-off.
+    pub(crate) fn repair_diagnostics(&self) -> Diagnostics {
+        self.core.borrow().repair_diagnostics.clone()
     }
 
     /// The offset repair chose as qpdf-logical zero. See
@@ -380,12 +430,13 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// `"belongs to a dropped PDF"` when it cannot upgrade its `Weak`, which
     /// is a different failure from this one.
     ///
-    /// # The loop branch, and what it does not yet do
+    /// # The loop branch
     ///
     /// qpdf's loop branch (`libqpdf/QPDF.cc:1706-1712`) does three things:
     /// warns `damagedPDF("", "loop detected resolving object " +
     /// og.unparse(' '))`, calls `updateCache(og, QPDF_Null::create(), -1, -1)`,
-    /// and returns without throwing. Two of the three are ported.
+    /// and returns without throwing. All three are ported; the notes below are
+    /// on *how*, and on the one qpdf side effect that stays out.
     ///
     /// *Null at offset -1* is [`ObjectHandle::set_missing`], not
     /// `set_resolved(ObjectValue::Null)`. qpdf draws no distinction to port
@@ -417,25 +468,25 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// is what the next lookup sees, and [`ObjectHandle::try_dereference`]
     /// short-circuits on it without consulting the resolver again.
     ///
-    /// *The warning is not emitted at all.* flpdf's counterpart of
-    /// `m->warnings` (`include/qpdf/QPDF.hh:1475`) is `Pdf::repair_diagnostics`,
-    /// which [`ResolverCore`]'s own doc records as deliberately absent from
-    /// the resolver, and this slice does not move it: `Pdf::repair_diagnostics`
-    /// returns `&Diagnostics`, a reference that cannot come out of a `RefCell`,
-    /// so the sink can only move by changing that signature across 90 call
-    /// sites in three crates. The mechanical replacement does not work either:
-    /// returning `Ref<'_, Diagnostics>` makes every
-    /// `let entries = pdf.repair_diagnostics().entries();` binding a rustc
-    /// E0716 — the `Ref` is a temporary freed at the end of that statement
-    /// while the slice still borrows it — and seven such bindings exist,
-    /// including `flpdf-qtest-tools/src/driver/mod.rs:323`. A second,
-    /// resolver-local sink was rejected as the larger divergence: qpdf has
-    /// exactly one warning list, and
-    /// splitting flpdf's would have to be undone at the same cost later. So
-    /// **a resolution loop is silent here where qpdf warns**, which is a
-    /// divergence and not a slice of parity. The plan of record assigns
-    /// warnings to Task 4, whose step 3 lists them among what it must
-    /// preserve.
+    /// *The warning* is `"loop detected resolving object N G"`, qpdf's own
+    /// text from `libqpdf/QPDF.cc:1710` with `og.unparse(' ')`
+    /// (`libqpdf/QPDFObjGen.cc:19-22`) expanded — that separator is why the
+    /// number and generation are space-joined rather than carrying qpdf's
+    /// default `,`. It goes through [`ResolverHandle::push_warning`] into the
+    /// same collection `Pdf::repair_diagnostics` hands back, so a loop is
+    /// visible to exactly the callers that see every other flpdf warning.
+    ///
+    /// The text is stored bare, without qpdf's `QPDFExc` framing.
+    /// `damagedPDF("", message)` (`:2625-2628`) fills in the filename and
+    /// `m->file->getLastOffset()`, and `QPDFExc::createWhat`
+    /// (`libqpdf/QPDFExc.cc:19-49`) renders `"<filename>: <message>"` — the
+    /// object description is empty here, so nothing else is interposed.
+    /// flpdf keeps the filename out of [`Diagnostic::message`] throughout
+    /// (`xref.rs`'s `"file is damaged"` is the same shape), so matching that
+    /// convention *is* matching qpdf's inner text. The offset is `None`
+    /// rather than qpdf's `getLastOffset()`: the resolver tracks no input
+    /// position in this slice, and a fabricated one would be worse than an
+    /// absent one.
     ///
     /// Not ported for a different reason: qpdf's `isUnresolved(og)` early
     /// return (`:1702-1704`) is phase 1 of Task 4's three-phase split.
@@ -447,6 +498,13 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         // method returns or unwinds, and `let Some(_) = ..` would drop it at
         // the end of this statement.
         let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
+            // qpdf's order: warn, then cache null (`libqpdf/QPDF.cc:1710-1711`).
+            // Neither call may hold a borrow across the other — `push_warning`
+            // takes its own `borrow_mut`.
+            self.push_warning(format!(
+                "loop detected resolving object {} {}",
+                object_ref.number, object_ref.generation
+            ));
             handle.set_missing();
             return Ok(());
         };
@@ -463,7 +521,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 mod tests {
     use super::ResolveMark;
     use crate::object_handle::NO_PARSED_OFFSET;
-    use crate::{Error, ObjectRef, Pdf};
+    use crate::{Error, ObjectRef, Pdf, Severity};
     use std::sync::Arc;
 
     /// A three-object document with a classic cross-reference table: catalog,
@@ -682,6 +740,88 @@ mod tests {
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "a failed resolution must not leave its reference marked in progress"
+        );
+    }
+
+    /// A detected loop warns, with qpdf's own message text.
+    ///
+    /// qpdf: `warn(damagedPDF("", "loop detected resolving object " +
+    /// og.unparse(' ')))` (`libqpdf/QPDF.cc:1710`). `og.unparse(' ')`
+    /// (`libqpdf/QPDFObjGen.cc:19-22`) is `number + separator + generation`,
+    /// so for object 1 generation 0 the message is exactly
+    /// `"loop detected resolving object 1 0"` — asserted here as a whole
+    /// string, not a `contains`, because the point is the wording and the
+    /// space separator rather than the mere presence of a warning.
+    ///
+    /// The assertion that the collection was empty beforehand matters as much
+    /// as the one after it: this fixture opens cleanly, so a warning appearing
+    /// at all is attributable to the loop and not to the parse.
+    #[test]
+    fn a_detected_loop_warns_with_qpdfs_message_text() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "this fixture opens without warnings, so the loop is the only source"
+        );
+
+        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
+        handle.try_dereference().expect("a loop is not an error");
+        drop(outer);
+
+        let diagnostics = pdf.repair_diagnostics();
+        let messages = diagnostics
+            .entries()
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["loop detected resolving object 1 0"]);
+        assert_eq!(
+            diagnostics.entries()[0].severity,
+            Severity::Warning,
+            "qpdf warns and continues here rather than failing the resolution"
+        );
+        assert_eq!(
+            diagnostics.entries()[0].offset,
+            None,
+            "the resolver tracks no input position in this slice, so qpdf's \
+             getLastOffset() has no counterpart to report"
+        );
+    }
+
+    /// A warning raised through the resolver and one raised through
+    /// `Pdf::push_warning` land in the same collection, in the order they were
+    /// raised — qpdf keeps one `m->warnings` (`include/qpdf/QPDF.hh:1475`) and
+    /// `QPDF::warn` only ever `push_back`s onto it (`libqpdf/QPDF.cc:490`).
+    ///
+    /// This is what the sink move bought, and the ordering is the part a
+    /// second sink could not have delivered.
+    #[test]
+    fn resolver_warnings_and_document_warnings_share_one_ordered_collection() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+
+        pdf.push_warning("before the loop");
+        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
+        handle.try_dereference().expect("a loop is not an error");
+        drop(outer);
+        pdf.push_warning("after the loop");
+
+        let diagnostics = pdf.repair_diagnostics();
+        let messages = diagnostics
+            .entries()
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "before the loop",
+                "loop detected resolving object 1 0",
+                "after the loop"
+            ]
         );
     }
 

@@ -27,8 +27,7 @@ use crate::security::standard::{
 use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
 use crate::{
-    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry,
-    XrefForm,
+    Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
@@ -93,7 +92,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     trailer: Dictionary,
     startxref: u64,
     last_xref_form: XrefForm,
-    repair_diagnostics: Diagnostics,
     cache: ObjectCache,
     /// Canonical indirect-object handle registry (`QPDF::getObject`-equivalent
     /// identity): repeated [`Pdf::get_object_handle`] calls for the same
@@ -460,8 +458,19 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Diagnostics emitted while opening the document — typically warnings from the
     /// xref/trailer recovery path. Always non-empty when the parse hit a soft failure.
-    pub fn repair_diagnostics(&self) -> &Diagnostics {
-        &self.repair_diagnostics
+    ///
+    /// Returns an owned snapshot. The collection is qpdf's `m->warnings` and
+    /// lives on the crate-private resolver core rather than on this struct,
+    /// so that `resolve_indirect`, which reaches this document through a
+    /// `Weak` and never holds a `&mut Pdf`, can warn at all — and a
+    /// `&Diagnostics` cannot be handed out from behind the `RefCell` that
+    /// makes that possible. The alternative, `Ref<'_, Diagnostics>`, avoids
+    /// the copy but leaks [`std::cell::Ref`] into the public API and lets a
+    /// caller holding one across a resolving call hit a `BorrowMutError` at
+    /// run time. The copy is cheap: the collection is empty for a document
+    /// that opened cleanly.
+    pub fn repair_diagnostics(&self) -> Diagnostics {
+        self.resolver.repair_diagnostics()
     }
 
     /// Record a non-fatal processing warning on this handle.
@@ -471,9 +480,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// than aborting) so the soft failure is surfaced via [`Pdf::repair_diagnostics`]
     /// instead of being silently swallowed. Mirrors qpdf, which warns and continues
     /// on malformed field trees.
+    ///
+    /// Still takes `&mut self` although the sink no longer requires it: every
+    /// caller already holds a `&mut Pdf`, and the resolver's own warnings go
+    /// through [`resolver::ResolverHandle::push_warning`] instead. Both doors
+    /// reach the one collection.
     pub(crate) fn push_warning(&mut self, message: impl Into<String>) {
-        self.repair_diagnostics
-            .push(Diagnostic::warning(message, None));
+        self.resolver.push_warning(message);
     }
 
     /// Exact source framing removed by an authoritative `endstream` scan.
@@ -673,12 +686,12 @@ impl<R: Read + Seek> Pdf<R> {
                 loaded_state.header_offset,
                 source_xref_entries,
                 options.repair,
+                loaded.repair_diagnostics,
             )),
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
             last_xref_form: loaded.last_xref_form,
-            repair_diagnostics: loaded.repair_diagnostics,
             cache,
             handle_registry: BTreeMap::new(),
             foreign_object_maps: BTreeMap::new(),
@@ -910,8 +923,7 @@ impl<R: Read + Seek> Pdf<R> {
             owner_password_matched,
         });
         if let Some(warning) = r6_perms_warning {
-            self.repair_diagnostics
-                .push(Diagnostic::warning(warning, None));
+            self.push_warning(warning);
         }
         Ok(())
     }
@@ -5410,7 +5422,8 @@ mod tests {
                 .expect("recover compressed stray name"),
             Object::Name(b"a\0\x31x".to_vec())
         );
-        let diagnostics = pdf.repair_diagnostics().entries();
+        let snapshot = pdf.repair_diagnostics();
+        let diagnostics = snapshot.entries();
         assert_eq!(
             diagnostics
                 .iter()
@@ -6286,7 +6299,8 @@ mod tests {
             normal_first.resolve_qpdf_json_object(object_ref).unwrap(),
             Object::Integer(3)
         );
-        let diagnostics = normal_first.repair_diagnostics().entries();
+        let snapshot = normal_first.repair_diagnostics();
+        let diagnostics = snapshot.entries();
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("expected endobj"));
 
@@ -6352,7 +6366,8 @@ mod tests {
 
         assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
         assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
-        let diagnostics = pdf.repair_diagnostics().entries();
+        let snapshot = pdf.repair_diagnostics();
+        let diagnostics = snapshot.entries();
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0]
             .message

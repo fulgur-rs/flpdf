@@ -47,6 +47,35 @@ to every document-created handle".
 Plus the warning sink, and the encryption parameters needed to build the
 *string* decrypter the parser uses (`m->encp`, `QPDF.cc:1338`).
 
+### The warning sink reshapes `Pdf::repair_diagnostics`
+
+**Found while landing the in-progress guard; this document did not anticipate
+it.** The sink (`m->warnings`, `QPDF.hh:1475`) has to live in `ResolverCore`
+because `QPDF::resolve` warns — on a resolution loop (`QPDF.cc:1710`) and on a
+damaged object (`:1738`, `:1740`) — and `resolve_indirect` reaches its document
+through a `Weak`, never a `&mut Pdf`. Once it is behind the `RefCell`,
+`Pdf::repair_diagnostics(&self) -> &Diagnostics` cannot stand: a reference
+cannot be handed out from a `RefCell`.
+
+**It returns an owned `Diagnostics` snapshot.** The alternative,
+`Ref<'_, Diagnostics>`, avoids the copy but leaks `std::cell::Ref` into the
+public API and lets a caller holding one across a resolving call hit a
+`BorrowMutError` at run time. The copy is cheap — the collection is empty for a
+document that opened cleanly — and both options cost the same call-site churn.
+
+Measured, not estimated: 11 call sites break, not the ~90 that call the method.
+Ten are `let x = pdf.repair_diagnostics().entries();` (rustc E0716, the snapshot
+is a temporary freed at the end of the statement), fixed by binding the
+snapshot first. The eleventh is a different class — a test helper returning
+`Vec<&str>` borrowed from the temporary (E0515), fixed by returning owned
+`String`s. `flpdf-cli` needs no change at all.
+
+**Do not split the sink in two.** A resolver-local second collection was
+considered and rejected: qpdf keeps exactly one `m->warnings`, and warning
+*order* across the resolver and the `&mut Pdf` helper walks is already
+load-bearing — prepending instead of appending fails seven pre-existing tests
+in `nntree`, `linearization::plan`, and `reader` on top of the resolver's own.
+
 **Stream decryption is not in the resolver.** `readObjectAtOffset` is 156 lines
 and contains no decryption; qpdf decrypts streams at pipe time
 (`decryptStream`, `QPDF.cc:2491`). flpdf's legacy `resolve_to_cache` decrypts

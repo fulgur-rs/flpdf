@@ -3297,8 +3297,8 @@ mod tests {
         let mut cyclic = NNTree::<NameKey>::new(Object::Reference(cycle_ref), false);
         assert!(!cyclic.begin(&mut pdf).unwrap().positioned());
 
-        let warnings = pdf
-            .repair_diagnostics()
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics
             .entries()
             .iter()
             .map(|entry| entry.message.as_str())
@@ -3818,8 +3818,8 @@ mod tests {
             found.current().map(|(key, value)| (key.as_slice(), value)),
             Some((b"beta".as_slice(), &Object::Integer(2)))
         );
-        let warnings = pdf
-            .repair_diagnostics()
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -4052,8 +4052,8 @@ mod tests {
             found.current().map(|(key, _)| key.as_slice()),
             Some(b"zulu".as_slice())
         );
-        let warnings = pdf
-            .repair_diagnostics()
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics
             .entries()
             .iter()
             .map(|diagnostic| diagnostic.message.as_str())
@@ -4133,7 +4133,8 @@ mod tests {
                 (b"zulu".to_vec(), Object::Integer(4)),
             ]
         );
-        let warnings = pdf.repair_diagnostics().entries();
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics.entries();
         assert_eq!(warnings.len(), 2);
         assert!(warnings[0]
             .message
@@ -4181,7 +4182,8 @@ mod tests {
         assert!(error
             .to_string()
             .contains("update ivalue: items array is too short"));
-        let warnings = pdf.repair_diagnostics().entries();
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics.entries();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0]
             .message

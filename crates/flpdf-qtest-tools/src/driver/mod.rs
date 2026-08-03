@@ -320,7 +320,8 @@ pub(crate) fn emit_new_diagnostics<R: io::Read + io::Seek>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    let entries = pdf.repair_diagnostics().entries();
+    let diagnostics = pdf.repair_diagnostics();
+    let entries = diagnostics.entries();
     for diagnostic in &entries[*diagnostics_written..] {
         write_warning(filename, diagnostic, stdout, stderr)?;
     }
