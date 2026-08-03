@@ -2182,7 +2182,7 @@ mod tests {
                 // Every third call, not just the first: the first reads belong
                 // to `Pdf::open`'s xref load, so interrupting only once would
                 // never reach `ResolverCore::read` at all.
-                if self.calls % 3 == 0 {
+                if self.calls.is_multiple_of(3) {
                     return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
                 }
                 let len = buf.len().min(7);
