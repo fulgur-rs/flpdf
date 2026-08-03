@@ -3124,9 +3124,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     }
     if encrypting && options.qdf {
         return Err(crate::Error::Unsupported(
-            "--encrypt / --copy-encryption-from cannot be combined with --qdf \
-             (flpdf-9hc.4.9 walking skeleton)"
-                .to_string(),
+            "--encrypt / --copy-encryption-from cannot be combined with --qdf".to_string(),
         ));
     }
 
