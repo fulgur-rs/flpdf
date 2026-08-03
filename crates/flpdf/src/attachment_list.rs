@@ -761,6 +761,77 @@ mod tests {
         );
     }
 
+    /// Point `/Names /EmbeddedFiles` straight at `[key value]`, bypassing the
+    /// name-tree writer so the value shape can be chosen freely.
+    fn attach_raw_tree_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: Object) {
+        let root = pdf.root_ref().expect("catalog");
+        let mut catalog = pdf
+            .resolve(root)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dictionary");
+        let mut tree = Dictionary::new();
+        tree.insert(
+            "Names",
+            Object::Array(vec![Object::String(key.to_vec()), value]),
+        );
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(tree));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(root, Object::Dictionary(catalog));
+    }
+
+    // ── Name-tree value shapes ────────────────────────────────────────────────
+
+    #[test]
+    fn inline_filespec_value_is_listed() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"j.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        // A name-tree leaf may hold the /Filespec inline instead of by
+        // reference; it must list exactly as an indirect one does.
+        attach_raw_tree_value(&mut pdf, b"j.txt", Object::Dictionary(filespec));
+
+        let n = stream_ref.number;
+        assert_eq!(
+            as_text(&listing(&mut pdf, true)),
+            format!(
+                "j.txt -> {n},0\n\
+                 \x20 preferred name: j.txt\n\
+                 \x20 all names:\n\
+                 \x20   /F -> j.txt\n\
+                 \x20 all data streams:\n\
+                 \x20   /F -> {n},0\n\
+                 \x20     creation date: \n\
+                 \x20     modification date: \n\
+                 \x20     mime type: \n\
+                 \x20     checksum: \n"
+            )
+        );
+    }
+
+    #[test]
+    fn non_dictionary_filespec_value_still_lists_the_key() {
+        // qpdf warns ("Embedded file object is not a dictionary") and carries
+        // on with empty values rather than failing the listing.
+        for value in [
+            Object::String(b"not-a-filespec".to_vec()),
+            Object::Reference(ObjectRef::new(4096, 0)),
+        ] {
+            let mut pdf = open_minimal();
+            attach_raw_tree_value(&mut pdf, b"k.txt", value);
+            assert_eq!(
+                as_text(&listing(&mut pdf, true)),
+                "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+            );
+        }
+    }
+
     // ── Name-tree keys use qpdf's UTF-8 view ──────────────────────────────────
 
     #[test]

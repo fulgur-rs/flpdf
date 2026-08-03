@@ -239,7 +239,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + **`json_inspect.rs` の `doJSON*` 族相当**（下記）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(306: `--list-attachments` の整形出力) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `QPDFJob` に相当する独立モジュールが**存在しない**。集約は `flpdf-q2fo`(D1) / `flpdf-ukux`(D2) / `flpdf-s5cw`(D3) |
+| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + **`json_inspect.rs` の `doJSON*` 族相当**（下記）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(1074: `QPDFJob.cc:876-911` の `doListAttachments` 移植。`<file> has no embedded files` は infilename を要するため CLI 側に残す) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `QPDFJob` に相当する独立モジュールが**存在しない**。集約は `flpdf-q2fo`(D1) / `flpdf-ukux`(D2) / `flpdf-s5cw`(D3) |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `diagnostics.rs`(80) | 🔀 |
 
