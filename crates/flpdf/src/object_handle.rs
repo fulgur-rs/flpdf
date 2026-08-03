@@ -252,7 +252,7 @@ impl ObjectHandle {
     // `handle_registry` the first time a given ref is requested.
     #[cfg(test)]
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
-        Self::new_indirect_unresolved_with_identity(object_ref, offset, None)
+        Self::new_indirect_unresolved_with_identity(object_ref, offset, None, None)
     }
 
     pub(crate) fn new_indirect_unresolved_for_pdf(
@@ -260,22 +260,42 @@ impl ObjectHandle {
         offset: i64,
         pdf_unique_id: u64,
     ) -> Self {
-        Self::new_indirect_unresolved_with_identity(object_ref, offset, Some(pdf_unique_id))
+        Self::new_indirect_unresolved_with_identity(object_ref, offset, Some(pdf_unique_id), None)
     }
 
-    fn new_indirect_unresolved_with_identity(
+    /// Construct a canonical unresolved slot carrying both its owning
+    /// document's identity and that document's resolver — what
+    /// `Pdf::get_object_handle` needs to hand out.
+    ///
+    /// Neither half is sufficient alone. The resolver is what
+    /// [`Self::try_dereference`] upgrades and calls; the identity is what
+    /// [`Self::belongs_to_pdf`] answers on, and what [`Self::set_resolved`]
+    /// stamps onto each direct child for
+    /// [`Self::containing_object_refs_for_pdf`].
+    ///
+    /// `pdf_unique_id` is an flpdf-internal document tag with no qpdf
+    /// counterpart: qpdf's object reaches its document through a raw `QPDF*`
+    /// back-pointer (`libqpdf/qpdf/QPDFValue.hh:150`, `QPDF* qpdf{nullptr}`)
+    /// that `QPDFObject::doResolve` hands straight to
+    /// `QPDF::Resolver::resolve` (`libqpdf/QPDFObject.cc:7-11`), so one
+    /// pointer serves as both identity and resolver there. See
+    /// [`Self::new_indirect_with_resolver`] for why this port splits them and
+    /// keeps the resolver link weak.
+    #[allow(dead_code)] // the production caller is `Pdf::get_object_handle`,
+                        // attached in the next step of flpdf-25kg.3.5; today
+                        // only this module's unit tests construct one
+    pub(crate) fn new_indirect_for_pdf_with_resolver(
         object_ref: ObjectRef,
         offset: i64,
-        pdf_unique_id: Option<u64>,
+        pdf_unique_id: u64,
+        resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
-        let _ = offset; // real Unresolved{offset} state lands in a later task
-        Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
+        Self::new_indirect_unresolved_with_identity(
             object_ref,
-            pdf_unique_id,
-            resolver: None,
-            state: IndirectState::NotYetResolved,
-            parsed_offset: NO_PARSED_OFFSET,
-        }))))
+            offset,
+            Some(pdf_unique_id),
+            Some(resolver),
+        )
     }
 
     /// Construct a canonical unresolved slot attached to its owning document
@@ -288,10 +308,25 @@ impl ObjectHandle {
         object_ref: ObjectRef,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
+        Self::new_indirect_unresolved_with_identity(
+            object_ref,
+            NO_PARSED_OFFSET,
+            None,
+            Some(resolver),
+        )
+    }
+
+    fn new_indirect_unresolved_with_identity(
+        object_ref: ObjectRef,
+        offset: i64,
+        pdf_unique_id: Option<u64>,
+        resolver: Option<Weak<dyn DocumentResolver>>,
+    ) -> Self {
+        let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
-            pdf_unique_id: None,
-            resolver: Some(resolver),
+            pdf_unique_id,
+            resolver,
             state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
         }))))
@@ -2125,6 +2160,59 @@ pub(crate) mod identity_tests {
         let error = handle.try_dereference().unwrap_err();
         assert_eq!(error.to_string(), "object 8 0 belongs to a dropped PDF");
         assert!(!handle.is_resolved());
+    }
+
+    /// A handle needs its owning document's identity *and* that document's
+    /// resolver at once: `Pdf::get_object_handle` hands out one handle that
+    /// must answer both questions.
+    ///
+    /// The identity is not decorative. `set_resolved` stamps the slot's
+    /// `pdf_unique_id` onto every direct child it installs (via
+    /// `associate_value_with_owners`), and that stamp is what
+    /// [`ObjectHandle::belongs_to_pdf`] and
+    /// [`ObjectHandle::containing_object_refs_for_pdf`] read — the
+    /// foreign-object rejection and owner lookup in
+    /// `Pdf::mark_object_handle_dirty`, `filespec_helper`, and
+    /// `embedded_files`. Building this handle with `pdf_unique_id: None`
+    /// fails 61 tests in `cargo test -p flpdf --lib`, measured by patching
+    /// `new_indirect_unresolved_for_pdf` to discard its argument.
+    ///
+    /// Note this is *not* what `Pdf::is_canonical_object_handle` compares on:
+    /// that one looks the ref up in `handle_registry` and compares `Rc`
+    /// pointers, never touching `pdf_unique_id`.
+    #[test]
+    fn an_indirect_slot_carries_both_its_pdf_identity_and_its_resolver() {
+        const PDF_ID: u64 = 4242;
+        let object_ref = ObjectRef::new(13, 0);
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            object_ref,
+            NO_PARSED_OFFSET,
+            PDF_ID,
+            Rc::downgrade(&resolver),
+        );
+
+        // Identity: preserved, and specific to this document rather than
+        // matching any id put to it.
+        assert!(handle.belongs_to_pdf(PDF_ID));
+        assert!(!handle.belongs_to_pdf(PDF_ID + 1));
+
+        // Resolver: reachable through `try_dereference`'s real path — upgrade
+        // the `Weak`, call `resolve_indirect` — not merely stored in the slot.
+        // Without it this is the dropped-document error instead.
+        handle.try_dereference().unwrap();
+        assert!(handle.is_resolved());
+
+        // Both at once. The child's owner stamp is written by `set_resolved`
+        // out of the slot's own `pdf_unique_id`, so it can only carry this id
+        // if the identity survived *into* the resolution the resolver drove.
+        let child = handle.get_key(b"A");
+        assert_eq!(child.as_integer(), Some(1));
+        assert_eq!(
+            child.containing_object_refs_for_pdf(PDF_ID),
+            vec![object_ref]
+        );
+        assert!(child.containing_object_refs_for_pdf(PDF_ID + 1).is_empty());
     }
 
     #[test]
