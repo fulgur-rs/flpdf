@@ -547,6 +547,62 @@ impl ObjectHandle {
         Ok(self.as_dictionary())
     }
 
+    /// qpdf-compatible name inspection with lazy dereference.
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_as_name(&self) -> Result<Option<Vec<u8>>> {
+        self.try_dereference()?;
+        Ok(self.as_name())
+    }
+
+    /// qpdf-compatible array inspection with lazy dereference. Only the array
+    /// itself is resolved; each returned child keeps its own identity.
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_as_array(&self) -> Result<Option<Vec<ObjectHandle>>> {
+        self.try_dereference()?;
+        Ok(self.as_array())
+    }
+
+    /// qpdf-compatible array *length* with lazy dereference — the item count
+    /// without materializing the items.
+    ///
+    /// `QPDFObjectHandle::getArrayNItems` is `asArray()->size()`
+    /// (`libqpdf/QPDFObjectHandle.cc:758-768`), and `asArray` is
+    /// `return dereference() ? obj->as<QPDF_Array>() : nullptr;` — a borrowed
+    /// `QPDF_Array*`, not a copy (`libqpdf/QPDFObjectHandle.cc:252-256`), so
+    /// qpdf reads the length in place. `QPDF_Stream::filterable` uses that to
+    /// size its `/Filter` and `/DecodeParms` loops
+    /// (`libqpdf/QPDF_Stream.cc:398`, `:443`, `:447`) before touching a single
+    /// item. [`Self::try_as_array`]
+    /// cannot serve that caller: it snapshots the child vector, so a length
+    /// that is only going to be rejected still costs a `Vec` allocation and
+    /// one `Rc` clone per child.
+    ///
+    /// **Deliberately not qpdf's non-array answer.** `getArrayNItems` warns
+    /// `typeWarning("array", "treating as empty")` and returns 0 for a
+    /// non-array (`libqpdf/QPDFObjectHandle.cc:763-766`), so qpdf reads a
+    /// non-array as an empty one. This returns `None`, matching
+    /// [`Self::try_as_array`], and leaves the meaning of "not an array" to the
+    /// caller — for [`crate::stream_filter::decode_filter_specs_from_handle`]
+    /// that is the "stream filter type is not name or array" error. That
+    /// divergence predates this accessor and is not widened by it; folding
+    /// qpdf's treat-as-empty in here would silently turn a rejected `/Filter`
+    /// into an accepted unfiltered stream.
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_array_len(&self) -> Result<Option<usize>> {
+        self.try_dereference()?;
+        Ok(self.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => Some(children.len()),
+            _ => None,
+        }))
+    }
+
+    /// qpdf-compatible integer inspection with lazy dereference.
+    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
+    pub(crate) fn try_as_integer(&self) -> Result<Option<i64>> {
+        self.try_dereference()?;
+        Ok(self.as_integer())
+    }
+
     /// qpdf-compatible dictionary lookup. The holder dictionary is resolved;
     /// the returned child retains its own direct/indirect identity.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
@@ -1911,12 +1967,49 @@ fn drain_dictionary_onto(dict: &mut Dictionary, stack: &mut Vec<Object>) {
 }
 
 #[cfg(test)]
-mod identity_tests {
+pub(crate) mod identity_tests {
     use super::*;
 
-    #[derive(Default)]
     struct RecordingResolver {
-        calls: RefCell<Vec<ObjectRef>>,
+        calls: ResolutionLog,
+        value: ObjectValue,
+    }
+
+    /// Every `resolve_indirect` a [`RecordingResolver`] performed, in order.
+    ///
+    /// Shared with the caller by [`logged_resolver_bearing_handle`] so a test
+    /// can assert a *negative*: that a position was never resolved at all.
+    /// `ObjectHandle::is_resolved` is not a substitute — a resolver that
+    /// errored would leave the handle unresolved despite having been called.
+    pub(crate) type ResolutionLog = Rc<RefCell<Vec<ObjectRef>>>;
+
+    impl RecordingResolver {
+        /// Install `value` instead of the default one-key dictionary, so a
+        /// test can exercise a resolving accessor for a non-dictionary shape.
+        ///
+        /// One instance installs the *same* child handles on every resolution:
+        /// cloning an `ObjectValue` container clones child `Rc`s rather than
+        /// the subtree (see that enum's own doc). Resolving two handles through
+        /// a single resolver therefore leaves their children `ptr_eq`, which no
+        /// current test wants — give each such test its own resolver.
+        fn installing(value: ObjectValue) -> Self {
+            Self::logging_into(Rc::new(RefCell::new(Vec::new())), value)
+        }
+
+        /// [`Self::installing`] with the call log owned by the caller instead.
+        fn logging_into(calls: ResolutionLog, value: ObjectValue) -> Self {
+            Self { calls, value }
+        }
+    }
+
+    impl Default for RecordingResolver {
+        fn default() -> Self {
+            Self::installing(ObjectValue::Dictionary(
+                [(b"A".to_vec(), ObjectHandle::integer(1))]
+                    .into_iter()
+                    .collect(),
+            ))
+        }
     }
 
     impl DocumentResolver for RecordingResolver {
@@ -1926,13 +2019,58 @@ mod identity_tests {
             handle: &ObjectHandle,
         ) -> crate::Result<()> {
             self.calls.borrow_mut().push(object_ref);
-            handle.set_resolved(ObjectValue::Dictionary(
-                [(b"A".to_vec(), ObjectHandle::integer(1))]
-                    .into_iter()
-                    .collect(),
-            ));
+            handle.set_resolved(self.value.clone());
             Ok(())
         }
+    }
+
+    /// An unresolved indirect handle whose resolver installs `value`.
+    ///
+    /// `pub(crate)` so `stream_filter.rs`'s handle-shape reader tests can
+    /// build an indirect child without a second harness; the returned
+    /// resolver is erased, so `RecordingResolver` itself stays private here.
+    ///
+    /// **The caller must keep the returned resolver alive**, and bind it to a
+    /// named `_resolver` rather than to `_` — the latter drops it immediately.
+    /// The handle holds only a `Weak`, so a dropped resolver turns every
+    /// accessor into `Error::Internal("object 20 0 belongs to a dropped
+    /// PDF")`: a test expecting a resolved value then fails confusingly, and
+    /// one expecting an error passes for the wrong reason. Dropping it
+    /// *deliberately* is how to build a dropped-document handle, as
+    /// `handle_reader_surfaces_a_dropped_document_from_every_child_position`
+    /// does.
+    pub(crate) fn resolver_bearing_handle(
+        value: ObjectValue,
+    ) -> (ObjectHandle, Rc<dyn DocumentResolver>) {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::installing(value));
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver),
+        );
+        // The resolver is returned so the caller keeps it alive: the handle
+        // holds only a `Weak`, and dropping it here would turn every accessor
+        // into the dropped-document error instead.
+        (handle, resolver)
+    }
+
+    /// [`resolver_bearing_handle`] plus the resolver's [`ResolutionLog`].
+    ///
+    /// For the one question the plain helper cannot answer: whether a child
+    /// position was resolved *at all*. The same "keep the resolver alive"
+    /// rule applies — an empty log proves nothing if the resolver was
+    /// dropped, since a severed handle never reaches `resolve_indirect`
+    /// either.
+    pub(crate) fn logged_resolver_bearing_handle(
+        value: ObjectValue,
+    ) -> (ObjectHandle, Rc<dyn DocumentResolver>, ResolutionLog) {
+        let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
+        let resolver: Rc<dyn DocumentResolver> =
+            Rc::new(RecordingResolver::logging_into(Rc::clone(&calls), value));
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver),
+        );
+        (handle, resolver, calls)
     }
 
     struct MissingResolver;
@@ -2037,6 +2175,22 @@ mod identity_tests {
             handle.try_has_key(b"A").unwrap_err().to_string(),
             "resolver failed"
         );
+        assert_eq!(
+            handle.try_as_name().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
+            handle.try_as_array().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
+            handle.try_array_len().unwrap_err().to_string(),
+            "resolver failed"
+        );
+        assert_eq!(
+            handle.try_as_integer().unwrap_err().to_string(),
+            "resolver failed"
+        );
         assert!(!handle.is_resolved());
     }
 
@@ -2063,6 +2217,129 @@ mod identity_tests {
 
         let scalar = ObjectHandle::integer(1);
         assert!(!scalar.try_has_key(b"A").unwrap());
+    }
+
+    #[test]
+    fn try_as_name_resolves_an_indirect_name_through_its_document() {
+        let (handle, _resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"FlateDecode".to_vec()));
+
+        // The non-resolving accessor cannot see through an unresolved handle,
+        // and reports the same `None` it would for a wrong-typed value. Closing
+        // that gap is the whole reason the `try_` form exists.
+        assert_eq!(handle.as_name(), None);
+        assert!(!handle.is_resolved());
+
+        assert_eq!(handle.try_as_name().unwrap(), Some(b"FlateDecode".to_vec()));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_as_integer_resolves_an_indirect_integer_through_its_document() {
+        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
+
+        assert_eq!(handle.as_integer(), None);
+        assert!(!handle.is_resolved());
+
+        assert_eq!(handle.try_as_integer().unwrap(), Some(7));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_as_array_resolves_an_indirect_array_through_its_document() {
+        let (handle, _resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::from_value(
+                ObjectValue::Name(b"FlateDecode".to_vec()),
+            )]));
+
+        assert!(handle.as_array().is_none());
+        assert!(!handle.is_resolved());
+
+        let items = handle
+            .try_as_array()
+            .unwrap()
+            .expect("recording resolver installs an array");
+        // `ObjectHandle` equality is identity rather than value (see
+        // `two_direct_handles_with_equal_value_are_distinct_identity`), so
+        // inspect the child's value instead of comparing the `Vec`.
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_name(), Some(b"FlateDecode".to_vec()));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_array_len_counts_in_place_and_keeps_none_for_a_non_array() {
+        // The count qpdf reads off the borrowed array
+        // (`getArrayNItems` → `asArray()->size()`,
+        // `libqpdf/QPDFObjectHandle.cc:758-768`), including the empty array
+        // `QPDF_Stream::filterable` special-cases at
+        // `libqpdf/QPDF_Stream.cc:443`.
+        let array = ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"ASCII85Decode".to_vec()),
+        ]);
+        assert_eq!(array.try_array_len().unwrap(), Some(2));
+        // Counting must not consume or replace the value.
+        assert_eq!(array.as_array().map(|items| items.len()), Some(2));
+
+        assert_eq!(
+            ObjectHandle::array(Vec::new()).try_array_len().unwrap(),
+            Some(0)
+        );
+
+        // Deliberately *not* qpdf's non-array answer. `getArrayNItems` warns
+        // `typeWarning("array", "treating as empty")` and returns 0
+        // (`libqpdf/QPDFObjectHandle.cc:763-766`); returning `Some(0)` here
+        // would make `stream_filter::decode_filter_specs_from_handle` read a
+        // scalar `/Filter` as an empty chain — an accepted unfiltered stream —
+        // instead of raising its type error.
+        for non_array in [
+            ObjectHandle::null(),
+            ObjectHandle::integer(1),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]),
+        ] {
+            assert_eq!(non_array.try_array_len().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn try_array_len_resolves_an_indirect_array_through_its_document() {
+        let (handle, _resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::null()]));
+
+        // Nothing non-resolving can see through an unresolved handle, so
+        // dropping `try_dereference` from `try_array_len` reports this array
+        // as "not an array" — the mutation the `stream_filter` call sites
+        // cannot kill on their own, because a preceding `try_*` has already
+        // resolved the slot by the time they count it.
+        assert!(handle.as_array().is_none());
+        assert!(!handle.is_resolved());
+
+        assert_eq!(handle.try_array_len().unwrap(), Some(1));
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn every_value_accessor_reports_a_dropped_document_rather_than_none() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(21, 0),
+            Rc::downgrade(&resolver),
+        );
+        drop(resolver);
+
+        // A `None` here would be indistinguishable from a resolved value of
+        // the wrong type, so each accessor must surface the dropped document.
+        for error in [
+            handle.try_as_name().unwrap_err(),
+            handle.try_as_array().unwrap_err(),
+            handle.try_array_len().unwrap_err(),
+            handle.try_as_integer().unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "object 21 0 belongs to a dropped PDF");
+        }
+        assert!(!handle.is_resolved());
     }
 
     #[test]
