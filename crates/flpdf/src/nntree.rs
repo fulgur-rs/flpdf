@@ -2304,7 +2304,7 @@ fn make_indirect<R: Read + Seek>(
             .map_err(|_| Error::Unsupported("object-number space exhausted".to_string()))?,
         0,
     );
-    if !pdf.object_ref_is_available(object_ref) {
+    if !pdf.object_number_is_available(object_ref.number) {
         object_ref = pdf.next_available_object_ref()?;
         next = u64::from(object_ref.number);
     }
@@ -2975,6 +2975,37 @@ mod tests {
             pdf.resolve_borrowed(intervening).expect("intervening object"),
             &Object::Integer(99),
             "a later direct-kid repair must not reuse an object number allocated between cursor steps"
+        );
+    }
+
+    #[test]
+    fn direct_kid_repair_does_not_reuse_an_intervening_object_number() {
+        let mut pdf = empty_pdf();
+        let first = name_leaf(&[(b"a", 1)], Some((b"a", b"a")));
+        let second = name_leaf(&[(b"b", 2)], Some((b"b", b"b")));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![first, second]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let mut cursor = tree.begin(&mut pdf).expect("repair first direct kid");
+        let intervening = ObjectRef::new(3, 1);
+        pdf.set_object(intervening, Object::Integer(99));
+
+        tree.next(&mut pdf, &mut cursor)
+            .expect("repair second direct kid");
+
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Array(kids)) = root.get("Kids") else {
+            panic!("root must retain /Kids"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Reference(repaired)) = kids.get(1) else {
+            panic!("second kid must be repaired to a reference"); // cov:ignore: test-shape guard
+        };
+        assert_ne!(
+            repaired.number, intervening.number,
+            "qpdf allocates above every occupied object number, regardless of generation"
         );
     }
 

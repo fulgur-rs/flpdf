@@ -1510,6 +1510,47 @@ fn helper_listing_rejects_a_first_non_string_name_tree_key() {
 }
 
 #[test]
+fn helper_listing_skips_a_later_non_string_name_tree_key() {
+    let mut pdf = open(build_no_names_pdf());
+    let first = make_filespec(&mut pdf, b"first.txt");
+    let last = make_filespec(&mut pdf, b"last.txt");
+    let mut tree = Dictionary::new();
+    tree.insert(
+        "Names",
+        Object::Array(vec![
+            Object::String(b"a".to_vec()),
+            first.materialize(),
+            Object::Name(b"not-a-string".to_vec()),
+            Object::Null,
+            Object::String(b"c".to_vec()),
+            last.materialize(),
+        ]),
+    );
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Dictionary(tree));
+    let catalog_ref = pdf.root_ref().expect("root");
+    let mut catalog = pdf
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary")
+        .clone();
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    let entries = pdf
+        .embedded_files()
+        .get_embedded_files()
+        .expect("qpdf skips invalid keys after the initial item");
+    assert_eq!(entries.keys().cloned().collect::<Vec<_>>(), [b"a", b"c"]);
+    assert!(pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .any(|entry| entry.message.contains("item 2 has the wrong type")));
+}
+
+#[test]
 fn helper_replace_keeps_direct_names_dictionary_direct() {
     let mut pdf = open(build_no_embedded_files_pdf());
     let filespec = make_filespec(&mut pdf, b"direct-names.txt");
