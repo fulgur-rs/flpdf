@@ -123,16 +123,36 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
 const FILTER_TYPE_ERROR: &str = "stream filter type is not name or array";
 
 /// `QPDF_Stream::filterable`'s `warn("stream /DecodeParms length is
-/// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised the
-/// same way.
+/// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised as an
+/// error rather than a warning just as [`FILTER_TYPE_ERROR`] is.
+///
+/// **flpdf reaches this check on inputs qpdf does not.** qpdf validates every
+/// filter name against `filter_factories` first and returns on an unknown one
+/// (`QPDF_Stream.cc:433-435`), so `:459`'s condition is never evaluated for a
+/// stream whose `/Filter` names an unimplemented codec. Neither flpdf shape
+/// reader consults filter-name validity at all — that is
+/// `filters::prepare_decode_filters`' job, downstream of [`FilterSpec`] — so
+/// an unknown filter combined with a misaligned `/DecodeParms` reports the
+/// length error here where qpdf would report the unknown filter. Tracked as
+/// beads `flpdf-vatj` (P2); not fixed here, because Task 5's contract is that
+/// the two readers keep the same branch order. Both readers diverge from qpdf
+/// *identically*, so the legacy-vs-native equivalence gate stays valid.
 const DECODE_PARMS_LENGTH_ERROR: &str = "stream /DecodeParms length is inconsistent with filters";
 
 /// Reject a `/Filter` chain longer than `maximum`.
 ///
 /// Unlike qpdf, which caps nothing here, flpdf refuses pathological chains on
 /// the decode path; `filters::MAX_FILTER_CHAIN_LEN` documents that divergence.
-/// Both shape readers call this so the cap — and, more importantly, its
-/// position *before* per-item validation — has exactly one definition.
+///
+/// Both shape readers call this, so the cap's *body* — the comparison and the
+/// message — has exactly one definition. Its *position* does not: each reader
+/// hand-places two calls (one inside the `/Filter` array arm, ahead of
+/// per-item validation; one after the `/DecodeParms` branch), and
+/// `filters::validate_filter_chain_len` places a fifth. Nothing structural
+/// keeps those placements aligned — only
+/// `handle_reader_matches_object_reader_for_every_filter_shape`, which sweeps
+/// the corpus at `None`, `Some(16)`, and `Some(0)` and fails if either
+/// reader's placement drifts.
 pub(crate) fn validate_filter_chain_count(count: usize, maximum: Option<usize>) -> Result<()> {
     if let Some(maximum) = maximum.filter(|maximum| count > *maximum) {
         return Err(Error::Unsupported(format!(
@@ -1280,6 +1300,16 @@ mod tests {
                 Some(Object::Integer(1)),
                 None,
             ),
+            // A dictionary `/Filter` is the one non-name non-array shape the
+            // handle reader could tell apart from the object reader, since it
+            // is the only shape reachable by an accessor the handle reader has
+            // and the branch does not use (`try_as_dictionary`). Both must
+            // still land on `FILTER_TYPE_ERROR`.
+            (
+                "dictionary /Filter",
+                Some(params(&[("Predictor", Object::Integer(12))])),
+                None,
+            ),
             (
                 "empty /Filter array ignores /DecodeParms",
                 Some(Object::Array(Vec::new())),
@@ -1441,6 +1471,12 @@ mod tests {
         // `decode_rejects_overlong_filter_chain_before_malformed_item`
         // (`filters.rs`) pins for the `Object` reader. Asserting the message
         // (not just that the two readers agree) is what makes this absolute.
+        // NOTE for anyone copying this into a bigger corpus: `vec![handle; n]`
+        // clones one `Rc`, so all 16 entries are the *same slot*, not 16
+        // distinct children. Harmless here — the cap fires before any item is
+        // inspected — but with indirect children it would share resolution
+        // state between supposedly independent items and pass for the wrong
+        // reason. Build such a vector with `(0..n).map(|_| ...)` instead.
         let mut items = vec![ObjectHandle::name(b"FlateDecode".to_vec()); 16];
         items.push(ObjectHandle::integer(1));
 
@@ -1461,10 +1497,13 @@ mod tests {
     fn both_readers_count_a_scalar_filter_against_the_chain_cap_too() {
         // The array arm's count never sees a scalar `/Filter`, so the count
         // that runs after the `/DecodeParms` branch is the only one left to
-        // catch it. It carried over from `filters.rs`'s
-        // `validate_filter_chain_count(specs.len(), ...)`, which no reachable
-        // production limit could trip; pin it here so moving it into the
-        // readers did not silently drop it.
+        // catch it. This is a live public-API path, not a vestigial one:
+        // `DecodeLimits` is `pub` with a `pub max_filter_chain`, so
+        // `decode_stream_data_with_limits(&dict, data, DecodeLimits {
+        // max_filter_chain: Some(0), .. })` reaches it from outside the crate.
+        // It carried over from `filters.rs`'s
+        // `validate_filter_chain_count(specs.len(), ...)`; pin it here so
+        // moving it into the readers did not silently drop it.
         let name = Object::Name(b"FlateDecode".to_vec());
         let expected = "unsupported PDF feature: filter chain length 1 exceeds maximum of 0";
 
@@ -1486,6 +1525,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn both_readers_report_a_decode_parms_mismatch_ahead_of_the_trailing_chain_count() {
+        // The absolute half of the corpus's "scalar /Filter with a misaligned
+        // /DecodeParms array" row. That row only pins that the two readers
+        // *agree*, so hoisting the trailing count above the /DecodeParms
+        // branch in both readers would leave it green. This pins which error
+        // wins, which is pre-Task-5 `filters.rs` behavior worth preserving.
+        let name = Object::Name(b"FlateDecode".to_vec());
+        let misaligned = Object::Array(vec![Object::Null, Object::Null]);
+        let expected =
+            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters";
+
+        assert_eq!(
+            decode_filter_specs_from_object(Some(&name), Some(&misaligned), Some(0))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            decode_filter_specs_from_handle(
+                &ObjectHandle::name(b"FlateDecode".to_vec()),
+                &ObjectHandle::array(vec![ObjectHandle::null(), ObjectHandle::null()]),
+                Some(0),
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+    }
+
     // ----- Decision D1: the handle reader dereferences its children -----
     //
     // `QPDF_Stream::filterable` reaches every child through a
@@ -1499,9 +1568,10 @@ mod tests {
     // Each case below starts from an *unresolved* indirect handle in one child
     // position, so the value that comes back proves that position resolved.
     //
-    // **What that does and does not pin.** A per-site mutation matrix over all
-    // ten `try_*` calls in the reader kills four — the first accessor each
-    // child position reaches: `filter.try_is_null`, the `/Filter` item's
+    // **What that does and does not pin.** A per-site mutation matrix over
+    // every `try_*` call in `decode_filter_specs_from_handle` and its two
+    // helpers kills four — the first accessor each child position reaches:
+    // `filter.try_is_null`, the `/Filter` item's
     // `try_as_name`, `decode_params_from_handle`'s `try_is_null`, and
     // `param_value_from_handle`'s `try_as_integer`. The other six survive
     // individual mutation, for two distinct reasons, neither of them a bug:

@@ -1937,6 +1937,16 @@ pub(crate) mod identity_tests {
     /// `pub(crate)` so `stream_filter.rs`'s handle-shape reader tests can
     /// build an indirect child without a second harness; the returned
     /// resolver is erased, so `RecordingResolver` itself stays private here.
+    ///
+    /// **The caller must keep the returned resolver alive**, and bind it to a
+    /// named `_resolver` rather than to `_` — the latter drops it immediately.
+    /// The handle holds only a `Weak`, so a dropped resolver turns every
+    /// accessor into `Error::Internal("object 20 0 belongs to a dropped
+    /// PDF")`: a test expecting a resolved value then fails confusingly, and
+    /// one expecting an error passes for the wrong reason. Dropping it
+    /// *deliberately* is how to build a dropped-document handle, as
+    /// `handle_reader_surfaces_a_dropped_document_from_every_child_position`
+    /// does.
     pub(crate) fn resolver_bearing_handle(
         value: ObjectValue,
     ) -> (ObjectHandle, Rc<dyn DocumentResolver>) {
