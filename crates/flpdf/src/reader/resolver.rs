@@ -25,7 +25,7 @@
 //! calls nothing that could re-enter resolution while that borrow is live.
 //! That is not stylistic: resolution is re-entrant (qpdf's own
 //! `/Length`-as-indirect-reference case, `QPDF::readStream`,
-//! `libqpdf/QPDF.cc:1360-1398`), so a borrow held across a nested resolve is a
+//! `libqpdf/QPDF.cc:1360-1399`), so a borrow held across a nested resolve is a
 //! `RefCell` double-borrow panic in production.
 //!
 //! **The qualifier is load-bearing and the hazard is real.**
@@ -46,7 +46,7 @@
 //! A full uncompressed resolution takes borrows at seven kinds of place, and
 //! every one of them begins and ends inside a single expression:
 //! [`ResolveMark::begin`] and its `drop`; [`ResolverHandle::xref_entry`];
-//! [`ResolverHandle::seek`]/[`ResolverHandle::tell`]/[`ResolverHandle::read`],
+//! [`ResolverHandle::seek`]/[`ResolverHandle::seek_relative`]/[`ResolverHandle::tell`]/[`ResolverHandle::read`],
 //! once per input operation; [`ResolverHandle::get_object_handle`], once per
 //! nested `N G R` the parse mints a handle for; [`ResolverHandle::push_warning`]
 //! wherever a warning is raised.
@@ -216,13 +216,61 @@ impl<R: Read + Seek> ResolverCore<R> {
     ///
     /// qpdf `m->file->tell()`. This is the live position `QPDF::readStream`
     /// saves before resolving `/Length` and restores afterwards
-    /// (`libqpdf/QPDF.cc:1361-1381`) — not a value recomputed from an
+    /// (`libqpdf/QPDF.cc:1367-1384`) — not a value recomputed from an
     /// argument, which is precisely why the restore is load-bearing.
     fn tell(&mut self) -> Result<u64> {
         Ok(self
             .reader
             .stream_position()?
             .saturating_sub(self.header_offset as u64))
+    }
+
+    /// Advance the input by `delta` bytes from wherever it currently is,
+    /// without naming an absolute position.
+    ///
+    /// qpdf `m->file->seek(delta, SEEK_CUR)`, and specifically the second half
+    /// of the pair `QPDF::readStream` performs under the comment "Seek in two
+    /// steps to avoid potential integer overflow"
+    /// (`libqpdf/QPDF.cc:1383-1385`). Two steps rather than one because
+    /// `stream_offset + length` is computed in `qpdf_offset_t`
+    /// (`long long`, `include/qpdf/Types.h:31`) and a declared `/Length` is
+    /// attacker-controlled up to that type's maximum.
+    ///
+    /// The bounds check is qpdf's, not an flpdf invention:
+    /// `BufferInputSource::seek`'s `SEEK_CUR` arm calls
+    /// `QIntC::range_check(this->cur_offset, offset)`
+    /// (`libqpdf/BufferInputSource.cc:95-97`), whose overflow arm is
+    /// `(std::numeric_limits<T>::max() - cur) < delta`
+    /// (`include/qpdf/QIntC.hh:255-268`, reached through `:270-278`) — the
+    /// comparison below, and its message, transcribed. Rust's `Seek` cannot
+    /// stand in for it: `Cursor::seek` adds in `u64` and so accepts an offset
+    /// that overflows `i64` (measured: from position 236,
+    /// `SeekFrom::Current(i64::MAX)` returns `Ok(9223372036854776043)`).
+    ///
+    /// **Which failure this is matters beyond the DoS**, because in qpdf the
+    /// exception *class* picks the recovery fork. `damagedPDF("expected
+    /// endstream")` is a `QPDFExc`, caught at `libqpdf/QPDF.cc:1390` and sent
+    /// to `recoverStreamLength`; the `std::range_error` this ports, like the
+    /// `std::runtime_error` `FileInputSource::seek` throws
+    /// (`libqpdf/FileInputSource.cc:100-107`), is not, so it passes that catch
+    /// and lands in `QPDF::resolve`'s `catch (std::exception&)`
+    /// (`:1739-1741`), which warns and leaves the object to resolve to null.
+    /// Collapsing this into "expected endstream" would file the case on the
+    /// wrong fork for whichever slice ports recovery.
+    fn seek_relative(&mut self, delta: u64) -> Result<()> {
+        // qpdf `std::numeric_limits<qpdf_offset_t>::max()`.
+        const MAX_OFFSET: u64 = i64::MAX as u64;
+
+        let position = self.reader.stream_position()?;
+        if delta > MAX_OFFSET.saturating_sub(position) {
+            return Err(Error::parse(
+                position as usize,
+                format!("adding {delta} to {position} would cause an integer overflow"),
+            ));
+        }
+        // Exact: the check above bounds `delta` by `i64::MAX`.
+        self.reader.seek(SeekFrom::Current(delta as i64))?;
+        Ok(())
     }
 
     /// Fill `buf` from the current position, returning how many bytes were
@@ -612,11 +660,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Collect `limit` bytes — or everything left when `limit` is `None` —
     /// from the current position into an owned buffer.
     ///
-    /// Grows as it goes rather than pre-allocating `limit`, which matters:
-    /// `read_window`'s bound comes from the *next* cross-reference offset, and
-    /// a corrupt table can make that arbitrarily large on a small file.
-    /// `std::io::Read::take(n).read_to_end(..)`, which this replaces, had the
-    /// same property.
+    /// Grows as it goes rather than pre-allocating `limit`, and every caller
+    /// it has wants that property, not merely the two legacy tenants below it:
+    /// [`Self::read_window`]'s bound comes from the *next* cross-reference
+    /// offset, which a corrupt table can make arbitrarily large on a small
+    /// file, and [`Self::read_stream`]'s is a declared `/Length` — a value the
+    /// input asserts about itself. `std::io::Read::take(n).read_to_end(..)`,
+    /// which this replaces, had the same property.
     fn read_to_owned(&self, limit: Option<u64>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         loop {
@@ -661,16 +711,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     // ---- the input source, streamed ----
     //
-    // Each of the three wrappers below takes its borrow and drops it inside
+    // Each of the four wrappers below takes its borrow and drops it inside
     // its own expression, so the input *position* — not a borrow — is what
     // survives between them. That is the whole point: qpdf's re-entrancy seam
     // is a save/restore of `m->file`'s position (`QPDF::readStream`,
-    // `libqpdf/QPDF.cc:1361-1381`), and a seam can only be ported onto a
+    // `libqpdf/QPDF.cc:1367-1384`), and a seam can only be ported onto a
     // position that a nested resolution can actually disturb.
 
     /// See [`ResolverCore::seek`].
     fn seek(&self, offset: u64) -> Result<()> {
         self.core.borrow_mut().seek(offset)
+    }
+
+    /// See [`ResolverCore::seek_relative`].
+    fn seek_relative(&self, delta: u64) -> Result<()> {
+        self.core.borrow_mut().seek_relative(delta)
     }
 
     /// See [`ResolverCore::tell`].
@@ -747,11 +802,30 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// it.
     ///
     /// qpdf `QPDF::readToken(m->file)` — `readObject` calls it to decide
-    /// between `stream` and `endobj` (`libqpdf/QPDF.cc:1346-1354`) and
-    /// `readStream` calls it to check for `endstream` (`:1383`).
+    /// between `stream` and `endobj` (`libqpdf/QPDF.cc:1347-1354`) and
+    /// `readStream` calls it to check for `endstream` (`:1386`).
+    ///
+    /// **EOF is a token here, not an error**, because it is one in qpdf: the
+    /// document's shared tokenizer has `m->tokenizer.allowEOF()` applied at
+    /// construction (`libqpdf/QPDF.cc:208`), so `readToken` at end of input
+    /// returns `tt_eof` rather than the `tt_bad` "unexpected EOF" the
+    /// un-permitted tokenizer would produce (`libqpdf/QPDFTokenizer.cc:930-939`).
+    /// That is what makes both of `readStream`'s checks report the framing
+    /// keyword they wanted — `expected endstream` at `:1386-1389`, `expected
+    /// endobj` at `:1352-1355` — instead of complaining about the EOF, and it
+    /// is the difference between a `/Length` that runs off the end of the
+    /// input being diagnosed as qpdf diagnoses it or not.
+    ///
+    /// One divergence stays: qpdf passes `allow_bad = true`
+    /// (`QPDF::readToken`, `:1536-1539`), so a *malformed* token is returned
+    /// as `tt_bad` and likewise reported as the missing keyword, whereas
+    /// `read_token(false, ..)` below turns it into an error. Widening that
+    /// changes every caller's error surface, so it is recorded rather than
+    /// taken here.
     fn read_token_from_input(&self) -> Result<Token> {
         self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
+            tokenizer.allow_eof();
             let token = tokenizer.read_token(false, 0)?;
             Ok((token, tokenizer.position()))
         })
@@ -884,7 +958,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })
     }
 
-    /// qpdf `QPDF::readStream` (`libqpdf/QPDF.cc:1359-1398`), entered with the
+    /// qpdf `QPDF::readStream` (`libqpdf/QPDF.cc:1360-1399`), entered with the
     /// input positioned immediately after the `stream` keyword.
     ///
     /// **This is the resolver's one re-entrancy seam**, and the reason
@@ -892,40 +966,93 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// borrow of [`ResolverCore`] is held anywhere in this method: every input
     /// operation takes and drops its own, so the `/Length` dereference below
     /// is free to re-enter `resolve_indirect` for another reference, seek the
-    /// input somewhere else entirely, and return. The explicit
-    /// [`Self::seek`] back to `stream_offset` is what makes the payload read
-    /// correct afterwards — delete it and a stream whose `/Length` is an
-    /// indirect reference reads its bytes from wherever the nested resolution
-    /// finished.
+    /// input somewhere else entirely, and return. The *first* [`Self::seek`]
+    /// back to `stream_offset` is what undoes that movement — delete it and a
+    /// stream whose `/Length` is an indirect reference looks for `endstream`
+    /// wherever the nested resolution happened to finish. The second one, in
+    /// front of the payload read, has nothing to do with re-entrancy: it
+    /// rewinds from where the `endstream` check left the position.
     ///
-    /// qpdf's recovery arm (`:1392-1398`: warn, then `recoverStreamLength`)
-    /// is not ported — it is gated on `m->attempt_recovery`, and recovery is
-    /// out of this slice.
+    /// # The declared `/Length` is validated before it is believed
+    ///
+    /// qpdf never allocates here. It seeks past the declared length, reads one
+    /// token, and hands `stream_offset` and `length` to
+    /// `QPDF_Stream::create` (`:1398`); the payload is read later by
+    /// `QPDF::pipeStreamData`, which is where the allocation
+    /// (`std::make_unique<char[]>(length)`, `:2497`) and the short-read
+    /// diagnosis ("unexpected EOF reading stream data", `:2498-2500`) live.
+    ///
+    /// flpdf's [`ObjectValue::Stream`] owns its bytes, so the payload read has
+    /// to happen somewhere, and it happens **after** the `endstream` check
+    /// rather than before it. That ordering is the whole defence: reaching a
+    /// non-EOF `endstream` token at `stream_offset + length` proves the input
+    /// holds at least that many bytes, so the buffer that follows is bounded
+    /// by the file rather than by the declaration. Reading first — as this did
+    /// until a review of PR #630 — turns `<< /Length 9223372036854775000 >>`
+    /// over a three-byte payload into `vec![0u8; 9223372036854775000]`, which
+    /// is not an error but an allocator abort: `memory allocation of
+    /// 9223372036854775000 bytes failed`, `SIGABRT`, process gone.
+    /// `an_absurd_declared_length_is_diagnosed_without_allocating_it` pins it.
+    ///
+    /// The same ordering is why there is no short-read check on the payload:
+    /// once the token check has passed it cannot come up short, and qpdf's own
+    /// short-read arm is at pipe time, where the length has already been
+    /// through this check or through `recoverStreamLength`.
+    ///
+    /// # Two divergences from qpdf's outcome, both pre-existing
+    ///
+    /// Every failure below is returned as an error. qpdf reaches neither
+    /// outcome that way, and both gaps belong to slices this one excludes:
+    ///
+    /// - a `QPDFExc` — `expected endstream` is one — is caught at
+    ///   `:1390-1397` and, when `m->attempt_recovery` is set (its default),
+    ///   warned about and passed to `recoverStreamLength`. Observed on qpdf
+    ///   11.9.0 for a stream whose `/Length` is 100000 over a 420-byte file:
+    ///   `expected endstream`, then `attempting to recover stream length`,
+    ///   then `recovered stream length: 4`. Recovery is out of this slice, so
+    ///   flpdf stops at the first of those three;
+    /// - anything that is *not* a `QPDFExc` — [`ResolverCore::seek_relative`]'s
+    ///   overflow refusal, and the `lseek` failure a file-backed source raises
+    ///   for an offset past the filesystem's maximum — passes that catch and
+    ///   is warned about by `QPDF::resolve` (`:1739-1741`), leaving the object
+    ///   to resolve to null (`:1745-1748`). Observed: `object 4/0: error
+    ///   reading object: seek to …, offset 9223372036854775000 (1): Invalid
+    ///   argument`, exit 3, 8.9 MB peak RSS. The resolve-to-null fallback is
+    ///   not ported either — see [`Self::read_object_at_offset`].
     fn read_stream(&self, dict: ObjectValue, dict_offset: i64) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
 
-        // qpdf `:1361-1363`: "Must get offset before accessing any additional
+        // qpdf `:1365-1367`: "Must get offset before accessing any additional
         // objects since resolving a previously unresolved indirect object
         // will change file position."
         let stream_offset = self.tell()?;
 
         let length = Self::stream_length(&dict)?;
+        let span = length as u64;
 
-        // qpdf `:1381`, `m->file->seek(stream_offset, SEEK_SET)`.
+        // qpdf `:1383-1385`: "Seek in two steps to avoid potential integer
+        // overflow", `m->file->seek(stream_offset, SEEK_SET)` then
+        // `m->file->seek(toO(length), SEEK_CUR)`. Nothing is read and nothing
+        // is allocated yet — the declared length has only moved the position.
         self.seek(stream_offset)?;
-        let mut data = vec![0u8; length];
-        if self.read(&mut data)? != length {
-            return Err(Error::parse(
-                stream_offset as usize,
-                "stream data ends before its declared /Length",
-            ));
-        }
+        self.seek_relative(span)?;
 
-        // qpdf `:1383-1386`.
+        // qpdf `:1386-1389`.
         if !self.read_token_from_input()?.is_word_value(b"endstream") {
             return Err(Error::parse(stream_offset as usize, "expected endstream"));
         }
-        // qpdf `:1352-1355`: `readObject` reads one more token after
+        let after_endstream = self.tell()?;
+
+        // No qpdf counterpart: `QPDF_Stream` keeps `stream_offset` and
+        // `length` and reads the payload at pipe time, while
+        // `ObjectValue::Stream` owns its bytes. `read_to_owned` grows to what
+        // the input actually yields rather than pre-allocating `length`, so
+        // even this now-bounded read never trusts the declaration.
+        self.seek(stream_offset)?;
+        let data = self.read_to_owned(Some(span))?;
+
+        self.seek(after_endstream)?;
+        // qpdf `:1350-1354`: `readObject` reads one more token after
         // `readStream` returns and warns if it is not `endobj`.
         if !self.read_token_from_input()?.is_word_value(b"endobj") {
             self.push_warning("expected endobj");
@@ -980,7 +1107,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.seek(position.saturating_sub(1))
     }
 
-    /// qpdf `readStream`'s `/Length` lookup (`libqpdf/QPDF.cc:1368-1379`).
+    /// qpdf `readStream`'s `/Length` lookup (`libqpdf/QPDF.cc:1371-1382`).
     ///
     /// Takes no `&self` on purpose: [`ObjectHandle::try_dereference`] below is
     /// the re-entry point, and a method with no access to [`ResolverCore`]
@@ -997,7 +1124,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             length.try_dereference()?;
         }
         // qpdf tests `isNull()` before `isInteger()` and reports the two
-        // separately (`:1370-1377`); an absent key reads as null there, so
+        // separately (`:1373-1380`); an absent key reads as null there, so
         // both routes land on the same message here.
         match length.map(ObjectHandle::as_integer) {
             Some(Some(value)) => usize::try_from(value)
@@ -2231,23 +2358,91 @@ mod tests {
     }
 
     /// A `/Length` running past the end of the input, and a payload not
-    /// followed by `endstream`, are both rejected.
+    /// followed by `endstream`, are both `expected endstream`.
+    ///
+    /// One message for both because qpdf has one: neither case reaches a
+    /// length check, they reach the token check at `libqpdf/QPDF.cc:1386-1389`
+    /// from opposite sides. Measured on qpdf 11.9.0 — `/Length 100000` over a
+    /// 420-byte file warns `expected endstream`, and so does `/Length 1` in
+    /// front of `abc`; each then goes on to `attempting to recover stream
+    /// length` / `recovered stream length: 4`, which is the recovery arm
+    /// [`super::ResolverHandle::read_stream`] records as not ported. An
+    /// earlier revision reported the first case as "stream data ends before
+    /// its declared /Length", a message with no counterpart anywhere in
+    /// `libqpdf/` — it came from reading the payload before checking the
+    /// framing, which is what made the absurd-length allocation reachable.
     #[test]
     fn a_stream_payload_that_does_not_match_its_length_is_rejected() {
+        for body in [
+            &b"2 0 obj\n<< /Length 100000 >>\nstream\nabc\nendstream\nendobj\n"[..],
+            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n",
+        ] {
+            with_second_object(body, |_, outcome, _| {
+                assert!(
+                    matches!(&outcome.expect_err("no `endstream` is where /Length says"),
+                    Error::Parse { message, .. } if message == "expected endstream"),
+                    "for {body:?}"
+                );
+            });
+        }
+    }
+
+    /// A `/Length` too large to be a position in the input is diagnosed
+    /// without ever being allocated.
+    ///
+    /// **This is a process-lifetime assertion before it is a message
+    /// assertion.** Reading the payload before checking the framing made the
+    /// first case `vec![0u8; 9223372036854775000]`, and an allocation that
+    /// large does not fail — it aborts: `memory allocation of
+    /// 9223372036854775000 bytes failed`, `SIGABRT`, taking the whole test
+    /// binary and every other result in it. Restore that `vec!` and this file
+    /// stops producing a test report at all.
+    ///
+    /// The two values are two different qpdf mechanisms, and the split is by
+    /// input source rather than by value, in flpdf exactly as in qpdf:
+    ///
+    /// - `9223372036854775000` added to a small position does not overflow
+    ///   `qpdf_offset_t`, so an in-memory source takes the seek and the
+    ///   following read finds nothing — `expected endstream`. That is
+    ///   `BufferInputSource::seek` (`libqpdf/BufferInputSource.cc:83-108`) and
+    ///   [`std::io::Cursor`] alike; qpdf's CLI cannot open an in-memory
+    ///   document, so it was measured instead at `/Length 1099511627776`,
+    ///   which a file-backed source *can* seek to: `expected endstream`, then
+    ///   recovery, 8.8 MB peak RSS. A file-backed source refuses the larger
+    ///   offset outright — qpdf: `seek to …, offset 9223372036854775000 (1):
+    ///   Invalid argument`; Rust `File::seek(SeekFrom::Current(..))`: the same
+    ///   `EINVAL`, both from `lseek` rejecting a result past the filesystem's
+    ///   maximum, which is not an integer overflow;
+    /// - `i64::MAX` added to any non-zero position *does* overflow
+    ///   `qpdf_offset_t`, which is what `QIntC::range_check` refuses and what
+    ///   [`super::ResolverCore::seek_relative`] refuses in the same words.
+    ///   This one is not source-dependent: `Cursor::seek` would accept it
+    ///   (measured: `Ok(9223372036854776043)` from position 236), so without
+    ///   that check flpdf would silently file it as `expected endstream` — on
+    ///   qpdf's recovery fork rather than on its resolve-to-null one.
+    #[test]
+    fn an_absurd_declared_length_is_diagnosed_without_allocating_it() {
         with_second_object(
-            b"2 0 obj\n<< /Length 100000 >>\nstream\nabc\nendstream\nendobj\n",
+            b"2 0 obj\n<< /Length 9223372036854775000 >>\nstream\nabc\nendstream\nendobj\n",
             |_, outcome, _| {
-                assert!(matches!(&outcome.expect_err("length runs past EOF"),
-                    Error::Parse { message, .. }
-                        if message == "stream data ends before its declared /Length"));
+                assert!(matches!(&outcome.expect_err("nothing is at that offset"),
+                    Error::Parse { message, .. } if message == "expected endstream"));
             },
         );
 
         with_second_object(
-            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n",
+            b"2 0 obj\n<< /Length 9223372036854775807 >>\nstream\nabc\nendstream\nendobj\n",
             |_, outcome, _| {
-                assert!(matches!(&outcome.expect_err("`bc` is not `endstream`"),
-                    Error::Parse { message, .. } if message == "expected endstream"));
+                let error = outcome.expect_err("that offset cannot be reached at all");
+                let Error::Parse { message, .. } = &error else {
+                    panic!("expected a parse error, got {error:?}");
+                };
+                assert!(
+                    message.starts_with("adding 9223372036854775807 to ")
+                        && message.ends_with(" would cause an integer overflow"),
+                    "the overflow refusal must stay distinct from `expected \
+                     endstream`, which is qpdf's recovery fork: {message:?}"
+                );
             },
         );
     }
@@ -2365,8 +2560,9 @@ mod tests {
     ///
     /// qpdf returns from `validateStreamLineEnd` on a premature EOF because
     /// "a premature EOF here will result in some other problem that will get
-    /// reported at another time" (`libqpdf/QPDF.cc:1413-1415`) — which is
-    /// exactly what happens: the payload read then finds nothing.
+    /// reported at another time" (`libqpdf/QPDF.cc:1414-1415`) — which is
+    /// exactly what happens: the seek past the declared length lands beyond
+    /// the input, and the token read there finds EOF instead of `endstream`.
     ///
     /// The object is appended past `%%EOF` and given an xref entry by hand,
     /// because a well-formed document always has its trailer after every
@@ -2392,9 +2588,9 @@ mod tests {
 
         assert!(
             matches!(&error, Error::Parse { message, .. }
-                if message == "stream data ends before its declared /Length"),
-            "the EOF must surface as the missing payload, not as a line-ending \
-             complaint: {error:?}"
+                if message == "expected endstream"),
+            "the EOF must surface as the missing framing keyword, not as a \
+             line-ending complaint: {error:?}"
         );
         let messages: Vec<String> = pdf
             .repair_diagnostics()
