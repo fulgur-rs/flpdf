@@ -247,9 +247,12 @@ impl ObjectHandle {
         self.is_same_object_as(other)
     }
 
-    // Used by this module's identity tests, and by `Pdf::get_object_handle`
-    // (reader.rs) to lazily create the canonical handle it registers into
-    // `handle_registry` the first time a given ref is requested.
+    // An indirect slot with neither a document identity nor a resolver.
+    // Test-only, and necessarily so: every caller is inside a `#[cfg(test)]`
+    // module (this file's own tests, plus `parser.rs`'s
+    // `handle_path_parity_tests` and `reader.rs`'s tests).
+    // `Pdf::get_object_handle` does *not* use this — it needs the document
+    // identity, so it calls `new_indirect_unresolved_for_pdf`.
     #[cfg(test)]
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
         Self::new_indirect_unresolved_with_identity(object_ref, offset, None, None)
@@ -273,14 +276,27 @@ impl ObjectHandle {
     /// stamps onto each direct child for
     /// [`Self::containing_object_refs_for_pdf`].
     ///
-    /// `pdf_unique_id` is an flpdf-internal document tag with no qpdf
-    /// counterpart: qpdf's object reaches its document through a raw `QPDF*`
-    /// back-pointer (`libqpdf/qpdf/QPDFValue.hh:150`, `QPDF* qpdf{nullptr}`)
-    /// that `QPDFObject::doResolve` hands straight to
-    /// `QPDF::Resolver::resolve` (`libqpdf/QPDFObject.cc:7-11`), so one
-    /// pointer serves as both identity and resolver there. See
-    /// [`Self::new_indirect_with_resolver`] for why this port splits them and
-    /// keeps the resolver link weak.
+    /// `pdf_unique_id` itself ports qpdf's document-level unique id:
+    /// `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
+    /// `libqpdf/QPDF.cc:2294-2296`) over the member
+    /// `unsigned long long unique_id{0}` (`include/qpdf/QPDF.hh:1454`),
+    /// minted from a function-static atomic counter in the constructor
+    /// (`libqpdf/QPDF.cc:211-212`). `Pdf`'s own `NEXT_PDF_ID.fetch_add`
+    /// (`reader.rs:645`) is that same mechanism, serving the same
+    /// cross-document identity purpose qpdf uses it for: keying
+    /// `m->object_copiers` by the *other* document's id
+    /// (`libqpdf/QPDF.cc:2065`, already noted at `reader.rs:82`) and
+    /// comparing two documents for sameness
+    /// (`libqpdf/QPDFPageObjectHelper.cc:1020`).
+    ///
+    /// What has no qpdf counterpart is storing that id *per object*. A qpdf
+    /// value reaches its document through a raw `QPDF*` back-pointer
+    /// (`libqpdf/qpdf/QPDFValue.hh:150`, `QPDF* qpdf{nullptr}`) which
+    /// `QPDFObject::doResolve` hands straight to `QPDF::Resolver::resolve`
+    /// (`libqpdf/QPDFObject.cc:6-11`), so upstream one pointer is both the
+    /// identity and the route to the resolver. This port splits that single
+    /// pointer into a plain tag plus a `Weak`, which is why both arguments
+    /// have to be supplied together here.
     #[allow(dead_code)] // no non-test caller yet: `Pdf::get_object_handle`
                         // attaches it in the next step of flpdf-25kg.3.5
     pub(crate) fn new_indirect_for_pdf_with_resolver(
@@ -297,9 +313,20 @@ impl ObjectHandle {
         )
     }
 
-    /// Construct a canonical unresolved slot attached to its owning document
-    /// resolver. This is the qpdf-native constructor; the resolver link is
-    /// weak so a surviving handle cannot keep its document alive.
+    /// Construct a canonical unresolved slot attached to a document resolver
+    /// but carrying no document identity tag. The resolver link is weak so a
+    /// surviving handle cannot keep its document alive.
+    ///
+    /// Identity-less, so [`Self::belongs_to_pdf`] answers `false` for every
+    /// document, and the owner [`Self::set_resolved`] records on each direct
+    /// child carries `None` as its document — which makes
+    /// [`Self::containing_object_refs_for_pdf`] empty for every id, since
+    /// `None` matches no `Some`. That makes this the *narrower* of the two
+    /// constructors, not the qpdf-native one — upstream a single `QPDF*`
+    /// carries identity and resolver together, so
+    /// [`Self::new_indirect_for_pdf_with_resolver`] is the shape that
+    /// corresponds to qpdf, and is what a handle vended by a `Pdf` needs.
+    /// This one exists for resolver tests that never consult identity.
     #[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5;
                         // this primitive slice exercises the constructor with
                         // sealed resolver unit tests only
@@ -2172,9 +2199,12 @@ pub(crate) mod identity_tests {
     /// [`ObjectHandle::containing_object_refs_for_pdf`] read — the
     /// foreign-object rejection and owner lookup in
     /// `Pdf::mark_object_handle_dirty`, `filespec_helper`, and
-    /// `embedded_files`. Building this handle with `pdf_unique_id: None`
-    /// fails 61 tests in `cargo test -p flpdf --lib`, measured by patching
-    /// `new_indirect_unresolved_for_pdf` to discard its argument.
+    /// `embedded_files`. Measured: patching `new_indirect_unresolved_for_pdf`
+    /// — the constructor `Pdf::get_object_handle` uses today — to discard its
+    /// argument fails 61 tests in `cargo test -p flpdf --lib`. Breaking the
+    /// identity of *this* constructor instead fails exactly one test, this
+    /// one, because nothing outside this module calls it yet; the 61 is what
+    /// the same mistake will cost once `get_object_handle` switches over.
     ///
     /// Note this is *not* what `Pdf::is_canonical_object_handle` compares on:
     /// that one looks the ref up in `handle_registry` and compares `Rc`
