@@ -260,6 +260,55 @@ fn annotation_action_absent_returns_none() {
     assert_eq!(annot.action().expect("action()"), None);
 }
 
+// ── QPDFAnnotationObjectHelper ObjectHandle boundary ───────────────────────
+
+#[test]
+fn annotation_handle_reads_qpdf_leaf_attributes() {
+    let bytes = build_annotation_pdf(
+        "/Subtype /Highlight /Rect [10 20 200 50] /AS /On /F 12",
+    );
+    let mut pdf = open(bytes);
+    let handle = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&handle).unwrap();
+
+    let annot = AnnotationObjectHelper::new(handle);
+
+    assert_eq!(annot.get_subtype(), b"Highlight");
+    assert_eq!(annot.get_appearance_state(), b"On");
+    assert_eq!(annot.get_flags(), 12);
+    assert_eq!(
+        annot.get_rect(),
+        Some(flpdf::PageBox::new(10.0, 20.0, 200.0, 50.0))
+    );
+    assert!(annot.get_appearance_dictionary().is_null());
+}
+
+#[test]
+fn annotation_handle_uses_direct_appearance_stream_even_with_state() {
+    let bytes = build_pdf(vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [ 3 0 R ] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Annots [ 4 0 R ] >>".to_vec(),
+        ),
+        (
+            4,
+            b"<< /Type /Annot /AS /On /AP << /N 5 0 R >> >>".to_vec(),
+        ),
+        (5, b"<< /Length 0 >>\nstream\n\nendstream".to_vec()),
+    ]);
+    let mut pdf = open(bytes);
+    let handle = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&handle).unwrap();
+
+    let annot = AnnotationObjectHelper::new(handle);
+    let stream = annot.get_appearance_stream(b"N", None);
+
+    assert_eq!(stream.object_ref(), Some(ObjectRef::new(5, 0)));
+    assert!(stream.as_stream_dict().is_some());
+}
+
 // ── FormFieldObjectHelper — leaf field (no /Parent) ───────────────────────────
 //
 // Object layout:
