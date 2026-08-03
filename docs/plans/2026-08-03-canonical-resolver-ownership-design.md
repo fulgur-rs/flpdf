@@ -99,14 +99,60 @@ guard, so the in-progress mark is removed on unwind as well as on return.
 second seam, the fix is to remove it, not to bracket it — a seam qpdf does not
 have is a divergence.
 
+## The `'static` bound, and what it does to `open_mem`
+
+**Found during the first attempt at the attach; an earlier revision of this
+document did not anticipate it.** Attaching a resolver forces `R: 'static` on
+`Pdf<R>`. The chain is short and has no escape:
+
+1. `ObjectHandle` carries no lifetime parameter (`flpdf-25kg.3.3`'s design).
+2. Its slot holds `Option<Weak<dyn DocumentResolver>>`, and a trait object in
+   that position defaults to `dyn DocumentResolver + 'static`.
+3. So the resolver's concrete type must be `'static`, and it owns the input
+   source — hence `R: 'static`.
+
+A lifetime-free handle cannot safely reference borrowed data. That is a
+property of the language, not a choice: the escapes are `unsafe`, which
+`crates/flpdf/src/lib.rs:83` forbids outright with `#![forbid(unsafe_code)]`,
+or owning the data. An earlier revision claimed an id-keyed side table could
+avoid the bound; that is wrong — such a registry still stores
+`Rc<dyn DocumentResolver>` and meets the same default.
+
+**The consequence lands on `Pdf::open_mem`,** which takes `&[u8]` and yields
+`Pdf<Cursor<&'a [u8]>>` — not `'static`. This is a parity question, not just an
+ergonomic one: qpdf's `processMemoryFile` (`libqpdf/QPDF.cc:259-268`) builds a
+`BufferInputSource` over `Buffer(unsigned char*, size_t)`, whose contract is
+"memory is owned by the caller and will not be freed when the Buffer is
+destroyed" (`include/qpdf/Buffer.hh:42-45`). **qpdf does not copy the bytes.**
+Copying silently inside `open_mem` would regress a public API's memory profile
+*and* diverge from the oracle.
+
+**Take `Arc<[u8]>` instead.** `Cursor<Arc<[u8]>>` is `Read + Seek + 'static`
+(verified by compiling it), and shared ownership is the safe-Rust analogue of
+qpdf's contract: the caller keeps a cheap clone, the document reads the same
+allocation, and neither side copies. A caller holding only a slice writes
+`Arc::from(slice)` itself, so the copy is visible at the call site instead of
+hidden in the library.
+
+`Arc` rather than `Rc` because the resolver already makes `Pdf` non-`Send`;
+using the atomic form for the *buffer* still lets one allocation be shared
+across threads that each open their own document.
+
+flpdf is pre-1.0 and does not preserve compatibility for its own sake, so
+reshaping this entry point is in scope.
+
 ## Alternatives rejected
 
 **qpdf-style back-pointer.** `QPDFObject.cc:10` calls
 `QPDF::Resolver::resolve(value->qpdf, og)` through a raw pointer, with teardown
 safety from `QPDF::~QPDF` disconnecting every cached object — which
 `impl Drop for Pdf` (`reader.rs:351-371`) already mirrors. Structurally immune
-to the borrow hazard, but needs `unsafe` for the raw pointer, or an id-keyed
-side table that introduces global state and thread-safety questions.
+to the borrow hazard **and** to the `'static` bound, since a raw pointer carries
+no lifetime — but `crates/flpdf/src/lib.rs:83` declares
+`#![forbid(unsafe_code)]`, so it is not merely undesirable here, it does not
+compile. The id-keyed side table offered as its fallback does not work either:
+the registry would hold `Rc<dyn DocumentResolver>` and meet the same `'static`
+default the raw pointer avoids.
 
 **Explicit dereference at the helper boundary.** Have helpers take `&mut Pdf`
 and pre-resolve. No structural change, but it abandons the ObjectHandle-only
