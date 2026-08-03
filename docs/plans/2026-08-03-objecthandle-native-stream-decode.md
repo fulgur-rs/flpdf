@@ -843,9 +843,31 @@ the native `ObjectHandle` entry point return the **same** `Ok`/`Err` and the
 `max_output` limit case and the malformed/truncated-flate cases that
 `stream_decode_recovery_public_api.rs` already pins.
 
-The point of this module is that it fails loudly if Task 1-3's refactor drifted
-the legacy behavior *or* if the native reader diverges — one assertion covering
-both AC3 and AC4.
+The point of this module is that it fails loudly if the native reader diverges
+from the legacy one.
+
+> **Corrected after implementation: this is a RELATIVE gate, and one assertion
+> does NOT cover both AC3 and AC4.** An earlier draft claimed it did. Mutation
+> testing disproved that: reversing `outcome.events` inside the *shared*
+> `decode_prepared_specs` leaves the equivalence assertion **green** — both
+> entry points drift together — while ~20 absolute tests go red. A relative
+> gate can only see the two paths disagreeing, never the engine beneath them
+> moving.
+>
+> So the module needs an **absolute companion** that pins real warning text and
+> codes, not just agreement (`the_corpus_reaches_multi_event_warning_sequences`).
+> Note that even that test was initially too weak — comparing only event
+> variant names let a `code - 1` mutation through — so it must assert the exact
+> message and code. `scripts/qpdf-stream-codecs-diff.sh` remains the absolute
+> qpdf truth for the codec layer; this module is the relative legacy-vs-native
+> one. Both are required.
+
+> **Module privacy applies inside a crate too.** `filters::tests` cannot see
+> `stream_filter::tests::shape_corpus` merely by being in the same crate, so
+> reusing Task 5's corpus helpers needs `pub(crate)` on that `#[cfg(test)] mod
+> tests` and on the two helpers — the same arrangement Task 4 established for
+> `object_handle::identity_tests`. That is a test-only change; **no production
+> visibility may widen.**
 
 **Carry the `max_filter_chain` dimension up from Task 5.** Task 5's *unit*
 corpus already sweeps `[None, Some(16), Some(0)]`. `DecodeLimits` is `pub` with
