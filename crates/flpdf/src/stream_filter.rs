@@ -1434,6 +1434,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Nothing in [`shape_corpus`] reaches the guard arm above, so without this
+    /// test it is unexecuted code. Deleting the arm is not the risk — the match
+    /// would stop being exhaustive and fail to compile. Weakening it is:
+    /// swapping the `panic!` for a permissive fallback such as
+    /// `ObjectHandle::null()` compiles and keeps every other test green while
+    /// silently admitting an `Object::Reference` row. That would matter,
+    /// because plan decision D1 of `flpdf-25kg.3.4` makes the two readers
+    /// diverge on an indirect child *by design* — the `Object` reader sees
+    /// `ParamValue::Other`, the handle reader dereferences — so such a row
+    /// would make
+    /// [`handle_reader_matches_object_reader_for_every_filter_shape`] assert
+    /// agreement that qpdf itself does not have.
+    #[test]
+    #[should_panic(expected = "is outside the shape corpus")]
+    fn handle_from_object_refuses_an_indirect_reference() {
+        handle_from_object(Some(&Object::Reference(crate::ObjectRef::new(4, 0))));
+    }
+
     /// `Error` is not `PartialEq`, so compare the message instead — the two
     /// readers must agree on `Ok`/`Err` *and* on the exact text.
     fn comparable(result: Result<Vec<FilterSpec>>) -> std::result::Result<Vec<FilterSpec>, String> {

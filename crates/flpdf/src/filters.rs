@@ -482,8 +482,11 @@ type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u
 ///
 /// [`DecodeLimits::max_filter_chain`] is the exception: it is applied above
 /// this function, once per shape reader, so it *can* drift between them. The
-/// shared `validate_filter_chain_count` keeps the message identical, but the
-/// call placements are pinned only by
+/// shared `validate_filter_chain_count` keeps the message identical, and each
+/// reader's own placement is pinned absolutely — by
+/// `decode_rejects_overlong_filter_chain_before_malformed_item` here and by
+/// `handle_reader_counts_the_raw_filter_array_before_inspecting_its_items` in
+/// `stream_filter.rs`. What checks the two *against each other* is
 /// `handle_reader_matches_object_reader_for_every_filter_shape`, which sweeps
 /// the corpus at `None`, `Some(16)`, and `Some(0)`.
 fn decode_prepared_specs(
