@@ -388,8 +388,9 @@ where
 ///
 /// Returns [`Error::Unsupported`] on the same filter-chain, decode-parameter,
 /// and codec conditions as [`decode_stream_data_with_limits`], and
-/// [`Error::Internal`] when a child is indirect and its document has been
-/// dropped (`ObjectHandle::try_dereference`).
+/// [`Error::Internal`] when any handle resolved on this path — `stream_dict`
+/// itself as well as a `/Filter` or `/DecodeParms` child — is indirect and its
+/// document has been dropped (`ObjectHandle::try_dereference`).
 ///
 /// On an unfilterable stream this matches `QPDF_Stream::getStreamData`'s
 /// *outcome* only — qpdf throws there too (`QPDF_Stream.cc:350-357`). The
@@ -917,6 +918,8 @@ fn apply_single_filter_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_handle::identity_tests::resolver_bearing_handle;
+    use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::stream_filter::ParamValue;
 
@@ -3259,5 +3262,48 @@ mod tests {
         // default limit admits this one-stage chain.
         assert!(decode_stream_data_recovering_from_handle(&dict, b">", limits).is_err());
         assert!(decode_stream_data_from_handle(&dict, b">", DecodeLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn native_entry_point_dereferences_the_stream_dictionary_holder_itself() {
+        // `QPDF_Stream::filterable` reaches both keys through
+        // `stream_dict.getKey` (`libqpdf/QPDF_Stream.cc:386`, `:441`), a
+        // `QPDFObjectHandle` accessor that resolves the *holder* before
+        // looking a key up. `try_get_key` is what reproduces that; the
+        // non-resolving `get_key` would read this severed handle as "not a
+        // dictionary", hand back a null `/Filter`, and answer `Ok` with the
+        // bytes untouched — a broken document behind a plausible answer.
+        //
+        // `handle_reader_surfaces_a_dropped_document_from_every_child_position`
+        // (`stream_filter.rs`) covers the *children*; the holder is reachable
+        // only from this entry point, so it is pinned here.
+        let (stream_dict, resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        drop(resolver);
+
+        let error =
+            decode_stream_data_from_handle(&stream_dict, b"payload", DecodeLimits::default())
+                .expect_err("a dropped document must not read as an empty filter chain");
+        assert_eq!(error.to_string(), "object 20 0 belongs to a dropped PDF");
+        assert!(matches!(error, Error::Internal(_)));
+
+        // The outcome-level entry point shares the same helper, so it surfaces
+        // the error rather than an empty event list.
+        let outcome_error = decode_stream_data_recovering_from_handle(
+            &stream_dict,
+            b"payload",
+            DecodeLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            outcome_error.to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
     }
 }
