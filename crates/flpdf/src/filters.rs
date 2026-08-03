@@ -391,11 +391,13 @@ where
 /// [`Error::Internal`] when a child is indirect and its document has been
 /// dropped (`ObjectHandle::try_dereference`).
 ///
-/// This mirrors `QPDF_Stream::getStreamData`'s *outcome* on an unfilterable
-/// stream — qpdf throws there too (`QPDF_Stream.cc:344-359`) — but not its
-/// diagnostic channel: qpdf first emits a warning and flpdf raises the same
-/// text as the error itself. That gap is plan decision D3, measured against
-/// qpdf 11.9.0 on 2026-08-03 and deliberately not closed here.
+/// On an unfilterable stream this matches `QPDF_Stream::getStreamData`'s
+/// *outcome* only — qpdf throws there too (`QPDF_Stream.cc:350-357`). The
+/// diagnostic channel still differs: qpdf emits `filterable`'s text as a
+/// warning and throws a separate `"getStreamData called on unfilterable
+/// stream"`, whereas flpdf emits no warning and raises `filterable`'s text as
+/// the error itself. That gap is plan decision D3, measured against qpdf
+/// 11.9.0 on 2026-08-03 and deliberately not closed here.
 #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
 pub(crate) fn decode_stream_data_from_handle(
     stream_dict: &ObjectHandle,
@@ -415,9 +417,11 @@ pub(crate) fn decode_stream_data_from_handle(
 /// ordered recovery events — the `ObjectHandle`-native counterpart of
 /// [`decode_stream_data_recovering_with_limits`].
 ///
-/// [`decode_stream_data_from_handle`] is this function plus the same strict
-/// replay the legacy path applies, so the two agree on bytes and differ only
-/// in whether a warning is reported or raised.
+/// [`decode_stream_data_from_handle`] reads the same dictionary through the
+/// same private helper and then applies the legacy path's strict replay, so
+/// the two differ only in that this form reports a warning or codec error as
+/// an ordered event (alongside [`StreamDecodeEvent::Data`] chunks) where the
+/// strict form turns the first of them into an [`Err`].
 ///
 /// # Errors
 ///
@@ -457,10 +461,11 @@ fn decode_stream_data_from_handle_with_mode(
     )
 }
 
-/// The provider a decode entry point installs to handle a `Crypt` stage,
-/// erased so both shape readers reach one engine rather than monomorphising a
-/// copy each. Plan decision D2 of `flpdf-25kg.3.4` keeps it an explicit
-/// parameter instead of a document hookup.
+/// The provider a decode entry point installs to handle a `Crypt` stage.
+///
+/// Erased rather than generic so the engine below stays one non-generic
+/// function both shape readers call. Plan decision D2 of `flpdf-25kg.3.4`
+/// keeps it an explicit parameter instead of a document hookup.
 type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u8>>;
 
 /// Run the staging, codec, and warning-ordering engine over already-read
