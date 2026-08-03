@@ -1228,15 +1228,12 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        match handle.try_dereference() {
-            Ok(()) => {}
-            Err(Error::Internal(message)) if message.contains("belongs to a dropped PDF") => {
-                panic!(
-                    "`get_object_handle` vended a handle with no resolver attached: {message:?}"
-                );
-            }
-            Err(other) => panic!("unexpected error from an attached resolver: {other:?}"),
-        }
+        handle.try_dereference().expect(
+            "an attached resolver resolves an uncompressed object; \
+             `belongs to a dropped PDF` here would instead mean `get_object_handle` \
+             vended a handle whose `Weak` could not be upgraded, i.e. no resolver \
+             was attached at all",
+        );
 
         assert!(handle.is_resolved());
         assert_eq!(
@@ -1820,10 +1817,16 @@ mod tests {
             handle.try_dereference().expect("resolve");
         }
 
-        assert!(
-            pdf.repair_diagnostics().entries().is_empty(),
-            "a clean document must resolve without warnings, got {:?}",
-            pdf.repair_diagnostics().entries()
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            Vec::<String>::new(),
+            "a clean document must resolve without warnings"
         );
     }
 
@@ -2048,8 +2051,7 @@ mod tests {
                 let error = outcome.expect_err("an unusable /Length must not resolve");
                 assert!(
                     matches!(&error, Error::Parse { message, .. } if message == expected),
-                    "for {}: expected {expected:?}, got {error:?}",
-                    String::from_utf8_lossy(dict)
+                    "for {dict:?}: expected {expected:?}, got {error:?}"
                 );
             });
         }
@@ -2148,9 +2150,7 @@ mod tests {
             body.extend_from_slice(b"\nendstream\nendobj\n");
 
             with_second_object(&body, |handle, outcome, warnings| {
-                outcome.unwrap_or_else(|error| {
-                    panic!("separator {separator:?} must still resolve, got {error:?}")
-                });
+                outcome.expect("every line-ending branch still resolves the stream");
                 assert_eq!(
                     handle.as_stream_data().as_deref(),
                     Some(payload),
@@ -2173,13 +2173,16 @@ mod tests {
     fn a_reluctant_input_source_still_resolves_the_same_object() {
         struct Reluctant {
             inner: std::io::Cursor<Vec<u8>>,
-            interrupted: bool,
+            calls: usize,
         }
 
         impl std::io::Read for Reluctant {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if !self.interrupted {
-                    self.interrupted = true;
+                self.calls += 1;
+                // Every third call, not just the first: the first reads belong
+                // to `Pdf::open`'s xref load, so interrupting only once would
+                // never reach `ResolverCore::read` at all.
+                if self.calls % 3 == 0 {
                     return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
                 }
                 let len = buf.len().min(7);
@@ -2195,7 +2198,7 @@ mod tests {
 
         let mut pdf = Pdf::open(Reluctant {
             inner: std::io::Cursor::new(indirect_length_pdf_bytes()),
-            interrupted: false,
+            calls: 0,
         })
         .expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(4, 0));
@@ -2203,5 +2206,99 @@ mod tests {
         handle.try_dereference().expect("resolve");
 
         assert_eq!(handle.as_stream_data().as_deref(), Some(STREAM_PAYLOAD));
+    }
+
+    /// A stream whose `stream` keyword is the last thing in the input.
+    ///
+    /// qpdf returns from `validateStreamLineEnd` on a premature EOF because
+    /// "a premature EOF here will result in some other problem that will get
+    /// reported at another time" (`libqpdf/QPDF.cc:1413-1415`) — which is
+    /// exactly what happens: the payload read then finds nothing.
+    ///
+    /// The object is appended past `%%EOF` and given an xref entry by hand,
+    /// because a well-formed document always has its trailer after every
+    /// object and so can never put one at the end of the input.
+    #[test]
+    fn a_stream_keyword_at_end_of_input_ends_the_line_check_without_a_warning() {
+        let mut bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec()]);
+        let truncated_at = bytes.len() as u64;
+        bytes.extend_from_slice(b"9 0 obj\n<< /Length 1 >>\nstream");
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(9, 0),
+            crate::XrefEntry::Uncompressed {
+                offset: truncated_at,
+            },
+        );
+        let handle = pdf.get_object_handle(ObjectRef::new(9, 0));
+
+        let error = handle
+            .try_dereference()
+            .expect_err("there is no payload to read");
+
+        assert!(
+            matches!(&error, Error::Parse { message, .. }
+                if message == "stream data ends before its declared /Length"),
+            "the EOF must surface as the missing payload, not as a line-ending \
+             complaint: {error:?}"
+        );
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            Vec::<String>::new(),
+            "qpdf returns silently on a premature EOF here"
+        );
+    }
+
+    /// An input source that starts failing part-way through a resolution
+    /// propagates the failure instead of truncating the object.
+    #[test]
+    fn an_input_source_that_fails_mid_resolution_propagates_the_error() {
+        struct Breakable {
+            inner: std::io::Cursor<Vec<u8>>,
+            broken: bool,
+        }
+
+        impl std::io::Read for Breakable {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.broken {
+                    return Err(std::io::Error::other("input source went away"));
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        impl std::io::Seek for Breakable {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let mut pdf = Pdf::open(Breakable {
+            inner: std::io::Cursor::new(minimal_pdf_bytes()),
+            broken: false,
+        })
+        .expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolver.with_reader_mut(|reader| reader.broken = true);
+
+        let error = handle
+            .try_dereference()
+            .expect_err("a dead input source cannot resolve anything");
+
+        assert!(
+            matches!(&error, Error::Io(_)),
+            "the I/O failure must reach the caller unchanged, got {error:?}"
+        );
+        assert!(
+            pdf.resolver.core.borrow().resolving.is_empty(),
+            "and must not leave the reference marked in progress"
+        );
     }
 }

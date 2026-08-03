@@ -6641,6 +6641,29 @@ mod tests {
         assert_eq!(refs.len(), 1);
     }
 
+    /// The shared-buffer entry point takes the same options, and shares the
+    /// caller's allocation rather than copying it — the property `open_mem`'s
+    /// own doc rests on (qpdf's `Buffer` contract,
+    /// `include/qpdf/Buffer.hh:42-45`).
+    #[test]
+    fn open_mem_with_options_shares_the_callers_buffer() {
+        let bytes: Arc<[u8]> = Arc::from(&minimal_pdf_bytes()[..]);
+        let kept = Arc::clone(&bytes);
+        let opts = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+
+        let mut pdf = Pdf::open_mem_with_options(bytes, opts).expect("open_mem_with_options");
+
+        assert_eq!(page_refs(&mut pdf).expect("page_refs").len(), 1);
+        assert_eq!(
+            Arc::strong_count(&kept),
+            2,
+            "the document must read the caller's allocation, not a copy"
+        );
+    }
+
     // ------------------------------------------------------------------
     // collect_object_stream_chain: /Extends chain depth bound
     // ------------------------------------------------------------------
