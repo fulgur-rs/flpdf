@@ -27,7 +27,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Return whether the referenced field object is PDF null.
     pub fn is_null(&mut self) -> Result<bool> {
-        Ok(matches!(self.pdf.resolve(self.field_ref)?, Object::Null))
+        let field = self.pdf.get_object_handle(self.field_ref);
+        let field = self.pdf.resolve_object_handle_to_terminal(&field)?;
+        Ok(field.is_null())
     }
 
     /// Return this field's direct `/Parent` reference, if present.

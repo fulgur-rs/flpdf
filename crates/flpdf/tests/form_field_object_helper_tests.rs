@@ -517,6 +517,28 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
 }
 
 #[test]
+fn is_null_resolves_a_multi_hop_field_holder_to_its_terminal_value() {
+    let bytes = doc(vec![
+        (10, "null".into()),
+        (11, "null".into()),
+        (12, "null".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(10, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert!(field.is_null().unwrap());
+}
+
+#[test]
 fn set_field_attribute_string_writes_a_qpdf_unicode_string_on_the_field() {
     let bytes = doc(vec![
         (10, "<< /Parent 11 0 R >>".into()),
