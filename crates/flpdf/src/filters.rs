@@ -900,11 +900,11 @@ fn apply_single_filter_encode(
     }
 
     // LZWEncode is not supported: flpdf writes stream compression as FlateDecode only
-    // (decision flpdf-9hc.7.2; qpdf has no LZW encoder either).
+    // (qpdf has no LZW encoder either).
     if filter_name == b"LZWDecode" {
         return Err(
             "LZWEncode is not supported: flpdf writes stream compression as FlateDecode only \
-             (decision flpdf-9hc.7.2; qpdf has no LZW encoder either)"
+             (qpdf has no LZW encoder either)"
                 .to_string(),
         );
     }

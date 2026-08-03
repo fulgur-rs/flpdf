@@ -1311,6 +1311,46 @@ fn copy_encryption_from_unencrypted_donor_is_rejected() {
         .stderr(predicates::str::contains("not encrypted"));
 }
 
+/// `--copy-encryption-from` accepts V=4 AES-128 donors only. An encrypted
+/// donor outside that shape (here V=5 AES-256) is rejected with a message
+/// naming the accepted shape rather than failing silently.
+#[test]
+fn copy_encryption_from_non_v4_aes128_donor_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = tmp.path().join("donor256.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--static-id",
+            "--encrypt",
+            "donoruser",
+            "donorowner",
+            "256",
+            "--",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&donor)
+        .assert()
+        .success();
+
+    let out = tmp.path().join("out.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "donoruser",
+        ])
+        .arg(fixture(UNENCRYPTED_FIXTURE))
+        .arg(&out)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "only V=4 AES-128 donors are accepted",
+        ));
+}
+
 /// `--copy-encryption-from` with a wrong password is rejected with an error
 /// (the donor cannot be opened with the supplied password).
 #[test]

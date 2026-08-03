@@ -739,7 +739,7 @@ grep qpdf output also work here. flpdf adds extra leading lines
 (`V = `, `Length = `, `Filter = `, `EncryptMetadata = `, and per-named
 `CF /<name> = <method>`) before the qpdf block.
 
-Divergences from qpdf, by design (flpdf-9hc.3.17): flpdf does not recover
+Divergences from qpdf, by design: flpdf does not recover
 the cleartext user password, so qpdf's `User password = <value>` line is
 omitted (a grep for it simply misses rather than getting wrong data).
 `Supplied password is owner/user password` is printed from the
@@ -2544,8 +2544,7 @@ fn build_copy_encryption_source(
     if !is_v4_aes128 {
         return Err(format!(
             "--copy-encryption-from: donor {:?} uses V={} length={} \
-             stream={} string={} — not yet supported \
-             (flpdf-9hc.4.9 follow-up; only V=4 AES-128 donors are accepted)",
+             stream={} string={} — only V=4 AES-128 donors are accepted",
             path, info.v, info.length_bits, info.stream_method, info.string_method,
         )
         .into());
@@ -2832,8 +2831,7 @@ fn parse_encrypt_segment(tokens: &[String], allow_weak_crypto: bool) -> CliResul
             return Err(
                 "--encrypt KEY-LEN=40 (V=1 RC4-40, R=2) does not accept --use-aes, \
                  --force-V4, --force-R5, --allow-insecure, or permission sub-flags; the R>=3 \
-                 permission grammar needs a 128- or 256-bit key (40-bit permission \
-                 flags are flpdf-9hc.4.9.5 follow-up)"
+                 permission grammar needs a 128- or 256-bit key"
                     .into(),
             );
         }
