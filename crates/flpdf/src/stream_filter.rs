@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from either an Object or an ObjectHandle stream dictionary.
+//! qpdf correspondence: QPDFStreamFilter.cc and QPDF_Stream.cc filter-name, DecodeParms-alignment, and decode-pipeline construction responsibilities, read from either Object-shaped or ObjectHandle-shaped /Filter and /DecodeParms values.
 
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85::Ascii85Decoder;

@@ -476,9 +476,16 @@ type CryptProvider<'a> = &'a mut dyn FnMut(&DecodeParams, &[u8]) -> Result<Vec<u
 /// readers — the `&Object` one behind the legacy `&Dictionary` entry points
 /// and the `ObjectHandle` one behind [`decode_stream_data_from_handle`] —
 /// funnel into this function, so filter-chain staging, predictor geometry,
-/// [`DecodeLimits`] enforcement, and event ordering cannot drift between the
-/// two shapes. Nothing in this body inspects a `/Filter` or `/DecodeParms`
-/// object of either shape.
+/// [`DecodeLimits::max_output`] enforcement, and event ordering cannot drift
+/// between the two shapes. Nothing in this body inspects a `/Filter` or
+/// `/DecodeParms` object of either shape.
+///
+/// [`DecodeLimits::max_filter_chain`] is the exception: it is applied above
+/// this function, once per shape reader, so it *can* drift between them. The
+/// shared `validate_filter_chain_count` keeps the message identical, but the
+/// call placements are pinned only by
+/// `handle_reader_matches_object_reader_for_every_filter_shape`, which sweeps
+/// the corpus at `None`, `Some(16)`, and `Some(0)`.
 fn decode_prepared_specs(
     specs: Vec<FilterSpec>,
     stream_data: &[u8],
