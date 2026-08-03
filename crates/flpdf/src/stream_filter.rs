@@ -385,6 +385,19 @@ fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
 /// `decode_parms.isNull()` (`QPDFStreamFilter.cc:6`). Only `try_is_null` can
 /// resolve anything here anyway — `try_as_dictionary` runs on the slot it just
 /// resolved, and `try_dereference` is idempotent.
+///
+/// **Which values are touched is decided before [`RETAINED_DECODE_PARAM_KEYS`],
+/// not after.** `SF_FlateLzwDecode::setDecodeParms` walks
+/// `decode_parms.getKeys()` (`SF_FlateLzwDecode.cc:29-31`), and
+/// `QPDF_Dictionary::getKeys` tests `!isNull()` on *every* value including the
+/// ones no filter names (`libqpdf/QPDF_Dictionary.cc:118-127`) — each of which
+/// dereferences. So a consuming filter resolves an unrecognized indirect value
+/// even though this function then drops it, which
+/// `handle_reader_resolves_an_unretained_decode_parms_value_for_a_filter_that_reads_them`
+/// pins. `try_is_null` is that `isNull`, called for the dereference rather
+/// than the answer; ordering the retention test ahead of it would silently
+/// stop touching objects qpdf touches once `flpdf-25kg.3.5` wires the
+/// resolver.
 fn decode_params_from_handle(params: &ObjectHandle, resolve_values: bool) -> Result<DecodeParams> {
     if params.try_is_null()? {
         return Ok(DecodeParams::Absent);
@@ -392,19 +405,25 @@ fn decode_params_from_handle(params: &ObjectHandle, resolve_values: bool) -> Res
     let Some(entries) = params.try_as_dictionary()? else {
         return Ok(DecodeParams::Present(Vec::new()));
     };
-    if !resolve_values {
-        return Ok(DecodeParams::Present(
-            entries
-                .iter()
-                .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
-                .collect(),
-        ));
+    let mut retained = Vec::new();
+    for (key, value) in &entries {
+        if resolve_values {
+            // qpdf's `getKeys()` walk, whose answer this deliberately drops:
+            // the null-valued entry it would skip is `flpdf-h8mv`, unchanged
+            // here.
+            value.try_is_null()?;
+        }
+        if !retains_decode_param_key(key) {
+            continue;
+        }
+        let value = if resolve_values {
+            param_value_from_handle(value)?
+        } else {
+            param_value_without_resolving(value)
+        };
+        retained.push((key.clone(), value));
     }
-    entries
-        .iter()
-        .map(|(key, value)| Ok((key.clone(), param_value_from_handle(value)?)))
-        .collect::<Result<Vec<_>>>()
-        .map(DecodeParams::Present)
+    Ok(DecodeParams::Present(retained))
 }
 
 fn param_value_from_handle(value: &ObjectHandle) -> Result<ParamValue> {
@@ -452,6 +471,7 @@ fn decode_params_from_object(params: Option<&Object>) -> DecodeParams {
         Some(object) => DecodeParams::Present(match object.as_dict() {
             Some(dict) => dict
                 .iter()
+                .filter(|(key, _)| retains_decode_param_key(key))
                 .map(|(key, value)| (key.to_vec(), param_value_from_object(value)))
                 .collect(),
             None => Vec::new(),
@@ -752,6 +772,53 @@ impl FlateLzwStreamFilter {
             early_code_change: true,
         }
     }
+}
+
+/// The `/DecodeParms` keys some flpdf consumer actually reads.
+///
+/// [`DecodeParams`] keeps only these. qpdf has no counterpart, and needs none:
+/// it replicates a `QPDFObjectHandle` — a `shared_ptr` — across the filter
+/// chain and never copies the dictionary. `DecodeParams` owns its entries, so
+/// a scalar `/DecodeParms` replicated across an *n*-filter chain would
+/// otherwise be converted and stored *n* times. Retaining only what some
+/// consumer names bounds each set at six entries however large the source
+/// dictionary is.
+///
+/// The five geometry keys are exactly the ones
+/// `<FlateLzwStreamFilter as StreamFilter>::set_decode_params` matches below —
+/// the one `setDecodeParms` override in qpdf 11.9.0 that reads entries at all
+/// (`libqpdf/SF_FlateLzwDecode.cc:32-66`). [`png_encode_geometry`] reads them
+/// through that same filter, so the encode direction needs no separate entry.
+/// qpdf spells its keys with the leading `/`; flpdf's `Dictionary` keys never
+/// carry one, so these do not either — matching
+/// `set_decode_params`' own `b"Predictor"` arms rather than qpdf's literals.
+/// `Name` is the Crypt stage's, and pairs with the `b"Crypt"` arm of
+/// [`filter_reads_decode_params`]: plan decision D2 of `flpdf-25kg.3.4` has
+/// that provider selecting its crypt filter from `/Name`, and no
+/// `StreamFilter` is involved there to carry the statement. Nothing else
+/// iterates [`DecodeParams::entries`] looking for a key it does not name, so
+/// dropping the rest is unobservable — a filter that starts reading a new key
+/// has to be added here as well as to its own `set_decode_params`.
+///
+/// This is *per key*, not per filter: `EarlyChange` survives under
+/// `/FlateDecode` even though `set_decode_params` consults it only for LZW,
+/// and `Name` survives under every filter. Bounding the set is the point;
+/// making it minimal per filter is not.
+///
+/// **Retention is not resolution.** [`decode_params_from_handle`] still
+/// dereferences every value a consuming filter's `getKeys()` walk touches,
+/// including the ones dropped here; see its own comment for why.
+const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 6] = [
+    b"BitsPerComponent",
+    b"Colors",
+    b"Columns",
+    b"EarlyChange",
+    b"Name",
+    b"Predictor",
+];
+
+fn retains_decode_param_key(key: &[u8]) -> bool {
+    RETAINED_DECODE_PARAM_KEYS.contains(&key)
 }
 
 /// Apply `getIntValueAsInt`'s saturation (`QPDFObjectHandle.cc:531-538`), which
@@ -1241,7 +1308,7 @@ pub(crate) mod tests {
         decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
         ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
         DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
-        Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
@@ -1372,6 +1439,17 @@ pub(crate) mod tests {
         assert!(present[0].decode_params.entries().is_empty());
     }
 
+    /// Both halves of the reduction in one read: each value drops to its
+    /// bounded [`ParamValue`], and each key outside
+    /// [`RETAINED_DECODE_PARAM_KEYS`] drops entirely.
+    ///
+    /// `/Whatever` carries the same `Object::Null` as the `/Predictor` above
+    /// it, which survives as `Other`. Only the key differs, so the assertion
+    /// separates "dropped because unread" from "kept but classified as
+    /// `Other`". That second row is also `flpdf-h8mv`'s shape, retained
+    /// unchanged by this filter — what it goes on to *do* is asserted by
+    /// `filters::tests::non_integer_decode_params_values_remain_unfilterable`
+    /// and by the corpus's "null-valued /DecodeParms key" row, not here.
     #[test]
     fn object_shape_reader_reduces_each_parameter_value_to_its_bounded_shape() {
         let name = Object::Name(b"FlateDecode".to_vec());
@@ -1380,6 +1458,7 @@ pub(crate) mod tests {
             ("Colors", Object::Integer(i64::from(i32::MIN) - 10)),
             ("Columns", Object::Integer(i64::from(i32::MAX) + 10)),
             ("Name", Object::Name(b"Identity".to_vec())),
+            ("Predictor", Object::Null),
             ("Whatever", Object::Null),
         ]);
 
@@ -1391,8 +1470,151 @@ pub(crate) mod tests {
                 (b"Colors".to_vec(), ParamValue::Int(i32::MIN)),
                 (b"Columns".to_vec(), ParamValue::Int(i32::MAX)),
                 (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
-                (b"Whatever".to_vec(), ParamValue::Other),
+                (b"Predictor".to_vec(), ParamValue::Other),
             ]
+        );
+    }
+
+    /// Exactly the keys a read keeps, spelled out.
+    ///
+    /// **The expectation is a literal, not [`RETAINED_DECODE_PARAM_KEYS`]
+    /// itself.** Reading the constant on both sides would be tautological in
+    /// the one direction that matters — deleting a key would shrink
+    /// expectation and result together and stay green.
+    ///
+    /// Shrinking the set is exactly what a "tidy the unused keys" change would
+    /// do, so each key needs somewhere to fail. Measured on
+    /// `cargo test -p flpdf --lib`, deleting each key in turn: `Predictor` 35
+    /// failures, `Columns` 34, `Name` 5, `BitsPerComponent` and `Colors` 4
+    /// each — and `EarlyChange` just 2, this test and
+    /// `filters::tests::lzw_early_change_reaches_the_codec_from_decode_parms`,
+    /// which was written for it. Before those two existed, deleting
+    /// `EarlyChange` reddened nothing at all: the legacy-vs-native corpus gate
+    /// is structurally blind to such a loss, being relative, and dropping a
+    /// key moves both readers together.
+    #[test]
+    fn the_object_reader_keeps_exactly_the_read_decode_parameter_keys() {
+        let name = Object::Name(b"FlateDecode".to_vec());
+        let dictionary = params(&[
+            ("BitsPerComponent", Object::Integer(1)),
+            ("Colors", Object::Integer(1)),
+            ("Columns", Object::Integer(1)),
+            ("EarlyChange", Object::Integer(1)),
+            ("Name", Object::Integer(1)),
+            ("Predictor", Object::Integer(1)),
+            ("Unread", Object::Integer(1)),
+        ]);
+
+        let specs = decode_filter_specs_from_object(Some(&name), Some(&dictionary), None).unwrap();
+
+        assert_eq!(
+            specs[0]
+                .decode_params
+                .entries()
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            // `Dictionary` is a `BTreeMap`, so this is the source order too.
+            vec![
+                b"BitsPerComponent".to_vec(),
+                b"Colors".to_vec(),
+                b"Columns".to_vec(),
+                b"EarlyChange".to_vec(),
+                b"Name".to_vec(),
+                b"Predictor".to_vec(),
+            ]
+        );
+    }
+
+    /// The bytes a read holds onto: each filter name, plus each retained key
+    /// and the payload of each retained `Name`. `Int` and `Other` carry
+    /// nothing beyond the enum itself.
+    ///
+    /// Deliberately the quantity the 2026-08-03 measurement reported, so its
+    /// figures and this test's are the same number.
+    fn retained_bytes(specs: &[FilterSpec]) -> usize {
+        specs
+            .iter()
+            .map(|spec| {
+                spec.name.len()
+                    + spec
+                        .decode_params
+                        .entries()
+                        .iter()
+                        .map(|(key, value)| {
+                            key.len()
+                                + match value {
+                                    ParamValue::Name(name) => name.len(),
+                                    ParamValue::Int(_) | ParamValue::Other => 0,
+                                }
+                        })
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// The cost [`RETAINED_DECODE_PARAM_KEYS`] exists to bound.
+    ///
+    /// **Not a qpdf-parity test.** qpdf replicates a `QPDFObjectHandle` — a
+    /// `shared_ptr` — across the chain and copies no dictionary, so there is no
+    /// parity claim here in either direction. This is flpdf's own cost,
+    /// introduced when `FilterSpec` stopped borrowing `&'a Object` and started
+    /// owning a neutral [`DecodeParams`]: a scalar `/DecodeParms` under an
+    /// *n*-entry `/Filter` array was then converted and stored *n* times, on
+    /// `decode_filter_specs_from_object` — the legacy `decode_stream_data`
+    /// path, which allocated nothing at all before.
+    ///
+    /// Asserted two ways, both absolute: the identical figure at two source
+    /// sizes, and a ceiling. A ratio would pass while both sides scaled.
+    #[test]
+    fn retained_decode_parameter_bytes_do_not_grow_with_the_source_dictionary() {
+        const CHAIN: usize = 16;
+        // 16 stages, each holding at most the six retained keys (16 bytes at
+        // the longest), one 64-byte `/Name` payload, and a 14-byte filter
+        // name: 16 * (6 * 16 + 64 + 14) = 2784.
+        const CEILING: usize = 4096;
+
+        let specs_for = |filler: usize| {
+            let mut dictionary = Dictionary::new();
+            // Every retained key, so this bounds a real retention rather than
+            // the empty set an all-unread dictionary would satisfy trivially.
+            for key in RETAINED_DECODE_PARAM_KEYS {
+                dictionary.insert(
+                    key,
+                    if key == b"Name" {
+                        Object::Name(vec![b'v'; 64])
+                    } else {
+                        Object::Integer(1)
+                    },
+                );
+            }
+            // 64-byte keys with 64-byte `/Name` values, as measured.
+            for index in 0..filler {
+                dictionary.insert(format!("Unread{index:058}"), Object::Name(vec![b'v'; 64]));
+            }
+            // `ASCIIHexDecode` reads no `/DecodeParms` entry whatsoever, so
+            // not one of these bytes can reach a decode decision.
+            let filter = Object::Array(vec![Object::Name(b"ASCIIHexDecode".to_vec()); CHAIN]);
+
+            decode_filter_specs_from_object(
+                Some(&filter),
+                Some(&Object::Dictionary(dictionary)),
+                None,
+            )
+            .unwrap()
+        };
+
+        let small = retained_bytes(&specs_for(1));
+        let large = retained_bytes(&specs_for(1024));
+
+        assert_eq!(
+            small, large,
+            "retention grew with the source dictionary: {small} bytes at 1 unread key, \
+             {large} at 1024"
+        );
+        assert!(
+            large <= CEILING,
+            "retained {large} bytes, ceiling {CEILING}"
         );
     }
 
@@ -1931,13 +2153,47 @@ pub(crate) mod tests {
         // none.
         assert_eq!(*calls.borrow(), Vec::new());
         assert!(!value.is_resolved());
-        // The entry is still *present*, so `set_decode_params`'s `is_absent()`
-        // still rejects it exactly as qpdf's base implementation does. Only
-        // the classification of the unresolved value is `Other`.
-        assert_eq!(
-            specs[0].decode_params,
-            DecodeParams::Present(vec![(b"Unused".to_vec(), ParamValue::Other)])
-        );
+        // `/Unused` is outside `RETAINED_DECODE_PARAM_KEYS`, so no entry
+        // survives — but the parameter set is still `Present`, and
+        // `set_decode_params`'s `is_absent()` reads exactly that, so the
+        // stream is refused just as qpdf's base implementation refuses it.
+        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
+        assert!(!specs[0].decode_params.is_absent());
+    }
+
+    #[test]
+    fn handle_reader_resolves_an_unretained_decode_parms_value_for_a_filter_that_reads_them() {
+        // Retention is not resolution, and this is the test that keeps the two
+        // apart. It is the sibling above with one byte changed — the filter —
+        // so the returned `DecodeParams` is identical (`/Unused` survives
+        // neither read) and the *only* thing that differs is the call log.
+        //
+        // qpdf resolves this object. `SF_FlateLzwDecode::setDecodeParms` walks
+        // `decode_parms.getKeys()` (`SF_FlateLzwDecode.cc:29-31`), and
+        // `QPDF_Dictionary::getKeys` tests `!isNull()` on every value in the
+        // dictionary, unrecognized keys included
+        // (`libqpdf/QPDF_Dictionary.cc:118-127`); `isNull` dereferences. The
+        // 2026-08-03 qpdf 11.9.0 probe recorded the observable half: with
+        // `/DecodeParms << /Unused 99 0 R >>` and object 99 damaged,
+        // `/FlateDecode` reports `(object 99 0, offset 342): expected n n obj`
+        // while `/ASCIIHexDecode` says nothing about 99.
+        //
+        // Moving the `retains_decode_param_key` test ahead of the
+        // `try_is_null` in `decode_params_from_handle` reddens this and
+        // nothing else.
+        let (value, _resolver, calls) = logged_resolver_bearing_handle(ObjectValue::Integer(4));
+        let parms = ObjectHandle::dictionary(vec![(b"Unused".to_vec(), value.clone())]);
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(*calls.borrow(), vec![crate::ObjectRef::new(20, 0)]);
+        assert!(value.is_resolved());
+        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
     }
 
     #[test]
@@ -2063,17 +2319,22 @@ pub(crate) mod tests {
         // `try_dereference` short-circuits on a direct handle, so the two
         // reads are the same walk — this pins that they stay the same walk,
         // across all three `ParamValue` variants, for a non-consuming filter.
+        //
+        // Every key is one `RETAINED_DECODE_PARAM_KEYS` keeps, so retention
+        // cannot hide a classification difference by dropping the entry that
+        // would have shown it. `/Predictor` carries the `Other` case because a
+        // retained key has to.
         let entries = || {
             vec![
                 (b"Columns".to_vec(), ObjectHandle::integer(7)),
                 (b"Name".to_vec(), ObjectHandle::name(b"Identity".to_vec())),
-                (b"Other".to_vec(), ObjectHandle::string(b"x".to_vec())),
+                (b"Predictor".to_vec(), ObjectHandle::string(b"x".to_vec())),
             ]
         };
         let expected = DecodeParams::Present(vec![
             (b"Columns".to_vec(), ParamValue::Int(7)),
             (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
-            (b"Other".to_vec(), ParamValue::Other),
+            (b"Predictor".to_vec(), ParamValue::Other),
         ]);
 
         // Spelled out rather than looped so a failure names the filter by the
@@ -2570,6 +2831,11 @@ pub(crate) mod tests {
         assert!(flate.early_code_change);
     }
 
+    /// `set_decode_params`' `_ => {}` arm, which no reader can now reach:
+    /// [`RETAINED_DECODE_PARAM_KEYS`] drops such a key before a `FilterSpec`
+    /// is built, and this test hands the filter a `DecodeParams` directly. It
+    /// stays because the arm is what makes retention *safe* to add — if an
+    /// unrecognized key mattered to a filter, dropping it would not be.
     #[test]
     fn unrecognized_decode_params_keys_are_ignored() {
         assert!(accepts(

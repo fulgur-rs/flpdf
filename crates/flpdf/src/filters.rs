@@ -2799,6 +2799,51 @@ mod tests {
         assert_eq!(decode_lzw(&stream).unwrap(), b"AB");
     }
 
+    /// `/DecodeParms /EarlyChange` reaches the LZW codec through the reader.
+    ///
+    /// The one retained `/DecodeParms` key with no other absolute end-to-end
+    /// test: `/Predictor`, `/Columns`, `/Colors` and `/BitsPerComponent` all
+    /// change a decode here, and `/Name` is pinned by
+    /// `crypt_stage_receives_the_name_parameter_a_provider_selects_on`, but
+    /// `/EarlyChange`'s only entry-point rows are in the legacy-vs-native
+    /// equivalence corpus, which is *relative* — dropping the key from
+    /// `RETAINED_DECODE_PARAM_KEYS` moves both readers together and leaves
+    /// that gate green.
+    ///
+    /// 300 literals cross LZW's first code-width transition, the only place
+    /// `/EarlyChange` is observable. The stream is packed for `1` and declared
+    /// as `0`, so the setting has to reach the codec for the two answers to
+    /// differ at all.
+    #[test]
+    fn lzw_early_change_reaches_the_codec_from_decode_parms() {
+        let codes: Vec<u32> = std::iter::once(256u32)
+            .chain(std::iter::repeat_n(0x41u32, 300))
+            .chain(std::iter::once(257))
+            .collect();
+        let plain = vec![b'A'; 300];
+        let decode = |early_change: Option<i64>| {
+            let mut dict = Dictionary::new();
+            dict.insert("Filter", Object::Name(b"LZWDecode".to_vec()));
+            if let Some(early_change) = early_change {
+                let mut parms = Dictionary::new();
+                parms.insert("EarlyChange", Object::Integer(early_change));
+                dict.insert("DecodeParms", Object::Dictionary(parms));
+            }
+            decode_stream_data(&dict, &crate::pipeline::lzw::pack_codes(&codes, true))
+                .map_err(|error| error.to_string())
+        };
+
+        // The default and an explicit `1` match how the codes were packed.
+        assert_eq!(decode(None).unwrap(), plain);
+        assert_eq!(decode(Some(1)).unwrap(), plain);
+        // `0` shifts the width transition by one code, so the decoder reads the
+        // same bits as a different code sequence and runs off the table.
+        assert_eq!(
+            decode(Some(0)).unwrap_err(),
+            "unsupported PDF feature: LZWDecoder: bad code received"
+        );
+    }
+
     // ----- Task 1: /Filter chain length cap (flpdf-hn1g.4) -----
 
     #[test]
@@ -3860,6 +3905,131 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+
+        /// The fourth input that collapses to `DecodeParams::Present(vec![])`.
+        ///
+        /// Three already did: an empty `/DecodeParms` dictionary, a present
+        /// non-dictionary, and — since `9e1c4c66` — a non-consuming filter's
+        /// view of a dictionary whose only entries are unresolved indirect
+        /// values. `RETAINED_DECODE_PARAM_KEYS` adds a fourth: a dictionary
+        /// holding nothing a consumer reads. That is only safe if no consumer
+        /// can tell it from an empty one, so ask all of them — both decode
+        /// entry points, strict and recovering, across the whole
+        /// `max_output`/`max_filter_chain` sweep, plus the encode path — for a
+        /// consuming filter, a non-consuming one, and a chain of both where
+        /// the scalar `/DecodeParms` is replicated per stage.
+        ///
+        /// This is the empirical form of the claim `RETAINED_DECODE_PARAM_KEYS`
+        /// makes in prose. Restoring the dropped keys (deleting the
+        /// `retains_decode_param_key` filter in `decode_params_from_object`)
+        /// leaves it green, because they are genuinely inert — what it catches
+        /// is a consumer that starts reading a key the constant does not name.
+        #[test]
+        fn a_dictionary_of_only_unread_keys_decodes_as_an_empty_one() {
+            let plain = b"only-unread-keys payload".to_vec();
+            let flate = encode_flate(&plain).unwrap();
+            let unread = parms_dictionary(&[
+                ("Unread", Object::Integer(1)),
+                ("Type", Object::Name(b"CryptFilterDecodeParms".to_vec())),
+                ("K", Object::Integer(-1)),
+            ]);
+            let empty = parms_dictionary(&[]);
+            let cases: Vec<(&str, Object, Vec<u8>)> = vec![
+                ("FlateDecode", filter_name(b"FlateDecode"), flate.clone()),
+                (
+                    "ASCIIHexDecode",
+                    filter_name(b"ASCIIHexDecode"),
+                    ascii_hex::encode(&plain),
+                ),
+                (
+                    "chain replicating the scalar",
+                    filter_array(&[b"ASCIIHexDecode", b"FlateDecode"]),
+                    ascii_hex::encode(&flate),
+                ),
+            ];
+
+            for (label, filter, stream_data) in cases {
+                let row = |decode_params: &Object| Row {
+                    label,
+                    filter: Some(filter.clone()),
+                    decode_params: Some(decode_params.clone()),
+                    stream_data: stream_data.clone(),
+                };
+                let (unread_row, empty_row) = (row(&unread), row(&empty));
+
+                for max_filter_chain in [None, Some(16), Some(0)] {
+                    for max_output in [None, Some(1), Some(2000)] {
+                        let limits = DecodeLimits {
+                            max_output,
+                            max_filter_chain,
+                        };
+                        let context = format!(
+                            "{label} at max_filter_chain {max_filter_chain:?}, \
+                             max_output {max_output:?}"
+                        );
+
+                        assert_eq!(
+                            comparable_outcome(decode_stream_data_recovering_with_limits(
+                                &unread_row.legacy_dictionary(),
+                                &unread_row.stream_data,
+                                limits,
+                            )),
+                            comparable_outcome(decode_stream_data_recovering_with_limits(
+                                &empty_row.legacy_dictionary(),
+                                &empty_row.stream_data,
+                                limits,
+                            )),
+                            "legacy recovering told them apart for {context}"
+                        );
+                        assert_eq!(
+                            comparable_bytes(decode_stream_data_with_limits(
+                                &unread_row.legacy_dictionary(),
+                                &unread_row.stream_data,
+                                limits,
+                            )),
+                            comparable_bytes(decode_stream_data_with_limits(
+                                &empty_row.legacy_dictionary(),
+                                &empty_row.stream_data,
+                                limits,
+                            )),
+                            "legacy strict told them apart for {context}"
+                        );
+                        assert_eq!(
+                            comparable_outcome(decode_stream_data_recovering_from_handle(
+                                &unread_row.native_dictionary(),
+                                &unread_row.stream_data,
+                                limits,
+                            )),
+                            comparable_outcome(decode_stream_data_recovering_from_handle(
+                                &empty_row.native_dictionary(),
+                                &empty_row.stream_data,
+                                limits,
+                            )),
+                            "native recovering told them apart for {context}"
+                        );
+                        assert_eq!(
+                            comparable_bytes(decode_stream_data_from_handle(
+                                &unread_row.native_dictionary(),
+                                &unread_row.stream_data,
+                                limits,
+                            )),
+                            comparable_bytes(decode_stream_data_from_handle(
+                                &empty_row.native_dictionary(),
+                                &empty_row.stream_data,
+                                limits,
+                            )),
+                            "native strict told them apart for {context}"
+                        );
+                    }
+                }
+
+                assert_eq!(
+                    comparable_bytes(encode_stream_data(&unread_row.legacy_dictionary(), &plain)),
+                    comparable_bytes(encode_stream_data(&empty_row.legacy_dictionary(), &plain)),
+                    "the encode path told them apart for {label}"
+                );
             }
         }
 
