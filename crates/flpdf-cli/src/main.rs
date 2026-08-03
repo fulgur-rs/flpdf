@@ -5717,9 +5717,13 @@ fn run_list_attachments(
 ) -> CliResult<()> {
     let input = input.ok_or("--list-attachments: missing input PDF")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    let entries = list_attachment_info(&mut pdf)?;
-    let listing = format_attachment_list(&entries, verbose);
-    print!("{listing}");
+    // qpdf reports the absence of an /EmbeddedFiles name tree with the input
+    // file name (QPDFJob::doListAttachments), so that branch stays with the
+    // caller that knows the name.
+    match format_attachment_list(&mut pdf, verbose)? {
+        Some(listing) => std::io::stdout().write_all(&listing)?,
+        None => println!("{} has no embedded files", input.display()),
+    }
     Ok(())
 }
 

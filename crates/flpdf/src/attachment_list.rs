@@ -1,51 +1,62 @@
 //! qpdf correspondence: QPDFJob.cc attachment enumeration and display formatting.
 //! Structured enumeration and formatted display of PDF attachments.
 //!
-//! This module builds on [`crate::embedded_files::list_embedded_files`] and
-//! [`crate::filespec_helper::FileSpec`] to produce a structured [`AttachmentInfo`]
-//! per attachment, and a human-readable formatted listing via
-//! [`format_attachment_list`].
+//! Two independent views of a document's embedded files live here:
 //!
-//! # Output format
+//! * [`list_attachment_info`] returns a structured [`AttachmentInfo`] per
+//!   attachment, for programs that want the metadata rather than a rendering.
+//! * [`format_attachment_list`] reproduces the listing `qpdf
+//!   --list-attachments [--verbose]` writes to its info log.
 //!
-//! The format is modelled on `qpdf --list-attachments [--verbose]`:
+//! # Listing format
 //!
-//! ```text
-//! key -> num,gen
-//!   display name: <name or (none)>
-//!   size:         <n or (none)>
-//!   mime type:    <type or (none)>
-//!   creation date:     <date or (none)>
-//!   modification date: <date or (none)>
-//! ```
-//!
-//! With `verbose: true`, three additional lines are appended per attachment:
+//! Without `verbose` each attachment contributes exactly one line, naming the
+//! name-tree key and the object/generation of its embedded file stream:
 //!
 //! ```text
-//!   description:      <desc or (none)>
-//!   af relationship:  <rel or (none)>
-//!   checksum:         <hex or (none)>
+//! potato.png -> 6,0
 //! ```
 //!
-//! # Missing fields
+//! With `verbose` the header line is followed by the preferred name, every
+//! recognized name key, and every `/EF` entry with that stream's parameters:
 //!
-//! All missing or absent fields are displayed as `(none)` rather than left empty.
+//! ```text
+//! potato.png -> 6,0
+//!   description: <only when /Desc is non-empty>
+//!   preferred name: π.png
+//!   all names:
+//!     /F -> π.png
+//!     /UF -> π.png
+//!   all data streams:
+//!     /F -> 6,0
+//!       creation date: D:20220215153939-05'00'
+//!       modification date: D:20220215153939-05'00'
+//!       mime type:
+//!       checksum: c55e70c0c72d7eaf01230124fe5ff2d9
+//! ```
+//!
+//! Absent values render as an empty string after the label — the label and its
+//! single trailing space are still written, as in the `mime type:` line above.
 //!
 //! # Example
 //!
 //! ```no_run
 //! use std::fs::File;
-//! use std::io::BufReader;
+//! use std::io::{BufReader, Write};
 //! use flpdf::{attachment_list, Pdf};
 //!
 //! let mut pdf = Pdf::open(BufReader::new(File::open("with-attachments.pdf")?))?;
-//! let infos = attachment_list::list_attachment_info(&mut pdf)?;
-//! print!("{}", attachment_list::format_attachment_list(&infos, false));
+//! match attachment_list::format_attachment_list(&mut pdf, false)? {
+//!     Some(listing) => std::io::stdout().write_all(&listing)?,
+//!     None => println!("with-attachments.pdf has no embedded files"),
+//! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 use crate::embedded_files::list_embedded_files;
-use crate::filespec_helper::FileSpec;
+use crate::filespec_helper::{EmbeddedFileStream, FileSpec};
+use crate::json_inspect::checksum_to_hex;
+use crate::object_handle::ObjectHandle;
 use crate::{ObjectRef, Pdf, Result};
 use std::io::{Read, Seek};
 
@@ -54,8 +65,7 @@ use std::io::{Read, Seek};
 /// Structured metadata for a single PDF attachment.
 ///
 /// Fields are `Option<Vec<u8>>` (or `Option<i64>` for `size`) because any
-/// field may be absent in a well-formed or partially-formed PDF.  The
-/// formatter renders absent fields as `(none)`.
+/// field may be absent in a well-formed or partially-formed PDF.
 ///
 /// `key` and `filespec_ref` are always present — they come from the
 /// `/Names /EmbeddedFiles` name tree and are required to have found the entry
@@ -183,124 +193,137 @@ fn collect_one<R: Read + Seek>(
 
 // ── format_attachment_list ────────────────────────────────────────────────────
 
-/// Format a slice of [`AttachmentInfo`] entries as a human-readable string.
+/// Render the `qpdf --list-attachments [--verbose]` listing for `pdf`.
 ///
-/// When `verbose` is `false`, each attachment is rendered as:
+/// Returns `None` when the document catalog has no `/Names /EmbeddedFiles`
+/// dictionary; callers report that case with the input file name, the way
+/// `qpdf` prints `<file> has no embedded files`.  A document that *does* carry
+/// an `/EmbeddedFiles` name tree returns `Some`, even when the tree is empty —
+/// an empty tree lists nothing and is not the "no embedded files" case.
 ///
-/// ```text
-/// key -> num,gen
-///   display name: <name or (none)>
-///   size:         <n or (none)>
-///   mime type:    <type or (none)>
-///   creation date:     <date or (none)>
-///   modification date: <date or (none)>
+/// The listing is returned as bytes, not [`String`]: names, descriptions and
+/// dates go through the same UTF-8 view qpdf uses for PDF strings, which may
+/// carry an explicit UTF-8 BOM followed by bytes that are not valid UTF-8.
+///
+/// Without `verbose` each attachment contributes only its header line, naming
+/// the name-tree key and the object/generation of the embedded file stream
+/// selected by [`FileSpec::get_embedded_file_stream`].  A filespec with no
+/// usable stream reports `0,0`.
+///
+/// With `verbose` the header is followed by `/Desc` (only when non-empty), the
+/// preferred name, every recognized name key, and one block per `/EF` entry
+/// carrying that stream's creation date, modification date, MIME type and
+/// hex-encoded checksum.  Absent values leave the text after the label empty.
+///
+/// # Errors
+///
+/// Propagates any error from the embedded-files name-tree walker or from
+/// resolving a `/Filespec`, `/EF` entry or embedded file stream.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use std::fs::File;
+/// # use std::io::{BufReader, Write};
+/// # use flpdf::{format_attachment_list, Pdf};
+/// # let mut pdf = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
+/// if let Some(listing) = format_attachment_list(&mut pdf, true)? {
+///     std::io::stdout().write_all(&listing)?;
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-///
-/// When `verbose` is `true`, three additional lines follow:
-///
-/// ```text
-///   description:     <desc or (none)>
-///   af relationship: <rel or (none)>
-///   checksum:        <hex or (none)>
-/// ```
-///
-/// All absent/missing fields are rendered as the literal string `(none)`.
-/// Dates are printed as-is (raw PDF date string).
-///
-/// # Note on qpdf wording
-///
-/// The field labels (`display name:`, `mime type:`, etc.) are modelled on
-/// `qpdf --list-attachments --verbose` output.  The per-field multi-line layout
-/// differs from qpdf's non-verbose single-line `key -> num,gen` format: the
-/// header line is shared but plain mode adds per-field lines, which qpdf omits.
-/// CLI task .10.9 may adjust final output wording further.
-/// The checksum is formatted as lowercase hexadecimal, matching qpdf output.
-pub fn format_attachment_list(entries: &[AttachmentInfo], verbose: bool) -> String {
-    let mut out = String::new();
-    for info in entries {
-        // Header line: key -> num,gen  (mirrors qpdf).  The name-tree key is a
-        // PDF string; decode it the same way as display name / description so
-        // non-ASCII PDFDocEncoding / UTF-16BE keys are not mojibake (roborev
-        // #954).  Only the displayed text is decoded — `info.key` keeps its
-        // raw bytes for lookups elsewhere.
-        let key_str = decode_pdf_text_string(&info.key);
-        out.push_str(&format!(
-            "{} -> {},{}\n",
-            key_str, info.filespec_ref.number, info.filespec_ref.generation
-        ));
+pub fn format_attachment_list<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    verbose: bool,
+) -> Result<Option<Vec<u8>>> {
+    let mut helper = pdf.embedded_files();
+    if !helper.has_embedded_files()? {
+        return Ok(None);
+    }
+    // The name-tree walker already hands out qpdf's UTF-8 view of each key, so
+    // the map is keyed and ordered by the converted bytes, as qpdf's is.
+    let entries = helper.get_embedded_files()?;
 
-        // Display name
-        let name_s = info
-            .display_name
-            .as_deref()
-            .map(|s| s.to_owned())
-            .unwrap_or_else(|| "(none)".to_owned());
-        out.push_str(&format!("  display name: {name_s}\n"));
+    let mut out = Vec::new();
+    for (key, filespec) in entries {
+        let ef = {
+            let mut file_spec = FileSpec::new(filespec, pdf)?;
+            let stream = file_spec.get_embedded_file_stream("")?;
+            out.extend_from_slice(&key);
+            out.extend_from_slice(b" -> ");
+            out.extend_from_slice(object_generation(&stream).as_bytes());
+            out.push(b'\n');
 
-        // Size
-        let size_s = info
-            .size
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "(none)".to_owned());
-        out.push_str(&format!("  size:         {size_s}\n"));
+            if !verbose {
+                continue;
+            }
 
-        // MIME type
-        let mime_s = info
-            .mimetype
-            .as_deref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_else(|| "(none)".to_owned());
-        out.push_str(&format!("  mime type:    {mime_s}\n"));
+            let description = file_spec.get_description()?;
+            if !description.is_empty() {
+                push_labelled(&mut out, b"  description: ", &description);
+            }
+            push_labelled(&mut out, b"  preferred name: ", &file_spec.get_filename()?);
+            out.extend_from_slice(b"  all names:\n");
+            for (name_key, name) in file_spec.get_filenames()? {
+                out.extend_from_slice(b"    ");
+                out.extend_from_slice(name_key.as_bytes());
+                out.extend_from_slice(b" -> ");
+                out.extend_from_slice(&name);
+                out.push(b'\n');
+            }
+            out.extend_from_slice(b"  all data streams:\n");
+            file_spec.get_embedded_file_streams()?
+        };
 
-        // Creation date
-        let cdate_s = info
-            .creation_date
-            .as_deref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_else(|| "(none)".to_owned());
-        out.push_str(&format!("  creation date:     {cdate_s}\n"));
+        // qpdf walks the raw /EF dictionary, so an entry under a key outside
+        // the recognized name keys is listed too; keys whose value is null are
+        // skipped, as they are by QPDFObjectHandle::getKeys.
+        let ef = pdf.resolve_object_handle_to_terminal(&ef)?;
+        let Some(streams) = ef.as_dictionary() else {
+            continue;
+        };
+        for (stream_key, stream) in streams {
+            if pdf.resolve_object_handle_to_terminal(&stream)?.is_null() {
+                continue;
+            }
+            out.extend_from_slice(b"    /");
+            out.extend_from_slice(&stream_key);
+            out.extend_from_slice(b" -> ");
+            out.extend_from_slice(object_generation(&stream).as_bytes());
+            out.push(b'\n');
 
-        // Modification date
-        let mdate_s = info
-            .modification_date
-            .as_deref()
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-            .unwrap_or_else(|| "(none)".to_owned());
-        out.push_str(&format!("  modification date: {mdate_s}\n"));
-
-        if verbose {
-            // Description — `/Filespec /Desc` is a PDF text string, so decode
-            // it through the canonical PDFDocEncoding/UTF-16 decoder rather
-            // than a lossy UTF-8 cast (roborev #953).
-            let desc_s = info
-                .description
-                .as_deref()
-                .map(decode_pdf_text_string)
-                .unwrap_or_else(|| "(none)".to_owned());
-            out.push_str(&format!("  description:     {desc_s}\n"));
-
-            // AFRelationship
-            let rel_s = info
-                .af_relationship
-                .as_deref()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_else(|| "(none)".to_owned());
-            out.push_str(&format!("  af relationship: {rel_s}\n"));
-
-            // Checksum as lowercase hex
-            let chk_s = info
-                .checksum
-                .as_deref()
-                .map(|b| {
-                    b.iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>()
-                })
-                .unwrap_or_else(|| "(none)".to_owned());
-            out.push_str(&format!("  checksum:        {chk_s}\n"));
+            let embedded_file = EmbeddedFileStream::new(stream, pdf)?;
+            let creation_date = embedded_file.get_creation_date()?;
+            let modification_date = embedded_file.get_mod_date()?;
+            let subtype = embedded_file.get_subtype()?;
+            let checksum = embedded_file.get_checksum()?;
+            push_labelled(&mut out, b"      creation date: ", &creation_date);
+            push_labelled(&mut out, b"      modification date: ", &modification_date);
+            push_labelled(&mut out, b"      mime type: ", &subtype);
+            push_labelled(
+                &mut out,
+                b"      checksum: ",
+                checksum_to_hex(&checksum).as_bytes(),
+            );
         }
     }
-    out
+    Ok(Some(out))
+}
+
+/// Append `label` followed by `value` and a newline.
+fn push_labelled(out: &mut Vec<u8>, label: &[u8], value: &[u8]) {
+    out.extend_from_slice(label);
+    out.extend_from_slice(value);
+    out.push(b'\n');
+}
+
+/// Render a handle's object and generation the way `QPDFObjGen::unparse(',')`
+/// does, reporting `0,0` for a direct object.
+fn object_generation(handle: &ObjectHandle) -> String {
+    match handle.object_ref() {
+        Some(object_ref) => format!("{},{}", object_ref.number, object_ref.generation),
+        None => "0,0".to_owned(),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -380,95 +403,466 @@ mod tests {
         assert!(infos.is_empty(), "no attachments → empty list");
     }
 
-    // ── (none) for missing metadata fields ───────────────────────────────────
+    // ── Filespec construction helpers ─────────────────────────────────────────
+
+    use crate::object::{Dictionary, Object, Stream};
+    use crate::ObjectRef;
+
+    fn next_ref(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectRef {
+        let next = pdf
+            .object_refs()
+            .iter()
+            .map(|r| r.number)
+            .max()
+            .unwrap_or(0);
+        ObjectRef::new(next + 1, 0)
+    }
+
+    /// Store an `/EmbeddedFile` stream and return its reference.
+    ///
+    /// `params` populates `/Params`; `subtype` populates `/Subtype`.  Both are
+    /// omitted entirely when `None`, which is what an attachment written by a
+    /// producer that records no metadata looks like.
+    fn add_ef_stream(
+        pdf: &mut Pdf<Cursor<Vec<u8>>>,
+        params: Option<Dictionary>,
+        subtype: Option<&[u8]>,
+    ) -> ObjectRef {
+        let stream_ref = next_ref(pdf);
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        dict.insert("Length", Object::Integer(4));
+        if let Some(subtype) = subtype {
+            dict.insert("Subtype", Object::Name(subtype.to_vec()));
+        }
+        if let Some(params) = params {
+            dict.insert("Params", Object::Dictionary(params));
+        }
+        pdf.set_object(
+            stream_ref,
+            Object::Stream(Stream::new(dict, b"data".to_vec())),
+        );
+        stream_ref
+    }
+
+    /// Store `filespec` and register it in the EmbeddedFiles name tree.
+    fn attach(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], filespec: Dictionary) -> ObjectRef {
+        let filespec_ref = next_ref(pdf);
+        pdf.set_object(filespec_ref, Object::Dictionary(filespec));
+        insert_embedded_file(pdf, key, filespec_ref).expect("insert");
+        filespec_ref
+    }
+
+    /// Build `/Params` with the standard four entries.
+    fn full_params() -> Dictionary {
+        let mut params = Dictionary::new();
+        params.insert("Size", Object::Integer(4));
+        params.insert(
+            "CreationDate",
+            Object::String(b"D:20240101000000Z".to_vec()),
+        );
+        params.insert("ModDate", Object::String(b"D:20240102000000Z".to_vec()));
+        params.insert("CheckSum", Object::String(vec![0x00, 0x1f, 0xa0, 0xff]));
+        params
+    }
+
+    fn listing(pdf: &mut Pdf<Cursor<Vec<u8>>>, verbose: bool) -> Vec<u8> {
+        format_attachment_list(pdf, verbose)
+            .expect("format")
+            .expect("document has an EmbeddedFiles name tree")
+    }
+
+    fn as_text(bytes: &[u8]) -> String {
+        String::from_utf8(bytes.to_vec()).expect("listing must be valid UTF-8 in these fixtures")
+    }
+
+    // ── Non-verbose output is one line per attachment ─────────────────────────
 
     #[test]
-    fn missing_metadata_renders_as_none() {
+    fn non_verbose_lists_only_the_header_line() {
         let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, Some(full_params()), Some(b"text/plain"));
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("Desc", Object::String(b"described".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
 
-        // Build a filespec with no mimetype, no dates, no desc, no AFRelationship.
-        let fs_ref = FileSpecBuilder::new("bare.txt", b"payload")
-            .build(&mut pdf)
-            .expect("build");
-        insert_embedded_file(&mut pdf, b"bare.txt", fs_ref).expect("insert");
-
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-
-        // The formatted non-verbose output must contain (none) for each absent field.
-        let formatted = format_attachment_list(std::slice::from_ref(info), false);
-        assert!(
-            formatted.contains("mime type:    (none)"),
-            "missing mime must render as (none): {formatted:?}"
-        );
-        assert!(
-            formatted.contains("creation date:     (none)"),
-            "missing creation date must render as (none): {formatted:?}"
-        );
-        assert!(
-            formatted.contains("modification date: (none)"),
-            "missing mod date must render as (none): {formatted:?}"
-        );
-
-        // Verbose: desc, af_relationship, checksum also (none)
-        // Note: FileSpecBuilder always writes /Params /CheckSum, so we only test desc/af.
-        let formatted_v = format_attachment_list(std::slice::from_ref(info), true);
-        assert!(
-            formatted_v.contains("description:     (none)"),
-            "missing desc must render as (none): {formatted_v:?}"
-        );
-        assert!(
-            formatted_v.contains("af relationship: (none)"),
-            "missing af_rel must render as (none): {formatted_v:?}"
+        let out = listing(&mut pdf, false);
+        assert_eq!(
+            as_text(&out),
+            format!("a.txt -> {},0\n", stream_ref.number),
+            "qpdf writes the header line outside its verbose block, so plain \
+             mode emits nothing else"
         );
     }
 
-    // ── verbose adds extra fields ─────────────────────────────────────────────
+    // ── Header object/generation comes from the embedded file stream ──────────
 
     #[test]
-    fn verbose_adds_desc_af_checksum_lines() {
+    fn header_objgen_is_the_stream_not_the_filespec() {
         let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        let filespec_ref = attach(&mut pdf, b"a.txt", filespec);
 
-        let fs_ref = FileSpecBuilder::new("verbose.txt", b"some data")
-            .description(b"A description")
-            .af_relationship(b"Source")
-            .build(&mut pdf)
-            .expect("build");
-        insert_embedded_file(&mut pdf, b"verbose.txt", fs_ref).expect("insert");
-
-        let infos = list_attachment_info(&mut pdf).expect("list");
-        assert_eq!(infos.len(), 1);
-
-        let non_verbose = format_attachment_list(&infos, false);
-        let verbose = format_attachment_list(&infos, true);
-
-        // Non-verbose must NOT contain description / af relationship / checksum lines
+        assert_ne!(
+            stream_ref.number, filespec_ref.number,
+            "fixture must distinguish the two objects"
+        );
+        let out = as_text(&listing(&mut pdf, false));
+        assert_eq!(out, format!("a.txt -> {},0\n", stream_ref.number));
         assert!(
-            !non_verbose.contains("description:"),
-            "non-verbose must not include description: {non_verbose:?}"
+            !out.contains(&format!("{},0", filespec_ref.number)),
+            "the /Filespec object number must not appear: {out:?}"
+        );
+    }
+
+    // ── Verbose block structure ───────────────────────────────────────────────
+
+    #[test]
+    fn verbose_block_matches_qpdf_structure() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, Some(full_params()), Some(b"text/plain"));
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        ef.insert("UF", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("UF", Object::String(encode_utf16be("π.txt")));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let n = stream_ref.number;
+        let expected = format!(
+            "a.txt -> {n},0\n\
+             \x20 preferred name: π.txt\n\
+             \x20 all names:\n\
+             \x20   /F -> a.txt\n\
+             \x20   /UF -> π.txt\n\
+             \x20 all data streams:\n\
+             \x20   /F -> {n},0\n\
+             \x20     creation date: D:20240101000000Z\n\
+             \x20     modification date: D:20240102000000Z\n\
+             \x20     mime type: text/plain\n\
+             \x20     checksum: 001fa0ff\n\
+             \x20   /UF -> {n},0\n\
+             \x20     creation date: D:20240101000000Z\n\
+             \x20     modification date: D:20240102000000Z\n\
+             \x20     mime type: text/plain\n\
+             \x20     checksum: 001fa0ff\n"
+        );
+        assert_eq!(as_text(&listing(&mut pdf, true)), expected);
+    }
+
+    // ── /Desc placement ───────────────────────────────────────────────────────
+
+    #[test]
+    fn description_precedes_preferred_name_and_only_when_present() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("Desc", Object::String(b"my description".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let with_desc = as_text(&listing(&mut pdf, true));
+        let lines: Vec<&str> = with_desc.lines().collect();
+        assert_eq!(lines[1], "  description: my description");
+        assert_eq!(lines[2], "  preferred name: a.txt");
+
+        // An empty /Desc drops the line entirely rather than printing a label.
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("Desc", Object::String(Vec::new()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let without_desc = as_text(&listing(&mut pdf, true));
+        assert!(
+            !without_desc.contains("description:"),
+            "an empty /Desc must not produce a line: {without_desc:?}"
+        );
+        assert_eq!(without_desc.lines().nth(1), Some("  preferred name: a.txt"));
+    }
+
+    // ── Absent metadata leaves the value empty ────────────────────────────────
+
+    #[test]
+    fn absent_values_render_empty_after_the_label() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let out = as_text(&listing(&mut pdf, true));
+        assert!(out.contains("      creation date: \n"), "{out:?}");
+        assert!(out.contains("      modification date: \n"), "{out:?}");
+        assert!(out.contains("      mime type: \n"), "{out:?}");
+        assert!(out.contains("      checksum: \n"), "{out:?}");
+        assert!(
+            !out.contains("(none)"),
+            "qpdf never substitutes a placeholder: {out:?}"
         );
         assert!(
-            !non_verbose.contains("af relationship:"),
-            "non-verbose must not include af relationship: {non_verbose:?}"
+            !out.contains("size:") && !out.contains("af relationship:"),
+            "qpdf's listing has no size or AFRelationship line: {out:?}"
         );
-        assert!(
-            !non_verbose.contains("checksum:"),
-            "non-verbose must not include checksum: {non_verbose:?}"
-        );
+    }
 
-        // Verbose must include all three extra fields
+    // ── /EF keys outside the recognized name keys ─────────────────────────────
+
+    #[test]
+    fn data_streams_list_every_ef_key_but_names_stay_recognized() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        ef.insert("Zed", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("Zed", Object::String(b"ignored.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let out = as_text(&listing(&mut pdf, true));
         assert!(
-            verbose.contains("description:     A description"),
-            "verbose must include description: {verbose:?}"
+            out.contains(&format!("    /Zed -> {},0\n", stream_ref.number)),
+            "an /EF key outside the name keys is still a data stream: {out:?}"
         );
         assert!(
-            verbose.contains("af relationship: Source"),
-            "verbose must include af relationship: {verbose:?}"
+            !out.contains("/Zed -> ignored.txt"),
+            "`all names` only covers the recognized name keys: {out:?}"
+        );
+    }
+
+    // ── Null /EF entries are skipped ──────────────────────────────────────────
+
+    #[test]
+    fn null_ef_entries_are_skipped() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let missing = ObjectRef::new(stream_ref.number + 40, 0);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        ef.insert("UF", Object::Null);
+        ef.insert("Unix", Object::Reference(missing));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"a.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"a.txt", filespec);
+
+        let out = as_text(&listing(&mut pdf, true));
+        assert!(out.contains("    /F -> "), "{out:?}");
+        assert!(
+            !out.contains("    /UF -> "),
+            "a direct null /EF value is not a key: {out:?}"
         );
         assert!(
-            verbose.contains("checksum:"),
-            "verbose must include checksum line: {verbose:?}"
+            !out.contains("    /Unix -> "),
+            "a reference to a missing object resolves to null: {out:?}"
+        );
+    }
+
+    // ── A filespec with no usable stream ──────────────────────────────────────
+
+    #[test]
+    fn filespec_without_ef_reports_zero_objgen() {
+        let mut pdf = open_minimal();
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"c.txt".to_vec()));
+        attach(&mut pdf, b"c.txt", filespec);
+
+        assert_eq!(
+            as_text(&listing(&mut pdf, true)),
+            "c.txt -> 0,0\n  preferred name: c.txt\n  all names:\n    /F -> c.txt\n  \
+             all data streams:\n",
+            "a missing /EF still prints the header and both section labels"
+        );
+    }
+
+    #[test]
+    fn ef_value_that_is_not_a_stream_is_not_preferred() {
+        let mut pdf = open_minimal();
+        let dict_ref = next_ref(&mut pdf);
+        let mut not_a_stream = Dictionary::new();
+        not_a_stream.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
+        pdf.set_object(dict_ref, Object::Dictionary(not_a_stream));
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(dict_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"g.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"g.txt", filespec);
+
+        let out = as_text(&listing(&mut pdf, true));
+        assert!(
+            out.starts_with("g.txt -> 0,0\n"),
+            "the header skips a non-stream /EF value: {out:?}"
+        );
+        assert!(
+            out.contains(&format!("    /F -> {},0\n", dict_ref.number)),
+            "`all data streams` reports the raw /EF value: {out:?}"
+        );
+    }
+
+    // ── Name tree presence decides the "no embedded files" branch ─────────────
+
+    #[test]
+    fn document_without_name_tree_returns_none() {
+        let mut pdf = open_minimal();
+        assert!(
+            format_attachment_list(&mut pdf, true)
+                .expect("format")
+                .is_none(),
+            "no /Names /EmbeddedFiles is the caller's `has no embedded files` case"
+        );
+    }
+
+    #[test]
+    fn empty_name_tree_lists_nothing_but_is_not_none() {
+        let mut pdf = open_minimal();
+        let root = pdf.root_ref().expect("catalog");
+        let mut catalog = pdf
+            .resolve(root)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dictionary");
+        let mut tree = Dictionary::new();
+        tree.insert("Names", Object::Array(Vec::new()));
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(tree));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(root, Object::Dictionary(catalog));
+
+        assert_eq!(
+            format_attachment_list(&mut pdf, true).expect("format"),
+            Some(Vec::new()),
+            "an empty tree lists nothing, but the document does have the tree"
+        );
+    }
+
+    /// Point `/Names /EmbeddedFiles` straight at `[key value]`, bypassing the
+    /// name-tree writer so the value shape can be chosen freely.
+    fn attach_raw_tree_value(pdf: &mut Pdf<Cursor<Vec<u8>>>, key: &[u8], value: Object) {
+        let root = pdf.root_ref().expect("catalog");
+        let mut catalog = pdf
+            .resolve(root)
+            .expect("resolve catalog")
+            .into_dict()
+            .expect("catalog dictionary");
+        let mut tree = Dictionary::new();
+        tree.insert(
+            "Names",
+            Object::Array(vec![Object::String(key.to_vec()), value]),
+        );
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Dictionary(tree));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(root, Object::Dictionary(catalog));
+    }
+
+    // ── Name-tree value shapes ────────────────────────────────────────────────
+
+    #[test]
+    fn inline_filespec_value_is_listed() {
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("Type", Object::Name(b"Filespec".to_vec()));
+        filespec.insert("F", Object::String(b"j.txt".to_vec()));
+        filespec.insert("EF", Object::Dictionary(ef));
+        // A name-tree leaf may hold the /Filespec inline instead of by
+        // reference; it must list exactly as an indirect one does.
+        attach_raw_tree_value(&mut pdf, b"j.txt", Object::Dictionary(filespec));
+
+        let n = stream_ref.number;
+        assert_eq!(
+            as_text(&listing(&mut pdf, true)),
+            format!(
+                "j.txt -> {n},0\n\
+                 \x20 preferred name: j.txt\n\
+                 \x20 all names:\n\
+                 \x20   /F -> j.txt\n\
+                 \x20 all data streams:\n\
+                 \x20   /F -> {n},0\n\
+                 \x20     creation date: \n\
+                 \x20     modification date: \n\
+                 \x20     mime type: \n\
+                 \x20     checksum: \n"
+            )
+        );
+    }
+
+    #[test]
+    fn non_dictionary_filespec_value_still_lists_the_key() {
+        // qpdf warns ("Embedded file object is not a dictionary") and carries
+        // on with empty values rather than failing the listing.
+        for value in [
+            Object::String(b"not-a-filespec".to_vec()),
+            Object::Reference(ObjectRef::new(4096, 0)),
+        ] {
+            let mut pdf = open_minimal();
+            attach_raw_tree_value(&mut pdf, b"k.txt", value);
+            assert_eq!(
+                as_text(&listing(&mut pdf, true)),
+                "k.txt -> 0,0\n  preferred name: \n  all names:\n  all data streams:\n",
+            );
+        }
+    }
+
+    // ── Name-tree keys use qpdf's UTF-8 view ──────────────────────────────────
+
+    #[test]
+    fn header_key_uses_the_qpdf_utf8_view() {
+        let mut pdf = open_minimal();
+        // Name-tree keys are qpdf's UTF-8 view on the way in; the tree stores
+        // them as UTF-16BE PDF strings, so a listing that echoed the stored
+        // bytes would be mojibake.
+        for (key, filename) in [
+            ("π.txt".as_bytes().to_vec(), b"pi.txt".as_slice()),
+            ("café.txt".as_bytes().to_vec(), b"cafe.txt".as_slice()),
+        ] {
+            let stream_ref = add_ef_stream(&mut pdf, None, None);
+            let mut ef = Dictionary::new();
+            ef.insert("F", Object::Reference(stream_ref));
+            let mut filespec = Dictionary::new();
+            filespec.insert("F", Object::String(filename.to_vec()));
+            filespec.insert("EF", Object::Dictionary(ef));
+            attach(&mut pdf, &key, filespec);
+        }
+
+        let out = as_text(&listing(&mut pdf, false));
+        let keys: Vec<&str> = out
+            .lines()
+            .map(|line| line.split(" -> ").next().expect("header key"))
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["café.txt", "π.txt"],
+            "keys decode through qpdf's UTF-8 view and order by the converted \
+             bytes: {out:?}"
         );
     }
 
@@ -476,29 +870,10 @@ mod tests {
 
     #[test]
     fn f_only_filespec_uses_f_as_display_name() {
-        use crate::object::{Dictionary, Object, Stream};
-        use crate::ObjectRef;
-
         let mut pdf = open_minimal();
 
-        // Allocate objects manually: stream + filespec with /F only (no /UF).
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
-        let stream_ref = ObjectRef::new(next + 1, 0);
-        let filespec_ref = ObjectRef::new(next + 2, 0);
-
         // Minimal EmbeddedFile stream (no /Params → missing size/dates/checksum).
-        let mut ef_dict = Dictionary::new();
-        ef_dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        ef_dict.insert("Length", Object::Integer(4));
-        let ef_stream = Stream::new(ef_dict, b"data".to_vec());
-        pdf.set_object(stream_ref, Object::Stream(ef_stream));
-
-        // /EF sub-dict with only /F.
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
         let mut ef_sub = Dictionary::new();
         ef_sub.insert("F", Object::Reference(stream_ref));
 
@@ -507,9 +882,7 @@ mod tests {
         fs_dict.insert("Type", Object::Name(b"Filespec".to_vec()));
         fs_dict.insert("F", Object::String(b"only-f.txt".to_vec()));
         fs_dict.insert("EF", Object::Dictionary(ef_sub));
-        pdf.set_object(filespec_ref, Object::Dictionary(fs_dict));
-
-        insert_embedded_file(&mut pdf, b"only-f.txt", filespec_ref).expect("insert");
+        attach(&mut pdf, b"only-f.txt", fs_dict);
 
         let infos = list_attachment_info(&mut pdf).expect("list");
         assert_eq!(infos.len(), 1);
@@ -519,10 +892,10 @@ mod tests {
             "/F must be used as display name when /UF is absent"
         );
 
-        let formatted = format_attachment_list(&infos, false);
+        let listed = as_text(&listing(&mut pdf, true));
         assert!(
-            formatted.contains("display name: only-f.txt"),
-            "formatted output must show /F as display name: {formatted:?}"
+            listed.contains("  preferred name: only-f.txt\n"),
+            "the listing falls back to /F for the preferred name: {listed:?}"
         );
     }
 
@@ -562,7 +935,7 @@ mod tests {
         let infos = list_attachment_info(&mut pdf).expect("list");
         assert_eq!(infos.len(), 1);
 
-        let verbose = format_attachment_list(&infos, true);
+        let verbose = as_text(&listing(&mut pdf, true));
         // The checksum line must contain lowercase hex, not raw bytes.
         // The actual MD5 of b"checksum test" is deterministic; verify format.
         let chk_line = verbose
@@ -627,13 +1000,28 @@ mod tests {
         assert_eq!(info.af_relationship.as_deref(), Some(b"Data".as_ref()));
         assert!(info.checksum.is_some(), "checksum must be present");
 
-        // Format check
-        let formatted = format_attachment_list(std::slice::from_ref(info), true);
-        assert!(formatted.contains("mime type:    text/plain"));
-        assert!(formatted.contains("creation date:     D:20260101000000Z"));
-        assert!(formatted.contains("modification date: D:20260615123000Z"));
-        assert!(formatted.contains("description:     Full test attachment"));
-        assert!(formatted.contains("af relationship: Data"));
+        // The listing renders the same document through qpdf's layout.
+        let formatted = as_text(&listing(&mut pdf, true));
+        assert!(
+            formatted.contains("      mime type: text/plain\n"),
+            "{formatted:?}"
+        );
+        assert!(
+            formatted.contains("      creation date: D:20260101000000Z\n"),
+            "{formatted:?}"
+        );
+        assert!(
+            formatted.contains("      modification date: D:20260615123000Z\n"),
+            "{formatted:?}"
+        );
+        assert!(
+            formatted.contains("  description: Full test attachment\n"),
+            "{formatted:?}"
+        );
+        assert!(
+            !formatted.contains("af relationship"),
+            "qpdf's listing has no /AFRelationship line: {formatted:?}"
+        );
     }
 
     // ── decode_pdf_text_string ────────────────────────────────────────────────
@@ -663,52 +1051,23 @@ mod tests {
         assert_eq!(decode_pdf_text_string(b"caf\xE9"), "café");
     }
 
-    // Regression for roborev #954: the header line key must be decoded as a
-    // PDF text string, not lossy UTF-8, so non-ASCII keys are not mojibake.
-    #[test]
-    fn header_key_decodes_pdfdocencoding() {
-        let info = AttachmentInfo {
-            key: b"caf\xE9.txt".to_vec(),
-            filespec_ref: crate::ObjectRef::new(7, 0),
-            display_name: Some("café.txt".to_owned()),
-            size: None,
-            mimetype: None,
-            creation_date: None,
-            modification_date: None,
-            description: None,
-            af_relationship: None,
-            checksum: None,
-        };
-        let formatted = format_attachment_list(std::slice::from_ref(&info), false);
-        assert!(
-            formatted.contains("café.txt -> 7,0"),
-            "non-ASCII PDFDocEncoding key must decode in the header: {formatted:?}"
-        );
-        assert!(
-            !formatted.contains('\u{FFFD}'),
-            "header must not contain replacement chars: {formatted:?}"
-        );
-    }
-
     // Regression for roborev #953: /Desc verbose output must decode PDF text
     // strings (here UTF-16BE) instead of showing mojibake.
     #[test]
     fn verbose_description_decodes_utf16be() {
-        let info = AttachmentInfo {
-            key: b"k.txt".to_vec(),
-            filespec_ref: crate::ObjectRef::new(1, 0),
-            display_name: Some("k.txt".to_owned()),
-            size: None,
-            mimetype: None,
-            creation_date: None,
-            modification_date: None,
-            description: Some(encode_utf16be("dé")),
-            af_relationship: None,
-            checksum: None,
-        };
-        let formatted = format_attachment_list(std::slice::from_ref(&info), true);
+        let mut pdf = open_minimal();
+        let stream_ref = add_ef_stream(&mut pdf, None, None);
+        let mut ef = Dictionary::new();
+        ef.insert("F", Object::Reference(stream_ref));
+        let mut filespec = Dictionary::new();
+        filespec.insert("F", Object::String(b"k.txt".to_vec()));
+        filespec.insert("Desc", Object::String(encode_utf16be("dé")));
+        filespec.insert("EF", Object::Dictionary(ef));
+        attach(&mut pdf, b"k.txt", filespec);
+
+        let formatted = as_text(&listing(&mut pdf, true));
         assert!(
-            formatted.contains("description:     dé"),
+            formatted.contains("  description: dé\n"),
             "UTF-16BE /Desc must be decoded: {formatted:?}"
         );
     }
