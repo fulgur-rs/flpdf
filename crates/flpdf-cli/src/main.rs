@@ -13,8 +13,7 @@ use flpdf::{
 };
 use flpdf::{
     check_reader_with_options_and_limits, enumerate_document_annotations, filters,
-    flatten_rotation_on_pages, fonts, generate_button_field_appearance,
-    generate_choice_field_appearance, generate_text_field_appearance,
+    flatten_rotation_on_pages, fonts,
     json_inspect::{
         write_qpdf_json_v2_selected_objects_to_output_with_options, DecodeLevel, JsonKey,
         JsonObjectSelector, JsonOutput, StreamDataMode as JsonStreamDataMode,
@@ -3324,10 +3323,10 @@ fn run_rewrite(
 /// Generate `/AP` `/N` appearance streams for widget annotations that lack one
 /// (`--generate-appearances`).
 ///
-/// Walks every page's `/Annots`, keeps only Widget annotations whose `/AP` `/N`
-/// is missing, and renders an appearance from the field's `/FT` (`Tx` → text,
-/// `Btn` → button, `Ch` → choice). Widgets that already carry an `/AP` `/N` are
-/// left untouched, matching qpdf which only fills in *missing* appearances.
+/// Walks every page's `/Annots`. Every button field re-applies its current
+/// value so `/AS` stays synchronized with `/V`; non-button widgets whose
+/// `/AP` `/N` is missing render from the terminal field's `/FT` (`Tx` → text,
+/// `Ch` → choice). Existing non-button `/AP` `/N` streams stay untouched.
 ///
 /// Review-pattern compliance:
 /// - #2 (indirect references): `/FT` is read via [`FormFieldObjectHelper::field_type`]
@@ -3341,18 +3340,32 @@ fn run_rewrite(
 /// per-widget mutation loop holds a single `&mut pdf` borrow at a time.
 fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
     // Collect candidate widget refs first (the enumeration borrows `pdf`).
-    let mut candidates: Vec<ObjectRef> = Vec::new();
+    let mut candidates: Vec<(ObjectRef, ObjectRef)> = Vec::new();
     for (_page_ref, annots) in enumerate_document_annotations(pdf)? {
         for annot in annots {
-            if annot.is_widget {
-                candidates.push(annot.annot_ref);
+            if let Some(field_ref) = annot.field_ref.filter(|_| annot.is_widget) {
+                candidates.push((field_ref, annot.annot_ref));
             }
         }
     }
 
-    for widget_ref in candidates {
-        // Skip widgets that already have a normal appearance (/AP /N). qpdf
-        // only synthesizes appearances for fields that lack them.
+    for (field_ref, widget_ref) in candidates {
+        // qpdf routes every /Btn through setV(getValue()), regardless of
+        // whether /AP/N exists. set_value owns checkbox/radio synchronization
+        // and intentionally ignores pushbuttons and invalid values.
+        let is_button = FormFieldObjectHelper::new(field_ref, pdf)
+            .field_type()?
+            .as_deref()
+            == Some(b"/Btn");
+        if is_button {
+            let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+            let value = helper.value()?.unwrap_or(Object::Null);
+            helper.set_value(value, false)?;
+            continue;
+        }
+
+        // Skip non-button widgets that already have a normal appearance
+        // (/AP /N). qpdf only synthesizes Tx/Ch appearances when missing.
         let has_normal = {
             let mut helper = AnnotationObjectHelper::new(widget_ref, pdf);
             // Treat /AP/N == null the same as absent. The flattening pass
@@ -3368,25 +3381,7 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             continue;
         }
 
-        // Dispatch on the inherited /FT (resolved through the field tree). The
-        // generate_* helpers each re-verify /FT and return None on a mismatch,
-        // so this is a fast-path filter that avoids three speculative calls.
-        let field_type = {
-            let mut helper = FormFieldObjectHelper::new(widget_ref, pdf);
-            helper.field_type()?
-        };
-        match field_type.as_deref() {
-            Some(b"Tx") => {
-                generate_text_field_appearance(pdf, widget_ref)?;
-            }
-            Some(b"Btn") => {
-                generate_button_field_appearance(pdf, widget_ref)?;
-            }
-            Some(b"Ch") => {
-                generate_choice_field_appearance(pdf, widget_ref)?;
-            }
-            _ => {}
-        }
+        FormFieldObjectHelper::new(field_ref, pdf).generate_appearance_for(widget_ref)?;
     }
 
     Ok(())
@@ -3396,33 +3391,7 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
 /// Keep an absent or already-false key unchanged, so the explicit CLI pass
 /// does not introduce a catalog mutation when qpdf would have returned early.
 fn clear_need_appearances_after_generation<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<()> {
-    let Some(root_ref) = pdf.root_ref() else {
-        return Ok(());
-    };
-    let Object::Dictionary(mut root) = pdf.resolve(root_ref)? else {
-        return Ok(());
-    };
-    let Some(acroform) = root.get("AcroForm").cloned() else {
-        return Ok(());
-    };
-    let (acroform, terminal_ref) = resolve_reference_chain(pdf, acroform)?;
-    let Object::Dictionary(mut acroform) = acroform else {
-        return Ok(());
-    };
-    let Some(need_appearances) = acroform.get("NeedAppearances").cloned() else {
-        return Ok(());
-    };
-    let (need_appearances, _) = resolve_reference_chain(pdf, need_appearances)?;
-    if !matches!(need_appearances, Object::Boolean(true)) {
-        return Ok(());
-    }
-    acroform.remove("NeedAppearances");
-    if let Some(acroform_ref) = terminal_ref {
-        pdf.set_object(acroform_ref, Object::Dictionary(acroform));
-    } else {
-        root.insert("AcroForm", Object::Dictionary(acroform));
-        pdf.set_object(root_ref, Object::Dictionary(root));
-    }
+    FormFieldObjectHelper::clear_need_appearances_after_generation(pdf)?;
     Ok(())
 }
 

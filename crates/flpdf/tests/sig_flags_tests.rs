@@ -386,9 +386,8 @@ fn build_deep_kids_tree_pdf() -> Vec<u8> {
     build_pdf(&borrowed)
 }
 
-/// A top-level form field that is an annotation (`/Rect`) whose inherited `/FT`
-/// must be resolved up a `/Parent` chain longer than the depth limit, so
-/// `getFieldType` overflows inside the disable loop.
+/// A top-level form field that is an annotation (`/Rect`) whose inherited
+/// `/FT /Sig` must be resolved up a long acyclic `/Parent` chain.
 fn build_deep_parent_chain_widget_field_pdf() -> Vec<u8> {
     let hops = DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30;
     let mut objects: Vec<(u32, Vec<u8>)> = vec![
@@ -412,7 +411,7 @@ fn build_deep_parent_chain_widget_field_pdf() -> Vec<u8> {
         objects.push((obj, format!("<< /Parent {next} 0 R >>").into_bytes()));
     }
     let tail = 6 + hops;
-    objects.push((tail, b"<< >>".to_vec()));
+    objects.push((tail, b"<< /FT /Sig >>".to_vec()));
     let borrowed: Vec<(u32, &[u8])> = objects.iter().map(|(n, b)| (*n, b.as_slice())).collect();
     build_pdf(&borrowed)
 }
@@ -811,10 +810,15 @@ fn disable_digital_signatures_errs_on_deep_kids_tree() {
 }
 
 #[test]
-fn disable_digital_signatures_errs_on_deep_parent_field_type() {
-    // A form field (annotation) whose inherited /FT must be resolved up a
-    // /Parent chain longer than the limit overflows getFieldType, and that
-    // error propagates out of the disable loop.
+fn disable_digital_signatures_follows_a_long_parent_chain_to_sig_field_type() {
+    // qpdf follows the full acyclic /Parent chain, recognizes the inherited
+    // /FT /Sig, and removes the top-level widget from /Fields. The inherited
+    // key remains on its ancestor because disableDigitalSignatures strips keys
+    // only from the form-field object itself.
     let mut pdf = open(build_deep_parent_chain_widget_field_pdf());
-    assert!(disable_digital_signatures(&mut pdf).is_err());
+    assert!(disable_digital_signatures(&mut pdf).unwrap());
+    assert!(acroform_fields(&mut pdf).is_empty());
+
+    let tail = ObjectRef::new(6 + DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32 + 30, 0);
+    assert!(has_entry(&mut pdf, tail, "FT"));
 }

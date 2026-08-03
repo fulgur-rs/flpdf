@@ -8,10 +8,10 @@
 //! - `/AcroForm /SigFlags` primitives ([`acroform_sig_flags`], [`clear_sig_flags`])
 //!   that read, surface, and clear the SignaturesExist/AppendOnly bits.
 
+use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json_inspect::decode_pdf_text_string;
 use crate::{
-    Dictionary, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf, Result, WriteOptions,
-    DEFAULT_MAX_ACROFORM_DEPTH,
+    Dictionary, Error, Object, ObjectRef, Pdf, Result, WriteOptions, DEFAULT_MAX_ACROFORM_DEPTH,
 };
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
@@ -313,8 +313,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 /// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`,
 /// page, and field-tree objects (surfaced by [`Pdf::resolve`]), and
 /// [`Error::Unsupported`] when the field-tree traversal depth limit
-/// ([`DEFAULT_MAX_ACROFORM_DEPTH`]) or a field's `/Parent` chain depth limit is
-/// exceeded.
+/// ([`DEFAULT_MAX_ACROFORM_DEPTH`]) is exceeded.
 pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let mut changed = remove_security_restrictions(pdf)?;
 
@@ -323,7 +322,7 @@ pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
     let mut to_remove: Vec<ObjectRef> = Vec::new();
     for field_ref in form_fields {
         let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
-        if field_type.as_deref() != Some(b"Sig") {
+        if field_type.as_deref() != Some(b"/Sig") {
             continue;
         }
         // qpdf records every /Sig form field in `to_remove` unconditionally,
@@ -863,7 +862,10 @@ fn strip_signature_values_from_field<R: Read + Seek>(
         return Ok(());
     };
 
-    let field_type = inherited_name(pdf, &dict, "FT")?.or(inherited_type);
+    let field_type = FormFieldObjectHelper::new(field_ref, pdf)
+        .field_type()?
+        .map(|name| name.strip_prefix(b"/").unwrap_or(&name).to_vec())
+        .or(inherited_type);
     let kids_obj = dict.get("Kids").cloned();
 
     let signature_value_ref = dict.get("V").and_then(Object::as_ref_id);
@@ -951,11 +953,14 @@ fn walk_signature_rewrite_field<R: Read + Seek>(
         return Ok(());
     };
 
-    // Resolve /FT through inherited_name so an indirect-reference /FT is still
-    // recognised as a signature field (matches walk_signature_field /
-    // strip_signature_values_from_field). inherited_ft remains the top-down
-    // fallback supplied by the parent during the Kids descent.
-    let field_type = inherited_name(pdf, &dict, "FT")?.or(inherited_ft);
+    // Resolve /FT through the form-field helper so an indirect-reference /FT
+    // is recognised consistently with the public object-helper boundary.
+    // `inherited_ft` remains the top-down fallback supplied by the parent
+    // during the Kids descent.
+    let field_type = FormFieldObjectHelper::new(field_ref, pdf)
+        .field_type()?
+        .map(|name| name.strip_prefix(b"/").unwrap_or(&name).to_vec())
+        .or(inherited_ft);
 
     if field_type.as_deref() == Some(b"Sig") {
         info.signed_object_refs.insert(field_ref);
@@ -1065,9 +1070,16 @@ fn walk_signature_field<R: Read + Seek>(
     };
     let field_dict = field_dict.clone();
 
-    let field_name = join_field_name(parent_name, text_entry(pdf, &field_dict, "T")?);
-    if inherited_name(pdf, &field_dict, "FT")?.as_deref() == Some(b"Sig") {
-        if let Some(info) = signature_info_for_field(pdf, field_ref, &field_name, &field_dict)? {
+    let (partial_name, is_signature) = {
+        let mut field = FormFieldObjectHelper::new(field_ref, pdf);
+        let partial_name = field.partial_name()?;
+        let partial_name = (!partial_name.is_empty()).then_some(partial_name);
+        let is_signature = field.field_type()?.as_deref() == Some(b"/Sig");
+        (partial_name, is_signature)
+    };
+    let field_name = join_field_name(parent_name, partial_name);
+    if is_signature {
+        if let Some(info) = signature_info_for_field(pdf, field_ref, &field_name)? {
             output.push(info);
         }
     }
@@ -1108,13 +1120,13 @@ fn signature_info_for_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
     field_name: &str,
-    field_dict: &Dictionary,
 ) -> Result<Option<SignatureInfo>> {
-    let Some(value) = inherited_field_value(pdf, field_dict, "V")? else {
+    let Some(value) = FormFieldObjectHelper::new(field_ref, pdf).field_value_handle()? else {
         return Ok(None);
     };
-    let signature_ref = value.as_ref_id();
-    let Some(signature_dict) = resolve_dictionary(pdf, value)? else {
+    let signature_ref = value.object_ref().or_else(|| value.as_reference());
+    let value = pdf.resolve_object_handle_to_terminal(&value)?;
+    let Object::Dictionary(signature_dict) = value.materialize() else {
         return Ok(None);
     };
     let Some(byte_range_obj) = signature_dict.get("ByteRange").cloned() else {
@@ -1188,56 +1200,6 @@ fn parse_byte_range<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<[
 
 fn invalid_byte_range(message: &'static str) -> Error {
     Error::parse(0, format!("invalid signature /ByteRange: {message}"))
-}
-
-fn inherited_name<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field_dict: &Dictionary,
-    key: &str,
-) -> Result<Option<Vec<u8>>> {
-    match inherited_field_value(pdf, field_dict, key)? {
-        Some(Object::Name(name)) => Ok(Some(name)),
-        Some(Object::Reference(object_ref)) => match pdf.resolve_borrowed(object_ref)? {
-            Object::Name(name) => Ok(Some(name.clone())),
-            _ => Ok(None),
-        },
-        _ => Ok(None),
-    }
-}
-
-fn inherited_field_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    field_dict: &Dictionary,
-    key: &str,
-) -> Result<Option<Object>> {
-    if let Some(local) = field_dict.get(key).cloned() {
-        return Ok(Some(local));
-    }
-
-    let mut parent = field_dict.get("Parent").cloned();
-    let mut seen = BTreeSet::new();
-    let mut depth: usize = 0;
-    while let Some(Object::Reference(parent_ref)) = parent {
-        if depth > DEFAULT_MAX_SIGNATURE_FIELD_DEPTH {
-            return Err(Error::Unsupported(format!(
-                "signature field-tree depth limit {DEFAULT_MAX_SIGNATURE_FIELD_DEPTH} exceeded at {parent_ref}"
-            )));
-        }
-        if !seen.insert(parent_ref) {
-            break;
-        }
-        match pdf.resolve_borrowed(parent_ref)? {
-            Object::Dictionary(parent_dict) => {
-                if let Some(value) = parent_dict.get(key).cloned() {
-                    return Ok(Some(value));
-                }
-                parent = parent_dict.get("Parent").cloned();
-            }
-            _ => break,
-        }
-        depth += 1;
-    }
-    Ok(None)
 }
 
 fn join_field_name(parent_name: &str, local_name: Option<String>) -> String {
@@ -1356,48 +1318,6 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(Cursor::new(bytes)).expect("open")
-    }
-
-    // Register a /Parent chain obj(start)->obj(start+1)->...->obj(start+len-1).
-    // The deepest node carries `key`; the starting dict (returned) only has /Parent.
-    fn parent_chain(pdf: &mut Pdf<Cursor<Vec<u8>>>, start: u32, len: u32, key: &str) -> Dictionary {
-        for i in 0..len {
-            let num = start + i;
-            let mut d = Dictionary::new();
-            if i + 1 < len {
-                d.insert("Parent", Object::Reference(ObjectRef::new(num + 1, 0)));
-            } else {
-                // deepest node holds the inheritable value
-                d.insert(key, Object::Integer(42));
-            }
-            pdf.set_object(ObjectRef::new(num, 0), Object::Dictionary(d));
-        }
-        let mut start_dict = Dictionary::new();
-        start_dict.insert("Parent", Object::Reference(ObjectRef::new(start, 0)));
-        start_dict
-    }
-
-    #[test]
-    fn inherited_field_value_errors_on_excessive_parent_depth() {
-        let mut pdf = empty_pdf();
-        // Chain longer than the limit so the guard trips before reaching the leaf.
-        let start_dict = parent_chain(
-            &mut pdf,
-            2,
-            (DEFAULT_MAX_SIGNATURE_FIELD_DEPTH as u32) + 5,
-            "V",
-        );
-        let err = inherited_field_value(&mut pdf, &start_dict, "V");
-        assert!(matches!(err, Err(Error::Unsupported(_))));
-    }
-
-    #[test]
-    fn inherited_field_value_resolves_within_limit() {
-        let mut pdf = empty_pdf();
-        // Short chain: the inherited value must be found, not errored.
-        let start_dict = parent_chain(&mut pdf, 2, 4, "V");
-        let got = inherited_field_value(&mut pdf, &start_dict, "V").unwrap();
-        assert_eq!(got, Some(Object::Integer(42)));
     }
 
     // Build a dictionary from (key, Object) pairs for the traverse-based

@@ -848,7 +848,7 @@ fn duplicate_field_tree<R: Read + Seek>(
         // rule 1.
         //
         // `/DA` is permitted as either a direct string or an indirect ref
-        // to a string (see `crate::appearance` for how the reader handles
+        // to a string (see the form-field rendering module for how the reader handles
         // both). Convert an indirect ref to a direct string on the copied
         // field: replacing the value inline keeps every foreign-copied
         // field independent of the source string object, so a subsequent

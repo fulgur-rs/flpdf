@@ -231,8 +231,9 @@ fn find_field_ref<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<
     // fall through to the /Parent branch below and be wrongly aggregated into
     // the ancestor together with its siblings. (review-pattern #2: both keys may
     // be indirect, so presence — not value type — is what matters.)
-    if matches!(dict.get("FT"), Some(v) if !matches!(v, Object::Null))
-        || matches!(dict.get("T"), Some(v) if !matches!(v, Object::Null))
+    if ["FT", "T", "Kids", "V", "DV", "Ff", "TU", "TM"]
+        .into_iter()
+        .any(|key| matches!(dict.get(key), Some(value) if !matches!(value, Object::Null)))
     {
         return Ok(Some(start));
     }
@@ -457,6 +458,20 @@ mod tests {
         // Each merged terminal field resolves to itself — NOT both to obj 5.
         assert_eq!(annots[0].field_ref, Some(ObjectRef::new(4, 0)));
         assert_eq!(annots[1].field_ref, Some(ObjectRef::new(6, 0)));
+    }
+
+    #[test]
+    fn unnamed_merged_widget_with_local_value_is_its_own_field() {
+        let obj4: &[u8] = b"4 0 obj\n<< /Type /Annot /Subtype /Widget \
+                             /Rect [0 0 100 20] /V (local) /Parent 5 0 R >>\nendobj\n";
+        let obj5: &[u8] = b"5 0 obj\n<< /FT /Tx /Kids [4 0 R] >>\nendobj\n";
+
+        let bytes = build_pdf(Some("[4 0 R]"), &[(4, obj4), (5, obj5)]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
+
+        let annots = enumerate_page_annotations(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(annots.len(), 1);
+        assert_eq!(annots[0].field_ref, Some(ObjectRef::new(4, 0)));
     }
 
     // -----------------------------------------------------------------------

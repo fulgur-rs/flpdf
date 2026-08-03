@@ -6,11 +6,12 @@
 //! [`crate::FormFieldObjectHelper`] for inherited value lookup and on
 //! [`crate::copy_objects`] for cross-document field copying.
 
+use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object::MAX_INLINE_DEPTH;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
-    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, FormFieldObjectHelper,
-    Object, ObjectRef, Pdf, Result, DEFAULT_MAX_ACROFORM_DEPTH,
+    copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, Object, ObjectRef, Pdf,
+    Result, DEFAULT_MAX_ACROFORM_DEPTH,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
