@@ -799,7 +799,23 @@ git commit -m "feat: decode stream data from an ObjectHandle dictionary"
 ## Task 7: Legacy-vs-native equivalence corpus (AC3 + AC4 in one gate)
 
 **Files:**
-- Create: `crates/flpdf/tests/objecthandle_stream_decode_equivalence.rs`
+- Modify: `crates/flpdf/src/filters.rs` — add the equivalence corpus as an
+  **in-crate** `#[cfg(test)]` module, not an integration test.
+
+> **Why in-crate, corrected after Task 5's review.** `lib.rs:167` declares
+> `pub(crate) mod stream_filter;`, so a file under `crates/flpdf/tests/`
+> compiles as a separate crate and cannot reach `decode_filter_specs_from_object`,
+> `decode_filter_specs_from_handle`, `FilterSpec`, `DecodeParams`, or Task 5's
+> `shape_corpus`/`handle_from_object` helpers. Task 6 also keeps its
+> outcome-level entry point `pub(crate)`. An earlier draft asked for an
+> integration test, which is incompatible with both.
+>
+> Do **not** resolve this by widening visibility. `flpdf-25kg.3.3` deliberately
+> kept the `try_*` accessors crate-private (PR #620 review) until `.3.5` wires
+> the resolver, and `.3.5` is itself in-crate, so nothing here needs a public
+> surface. The `qtest-driver` feature gate used for `ref_chain`/`tokenizer`
+> (`lib.rs:151-155`, `:170-174`) exists for an external driver — this is not
+> that case.
 
 > **This gate covers a DIRECT-ONLY corpus, and that limit is load-bearing.**
 > Decision D1 makes the two readers *deliberately* disagree on an indirect
@@ -827,19 +843,28 @@ the native `ObjectHandle` entry point return the **same** `Ok`/`Err` and the
 `max_output` limit case and the malformed/truncated-flate cases that
 `stream_decode_recovery_public_api.rs` already pins.
 
-The point of this file is that it fails loudly if Task 1-3's refactor drifted the
-legacy behavior *or* if the native reader diverges — one assertion covering both
-AC3 and AC4.
+The point of this module is that it fails loudly if Task 1-3's refactor drifted
+the legacy behavior *or* if the native reader diverges — one assertion covering
+both AC3 and AC4.
+
+**Carry the `max_filter_chain` dimension up from Task 5.** Task 5's *unit*
+corpus already sweeps `[None, Some(16), Some(0)]`. `DecodeLimits` is `pub` with
+a `pub max_filter_chain` field and `decode_stream_data_with_limits` is `pub`,
+so `Some(0)` is genuinely reachable by an embedder — Task 5's review proved it
+by compiling a probe that got
+`filter chain length 1 exceeds maximum of 0` out of the public API. If this
+entry-point corpus sweeps only the default limit, that live public behavior
+ships uncompared between the two entry points.
 
 **Step 2: Run it**
 
-Run: `cargo test -p flpdf --test objecthandle_stream_decode_equivalence`
+Run: `cargo test -p flpdf --lib equivalence`
 Expected: PASS.
 
 **Step 3: Commit**
 
 ```bash
-git add crates/flpdf/tests/objecthandle_stream_decode_equivalence.rs
+git add crates/flpdf/src/filters.rs
 git commit -m "test: pin legacy and ObjectHandle decode equivalence"
 ```
 
