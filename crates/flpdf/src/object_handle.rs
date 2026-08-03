@@ -251,19 +251,12 @@ impl ObjectHandle {
     // Test-only, and necessarily so: every caller is inside a `#[cfg(test)]`
     // module (this file's own tests, plus `parser.rs`'s
     // `handle_path_parity_tests` and `reader.rs`'s tests).
-    // `Pdf::get_object_handle` does *not* use this — it needs the document
-    // identity, so it calls `new_indirect_unresolved_for_pdf`.
+    // `Pdf::get_object_handle` does *not* use this — it needs both the
+    // document identity and the resolver, so it calls
+    // `new_indirect_for_pdf_with_resolver`.
     #[cfg(test)]
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
         Self::new_indirect_unresolved_with_identity(object_ref, offset, None, None)
-    }
-
-    pub(crate) fn new_indirect_unresolved_for_pdf(
-        object_ref: ObjectRef,
-        offset: i64,
-        pdf_unique_id: u64,
-    ) -> Self {
-        Self::new_indirect_unresolved_with_identity(object_ref, offset, Some(pdf_unique_id), None)
     }
 
     /// Construct a canonical unresolved slot carrying both its owning
@@ -297,8 +290,6 @@ impl ObjectHandle {
     /// identity and the route to the resolver. This port splits that single
     /// pointer into a plain tag plus a `Weak`, which is why both arguments
     /// have to be supplied together here.
-    #[allow(dead_code)] // no non-test caller yet: `Pdf::get_object_handle`
-                        // attaches it in the next step of flpdf-25kg.3.5
     pub(crate) fn new_indirect_for_pdf_with_resolver(
         object_ref: ObjectRef,
         offset: i64,

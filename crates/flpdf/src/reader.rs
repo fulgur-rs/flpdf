@@ -1,14 +1,16 @@
 //! qpdf correspondence: QPDF.cc document reading, object resolution, recovery, and authentication responsibilities.
 pub(crate) mod file_object;
+pub(crate) mod resolver;
 
 use self::file_object::{
     finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingBody,
     PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
+use self::resolver::ResolverHandle;
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -29,7 +31,8 @@ use crate::{
     XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek};
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -75,11 +78,17 @@ static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 pub struct Pdf<R: Read + Seek + 'static> {
     /// Stable per-document identity used by qpdf-style foreign object copiers.
     unique_id: u64,
-    reader: R,
-    /// Physical byte position corresponding to qpdf's logical input offset 0.
-    /// This is nonzero only when repair found a valid header after leading
-    /// material in the first 1024 bytes.
-    header_offset: usize,
+    /// The canonical resolver and the state it owns — the input source, the
+    /// header offset, and the cross-reference table among them. See
+    /// [`resolver::ResolverCore`] for the full field list and its qpdf
+    /// correspondence.
+    ///
+    /// Held behind an `Rc` because every [`ObjectHandle`] this document vends
+    /// carries a `Weak` to it, so a nested reference can be dereferenced with
+    /// no `&mut Pdf` in scope. `Pdf` holds the only strong reference, so a
+    /// surviving handle can never keep a dropped document's input source
+    /// alive.
+    resolver: Rc<ResolverHandle<R>>,
     version: String,
     trailer: Dictionary,
     startxref: u64,
@@ -135,7 +144,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// of objects whose bodies run to EOF cannot revive the quadratic cost.
     resolution_fallbacks_remaining: u32,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
-    source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
     dirty_object_refs: BTreeSet<ObjectRef>,
     /// Dirty objects whose live ObjectHandle graph was changed directly, so
     /// the legacy object cache may no longer agree with it. `set_object`
@@ -660,8 +668,12 @@ impl<R: Read + Seek> Pdf<R> {
         let cache = ObjectCache::from_offsets(&loaded.entries);
         let mut pdf = Self {
             unique_id: NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed),
-            reader,
-            header_offset: loaded_state.header_offset,
+            resolver: Rc::new(ResolverHandle::new(
+                reader,
+                loaded_state.header_offset,
+                source_xref_entries,
+                options.repair,
+            )),
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
@@ -676,7 +688,6 @@ impl<R: Read + Seek> Pdf<R> {
             sorted_object_offsets,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             source_xref_offsets,
-            source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             recovered_stream_eols: BTreeMap::new(),
@@ -1074,11 +1085,11 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        self.source_xref_entries.clone()
+        self.resolver.xref_entries()
     }
 
     pub(crate) fn source_header_offset(&self) -> usize {
-        self.header_offset
+        self.resolver.header_offset()
     }
 
     /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
@@ -1091,9 +1102,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// normal resolution, so `stream` text inside strings, names, comments, or
     /// earlier stream payloads cannot be mistaken for the stream marker.
     pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let pending = self.parse_source_file_object_at(offset)?;
@@ -1101,10 +1110,6 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(None);
         };
         Ok(Some(offset.saturating_add(data_start as u64)))
-    }
-
-    fn physical_source_offset(&self, logical_offset: u64) -> u64 {
-        (self.header_offset as u64).saturating_add(logical_offset)
     }
 
     /// Return the source offset of the `/DecodeParms` value paired with one
@@ -1120,9 +1125,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         filter_index: usize,
     ) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
@@ -1145,9 +1148,7 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         object_ref: ObjectRef,
     ) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let body_start =
@@ -1173,9 +1174,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         array_index: usize,
     ) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
@@ -1199,25 +1198,13 @@ impl<R: Read + Seek> Pdf<R> {
         parse: impl Fn(&[u8]) -> Result<T>,
     ) -> Result<T> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
-        self.reader.seek(SeekFrom::Start(physical_offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => self
-                .reader
-                .by_ref()
-                .take(next.saturating_sub(offset))
-                .read_to_end(&mut bytes)?,
-            None => self.reader.read_to_end(&mut bytes)?,
-        };
+        let bytes = self.resolver.read_window(offset, next)?;
 
         match parse(&bytes) {
             Ok(value) => Ok(value),
             Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(physical_offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
+                let full = self.resolver.read_window(offset, None)?;
                 parse(&full).or(Err(window_error))
             }
             Err(error) => Err(error),
@@ -1250,25 +1237,13 @@ impl<R: Read + Seek> Pdf<R> {
 
     fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
-        self.reader.seek(SeekFrom::Start(physical_offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => self
-                .reader
-                .by_ref()
-                .take(next.saturating_sub(offset))
-                .read_to_end(&mut bytes)?,
-            None => self.reader.read_to_end(&mut bytes)?,
-        };
+        let bytes = self.resolver.read_window(offset, next)?;
 
         match parse_file_object_syntax(&bytes) {
             Ok(pending) => Ok(pending),
             Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(physical_offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
+                let full = self.resolver.read_window(offset, None)?;
                 parse_file_object_syntax(&full).or(Err(window_error))
             }
             Err(error) => Err(error),
@@ -1413,10 +1388,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
-        self.reader.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        self.reader.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        self.resolver.read_physical_input()
     }
 
     /// Number of objects currently resolved in the cache. Useful when you want to
@@ -1620,16 +1592,34 @@ impl<R: Read + Seek> Pdf<R> {
     /// This does not perform file I/O or force object-body parsing: the
     /// returned handle's value is not read or resolved by this call.
     pub fn get_object_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        self.handle_registry
-            .entry(object_ref)
-            .or_insert_with(|| {
-                ObjectHandle::new_indirect_unresolved_for_pdf(
-                    object_ref,
-                    NO_PARSED_OFFSET,
-                    self.unique_id,
-                )
-            })
-            .clone()
+        if let Some(handle) = self.handle_registry.get(&object_ref) {
+            return handle.clone();
+        }
+        // Both halves together, per `new_indirect_for_pdf_with_resolver`'s own
+        // doc: the identity is what `belongs_to_pdf` answers on, the `Weak` is
+        // what `try_dereference` upgrades and calls. Downgrading here rather
+        // than on the hit path above keeps the common lookup free of weak-count
+        // traffic.
+        let weak = Rc::downgrade(&self.resolver);
+        let resolver: Weak<dyn DocumentResolver> = weak;
+        let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            object_ref,
+            NO_PARSED_OFFSET,
+            self.unique_id,
+            resolver,
+        );
+        self.handle_registry.insert(object_ref, handle.clone());
+        handle
+    }
+
+    /// Whether this document holds the only strong reference to its resolver.
+    ///
+    /// Test-only: lets the resolver's own teardown regression assert that
+    /// handing out `Weak`s cannot keep a dropped document's input source
+    /// alive, rather than arguing it from the types.
+    #[cfg(test)]
+    pub(crate) fn resolver_is_uniquely_owned(&self) -> bool {
+        Rc::strong_count(&self.resolver) == 1
     }
 
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
@@ -1841,10 +1831,10 @@ impl<R: Read + Seek> Pdf<R> {
     /// registered via [`Pdf::get_object_handle`], which cannot fail.
     pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
         let refs_to_register: Vec<ObjectRef> = self
-            .source_xref_entries
-            .iter()
+            .source_xref_entries()
+            .into_iter()
             .filter(|(_, entry)| !matches!(entry, XrefEntry::Free { .. }))
-            .map(|(object_ref, _)| *object_ref)
+            .map(|(object_ref, _)| object_ref)
             .collect();
         for object_ref in refs_to_register {
             self.get_object_handle(object_ref);
@@ -1982,7 +1972,7 @@ impl<R: Read + Seek> Pdf<R> {
         // fast native-parse window failed for an unrelated reason — with
         // literal nesting between the two bounds.
         let mut native_parsed = false;
-        let (mut value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
+        let (mut value, parsed_offset) = match self.resolver.xref_entry(object_ref) {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {
@@ -2614,21 +2604,7 @@ impl<R: Read + Seek> Pdf<R> {
     // computed.
     fn read_bounded_object_window(&mut self, offset: u64) -> Result<Vec<u8>> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
-        self.reader.seek(SeekFrom::Start(physical_offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => {
-                self.reader
-                    .by_ref()
-                    .take(next.saturating_sub(offset))
-                    .read_to_end(&mut bytes)?;
-            }
-            None => {
-                self.reader.read_to_end(&mut bytes)?;
-            }
-        }
-        Ok(bytes)
+        self.resolver.read_window(offset, next)
     }
 
     fn read_object_at_with_policy(
@@ -2639,7 +2615,6 @@ impl<R: Read + Seek> Pdf<R> {
         full_policy: RecoveryPolicy,
     ) -> Result<file_object::FileObjectRead> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
         let bytes = self.read_bounded_object_window(offset)?;
 
         let initial_policy = if next.is_some() {
@@ -2651,9 +2626,10 @@ impl<R: Read + Seek> Pdf<R> {
             Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(physical_offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
+                // A fresh, short borrow: the borrow the window read above took
+                // ended before `parse_and_finish_file_object`, which can
+                // re-enter resolution through an indirect `/Length`.
+                let full = self.resolver.read_window(offset, None)?;
                 self.parse_and_finish_file_object(expected_ref, &full, offset, full_policy)
                     .or(Err(window_err))
             }
@@ -4170,6 +4146,9 @@ mod tests {
     use super::*;
     use crate::pages::page_refs;
     use crate::Stream;
+    // `SeekFrom` left `reader.rs`'s own imports along with the input source;
+    // the fault-injecting cursor below still implements `Seek`.
+    use std::io::SeekFrom;
 
     struct ReadFailingCursor {
         inner: Cursor<Vec<u8>>,
@@ -5425,7 +5404,8 @@ mod tests {
         )
         .expect("parse pending target stream");
 
-        pdf.reader.fail_reads = true;
+        pdf.resolver
+            .with_reader_mut(|reader| reader.fail_reads = true);
         let err = pdf
             .resolve_pending_stream_length(target, &pending, target_offset)
             .expect_err("holder I/O errors must remain unrecoverable");
@@ -7479,7 +7459,7 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.source_xref_entries.insert(
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
@@ -7539,7 +7519,7 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.source_xref_entries.insert(
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
@@ -7631,7 +7611,7 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.source_xref_entries.insert(
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
