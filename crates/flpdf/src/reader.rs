@@ -3081,12 +3081,41 @@ impl Pdf<Cursor<Arc<[u8]>>> {
     /// visible at the call site rather than hidden in the library.
     ///
     /// `Arc` rather than `Rc` because the buffer, unlike the document, can then
-    /// be shared across threads that each open their own `Pdf`. Both halves of
-    /// that were checked by compiling them: `Arc<[u8]>` clones do move across a
-    /// thread boundary into separate `open_mem` calls, and `Pdf` itself does
-    /// not — `require_send(Pdf::open_mem(..))` fails on the resolver's own
-    /// `Rc<ResolverHandle<..>>`. The `Arc` buys sharing of the input, not of
-    /// the document.
+    /// be shared across threads that each open their own `Pdf`. The `Arc` buys
+    /// sharing of the *input*, not of the document — the two doctests below
+    /// pin both halves of that, so neither can go stale silently.
+    ///
+    /// One buffer, cloned across threads, each clone opening its own document:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Arc<[u8]> = Arc::from(&b"%PDF-1.4\n"[..]);
+    /// let workers: Vec<_> = (0..2)
+    ///     .map(|_| {
+    ///         let shared = Arc::clone(&bytes);
+    ///         std::thread::spawn(move || Pdf::open_mem(shared).is_ok())
+    ///     })
+    ///     .collect();
+    /// for worker in workers {
+    ///     worker.join().unwrap();
+    /// }
+    /// ```
+    ///
+    /// The document itself, by contrast, is not `Send` — the resolver every
+    /// handle points back at is an `Rc`. Only the `require_send` line differs
+    /// from the example above, so this cannot pass merely because the call
+    /// stopped compiling:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// fn require_send<T: Send>(_: T) {}
+    /// let bytes: Arc<[u8]> = Arc::from(&b"%PDF-1.4\n"[..]);
+    /// require_send(Pdf::open_mem(bytes));
+    /// ```
     ///
     /// # Errors
     ///
