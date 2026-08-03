@@ -1774,3 +1774,190 @@ fn checkbox_selects_an_indirect_widget_after_unselectable_kids() {
         Some(&Object::Name(b"On".to_vec()))
     );
 }
+
+#[test]
+fn choices_resolve_each_indirect_item_to_its_terminal_string() {
+    let bytes = doc(vec![
+        (10, "<< /FT /Ch /Opt [20 0 R] >>".into()),
+        (20, "null".into()),
+        (21, "null".into()),
+        (22, "(terminal)".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(22, 0)),
+    );
+
+    let choices = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .choices()
+        .unwrap();
+
+    assert_eq!(choices, vec!["terminal"]);
+}
+
+#[test]
+fn top_level_field_stops_before_a_parent_that_resolves_to_null() {
+    let bytes = doc(vec![
+        (10, "<< /Parent 20 0 R >>".into()),
+        (20, "null".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .top_level_field()
+            .unwrap(),
+        (ObjectRef::new(10, 0), false)
+    );
+}
+
+#[test]
+fn set_value_mutates_the_terminal_field_dictionary_without_replacing_holders() {
+    let bytes = doc(vec![
+        (10, "null".into()),
+        (11, "null".into()),
+        (12, "<< /FT /Tx >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(10, 0),
+        Object::Reference(ObjectRef::new(11, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::String(b"updated".to_vec()), false)
+        .unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(11, 0))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(12, 0))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::String(flpdf::pdf_string::new_unicode_string(
+            b"updated"
+        )))
+    );
+}
+
+#[test]
+fn radio_updates_widgets_behind_a_multi_hop_kids_holder() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids 20 0 R >>".into(),
+        ),
+        (11, "<< /AP << /N << /Off null /First null >> >> >>".into()),
+        (
+            12,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+        (20, "null".into()),
+        (21, "null".into()),
+        (22, "[11 0 R 12 0 R]".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(22, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Off".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+}
+
+#[test]
+#[ignore = "subprocess-only stack-overflow regression probe"]
+fn checkbox_cyclic_kids_probe() {
+    assert_eq!(
+        std::env::var_os("FLPDF_CHECKBOX_CYCLE_PROBE").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+    let bytes = doc(vec![
+        (10, "<< /FT /Btn /Kids 20 0 R >>".into()),
+        (20, "null".into()),
+        (21, "null".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(20, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"On".to_vec()), false)
+        .unwrap();
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Yes".to_vec()))
+    );
+}
+
+#[test]
+fn checkbox_cyclic_kids_do_not_overflow_the_stack() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "checkbox_cyclic_kids_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("FLPDF_CHECKBOX_CYCLE_PROBE", "1")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "cycle probe failed: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

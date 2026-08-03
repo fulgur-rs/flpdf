@@ -307,20 +307,18 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(Vec::new());
         }
 
-        let Some(options) = self.resolve_inherited_object(b"Opt")? else {
+        let Some(options) = self.resolve_inherited_handle(b"Opt")? else {
             return Ok(Vec::new());
         };
+        let options = self.pdf.resolve_object_handle_to_terminal(&options)?;
         let Some(items) = options.as_array() else {
             return Ok(Vec::new());
         };
 
         let mut choices = Vec::new();
         for item in items {
-            let item = match item {
-                Object::Reference(reference) => self.pdf.resolve(*reference)?,
-                item => item.clone(),
-            };
-            if let Object::String(value) = item {
+            let item = self.pdf.resolve_object_handle_to_terminal(&item)?;
+            if let Some(value) = item.as_string() {
                 choices.push(Self::utf8_string(&value));
             }
         }
@@ -332,14 +330,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// This is qpdf's `setFieldAttribute(key, value)`: inherited attributes
     /// are never modified on an ancestor.
     pub fn set_field_attribute(&mut self, key: &[u8], value: Object) -> Result<()> {
-        let field = self.pdf.resolve_borrowed(self.field_ref)?;
-        let Some(mut field) = field.as_dict().cloned() else {
-            return Ok(());
-        };
-        field.insert(key, value);
-        self.pdf
-            .set_object(self.field_ref, Object::Dictionary(field));
-        Ok(())
+        self.set_direct_attribute(self.field_ref, key, value)
     }
 
     /// Replace a direct string attribute using qpdf's Unicode-string encoding.
@@ -512,34 +503,32 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         kids: Object,
         checked: bool,
     ) -> Result<Option<(Object, Vec<u8>)>> {
-        match kids {
-            Object::Array(mut kids) => {
-                for kid in &mut kids {
-                    let Object::Dictionary(mut widget) = kid.clone() else {
-                        continue;
-                    };
-                    if !self.has_non_null_appearance(&widget)? {
-                        continue;
-                    }
-                    let state = self.checkbox_state(Some(&widget), checked)?;
-                    widget.insert("AS", Object::Name(state.clone()));
-                    *kid = Object::Dictionary(widget);
-                    return Ok(Some((Object::Array(kids), state)));
-                }
-                Ok(None)
+        let original_reference = match kids {
+            Object::Reference(reference) => Some(reference),
+            _ => None,
+        };
+        let Some((mut kids, terminal_ref)) = self.resolve_array_target(kids)? else {
+            return Ok(None);
+        };
+        for kid in &mut kids {
+            let Object::Dictionary(mut widget) = kid.clone() else {
+                continue;
+            };
+            if !self.has_non_null_appearance(&widget)? {
+                continue;
             }
-            Object::Reference(reference) => {
-                let resolved = self.pdf.resolve(reference)?;
-                let Some((updated, state)) =
-                    self.update_direct_checkbox_kid_in_array(resolved, checked)?
-                else {
-                    return Ok(None);
-                };
+            let state = self.checkbox_state(Some(&widget), checked)?;
+            widget.insert("AS", Object::Name(state.clone()));
+            *kid = Object::Dictionary(widget);
+            let updated = Object::Array(kids);
+            if let Some(reference) = terminal_ref {
                 self.pdf.set_object(reference, updated);
-                Ok(Some((Object::Reference(reference), state)))
+                return Ok(original_reference
+                    .map(|reference| (Object::Reference(reference), state.clone())));
             }
-            _ => Ok(None),
+            return Ok(Some((updated, state)));
         }
+        Ok(None)
     }
 
     fn checkbox_state(
@@ -603,26 +592,18 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         kids_value: Object,
         value: &[u8],
     ) -> Result<()> {
-        match kids_value {
-            Object::Array(kids) => {
-                let mut updated = Vec::with_capacity(kids.len());
-                for kid in kids {
-                    updated.push(self.update_radio_kid(kid, value)?);
-                }
-                self.set_direct_attribute(field_ref, b"Kids", Object::Array(updated))?;
-            }
-            Object::Reference(reference) => {
-                let resolved = self.pdf.resolve(reference)?;
-                let Object::Array(kids) = resolved else {
-                    return Ok(()); // cov:ignore: object_array above already resolved this holder as an array
-                };
-                let mut updated = Vec::with_capacity(kids.len());
-                for kid in kids {
-                    updated.push(self.update_radio_kid(kid, value)?);
-                }
-                self.pdf.set_object(reference, Object::Array(updated));
-            }
-            _ => {} // cov:ignore: set_radio_button_value calls this only after object_array accepted /Kids
+        let Some((kids, terminal_ref)) = self.resolve_array_target(kids_value)? else {
+            return Ok(()); // cov:ignore: object_array above already accepted the terminal /Kids array
+        };
+        let mut updated = Vec::with_capacity(kids.len());
+        for kid in kids {
+            updated.push(self.update_radio_kid(kid, value)?);
+        }
+        let updated = Object::Array(updated);
+        if let Some(reference) = terminal_ref {
+            self.pdf.set_object(reference, updated);
+        } else {
+            self.set_direct_attribute(field_ref, b"Kids", updated)?;
         }
         Ok(())
     }
@@ -794,22 +775,45 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         key: &[u8],
         value: Object,
     ) -> Result<()> {
-        let mut dictionary = self.field_dict_for(reference, "form field")?;
-        dictionary.insert(String::from_utf8_lossy(key).into_owned(), value);
-        self.pdf
-            .set_object(reference, Object::Dictionary(dictionary));
+        let Some(dictionary) = self.dictionary_handle_for(reference)? else {
+            return Ok(());
+        };
+        let value = self.pdf.lift_object_to_handle(&value)?;
+        self.pdf.mark_object_handle_dirty(&dictionary)?;
+        dictionary.replace_key(key, value);
         Ok(())
     }
 
     fn field_dict_for(&mut self, reference: ObjectRef, label: &str) -> Result<Dictionary> {
-        match self.pdf.resolve_borrowed(reference)? {
-            Object::Dictionary(dictionary) => Ok(dictionary.clone()),
+        match self.dictionary_handle_for(reference)? {
+            Some(dictionary) => Ok(dictionary
+                .materialize()
+                .into_dict()
+                .expect("dictionary handle must materialize as a dictionary")),
             // cov:ignore-start: all private callers establish a dictionary before mutation
-            _ => Err(Error::Unsupported(format!(
+            None => Err(Error::Unsupported(format!(
                 "{label} object {reference} is not a dictionary"
             ))),
             // cov:ignore-end
         }
+    }
+
+    /// Return the canonical terminal dictionary handle for an indirect field
+    /// holder. qpdf mutators operate on the dereferenced handle, so replacing
+    /// a key must dirty the terminal object rather than an intermediate
+    /// redirect recorded by flpdf's legacy object representation.
+    fn dictionary_handle_for(&mut self, reference: ObjectRef) -> Result<Option<ObjectHandle>> {
+        let start = self.pdf.get_object_handle(reference);
+        let (resolved, terminal_ref) = self.pdf.resolve_object_handle_to_terminal_ref(&start)?;
+        if resolved.as_dictionary().is_none() {
+            return Ok(None);
+        }
+        let Some(terminal_ref) = terminal_ref else {
+            return Ok(Some(resolved));
+        };
+        let terminal = self.pdf.get_object_handle(terminal_ref);
+        self.pdf.resolve_object_handle(&terminal)?;
+        Ok(terminal.as_dictionary().map(|_| terminal))
     }
 
     fn resolve_object(&mut self, value: Object) -> Result<Object> {
@@ -831,10 +835,24 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let Some(value) = value else {
             return Ok(None);
         };
-        match self.resolve_object(value)? {
-            Object::Array(items) => Ok(Some(items)),
-            _ => Ok(None),
-        }
+        Ok(self
+            .resolve_array_target(value)?
+            .map(|(items, _terminal_ref)| items))
+    }
+
+    /// Resolve an array value and preserve the terminal reference that owns
+    /// it. A cyclic redirect degrades to null through the shared canonical
+    /// handle resolver, matching qpdf's non-recursive `isArray()` access.
+    fn resolve_array_target(
+        &mut self,
+        value: Object,
+    ) -> Result<Option<(Vec<Object>, Option<ObjectRef>)>> {
+        let value = self.pdf.lift_object_to_handle(&value)?;
+        let (value, terminal_ref) = self.pdf.resolve_object_handle_to_terminal_ref(&value)?;
+        let Object::Array(items) = value.materialize() else {
+            return Ok(None);
+        };
+        Ok(Some((items, terminal_ref)))
     }
 
     fn acroform_value(&mut self, key: &[u8]) -> Result<Option<Object>> {
@@ -863,11 +881,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn direct_parent(&mut self, field_ref: ObjectRef) -> Result<Option<ObjectRef>> {
-        let node = self.pdf.resolve_borrowed(field_ref)?;
-        Ok(match node.as_dict().and_then(|dict| dict.get("Parent")) {
-            Some(Object::Reference(parent)) => Some(*parent),
-            _ => None,
-        })
+        let node = self.pdf.get_object_handle(field_ref);
+        let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
+        let Some(parent) = node
+            .as_dictionary()
+            .and_then(|dict| dict.get(b"Parent".as_slice()).cloned())
+        else {
+            return Ok(None);
+        };
+        let parent_ref = parent.object_ref().or_else(|| parent.as_reference());
+        let parent = self.pdf.resolve_object_handle_to_terminal(&parent)?;
+        Ok((!parent.is_null()).then_some(parent_ref).flatten())
     }
 
     fn resolve_inherited_name(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
