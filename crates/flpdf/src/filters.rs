@@ -3868,7 +3868,7 @@ mod tests {
             //
             // Only the native entry point is asked; the equivalence test is
             // what makes the legacy side's answer the same.
-            let sequences: Vec<Vec<&'static str>> = corpus()
+            let outcomes: Vec<Vec<ComparableEvent>> = corpus()
                 .iter()
                 .filter_map(|row| {
                     decode_stream_data_recovering_from_handle(
@@ -3878,12 +3878,11 @@ mod tests {
                     )
                     .ok()
                 })
-                .map(|outcome| {
-                    comparable_events(outcome.events)
-                        .iter()
-                        .map(ComparableEvent::variant)
-                        .collect()
-                })
+                .map(|outcome| comparable_events(outcome.events))
+                .collect();
+            let sequences: Vec<Vec<&'static str>> = outcomes
+                .iter()
+                .map(|events| events.iter().map(ComparableEvent::variant).collect())
                 .collect();
 
             for expected in [
@@ -3900,6 +3899,24 @@ mod tests {
                     "no corpus row produced {expected:?}; observed {sequences:?}"
                 );
             }
+
+            // Those orderings are variant names, which throw the warning's own
+            // text and zlib code away: decrementing `code` where
+            // `decode_prepared_specs` builds the `StreamDecodeWarning` reddened
+            // 10 absolute tests elsewhere while leaving both tests in this
+            // module green. So pin the payload of the two diagnostics the
+            // corpus leans on as well.
+            let contains = |expected: ComparableEvent| {
+                outcomes.iter().flatten().any(|event| *event == expected)
+            };
+            assert!(contains(ComparableEvent::Warning(
+                "input stream is complete but output may still be valid".to_string(),
+                -5,
+            )));
+            assert!(contains(ComparableEvent::Error(
+                "unsupported PDF feature: character out of range during base Hex decode: G"
+                    .to_string(),
+            )));
         }
     }
 }
