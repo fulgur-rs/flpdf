@@ -607,12 +607,17 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn update_radio_kid(&mut self, kid: Object, value: &[u8]) -> Result<Object> {
         match kid {
             Object::Reference(reference) => {
-                let object = self.pdf.resolve(reference)?;
-                if let Object::Dictionary(dictionary) = object {
-                    let dictionary = self.update_radio_kid_dict(dictionary, value)?;
-                    self.pdf
-                        .set_object(reference, Object::Dictionary(dictionary));
-                }
+                let Some(dictionary) = self.dictionary_handle_for(reference)? else {
+                    return Ok(Object::Reference(reference));
+                };
+                let terminal_ref = dictionary.object_ref().unwrap_or(reference);
+                let dictionary = dictionary
+                    .materialize()
+                    .into_dict()
+                    .expect("dictionary handle must materialize as a dictionary");
+                let dictionary = self.update_radio_kid_dict(dictionary, value)?;
+                self.pdf
+                    .set_object(terminal_ref, Object::Dictionary(dictionary));
                 Ok(Object::Reference(reference))
             }
             Object::Dictionary(dictionary) => Ok(Object::Dictionary(
@@ -903,14 +908,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn resolve_inherited_handle(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
         let mut seen = BTreeSet::new();
         let mut current = self.field_ref;
-        let mut depth = 0;
         loop {
-            if depth >= DEFAULT_MAX_PAGE_TREE_DEPTH {
-                return Err(Error::Unsupported(format!(
-                    "field tree depth exceeds maximum of {} at {}",
-                    DEFAULT_MAX_PAGE_TREE_DEPTH, current
-                )));
-            }
             if !seen.insert(current) {
                 return Ok(None);
             }
@@ -932,7 +930,6 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             match parent_ref {
                 Some(parent) => {
                     current = parent;
-                    depth += 1;
                 }
                 None => return Ok(None),
             }

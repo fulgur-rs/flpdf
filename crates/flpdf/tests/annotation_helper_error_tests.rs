@@ -8,8 +8,8 @@
 //!   `resolve_optional_dict`, `parse_rect_array`) reached via `rect()`,
 //!   `appearance()`, and `action()`;
 //! - each inheritance walk's `/Parent`-chain anomalies — direct/indirect Null,
-//!   wrong value type, non-dictionary node, and the depth-limit guard — across
-//!   the three distinct walkers (`/FT` name, `/V` object, `/Ff` integer).
+//!   wrong value type, non-dictionary node, cycles, and long acyclic chains —
+//!   across `/FT` names, `/V` objects, and `/Ff` integers.
 
 use flpdf::{AnnotationObjectHelper, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf};
 use std::io::Cursor;
@@ -230,11 +230,11 @@ fn field_flags_cycle_returns_none() {
 }
 
 // ===========================================================================
-// Depth-limit guard (DEFAULT_MAX_PAGE_TREE_DEPTH) on each walker
+// Long acyclic inheritance walks are cycle-bounded, as in qpdf
 // ===========================================================================
 
 /// Build a /Parent chain of `len` field nodes (10, 11, ..., 10+len-1), none of
-/// which carries the inheritable key, so every walker climbs to the limit.
+/// which carries the inheritable key, so every walker reaches the terminal.
 fn deep_field_chain(len: u32) -> Vec<u8> {
     let mut objects = Vec::new();
     for i in 0..len {
@@ -250,26 +250,25 @@ fn deep_field_chain(len: u32) -> Vec<u8> {
 }
 
 #[test]
-fn field_type_depth_limit_errors() {
-    // 130 hops exceeds DEFAULT_MAX_PAGE_TREE_DEPTH (100).
+fn field_type_long_acyclic_chain_returns_none() {
     let bytes = deep_field_chain(130);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(field.field_type());
+    assert_eq!(field.field_type().unwrap(), None);
 }
 
 #[test]
-fn field_value_depth_limit_errors() {
+fn field_value_long_acyclic_chain_returns_none() {
     let bytes = deep_field_chain(130);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(field.field_value());
+    assert_eq!(field.field_value().unwrap(), None);
 }
 
 #[test]
-fn field_flags_depth_limit_errors() {
+fn field_flags_long_acyclic_chain_returns_none() {
     let bytes = deep_field_chain(130);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_unsupported(field.field_flags());
+    assert_eq!(field.field_flags().unwrap(), None);
 }

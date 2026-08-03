@@ -313,8 +313,7 @@ pub fn remove_security_restrictions<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<
 /// Propagates any error from resolving the catalog, `/AcroForm`, `/Fields`,
 /// page, and field-tree objects (surfaced by [`Pdf::resolve`]), and
 /// [`Error::Unsupported`] when the field-tree traversal depth limit
-/// ([`DEFAULT_MAX_ACROFORM_DEPTH`]) or a field's `/Parent` chain depth limit is
-/// exceeded.
+/// ([`DEFAULT_MAX_ACROFORM_DEPTH`]) is exceeded.
 pub fn disable_digital_signatures<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     let mut changed = remove_security_restrictions(pdf)?;
 

@@ -426,6 +426,27 @@ fn reads_metadata_from_field_inheritance_then_acroform() {
 }
 
 #[test]
+fn default_appearance_follows_a_long_acyclic_parent_chain_before_acroform_fallback() {
+    let mut objects = Vec::new();
+    for number in 100..=201 {
+        let dictionary = if number == 201 {
+            "<< >>".to_string()
+        } else {
+            format!("<< /Parent {} 0 R >>", number + 1)
+        };
+        objects.push((number, dictionary));
+    }
+    objects.push((20, "<< /DA (/Helv 8 Tf 0 g) >>".into()));
+    let mut pdf = open(doc_with_acroform(objects));
+
+    let appearance = FormFieldObjectHelper::new(ObjectRef::new(100, 0), &mut pdf)
+        .default_appearance()
+        .expect("qpdf inheritance walk is cycle-bounded, not depth-bounded");
+
+    assert_eq!(appearance, "/Helv 8 Tf 0 g");
+}
+
+#[test]
 fn checked_requires_checkbox_and_an_on_name_value() {
     let cases = [
         ("/Btn", 0, "/On", true),
@@ -1289,7 +1310,7 @@ fn radio_keeps_direct_children_without_appearance_or_grandchildren() {
 }
 
 #[test]
-fn field_tree_depth_limits_apply_to_top_level_and_reference_accessors() {
+fn top_level_field_limits_depth_but_inherited_reference_reaches_the_terminal_value() {
     let mut objects = Vec::new();
     for number in 10..=111 {
         let dictionary = if number == 111 {
@@ -1311,10 +1332,8 @@ fn field_tree_depth_limits_apply_to_top_level_and_reference_accessors() {
 
     let field_value_reference = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
         .field_value_reference()
-        .unwrap_err();
-    assert!(field_value_reference
-        .to_string()
-        .contains("field tree depth exceeds maximum"));
+        .unwrap();
+    assert_eq!(field_value_reference, Some(ObjectRef::new(112, 0)));
 }
 
 #[test]
@@ -1999,6 +2018,51 @@ fn radio_updates_widgets_behind_a_multi_hop_kids_holder() {
             .unwrap()
             .get("AS"),
         Some(&Object::Name(b"Off".to_vec()))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+}
+
+#[test]
+fn radio_updates_a_widget_behind_a_multi_hop_child_holder() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent null /Kids [11 0 R] >>".into(),
+        ),
+        (11, "null".into()),
+        (
+            12,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("set radio value through child holder");
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(11, 0)).unwrap(),
+        Object::Reference(ObjectRef::new(12, 0))
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Selected".to_vec()))
     );
     assert_eq!(
         pdf.resolve(ObjectRef::new(12, 0))
