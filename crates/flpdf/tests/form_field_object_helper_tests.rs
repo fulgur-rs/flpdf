@@ -2166,6 +2166,46 @@ fn radio_with_a_non_null_parent_marker_is_a_noop() {
 }
 
 #[test]
+fn radio_treats_a_cyclic_parent_holder_as_null() {
+    let bytes = doc(vec![
+        (
+            10,
+            "<< /FT /Btn /Ff 32768 /Parent 20 0 R /Kids [11 0 R] >>".into(),
+        ),
+        (
+            11,
+            "<< /AP << /N << /Off null /Selected null >> >> >>".into(),
+        ),
+        (20, "null".into()),
+        (21, "null".into()),
+    ]);
+    let mut pdf = open(bytes);
+    pdf.set_object(
+        ObjectRef::new(20, 0),
+        Object::Reference(ObjectRef::new(21, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(21, 0),
+        Object::Reference(ObjectRef::new(20, 0)),
+    );
+
+    FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(Object::Name(b"Selected".to_vec()), false)
+        .expect("set a radio value when the parent holder is cyclic");
+
+    let field = pdf.resolve(ObjectRef::new(10, 0)).unwrap();
+    assert_eq!(
+        field.as_dict().unwrap().get("V"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+    let widget = pdf.resolve(ObjectRef::new(11, 0)).unwrap();
+    assert_eq!(
+        widget.as_dict().unwrap().get("AS"),
+        Some(&Object::Name(b"Selected".to_vec()))
+    );
+}
+
+#[test]
 fn radio_follows_a_multi_hop_nested_kids_holder() {
     let bytes = doc(vec![
         (

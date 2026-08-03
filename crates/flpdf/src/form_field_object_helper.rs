@@ -825,7 +825,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// helper boundary so button mutation uses the same top-level check.
     fn value_is_null(&mut self, value: Option<Object>) -> Result<bool> {
         match value {
-            Some(value) => Ok(matches!(self.resolve_object(value)?, Object::Null)),
+            Some(value) => {
+                let value = self.pdf.lift_object_to_handle(&value)?;
+                let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
+                Ok(value.is_null())
+            }
             None => Ok(true),
         }
     }
