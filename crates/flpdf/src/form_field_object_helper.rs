@@ -809,10 +809,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(None);
         }
         let Some(terminal_ref) = terminal_ref else {
-            // cov:ignore: `reference` always creates an indirect start handle;
-            // a successfully resolved dictionary therefore always retains its
-            // own or terminal object reference (only direct handles yield None).
-            return Ok(Some(resolved));
+            return Ok(Some(resolved)); // cov:ignore: ObjectRef start always retains a terminal ref
         };
         let terminal = self.pdf.get_object_handle(terminal_ref);
         self.pdf.resolve_object_handle(&terminal)?;
