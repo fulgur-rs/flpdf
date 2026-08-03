@@ -14,7 +14,6 @@ use flpdf::{
     WriteOptions, XrefEntry,
 };
 use std::io::{Cursor, Write};
-use std::sync::Arc;
 
 // ── Fixture builders ─────────────────────────────────────────────────────────
 
@@ -637,7 +636,7 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
         report.diagnostics.entries()
     );
 
-    let mut reopened = Pdf::open_mem(Arc::from(&output[..])).unwrap();
+    let mut reopened = Pdf::open_mem_owned(output).unwrap();
 
     // At least one ObjStm container must exist (otherwise the test would not
     // exercise the renumbered-member path at all).
@@ -780,7 +779,7 @@ fn pdf_with_eligible_orphan() -> Vec<u8> {
 #[test]
 fn generate_mode_full_rewrite_drops_eligible_orphan() {
     let source = pdf_with_eligible_orphan();
-    let mut pdf = Pdf::open_mem(Arc::from(&source[..])).unwrap();
+    let mut pdf = Pdf::open_mem_owned(source).unwrap();
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
@@ -801,7 +800,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
     );
 
     // (b) Re-opened output: Catalog/Pages/pages resolve.
-    let mut reopened = Pdf::open_mem(Arc::from(&output[..])).unwrap();
+    let mut reopened = Pdf::open_mem_owned(output).unwrap();
     let root_ref = reopened
         .root_ref()
         .expect("trailer must have a resolvable /Root");

@@ -758,7 +758,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     }
 }
 
-impl<'a, R: Read + Seek + 'static> Iterator for PageWalk<'a, R> {
+impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
     type Item = Result<ObjectRef>;
 
     fn next(&mut self) -> Option<Self::Item> {

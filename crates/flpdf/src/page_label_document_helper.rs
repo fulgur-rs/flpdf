@@ -370,7 +370,7 @@ pub struct PageLabelDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek + 'static> PageLabelDocumentHelper<'a, R> {
+impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     /// Create a new helper borrowing `pdf` mutably.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
         Self { pdf }

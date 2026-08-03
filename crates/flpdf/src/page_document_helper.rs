@@ -57,7 +57,7 @@ impl<'a, R: Read + Seek> PageInput<'a, R> {
     }
 }
 
-impl<'a, R: Read + Seek + 'static> PageDocumentHelper<'a, R> {
+impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
     /// Create a new helper borrowing `pdf` mutably.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
         Self { pdf }
@@ -160,7 +160,7 @@ impl<'a, R: Read + Seek + 'static> PageDocumentHelper<'a, R> {
         rebuild_page_tree(self.pdf, &refs)
     }
 
-    fn materialize_page_input<RS: Read + Seek + 'static>(
+    fn materialize_page_input<RS: Read + Seek>(
         &mut self,
         input: PageInput<'_, RS>,
     ) -> Result<ObjectRef> {

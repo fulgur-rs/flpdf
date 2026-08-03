@@ -67,7 +67,7 @@ pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek + 'static> AnnotationObjectHelper<'a, R> {
+impl<'a, R: Read + Seek> AnnotationObjectHelper<'a, R> {
     /// Construct a new helper for the annotation at `annot_ref`.
     ///
     /// The constructor does not resolve the object; errors are surfaced by the

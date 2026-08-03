@@ -17,17 +17,26 @@
 //! # Borrow discipline
 //!
 //! Every non-test accessor below takes its `RefCell` borrow and drops it
-//! within a single expression, and calls nothing that could re-enter
-//! resolution while that borrow is live. That is not stylistic: resolution is
-//! re-entrant (qpdf's own `/Length`-as-indirect-reference case,
-//! `QPDF::readStream`, `libqpdf/QPDF.cc:1360-1398`), so a borrow held across
-//! a nested resolve is a `RefCell` double-borrow panic in production. Reads
-//! return owned `Vec<u8>` for exactly this reason — a caller cannot hold a
-//! borrow it never receives.
+//! within a single expression, and — **for every `R` in this workspace** —
+//! calls nothing that could re-enter resolution while that borrow is live.
+//! That is not stylistic: resolution is re-entrant (qpdf's own
+//! `/Length`-as-indirect-reference case, `QPDF::readStream`,
+//! `libqpdf/QPDF.cc:1360-1398`), so a borrow held across a nested resolve is a
+//! `RefCell` double-borrow panic in production.
 //!
-//! [`ResolverHandle::with_reader_mut`] is the single exception: it hands out
-//! `&mut R` while the borrow is held, which is why it is `#[cfg(test)]` and
-//! carries its own warning.
+//! **The qualifier is load-bearing and the hazard is real.**
+//! [`ResolverCore::read_window`] holds `borrow_mut()` across
+//! `R::seek`/`R::read`, which is caller-supplied code. `R` is arbitrary and
+//! [`ObjectHandle`] is `'static + Clone`, so an `R` that owns a handle from
+//! this same document could call `try_dereference` from inside `read` and
+//! re-enter — reaching a double-borrow panic from entirely safe Rust, once
+//! anything in the resolver path takes a borrow of its own. Nothing in-tree
+//! does this (every `R` is a `Cursor` or `BufReader`), so it is unreachable
+//! today rather than guarded against.
+//!
+//! `with_reader_mut` is the one accessor that hands out `&mut R` while the
+//! borrow is held, which is why it is `#[cfg(test)]` and carries its own
+//! warning.
 //!
 //! This discipline is currently *stated and readable, not pinned by a test*.
 //! [`ResolverHandle::resolve_indirect`] takes no borrow at all yet, so the
@@ -80,9 +89,15 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// material, qpdf does not keep the offset beside the input source, it
     /// *wraps* the source so the shift is invisible to every later read —
     /// `m->file = std::shared_ptr<InputSource>(new OffsetInputSource(m->file,
-    /// global_offset))` (`libqpdf/QPDF.cc:406`). Storing the shift next to
-    /// `reader` and applying it in [`Self::read_window`] is the same
-    /// single-owner arrangement without a second input-source type.
+    /// global_offset))` (`libqpdf/QPDF.cc:406`). Keeping the shift beside
+    /// `reader` and applying it in [`Self::read_window`] puts it under the
+    /// same single owner, without a second input-source type.
+    ///
+    /// It is *not* equivalent, and the difference is visible right here:
+    /// wrapping makes the shift unskippable, so qpdf has no way to read from
+    /// physical zero through `m->file` at all, whereas
+    /// [`Self::read_physical_input`] does exactly that. That method is a
+    /// legacy tenant (see its own note), not a port of anything qpdf does.
     header_offset: usize,
     /// qpdf `m->xref_table` (`QPDF.hh:1465`).
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
@@ -127,12 +142,23 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     attempt_recovery: bool,
 }
 
-impl<R: Read + Seek + 'static> ResolverCore<R> {
+impl<R: Read + Seek> ResolverCore<R> {
     /// Read `[offset, next)` — or `[offset, EOF)` when `next` is `None` — from
     /// the input source, in qpdf-logical coordinates.
     ///
-    /// Returns owned bytes rather than lending the reader out, so no caller
-    /// can hold this borrow across a parse that re-enters resolution.
+    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: **this is not a port of anything
+    /// in qpdf, and the resolver never calls it.** Its only callers are
+    /// `Pdf`'s legacy read helpers, which live on the other side of the
+    /// cutover; it sits here solely because the input source it reads now has
+    /// a single owner. Delete it once those callers are gone.
+    ///
+    /// Do not build on its shape. Reading a bounded window into an owned
+    /// `Vec` is an flpdf-ism: qpdf streams from `m->file` and brackets the one
+    /// re-entrant seam by saving and restoring the position
+    /// (`QPDF::readStream`, `libqpdf/QPDF.cc:1360-1398`). The design of record
+    /// names generalising this owned-window shape as a wrong turn that would
+    /// entrench a divergence, so `readObjectAtOffset`/`readStream` port that
+    /// save/restore seam rather than reusing this.
     fn read_window(&mut self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
         let physical = (self.header_offset as u64).saturating_add(offset);
         self.reader.seek(SeekFrom::Start(physical))?;
@@ -154,6 +180,14 @@ impl<R: Read + Seek + 'static> ResolverCore<R> {
     /// Read the entire input from *physical* offset zero, header shift
     /// included. Callers that want qpdf-logical coordinates use
     /// [`Self::read_window`].
+    ///
+    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: same status as
+    /// [`Self::read_window`] — no qpdf counterpart, no resolver caller, here
+    /// only because it needs the input source. qpdf could not express it
+    /// through `m->file` even if it wanted to, since `OffsetInputSource`
+    /// (`libqpdf/QPDF.cc:406`) makes the header shift unskippable. Its one
+    /// caller is `Pdf::source_bytes`, used by the writer to copy the original
+    /// file verbatim.
     fn read_physical_input(&mut self) -> Result<Vec<u8>> {
         self.reader.seek(SeekFrom::Start(0))?;
         let mut bytes = Vec::new();
@@ -168,7 +202,7 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     core: RefCell<ResolverCore<R>>,
 }
 
-impl<R: Read + Seek + 'static> ResolverHandle<R> {
+impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn new(
         reader: R,
         header_offset: usize,
@@ -205,8 +239,33 @@ impl<R: Read + Seek + 'static> ResolverHandle<R> {
     }
 
     /// A snapshot of the whole cross-reference table.
+    ///
+    /// Prefer [`Self::xref_refs_matching`] when only a selection of refs is
+    /// wanted: this clones every entry, and moving the table behind a
+    /// `RefCell` would otherwise make that the only option for all ten
+    /// existing consumers.
     pub(crate) fn xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.core.borrow().source_xref_entries.clone()
+    }
+
+    /// The refs the source cross-reference table declares whose entry
+    /// satisfies `keep`, collected under a single short borrow.
+    ///
+    /// The escape hatch from [`Self::xref_entries`]: a caller that wants a
+    /// filtered list of refs gets one without cloning the table to filter it
+    /// and drop it again.
+    ///
+    /// `keep` runs while the borrow is held, so it inherits the module-level
+    /// hazard: a predicate that resolved something would re-enter. Every
+    /// in-tree predicate is a `matches!` over the entry it is handed.
+    pub(crate) fn xref_refs_matching(&self, keep: impl Fn(&XrefEntry) -> bool) -> Vec<ObjectRef> {
+        self.core
+            .borrow()
+            .source_xref_entries
+            .iter()
+            .filter(|(_, entry)| keep(entry))
+            .map(|(object_ref, _)| *object_ref)
+            .collect()
     }
 
     /// See [`ResolverCore::read_window`].
@@ -241,7 +300,7 @@ impl<R: Read + Seek + 'static> ResolverHandle<R> {
     }
 }
 
-impl<R: Read + Seek + 'static> DocumentResolver for ResolverHandle<R> {
+impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// Resolve `object_ref`'s slot in place.
     ///
     /// No source class is implemented yet, so every reference is rejected
@@ -267,6 +326,7 @@ impl<R: Read + Seek + 'static> DocumentResolver for ResolverHandle<R> {
 #[cfg(test)]
 mod tests {
     use crate::{Error, ObjectRef, Pdf};
+    use std::sync::Arc;
 
     /// A three-object document with a classic cross-reference table: catalog,
     /// page tree, and one page. Every object is uncompressed (xref type 1).
@@ -354,17 +414,44 @@ mod tests {
         assert!(handle.is_null());
     }
 
-    /// The resolver cannot outlive the document that owns it: the only strong
-    /// reference lives in `Pdf`, and every handle holds a `Weak`. Dropping the
-    /// document therefore drops the input source too, rather than leaving it
-    /// alive behind a handle someone kept.
+    /// The resolver cannot outlive the document that owns it, observed through
+    /// the input source it owns rather than through an internal count.
+    ///
+    /// A handle is deliberately kept alive *across* `drop(pdf)` here. If a
+    /// vended handle's link back to its document were strong rather than
+    /// `Weak`, the surviving handle would keep the `ResolverHandle` alive, the
+    /// `ResolverCore` with it, and therefore the `Arc<[u8]>` the document was
+    /// reading — so `Arc::strong_count` would stay at 2. Watching it fall to 1
+    /// is what makes this a leak test and not a restatement of the types.
+    ///
+    /// `Rc::strong_count` on the resolver is asserted too, but only while the
+    /// document is alive: after the drop there is no `Pdf` left to ask.
     #[test]
-    fn a_surviving_handle_does_not_keep_its_documents_resolver_alive() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
-        assert!(
-            pdf.resolver_is_uniquely_owned(),
-            "the document must hold the only strong reference to its resolver"
+    fn a_handle_outliving_its_document_does_not_keep_the_input_source_alive() {
+        let bytes: Arc<[u8]> = Arc::from(&minimal_pdf_bytes()[..]);
+        let kept = Arc::clone(&bytes);
+
+        let handle = {
+            let mut pdf = Pdf::open_mem(bytes).expect("open");
+            let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+            assert!(
+                pdf.resolver_is_uniquely_owned(),
+                "the document must hold the only strong reference to its resolver"
+            );
+            assert_eq!(
+                Arc::strong_count(&kept),
+                2,
+                "the live document holds the buffer"
+            );
+            handle
+        };
+
+        // The handle is still alive right here — that is the whole point.
+        assert!(handle.is_indirect());
+        assert_eq!(
+            Arc::strong_count(&kept),
+            1,
+            "a surviving handle must not keep its dropped document's input source alive"
         );
         drop(handle);
     }

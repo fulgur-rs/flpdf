@@ -4548,7 +4548,7 @@ mod tests {
     #[test]
     fn remap_qpdf_trailer_refs_propagates_unmapped_nested_live_ref() {
         let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let map = CatalogFirstRenumber::from_pairs_for_test(&[(
             ObjectRef::new(1, 0),
             ObjectRef::new(1, 0),
@@ -5697,7 +5697,7 @@ mod tests {
             object_streams: ObjectStreamMode::Generate,
             ..WriteOptions::default()
         };
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let mut out = Vec::new();
         write_pdf_with_options(&mut pdf, &mut out, &opts).expect("write");
 
@@ -5809,7 +5809,7 @@ mod tests {
     #[test]
     fn deterministic_id_and_static_id_are_mutually_exclusive() {
         let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let opts = WriteOptions {
             full_rewrite: true,
             deterministic_id: true,
@@ -5826,7 +5826,7 @@ mod tests {
     #[test]
     fn encrypt_and_copy_encryption_are_mutually_exclusive() {
         let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let opts = WriteOptions {
             full_rewrite: true,
             encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
@@ -5852,7 +5852,7 @@ mod tests {
     #[test]
     fn deterministic_id_rejected_with_encryption() {
         let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         let opts = WriteOptions {
             full_rewrite: true,
             deterministic_id: true,
@@ -5873,7 +5873,7 @@ mod tests {
     #[test]
     fn deterministic_id_requires_full_rewrite() {
         let fixture = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("fixture must open");
         // full_rewrite defaults to false → incremental path.
         let opts = WriteOptions {
             deterministic_id: true,
@@ -5938,7 +5938,7 @@ mod tests {
     #[test]
     fn partition_objstm_eligible_splits_packable_and_plain_in_order() {
         let bytes = build_partition_fixture();
-        let mut pdf = crate::Pdf::open_mem(Arc::from(&bytes[..])).expect("fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(bytes).expect("fixture must open");
 
         let plain_dict = ObjectRef::new(3, 0);
         let stream_ref = ObjectRef::new(4, 0);
@@ -6223,8 +6223,7 @@ mod tests {
     #[test]
     fn write_incremental_objstm_emits_container_and_member_index_map() {
         let fixture = build_xref_stream_fixture();
-        let mut pdf =
-            crate::Pdf::open_mem(Arc::from(&fixture[..])).expect("xref-stream fixture must open");
+        let mut pdf = crate::Pdf::open_mem_owned(fixture).expect("xref-stream fixture must open");
 
         // Two plain, gen-0, ObjStm-eligible objects, resolved via the xref
         // stream. Sanity-check the fixture before exercising the emitter.
@@ -7768,7 +7767,7 @@ mod tests {
             ..WriteOptions::default()
         };
         let out = write_full_rewrite_with(&src, &options);
-        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
         // The whole /Extensions dict must be gone from the output Catalog.
         let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
         let catalog = reopened
@@ -7822,7 +7821,7 @@ mod tests {
             ..WriteOptions::default()
         };
         let out = write_full_rewrite_with(&src, &options);
-        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
         let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
         let catalog = reopened
             .resolve(root_ref)
@@ -7890,7 +7889,7 @@ mod tests {
             ..WriteOptions::default()
         };
         let out = write_full_rewrite_with(&src, &options);
-        let mut reopened = crate::Pdf::open_mem_owned(out).expect("output must open");
+        let mut reopened = crate::Pdf::open_mem(Arc::from(&out[..])).expect("output must open");
         let root_ref = reopened.trailer().get_ref("Root").expect("Root ref");
         let catalog = reopened
             .resolve(root_ref)

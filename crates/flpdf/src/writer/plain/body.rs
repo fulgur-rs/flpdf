@@ -188,12 +188,12 @@ mod tests {
     use super::*;
     use crate::writer::plain::plan::PlannedIndirectObject;
     use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, ObjectStreamMode, Stream};
-    use std::sync::Arc;
+    use std::io::Cursor;
 
     #[test]
     fn disable_emission_records_every_planned_source_offset() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let options = WriteOptions {
             full_rewrite: true,
             object_streams: ObjectStreamMode::Disable,
@@ -217,7 +217,7 @@ mod tests {
     fn object_stream_emission_records_container_and_member_locations() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         for compress_streams in [CompressStreams::Yes, CompressStreams::No] {
-            let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
+            let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
             let options = WriteOptions {
                 full_rewrite: true,
                 object_streams: ObjectStreamMode::Generate,
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn source_emission_propagates_reference_rewrite_failure() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let options = WriteOptions {
             object_streams: ObjectStreamMode::Disable,
             ..WriteOptions::default()
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn disable_emission_does_not_serialize_reachable_source_objstm_container() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
-        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let root = pdf.root_ref().unwrap();
         let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
         let source_objstm = ObjectRef::new(1, 0);
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn object_stream_emission_propagates_reference_rewrite_failure() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let options = WriteOptions {
             object_streams: ObjectStreamMode::Generate,
             ..WriteOptions::default()
@@ -322,7 +322,7 @@ mod tests {
 
     fn assert_invalid_planned_member_is_rejected(invalid: Object, expected_kind: &str) {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let options = WriteOptions {
             object_streams: ObjectStreamMode::Generate,
             ..WriteOptions::default()

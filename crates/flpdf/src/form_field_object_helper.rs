@@ -19,7 +19,7 @@ pub struct FormFieldObjectHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek + 'static> FormFieldObjectHelper<'a, R> {
+impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Construct a new helper for the form field at `field_ref`.
     pub fn new(field_ref: ObjectRef, pdf: &'a mut Pdf<R>) -> Self {
         Self { field_ref, pdf }

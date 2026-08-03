@@ -91,7 +91,7 @@ pub struct EmbeddedFileDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek + 'static> EmbeddedFileDocumentHelper<'a, R> {
+impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// Create an embedded-files helper borrowing `pdf` mutably.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
         Self { pdf }

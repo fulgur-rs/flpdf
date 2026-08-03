@@ -1592,24 +1592,28 @@ impl<R: Read + Seek> Pdf<R> {
     /// This does not perform file I/O or force object-body parsing: the
     /// returned handle's value is not read or resolved by this call.
     pub fn get_object_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        if let Some(handle) = self.handle_registry.get(&object_ref) {
-            return handle.clone();
-        }
-        // Both halves together, per `new_indirect_for_pdf_with_resolver`'s own
-        // doc: the identity is what `belongs_to_pdf` answers on, the `Weak` is
-        // what `try_dereference` upgrades and calls. Downgrading here rather
-        // than on the hit path above keeps the common lookup free of weak-count
-        // traffic.
+        // Hoisted so the registry can be probed and filled in one lookup:
+        // both borrow `self`, which `entry()` holds mutably. `Rc::downgrade`
+        // is a non-atomic weak-count bump, cheap enough to pay on the hit
+        // path too.
+        let unique_id = self.unique_id;
         let weak = Rc::downgrade(&self.resolver);
-        let resolver: Weak<dyn DocumentResolver> = weak;
-        let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
-            object_ref,
-            NO_PARSED_OFFSET,
-            self.unique_id,
-            resolver,
-        );
-        self.handle_registry.insert(object_ref, handle.clone());
-        handle
+        self.handle_registry
+            .entry(object_ref)
+            .or_insert_with(|| {
+                // Both halves together, per
+                // `new_indirect_for_pdf_with_resolver`'s own doc: the identity
+                // is what `belongs_to_pdf` answers on, the `Weak` is what
+                // `try_dereference` upgrades and calls.
+                let resolver: Weak<dyn DocumentResolver> = weak;
+                ObjectHandle::new_indirect_for_pdf_with_resolver(
+                    object_ref,
+                    NO_PARSED_OFFSET,
+                    unique_id,
+                    resolver,
+                )
+            })
+            .clone()
     }
 
     /// Whether this document holds the only strong reference to its resolver.
@@ -1831,11 +1835,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// registered via [`Pdf::get_object_handle`], which cannot fail.
     pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
         let refs_to_register: Vec<ObjectRef> = self
-            .source_xref_entries()
-            .into_iter()
-            .filter(|(_, entry)| !matches!(entry, XrefEntry::Free { .. }))
-            .map(|(object_ref, _)| object_ref)
-            .collect();
+            .resolver
+            .xref_refs_matching(|entry| !matches!(entry, XrefEntry::Free { .. }));
         for object_ref in refs_to_register {
             self.get_object_handle(object_ref);
         }
@@ -3103,8 +3104,13 @@ impl Pdf<Cursor<Arc<[u8]>>> {
     /// }
     /// ```
     ///
-    /// The document itself, by contrast, is not `Send` — the resolver every
-    /// handle points back at is an `Rc`. `compile_fail` passes on *any* error,
+    /// The document itself, by contrast, is not `Send`, and has not been since
+    /// long before the resolver existed: `handle_registry` holds
+    /// [`ObjectHandle`]s whose identity is `Rc<RefCell<..>>`, as that field's
+    /// own comment records. The resolver's `Rc` is a second reason, not the
+    /// reason — compiling the snippet below standalone reports both, and
+    /// `Rc<RefCell<DirectSlot>>` is the one that predates this work.
+    /// `compile_fail` passes on *any* error,
     /// so this one is only meaningful next to the example above: that one
     /// builds the same `Arc<[u8]>` and calls the same `open_mem`, and it runs.
     /// The bound `require_send` adds is therefore the only thing left to
@@ -6549,7 +6555,7 @@ mod tests {
     #[test]
     fn open_mem_opens_minimal_pdf() {
         let bytes = minimal_pdf_bytes();
-        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open_mem should succeed");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open_mem should succeed");
         let refs = page_refs(&mut pdf).expect("page_refs should succeed");
         assert_eq!(refs.len(), 1, "expected 1 page");
         assert_eq!(
@@ -6595,7 +6601,7 @@ mod tests {
         let refs_cursor = page_refs(&mut pdf_cursor).expect("page_refs from cursor");
         let root_cursor = pdf_cursor.root_ref();
 
-        let mut pdf_mem = Pdf::open_mem(Arc::from(&bytes[..])).expect("open_mem should succeed");
+        let mut pdf_mem = Pdf::open_mem_owned(bytes).expect("open_mem should succeed");
         let refs_mem = page_refs(&mut pdf_mem).expect("page_refs from open_mem");
         let root_mem = pdf_mem.root_ref();
 
@@ -6633,8 +6639,7 @@ mod tests {
             repair: true,
             ..PdfOpenOptions::default()
         };
-        let mut pdf =
-            Pdf::open_mem_with_options(Arc::from(&bytes[..]), opts).expect("open_mem_with_options");
+        let mut pdf = Pdf::open_mem_owned_with_options(bytes, opts).expect("open_mem_with_options");
         let refs = page_refs(&mut pdf).expect("page_refs");
         assert_eq!(refs.len(), 1);
     }

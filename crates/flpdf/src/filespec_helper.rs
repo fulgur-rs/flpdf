@@ -138,7 +138,7 @@ pub struct EmbeddedFileStream<'a, R: Read + Seek + 'static> {
     pdf: RefCell<&'a mut Pdf<R>>,
 }
 
-impl<'a, R: Read + Seek + 'static> EmbeddedFileStream<'a, R> {
+impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// Create an indirect `/EmbeddedFile` stream from decoded data, including
     /// qpdf's computed `/Params /Size` and binary MD5 `/CheckSum` values.
     ///
@@ -456,7 +456,7 @@ pub struct FileSpec<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek + 'static> FileSpec<'a, R> {
+impl<'a, R: Read + Seek> FileSpec<'a, R> {
     /// Create an indirect `/Filespec` whose `/EF /F` and `/EF /UF` entries
     /// reference the same embedded-file stream, returning its object handle.
     ///

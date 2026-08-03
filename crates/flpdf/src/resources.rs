@@ -1138,7 +1138,7 @@ fn is_form_xobject(dict: &Dictionary) -> bool {
 /// incomplete — a decode/tokenise failure whose names feed the page, or a
 /// direct-stream Form — signalling the page must be conservatively retained.
 /// Structural resolution errors propagate as `Err`.
-fn recurse_form_xobject<R: Read + Seek + 'static>(
+fn recurse_form_xobject<R: Read + Seek>(
     ctx: &mut CollectCtx<'_, R>,
     xobject_name: &[u8],
     caller: Scope<'_>,

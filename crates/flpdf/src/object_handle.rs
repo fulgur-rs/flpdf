@@ -32,7 +32,6 @@ pub type ResourceConflicts =
 /// The document-owned resolver qpdf's `QPDFObject` calls through its owning
 /// `QPDF*` and object identity. Kept crate-private so only the canonical
 /// document implementation can resolve an indirect slot.
-#[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 }
@@ -202,7 +201,6 @@ pub(crate) enum IndirectState {
 struct IndirectSlot {
     object_ref: ObjectRef,
     pdf_unique_id: Option<u64>,
-    #[allow(dead_code)] // read through the flpdf-25kg.3.5 resolver cutover
     resolver: Option<Weak<dyn DocumentResolver>>,
     state: IndirectState,
     parsed_offset: i64,

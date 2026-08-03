@@ -193,7 +193,7 @@ impl ParserCallbacks for ObjectRecordingCallbacks {
     }
 }
 
-impl<'a, R: Read + Seek + 'static> PageObjectHelper<'a, R> {
+impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
     /// Create a new helper for `page_ref` borrowing `pdf` mutably.
     ///
     /// `page_ref` should be the `ObjectRef` of a leaf `/Page` dictionary.

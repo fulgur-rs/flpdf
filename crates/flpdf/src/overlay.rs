@@ -733,7 +733,7 @@ fn apply_aggregated_sources<R: Read + Seek>(
 ///   [`Pdf::resolve`].
 pub fn apply_overlay_specs<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
 where
-    RS: Read + Seek + 'static,
+    RS: Read + Seek,
     RT: Read + Seek,
 {
     // Map every spec first, collecting its per-dest-page sources in declaration
@@ -811,7 +811,7 @@ pub fn overlay_verbose_report<RS, RT>(
     specs: &mut [OverlaySpec<RS>],
 ) -> Result<Vec<OverlayVerbosePage>>
 where
-    RS: Read + Seek + 'static,
+    RS: Read + Seek,
     RT: Read + Seek,
 {
     let n_dest = u32_len(page_refs(dest)?.len());

@@ -1437,8 +1437,8 @@ fn repair_invalid_header_version_uses_version_1_2_and_preserves_strict_version()
         [flpdf::Diagnostic::warning("can't find PDF header", None)]
     );
 
-    let strict =
-        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("strict keeps its raw version");
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect("strict keeps its raw version");
     assert_eq!(strict.version, "x.y");
     assert!(strict.repair_diagnostics.entries().is_empty());
 }
@@ -1489,8 +1489,8 @@ fn header_version_uses_qpdfs_valid_numeric_prefix() {
     assert_eq!(repaired.version, "1.7");
     assert!(repaired.repair_diagnostics.entries().is_empty());
 
-    let strict =
-        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("strict keeps its raw version");
+    let strict = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect("strict keeps its raw version");
     assert_eq!(strict.version, "1.7suffix");
     assert!(strict.repair_diagnostics.entries().is_empty());
 }

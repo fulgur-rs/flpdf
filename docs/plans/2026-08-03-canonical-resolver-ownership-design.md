@@ -134,9 +134,13 @@ allocation, and neither side copies. A caller holding only a slice writes
 `Arc::from(slice)` itself, so the copy is visible at the call site instead of
 hidden in the library.
 
-`Arc` rather than `Rc` because the resolver already makes `Pdf` non-`Send`;
-using the atomic form for the *buffer* still lets one allocation be shared
-across threads that each open their own document.
+`Arc` rather than `Rc` because `Pdf` is not `Send` — and has not been since
+`flpdf-25kg.3.3` gave `ObjectHandle` its `Rc<RefCell<..>>` identity, which
+`reader.rs`'s `handle_registry` comment already records. (An earlier revision
+of this document credited the resolver for that; the resolver's own `Rc` is a
+second reason, not the first.) Using the atomic form for the *buffer* still
+lets one allocation be shared across threads that each open their own
+document.
 
 flpdf is pre-1.0 and does not preserve compatibility for its own sake, so
 reshaping this entry point is in scope.

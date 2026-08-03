@@ -814,7 +814,7 @@ fn rewrite_field_kids<R: Read + Seek>(
 ///   empty page selection is permitted; see above), or if a requested page
 ///   index is out of range for its input.
 /// - Propagates resolve/copy errors from the underlying primitives.
-pub fn merge_documents<R: Read + Seek + 'static>(
+pub fn merge_documents<R: Read + Seek>(
     inputs: &mut [MergeInput<'_, R>],
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if inputs.is_empty() {

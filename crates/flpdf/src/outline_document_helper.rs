@@ -86,7 +86,7 @@ pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek + 'static> OutlineDocumentHelper<'a, R> {
+impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Wrap a document for outline access. Prefer [`Pdf::outline`].
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
         Self { pdf }
