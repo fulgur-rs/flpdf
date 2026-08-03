@@ -39,10 +39,12 @@
 //! warning.
 //!
 //! This discipline is currently *stated and readable, not pinned by a test*.
-//! [`ResolverHandle::resolve_indirect`] takes no borrow at all yet, so the
-//! only borrows in play are the ones `Pdf`'s legacy read helpers take — and
-//! those are exercised, including through the re-entrant indirect-`/Length`
-//! path (`reader.rs`'s
+//! [`ResolverHandle::resolve_indirect`] now takes borrows of its own, but only
+//! the two [`ResolveMark`] takes — one inside `begin`, one inside `drop`, each
+//! confined to a single statement — so nothing yet holds a borrow across the
+//! body a nested resolution would run in. The other borrows in play are the
+//! ones `Pdf`'s legacy read helpers take, and those are exercised, including
+//! through the re-entrant indirect-`/Length` path (`reader.rs`'s
 //! `qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors`). The
 //! regression that makes a borrow spanning a nested resolve fail loudly
 //! arrives with the resolver's own re-entrancy test.
@@ -64,13 +66,15 @@ use std::io::{Read, Seek, SeekFrom};
 ///
 /// **Two members of that restriction are deliberately missing.**
 ///
-/// *The warning sink.* `QPDF::resolve` warns (`m->warnings`, `QPDF.hh:1475`)
-/// on a resolution loop and on a damaged object, so a complete resolver owns
-/// it. flpdf's sink is `Pdf::repair_diagnostics`, and
-/// `Pdf::repair_diagnostics()` hands out a `&Diagnostics` that cannot be
-/// returned from behind a `RefCell`. Nothing here warns yet, so moving it now
-/// would change a public signature for no exercised behaviour; it moves with
-/// the first code that writes a warning.
+/// *The warning sink.* `QPDF::resolve` warns (`m->warnings`,
+/// `include/qpdf/QPDF.hh:1475`) on a resolution loop and on a damaged object,
+/// so a complete resolver owns it. flpdf's sink is `Pdf::repair_diagnostics`,
+/// and `Pdf::repair_diagnostics()` hands out a `&Diagnostics` that cannot be
+/// returned from behind a `RefCell`. It is still absent, and that is now a
+/// live divergence rather than a deferral of dead code: the loop branch of
+/// [`ResolverHandle::resolve_indirect`] is a place qpdf warns and flpdf does
+/// not. That method's own doc carries the reasoning and the cost of moving
+/// the sink.
 ///
 /// *The string decrypter's encryption parameters* (qpdf `m->encp`). qpdf
 /// builds a `StringDecrypter` per object inside `readObjectAtOffset`'s parse
@@ -115,11 +119,12 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// document. Either install into both, or move the teardown walk here.
     #[allow(dead_code)] // populated when uncompressed resolution lands
     object_cache: BTreeMap<ObjectRef, ObjectHandle>,
-    /// qpdf `m->resolving` (`QPDF.hh:1468`), the set `QPDF::resolve` tests to
-    /// detect "an object references itself directly or indirectly in some key
-    /// that has to be resolved during object parsing, such as stream length"
-    /// (`libqpdf/QPDF.cc:1706-1708`).
-    #[allow(dead_code)] // the in-progress guard is the next task
+    /// qpdf `m->resolving` (`include/qpdf/QPDF.hh:1468`), the set
+    /// `QPDF::resolve` tests to detect "an object references itself directly
+    /// or indirectly in some key that has to be resolved during object
+    /// parsing, such as stream length" (`libqpdf/QPDF.cc:1706-1708`).
+    ///
+    /// Written only through [`ResolveMark`], never directly.
     resolving: BTreeSet<ObjectRef>,
     /// qpdf `m->resolved_object_streams` (`QPDF.hh:1485`). Keyed by object
     /// stream *number* rather than by `ObjectRef`, matching qpdf's own
@@ -193,6 +198,65 @@ impl<R: Read + Seek> ResolverCore<R> {
         let mut bytes = Vec::new();
         self.reader.read_to_end(&mut bytes)?;
         Ok(bytes)
+    }
+}
+
+/// The record that one reference's resolution is in progress, removed when the
+/// record goes out of scope.
+///
+/// qpdf's `ResolveRecorder` (`include/qpdf/QPDF.hh:980-996`): its constructor
+/// inserts into `m->resolving` (`:985`) and its destructor erases (`:990`).
+///
+/// **A `Drop` guard rather than a matched insert/remove pair**, for the same
+/// reason qpdf uses an RAII class rather than two statements: the removal has
+/// to happen on *every* exit from the resolution, including the ones the
+/// author did not write. qpdf's `try`/`catch` (`libqpdf/QPDF.cc:1718-1742`)
+/// brackets only the xref-entry switch; `updateCache` (`:1748`) and
+/// `setDefaultDescription` (`:1752`) run outside it, so `~ResolveRecorder` is
+/// what erases the mark should either throw. The Rust body has exits of the
+/// same shape — an unwinding panic today, plus the `?` returns Task 4's
+/// read-and-parse steps will add.
+/// `the_in_progress_mark_is_removed_when_a_resolution_unwinds` asserts the
+/// unwind case rather than assuming it.
+///
+/// One divergence in mechanism, none in outcome: qpdf stores the iterator
+/// `std::set::insert` returns and erases *by iterator*, while this removes by
+/// key. Same element either way — `object_ref` is what was inserted, and
+/// [`ResolverCore::resolving`] is not otherwise written.
+struct ResolveMark<'a, R: Read + Seek + 'static> {
+    core: &'a RefCell<ResolverCore<R>>,
+    object_ref: ObjectRef,
+}
+
+impl<'a, R: Read + Seek> ResolveMark<'a, R> {
+    /// Record `object_ref` as in progress, or report that it already was.
+    ///
+    /// Folds two qpdf steps into one `BTreeSet::insert`: the loop test
+    /// `m->resolving.count(og)` (`libqpdf/QPDF.cc:1706`) and the insert inside
+    /// `ResolveRecorder`'s constructor (`include/qpdf/QPDF.hh:985`). `insert`
+    /// already answers "was it there?", so asking twice would be redundant.
+    ///
+    /// **`None` deliberately yields no guard.** qpdf `return`s at
+    /// `libqpdf/QPDF.cc:1712`, before `ResolveRecorder rr(this, og)` at
+    /// `:1714`, so a loop-detecting call constructs no recorder and destroys
+    /// none — the outer resolution's mark survives its inner call. A guard
+    /// handed back here regardless would erase that mark on drop.
+    ///
+    /// Borrow discipline: the `borrow_mut()` is taken and dropped inside this
+    /// expression, so no borrow is live when the caller runs its body.
+    fn begin(core: &'a RefCell<ResolverCore<R>>, object_ref: ObjectRef) -> Option<Self> {
+        if core.borrow_mut().resolving.insert(object_ref) {
+            Some(Self { core, object_ref })
+        } else {
+            None
+        }
+    }
+}
+
+impl<R: Read + Seek> Drop for ResolveMark<'_, R> {
+    /// qpdf `~ResolveRecorder` (`include/qpdf/QPDF.hh:988-991`).
+    fn drop(&mut self) {
+        self.core.borrow_mut().resolving.remove(&self.object_ref);
     }
 }
 
@@ -303,19 +367,80 @@ impl<R: Read + Seek> ResolverHandle<R> {
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// Resolve `object_ref`'s slot in place.
     ///
-    /// No source class is implemented yet, so every reference is rejected
-    /// with [`Error::Unsupported`]. This is deliberately *not* a fallback
-    /// into `Pdf`'s legacy `resolve_object_handle`/`resolve_borrowed` route:
-    /// that bridge is what `flpdf-25kg.3.5`'s acceptance criteria forbid, so
-    /// an unhandled class errors and gains real support in a later slice.
+    /// Two of `QPDF::resolve`'s branches (`libqpdf/QPDF.cc:1700-1753`) exist
+    /// so far. The resolution loop is handled; no source class is implemented
+    /// yet, so every other reference is rejected with [`Error::Unsupported`].
+    /// That rejection is deliberately *not* a fallback into `Pdf`'s legacy
+    /// `resolve_object_handle`/`resolve_borrowed` route: that bridge is what
+    /// `flpdf-25kg.3.5`'s acceptance criteria forbid, so an unhandled class
+    /// errors and gains real support in a later slice.
     ///
     /// Reaching this at all is what distinguishes an attached handle from a
     /// detached one — [`ObjectHandle::try_dereference`] reports
     /// `"belongs to a dropped PDF"` when it cannot upgrade its `Weak`, which
     /// is a different failure from this one.
+    ///
+    /// # The loop branch, and what it does not yet do
+    ///
+    /// qpdf's loop branch (`libqpdf/QPDF.cc:1706-1712`) does three things:
+    /// warns `damagedPDF("", "loop detected resolving object " +
+    /// og.unparse(' '))`, calls `updateCache(og, QPDF_Null::create(), -1, -1)`,
+    /// and returns without throwing. Two of the three are ported.
+    ///
+    /// *Null at offset -1* is [`ObjectHandle::set_missing`], not
+    /// `set_resolved(ObjectValue::Null)`. qpdf draws no distinction to port
+    /// here — a loop and an object absent from the xref table both end at the
+    /// same `updateCache(og, QPDF_Null::create(), -1, -1)` call (`:1711` and
+    /// `:1748`) — so the loop takes whichever route flpdf's absent-reference
+    /// case already takes, which is `set_missing` (`reader.rs`'s
+    /// `resolve_object_handle`). It is also the one that clears the parsed
+    /// offset, matching qpdf's `-1` argument; `set_resolved` leaves any
+    /// recorded offset in place. The design's Parsed-Offset Contract names
+    /// "cyclic" in the set `set_missing`'s own doc quotes.
+    ///
+    /// *The canonical cache* is not written, because
+    /// [`ResolverCore::object_cache`] has no writer and no reader anywhere in
+    /// this slice; Task 4 introduces both together. Nothing observable turns
+    /// on it meanwhile: `Pdf::get_object_handle` vends one registry entry per
+    /// [`ObjectRef`] and re-hands that same handle, so the null this installs
+    /// is what the next lookup sees, and [`ObjectHandle::try_dereference`]
+    /// short-circuits on it without consulting the resolver again.
+    ///
+    /// *The warning is not emitted at all.* flpdf's counterpart of
+    /// `m->warnings` (`include/qpdf/QPDF.hh:1475`) is `Pdf::repair_diagnostics`,
+    /// which [`ResolverCore`]'s own doc records as deliberately absent from
+    /// the resolver, and this slice does not move it: `Pdf::repair_diagnostics`
+    /// returns `&Diagnostics`, a reference that cannot come out of a `RefCell`,
+    /// so the sink can only move by changing that signature across 90 call
+    /// sites in three crates. The mechanical replacement does not work either:
+    /// returning `Ref<'_, Diagnostics>` makes every
+    /// `let entries = pdf.repair_diagnostics().entries();` binding a rustc
+    /// E0716 — the `Ref` is a temporary freed at the end of that statement
+    /// while the slice still borrows it — and seven such bindings exist,
+    /// including `flpdf-qtest-tools/src/driver/mod.rs:323`. A second,
+    /// resolver-local sink was rejected as the larger divergence: qpdf has
+    /// exactly one warning list, and
+    /// splitting flpdf's would have to be undone at the same cost later. So
+    /// **a resolution loop is silent here where qpdf warns**, which is a
+    /// divergence and not a slice of parity. The plan of record assigns
+    /// warnings to Task 4, whose step 3 lists them among what it must
+    /// preserve.
+    ///
+    /// Not ported for a different reason: qpdf's `isUnresolved(og)` early
+    /// return (`:1702-1704`) is phase 1 of Task 4's three-phase split.
+    /// [`ObjectHandle::try_dereference`] happens to make the same test before
+    /// calling in, so it is not reachable through that path today, but this
+    /// method does not make it itself.
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-        // `handle` is the slot a later slice writes the parsed value into.
-        let _ = handle;
+        // Bound to a named local, not to `_`: the mark must live until this
+        // method returns or unwinds, and `let Some(_) = ..` would drop it at
+        // the end of this statement.
+        let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
+            handle.set_missing();
+            return Ok(());
+        };
+
+        // `handle` is also the slot a later slice writes the parsed value into.
         Err(Error::Unsupported(format!(
             "canonical resolver cannot yet resolve object {} {}: no source class is implemented",
             object_ref.number, object_ref.generation
@@ -325,6 +450,8 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 
 #[cfg(test)]
 mod tests {
+    use super::ResolveMark;
+    use crate::object_handle::NO_PARSED_OFFSET;
     use crate::{Error, ObjectRef, Pdf};
     use std::sync::Arc;
 
@@ -454,5 +581,125 @@ mod tests {
             "a surviving handle must not keep its dropped document's input source alive"
         );
         drop(handle);
+    }
+
+    /// Re-entering resolution for a reference already in progress takes qpdf's
+    /// loop branch, and the outer resolution's mark survives that inner call.
+    ///
+    /// The outer resolution is staged by holding a [`ResolveMark`] — the same
+    /// production guard [`ResolverHandle::resolve_indirect`] takes — rather
+    /// than by a genuinely nested call, because nothing in this slice resolves
+    /// far enough to re-enter on its own. Task 5's `/Length` regression drives
+    /// the same guard through a real nested resolution.
+    ///
+    /// Three separate things are asserted, because a guard can get any one of
+    /// them wrong on its own:
+    ///
+    /// 1. the inner call is not an error — qpdf's loop branch `return`s after
+    ///    warning and caching null (`libqpdf/QPDF.cc:1706-1712`), it does not
+    ///    throw;
+    /// 2. the handle reads as null and its parsed offset has been *cleared*,
+    ///    qpdf's `updateCache(og, QPDF_Null::create(), -1, -1)` (`:1711`),
+    ///    which writes `-1` over whatever the cache entry held. The offset is
+    ///    pre-set below only so that assertion can tell the two null routes
+    ///    apart: a freshly vended handle already reports `NO_PARSED_OFFSET`,
+    ///    so `set_resolved(ObjectValue::Null)` — which leaves the offset
+    ///    untouched — would otherwise satisfy it by accident;
+    /// 3. the mark is *still* held after the inner call returns. qpdf reaches
+    ///    its `return` at `:1712` before constructing `ResolveRecorder rr` at
+    ///    `:1714`, so the inner call never owns a recorder and never erases
+    ///    the outer's entry. A guard that inserted unconditionally and erased
+    ///    on drop would clear the outer resolution's mark from underneath it.
+    #[test]
+    fn a_reference_already_being_resolved_takes_the_loop_branch_and_leaves_the_outer_mark() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.set_parsed_offset_if_unset(100);
+
+        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref)
+            .expect("the first mark for a reference must be recorded, not reported as a loop");
+
+        handle
+            .try_dereference()
+            .expect("a resolution loop is qpdf's null outcome, not an error");
+
+        assert!(handle.is_null(), "a detected loop resolves to null");
+        assert!(
+            handle.is_resolved(),
+            "and is terminal, so it is not re-read"
+        );
+        assert_eq!(
+            handle.get_parsed_offset(),
+            NO_PARSED_OFFSET,
+            "qpdf caches the loop null at offset -1, overwriting what was there"
+        );
+        assert!(
+            pdf.resolver.core.borrow().resolving.contains(&object_ref),
+            "the inner loop-detecting call must not erase the outer resolution's mark"
+        );
+
+        drop(outer);
+        assert!(
+            !pdf.resolver.core.borrow().resolving.contains(&object_ref),
+            "the outer guard must remove its own mark when it goes out of scope"
+        );
+    }
+
+    /// The mark is removed when the resolution returns an *error*, not only
+    /// when it returns successfully.
+    ///
+    /// Every non-loop reference errors in this slice, so the error exit is the
+    /// only exit `resolve_indirect` currently has — which makes this the test
+    /// that a matched insert/remove pair placed only on the success path would
+    /// fail. Left behind, the mark would make the very next attempt at the
+    /// same reference report a phantom loop and resolve it to null.
+    #[test]
+    fn a_resolution_that_returns_an_error_leaves_no_in_progress_mark() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+
+        let error = handle
+            .try_dereference()
+            .expect_err("no source class resolves in this slice");
+        assert!(
+            matches!(error, Error::Unsupported(_)),
+            "the class rejection, not a loop: {error:?}"
+        );
+
+        assert!(
+            pdf.resolver.core.borrow().resolving.is_empty(),
+            "a failed resolution must not leave its reference marked in progress"
+        );
+    }
+
+    /// The mark is removed when a resolution *unwinds*, which is the reason
+    /// [`ResolveMark`] is a `Drop` guard rather than a matched insert/remove
+    /// pair around the body — qpdf gets the same property from
+    /// `~ResolveRecorder` (`include/qpdf/QPDF.hh:988-991`).
+    ///
+    /// The panic stands in for any panic raised between the mark being taken
+    /// and the resolution finishing. [`std::panic::AssertUnwindSafe`] is
+    /// required, not decorative: without it rustc rejects the closure with
+    /// E0277, because the captured `Rc<ResolverHandle<_>>` reaches both the
+    /// `UnsafeCell` inside [`ResolverHandle`]'s `RefCell` and the one holding
+    /// the `Rc` strong count, neither of which is
+    /// [`std::panic::RefUnwindSafe`].
+    #[test]
+    fn the_in_progress_mark_is_removed_when_a_resolution_unwinds() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _mark = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
+            panic!("simulated failure part-way through a resolution");
+        }));
+
+        assert!(unwound.is_err(), "the body must actually have panicked");
+        assert!(
+            !pdf.resolver.core.borrow().resolving.contains(&object_ref),
+            "an unwind must leave the reference resolvable, not permanently marked in progress"
+        );
     }
 }
