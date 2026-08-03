@@ -47,9 +47,19 @@ and gains real support in a later one.
 
 `new_indirect_with_resolver` (`:287`) sets `pdf_unique_id: None`;
 `new_indirect_unresolved_for_pdf` (`:258`) sets the identity but no resolver.
-`get_object_handle` needs both: the identity is what
-`is_canonical_object_handle` (`reader.rs:1618`) and the foreign-object logic
-compare on, so it cannot be dropped to gain a resolver.
+`get_object_handle` needs both, and the identity cannot be dropped to gain a
+resolver.
+
+> **Corrected during implementation.** A draft of this task said
+> `is_canonical_object_handle` (`reader.rs:1618`) compares on `pdf_unique_id`.
+> It does not — it looks the ref up in `handle_registry` and compares `Rc`
+> pointers through `is_same_object_as`. The conclusion survives through the
+> other half: `belongs_to_pdf` (`:418`) and `containing_object_refs_for_pdf`
+> (`:405`) back the foreign-object rejection in `mark_object_handle_dirty`
+> (`:1785`, `:1790`), `filespec_helper.rs:114`, and `embedded_files.rs:492`,
+> and `set_resolved` stamps the slot's identity onto every direct child, so a
+> `None` identity poisons children too. Measured rather than argued: patching
+> `new_indirect_unresolved_for_pdf` to discard its argument fails 61 tests.
 
 **Step 1: failing test** — construct a handle with both, assert the identity is
 preserved and the resolver reachable.
