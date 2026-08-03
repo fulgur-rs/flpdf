@@ -3783,6 +3783,14 @@ mod tests {
         /// Each shape row decodes the same flate payload, so the shapes whose
         /// chain is buildable run a real codec instead of stopping at the
         /// reader.
+        ///
+        /// The D4 row ("null-valued /DecodeParms key (flpdf-h8mv)") pins
+        /// **reader agreement, not qpdf agreement**: qpdf's
+        /// `QPDF_Dictionary::getKeys` skips null-valued entries and tolerates
+        /// the stream, flpdf rejects it, and the divergence is tracked as beads
+        /// `flpdf-h8mv` rather than fixed here. Two readers agreeing is not
+        /// evidence either is right; `shape_corpus`'s own comment on that row
+        /// carries the qpdf citation.
         fn corpus() -> Vec<Row> {
             let flate = encode_flate(b"shape corpus payload").unwrap();
             shape_corpus()
