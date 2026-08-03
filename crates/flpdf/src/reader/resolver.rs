@@ -2301,4 +2301,67 @@ mod tests {
             "and must not leave the reference marked in progress"
         );
     }
+
+    /// Two nested [`super::ResolverHandle::read_stream`] frames each keep their
+    /// own saved offset — a single shared save/restore slot would give the
+    /// outer stream the inner one's position.
+    ///
+    /// **The nesting is only reachable on an error path, and that is a fact
+    /// about the format rather than about this fixture.** Entering
+    /// `read_stream` twice requires the `/Length` reference to resolve to a
+    /// stream, and a stream is not an integer — so qpdf's own
+    /// `length_obj.isInteger()` test (`libqpdf/QPDF.cc:1370`) rejects the outer
+    /// stream whenever the inner frame was entered at all. The inner
+    /// resolution still completes first, which is what makes it observable:
+    /// object 3's payload is asserted directly, and it can only be right if
+    /// its own `stream_offset` was saved and restored while object 2's was
+    /// also live.
+    ///
+    /// The two payloads differ in length and content so a mix-up cannot
+    /// coincide.
+    #[test]
+    fn nested_stream_length_resolutions_each_restore_their_own_offset() {
+        let outer: &[u8] = b"OUTER-PAYLOAD";
+        let inner: &[u8] = b"IN";
+
+        let mut second = b"2 0 obj\n<< /Length 3 0 R >>\nstream\n".to_vec();
+        second.extend_from_slice(outer);
+        second.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let mut third = b"3 0 obj\n<< /Length 4 0 R >>\nstream\n".to_vec();
+        third.extend_from_slice(inner);
+        third.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            second,
+            third,
+            format!("4 0 obj\n{}\nendobj\n", inner.len()).into_bytes(),
+        ]);
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        let error = handle
+            .try_dereference()
+            .expect_err("a stream is not a usable /Length");
+        assert!(
+            matches!(&error, Error::Parse { message, .. }
+                if message == "/Length key in stream dictionary is not an integer"),
+            "the outer stream must fail on the value, not on a mis-read: {error:?}"
+        );
+
+        assert_eq!(
+            pdf.get_object_handle(ObjectRef::new(3, 0))
+                .as_stream_data()
+                .as_deref(),
+            Some(inner),
+            "the inner stream, resolved while the outer frame was live, must \
+             have read from its own saved offset"
+        );
+        assert!(
+            pdf.resolver.core.borrow().resolving.is_empty(),
+            "every mark must be gone once the outermost resolution returns"
+        );
+    }
 }
