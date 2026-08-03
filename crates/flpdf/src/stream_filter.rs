@@ -345,7 +345,8 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
 /// [`RETAINED_DECODE_PARAM_KEYS`], because the retention test runs inside the
 /// walk, after the snapshot. Nor was the stage count capped in general:
 /// `max_filter_chain` bounds it only where [`crate::filters::DecodeLimits`]
-/// carries one, and that field is a `pub Option` its owner may leave `None`.
+/// carries one. `DecodeLimits::default()` does, but the field is a `pub
+/// Option` a caller may set to `None`, which the entry-point corpus sweeps.
 /// Taking the snapshot here instead costs one whatever the chain length is,
 /// and the per-filter walk then borrows it.
 ///
