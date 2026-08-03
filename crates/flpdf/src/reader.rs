@@ -10,7 +10,7 @@ use self::resolver::ResolverHandle;
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -31,7 +31,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -93,16 +93,18 @@ pub struct Pdf<R: Read + Seek + 'static> {
     startxref: u64,
     last_xref_form: XrefForm,
     cache: ObjectCache,
-    /// Canonical indirect-object handle registry (`QPDF::getObject`-equivalent
-    /// identity): repeated [`Pdf::get_object_handle`] calls for the same
-    /// `ObjectRef` return the same shared handle. Populated lazily on first
-    /// request; does not perform file I/O or force body parsing.
+    // The canonical indirect-object handle registry that used to live here is
+    // now `ResolverCore::object_cache`, reached through `self.resolver`. It
+    // had to move: `DocumentResolver::resolve_indirect` takes `&self` and
+    // must mint a canonical handle for every nested `N G R` it parses, and a
+    // registry it cannot reach would mean two maps, divergent identity, and
+    // reference cycles `Pdf::drop` could no longer break.
+    //
     // `ObjectHandle`'s Rc<RefCell<..>> identity (see object_handle.rs) makes
     // `Pdf<R>` lose the `Send`/`Sync` auto traits it previously had for any
     // `R: Send`/`Sync`. This is an accepted, intentional consequence of that
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
-    handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
     /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
     foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
@@ -387,9 +389,7 @@ impl<R: Read + Seek> Drop for Pdf<R> {
     // registry itself drops ensures no lingering cycle keeps a document's
     // object graph (and any reachable stream buffers) alive past `self`.
     fn drop(&mut self) {
-        for handle in self.handle_registry.values() {
-            handle.disconnect();
-        }
+        self.resolver.disconnect_all();
     }
 }
 
@@ -679,21 +679,25 @@ impl<R: Read + Seek> Pdf<R> {
         sorted_object_offsets.sort_unstable();
         sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
+        // Hoisted out of the struct literal because the resolver needs the
+        // same id: it stamps `pdf_unique_id` onto every canonical handle it
+        // mints, which `ObjectHandle::belongs_to_pdf` answers on.
+        let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
         let mut pdf = Self {
-            unique_id: NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed),
-            resolver: Rc::new(ResolverHandle::new(
+            unique_id,
+            resolver: ResolverHandle::new_shared(
                 reader,
                 loaded_state.header_offset,
                 source_xref_entries,
                 options.repair,
                 loaded.repair_diagnostics,
-            )),
+                unique_id,
+            ),
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
             last_xref_form: loaded.last_xref_form,
             cache,
-            handle_registry: BTreeMap::new(),
             foreign_object_maps: BTreeMap::new(),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
@@ -1505,9 +1509,9 @@ impl<R: Read + Seek> Pdf<R> {
             );
             let has_handle_only_target = self.cache.entry(object_ref).is_none()
                 && self
-                    .handle_registry
-                    .get(&object_ref)
-                    .is_some_and(ObjectHandle::is_resolved);
+                    .resolver
+                    .registered_handle(object_ref)
+                    .is_some_and(|handle| handle.is_resolved());
             if !(has_cached_target || has_handle_only_target) {
                 self.qpdf_dangling_refs.insert(object_ref);
                 if self.cache.entry(object_ref).is_none() {
@@ -1535,18 +1539,16 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// qpdf's `obj_cache` owns both parsed objects and objects created with
     /// `makeIndirectObject`. During the ObjectHandle cutover, the latter live
-    /// solely in `handle_registry`: including resolved cache-miss handles here
-    /// preserves that visibility without cloning their stream payloads into
-    /// the legacy `Object` cache.
+    /// solely in the canonical handle registry: including resolved cache-miss
+    /// handles here preserves that visibility without cloning their stream
+    /// payloads into the legacy `Object` cache.
     fn qpdf_json_live_object_refs(&self) -> Vec<ObjectRef> {
         let mut refs = self.live_object_refs();
         refs.extend(
-            self.handle_registry
-                .iter()
-                .filter_map(|(object_ref, handle)| {
-                    (self.cache.entry(*object_ref).is_none() && handle.is_resolved())
-                        .then_some(*object_ref)
-                }),
+            self.resolver
+                .resolved_object_refs()
+                .into_iter()
+                .filter(|object_ref| self.cache.entry(*object_ref).is_none()),
         );
         refs.sort_unstable();
         refs.dedup();
@@ -1604,28 +1606,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// This does not perform file I/O or force object-body parsing: the
     /// returned handle's value is not read or resolved by this call.
     pub fn get_object_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        // Hoisted so the registry can be probed and filled in one lookup:
-        // both borrow `self`, which `entry()` holds mutably. `Rc::downgrade`
-        // is a non-atomic weak-count bump, cheap enough to pay on the hit
-        // path too.
-        let unique_id = self.unique_id;
-        let weak = Rc::downgrade(&self.resolver);
-        self.handle_registry
-            .entry(object_ref)
-            .or_insert_with(|| {
-                // Both halves together, per
-                // `new_indirect_for_pdf_with_resolver`'s own doc: the identity
-                // is what `belongs_to_pdf` answers on, the `Weak` is what
-                // `try_dereference` upgrades and calls.
-                let resolver: Weak<dyn DocumentResolver> = weak;
-                ObjectHandle::new_indirect_for_pdf_with_resolver(
-                    object_ref,
-                    NO_PARSED_OFFSET,
-                    unique_id,
-                    resolver,
-                )
-            })
-            .clone()
+        // The registry itself lives on the resolver, which is also what mints
+        // the handle: it holds both halves `new_indirect_for_pdf_with_resolver`
+        // needs — the document identity `belongs_to_pdf` answers on and the
+        // `Weak` `try_dereference` upgrades — and it is the same door
+        // `resolve_indirect` uses for a nested `N G R`, so the two can never
+        // hand out different handles for one ref.
+        self.resolver.get_object_handle(object_ref)
     }
 
     /// Whether this document holds the only strong reference to its resolver.
@@ -1640,8 +1627,8 @@ impl<R: Read + Seek> Pdf<R> {
 
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.object_ref().is_some_and(|object_ref| {
-            self.handle_registry
-                .get(&object_ref)
+            self.resolver
+                .registered_handle(object_ref)
                 .is_some_and(|canonical| canonical.is_same_object_as(handle))
         })
     }
@@ -1724,7 +1711,7 @@ impl<R: Read + Seek> Pdf<R> {
             .object_refs()
             .iter()
             .map(|r| r.number)
-            .chain(self.handle_registry.keys().map(|r| r.number))
+            .chain(self.resolver.max_object_number())
             .max()
             .unwrap_or(0)
             .checked_add(1)
@@ -1741,12 +1728,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// generation-one occupant reserves the number just as generation zero
     /// does.
     pub(crate) fn object_number_is_available(&self, number: u32) -> bool {
-        !self.cache.contains_object_number(number)
-            && self
-                .handle_registry
-                .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))
-                .next()
-                .is_none()
+        !self.cache.contains_object_number(number) && !self.resolver.holds_object_number(number)
     }
 
     pub(crate) fn unique_id(&self) -> u64 {
@@ -1852,7 +1834,7 @@ impl<R: Read + Seek> Pdf<R> {
         for object_ref in refs_to_register {
             self.get_object_handle(object_ref);
         }
-        Ok(self.handle_registry.values().cloned().collect())
+        Ok(self.resolver.all_object_handles())
     }
 
     // qpdf-cutover-delete(flpdf-25kg.3.3): one-hop legacy bridge. Delete
@@ -2708,9 +2690,9 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         if self.cache.entry(object_ref).is_none() {
             if let Some(handle) = self
-                .handle_registry
-                .get(&object_ref)
-                .filter(|handle| handle.is_resolved())
+                .resolver
+                .registered_handle(object_ref)
+                .filter(ObjectHandle::is_resolved)
             {
                 return Ok(handle.materialize());
             }
@@ -7780,7 +7762,7 @@ mod tests {
             "object 0 must never be tracked as an explicitly removed reference"
         );
         assert!(
-            !pdf.handle_registry.contains_key(&free_list_head),
+            pdf.resolver.registered_handle(free_list_head).is_none(),
             "object 0 must not gain a handle just from delete_object"
         );
     }
@@ -7811,7 +7793,7 @@ mod tests {
             "prepare_qpdf_json_objects must have seeded the cache as Missing"
         );
         assert!(
-            !pdf.handle_registry.contains_key(&dangling_ref),
+            pdf.resolver.registered_handle(dangling_ref).is_none(),
             "no handle must exist yet for this ref"
         );
 

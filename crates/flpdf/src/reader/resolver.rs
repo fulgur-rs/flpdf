@@ -14,6 +14,11 @@
 //! wraps it in a `RefCell`, and `Pdf` owns the whole thing behind an `Rc` so
 //! handles can hold a `Weak` to it.
 //!
+//! That ownership is also why the canonical handle registry lives here rather
+//! than on `Pdf`: resolving an object means minting a canonical handle for
+//! every nested `N G R` in its body, and `resolve_indirect` has no `&mut Pdf`
+//! to mint through. See [`ResolverCore::object_cache`].
+//!
 //! # Borrow discipline
 //!
 //! Every non-test accessor below takes its `RefCell` borrow and drops it
@@ -55,11 +60,12 @@
 //! regression that makes a borrow spanning a nested resolve fail loudly
 //! arrives with the resolver's own re-entrancy test.
 
-use crate::object_handle::DocumentResolver;
+use crate::object_handle::{DocumentResolver, NO_PARSED_OFFSET};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::rc::{Rc, Weak};
 
 /// The state `QPDF::resolve` and the functions it calls operate on.
 ///
@@ -101,19 +107,25 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     header_offset: usize,
     /// qpdf `m->xref_table` (`QPDF.hh:1465`).
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
-    /// qpdf `m->obj_cache` (`QPDF.hh:1467`).
+    /// qpdf `m->obj_cache` (`QPDF.hh:1467`), and the document's *only*
+    /// canonical [`ObjectRef`] → [`ObjectHandle`] map.
     ///
-    /// Empty for the whole of this slice: nothing populates it until
-    /// uncompressed resolution lands, so it is not yet a second view of
-    /// `Pdf::handle_registry`.
+    /// **It absorbed what was `Pdf::handle_registry`.** An earlier revision
+    /// of this doc said the map was "empty for the whole of this slice … not
+    /// yet a second view of `Pdf::handle_registry`", and flagged a teardown
+    /// hazard for whoever populated it, offering "install into both, or move
+    /// the teardown walk here". Neither half survives: real resolution has to
+    /// mint a handle for every nested `N G R` it parses, and a second map
+    /// would hand out handles that are not `is_same_object_as` the ones
+    /// [`crate::Pdf::get_object_handle`] vends — breaking
+    /// `Pdf::is_canonical_object_handle` and leaking every reference cycle
+    /// `Pdf::drop` could no longer reach. So the registry moved here whole,
+    /// which is also qpdf's shape: `m->obj_cache` is what `QPDF::getObject`
+    /// fills, what `QPDF::getAllObjects` walks (`libqpdf/QPDF.cc:1285-1295`),
+    /// and what `QPDF::~QPDF` disconnects.
     ///
-    /// **Teardown hazard for whoever populates it.** `Pdf::drop` breaks the
-    /// resolved-handle reference cycle by walking `Pdf::handle_registry` and
-    /// disconnecting each entry. It does not walk this map. A handle
-    /// installed here but not also in `handle_registry` would therefore keep
-    /// its cycle — and every stream buffer reachable from it — alive past the
-    /// document. Either install into both, or move the teardown walk here.
-    #[allow(dead_code)] // populated when uncompressed resolution lands
+    /// The teardown walk moved with it: [`ResolverHandle::disconnect_all`] is
+    /// what `Pdf::drop` now calls.
     object_cache: BTreeMap<ObjectRef, ObjectHandle>,
     /// qpdf `m->resolving` (`include/qpdf/QPDF.hh:1468`), the set
     /// `QPDF::resolve` tests to detect "an object references itself directly
@@ -278,17 +290,44 @@ impl<R: Read + Seek> Drop for ResolveMark<'_, R> {
 /// [`DocumentResolver`] a document's handles hold a `Weak` to.
 pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     core: RefCell<ResolverCore<R>>,
+    /// A `Weak` to this same allocation, so minting a canonical handle can
+    /// attach the resolver the handle will later call back into.
+    ///
+    /// Not a qpdf member. qpdf's `QPDF_Stream`/`QPDFObject` carry a raw
+    /// `QPDF*` back-pointer (`libqpdf/QPDFObject.cc:10` calls
+    /// `QPDF::Resolver::resolve(value->qpdf, og)`), which needs no such
+    /// field. `#![forbid(unsafe_code)]` (`crates/flpdf/src/lib.rs:83`) rules
+    /// that out, and the design of record records the raw back-pointer as an
+    /// alternative rejected for exactly that reason, so the `Weak` is the
+    /// safe-Rust stand-in and this field is the only way to obtain one from
+    /// `&self`.
+    self_weak: Weak<ResolverHandle<R>>,
+    /// The owning document's [`crate::Pdf`] identity, stamped onto every
+    /// handle this minted — `ObjectHandle`'s `pdf_unique_id`, whose own doc
+    /// traces it to qpdf's `QPDF::getUniqueId`
+    /// (`include/qpdf/QPDF.hh:283`, `libqpdf/QPDF.cc:2294-2296`).
+    ///
+    /// Duplicated from `Pdf::unique_id` rather than reached through it: the
+    /// resolver has no `&Pdf`, and the value is assigned once before either
+    /// is constructed, so the two copies cannot drift.
+    pdf_unique_id: u64,
 }
 
 impl<R: Read + Seek> ResolverHandle<R> {
-    pub(crate) fn new(
+    /// Build the resolver already inside its `Rc`.
+    ///
+    /// `Rc::new_cyclic` rather than `Rc::new` because [`Self::self_weak`]
+    /// has to point at this very allocation; there is no way to add it
+    /// afterwards without making the field mutable.
+    pub(crate) fn new_shared(
         reader: R,
         header_offset: usize,
         source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
         attempt_recovery: bool,
         repair_diagnostics: Diagnostics,
-    ) -> Self {
-        Self {
+        pdf_unique_id: u64,
+    ) -> Rc<Self> {
+        Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
                 reader,
                 header_offset,
@@ -299,6 +338,99 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 attempt_recovery,
                 repair_diagnostics,
             }),
+            self_weak: self_weak.clone(),
+            pdf_unique_id,
+        })
+    }
+
+    /// The canonical handle for `object_ref`, minting and registering one on
+    /// first request.
+    ///
+    /// qpdf's `QPDF::getObject`: one `QPDFObject` per `QPDFObjGen` in
+    /// `m->obj_cache`, handed back on every later lookup. Repeated calls
+    /// return handles that are `is_same_object_as` each other, which is what
+    /// makes lazy resolution observable through any clone.
+    ///
+    /// Borrow discipline: the `borrow_mut()` spans only the map lookup and
+    /// the `ObjectHandle` construction, neither of which resolves anything.
+    pub(crate) fn get_object_handle(&self, object_ref: ObjectRef) -> ObjectHandle {
+        self.core
+            .borrow_mut()
+            .object_cache
+            .entry(object_ref)
+            .or_insert_with(|| {
+                let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
+                ObjectHandle::new_indirect_for_pdf_with_resolver(
+                    object_ref,
+                    NO_PARSED_OFFSET,
+                    self.pdf_unique_id,
+                    resolver,
+                )
+            })
+            .clone()
+    }
+
+    /// The canonical handle for `object_ref` **if one has already been
+    /// minted**, without minting one.
+    ///
+    /// The read-only counterpart of [`Self::get_object_handle`], for the
+    /// `&self` callers that ask whether a reference has a handle at all.
+    pub(crate) fn registered_handle(&self, object_ref: ObjectRef) -> Option<ObjectHandle> {
+        self.core.borrow().object_cache.get(&object_ref).cloned()
+    }
+
+    /// Every canonical handle minted so far, in [`ObjectRef`] order.
+    ///
+    /// qpdf `QPDF::getAllObjects` walks `m->obj_cache` the same way
+    /// (`libqpdf/QPDF.cc:1285-1295`).
+    pub(crate) fn all_object_handles(&self) -> Vec<ObjectHandle> {
+        self.core.borrow().object_cache.values().cloned().collect()
+    }
+
+    /// The refs whose canonical handle has already left `NotYetResolved`.
+    ///
+    /// Collected under one short borrow, and deliberately *not* a
+    /// predicate-taking variant: [`ObjectHandle::is_resolved`] cannot
+    /// re-enter resolution, whereas a caller-supplied predicate could.
+    pub(crate) fn resolved_object_refs(&self) -> Vec<ObjectRef> {
+        self.core
+            .borrow()
+            .object_cache
+            .iter()
+            .filter(|(_, handle)| handle.is_resolved())
+            .map(|(object_ref, _)| *object_ref)
+            .collect()
+    }
+
+    /// The largest object *number* any canonical handle occupies.
+    pub(crate) fn max_object_number(&self) -> Option<u32> {
+        self.core
+            .borrow()
+            .object_cache
+            .keys()
+            .next_back()
+            .map(|object_ref| object_ref.number)
+    }
+
+    /// Whether a canonical handle occupies `number` at any generation.
+    pub(crate) fn holds_object_number(&self, number: u32) -> bool {
+        self.core
+            .borrow()
+            .object_cache
+            .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))
+            .next()
+            .is_some()
+    }
+
+    /// Sever every canonical handle's value, breaking the reference cycles a
+    /// resolved object graph forms.
+    ///
+    /// qpdf `QPDF::~QPDF` walks `m->obj_cache` and replaces each object with
+    /// `QPDF_Destroyed` for the same reason. `Pdf::drop` is the sole caller;
+    /// see its own comment for why the cycles exist.
+    pub(crate) fn disconnect_all(&self) {
+        for handle in self.core.borrow().object_cache.values() {
+            handle.disconnect();
         }
     }
 
