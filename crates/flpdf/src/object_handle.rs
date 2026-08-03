@@ -906,6 +906,30 @@ impl ObjectHandle {
         replaced
     }
 
+    /// Replace every item in this live array while preserving the array
+    /// handle itself. Returns `false` for a non-array handle or when the
+    /// replacement would create a direct self-cycle.
+    pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
+        if items.iter().any(|item| self.is_same_direct_handle(item)) {
+            return false; // cov:ignore: internal callers only replay materialized child arrays
+        }
+        let owner_refs = self.child_owner_refs();
+        let replaced = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(current_items)) = current else {
+                return false; // cov:ignore: internal callers confirm the array type first
+            };
+            *current_items = items.clone();
+            true
+        });
+        if !replaced {
+            return false; // cov:ignore: internal callers confirm the array type first
+        }
+        for item in items {
+            item.associate_with_owners(&owner_refs, 0);
+        }
+        true
+    }
+
     /// True if `self` and `other` are both direct handles sharing the same
     /// underlying storage — i.e. `other` is `self` itself (or a clone of
     /// it), not merely a distinct direct handle with an equal value. Unlike

@@ -254,35 +254,37 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         else {
             return updated;
         };
-        if key == b"Names" && current_items.len() % 2 == 0 && updated_items.len() % 2 == 0 {
-            return ObjectHandle::array(Self::merge_name_pairs(current_items, updated_items));
-        }
-        ObjectHandle::array(
-            updated_items
-                .into_iter()
-                .enumerate()
-                .map(|(index, item)| {
-                    current_items
-                        .get(index)
-                        .filter(|current| Self::same_handle_value(current, &item))
-                        .cloned()
-                        .unwrap_or(item)
-                })
-                .collect(),
-        )
+        let merged =
+            if key == b"Names" && current_items.len() % 2 == 0 && updated_items.len() % 2 == 0 {
+                Self::merge_name_pairs(current_items, updated_items)
+            } else {
+                updated_items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        current_items
+                            .get(index)
+                            .filter(|current| Self::same_handle_value(current, &item))
+                            .cloned()
+                            .unwrap_or(item)
+                    })
+                    .collect()
+            };
+        current.replace_array_items(merged);
+        current.clone()
     }
 
     fn merge_name_pairs(
         current_items: Vec<ObjectHandle>,
         updated_items: Vec<ObjectHandle>,
     ) -> Vec<ObjectHandle> {
-        let current_pairs: Vec<_> = current_items.chunks_exact(2).collect();
+        let mut current_pairs = BTreeMap::new();
+        for pair in current_items.chunks_exact(2) {
+            current_pairs.entry(pair[0].unparse()).or_insert(pair);
+        }
         let mut merged = Vec::with_capacity(updated_items.len());
         for updated_pair in updated_items.chunks_exact(2) {
-            let current_pair = current_pairs
-                .iter()
-                .copied()
-                .find(|pair| Self::same_handle_value(&pair[0], &updated_pair[0]));
+            let current_pair = current_pairs.get(&updated_pair[0].unparse()).copied();
             match current_pair {
                 Some(pair) => {
                     merged.push(pair[0].clone());
@@ -1297,6 +1299,7 @@ mod tests {
         pdf.resolve_object_handle(&catalog_handle)
             .expect("resolve catalog");
         let retained_root = catalog_handle.get_key(b"Names").get_key(b"EmbeddedFiles");
+        let retained_pairs = retained_root.get_key(b"Names");
 
         let filespec_ref = ObjectRef::new(90, 0);
         pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
@@ -1312,6 +1315,14 @@ mod tests {
                 .is_some_and(|pairs| pairs.len() == 2),
             "a retained direct root must observe helper replacement"
         );
+        assert_eq!(
+            retained_pairs
+                .as_array()
+                .expect("retained names array")
+                .len(),
+            2,
+            "a retained direct leaf array must observe helper replacement"
+        );
 
         assert!(pdf
             .embedded_files()
@@ -1325,6 +1336,14 @@ mod tests {
                 .len(),
             0,
             "a retained direct root must observe helper removal"
+        );
+        assert_eq!(
+            retained_pairs
+                .as_array()
+                .expect("retained names array")
+                .len(),
+            0,
+            "a retained direct leaf array must observe helper removal"
         );
         assert!(pdf.embedded_files().has_embedded_files().expect("has tree"));
         assert!(!pdf
