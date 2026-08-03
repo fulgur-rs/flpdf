@@ -68,10 +68,11 @@ mod tests {
     use crate::{
         write_pdf_with_options, Dictionary, Object, ObjectStreamMode, Pdf, Stream, WriteOptions,
     };
+    use std::sync::Arc;
 
     fn write_with(options: &WriteOptions) {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
         write_pdf_with_options(&mut pdf, Vec::new(), options).unwrap();
     }
 
@@ -201,7 +202,7 @@ mod tests {
     #[test]
     fn invalid_prebuilt_member_leaves_caller_writer_unchanged() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(fixture).unwrap();
+        let mut pdf = Pdf::open_mem(Arc::from(&fixture[..])).unwrap();
         let options = WriteOptions {
             object_streams: ObjectStreamMode::Generate,
             ..WriteOptions::default()

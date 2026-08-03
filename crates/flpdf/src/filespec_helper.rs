@@ -128,7 +128,7 @@ fn ensure_indirect_handle_belongs_to_pdf<R: Read + Seek>(
 ///
 /// All accessors are cheap: only [`payload`](EmbeddedFileStream::payload)
 /// performs I/O (decoding the filter chain).
-pub struct EmbeddedFileStream<'a, R: Read + Seek> {
+pub struct EmbeddedFileStream<'a, R: Read + Seek + 'static> {
     /// qpdf's shared `/EmbeddedFile` object handle. Unlike a copied
     /// [`crate::Stream`], this preserves identity and lets metadata setters
     /// update its dictionary without cloning its payload.
@@ -138,7 +138,7 @@ pub struct EmbeddedFileStream<'a, R: Read + Seek> {
     pdf: RefCell<&'a mut Pdf<R>>,
 }
 
-impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
+impl<'a, R: Read + Seek + 'static> EmbeddedFileStream<'a, R> {
     /// Create an indirect `/EmbeddedFile` stream from decoded data, including
     /// qpdf's computed `/Params /Size` and binary MD5 `/CheckSum` values.
     ///
@@ -450,13 +450,13 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
 /// All accessors except [`embedded_file`](FileSpec::embedded_file) are
 /// cheap dictionary lookups that return `Ok(None)` when the key is absent.
 /// [`embedded_file`](FileSpec::embedded_file) resolves the `/EF /F` (or `/EF /UF`) indirect reference.
-pub struct FileSpec<'a, R: Read + Seek> {
+pub struct FileSpec<'a, R: Read + Seek + 'static> {
     /// qpdf's Filespec object handle. It may be direct or indirect.
     filespec: ObjectHandle,
     pdf: &'a mut Pdf<R>,
 }
 
-impl<'a, R: Read + Seek> FileSpec<'a, R> {
+impl<'a, R: Read + Seek + 'static> FileSpec<'a, R> {
     /// Create an indirect `/Filespec` whose `/EF /F` and `/EF /UF` entries
     /// reference the same embedded-file stream, returning its object handle.
     ///

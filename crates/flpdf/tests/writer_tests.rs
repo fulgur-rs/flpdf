@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::io::{BufReader, Cursor};
 use std::process::Command;
+use std::sync::Arc;
 
 #[test]
 fn rewrites_minimal_pdf_to_valid_pdf() {
@@ -473,7 +474,7 @@ fn write_pdf_twice_builds_valid_prev_chain() {
         let mut output = Vec::new();
         write_pdf(&mut pdf, &mut output).unwrap();
 
-        let report = check_reader(Cursor::new(&output)).unwrap();
+        let report = check_reader(Cursor::new(output.clone())).unwrap();
         assert!(
             report.valid,
             "generation {} diagnostics: {:?}",
@@ -492,7 +493,7 @@ fn write_pdf_twice_builds_valid_prev_chain() {
 
     for (generation, bytes) in generations.iter().enumerate() {
         let current_startxref = parse_startxref(bytes);
-        let parsed = Pdf::open(Cursor::new(bytes)).unwrap();
+        let parsed = Pdf::open_mem(Arc::from(&bytes[..])).unwrap();
         let current_generations = parse_last_xref_generations(bytes);
         let trailer = parsed.trailer();
 
@@ -555,7 +556,7 @@ fn write_pdf_rewriting_chain_is_self_consistent_on_open() {
         let current = &snapshots[generation];
         let previous = &snapshots[generation - 1];
 
-        let pdf = Pdf::open(Cursor::new(current)).unwrap();
+        let pdf = Pdf::open_mem(Arc::from(&current[..])).unwrap();
         let prev = pdf
             .trailer()
             .get("Prev")
@@ -565,7 +566,7 @@ fn write_pdf_rewriting_chain_is_self_consistent_on_open() {
         chain.push(prev);
         assert_eq!(prev, parse_startxref(previous));
 
-        let report = check_reader(Cursor::new(current)).unwrap();
+        let report = check_reader(Cursor::new(current.clone())).unwrap();
         assert!(
             report.valid,
             "rewritten generation {generation} diagnostics: {:?}",
@@ -680,7 +681,7 @@ fn write_pdf_deletes_object_with_free_incremental_xref_entry() {
     let latest_generations = parse_last_xref_generations(&output);
     assert_eq!(latest_generations.get(&3), Some(&1));
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     assert_eq!(reopened.resolve(deleted_ref).unwrap(), Object::Null);
 
     let mut output_reader = Cursor::new(&output);
@@ -771,7 +772,7 @@ fn set_object_after_delete_keeps_object_live() {
     let latest_entries = parse_last_xref_entries(&output);
     assert_eq!(latest_entries.get(&3), Some(&b'n'));
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     assert_eq!(reopened.resolve(object_ref).unwrap(), replacement);
 }
 
@@ -1889,7 +1890,7 @@ fn writes_qdf_normalizes_object_generations() {
 
     // Re-open and verify the normalization contract via references, not
     // hardcoded numbers.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let root = reopened.root_ref().expect("output has /Root");
     assert_eq!(
         root.generation, 0,
@@ -3097,7 +3098,7 @@ fn full_rewrite_minimal_pdf_is_valid() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite output should be valid; diagnostics: {:?}",
@@ -3117,7 +3118,7 @@ fn full_rewrite_no_prev_in_trailer() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Trailer must not contain /Prev.
-    let reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     assert!(
         reopened.trailer().get("Prev").is_none(),
         "full-rewrite output must not have /Prev in trailer"
@@ -3136,7 +3137,7 @@ fn full_rewrite_single_flatedecode_filter() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Re-open and inspect stream 3's filter.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let metadata_ref = metadata_stream_ref(&mut reopened);
     let stream_obj = reopened.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
@@ -3174,7 +3175,7 @@ fn full_rewrite_multi_filter_decodes_and_reencodes() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite of multi-filter PDF should be valid; diagnostics: {:?}",
@@ -3182,7 +3183,7 @@ fn full_rewrite_multi_filter_decodes_and_reencodes() {
     );
 
     // Stream 3 should now have a single FlateDecode filter (not ASCII85+Flate).
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let metadata_ref = metadata_stream_ref(&mut reopened);
     let stream_obj = reopened.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
@@ -3248,7 +3249,7 @@ fn full_rewrite_from_fixture() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite of fixture should be valid; diagnostics: {:?}",
@@ -3325,7 +3326,7 @@ fn full_rewrite_xref_stream_input_produces_valid_pdf() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite of xref-stream input should be valid; diagnostics: {:?}",
@@ -3382,7 +3383,7 @@ fn full_rewrite_xref_stream_input_downgrades_to_classic_table_under_force_versio
         !String::from_utf8_lossy(&output).contains("/Type /XRef"),
         "inherited xref stream must be downgraded to a classic xref table under force<1.5"
     );
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "downgraded output must be a valid PDF; diagnostics: {:?}",
@@ -3448,7 +3449,7 @@ fn full_rewrite_xref_stream_compress_yes_produces_valid_flate_xref() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // The output must parse back cleanly (FlateDecode xref stream is valid).
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite output from filtered xref-stream input should be valid; diagnostics: {:?}",
@@ -3499,7 +3500,7 @@ fn full_rewrite_xref_stream_compress_no_strips_all_filter_keys() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // The output must parse back cleanly.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "CompressStreams::No full-rewrite should produce a valid PDF; diagnostics: {:?}",
@@ -3579,7 +3580,7 @@ fn full_rewrite_strips_external_file_ref_from_reencoded_stream() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let metadata_ref = metadata_stream_ref(&mut reopened);
     let stream_obj = reopened.resolve(metadata_ref).unwrap();
     let Object::Stream(stream) = stream_obj else {
@@ -3722,7 +3723,7 @@ fn full_rewrite_preserves_catalog_version_verbatim_under_force_version() {
         std::str::from_utf8(&output[..9]).unwrap_or("<bad>")
     );
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let Object::Dictionary(catalog) = reopened.resolve(ObjectRef::new(1, 0)).unwrap() else {
         panic!("object 1 should be the Catalog dictionary");
     };

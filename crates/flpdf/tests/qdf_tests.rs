@@ -605,7 +605,7 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Output must be a structurally valid PDF.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf ObjStm-decompose output must be valid; diagnostics: {:?}",
@@ -613,7 +613,7 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
     );
 
     // No /Type /ObjStm must exist in the output.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for obj_ref in reopened.object_refs() {
         if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
             let is_objstm = matches!(
@@ -630,7 +630,7 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
 
     // Object 2 (originally inside the ObjStm) must be resolvable with its
     // original number and must be the Pages dict.
-    let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
     let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
     match &pages {
         Object::Dictionary(d) => {
@@ -744,7 +744,7 @@ fn qdf_overrides_generate_mode_no_objstm() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Output must be valid.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf+Generate output must be valid; diagnostics: {:?}",
@@ -752,7 +752,7 @@ fn qdf_overrides_generate_mode_no_objstm() {
     );
 
     // qdf must override Generate — no /Type /ObjStm in output.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for obj_ref in reopened.object_refs() {
         if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
             let is_objstm = matches!(
@@ -768,7 +768,7 @@ fn qdf_overrides_generate_mode_no_objstm() {
     }
 
     // Object 2 must still be resolvable as the Pages dict.
-    let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
     let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
     match &pages {
         Object::Dictionary(d) => {
@@ -839,7 +839,7 @@ fn qdf_original_object_id_comments_emitted_when_flag_false() {
     check_pair(2, 4, 0); // Pages (emission 4; holder occupies emission 3)
 
     // The output must still be a valid PDF (xref offsets point at "N G obj").
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "QDF output with original-object-id comments must be valid; diagnostics: {:?}",
@@ -954,7 +954,7 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
     );
 
     // Output must be structurally valid.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf xref-stream→table output must be valid; diagnostics: {:?}",
@@ -1053,7 +1053,7 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
     );
 
     // No ObjStm (6.2 regression guard still holds).
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for obj_ref in reopened.object_refs() {
         if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
             let is_objstm = matches!(
@@ -1069,7 +1069,7 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
     }
 
     // Output must be valid.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "qdf+Generate xref-table output must be valid; diagnostics: {:?}",
@@ -1453,7 +1453,7 @@ fn qdf_output_is_idempotent() {
     let twice = qdf_rewrite(&once);
 
     // The double-pass output must be a structurally valid PDF.
-    let report = check_reader(Cursor::new(&twice)).unwrap();
+    let report = check_reader(Cursor::new(twice.clone())).unwrap();
     assert!(
         report.valid,
         "qdf-of-qdf output must be valid; diagnostics: {:?}",

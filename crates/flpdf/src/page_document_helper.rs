@@ -16,7 +16,7 @@ use std::io::{Read, Seek};
 /// Construct with [`PageDocumentHelper::new`], then use the provided methods to
 /// traverse or mutate the document's page list through qpdf-corresponding
 /// operations. No page-tree state is cached inside this struct.
-pub struct PageDocumentHelper<'a, R: Read + Seek> {
+pub struct PageDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 
@@ -26,7 +26,7 @@ pub struct PageDocumentHelper<'a, R: Read + Seek> {
 /// qpdf accepts a `QPDFObjectHandle`, which can be direct, target-owned, or
 /// owned by another `QPDF`. Rust's handles do not retain an owning-document
 /// borrow, so the foreign case explicitly carries its source document.
-pub enum PageInput<'a, R: Read + Seek> {
+pub enum PageInput<'a, R: Read + Seek + 'static> {
     /// A direct page handle, which qpdf turns into a fresh indirect object.
     Direct(ObjectHandle),
     /// An indirect page already owned by the target document.
@@ -57,7 +57,7 @@ impl<'a, R: Read + Seek> PageInput<'a, R> {
     }
 }
 
-impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
+impl<'a, R: Read + Seek + 'static> PageDocumentHelper<'a, R> {
     /// Create a new helper borrowing `pdf` mutably.
     pub fn new(pdf: &'a mut Pdf<R>) -> Self {
         Self { pdf }
@@ -160,7 +160,7 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
         rebuild_page_tree(self.pdf, &refs)
     }
 
-    fn materialize_page_input<RS: Read + Seek>(
+    fn materialize_page_input<RS: Read + Seek + 'static>(
         &mut self,
         input: PageInput<'_, RS>,
     ) -> Result<ObjectRef> {

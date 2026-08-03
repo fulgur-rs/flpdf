@@ -678,7 +678,7 @@ fn useoutlines_generate_routes_outlines_to_first_page_and_round_trips() {
     let bytes = linearize_generate("objstm-lin-useoutlines-80-80.pdf");
 
     // The output must parse as a valid linearized PDF.
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {

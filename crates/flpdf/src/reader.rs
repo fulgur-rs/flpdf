@@ -31,6 +31,7 @@ use crate::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static NULL_OBJECT: Object = Object::Null;
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
@@ -55,7 +56,23 @@ static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 /// let catalog = pdf.resolve(pdf.root_ref().expect("root"))?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub struct Pdf<R: Read + Seek> {
+///
+/// # Why `R: 'static`
+///
+/// A document hands each [`ObjectHandle`] it vends a weak link back to its own
+/// resolver, so that dereferencing a nested reference will not require the
+/// `Pdf` in scope. [`ObjectHandle`] has no lifetime parameter — it is a plain
+/// `'static` type held in the document's registry and handed to callers — so
+/// the trait object that link points at is `dyn DocumentResolver + 'static`,
+/// and everything reachable from it, the input source included, must be
+/// `'static` too.
+///
+/// The practical consequence is that `R` cannot borrow: `Cursor<&[u8]>` is
+/// rejected, while `Cursor<Vec<u8>>`, `Cursor<Arc<[u8]>>`, and
+/// `BufReader<File>` are fine. For in-memory input use [`Pdf::open_mem`],
+/// which shares an `Arc<[u8]>` with the caller, or [`Pdf::open_mem_owned`],
+/// which takes a `Vec<u8>` outright. Neither copies.
+pub struct Pdf<R: Read + Seek + 'static> {
     /// Stable per-document identity used by qpdf-style foreign object copiers.
     unique_id: u64,
     reader: R,
@@ -3047,37 +3064,66 @@ impl<R: Read + Seek> crate::parser::HandleResolver for Pdf<R> {
     }
 }
 
-impl<'a> Pdf<Cursor<&'a [u8]>> {
-    /// Open a PDF document from a borrowed byte slice without wrapping it in a `Cursor` manually.
+impl Pdf<Cursor<Arc<[u8]>>> {
+    /// Open a PDF document from a shared, reference-counted byte buffer.
     ///
-    /// This is a zero-copy convenience wrapper around [`Pdf::open`]. The resulting handle
-    /// borrows `bytes` for its lifetime, so it is not `'static` and cannot be moved out of
-    /// the scope that owns the original slice.
+    /// **This call copies nothing.** The document and the caller share one
+    /// allocation; clone the `Arc` to keep reading the same bytes elsewhere,
+    /// and it is freed once both are done with it. (Producing the `Arc<[u8]>`
+    /// in the first place may copy — `Vec<u8> -> Arc<[u8]>` reallocates so the
+    /// refcount can sit beside the data — but that happens once, in the
+    /// caller's own code, not per open.)
     ///
-    /// For an owned, movable version see [`Pdf::open_mem_owned`].
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Arc<[u8]> = std::fs::read("input.pdf")?.into();
+    /// let kept = Arc::clone(&bytes);
+    /// let mut pdf = Pdf::open_mem(bytes)?;
+    /// // `kept` and the document are the same bytes, not two copies.
+    /// println!("version {} over {} shared bytes", pdf.version(), kept.len());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Why `Arc<[u8]>` and not `&[u8]`
+    ///
+    /// This took `&[u8]` and returned `Pdf<Cursor<&'a [u8]>>`, borrowing
+    /// without copying. That type is no longer well-formed: `Pdf<R>` requires
+    /// `R: 'static` (see the bound on [`Pdf`] for why), so the input must be
+    /// owned rather than borrowed.
+    ///
+    /// Copying the slice internally would have kept the old signature, and it
+    /// is the wrong trade. qpdf's own in-memory entry point does not copy:
+    /// `QPDF::processMemoryFile` (`libqpdf/QPDF.cc:259-268`) wraps the
+    /// caller's pointer in a `BufferInputSource` over
+    /// `Buffer(unsigned char*, size_t)`, whose contract is "memory is owned by
+    /// the caller and will not be freed when the Buffer is destroyed"
+    /// (`include/qpdf/Buffer.hh:42-45`). Shared ownership is the safe-Rust
+    /// analogue of that contract — no copy on either side — and a caller who
+    /// holds only a slice writes `Arc::from(slice)` itself, so the copy is
+    /// visible at the call site rather than hidden in the library.
+    ///
+    /// `Arc` rather than `Rc` because the buffer, unlike the document, can then
+    /// be shared across threads that each open their own `Pdf`. Both halves of
+    /// that were checked by compiling them: `Arc<[u8]>` clones do move across a
+    /// thread boundary into separate `open_mem` calls, and `Pdf` itself does
+    /// not — `require_send(Pdf::open_mem(..))` fails on the resolver's own
+    /// `Rc<ResolverHandle<..>>`. The `Arc` buys sharing of the input, not of
+    /// the document.
     ///
     /// # Errors
     ///
     /// Propagates any error from [`Pdf::open`]; see that method for the full error set.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use flpdf::Pdf;
-    ///
-    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
-    /// let mut pdf = Pdf::open_mem(&bytes)?;
-    /// println!("version {}", pdf.version());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn open_mem(bytes: &'a [u8]) -> crate::Result<Self> {
+    pub fn open_mem(bytes: Arc<[u8]>) -> crate::Result<Self> {
         Self::open(Cursor::new(bytes))
     }
 
-    /// Open a PDF document from a borrowed byte slice with explicit open options.
+    /// Open a PDF document from a shared byte buffer with explicit open options.
     ///
     /// Like [`Pdf::open_mem`] but accepts a [`PdfOpenOptions`] struct for repair and
-    /// password configuration, mirroring [`Pdf::open_with_options`].
+    /// password configuration, mirroring [`Pdf::open_with_options`]. Shares
+    /// `bytes` without copying, on the same terms.
     ///
     /// # Errors
     ///
@@ -3087,15 +3133,16 @@ impl<'a> Pdf<Cursor<&'a [u8]>> {
     /// # Examples
     ///
     /// ```no_run
+    /// use std::sync::Arc;
     /// use flpdf::{Pdf, PdfOpenOptions};
     ///
-    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let bytes: Arc<[u8]> = std::fs::read("input.pdf")?.into();
     /// let opts = PdfOpenOptions { repair: true, ..PdfOpenOptions::default() };
-    /// let mut pdf = Pdf::open_mem_with_options(&bytes, opts)?;
+    /// let mut pdf = Pdf::open_mem_with_options(bytes, opts)?;
     /// println!("version {}", pdf.version());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn open_mem_with_options(bytes: &'a [u8], options: PdfOpenOptions) -> crate::Result<Self> {
+    pub fn open_mem_with_options(bytes: Arc<[u8]>, options: PdfOpenOptions) -> crate::Result<Self> {
         Self::open_with_options(Cursor::new(bytes), options)
     }
 }
@@ -3103,8 +3150,9 @@ impl<'a> Pdf<Cursor<&'a [u8]>> {
 impl Pdf<Cursor<Vec<u8>>> {
     /// Open a PDF document from an owned byte vector without wrapping it in a `Cursor` manually.
     ///
-    /// This is the owned counterpart to [`Pdf::open_mem`]. The handle takes ownership of
-    /// `bytes` and is therefore `'static`—it can be freely moved and stored in data structures.
+    /// The sole-ownership counterpart to [`Pdf::open_mem`]: the handle takes the
+    /// `Vec` outright rather than sharing an `Arc`. Neither copies; both are
+    /// `'static` and can be freely moved and stored in data structures.
     ///
     /// This is the preferred form for in-memory PDF handling in most contexts (e.g. WASM,
     /// test helpers, fulgur's document pipeline).
@@ -6445,13 +6493,48 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Acceptance (2): open_mem(&[u8]) opens an in-memory PDF
+    // Acceptance (2): open_mem(Arc<[u8]>) opens an in-memory PDF
     // ------------------------------------------------------------------
+
+    /// `open_mem` shares the caller's buffer instead of copying it.
+    ///
+    /// This is the contract that makes `Arc<[u8]>` the right parameter rather
+    /// than `&[u8]`: qpdf's own in-memory entry point does not copy either
+    /// (`QPDF::processMemoryFile`, `libqpdf/QPDF.cc:259-268`, over a `Buffer`
+    /// whose "memory is owned by the caller and will not be freed when the
+    /// Buffer is destroyed", `include/qpdf/Buffer.hh:42-45`).
+    ///
+    /// A strong count of 2 is only reachable if the document holds *this*
+    /// allocation. Reintroducing an internal copy — `Cursor::new(bytes.to_vec())`
+    /// — leaves the caller's count at 1 and fails here, which is the whole
+    /// point of the assertion.
+    #[test]
+    fn open_mem_shares_the_callers_buffer_rather_than_copying_it() {
+        let bytes: Arc<[u8]> = Arc::from(&minimal_pdf_bytes()[..]);
+        let kept = Arc::clone(&bytes);
+        assert_eq!(Arc::strong_count(&kept), 2, "caller's clone plus `bytes`");
+
+        let mut pdf = Pdf::open_mem(bytes).expect("open_mem should succeed");
+        assert_eq!(
+            Arc::strong_count(&kept),
+            2,
+            "the document must hold the caller's allocation, not a copy of it"
+        );
+        assert_eq!(page_refs(&mut pdf).expect("page_refs").len(), 1);
+
+        drop(pdf);
+        assert_eq!(
+            Arc::strong_count(&kept),
+            1,
+            "dropping the document must release its share of the buffer"
+        );
+        assert_eq!(&kept[..9], b"%PDF-1.4\n");
+    }
 
     #[test]
     fn open_mem_opens_minimal_pdf() {
         let bytes = minimal_pdf_bytes();
-        let mut pdf = Pdf::open_mem(&bytes).expect("open_mem should succeed");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open_mem should succeed");
         let refs = page_refs(&mut pdf).expect("page_refs should succeed");
         assert_eq!(refs.len(), 1, "expected 1 page");
         assert_eq!(
@@ -6497,7 +6580,7 @@ mod tests {
         let refs_cursor = page_refs(&mut pdf_cursor).expect("page_refs from cursor");
         let root_cursor = pdf_cursor.root_ref();
 
-        let mut pdf_mem = Pdf::open_mem(&bytes).expect("open_mem should succeed");
+        let mut pdf_mem = Pdf::open_mem(Arc::from(&bytes[..])).expect("open_mem should succeed");
         let refs_mem = page_refs(&mut pdf_mem).expect("page_refs from open_mem");
         let root_mem = pdf_mem.root_ref();
 
@@ -6535,7 +6618,8 @@ mod tests {
             repair: true,
             ..PdfOpenOptions::default()
         };
-        let mut pdf = Pdf::open_mem_with_options(&bytes, opts).expect("open_mem_with_options");
+        let mut pdf =
+            Pdf::open_mem_with_options(Arc::from(&bytes[..]), opts).expect("open_mem_with_options");
         let refs = page_refs(&mut pdf).expect("page_refs");
         assert_eq!(refs.len(), 1);
     }

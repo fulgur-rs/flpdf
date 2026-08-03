@@ -2,6 +2,7 @@
 
 use flpdf::{copy_objects, Object, ObjectRef, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Minimal PDF builder helpers
@@ -87,8 +88,8 @@ fn copies_chain_with_fresh_numbers() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[
         ObjectRef::new(4, 0),
@@ -144,8 +145,8 @@ fn remaps_references_inside_arrays() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[
         ObjectRef::new(4, 0),
@@ -186,8 +187,8 @@ fn preserves_reference_cycle() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();
@@ -224,8 +225,8 @@ fn shares_child_within_a_single_call() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[
         ObjectRef::new(4, 0),
@@ -260,8 +261,8 @@ fn nulls_out_of_set_references() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[ObjectRef::new(4, 0)]);
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();
@@ -297,8 +298,8 @@ fn copies_are_independent_across_calls() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
     let map1 = copy_objects(&mut source, &mut target, &refs).unwrap();
@@ -333,8 +334,8 @@ fn copies_stream_payload() {
         1,
     );
     let tgt = build_target_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
-    let mut target = Pdf::open_mem(&tgt).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
+    let mut target = Pdf::open_mem(Arc::from(&tgt[..])).unwrap();
 
     let refs = refset(&[ObjectRef::new(4, 0), ObjectRef::new(5, 0)]);
     let map = copy_objects(&mut source, &mut target, &refs).unwrap();

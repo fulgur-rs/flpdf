@@ -837,7 +837,7 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
     run_rewrite(&input, &output, &["--full-rewrite", "--compress-streams=y"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
-    let mut out_pdf = Pdf::open(Cursor::new(&output_bytes)).unwrap();
+    let mut out_pdf = Pdf::open(Cursor::new(output_bytes.clone())).unwrap();
 
     // Verify: every page's content stream is compressed with FlateDecode.
     let pages = page_refs(&mut out_pdf).unwrap();
@@ -919,7 +919,7 @@ fn compress_streams_n_omits_filter_and_roundtrips() {
     run_rewrite(&input, &output, &["--full-rewrite", "--compress-streams=n"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
-    let mut out_pdf = Pdf::open(Cursor::new(&output_bytes)).unwrap();
+    let mut out_pdf = Pdf::open(Cursor::new(output_bytes.clone())).unwrap();
 
     let pages = page_refs(&mut out_pdf).unwrap();
     assert!(!pages.is_empty());

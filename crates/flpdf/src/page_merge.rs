@@ -38,7 +38,7 @@ use std::io::{Cursor, Read, Seek};
 
 /// One merge input: an opened source document and the 0-based page indices to
 /// take from it (arbitrary order, duplicates allowed).
-pub struct MergeInput<'a, R: Read + Seek> {
+pub struct MergeInput<'a, R: Read + Seek + 'static> {
     /// The opened source document.
     pub source: &'a mut Pdf<R>,
     /// 0-based page indices to copy, in output order.
@@ -814,7 +814,7 @@ fn rewrite_field_kids<R: Read + Seek>(
 ///   empty page selection is permitted; see above), or if a requested page
 ///   index is out of range for its input.
 /// - Propagates resolve/copy errors from the underlying primitives.
-pub fn merge_documents<R: Read + Seek>(
+pub fn merge_documents<R: Read + Seek + 'static>(
     inputs: &mut [MergeInput<'_, R>],
 ) -> Result<Pdf<Cursor<Vec<u8>>>> {
     if inputs.is_empty() {

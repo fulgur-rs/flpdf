@@ -5,6 +5,7 @@ use flpdf::{
     WriteOptions,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
 /// `body` is the literal text between `N 0 obj` and `endobj`.
@@ -129,7 +130,7 @@ fn assert_reference_target_is_null(
 #[test]
 fn extracts_single_page_with_count_one() {
     let src = two_page_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
 
@@ -168,7 +169,7 @@ fn inherited_attrs_pdf() -> Vec<u8> {
 #[test]
 fn materializes_inherited_attributes() {
     let src = inherited_attrs_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
     let leaf = only_leaf(&mut out);
@@ -226,7 +227,7 @@ fn inherited_cropbox_pdf() -> Vec<u8> {
 #[test]
 fn materializes_inherited_cropbox() {
     let src = inherited_cropbox_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
     let leaf = only_leaf(&mut out);
@@ -276,7 +277,7 @@ fn own_cropbox_pdf() -> Vec<u8> {
 #[test]
 fn own_cropbox_is_preserved() {
     let src = own_cropbox_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
     let leaf = only_leaf(&mut out);
@@ -315,7 +316,7 @@ fn intermediate_boxes_pdf() -> Vec<u8> {
 #[test]
 fn materializes_intermediate_mediabox_and_cropbox() {
     let src = intermediate_boxes_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0]).unwrap();
     let leaf = only_leaf(&mut out);
@@ -364,7 +365,7 @@ fn indirect_inherited_mediabox_pdf() -> Vec<u8> {
 #[test]
 fn remaps_indirect_inherited_mediabox() {
     let src = indirect_inherited_mediabox_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
     let leaf = only_leaf(&mut out);
@@ -391,7 +392,7 @@ fn remaps_indirect_inherited_mediabox() {
 #[test]
 fn own_mediabox_is_preserved() {
     let src = two_page_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut p0 = extract_page(&mut source, 0).unwrap();
     let leaf0 = only_leaf(&mut p0);
@@ -477,7 +478,7 @@ fn count_type(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, type_name: &[u8]) -> usiz
 #[test]
 fn extracted_doc_has_no_unrelated_objects() {
     let src = shared_resource_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
 
@@ -520,7 +521,7 @@ fn extracted_doc_has_no_unrelated_objects() {
 #[test]
 fn extracted_contents_match_source_page() {
     let src = two_page_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let src_pages = pages::page_refs(&mut source).unwrap();
     let src_leaf = source
@@ -558,7 +559,7 @@ fn extracted_contents_match_source_page() {
 #[test]
 fn out_of_range_index_errors() {
     let src = two_page_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let err = match extract_page(&mut source, 2) {
         Ok(_) => panic!("index 2 out of range should error, got Ok"),
         Err(e) => e,
@@ -572,7 +573,7 @@ fn out_of_range_index_errors() {
 #[test]
 fn source_is_not_modified_by_extract() {
     let src = two_page_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let before = pages::page_refs(&mut source).unwrap();
     assert_eq!(before.len(), 2);
 
@@ -609,7 +610,7 @@ fn cross_page_link_keeps_dest_and_nulls_removed_page() {
     // qpdf keeps the explicit cross-page /Dest carrier and replaces the copied
     // unselected page object with null.
     let src = cross_page_link_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_page(&mut source, 0).unwrap();
 
@@ -701,7 +702,7 @@ fn self_page_link_is_preserved() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
     let leaf_refs = pages::page_refs(&mut out).unwrap();
@@ -747,7 +748,7 @@ fn named_dest_is_preserved_no_leak() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -790,7 +791,7 @@ fn action_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -845,7 +846,7 @@ fn annot_aa_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -903,7 +904,7 @@ fn action_next_chain_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -969,7 +970,7 @@ fn next_array_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1034,7 +1035,7 @@ fn page_level_aa_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1087,7 +1088,7 @@ fn indirect_action_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1148,7 +1149,7 @@ fn selflink_dest_and_crosspage_action_carriers_are_preserved() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1199,7 +1200,7 @@ fn action_uri_is_preserved() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     let leaf_refs = pages::page_refs(&mut out).unwrap();
     let leaf = out
@@ -1241,7 +1242,7 @@ fn indirect_dest_is_preserved_and_removed_page_is_null() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1293,7 +1294,7 @@ fn indirect_aa_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1360,7 +1361,7 @@ fn indirect_next_array_goto_keeps_d_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1445,7 +1446,7 @@ fn action_after_71_array_holders(
 #[test]
 fn long_indirect_next_array_keeps_carrier_and_nulls_removed_page() {
     let bytes = long_indirect_next_array_pdf();
-    let mut source = Pdf::open_mem(&bytes).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&bytes[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
 
     assert_eq!(count_type(&mut out, b"Page"), 1);
@@ -1494,7 +1495,7 @@ fn indirect_annots_array_keeps_dest_and_nulls_removed_page() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1538,7 +1539,7 @@ fn aa_with_only_local_subaction_is_unchanged() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
     let leaf_refs = pages::page_refs(&mut out).unwrap();
@@ -1590,7 +1591,7 @@ fn indirect_next_cycle_is_preserved_and_removed_page_is_null() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(
         count_type(&mut out, b"Page"),
@@ -1649,7 +1650,7 @@ fn action_goto_self_link_is_preserved() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
     let leaf_refs = pages::page_refs(&mut out).unwrap();
@@ -1698,7 +1699,7 @@ fn deep_inline_next_chain_is_preserved() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let mut out = extract_page(&mut source, 0).unwrap();
     assert_eq!(count_type(&mut out, b"Page"), 1);
 }
@@ -2012,7 +2013,7 @@ fn leaf_font_basefont(doc: &mut Pdf<std::io::Cursor<Vec<u8>>>, leaf: flpdf::Obje
 #[test]
 fn extract_pages_copies_shared_resource_once() {
     let src = three_page_shared_font_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 
@@ -2036,7 +2037,7 @@ fn extract_pages_copies_shared_resource_once() {
 #[test]
 fn extract_pages_object_count_sublinear_vs_per_page_extracts() {
     let src = three_page_shared_font_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let combined = extract_pages(&mut source, &[0, 1])
         .unwrap()
@@ -2053,7 +2054,7 @@ fn extract_pages_object_count_sublinear_vs_per_page_extracts() {
 #[test]
 fn extract_pages_preserves_selection_order() {
     let src = three_page_shared_font_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[2, 0]).unwrap();
 
@@ -2074,7 +2075,7 @@ fn extract_pages_preserves_selection_order() {
 #[test]
 fn extract_pages_empty_selection_errors() {
     let src = three_page_shared_font_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let err = match extract_pages(&mut source, &[]) {
         Ok(_) => panic!("empty selection should error, got Ok"),
         Err(e) => e,
@@ -2088,7 +2089,7 @@ fn extract_pages_empty_selection_errors() {
 #[test]
 fn extract_pages_out_of_range_index_errors() {
     let src = three_page_shared_font_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
     let err = match extract_pages(&mut source, &[0, 3]) {
         Ok(_) => panic!("index 3 out of range should error, got Ok"),
         Err(e) => e,
@@ -2106,7 +2107,7 @@ fn extract_pages_duplicate_index_shallow_clones_page() {
     // fresh page object whose sub-objects (/Contents, /Resources) stay shared
     // with the first copy.
     let src = three_page_shared_font_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0, 0]).unwrap();
 
@@ -2172,7 +2173,7 @@ fn extract_pages_keeps_dest_between_selected_pages() {
     // kept (the target is present in the output); a /Dest to a NON-selected
     // page is also kept, but its copied page target is null.
     let src = three_page_linked_pdf();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 
@@ -2236,7 +2237,7 @@ fn extract_pages_materializes_inherited_attrs_per_parent() {
         ],
         1,
     );
-    let mut source = Pdf::open_mem(&bytes).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&bytes[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 
@@ -2380,7 +2381,7 @@ fn extract_pages_reconstructs_labels_in_selection_order_with_duplicates() {
     // Verified byte-for-byte against qpdf 11.9.0 (`--empty --pages src.pdf
     // 3,1,3 -- out.pdf`), which reconstructs the identical 3-entry /Nums.
     let src = four_page_pdf_with_labels();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[2, 0, 2]).unwrap();
 
@@ -2399,7 +2400,7 @@ fn extract_pages_folds_redundant_sequential_labels() {
     // real range starts (0 and 2) rather than one entry per page. Verified
     // against qpdf 11.9.0 (`--empty --pages src.pdf 1,2,3,4 -- out.pdf`).
     let src = four_page_pdf_with_labels();
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0, 1, 2, 3]).unwrap();
 
@@ -2419,7 +2420,7 @@ fn extract_pages_folds_redundant_sequential_labels() {
 #[test]
 fn extract_pages_without_source_labels_has_none() {
     let src = three_page_shared_font_pdf(); // no /PageLabels
-    let mut source = Pdf::open_mem(&src).unwrap();
+    let mut source = Pdf::open_mem(Arc::from(&src[..])).unwrap();
 
     let mut out = extract_pages(&mut source, &[0, 1]).unwrap();
 

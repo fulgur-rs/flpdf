@@ -710,7 +710,7 @@ pub fn resolve_inherited_resources_with_max_depth<R: Read + Seek>(
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub struct PageWalk<'a, R: Read + Seek> {
+pub struct PageWalk<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
     /// Stack of `(node_ref, depth)` yet to be visited.
     stack: Vec<(ObjectRef, usize)>,
@@ -758,7 +758,7 @@ impl<'a, R: Read + Seek> PageWalk<'a, R> {
     }
 }
 
-impl<'a, R: Read + Seek> Iterator for PageWalk<'a, R> {
+impl<'a, R: Read + Seek + 'static> Iterator for PageWalk<'a, R> {
     type Item = Result<ObjectRef>;
 
     fn next(&mut self) -> Option<Self::Item> {

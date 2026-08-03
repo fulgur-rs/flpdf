@@ -881,7 +881,7 @@ const MAX_FORM_DEPTH: usize = 64;
 /// separately. (Keeping the invariant borrows in one parameter also keeps the
 /// recursive call sites on a single line, which stops rustfmt from reflowing a
 /// `)?` onto its own line and fragmenting its coverage region.)
-struct CollectCtx<'a, R: Read + Seek> {
+struct CollectCtx<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
     /// The page's real used-name accumulator — the bubble target for the names
     /// of resource-less Form XObjects, wherever they sit in the Form tree.
@@ -1138,7 +1138,7 @@ fn is_form_xobject(dict: &Dictionary) -> bool {
 /// incomplete — a decode/tokenise failure whose names feed the page, or a
 /// direct-stream Form — signalling the page must be conservatively retained.
 /// Structural resolution errors propagate as `Err`.
-fn recurse_form_xobject<R: Read + Seek>(
+fn recurse_form_xobject<R: Read + Seek + 'static>(
     ctx: &mut CollectCtx<'_, R>,
     xobject_name: &[u8],
     caller: Scope<'_>,

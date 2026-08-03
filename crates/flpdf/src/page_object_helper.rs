@@ -167,7 +167,7 @@ impl PageBox {
 /// inspect the page's content streams, resources, rotation, annotations, and
 /// bounding boxes. All operations are delegated to the underlying `Pdf<R>`
 /// infrastructure; no state is cached inside this struct.
-pub struct PageObjectHelper<'a, R: Read + Seek> {
+pub struct PageObjectHelper<'a, R: Read + Seek + 'static> {
     page_ref: ObjectRef,
     pdf: &'a mut Pdf<R>,
 }
@@ -193,7 +193,7 @@ impl ParserCallbacks for ObjectRecordingCallbacks {
     }
 }
 
-impl<'a, R: Read + Seek> PageObjectHelper<'a, R> {
+impl<'a, R: Read + Seek + 'static> PageObjectHelper<'a, R> {
     /// Create a new helper for `page_ref` borrowing `pdf` mutably.
     ///
     /// `page_ref` should be the `ObjectRef` of a leaf `/Page` dictionary.

@@ -626,7 +626,7 @@ where
 /// A single overlay/underlay specification: a source document, its kind, and its
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.
-pub struct OverlaySpec<RS: Read + Seek> {
+pub struct OverlaySpec<RS: Read + Seek + 'static> {
     /// The source document supplying the overlay/underlay pages.
     pub source: Pdf<RS>,
     /// Whether the source is drawn beneath or above the destination content.
@@ -733,7 +733,7 @@ fn apply_aggregated_sources<R: Read + Seek>(
 ///   [`Pdf::resolve`].
 pub fn apply_overlay_specs<RS, RT>(dest: &mut Pdf<RT>, specs: &mut [OverlaySpec<RS>]) -> Result<()>
 where
-    RS: Read + Seek,
+    RS: Read + Seek + 'static,
     RT: Read + Seek,
 {
     // Map every spec first, collecting its per-dest-page sources in declaration
@@ -811,7 +811,7 @@ pub fn overlay_verbose_report<RS, RT>(
     specs: &mut [OverlaySpec<RS>],
 ) -> Result<Vec<OverlayVerbosePage>>
 where
-    RS: Read + Seek,
+    RS: Read + Seek + 'static,
     RT: Read + Seek,
 {
     let n_dest = u32_len(page_refs(dest)?.len());

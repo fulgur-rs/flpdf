@@ -90,8 +90,9 @@ use crate::pages::page_refs;
 use crate::writer::{write_pdf, write_pdf_with_options, WriteOptions};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::fs::File;
-use std::io::{BufWriter, Cursor};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -138,8 +139,14 @@ pub fn split_pages(
         ));
     }
 
+    // `Pdf<R>` requires `R: 'static`, so the source cannot be read through a
+    // borrowed cursor. Share one allocation across the initial open and every
+    // chunk's re-open instead of handing each of them its own copy: chunks are
+    // written sequentially and none of them mutates the source bytes.
+    let shared_source: Arc<[u8]> = Arc::from(src_bytes);
+
     // Open once to determine page count and collect page refs.
-    let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
+    let mut pdf = Pdf::open_mem(Arc::clone(&shared_source))?;
     let all_page_refs = page_refs(&mut pdf)?;
     let total_pages = all_page_refs.len();
     if total_pages == 0 {
@@ -179,7 +186,7 @@ pub fn split_pages(
 
         // Write the chunk to the output file.
         write_chunk(
-            src_bytes,
+            Arc::clone(&shared_source),
             pages_root_ref,
             &chunk_refs,
             chunk_start,
@@ -362,7 +369,7 @@ pub fn digit_width(n: u32) -> usize {
 /// *source* document, used to reconstruct `/PageLabels` for the chunk
 /// (qpdf `--split-pages` parity).
 fn write_chunk(
-    src_bytes: &[u8],
+    src_bytes: Arc<[u8]>,
     pages_root_ref: ObjectRef,
     chunk_refs: &[ObjectRef],
     chunk_start: usize,
@@ -371,7 +378,8 @@ fn write_chunk(
     deterministic_id: bool,
 ) -> Result<()> {
     // Re-open the source bytes so each chunk starts from the pristine state.
-    let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
+    // The buffer is shared with every other chunk, not copied per chunk.
+    let mut pdf = Pdf::open_mem(src_bytes)?;
 
     // /PageLabels (qpdf `QPDFJob::doSplitPages` parity): reconstruct the
     // label range for this chunk's local page span, renumbered to start at
@@ -760,7 +768,7 @@ mod tests {
 
     /// Open a PDF from bytes and return the page count.
     fn page_count_of(bytes: &[u8]) -> usize {
-        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("should parse");
+        let mut pdf = Pdf::open_mem(Arc::from(bytes)).expect("should parse");
         page_refs(&mut pdf).expect("should get page refs").len()
     }
 

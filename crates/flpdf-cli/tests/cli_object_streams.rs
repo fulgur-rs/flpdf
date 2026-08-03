@@ -77,7 +77,7 @@ fn object_streams_generate_is_accepted_and_emits_objstm() {
     .success();
 
     let bytes = std::fs::read(&output).unwrap();
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     let mut found_objstm = false;
     for r in pdf.object_refs() {
         if let Ok(Object::Stream(s)) = pdf.resolve(r) {
