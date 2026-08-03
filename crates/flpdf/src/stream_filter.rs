@@ -1332,8 +1332,9 @@ pub(crate) mod tests {
     };
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
-    use crate::{Dictionary, Error, Object, Result};
+    use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
     use std::cell::{Cell, RefCell};
+    use std::io::Cursor;
 
     #[test]
     fn run_length_encoder_uses_qpdf_two_byte_run() {
@@ -2536,6 +2537,67 @@ pub(crate) mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// A document whose object 2 is the bare name `/FlateDecode`, so a
+    /// registry handle for `2 0 R` can stand in for an indirect `/Filter`.
+    fn pdf_with_a_filter_name_object() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let catalog = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let filter = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\n/FlateDecode\nendobj\n");
+        let xref_start = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{catalog:010} 00000 n \n{filter:010} 00000 n \n\
+                 trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[test]
+    fn handle_reader_reads_a_filter_disconnected_by_pdf_teardown_as_absent() {
+        // Production teardown, not a synthetic resolver: `Pdf::drop`
+        // (`reader.rs`, mirroring `QPDF::~QPDF`, `libqpdf/QPDF.cc:215-236`)
+        // calls `ObjectHandle::disconnect` on every registry entry, leaving
+        // the slot `Destroyed`. `try_dereference` treats every state other
+        // than `NotYetResolved` as terminal, so a surviving handle does *not*
+        // raise `Error::Internal("... belongs to a dropped PDF")` — that error
+        // belongs to the other path, a still-`NotYetResolved` handle whose
+        // resolver `Weak` has expired. `Destroyed` presents as null instead,
+        // and this reader takes a null `/Filter` as absent.
+        //
+        // **This pins flpdf behavior, not qpdf parity — beads `flpdf-nrp3`
+        // (P2).** qpdf's `isNull()` is `dereference() && getTypeCode() ==
+        // ::ot_null` (`libqpdf/QPDFObjectHandle.cc:353-356`) and a destroyed
+        // object is `::ot_destroyed`, so qpdf answers false where flpdf
+        // answers true and would not read this stream as unfiltered. Do not
+        // cite this test as evidence the two agree. The divergence is
+        // `is_null` alone: `as_name`/`as_array`/`as_integer`/`as_dictionary`
+        // all fall through to `None` for `Destroyed`, which is what qpdf does
+        // for `::ot_destroyed` too.
+        let mut pdf = Pdf::open(Cursor::new(pdf_with_a_filter_name_object())).expect("open");
+        let filter = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&filter).expect("resolve /Filter");
+
+        // Control, so the assertion after the drop cannot pass vacuously for a
+        // handle that never carried a value in the first place.
+        let live = decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None)
+            .expect("a resolved /Filter name reads normally");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].name, b"FlateDecode".to_vec());
+
+        drop(pdf);
+
+        assert!(filter.is_resolved(), "disconnect leaves a terminal state");
+        assert!(
+            decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None)
+                .expect("a disconnected /Filter is terminal, not an error")
+                .is_empty()
+        );
     }
 
     #[test]

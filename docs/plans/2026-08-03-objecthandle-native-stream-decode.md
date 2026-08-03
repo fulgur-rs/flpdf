@@ -87,12 +87,52 @@ use `try_*`, not the non-resolving `as_*`.
 
 - **D1 — indirect `/Filter` / `/DecodeParms`.** The native reader uses the
   crate-private `try_dereference`/`try_get_key`/`try_as_dictionary` family
-  (`object_handle.rs:507-571`) plus the new `try_as_*` accessors from Task 4, so
-  an indirect child resolves through its document exactly as qpdf's accessors
-  do. A handle whose document was dropped already returns
-  `Error::Internal("object N G belongs to a dropped PDF")` from
-  `try_dereference`; that error propagates unchanged. Do **not** add a
-  non-resolving fallback.
+  (`object_handle.rs:507-602`) plus the new `try_as_*`/`try_array_len`
+  accessors from Task 4, so an indirect child resolves through its document
+  exactly as qpdf's accessors do. Do **not** add a non-resolving fallback.
+
+  **Correction (2026-08-03, review of PR #626).** An earlier revision of this
+  bullet said a handle "whose document was dropped" returns
+  `Error::Internal("object N G belongs to a dropped PDF")`. That is only one of
+  two states, and it is *not* the one production teardown produces:
+
+  - `Error::Internal` comes from `try_dereference` on a handle that is still
+    `NotYetResolved` and whose resolver `Weak` cannot be upgraded
+    (`object_handle.rs`, `try_dereference`). Today that also covers every
+    handle `Pdf::get_object_handle` hands out before it is resolved, because
+    `new_indirect_unresolved_for_pdf` leaves `resolver: None` until
+    `flpdf-25kg.3.5` wires the live link.
+  - Production teardown is the other path: `impl Drop for Pdf`
+    (`crates/flpdf/src/reader.rs:351-371`) calls `ObjectHandle::disconnect` on
+    every registry entry, explicitly mirroring `QPDF::~QPDF`
+    (`libqpdf/QPDF.cc:215-236`), which sets the slot to `Destroyed`.
+    `try_dereference` returns `Ok(())` for every state other than
+    `NotYetResolved`, so `Destroyed` is terminal, `with_value` presents it as
+    `ObjectValue::Null` (`object_handle.rs:1344`), and `is_null` is
+    `matches!(value, Some(ObjectValue::Null))` (`:815-817`). A `/Filter` handle
+    disconnected this way therefore reads as **absent**, and
+    `decode_filter_specs_from_handle` returns `Ok(vec![])` — no error at all.
+
+  Pinned by `stream_filter`'s
+  `handle_reader_reads_a_filter_disconnected_by_pdf_teardown_as_absent`, which
+  builds a real `Pdf`, resolves the handle, drops the document, and reads it
+  again. The existing `handle_reader_surfaces_a_dropped_document_from_every_\
+  child_position` covers only the first bullet: it drops a *synthetic*
+  resolver while its handle is still `NotYetResolved`, which teardown never
+  does.
+
+  The second bullet is a **genuine qpdf divergence**, filed as beads
+  `flpdf-nrp3` (P2) and deliberately **not** fixed here. qpdf's `isNull()` is
+  `dereference() && getTypeCode() == ::ot_null`
+  (`libqpdf/QPDFObjectHandle.cc:353-356`) and `QPDF_Destroyed` is
+  `::ot_destroyed`, so qpdf answers false where flpdf answers true. `is_null`
+  is `pub`, its `Destroyed`-reads-as-null behavior is an approved
+  `flpdf-25kg.3.3` contract with a test named for it
+  (`disconnect_replaces_a_resolved_value_and_presents_as_null`), and changing
+  it needs a sweep of every `is_null` caller. The divergence is `is_null`
+  **alone** — `as_name`/`as_array`/`as_integer`/`as_dictionary` all fall
+  through to `None` for `Destroyed`, which is what qpdf does for
+  `::ot_destroyed` too.
 - **D2 — Crypt.** The crypt provider stays an explicit closure parameter. Its
   only production instantiation today (`filters.rs:334-338`) returns
   `Error::Unsupported("unsupported stream filter: Crypt")`. The native path
