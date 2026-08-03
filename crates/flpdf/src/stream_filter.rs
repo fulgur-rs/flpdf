@@ -68,8 +68,9 @@ pub(crate) enum DecodeParams {
 /// filters that read parameter entries at all** — qpdf dereferences a value
 /// only through `SF_FlateLzwDecode`'s `getKeys()`/`getKey()` walk, so for
 /// every other filter `decode_params_from_handle` reads the value without
-/// resolving and lands on the same `Other` the `Object` reader does. See
-/// [`filter_reads_decode_params`]. This enum is the same either way.
+/// resolving. See [`filter_reads_decode_params`], and
+/// [`param_value_without_resolving`] for what such a value classifies as and
+/// why that classification is unobservable. This enum is the same either way.
 ///
 /// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for `Crypt`'s
 /// `/Name`, which selects the crypt filter, so carrying it now keeps Phase 3's
@@ -342,6 +343,12 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
 /// distinction is implicit — it is simply whether a filter's `setDecodeParms`
 /// override calls `getKeys()`.
 ///
+/// That covers the `StreamFilter`-backed half only. The `b"Crypt"` literal
+/// below *is* a second literal: it shadows the identical test in
+/// `filters::prepare_decode_filters`, which is where a `Crypt` spec is routed
+/// away from the registry in the first place. The two must move together —
+/// there is no registry entry to keep them in step.
+///
 /// Abbreviations are expanded first because qpdf expands them at
 /// `QPDF_Stream.cc:419-423`, ahead of the `filter_factories` lookup at `:425`,
 /// so `/Fl` reaches `SF_FlateLzwDecode` and consumes.
@@ -414,10 +421,21 @@ fn param_value_from_handle(value: &ObjectHandle) -> Result<ParamValue> {
 ///
 /// Deliberately the shape of [`param_value_from_object`]: the same
 /// classification off the same non-resolving accessors, so a *direct* value
-/// reduces to the identical [`ParamValue`] all three readers agree on. An
-/// *indirect* value stays unresolved and reduces to `Other` — which is also
-/// what the `Object` reader yields for `Object::Reference`, so this converges
-/// the two readers rather than splitting them further.
+/// reduces to the identical [`ParamValue`] all three readers agree on.
+///
+/// An indirect value that is *still unresolved* reduces to `Other` — the same
+/// thing the `Object` reader yields for `Object::Reference`. An indirect value
+/// that some earlier read already resolved does not: `ObjectHandle::as_integer`
+/// and `as_name` report an indirect handle's already-resolved value, so a
+/// `/DecodeParms` value sharing an object with an earlier-visited position
+/// would classify as `Int` or `Name` here. That is a real difference once
+/// `flpdf-25kg.3.5` wires the live resolver, and it is deliberately not
+/// defended against, because it is unobservable: the only filters routed here
+/// are the ones whose `set_decode_params` reads nothing but `is_absent()`, and
+/// `is_absent()` distinguishes `Absent` from `Present` without looking at a
+/// single [`ParamValue`]. What must not vary is `Absent` vs `Present`, and
+/// that is decided upstream by the two unconditional calls on the parameter
+/// handle itself.
 fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
     match value.as_integer() {
         Some(int) => ParamValue::Int(clamp_to_i32(int)),
@@ -1940,6 +1958,49 @@ pub(crate) mod tests {
         assert_eq!(*calls.borrow(), vec![crate::ObjectRef::new(20, 0)]);
         assert_eq!(
             specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
+        );
+    }
+
+    #[test]
+    fn each_decode_parms_array_item_follows_its_own_filter() {
+        // Every other test here uses a scalar `/Filter`, where one name makes
+        // `filter_reads_decode_params(name)` indistinguishable from indexing
+        // `names[0]`, from a reversed zip, or from hoisting the predicate out
+        // of the loop. This is the only test that pins the *per-spec*
+        // threading `decode_filter_specs_from_handle`'s doc claims — and the
+        // corpus cannot help, because its two-filter rows are all direct.
+        //
+        // Non-consuming first is deliberate: a reversed zip flips both
+        // assertions rather than leaving one of them accidentally true. The
+        // two values get separate resolvers so neither log can pick up the
+        // other's call.
+        let (ahx_value, _ahx_resolver, ahx_calls) =
+            logged_resolver_bearing_handle(ObjectValue::Integer(4));
+        let (flate_value, _flate_resolver, flate_calls) =
+            logged_resolver_bearing_handle(ObjectValue::Integer(4));
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::array(vec![
+                ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ]),
+            &ObjectHandle::array(vec![
+                ObjectHandle::dictionary(vec![(b"Columns".to_vec(), ahx_value)]),
+                ObjectHandle::dictionary(vec![(b"Columns".to_vec(), flate_value)]),
+            ]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(*ahx_calls.borrow(), Vec::new());
+        assert_eq!(*flate_calls.borrow(), vec![crate::ObjectRef::new(20, 0)]);
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Other)])
+        );
+        assert_eq!(
+            specs[1].decode_params,
             DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
         );
     }
