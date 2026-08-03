@@ -1889,9 +1889,17 @@ pub(crate) mod identity_tests {
     use super::*;
 
     struct RecordingResolver {
-        calls: RefCell<Vec<ObjectRef>>,
+        calls: ResolutionLog,
         value: ObjectValue,
     }
+
+    /// Every `resolve_indirect` a [`RecordingResolver`] performed, in order.
+    ///
+    /// Shared with the caller by [`logged_resolver_bearing_handle`] so a test
+    /// can assert a *negative*: that a position was never resolved at all.
+    /// `ObjectHandle::is_resolved` is not a substitute — a resolver that
+    /// errored would leave the handle unresolved despite having been called.
+    pub(crate) type ResolutionLog = Rc<RefCell<Vec<ObjectRef>>>;
 
     impl RecordingResolver {
         /// Install `value` instead of the default one-key dictionary, so a
@@ -1903,10 +1911,12 @@ pub(crate) mod identity_tests {
         /// a single resolver therefore leaves their children `ptr_eq`, which no
         /// current test wants — give each such test its own resolver.
         fn installing(value: ObjectValue) -> Self {
-            Self {
-                calls: RefCell::new(Vec::new()),
-                value,
-            }
+            Self::logging_into(Rc::new(RefCell::new(Vec::new())), value)
+        }
+
+        /// [`Self::installing`] with the call log owned by the caller instead.
+        fn logging_into(calls: ResolutionLog, value: ObjectValue) -> Self {
+            Self { calls, value }
         }
     }
 
@@ -1959,6 +1969,26 @@ pub(crate) mod identity_tests {
         // holds only a `Weak`, and dropping it here would turn every accessor
         // into the dropped-document error instead.
         (handle, resolver)
+    }
+
+    /// [`resolver_bearing_handle`] plus the resolver's [`ResolutionLog`].
+    ///
+    /// For the one question the plain helper cannot answer: whether a child
+    /// position was resolved *at all*. The same "keep the resolver alive"
+    /// rule applies — an empty log proves nothing if the resolver was
+    /// dropped, since a severed handle never reaches `resolve_indirect`
+    /// either.
+    pub(crate) fn logged_resolver_bearing_handle(
+        value: ObjectValue,
+    ) -> (ObjectHandle, Rc<dyn DocumentResolver>, ResolutionLog) {
+        let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
+        let resolver: Rc<dyn DocumentResolver> =
+            Rc::new(RecordingResolver::logging_into(Rc::clone(&calls), value));
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver),
+        );
+        (handle, resolver, calls)
     }
 
     struct MissingResolver;

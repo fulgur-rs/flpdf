@@ -63,9 +63,13 @@ pub(crate) enum DecodeParams {
 /// `isInteger` also `dereference()`s first, and honoring that is each shape
 /// reader's job rather than this type's: `param_value_from_object` classifies
 /// whatever `Object` it is handed, so an indirect integer inside a
-/// `/DecodeParms` dictionary reduces to `Other` there. A handle-shaped reader
-/// entering through the resolving accessors is what closes that gap (plan
-/// decision D1 of `flpdf-25kg.3.4`); this enum is the same either way.
+/// `/DecodeParms` dictionary reduces to `Other` there. The handle-shaped
+/// reader closes that gap (plan decision D1 of `flpdf-25kg.3.4`) **for the
+/// filters that read parameter entries at all** — qpdf dereferences a value
+/// only through `SF_FlateLzwDecode`'s `getKeys()`/`getKey()` walk, so for
+/// every other filter `decode_params_from_handle` reads the value without
+/// resolving and lands on the same `Other` the `Object` reader does. See
+/// [`filter_reads_decode_params`]. This enum is the same either way.
 ///
 /// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for `Crypt`'s
 /// `/Name`, which selects the crypt filter, so carrying it now keeps Phase 3's
@@ -228,6 +232,13 @@ pub(crate) fn decode_filter_specs_from_object(
 /// it points at, which a `&Object` walk cannot do and which the 2026-08-03
 /// live-qpdf probe recorded in plan decision D1 of `flpdf-25kg.3.4`.
 ///
+/// That is unconditional for `/Filter`, each `/Filter` array item, the
+/// `/DecodeParms` handle, and each `/DecodeParms` array item — every position
+/// `QPDF_Stream::filterable` itself inspects. It is *conditional* one level
+/// deeper: a `/DecodeParms` dictionary **value** is reached only by
+/// `SF_FlateLzwDecode::setDecodeParms`, so this reader resolves one only when
+/// [`filter_reads_decode_params`] holds for that spec's filter.
+///
 /// A missing key arrives here as a null handle, exactly as `getKey` hands one
 /// back (`libqpdf/QPDFObjectHandle.cc:979-988`), so absent and null share the
 /// `isNull` branch just as they do in qpdf.
@@ -275,7 +286,10 @@ pub(crate) fn decode_filter_specs_from_handle(
             }
             items
                 .iter()
-                .map(decode_params_from_handle)
+                .zip(&names)
+                .map(|(item, name)| {
+                    decode_params_from_handle(item, filter_reads_decode_params(name))
+                })
                 .collect::<Result<_>>()?
         }
     } else {
@@ -283,7 +297,7 @@ pub(crate) fn decode_filter_specs_from_handle(
         // as the `Object` reader re-reads the one borrowed object.
         names
             .iter()
-            .map(|_| decode_params_from_handle(decode_params))
+            .map(|name| decode_params_from_handle(decode_params, filter_reads_decode_params(name)))
             .collect::<Result<_>>()?
     };
 
@@ -303,13 +317,82 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
     (0..count).map(|_| DecodeParams::Absent).collect()
 }
 
-fn decode_params_from_handle(params: &ObjectHandle) -> Result<DecodeParams> {
+/// Does the filter named `filter_name` read `/DecodeParms` *entries*?
+///
+/// qpdf draws this line per filter, not per key. `QPDFStreamFilter`'s base
+/// `setDecodeParms` is `return decode_parms.isNull();`
+/// (`libqpdf/QPDFStreamFilter.cc:3-7`) — it inspects the parameter handle
+/// itself and never touches an entry — and ASCII85, ASCIIHex, and RunLength
+/// all inherit it. `SF_FlateLzwDecode::setDecodeParms` is the one that walks
+/// `decode_parms.getKeys()` and `getKey(key)`
+/// (`libqpdf/SF_FlateLzwDecode.cc:29-31`). Since every `QPDFObjectHandle`
+/// inspector dereferences first, a `/DecodeParms` value behind an indirect
+/// reference is resolved by qpdf iff its filter is in the second group.
+///
+/// **The source is the evidence.** A live probe cannot settle this by itself:
+/// qpdf resolves a dangling reference to null silently, so "qpdf printed
+/// nothing about object 99" is equally consistent with looking and with not
+/// looking. The 2026-08-03 qpdf 11.9.0 probe pins only the observable half —
+/// `/ASCIIHexDecode` with a present `/DecodeParms` fails at
+/// `setDecodeParms`, exiting 2 with "unable to filter stream data".
+///
+/// The predicate lives on [`StreamFilter`] and is reached through
+/// [`stream_filter_for`] rather than being a name list here, so it cannot
+/// drift from that registry the way a second list would. In qpdf the same
+/// distinction is implicit — it is simply whether a filter's `setDecodeParms`
+/// override calls `getKeys()`.
+///
+/// Abbreviations are expanded first because qpdf expands them at
+/// `QPDF_Stream.cc:419-423`, ahead of the `filter_factories` lookup at `:425`,
+/// so `/Fl` reaches `SF_FlateLzwDecode` and consumes.
+///
+/// An unknown name has no registered filter, so it lands on `false`. That is
+/// *closer* to qpdf, which fails the factory lookup and returns at
+/// `QPDF_Stream.cc:433-435` without ever reading `/DecodeParms` at `:441` —
+/// but not identical, because flpdf still resolves the `/DecodeParms` handle
+/// itself. That residue is beads `flpdf-vatj`, not this function's business.
+fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
+    let filter_name = normalize_filter_name(filter_name);
+    // `Crypt` is deliberately here rather than falling through to `false`: it
+    // is not a `StreamFilter` at all. `filters::prepare_decode_filters` peels
+    // it off into `PreparedStage::Crypt` before consulting `stream_filter_for`,
+    // and the crypt provider is then handed `&stage.spec.decode_params` — plan
+    // decision D2 of `flpdf-25kg.3.4` has that provider selecting its crypt
+    // filter from `/Name`. Leaving it out would silently starve that reader.
+    if filter_name == b"Crypt" {
+        return true;
+    }
+    stream_filter_for(filter_name).is_some_and(|filter| filter.reads_decode_params())
+}
+
+/// Read a `/DecodeParms` value into [`DecodeParams`].
+///
+/// `resolve_values` is [`filter_reads_decode_params`] for the filter this
+/// parameter set belongs to. It governs *only* whether an entry's value is
+/// dereferenced; a direct value classifies identically either way, because
+/// `ObjectHandle::try_dereference` short-circuits on a direct handle.
+///
+/// The two calls on `params` itself stay unconditional, because qpdf makes
+/// them for every filter: `QPDF_Stream::filterable` asks `decode_obj.isArray()`
+/// (`QPDF_Stream.cc:442`) and the base `setDecodeParms` asks
+/// `decode_parms.isNull()` (`QPDFStreamFilter.cc:6`). Only `try_is_null` can
+/// resolve anything here anyway — `try_as_dictionary` runs on the slot it just
+/// resolved, and `try_dereference` is idempotent.
+fn decode_params_from_handle(params: &ObjectHandle, resolve_values: bool) -> Result<DecodeParams> {
     if params.try_is_null()? {
         return Ok(DecodeParams::Absent);
     }
     let Some(entries) = params.try_as_dictionary()? else {
         return Ok(DecodeParams::Present(Vec::new()));
     };
+    if !resolve_values {
+        return Ok(DecodeParams::Present(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
+                .collect(),
+        ));
+    }
     entries
         .iter()
         .map(|(key, value)| Ok((key.clone(), param_value_from_handle(value)?)))
@@ -325,6 +408,24 @@ fn param_value_from_handle(value: &ObjectHandle) -> Result<ParamValue> {
         Some(name) => ParamValue::Name(name),
         None => ParamValue::Other,
     })
+}
+
+/// [`param_value_from_handle`] for a filter that never reads the entry.
+///
+/// Deliberately the shape of [`param_value_from_object`]: the same
+/// classification off the same non-resolving accessors, so a *direct* value
+/// reduces to the identical [`ParamValue`] all three readers agree on. An
+/// *indirect* value stays unresolved and reduces to `Other` — which is also
+/// what the `Object` reader yields for `Object::Reference`, so this converges
+/// the two readers rather than splitting them further.
+fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
+    match value.as_integer() {
+        Some(int) => ParamValue::Int(clamp_to_i32(int)),
+        None => match value.as_name() {
+            Some(name) => ParamValue::Name(name),
+            None => ParamValue::Other,
+        },
+    }
 }
 
 fn decode_params_from_object(params: Option<&Object>) -> DecodeParams {
@@ -550,6 +651,21 @@ pub(crate) trait StreamFilter {
         decode_params.is_absent()
     }
 
+    /// Does [`Self::set_decode_params`] look at the parameter *entries*?
+    ///
+    /// `false` alongside the default `set_decode_params` above, which reads
+    /// nothing but `is_absent()` — qpdf's `decode_parms.isNull()`. A filter
+    /// overriding one should consider the other: this is the flpdf-side
+    /// statement of whether qpdf's counterpart calls `getKeys()`.
+    ///
+    /// It is not a decode decision — it decides whether the `ObjectHandle`
+    /// shape reader *dereferences* each value, so that flpdf touches exactly
+    /// the objects qpdf touches. See [`filter_reads_decode_params`], which is
+    /// the only caller.
+    fn reads_decode_params(&self) -> bool {
+        false
+    }
+
     /// Build the filter's decode pipeline without decoding anything.
     ///
     /// `QPDF_Stream::pipeStreamData` constructs every filter's decode pipeline
@@ -657,6 +773,13 @@ fn to_uint(value: i32) -> Result<u32> {
 }
 
 impl StreamFilter for FlateLzwStreamFilter {
+    /// `SF_FlateLzwDecode::setDecodeParms` is the one override in qpdf 11.9.0
+    /// that walks `decode_parms.getKeys()` (`SF_FlateLzwDecode.cc:29-31`), so
+    /// this is the one filter whose parameter values qpdf dereferences.
+    fn reads_decode_params(&self) -> bool {
+        true
+    }
+
     fn set_decode_params(&mut self, decode_params: &DecodeParams) -> bool {
         // The one early return SF_FlateLzwDecode::setDecodeParms has
         // (SF_FlateLzwDecode.cc:24-26), for a null /DecodeParms. Every other
@@ -1102,7 +1225,9 @@ pub(crate) mod tests {
         DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
         Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
     };
-    use crate::object_handle::identity_tests::resolver_bearing_handle;
+    use crate::object_handle::identity_tests::{
+        logged_resolver_bearing_handle, resolver_bearing_handle,
+    };
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::{Dictionary, Error, Object, Result};
@@ -1264,9 +1389,14 @@ pub(crate) mod tests {
     /// disagree on an indirect child: the `Object` reader classifies
     /// `Object::Reference` as `ParamValue::Other` (or as a non-name filter
     /// item), while the handle reader dereferences it, which the 2026-08-03
-    /// live-qpdf probe confirmed is what qpdf does. Adding an indirect row
-    /// here would therefore assert the wrong thing; indirect coverage lives in
-    /// the `handle_reader_dereferences_*` /
+    /// live-qpdf probe confirmed is what qpdf does. (One position is narrower:
+    /// a `/DecodeParms` dictionary value under a filter that does not read
+    /// entries is *not* dereferenced, so there the two readers agree — see
+    /// [`filter_reads_decode_params`]. The disagreement still holds for every
+    /// other position, which is why an indirect row is barred outright rather
+    /// than case by case.) Adding an indirect row here would therefore assert
+    /// the wrong thing; indirect coverage lives in the
+    /// `handle_reader_dereferences_*` /
     /// `handle_reader_surfaces_a_dropped_document_*` tests below.
     pub(crate) fn shape_corpus() -> Vec<(&'static str, Option<Object>, Option<Object>)> {
         let flate = || Object::Name(b"FlateDecode".to_vec());
@@ -1591,11 +1721,19 @@ pub(crate) mod tests {
     // Each case below starts from an *unresolved* indirect handle in one child
     // position, so the value that comes back proves that position resolved.
     //
+    // The `/DecodeParms` dictionary-value position is the one exception, and
+    // it is qpdf's, not flpdf's: only `SF_FlateLzwDecode::setDecodeParms`
+    // reaches a value (`SF_FlateLzwDecode.cc:29-31`), so that position is
+    // resolved iff `filter_reads_decode_params` holds. Its tests come in
+    // pairs — a Flate case proving resolution, an ASCIIHex case proving its
+    // absence — and the negative half asserts a *call count*, because "never
+    // looked" is not observable in the returned value alone.
+    //
     // **What that does and does not pin.** A per-site mutation matrix over
     // every `try_*` call in `decode_filter_specs_from_handle` and its two
-    // helpers kills four — the first accessor each child position reaches:
-    // `filter.try_is_null`, the `/Filter` item's
-    // `try_as_name`, `decode_params_from_handle`'s `try_is_null`, and
+    // resolving helpers kills four — the first accessor each child position
+    // reaches: `filter.try_is_null`, the `/Filter` item's `try_as_name`,
+    // `decode_params_from_handle`'s `try_is_null`, and
     // `param_value_from_handle`'s `try_as_integer`. The other six survive
     // individual mutation, for two distinct reasons, neither of them a bug:
     //
@@ -1612,6 +1750,11 @@ pub(crate) mod tests {
     //   document surfaces the same error one call later. It mirrors the
     //   `Object` reader's `None | Some(Object::Null)` arm and is kept for that
     //   symmetry.
+    //
+    // That matrix covers only the ten `try_*` sites. It says nothing about
+    // `param_value_without_resolving`, which has no `try_*` to mutate: the
+    // mutation that discriminates *it* is flipping `resolve_values` itself,
+    // which the paired tests above cover in both directions.
     //
     // All six stay `try_*` for uniformity and for robustness against a future
     // reordering — not because a test can tell them apart today. Read the tests
@@ -1732,11 +1875,206 @@ pub(crate) mod tests {
         assert_eq!(specs[0].decode_params, DecodeParams::Absent);
     }
 
+    // ----- The per-filter boundary on /DecodeParms *values* -----
+    //
+    // The decisive pair. Both build the identical shape — a direct
+    // `/DecodeParms` dictionary holding one indirect value — and differ only
+    // in `/Filter`, so the only thing the assertion can be reading is the
+    // per-filter decision. Keeping `/Filter` and the dictionary direct means
+    // the value is the only handle that *could* resolve, which is what makes
+    // the log length unambiguous.
+
+    #[test]
+    fn handle_reader_never_resolves_a_decode_parms_value_for_a_filter_that_ignores_them() {
+        // `ASCIIHexDecode` inherits `QPDFStreamFilter::setDecodeParms`
+        // (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
+        // `return decode_parms.isNull();` — it never reaches an entry. The
+        // 2026-08-03 qpdf 11.9.0 probe (`/Filter /ASCIIHexDecode /DecodeParms
+        // << /Unused 99 0 R >>`, object 99 dangling) exits 2 with "unable to
+        // filter stream data" and reports nothing about object 99 — the
+        // observable half only; see `filter_reads_decode_params` for why a
+        // probe cannot decide the resolution question and the source can.
+        //
+        // A returned value cannot express "never looked" — an unresolved
+        // handle and a resolved non-integer both read as `Other`. The call log
+        // can, which is why this test asserts on it.
+        let (value, _resolver, calls) = logged_resolver_bearing_handle(ObjectValue::Integer(4));
+        let parms = ObjectHandle::dictionary(vec![(b"Unused".to_vec(), value.clone())]);
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            calls.borrow().is_empty(),
+            "qpdf never fetches this object; flpdf resolved {:?}",
+            calls.borrow()
+        );
+        assert!(!value.is_resolved());
+        // The entry is still *present*, so `set_decode_params`'s `is_absent()`
+        // still rejects it exactly as qpdf's base implementation does. Only
+        // the classification of the unresolved value is `Other`.
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Unused".to_vec(), ParamValue::Other)])
+        );
+    }
+
+    #[test]
+    fn handle_reader_resolves_a_decode_parms_value_for_a_filter_that_reads_them() {
+        // The positive half: `SF_FlateLzwDecode::setDecodeParms` walks
+        // `getKeys()`/`getKey()` (`libqpdf/SF_FlateLzwDecode.cc:29-31`) and
+        // `isInteger()` dereferences, so this value *is* fetched.
+        let (value, _resolver, calls) = logged_resolver_bearing_handle(ObjectValue::Integer(4));
+        let parms = ObjectHandle::dictionary(vec![(b"Columns".to_vec(), value)]);
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(*calls.borrow(), vec![crate::ObjectRef::new(20, 0)]);
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
+        );
+    }
+
+    #[test]
+    fn handle_reader_resolves_a_crypt_decode_parms_value() {
+        // `Crypt` is the one consuming name that is not a `StreamFilter`:
+        // `filters::prepare_decode_filters` routes it to
+        // `PreparedStage::Crypt`, whose provider is handed
+        // `&stage.spec.decode_params` and, under plan decision D2 of
+        // `flpdf-25kg.3.4`, reads `/Name` to select its crypt filter. Without
+        // its own arm in `filter_reads_decode_params` it would fall through to
+        // the unregistered-name `false` and starve that provider.
+        //
+        // This test is what makes that arm load-bearing: the corpus's "Crypt
+        // filter" row is direct, so it stays green either way.
+        let (value, _resolver, calls) =
+            logged_resolver_bearing_handle(ObjectValue::Name(b"Identity".to_vec()));
+        let parms = ObjectHandle::dictionary(vec![(b"Name".to_vec(), value)]);
+
+        let specs =
+            decode_filter_specs_from_handle(&ObjectHandle::name(b"Crypt".to_vec()), &parms, None)
+                .unwrap();
+
+        assert_eq!(*calls.borrow(), vec![crate::ObjectRef::new(20, 0)]);
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(
+                b"Name".to_vec(),
+                ParamValue::Name(b"Identity".to_vec())
+            )])
+        );
+    }
+
+    #[test]
+    fn handle_reader_expands_an_abbreviation_before_deciding_whether_to_resolve() {
+        // qpdf rewrites `/Fl` to `/FlateDecode` at `QPDF_Stream.cc:419-423`,
+        // *ahead* of the `filter_factories` lookup at `:425`, so an
+        // abbreviated Flate filter reads its parameters like the spelled-out
+        // one. The corpus cannot catch a missing `normalize_filter_name` here:
+        // its "abbreviation Fl" row carries no `/DecodeParms` at all.
+        let (value, _resolver, calls) = logged_resolver_bearing_handle(ObjectValue::Integer(4));
+        let parms = ObjectHandle::dictionary(vec![(b"Columns".to_vec(), value)]);
+
+        let specs =
+            decode_filter_specs_from_handle(&ObjectHandle::name(b"Fl".to_vec()), &parms, None)
+                .unwrap();
+
+        assert_eq!(*calls.borrow(), vec![crate::ObjectRef::new(20, 0)]);
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
+        );
+    }
+
+    #[test]
+    fn a_non_resolving_read_classifies_direct_values_exactly_as_the_object_reader_does() {
+        // The half of the change that must *not* be observable: skipping
+        // resolution may not change what a direct value becomes.
+        // `try_dereference` short-circuits on a direct handle, so the two
+        // reads are the same walk — this pins that they stay the same walk,
+        // across all three `ParamValue` variants, for a non-consuming filter.
+        let entries = || {
+            vec![
+                (b"Columns".to_vec(), ObjectHandle::integer(7)),
+                (b"Name".to_vec(), ObjectHandle::name(b"Identity".to_vec())),
+                (b"Other".to_vec(), ObjectHandle::string(b"x".to_vec())),
+            ]
+        };
+        let expected = DecodeParams::Present(vec![
+            (b"Columns".to_vec(), ParamValue::Int(7)),
+            (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
+            (b"Other".to_vec(), ParamValue::Other),
+        ]);
+
+        for filter in [b"ASCIIHexDecode".to_vec(), b"FlateDecode".to_vec()] {
+            let specs = decode_filter_specs_from_handle(
+                &ObjectHandle::name(filter.clone()),
+                &ObjectHandle::dictionary(entries()),
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                specs[0].decode_params,
+                expected,
+                "filter {}",
+                String::from_utf8_lossy(&filter)
+            );
+        }
+    }
+
+    #[test]
+    fn handle_reader_leaves_a_dropped_document_unread_for_a_filter_that_ignores_decode_parms() {
+        // The counterpart to the "/DecodeParms dictionary value" row of
+        // `handle_reader_surfaces_a_dropped_document_from_every_child_position`.
+        // A severed handle at that position is *not* an error under a
+        // non-consuming filter, and that is not flpdf being lax: qpdf's
+        // ASCIIHex filter never fetches the object, so a broken reference
+        // there cannot be diagnosed by qpdf either. The stream is still
+        // refused downstream — `set_decode_params` sees a `Present` parameter
+        // set — just not for the reference's sake.
+        let dropped = {
+            let (handle, resolver) = resolver_bearing_handle(ObjectValue::Integer(4));
+            drop(resolver);
+            handle
+        };
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+            &ObjectHandle::dictionary(vec![(b"Columns".to_vec(), dropped)]),
+            None,
+        )
+        .expect("qpdf never dereferences this value, so neither does flpdf");
+
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Other)])
+        );
+    }
+
     #[test]
     fn handle_reader_surfaces_a_dropped_document_from_every_child_position() {
         // `try_dereference`'s `Error::Internal` has to reach the caller from
-        // each position; silently reading the severed handle as "absent" or
-        // "not a name" would hide a broken document behind a plausible answer.
+        // each position this reader dereferences; silently reading the severed
+        // handle as "absent" or "not a name" would hide a broken document
+        // behind a plausible answer.
+        //
+        // Four of the five positions are unconditional. The fifth — a
+        // `/DecodeParms` dictionary value — is conditional on the filter, so
+        // it is listed with `flate()` here and its non-consuming counterpart
+        // is `handle_reader_leaves_a_dropped_document_unread_for_a_filter_\
+        // that_ignores_decode_parms`, which asserts `Ok` precisely because
+        // qpdf never fetches that object either.
         let dropped = || {
             let (handle, resolver) =
                 resolver_bearing_handle(ObjectValue::Name(b"FlateDecode".to_vec()));
