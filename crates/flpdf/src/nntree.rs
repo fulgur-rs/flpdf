@@ -2298,11 +2298,20 @@ fn make_indirect<R: Read + Seek>(
     // A fresh allocator is created for each tree update, so allocations made
     // through the same Pdf between updates are included in this initial scan.
     // Recursive splits and repair rebuilds then advance in O(1) per object.
-    let next = allocator.next_number(pdf);
+    let mut next = allocator.next_number(pdf);
+    let mut object_ref = ObjectRef::new(
+        u32::try_from(next)
+            .map_err(|_| Error::Unsupported("object-number space exhausted".to_string()))?,
+        0,
+    );
+    if !pdf.object_ref_is_available(object_ref) {
+        object_ref = pdf.next_available_object_ref()?;
+        next = u64::from(object_ref.number);
+    }
     let number = u32::try_from(next)
         .map_err(|_| Error::Unsupported("object-number space exhausted".to_string()))?;
     allocator.next = Some(next + 1);
-    let object_ref = ObjectRef::new(number, 0);
+    debug_assert_eq!(object_ref, ObjectRef::new(number, 0));
     pdf.set_object(object_ref, value);
     Ok(object_ref)
 }
@@ -2944,6 +2953,29 @@ mod tests {
                         if matches!(kids.first(), Some(Object::Dictionary(_)))
                 )
         ));
+    }
+
+    #[test]
+    fn direct_kid_repair_does_not_overwrite_an_intervening_allocation() {
+        let mut pdf = empty_pdf();
+        let first = name_leaf(&[(b"a", 1)], Some((b"a", b"a")));
+        let second = name_leaf(&[(b"b", 2)], Some((b"b", b"b")));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![first, second]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let mut cursor = tree.begin(&mut pdf).expect("repair first direct kid");
+        let intervening = ObjectRef::new(3, 0);
+        pdf.set_object(intervening, Object::Integer(99));
+
+        tree.next(&mut pdf, &mut cursor)
+            .expect("repair second direct kid");
+
+        assert_eq!(
+            pdf.resolve_borrowed(intervening).expect("intervening object"),
+            &Object::Integer(99),
+            "a later direct-kid repair must not reuse an object number allocated between cursor steps"
+        );
     }
 
     #[test]

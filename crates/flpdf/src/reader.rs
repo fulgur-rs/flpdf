@@ -1709,6 +1709,14 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(ObjectRef::new(next_number, 0))
     }
 
+    /// Whether no parsed or canonical object currently owns `object_ref`.
+    ///
+    /// Tree-local allocation caches use this to detect an intervening PDF
+    /// allocation before reusing their next candidate.
+    pub(crate) fn object_ref_is_available(&self, object_ref: ObjectRef) -> bool {
+        self.cache.entry(object_ref).is_none() && !self.handle_registry.contains_key(&object_ref)
+    }
+
     pub(crate) fn unique_id(&self) -> u64 {
         self.unique_id
     }

@@ -411,12 +411,13 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 return Err(error);
             }
         };
-        self.store_embedded_files_root(tree.into_root())?;
         // cov:ignore-start: the exercised missing-key return is attributed to find_object
         let Some(removed) = removed else {
+            self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
             return Ok(false);
         };
         // cov:ignore-end
+        self.store_embedded_files_root(tree.into_root())?;
         // cov:ignore-start: the same exclusive helper borrow just found this key
         if !delete_embedded_file(self.pdf, key)? {
             return Ok(false);
@@ -1076,6 +1077,23 @@ mod tests {
             .expect("lookup")
             .is_some());
         assert!(!pdf.is_dirty(names_ref));
+    }
+
+    #[test]
+    fn helper_absent_removal_does_not_dirty_an_unchanged_indirect_names_dictionary() {
+        let mut pdf = Pdf::open(std::io::Cursor::new(indirect_names_pdf_bytes())).expect("open");
+        let names_ref = ObjectRef::new(4, 0);
+        assert!(!pdf.is_dirty(names_ref));
+
+        assert!(!pdf
+            .embedded_files()
+            .remove_embedded_file(b"missing")
+            .expect("absent removal"));
+
+        assert!(
+            !pdf.is_dirty(names_ref),
+            "an absent removal must not rewrite the unchanged /Names dictionary"
+        );
     }
 
     // ── Test: transitively-unreachable subgraph is swept (flpdf-eg3) ─────────
