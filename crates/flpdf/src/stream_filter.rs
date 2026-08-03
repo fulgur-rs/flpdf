@@ -1088,8 +1088,13 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
     sink.take_buffer().map_err(map_pipeline_error)
 }
 
+/// `pub(crate)` so `filters.rs`'s entry-point equivalence corpus can reuse
+/// [`tests::shape_corpus`] and [`tests::handle_from_object`] instead of keeping
+/// a second copy that could grow a row this module's corpus never sees. Only
+/// those two helpers are crate-visible; the tests themselves stay private.
+/// `object_handle::identity_tests` is the same arrangement.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         decode_filter_specs_from_handle, decode_filter_specs_from_object, decode_flate,
         decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
@@ -1263,7 +1268,7 @@ mod tests {
     /// here would therefore assert the wrong thing; indirect coverage lives in
     /// the `handle_reader_dereferences_*` /
     /// `handle_reader_surfaces_a_dropped_document_*` tests below.
-    fn shape_corpus() -> Vec<(&'static str, Option<Object>, Option<Object>)> {
+    pub(crate) fn shape_corpus() -> Vec<(&'static str, Option<Object>, Option<Object>)> {
         let flate = || Object::Name(b"FlateDecode".to_vec());
         let ascii85 = || Object::Name(b"ASCII85Decode".to_vec());
         let two_filters = || Object::Array(vec![flate(), ascii85()]);
@@ -1401,7 +1406,7 @@ mod tests {
     /// a row by accident. The other rejected shapes (`Stream`, `RealLiteral`,
     /// `Operator`, `InlineImage`) are direct and merely unused; widening this
     /// to admit one is fine, adding `Reference` is not.
-    fn handle_from_object(object: Option<&Object>) -> ObjectHandle {
+    pub(crate) fn handle_from_object(object: Option<&Object>) -> ObjectHandle {
         match object {
             None | Some(Object::Null) => ObjectHandle::null(),
             Some(Object::Boolean(value)) => ObjectHandle::boolean(*value),

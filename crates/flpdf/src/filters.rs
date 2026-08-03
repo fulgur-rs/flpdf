@@ -3366,4 +3366,532 @@ mod tests {
             "unsupported PDF feature: unsupported stream filter: Crypt"
         );
     }
+
+    // ----- flpdf-25kg.3.4 Task 7: legacy-vs-native entry-point equivalence ---
+
+    /// One corpus, run through the `&Dictionary` entry points and the
+    /// `ObjectHandle` ones, compared row by row.
+    ///
+    /// # What is compared
+    ///
+    /// Each row goes through **both levels of both shapes**:
+    ///
+    /// - the recovering entry points ([`decode_stream_data_recovering_with_limits`]
+    ///   against [`decode_stream_data_recovering_from_handle`]) — `Ok`/`Err`,
+    ///   the decoded bytes, *and* the whole ordered event sequence: each
+    ///   [`StreamDecodeEvent`]'s variant in emission order, a warning's message
+    ///   and numeric code, an error's rendered text. [`StreamDecodeEvent`] is
+    ///   not `PartialEq` (it carries an [`Error`]), so the sequence is
+    ///   projected onto [`ComparableEvent`] rather than dropped, which is what
+    ///   keeps this from degrading into a bytes-only comparison.
+    /// - the strict entry points ([`decode_stream_data_with_limits`] against
+    ///   [`decode_stream_data_from_handle`]) — the `Suppress`-mode wiring and
+    ///   the replay that turns the first event into an `Err`.
+    ///
+    /// Both limits are swept: `max_filter_chain` over `[None, Some(16),
+    /// Some(0)]`, because each shape reader hand-places two chain counts and
+    /// only a cap makes their positions observable, and `max_output` over
+    /// `[None, Some(1999), Some(2000)]`, the boundary
+    /// [`flate_decode_honors_output_limit`] already pins around the
+    /// 2000-byte row below. Both fields are `pub` on `DecodeLimits` and
+    /// [`decode_stream_data_with_limits`] is `pub`, so every combination is
+    /// reachable by an embedder.
+    ///
+    /// # Which rows carry event sequences
+    ///
+    /// A row compares an ordered event sequence only if its filter chain can be
+    /// built at all. Many of [`shape_corpus`]'s rows are malformed on purpose
+    /// and stop in the shape reader or in `prepare_decode_filters`, so they
+    /// compare an `Err` string and nothing else. The multi-event orderings come
+    /// mostly from [`payload_rows`] — several of which are the shapes
+    /// `crates/flpdf/tests/stream_decode_recovery_public_api.rs` pins — plus the
+    /// few shape rows that reach a codec.
+    /// [`the_corpus_reaches_multi_event_warning_sequences`] asserts those
+    /// orderings really are produced, so this module cannot hollow out into an
+    /// error-string comparison unnoticed.
+    ///
+    /// # What this gate does and does not catch
+    ///
+    /// It catches divergence *between the two shapes* — a native reader or
+    /// entry point that reads a key differently, orders events differently, or
+    /// places a limit check differently from the legacy path, and equally a
+    /// legacy-only drift in `decode_filter_specs_from_object`.
+    ///
+    /// It does **not** catch a drift below [`FilterSpec`]: both entry points
+    /// funnel into the single [`decode_prepared_specs`], so a change there moves
+    /// both sides together and this comparison stays green. Measured — reversing
+    /// `events` at the end of [`decode_prepared_specs`] leaves
+    /// [`legacy_and_native_entry_points_agree_on_every_corpus_row`] passing
+    /// while reddening [`the_corpus_reaches_multi_event_warning_sequences`]
+    /// together with the absolute event-order tests in this file (the
+    /// `recovering_decode_*` family among them) and in
+    /// `stream_decode_recovery_public_api.rs`. Those absolute pins are what
+    /// covers the shared engine; this module is the relative gate.
+    ///
+    /// # This corpus is DIRECT-ONLY, and that limit is load-bearing
+    ///
+    /// Plan decision D1 of `flpdf-25kg.3.4` makes the two readers
+    /// *deliberately* disagree on an indirect child: the legacy `as_*` reader
+    /// classifies `Object::Reference` as [`ParamValue::Other`] (or as a
+    /// non-name filter item), while the native `try_*` reader dereferences it —
+    /// which the 2026-08-03 live-qpdf probe confirmed is what qpdf does.
+    /// Asserting equivalence over an indirect row would assert the wrong thing,
+    /// so [`handle_from_object`] panics on `Object::Reference` and this module
+    /// must not add one. D1's own acceptance tests are the
+    /// `handle_reader_dereferences_*` family in `stream_filter.rs`, plus
+    /// [`native_entry_point_decodes_through_a_live_indirect_stream_dictionary`]
+    /// at the entry-point level; do not "fix" the gap by widening the corpus
+    /// here.
+    ///
+    /// Relatedly, an absent key and an explicitly null one are **the same
+    /// native input**: [`handle_from_object`] maps both to a null handle, and
+    /// `try_get_key` hands a missing key back as one too, exactly as qpdf's
+    /// `getKey` does. The "absent /Filter" and "null /Filter" rows therefore
+    /// agree trivially on the native side; it is the *legacy* side where they
+    /// are distinct objects that both have to reach the same branch.
+    ///
+    /// # Proven to discriminate
+    ///
+    /// Two mutations of `decode_stream_data_from_handle_with_mode` were applied
+    /// and reverted while writing this module:
+    ///
+    /// - dropping its `/DecodeParms` read (passing `&ObjectHandle::null()`
+    ///   instead) reddens
+    ///   [`legacy_and_native_entry_points_agree_on_every_corpus_row`] — the
+    ///   shape half.
+    /// - reversing the returned `outcome.events`, which leaves `outcome.data`
+    ///   byte-identical, also reddens it, on the recovering comparison and with
+    ///   both sides' `data` equal in the failure output — the ordering half, and
+    ///   the direct evidence that this comparison is not bytes-only.
+    mod equivalence {
+        use super::*;
+        use crate::stream_filter::tests::{handle_from_object, shape_corpus};
+
+        /// [`StreamDecodeEvent`] reduced to something `PartialEq` can compare,
+        /// keeping every field the two entry points must agree on.
+        #[derive(Debug, PartialEq, Eq)]
+        enum ComparableEvent {
+            Data(Vec<u8>),
+            Warning(String, i32),
+            Error(String),
+        }
+
+        impl ComparableEvent {
+            /// The variant name alone, for
+            /// [`the_corpus_reaches_multi_event_warning_sequences`].
+            fn variant(&self) -> &'static str {
+                match self {
+                    Self::Data(_) => "Data",
+                    Self::Warning(..) => "Warning",
+                    Self::Error(_) => "Error",
+                }
+            }
+        }
+
+        type ComparableOutcome = std::result::Result<(Vec<u8>, Vec<ComparableEvent>), String>;
+
+        /// `Error` is not `PartialEq`, so render it; the two entry points must
+        /// agree on `Ok`/`Err` *and* on the exact text.
+        fn comparable_outcome(result: Result<StreamDecodeOutcome>) -> ComparableOutcome {
+            result
+                .map(|outcome| (outcome.data, comparable_events(outcome.events)))
+                .map_err(|error| error.to_string())
+        }
+
+        fn comparable_events(events: Vec<StreamDecodeEvent>) -> Vec<ComparableEvent> {
+            events
+                .into_iter()
+                .map(|event| match event {
+                    StreamDecodeEvent::Data(data) => ComparableEvent::Data(data),
+                    StreamDecodeEvent::Warning(warning) => {
+                        ComparableEvent::Warning(warning.message, warning.code)
+                    }
+                    StreamDecodeEvent::Error(error) => ComparableEvent::Error(error.to_string()),
+                })
+                .collect()
+        }
+
+        fn comparable_bytes(result: Result<Vec<u8>>) -> std::result::Result<Vec<u8>, String> {
+            result.map_err(|error| error.to_string())
+        }
+
+        struct Row {
+            label: &'static str,
+            filter: Option<Object>,
+            decode_params: Option<Object>,
+            stream_data: Vec<u8>,
+        }
+
+        impl Row {
+            /// The legacy shape: keys are inserted only when the row has them,
+            /// so `dict.get("Filter")` answers `None` for an absent one and
+            /// `Some(&Object::Null)` for an explicitly null one.
+            fn legacy_dictionary(&self) -> Dictionary {
+                let mut dictionary = Dictionary::new();
+                if let Some(filter) = &self.filter {
+                    dictionary.insert("Filter", filter.clone());
+                }
+                if let Some(decode_params) = &self.decode_params {
+                    dictionary.insert("DecodeParms", decode_params.clone());
+                }
+                dictionary
+            }
+
+            fn native_dictionary(&self) -> ObjectHandle {
+                let mut entries = Vec::new();
+                if let Some(filter) = &self.filter {
+                    entries.push((b"Filter".to_vec(), handle_from_object(Some(filter))));
+                }
+                if let Some(decode_params) = &self.decode_params {
+                    entries.push((
+                        b"DecodeParms".to_vec(),
+                        handle_from_object(Some(decode_params)),
+                    ));
+                }
+                ObjectHandle::dictionary(entries)
+            }
+        }
+
+        fn filter_name(name: &[u8]) -> Object {
+            Object::Name(name.to_vec())
+        }
+
+        fn filter_array(names: &[&[u8]]) -> Object {
+            Object::Array(names.iter().map(|name| filter_name(name)).collect())
+        }
+
+        fn parms_dictionary(entries: &[(&str, Object)]) -> Object {
+            let mut dictionary = Dictionary::new();
+            for (key, value) in entries {
+                dictionary.insert(key, value.clone());
+            }
+            Object::Dictionary(dictionary)
+        }
+
+        /// ASCIIHex without the trailing `>`, so a byte appended after it is
+        /// still read as a hex digit rather than sitting past EOD.
+        /// `stream_decode_recovery_public_api.rs`'s own hex encoder emits no
+        /// EOD for the same reason.
+        fn asciihex_without_eod(data: &[u8]) -> Vec<u8> {
+            let mut encoded = ascii_hex::encode(data);
+            let eod = encoded.pop();
+            assert_eq!(eod, Some(b'>'));
+            encoded
+        }
+
+        /// Rows carrying real encoded payloads, so the corpus reaches the codec
+        /// stack, the predictor, [`DecodeLimits::max_output`], and the
+        /// warning/error ordering engine — none of which a malformed shape row
+        /// ever gets to.
+        fn payload_rows() -> Vec<Row> {
+            let plain = b"equivalence corpus payload, compressible enough to matter".to_vec();
+            let flate = encode_flate(&plain).unwrap();
+            let mut truncated_flate = flate.clone();
+            truncated_flate.truncate(truncated_flate.len() - 4);
+
+            let (png_encoded, _, _) = png_predicted_flate_fixture();
+
+            // 300 literals cross LZW's first code-width transition, which is
+            // the only place `/EarlyChange` is observable: the same code
+            // sequence packed for each setting decodes to the same plaintext
+            // only when the decoder applies the matching transition point
+            // (`pipeline::lzw::tests::early_code_change_shifts_the_width_transition_by_one_code`).
+            let lzw_codes: Vec<u32> = std::iter::once(256u32)
+                .chain(std::iter::repeat_n(0x41u32, 300))
+                .chain(std::iter::once(257))
+                .collect();
+            let lzw_early = pack_codes(&lzw_codes, true);
+            let lzw_late = pack_codes(&lzw_codes, false);
+
+            // The boundary `flate_decode_honors_output_limit` pins: exactly
+            // 2000 decoded bytes, so the `max_output` sweep straddles it.
+            let big_flate = encode_flate(&vec![b'A'; 2000]).unwrap();
+
+            let mut truncated_flate_then_bad_hex = asciihex_without_eod(&truncated_flate);
+            truncated_flate_then_bad_hex.push(b'G');
+
+            let mut flate_414 = encode_flate(b"414").unwrap();
+            flate_414.truncate(flate_414.len() - 4);
+            let mut flate_4g = encode_flate(b"4G ").unwrap();
+            flate_4g.truncate(flate_4g.len() - 4);
+            let mut flate_predictor_row = encode_flate(b"\0A").unwrap();
+            flate_predictor_row.truncate(flate_predictor_row.len() - 4);
+
+            // 17 ASCIIHex stages, encoded stage by stage: each round appends its
+            // own `>` EOD, so the nesting unwinds one stage per decode.
+            let mut one_stage = Dictionary::new();
+            one_stage.insert("Filter", filter_name(b"ASCIIHexDecode"));
+            let mut seventeen_stage_data = b"A".to_vec();
+            for _ in 0..17 {
+                seventeen_stage_data =
+                    encode_stream_data(&one_stage, &seventeen_stage_data).unwrap();
+            }
+
+            vec![
+                Row {
+                    label: "flate payload",
+                    filter: Some(filter_name(b"FlateDecode")),
+                    decode_params: None,
+                    stream_data: flate.clone(),
+                },
+                Row {
+                    label: "flate under a PNG predictor",
+                    filter: Some(filter_name(b"FlateDecode")),
+                    decode_params: Some(parms_dictionary(&[
+                        ("Predictor", Object::Integer(12)),
+                        ("Columns", Object::Integer(4)),
+                    ])),
+                    stream_data: png_encoded,
+                },
+                Row {
+                    label: "LZW at the default /EarlyChange",
+                    filter: Some(filter_name(b"LZWDecode")),
+                    decode_params: None,
+                    stream_data: lzw_early.clone(),
+                },
+                Row {
+                    label: "LZW with /EarlyChange 1",
+                    filter: Some(filter_name(b"LZWDecode")),
+                    decode_params: Some(parms_dictionary(&[("EarlyChange", Object::Integer(1))])),
+                    stream_data: lzw_early.clone(),
+                },
+                Row {
+                    label: "LZW with /EarlyChange 0",
+                    filter: Some(filter_name(b"LZWDecode")),
+                    decode_params: Some(parms_dictionary(&[("EarlyChange", Object::Integer(0))])),
+                    stream_data: lzw_late,
+                },
+                // Packed for one setting and declared as the other, so
+                // `/EarlyChange` has to actually reach the codec for this row
+                // to differ from the two above.
+                Row {
+                    label: "LZW packed early but declaring /EarlyChange 0",
+                    filter: Some(filter_name(b"LZWDecode")),
+                    decode_params: Some(parms_dictionary(&[("EarlyChange", Object::Integer(0))])),
+                    stream_data: lzw_early,
+                },
+                Row {
+                    label: "ASCII85 payload",
+                    filter: Some(filter_name(b"ASCII85Decode")),
+                    decode_params: None,
+                    stream_data: ascii85::encode(&plain),
+                },
+                Row {
+                    label: "ASCIIHex payload",
+                    filter: Some(filter_name(b"ASCIIHexDecode")),
+                    decode_params: None,
+                    stream_data: ascii_hex::encode(&plain),
+                },
+                Row {
+                    label: "RunLength payload",
+                    filter: Some(filter_name(b"RunLengthDecode")),
+                    decode_params: None,
+                    stream_data: encode_run_length(&plain).unwrap(),
+                },
+                Row {
+                    label: "chain of two: ASCIIHex then Flate",
+                    filter: Some(filter_array(&[b"ASCIIHexDecode", b"FlateDecode"])),
+                    decode_params: None,
+                    stream_data: ascii_hex::encode(&flate),
+                },
+                Row {
+                    label: "2000 decoded bytes, straddling the max_output sweep",
+                    filter: Some(filter_name(b"FlateDecode")),
+                    decode_params: None,
+                    stream_data: big_flate,
+                },
+                Row {
+                    label: "truncated flate",
+                    filter: Some(filter_name(b"FlateDecode")),
+                    decode_params: None,
+                    stream_data: truncated_flate,
+                },
+                Row {
+                    label: "corrupt flate",
+                    filter: Some(filter_name(b"FlateDecode")),
+                    decode_params: None,
+                    stream_data: b"not a deflate stream at all".to_vec(),
+                },
+                // The remaining rows are the shapes
+                // `stream_decode_recovery_public_api.rs` pins, which is where
+                // the multi-event orderings come from.
+                Row {
+                    label: "AHx write error then a Flate finish warning",
+                    filter: Some(filter_array(&[b"ASCIIHexDecode", b"FlateDecode"])),
+                    decode_params: None,
+                    stream_data: b"78G".to_vec(),
+                },
+                Row {
+                    label: "AHx odd-nibble cleanup after a write error",
+                    filter: Some(filter_name(b"AHx")),
+                    decode_params: None,
+                    stream_data: b"4G ".to_vec(),
+                },
+                Row {
+                    label: "downstream data before an upstream write error",
+                    filter: Some(filter_array(&[b"AHx", b"AHx"])),
+                    decode_params: None,
+                    stream_data: b"3431G".to_vec(),
+                },
+                Row {
+                    label: "downstream cleanup after an upstream write error",
+                    filter: Some(filter_array(&[b"AHx", b"AHx"])),
+                    decode_params: None,
+                    stream_data: b"343G".to_vec(),
+                },
+                Row {
+                    label: "final data and warning after a prior write error",
+                    filter: Some(filter_array(&[b"AHx", b"FlateDecode"])),
+                    decode_params: None,
+                    stream_data: truncated_flate_then_bad_hex,
+                },
+                Row {
+                    label: "non-final warning between data and cleanup",
+                    filter: Some(filter_array(&[b"FlateDecode", b"AHx"])),
+                    decode_params: None,
+                    stream_data: flate_414,
+                },
+                Row {
+                    label: "final cleanup after a non-final warning and a write error",
+                    filter: Some(filter_array(&[b"FlateDecode", b"AHx"])),
+                    decode_params: None,
+                    stream_data: flate_4g,
+                },
+                Row {
+                    label: "final flate warning before predictor finish data",
+                    filter: Some(filter_name(b"FlateDecode")),
+                    decode_params: Some(parms_dictionary(&[
+                        ("Predictor", Object::Integer(12)),
+                        ("Columns", Object::Integer(2)),
+                    ])),
+                    stream_data: flate_predictor_row,
+                },
+                Row {
+                    label: "17 ASCIIHex stages, decodable only with an unlimited chain",
+                    filter: Some(Object::Array(vec![filter_name(b"ASCIIHexDecode"); 17])),
+                    decode_params: None,
+                    stream_data: seventeen_stage_data,
+                },
+            ]
+        }
+
+        /// [`shape_corpus`]'s rows — every `/Filter` + `/DecodeParms` shape
+        /// `QPDF_Stream::filterable` distinguishes, including decision D4's
+        /// null-valued `/DecodeParms` key — carried up from the unit-level
+        /// reader gate to the entry points, plus [`payload_rows`].
+        ///
+        /// Each shape row decodes the same flate payload, so the shapes whose
+        /// chain is buildable run a real codec instead of stopping at the
+        /// reader.
+        fn corpus() -> Vec<Row> {
+            let flate = encode_flate(b"shape corpus payload").unwrap();
+            shape_corpus()
+                .into_iter()
+                .map(|(label, filter, decode_params)| Row {
+                    label,
+                    filter,
+                    decode_params,
+                    stream_data: flate.clone(),
+                })
+                .chain(payload_rows())
+                .collect()
+        }
+
+        #[test]
+        fn legacy_and_native_entry_points_agree_on_every_corpus_row() {
+            for row in corpus() {
+                let legacy = row.legacy_dictionary();
+                let native = row.native_dictionary();
+                for max_filter_chain in [None, Some(16), Some(0)] {
+                    for max_output in [None, Some(1999), Some(2000)] {
+                        let limits = DecodeLimits {
+                            max_output,
+                            max_filter_chain,
+                        };
+                        let context = format!(
+                            "row {:?} at max_filter_chain {max_filter_chain:?}, \
+                             max_output {max_output:?}",
+                            row.label
+                        );
+
+                        assert_eq!(
+                            comparable_outcome(decode_stream_data_recovering_with_limits(
+                                &legacy,
+                                &row.stream_data,
+                                limits,
+                            )),
+                            comparable_outcome(decode_stream_data_recovering_from_handle(
+                                &native,
+                                &row.stream_data,
+                                limits,
+                            )),
+                            "recovering entry points diverged for {context}"
+                        );
+                        assert_eq!(
+                            comparable_bytes(decode_stream_data_with_limits(
+                                &legacy,
+                                &row.stream_data,
+                                limits,
+                            )),
+                            comparable_bytes(decode_stream_data_from_handle(
+                                &native,
+                                &row.stream_data,
+                                limits,
+                            )),
+                            "strict entry points diverged for {context}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_corpus_reaches_multi_event_warning_sequences() {
+            // Without this, the module's central claim would be unfalsifiable:
+            // if every row failed in the shape reader, or the codec layer
+            // stopped emitting warnings, the equivalence test above would keep
+            // passing while comparing nothing but error strings. So pin the
+            // orderings the corpus is supposed to produce, absolutely rather
+            // than by agreement. Measured: reversing `events` at the end of
+            // `decode_prepared_specs` reddens this test while leaving the
+            // equivalence test green, because it moves both entry points
+            // together — the one case the relative gate structurally cannot
+            // see.
+            //
+            // Only the native entry point is asked; the equivalence test is
+            // what makes the legacy side's answer the same.
+            let sequences: Vec<Vec<&'static str>> = corpus()
+                .iter()
+                .filter_map(|row| {
+                    decode_stream_data_recovering_from_handle(
+                        &row.native_dictionary(),
+                        &row.stream_data,
+                        DecodeLimits::default(),
+                    )
+                    .ok()
+                })
+                .map(|outcome| {
+                    comparable_events(outcome.events)
+                        .iter()
+                        .map(ComparableEvent::variant)
+                        .collect()
+                })
+                .collect();
+
+            for expected in [
+                vec!["Error", "Warning"],
+                vec!["Error", "Data"],
+                vec!["Data", "Error"],
+                vec!["Data", "Error", "Warning"],
+                vec!["Data", "Warning", "Data"],
+                vec!["Warning", "Error", "Data"],
+                vec!["Warning", "Data"],
+            ] {
+                assert!(
+                    sequences.contains(&expected),
+                    "no corpus row produced {expected:?}; observed {sequences:?}"
+                );
+            }
+        }
+    }
 }
