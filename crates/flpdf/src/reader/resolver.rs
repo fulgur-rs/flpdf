@@ -2518,4 +2518,120 @@ mod tests {
             "every mark must be gone once the outermost resolution returns"
         );
     }
+
+    /// `flpdf-k8ln`'s acceptance criterion, folded into `flpdf-25kg.3.5`: a
+    /// nested handle such as `/AP /N 5 0 R` resolves through the owning
+    /// document.
+    ///
+    /// The mechanism this exercises — [`ChildHandles::indirect_handle`]
+    /// minting a canonical handle during a parse — is the same one
+    /// [`a_nested_reference_resolves_to_the_documents_canonical_handle`]
+    /// already pins; what is new here is the *container shape*. That
+    /// sibling's two nested refs are `/Pages`, a dictionary value that *is*
+    /// the reference, and `/Kids`' entry, an array item. `/AP` here is a
+    /// direct sub-dictionary — never itself dereferenced — and `/N` is
+    /// nested inside *that*: a dictionary nested inside a dictionary, a
+    /// shape no other fixture in this file builds. (Parser nesting depth is
+    /// not what distinguishes it — `/Kids[0]` and `/AP /N` both land at
+    /// parser depth 3 — it is genuinely the container kind.)
+    ///
+    /// It is also the only fixture whose *test body* dereferences a handle
+    /// obtained purely by navigating an already-resolved value's own
+    /// dictionary rather than one re-fetched through
+    /// [`Pdf::get_object_handle`]. Production code already does this same
+    /// thing — [`ResolverHandle::read_stream`] dereferences the `/Length`
+    /// handle it just pulled out of the freshly-parsed stream dictionary the
+    /// same way — which is exactly why the mutation below also reddens the
+    /// two fixtures that exercise indirect `/Length`: their nested handle is
+    /// navigated, not re-fetched, too.
+    ///
+    /// **This mutation reddens it, and its siblings too, not just it.**
+    /// Changing [`ChildHandles::indirect_handle`] to mint an unattached
+    /// handle — `ObjectHandle::new_indirect_unresolved(object_ref,
+    /// NO_PARSED_OFFSET)` in place of `self.resolver.get_object_handle(...)`
+    /// — makes this test's `n.try_dereference()` return `Error::Internal`
+    /// ("... belongs to a dropped PDF") instead of resolving, which is
+    /// exactly the failure the acceptance criterion rules out. The same
+    /// change also reddens
+    /// `a_nested_reference_resolves_to_the_documents_canonical_handle` (the
+    /// minted `/Pages` child is no longer `is_same_object_as` the handle
+    /// [`Pdf::get_object_handle`] hands back) and every other fixture that
+    /// dereferences a handle reached through a nested `N G R` rather than a
+    /// fresh top-level fetch — because minting is one function shared by
+    /// every nesting depth and container shape, not a distinct routine this
+    /// fixture alone calls into. That sharing is why one fixture at each
+    /// distinct *shape* earns its place rather than one fixture proving the
+    /// whole mechanism: a bug scoped to one shape (say, a dictionary nested
+    /// inside a dictionary, as `/AP` is) would not necessarily show up in a
+    /// fixture built only from top-level refs and arrays.
+    #[test]
+    fn a_nested_ap_n_reference_resolves_through_the_owning_document() {
+        let appearance_payload: &[u8] = b"q 1 0 0 1 0 0 cm Q";
+        let mut appearance_stream = format!(
+            "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length {} >>\nstream\n",
+            appearance_payload.len()
+        )
+        .into_bytes();
+        appearance_stream.extend_from_slice(appearance_payload);
+        appearance_stream.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_vec(),
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>\nendobj\n".to_vec(),
+            b"4 0 obj\n<< /Type /Annot /Subtype /Widget /Rect [0 0 100 100] \
+              /AP << /N 5 0 R >> >>\nendobj\n"
+                .to_vec(),
+            appearance_stream,
+        ]);
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let annotation = pdf.get_object_handle(ObjectRef::new(4, 0));
+        annotation
+            .try_dereference()
+            .expect("the annotation dictionary resolves");
+
+        let ap = annotation
+            .as_dictionary()
+            .expect("the annotation is a dictionary")
+            .get(b"AP".as_slice())
+            .expect("the annotation has /AP")
+            .clone();
+        // Pins the fixture's own shape, not resolver behavior: confirms /AP
+        // really did parse as an inline sub-dictionary rather than a
+        // reference, which is the precondition the rest of this test needs.
+        assert!(
+            ap.is_direct(),
+            "/AP must be direct in this fixture for the dict-inside-dict shape \
+             below to be the one under test"
+        );
+
+        let n = ap
+            .as_dictionary()
+            .expect("/AP is a dictionary")
+            .get(b"N".as_slice())
+            .expect("/AP has /N")
+            .clone();
+        assert!(
+            n.is_indirect() && !n.is_resolved(),
+            "the annotation's own parse must have minted /N as an unresolved \
+             indirect handle, not resolved it eagerly or copied its value"
+        );
+
+        n.try_dereference().expect(
+            "a nested handle reached only by navigating /AP /N, never re-fetched \
+             through `Pdf::get_object_handle`, must still resolve through the \
+             owning document",
+        );
+
+        assert_eq!(
+            n.as_stream_data().as_deref(),
+            Some(appearance_payload),
+            "the resolved appearance stream must carry its own payload"
+        );
+        assert!(
+            n.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(5, 0))),
+            "the nested handle must be the document's one canonical handle for object 5"
+        );
+    }
 }
