@@ -1,8 +1,7 @@
 //! The canonical document resolver: the state `QPDF::resolve` reaches for, and
 //! the borrow seam that lets it be reached from an [`ObjectHandle`] alone.
 //!
-//! qpdf correspondence: `QPDF::resolve` (`libqpdf/QPDF.cc:1700-1753`) and the
-//! `QPDF::Members` fields it touches.
+//! qpdf correspondence: `QPDF::resolve` (`libqpdf/QPDF.cc:1700-1753`) and the `QPDF::Members` fields it touches.
 //!
 //! # Why this exists as its own owner
 //!
