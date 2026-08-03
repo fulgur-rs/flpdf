@@ -227,6 +227,13 @@ impl<K: TreeKey> NNTreeCursor<K> {
                 .zip(&other.path)
                 .all(|(left, right)| left.kid_number == right.kid_number)
     }
+
+    fn selected_path(&self) -> Option<(Vec<usize>, usize)> {
+        Some((
+            self.path.iter().map(|element| element.kid_number).collect(),
+            self.item_number?,
+        ))
+    }
 }
 
 impl<K: TreeKey> Clone for NNTreeCursor<K> {
@@ -247,6 +254,7 @@ pub(crate) struct NNTree<K: TreeKey> {
     auto_repair: bool,
     split_threshold: usize,
     max_depth: Option<usize>,
+    repair_allocator: ObjectAllocator,
     marker: PhantomData<K>,
 }
 
@@ -467,6 +475,15 @@ impl PartialEq for NameTreeCursor {
 impl Eq for NameTreeCursor {}
 
 impl NameTreeCursor {
+    pub(crate) fn selected_path(&self) -> Option<(Vec<usize>, usize)> {
+        self.inner.selected_path()
+    }
+
+    /// Whether traversal selected an array slot, even if its key is malformed.
+    pub(crate) fn positioned(&self) -> bool {
+        self.inner.positioned()
+    }
+
     /// Whether the cursor points to a valid key/value pair.
     pub fn valid(&self) -> bool {
         self.inner.current().is_some()
@@ -905,6 +922,7 @@ impl<K: TreeKey> NNTree<K> {
             auto_repair,
             split_threshold: DEFAULT_SPLIT_THRESHOLD,
             max_depth: None,
+            repair_allocator: ObjectAllocator::default(),
             marker: PhantomData,
         }
     }
@@ -927,6 +945,7 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        self.repair_allocator = ObjectAllocator::default();
         let mut cursor = NNTreeCursor::empty();
         let root = self.root_handle(pdf)?;
         self.descend(pdf, &mut cursor, root, true, true)?;
@@ -938,6 +957,7 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
+        self.repair_allocator = ObjectAllocator::default();
         let mut cursor = NNTreeCursor::empty();
         let root = self.root_handle(pdf)?;
         self.descend(pdf, &mut cursor, root, false, true)?;
@@ -966,6 +986,7 @@ impl<K: TreeKey> NNTree<K> {
         key: &K::Key,
         return_previous_if_missing: bool,
     ) -> Result<NNTreeCursor<K>> {
+        self.repair_allocator = ObjectAllocator::default();
         match self.find_internal(pdf, key, return_previous_if_missing) {
             Ok(cursor) => Ok(cursor),
             Err(Error::Parse { message, .. }) if self.auto_repair => {
@@ -2074,8 +2095,7 @@ impl<K: TreeKey> NNTree<K> {
                 parent,
                 format!("converting kid number {kid_number} to an indirect object"),
             );
-            let mut allocator = ObjectAllocator::default();
-            let object_ref = make_indirect(pdf, &mut allocator, kid_object)?;
+            let object_ref = make_indirect(pdf, &mut self.repair_allocator, kid_object)?;
             let mut dictionary = self.load_node(pdf, parent)?;
             // cov:ignore-start: prepare_kid receives kid_object from this same parent Kids array
             let Some(mut kids) = resolved_array(pdf, dictionary.get("Kids"))? else {
@@ -2278,11 +2298,20 @@ fn make_indirect<R: Read + Seek>(
     // A fresh allocator is created for each tree update, so allocations made
     // through the same Pdf between updates are included in this initial scan.
     // Recursive splits and repair rebuilds then advance in O(1) per object.
-    let next = allocator.next_number(pdf);
+    let mut next = allocator.next_number(pdf);
+    let mut object_ref = ObjectRef::new(
+        u32::try_from(next)
+            .map_err(|_| Error::Unsupported("object-number space exhausted".to_string()))?,
+        0,
+    );
+    if !pdf.object_number_is_available(object_ref.number) {
+        object_ref = pdf.next_available_object_ref()?;
+        next = u64::from(object_ref.number);
+    }
     let number = u32::try_from(next)
         .map_err(|_| Error::Unsupported("object-number space exhausted".to_string()))?;
     allocator.next = Some(next + 1);
-    let object_ref = ObjectRef::new(number, 0);
+    debug_assert_eq!(object_ref, ObjectRef::new(number, 0));
     pdf.set_object(object_ref, value);
     Ok(object_ref)
 }
@@ -2924,6 +2953,60 @@ mod tests {
                         if matches!(kids.first(), Some(Object::Dictionary(_)))
                 )
         ));
+    }
+
+    #[test]
+    fn direct_kid_repair_does_not_overwrite_an_intervening_allocation() {
+        let mut pdf = empty_pdf();
+        let first = name_leaf(&[(b"a", 1)], Some((b"a", b"a")));
+        let second = name_leaf(&[(b"b", 2)], Some((b"b", b"b")));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![first, second]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let mut cursor = tree.begin(&mut pdf).expect("repair first direct kid");
+        let intervening = ObjectRef::new(3, 0);
+        pdf.set_object(intervening, Object::Integer(99));
+
+        tree.next(&mut pdf, &mut cursor)
+            .expect("repair second direct kid");
+
+        assert_eq!(
+            pdf.resolve_borrowed(intervening).expect("intervening object"),
+            &Object::Integer(99),
+            "a later direct-kid repair must not reuse an object number allocated between cursor steps"
+        );
+    }
+
+    #[test]
+    fn direct_kid_repair_does_not_reuse_an_intervening_object_number() {
+        let mut pdf = empty_pdf();
+        let first = name_leaf(&[(b"a", 1)], Some((b"a", b"a")));
+        let second = name_leaf(&[(b"b", 2)], Some((b"b", b"b")));
+        let mut root = Dictionary::new();
+        root.insert("Kids", Object::Array(vec![first, second]));
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+
+        let mut cursor = tree.begin(&mut pdf).expect("repair first direct kid");
+        let intervening = ObjectRef::new(3, 1);
+        pdf.set_object(intervening, Object::Integer(99));
+
+        tree.next(&mut pdf, &mut cursor)
+            .expect("repair second direct kid");
+
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Array(kids)) = root.get("Kids") else {
+            panic!("root must retain /Kids"); // cov:ignore: test-shape guard
+        };
+        let Some(Object::Reference(repaired)) = kids.get(1) else {
+            panic!("second kid must be repaired to a reference"); // cov:ignore: test-shape guard
+        };
+        assert_ne!(
+            repaired.number, intervening.number,
+            "qpdf allocates above every occupied object number, regardless of generation"
+        );
     }
 
     #[test]

@@ -1709,6 +1709,23 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(ObjectRef::new(next_number, 0))
     }
 
+    /// Whether no parsed or canonical object currently owns `number` at any
+    /// generation.
+    ///
+    /// Tree-local allocation caches use this to detect an intervening PDF
+    /// allocation before reusing their generation-zero candidate. qpdf's
+    /// `nextObjGen()` allocates above the maximum object number, so a
+    /// generation-one occupant reserves the number just as generation zero
+    /// does.
+    pub(crate) fn object_number_is_available(&self, number: u32) -> bool {
+        !self.cache.contains_object_number(number)
+            && self
+                .handle_registry
+                .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))
+                .next()
+                .is_none()
+    }
+
     pub(crate) fn unique_id(&self) -> u64 {
         self.unique_id
     }
@@ -4908,6 +4925,15 @@ mod tests {
         // itself drops, so only this test's own local handles remain live.
         assert_eq!(pages.strong_count(), 1);
         assert_eq!(page.strong_count(), 1);
+    }
+
+    #[test]
+    fn object_number_availability_checks_every_registered_generation() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        pdf.get_object_handle(ObjectRef::new(90, 1));
+
+        assert!(!pdf.object_number_is_available(90));
+        assert!(pdf.object_number_is_available(91));
     }
 
     #[test]

@@ -196,7 +196,8 @@ pub use default_appearance::{parse_default_appearance, DefaultAppearance, TextCo
 pub use diagnostics::{Diagnostic, Diagnostics, Severity};
 pub use embedded_files::{
     delete_embedded_file, insert_embedded_file, list_embedded_files,
-    list_embedded_files_with_max_depth, remove_attachment, DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
+    list_embedded_files_with_max_depth, remove_attachment, EmbeddedFileDocumentHelper,
+    DEFAULT_MAX_EMBEDDED_FILES_DEPTH,
 };
 pub use encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
 pub use error::{EncryptedError, Error, Result};
