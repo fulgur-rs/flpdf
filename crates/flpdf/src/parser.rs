@@ -143,19 +143,45 @@ pub(crate) fn parse_qpdf_direct_object_handle(
     base_offset: i64,
     resolver: &mut dyn HandleResolver,
 ) -> Result<(ObjectValue, i64)> {
+    let (value, parsed_offset, _end) =
+        parse_qpdf_direct_object_handle_with_end(input, base_offset, resolver)?;
+    Ok((value, parsed_offset))
+}
+
+/// [`parse_qpdf_direct_object_handle`], additionally reporting the position in
+/// `input` immediately after the value it consumed.
+///
+/// qpdf never needs this: `QPDFParser::parse` consumes `m->file` directly, so
+/// the input source is *already* positioned after the object when it returns
+/// and `QPDF::readObject` can just call `readToken(m->file)` again
+/// (`libqpdf/QPDF.cc:1346`). flpdf's parser runs over a slice, so the caller
+/// has to be told how far it got in order to put its own input source in the
+/// same place. `reader/resolver.rs` is the caller that needs it; the
+/// two-value form above is what every existing caller keeps using.
+///
+/// For the recovered-empty-object case the reported position is the start of
+/// the `endobj` token, not past it: `peek_token` does not consume, matching
+/// qpdf, whose `QPDFParser` likewise leaves `endobj` for its caller to read.
+pub(crate) fn parse_qpdf_direct_object_handle_with_end(
+    input: &[u8],
+    base_offset: i64,
+    resolver: &mut dyn HandleResolver,
+) -> Result<(ObjectValue, i64, usize)> {
     let mut tokenizer = Tokenizer::new(input);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
     let token = parser.peek_token()?;
     if token.is_word_value(b"endobj") {
-        return Ok((ObjectValue::Null, NO_PARSED_OFFSET));
+        return Ok((ObjectValue::Null, NO_PARSED_OFFSET, parser.position()));
     }
 
     let handle = parser.object_handle(base_offset, resolver)?;
-    Ok(handle.into_direct_value().expect(
+    let end = parser.position();
+    let (value, parsed_offset) = handle.into_direct_value().expect(
         "top_level_no_reference forces the outermost integer_or_ref decision to Integer, \
          so the top-level handle this function just built is always direct",
-    ))
+    );
+    Ok((value, parsed_offset, end))
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {

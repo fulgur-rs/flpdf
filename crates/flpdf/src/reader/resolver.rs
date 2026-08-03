@@ -30,7 +30,8 @@
 //! `RefCell` double-borrow panic in production.
 //!
 //! **The qualifier is load-bearing and the hazard is real.**
-//! [`ResolverCore::read_window`] holds `borrow_mut()` across
+//! [`ResolverCore::read_window`] — and every one of the streaming primitives
+//! that replaced it for the resolver's own use — holds `borrow_mut()` across
 //! `R::seek`/`R::read`, which is caller-supplied code. `R` is arbitrary and
 //! [`ObjectHandle`] is `'static + Clone`, so an `R` that owns a handle from
 //! this same document could call `try_dereference` from inside `read` and
@@ -43,24 +44,32 @@
 //! borrow is held, which is why it is `#[cfg(test)]` and carries its own
 //! warning.
 //!
-//! This discipline is currently *stated and readable, not pinned by a test*.
-//! [`ResolverHandle::resolve_indirect`] now takes borrows of its own — three
-//! of them, all short: the two [`ResolveMark`] takes (one inside `begin`, one
-//! inside `drop`) and the one [`ResolverHandle::push_warning`] takes on the
-//! loop branch. Each is confined to a single statement, so nothing yet holds a
-//! borrow across the body a nested resolution would run in.
+//! A full uncompressed resolution takes borrows at seven kinds of place, and
+//! every one of them begins and ends inside a single expression:
+//! [`ResolveMark::begin`] and its `drop`; [`ResolverHandle::xref_entry`];
+//! [`ResolverHandle::seek`]/[`ResolverHandle::tell`]/[`ResolverHandle::read`],
+//! once per input operation; [`ResolverHandle::get_object_handle`], once per
+//! nested `N G R` the parse mints a handle for; [`ResolverHandle::push_warning`]
+//! wherever a warning is raised.
 //!
-//! The warning sink is the newest way to get this wrong, and the way that will
-//! bite first: Task 4 warns on a damaged object *while* it has the xref entry
-//! in hand, so the push has to happen after that borrow is released, not
-//! inside it. The other borrows in play are the ones `Pdf`'s legacy read
-//! helpers take, and those are exercised, including through the re-entrant
-//! indirect-`/Length` path (`reader.rs`'s
-//! `qpdf_object_read_uses_bounded_fallback_and_preserves_strict_errors`). The
-//! regression that makes a borrow spanning a nested resolve fail loudly
-//! arrives with the resolver's own re-entrancy test.
+//! **This is pinned by a test now, not merely stated.**
+//! `a_streams_indirect_length_resolves_mid_parse_and_the_payload_is_read_from_the_restored_position`
+//! drives a real nested resolution through the `/Length` seam, so a borrow
+//! spanning it panics there instead of passing unnoticed. Verified by breaking
+//! it: holding [`ResolverHandle::xref_entry`]'s borrow across
+//! `read_object_at_offset` fails six tests with `RefCell already borrowed`,
+//! and wrapping a [`ResolverHandle::push_warning`] call in a borrow fails
+//! five.
+//!
+//! The warning sink stays the easiest way to get this wrong, because
+//! `push_warning` needs `borrow_mut` and the code that warns is the code that
+//! has just finished reading something. [`ResolverHandle::frame_object`]
+//! therefore hands its warnings back rather than pushing them — it holds no
+//! borrow, but [`ResolverHandle::scan_forward`] runs it more than once per
+//! object, so duplicates would be the bug instead.
 
-use crate::object_handle::{DocumentResolver, NO_PARSED_OFFSET};
+use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::tokenizer::{Token, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,8 +105,9 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// *wraps* the source so the shift is invisible to every later read —
     /// `m->file = std::shared_ptr<InputSource>(new OffsetInputSource(m->file,
     /// global_offset))` (`libqpdf/QPDF.cc:406`). Keeping the shift beside
-    /// `reader` and applying it in [`Self::read_window`] puts it under the
-    /// same single owner, without a second input-source type.
+    /// `reader` and applying it in [`Self::seek`], [`Self::tell`] and
+    /// [`Self::read_window`] puts it under the same single owner, without a
+    /// second input-source type.
     ///
     /// It is *not* equivalent, and the difference is visible right here:
     /// wrapping makes the shift unskippable, so qpdf has no way to read from
@@ -167,13 +177,62 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// **Borrow discipline.** [`ResolverHandle::push_warning`] takes
     /// `borrow_mut()` and [`ResolverHandle::repair_diagnostics`] takes
     /// `borrow()`, so neither may be called while a borrow of this core is
-    /// already held. That is a real constraint on Task 4's read-and-parse
-    /// phase, which warns on a damaged object: the warning must be pushed
-    /// outside the borrow that read the xref entry, not inside it.
+    /// already held. That constraint binds the read-and-parse phase, which
+    /// warns from [`ResolverHandle::validate_stream_line_end`] and from
+    /// [`ResolverHandle::read_object_at_offset`] in between input operations;
+    /// each of those takes and drops its own borrow, so nothing is held when
+    /// the push happens.
     repair_diagnostics: Diagnostics,
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
+    /// Position the input source at qpdf-logical `offset`.
+    ///
+    /// qpdf `m->file->seek(offset, SEEK_SET)`. The header shift is applied
+    /// here for the same reason `OffsetInputSource` applies it inside
+    /// `m->file` (`libqpdf/QPDF.cc:406`): every caller above this line works
+    /// in qpdf-logical coordinates and never sees the physical position.
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        let physical = (self.header_offset as u64).saturating_add(offset);
+        self.reader.seek(SeekFrom::Start(physical))?;
+        Ok(())
+    }
+
+    /// The input source's current qpdf-logical position.
+    ///
+    /// qpdf `m->file->tell()`. This is the live position `QPDF::readStream`
+    /// saves before resolving `/Length` and restores afterwards
+    /// (`libqpdf/QPDF.cc:1361-1381`) — not a value recomputed from an
+    /// argument, which is precisely why the restore is load-bearing.
+    fn tell(&mut self) -> Result<u64> {
+        Ok(self
+            .reader
+            .stream_position()?
+            .saturating_sub(self.header_offset as u64))
+    }
+
+    /// Fill `buf` from the current position, returning how many bytes were
+    /// available, and leave the position advanced by exactly that many.
+    ///
+    /// qpdf `m->file->read(buf, len)`, whose contract is likewise "returns
+    /// the number of bytes read, 0 at EOF" — `FileInputSource::read` loops
+    /// over `fread` and `BufferInputSource::read` clamps to what remains
+    /// (`libqpdf/FileInputSource.cc`, `libqpdf/BufferInputSource.cc`). The
+    /// loop here is what makes a short `Read::read` — legal for any `R` —
+    /// indistinguishable from that contract.
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.reader.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(filled)
+    }
+
     /// Read `[offset, next)` — or `[offset, EOF)` when `next` is `None` — from
     /// the input source, in qpdf-logical coordinates.
     ///
@@ -557,6 +616,404 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .source_xref_entries
             .insert(object_ref, entry);
     }
+
+    // ---- the input source, streamed ----
+    //
+    // Each of the three wrappers below takes its borrow and drops it inside
+    // its own expression, so the input *position* — not a borrow — is what
+    // survives between them. That is the whole point: qpdf's re-entrancy seam
+    // is a save/restore of `m->file`'s position (`QPDF::readStream`,
+    // `libqpdf/QPDF.cc:1361-1381`), and a seam can only be ported onto a
+    // position that a nested resolution can actually disturb.
+
+    /// See [`ResolverCore::seek`].
+    fn seek(&self, offset: u64) -> Result<()> {
+        self.core.borrow_mut().seek(offset)
+    }
+
+    /// See [`ResolverCore::tell`].
+    fn tell(&self) -> Result<u64> {
+        self.core.borrow_mut().tell()
+    }
+
+    /// See [`ResolverCore::read`].
+    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        self.core.borrow_mut().read(buf)
+    }
+
+    /// Append the next chunk of input to `bytes`, reporting whether anything
+    /// was left to append.
+    ///
+    /// The position advances by exactly what was appended, so `bytes` always
+    /// mirrors `[scan start, current position)`.
+    fn refill(&self, bytes: &mut Vec<u8>) -> Result<bool> {
+        let filled = bytes.len();
+        bytes.resize(filled + INPUT_CHUNK, 0);
+        let read = self.read(&mut bytes[filled..])?;
+        bytes.truncate(filled + read);
+        Ok(read != 0)
+    }
+
+    /// Pull the input forward from the current position until `attempt`
+    /// reports a complete result, then leave the position exactly where that
+    /// result stopped consuming.
+    ///
+    /// **This is the one place flpdf cannot follow qpdf's shape literally,
+    /// and the compromise is deliberate.** `QPDFTokenizer` and `QPDFParser`
+    /// consume `m->file` a character at a time
+    /// (`QPDFTokenizer::presentCharacter`, and `unreadCh` to give back the
+    /// one character of overshoot — `libqpdf/QPDF.cc:1656` uses
+    /// `seek(-1, SEEK_CUR)` for the same purpose), so qpdf never has to know
+    /// in advance how far an object reaches. flpdf's [`Tokenizer`] and parser
+    /// take a slice, so the bytes must be in memory before they can be
+    /// looked at.
+    ///
+    /// What is preserved is what the seam depends on: the position is live,
+    /// the pull advances it, and it is left immediately after the consumed
+    /// bytes — so a nested resolution really does move it and the explicit
+    /// restore in [`Self::read_stream`] really is what puts it back. What is
+    /// *not* preserved is qpdf's "stop reading at the first bad character":
+    /// `attempt` re-runs against a longer buffer, so a malformed object costs
+    /// one pull to EOF. `ResolverCore::read_window`'s bounded-window shape is
+    /// **not** what this is — that one takes its extent from the next xref
+    /// entry and leaves no position behind at all.
+    ///
+    /// `attempt` reports `(value, end)` where `end` is how many bytes it
+    /// consumed. A result that consumed the *whole* buffer is treated as
+    /// possibly truncated and re-attempted against more input, because a
+    /// token cut short by the buffer's end can parse as a shorter valid one
+    /// (`12345` cut to `1234`, `endobj` cut to `endob`). Only when the buffer
+    /// has reached EOF is such a result accepted.
+    fn scan_forward<T>(&self, mut attempt: impl FnMut(&[u8]) -> Result<(T, usize)>) -> Result<T> {
+        let start = self.tell()?;
+        let mut bytes = Vec::new();
+        let mut more = true;
+        loop {
+            let outcome = attempt(&bytes);
+            let complete = matches!(&outcome, Ok((_, end)) if *end < bytes.len());
+            if complete || !more {
+                let (value, end) = outcome?;
+                self.seek(start.saturating_add(end as u64))?;
+                return Ok(value);
+            }
+            more = self.refill(&mut bytes)?;
+        }
+    }
+
+    /// Read one token from the current position, leaving the input just past
+    /// it.
+    ///
+    /// qpdf `QPDF::readToken(m->file)` — `readObject` calls it to decide
+    /// between `stream` and `endobj` (`libqpdf/QPDF.cc:1346-1354`) and
+    /// `readStream` calls it to check for `endstream` (`:1383`).
+    fn read_token_from_input(&self) -> Result<Token> {
+        self.scan_forward(|bytes| {
+            let mut tokenizer = Tokenizer::new(bytes);
+            let token = tokenizer.read_token(false, 0)?;
+            Ok((token, tokenizer.position()))
+        })
+    }
+
+    /// Read one byte from the current position, or `None` at EOF.
+    fn read_byte(&self) -> Result<Option<u8>> {
+        let mut byte = [0u8; 1];
+        Ok((self.read(&mut byte)? == 1).then_some(byte[0]))
+    }
+
+    /// qpdf `QPDF::readObjectAtOffset` (`libqpdf/QPDF.cc:1541-1697`),
+    /// restricted to the call `QPDF::resolve` makes for a type-1 entry.
+    ///
+    /// Returns the value and the parsed offset to record on the slot, in
+    /// qpdf-logical coordinates.
+    ///
+    /// Four of qpdf's behaviours here are **not** ported, each because it
+    /// belongs to a class this slice excludes:
+    ///
+    /// - the `offset == 0` special case (`:1571-1575`), which warns and
+    ///   returns null — a damaged-xref case;
+    /// - the `try_recovery` catch (`:1613-1637`), which reconstructs the xref
+    ///   table and retries — gated on `m->attempt_recovery`, and recovery is
+    ///   out of scope;
+    /// - the object-id **mismatch** outcome (`:1600-1608` together with
+    ///   `:1641-1693`). qpdf, with recovery off, warns and then reads the
+    ///   object anyway — but it caches what it read under the id the *file*
+    ///   carries, not the one the xref table asked for, so back in
+    ///   `QPDF::resolve` the requested reference is still unresolved and falls
+    ///   through to `updateCache(og, QPDF_Null::create(), -1, -1)` (`:1745`).
+    ///   Reproducing that means porting the resolve-to-null fallback, which
+    ///   arrives with the recovery work; until then a mismatch is an error, so
+    ///   nothing silently diverges;
+    /// - `end_before_space`/`end_after_space` (`:1649-1663`), the two extra
+    ///   positions `updateCache` stores for linearization-hint validation.
+    ///   flpdf's `ObjCache` counterpart is a bare `ObjectHandle`, which has
+    ///   nowhere to put them; the position is still left after `endobj` so a
+    ///   later slice can take them without changing this shape.
+    fn read_object_at_offset(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+    ) -> Result<(ObjectValue, i64)> {
+        self.seek(offset)?;
+        let framed = self.scan_forward(|bytes| {
+            let framed = self.frame_object(bytes, offset)?;
+            let end = framed.end;
+            Ok((framed, end))
+        })?;
+
+        if framed.found != Some(expected) {
+            return Err(Error::parse(
+                offset as usize,
+                format!("expected {} {} obj", expected.number, expected.generation),
+            ));
+        }
+
+        // Emitted here rather than inside `frame_object`, which `scan_forward`
+        // may run several times against a growing buffer: a warning pushed in
+        // there would be duplicated once per attempt.
+        for warning in framed.warnings {
+            self.push_warning(warning);
+        }
+
+        match framed.framing {
+            ObjectFraming::Direct => Ok((framed.value, framed.value_offset)),
+            ObjectFraming::Stream => self.read_stream(framed.value, framed.value_offset),
+        }
+    }
+
+    /// Tokenize `N G obj`, parse the value, and read the one token that
+    /// follows it — qpdf's `readObjectAtOffset` header check
+    /// (`libqpdf/QPDF.cc:1577-1608`) plus `QPDF::readObject`
+    /// (`:1329-1355`), over a buffer rather than over `m->file`.
+    ///
+    /// Runs once per [`Self::scan_forward`] attempt, so it must stay free of
+    /// side effects that are not idempotent. Minting a canonical child handle
+    /// is idempotent ([`Self::get_object_handle`] is entry-or-insert);
+    /// warnings are not, and are therefore returned rather than pushed.
+    fn frame_object(&self, bytes: &[u8], offset: u64) -> Result<FramedObject> {
+        let mut warnings = Vec::new();
+        let mut tokenizer = Tokenizer::new(bytes);
+        let number = tokenizer.next_integer()?;
+        let generation = tokenizer.next_integer()?;
+        tokenizer.expect_word(b"obj")?;
+        tokenizer.skip_ignorable()?;
+        let body_start = tokenizer.position();
+
+        // Reported rather than acted on here: this runs once per
+        // `scan_forward` attempt, and turning the mismatch into an error would
+        // make every attempt fail and pull the input to EOF before saying so.
+        let found = u32::try_from(number)
+            .ok()
+            .zip(u16::try_from(generation).ok())
+            .map(|(number, generation)| ObjectRef::new(number, generation));
+
+        let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
+        let mut minter = ChildHandles { resolver: self };
+        let (value, value_offset, value_end) =
+            crate::parser::parse_qpdf_direct_object_handle_with_end(
+                &bytes[body_start..],
+                file_origin.saturating_add(body_start as i64),
+                &mut minter,
+            )
+            .map_err(|error| error.rebase_offset(body_start))?;
+
+        let mut after = Tokenizer::new(bytes);
+        after.set_position(body_start + value_end)?;
+        let token = after.read_token(false, 0)?;
+        let end = after.position();
+
+        // qpdf `:1346-1354`.
+        let framing = if token.is_word_value(b"stream") {
+            ObjectFraming::Stream
+        } else {
+            if !token.is_word_value(b"endobj") {
+                warnings.push("expected endobj".to_string());
+            }
+            ObjectFraming::Direct
+        };
+
+        Ok(FramedObject {
+            found,
+            value,
+            value_offset,
+            end,
+            framing,
+            warnings,
+        })
+    }
+
+    /// qpdf `QPDF::readStream` (`libqpdf/QPDF.cc:1359-1398`), entered with the
+    /// input positioned immediately after the `stream` keyword.
+    ///
+    /// **This is the resolver's one re-entrancy seam**, and the reason
+    /// [`ResolverHandle::resolve_indirect`] is split into phases at all. No
+    /// borrow of [`ResolverCore`] is held anywhere in this method: every input
+    /// operation takes and drops its own, so the `/Length` dereference below
+    /// is free to re-enter `resolve_indirect` for another reference, seek the
+    /// input somewhere else entirely, and return. The explicit
+    /// [`Self::seek`] back to `stream_offset` is what makes the payload read
+    /// correct afterwards — delete it and a stream whose `/Length` is an
+    /// indirect reference reads its bytes from wherever the nested resolution
+    /// finished.
+    ///
+    /// qpdf's recovery arm (`:1392-1398`: warn, then `recoverStreamLength`)
+    /// is not ported — it is gated on `m->attempt_recovery`, and recovery is
+    /// out of this slice.
+    fn read_stream(&self, dict: ObjectValue, dict_offset: i64) -> Result<(ObjectValue, i64)> {
+        self.validate_stream_line_end()?;
+
+        // qpdf `:1361-1363`: "Must get offset before accessing any additional
+        // objects since resolving a previously unresolved indirect object
+        // will change file position."
+        let stream_offset = self.tell()?;
+
+        let length = Self::stream_length(&dict)?;
+
+        // qpdf `:1381`, `m->file->seek(stream_offset, SEEK_SET)`.
+        self.seek(stream_offset)?;
+        let mut data = vec![0u8; length];
+        if self.read(&mut data)? != length {
+            return Err(Error::parse(
+                stream_offset as usize,
+                "stream data ends before its declared /Length",
+            ));
+        }
+
+        // qpdf `:1383-1386`.
+        if !self.read_token_from_input()?.is_word_value(b"endstream") {
+            return Err(Error::parse(stream_offset as usize, "expected endstream"));
+        }
+        // qpdf `:1352-1355`: `readObject` reads one more token after
+        // `readStream` returns and warns if it is not `endobj`.
+        if !self.read_token_from_input()?.is_word_value(b"endobj") {
+            self.push_warning("expected endobj");
+        }
+
+        let dict = ObjectHandle::from_value(dict);
+        dict.set_parsed_offset_if_unset(dict_offset);
+        Ok((
+            ObjectValue::Stream { dict, data },
+            i64::try_from(stream_offset).unwrap_or(i64::MAX),
+        ))
+    }
+
+    /// qpdf `QPDF::validateStreamLineEnd` (`libqpdf/QPDF.cc:1400-1448`),
+    /// byte for byte: a newline ends it; a carriage return ends it, consuming
+    /// a following newline or warning if there is none; any other
+    /// non-whitespace is pushed back with a warning; whitespace warns and
+    /// keeps going; EOF just returns, because "a premature EOF here will
+    /// result in some other problem that will get reported at another time"
+    /// (`:1413-1415`).
+    fn validate_stream_line_end(&self) -> Result<()> {
+        loop {
+            let Some(byte) = self.read_byte()? else {
+                return Ok(());
+            };
+            if byte == b'\n' {
+                return Ok(());
+            }
+            if byte == b'\r' {
+                match self.read_byte()? {
+                    Some(b'\n') | None => {}
+                    Some(_) => {
+                        self.unread_byte()?;
+                        self.push_warning("stream keyword followed by carriage return only");
+                    }
+                }
+                return Ok(());
+            }
+            if !crate::tokenizer::is_ws(byte) {
+                self.unread_byte()?;
+                self.push_warning("stream keyword not followed by proper line terminator");
+                return Ok(());
+            }
+            self.push_warning("stream keyword followed by extraneous whitespace");
+        }
+    }
+
+    /// Give back the byte just read. qpdf `InputSource::unreadCh`, which
+    /// `validateStreamLineEnd` uses at `libqpdf/QPDF.cc:1432` and `:1442`.
+    fn unread_byte(&self) -> Result<()> {
+        let position = self.tell()?;
+        self.seek(position.saturating_sub(1))
+    }
+
+    /// qpdf `readStream`'s `/Length` lookup (`libqpdf/QPDF.cc:1368-1379`).
+    ///
+    /// Takes no `&self` on purpose: [`ObjectHandle::try_dereference`] below is
+    /// the re-entry point, and a method with no access to [`ResolverCore`]
+    /// cannot be holding a borrow of it when that happens.
+    fn stream_length(dict: &ObjectValue) -> Result<usize> {
+        let ObjectValue::Dictionary(entries) = dict else {
+            return Err(Error::parse(
+                0,
+                "stream keyword follows an object that is not a dictionary",
+            ));
+        };
+        let length = entries.get(b"Length".as_slice());
+        if let Some(length) = length {
+            length.try_dereference()?;
+        }
+        // qpdf tests `isNull()` before `isInteger()` and reports the two
+        // separately (`:1370-1377`); an absent key reads as null there, so
+        // both routes land on the same message here.
+        match length.map(ObjectHandle::as_integer) {
+            Some(Some(value)) => usize::try_from(value)
+                .map_err(|_| Error::parse(0, "/Length key in stream dictionary is out of range")),
+            Some(None) if length.is_some_and(|length| !length.is_null()) => Err(Error::parse(
+                0,
+                "/Length key in stream dictionary is not an integer",
+            )),
+            _ => Err(Error::parse(0, "stream dictionary lacks /Length key")),
+        }
+    }
+}
+
+/// Bytes pulled from the input source per [`ResolverHandle::refill`].
+const INPUT_CHUNK: usize = 4096;
+
+/// What followed an object's value: qpdf's `readObject` reads one token after
+/// the parse and branches on it (`libqpdf/QPDF.cc:1346-1354`).
+enum ObjectFraming {
+    /// `endobj` — or, with a warning, something else entirely.
+    Direct,
+    /// `stream`, so the value is a stream dictionary and the payload follows.
+    Stream,
+}
+
+/// One object's parse, before its warnings have been emitted.
+struct FramedObject {
+    /// The `N G` the file actually carries at this offset, or `None` when
+    /// either number is outside [`ObjectRef`]'s range.
+    found: Option<ObjectRef>,
+    value: ObjectValue,
+    value_offset: i64,
+    /// Bytes consumed, up to and including the framing keyword.
+    end: usize,
+    framing: ObjectFraming,
+    warnings: Vec<String>,
+}
+
+/// Lets the parser mint a canonical handle for a nested `N G R` through the
+/// resolver's own registry.
+///
+/// The adapter exists only because [`crate::parser::HandleResolver`] takes
+/// `&mut self` while [`DocumentResolver::resolve_indirect`] has `&self`;
+/// holding `&ResolverHandle` in a struct and taking `&mut` of *that* bridges
+/// the two without any interior mutability of its own.
+///
+/// qpdf's parser reaches the same map directly: `QPDFParser` calls
+/// `QPDF::getObject(og)`, which inserts a `QPDF_Unresolved` into
+/// `m->obj_cache` if absent (`libqpdf/QPDF.cc:1952-1959`) — and notes there
+/// that it "must not resolve any objects", which is exactly why the handle
+/// this hands back is unresolved.
+struct ChildHandles<'a, R: Read + Seek + 'static> {
+    resolver: &'a ResolverHandle<R>,
+}
+
+impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
+    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        self.resolver.get_object_handle(object_ref)
+    }
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
@@ -605,13 +1062,22 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// gives a null value a mutable meaning should re-check this against qpdf,
     /// where the loop's cache entry is a live `QPDF_Null` in `m->obj_cache`.
     ///
-    /// *The canonical cache* is not written, because
-    /// [`ResolverCore::object_cache`] has no writer and no reader anywhere in
-    /// this slice; Task 4 introduces both together. Nothing observable turns
-    /// on it meanwhile: `Pdf::get_object_handle` vends one registry entry per
-    /// [`ObjectRef`] and re-hands that same handle, so the null this installs
-    /// is what the next lookup sees, and [`ObjectHandle::try_dereference`]
-    /// short-circuits on it without consulting the resolver again.
+    /// *The canonical cache* needs no separate write. The `handle` this was
+    /// called with is already the [`ResolverCore::object_cache`] entry for
+    /// `object_ref` — [`ObjectHandle::try_dereference`] can only reach here
+    /// through a handle carrying this resolver's `Weak`, and
+    /// [`Self::get_object_handle`] is the only thing that mints one — so
+    /// `set_missing` writes straight through the cached slot, which is what
+    /// qpdf's `updateCache` achieves with `cache.object->assign(...)`
+    /// (`libqpdf/QPDF.cc:1849-1853`).
+    ///
+    /// qpdf's other `updateCache` branch, the insert, is unreachable from
+    /// `QPDF::resolve`: `QPDF::getObject` has already put a `QPDF_Unresolved`
+    /// in `m->obj_cache` (`:1955-1957`) before anything can ask for the object
+    /// to be resolved, so `isCached(og)` is always true here. flpdf is the
+    /// same — [`Self::get_object_handle`] is the only minter and it is
+    /// entry-or-insert — which is why neither branch of this method has a
+    /// separate counterpart in `resolve_indirect`.
     ///
     /// *The warning* is `"loop detected resolving object N G"`, qpdf's own
     /// text from `libqpdf/QPDF.cc:1710` with `og.unparse(' ')`
@@ -629,16 +1095,56 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// flpdf keeps the filename out of [`Diagnostic::message`] throughout
     /// (`xref.rs`'s `"file is damaged"` is the same shape), so matching that
     /// convention *is* matching qpdf's inner text. The offset is `None`
-    /// rather than qpdf's `getLastOffset()`: the resolver tracks no input
-    /// position in this slice, and a fabricated one would be worse than an
-    /// absent one.
+    /// rather than qpdf's `getLastOffset()`: `getLastOffset` is the start of
+    /// the last token the tokenizer produced, which flpdf does not track —
+    /// the resolver's own input position (see [`ResolverCore::tell`]) is a
+    /// different quantity, and reporting it instead would be a fabrication.
     ///
     /// Not ported for a different reason: qpdf's `isUnresolved(og)` early
-    /// return (`:1702-1704`) is phase 1 of Task 4's three-phase split.
-    /// [`ObjectHandle::try_dereference`] happens to make the same test before
-    /// calling in, so it is not reachable through that path today, but this
-    /// method does not make it itself.
+    /// return (`:1702-1704`). [`ObjectHandle::try_dereference`] makes the same
+    /// test before calling in, so it is not reachable through that path, but
+    /// this method does not make it itself.
+    ///
+    /// # The type-1 branch
+    ///
+    /// qpdf's `case 1:` (`libqpdf/QPDF.cc:1720-1727`) calls
+    /// `readObjectAtOffset`, which caches the object it read.
+    /// [`Self::read_object_at_offset`] is that call; the value it returns is
+    /// written into `handle`'s slot, which *is* the
+    /// [`ResolverCore::object_cache`] entry (see the loop branch above).
+    ///
+    /// **The three phases, and where each borrow of [`ResolverCore`] lives.**
+    ///
+    /// 1. *Short borrows.* [`ResolveMark::begin`] takes one to test and set
+    ///    `resolving`; [`Self::xref_entry`] takes one to read the entry. Both
+    ///    end inside their own call.
+    /// 2. *No borrow at all.* `read_object_at_offset` runs here. It reads and
+    ///    parses through [`Self::scan_forward`], every step of which takes and
+    ///    drops its own borrow, so the `/Length` dereference inside
+    ///    [`Self::read_stream`] is free to re-enter this very method.
+    /// 3. *Short borrows.* `set_resolved`/`set_parsed_offset_if_unset` touch
+    ///    only the handle's own cell — which is the canonical cache entry, so
+    ///    they are the `updateCache` equivalent — and the mark's `drop` takes
+    ///    the last borrow of the core.
+    ///
+    /// **What is not ported, and why it is not a fallback.** A `Compressed`
+    /// (type-2) entry, a `Free` entry and an entry absent from the table all
+    /// return [`Error::Unsupported`]. qpdf resolves the first through
+    /// `resolveObjectsInStream` and the other two to null (`:1745-1749`);
+    /// both are later slices. Erroring is deliberately *not* a delegation to
+    /// `Pdf`'s legacy `resolve_object_handle`/`resolve_borrowed` route —
+    /// that bridge is what `flpdf-25kg.3.5`'s acceptance criteria forbid.
+    ///
+    /// A read or parse failure likewise propagates instead of taking qpdf's
+    /// `catch (QPDFExc& e) { warn(e); }` (`:1740-1743`) followed by the
+    /// resolve-to-null fallback (`:1745-1749`). Reproducing `warn(e)` means
+    /// reproducing `QPDFExc`'s rendered text for whatever failed, which flpdf
+    /// has no counterpart for; a fabricated message would be a worse ledger
+    /// entry than a propagated error. The damaged-object route arrives with
+    /// the recovery work `attempt_recovery` gates.
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+        // ---- phase 1: short borrows only ----
+
         // Bound to a named local, not to `_`: the mark must live until this
         // method returns or unwinds, and `let Some(_) = ..` would drop it at
         // the end of this statement.
@@ -653,12 +1159,22 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
             handle.set_missing();
             return Ok(());
         };
+        let entry = self.xref_entry(object_ref);
 
-        // `handle` is also the slot a later slice writes the parsed value into.
-        Err(Error::Unsupported(format!(
-            "canonical resolver cannot yet resolve object {} {}: no source class is implemented",
-            object_ref.number, object_ref.generation
-        )))
+        // ---- phase 2: no borrow is held across this ----
+        let Some(XrefEntry::Uncompressed { offset }) = entry else {
+            return Err(Error::Unsupported(format!(
+                "canonical resolver cannot yet resolve object {} {}: \
+                 only uncompressed cross-reference entries are implemented",
+                object_ref.number, object_ref.generation
+            )));
+        };
+        let (value, parsed_offset) = self.read_object_at_offset(offset, object_ref)?;
+
+        // ---- phase 3: short borrows, then the mark drops ----
+        handle.set_resolved(value);
+        handle.set_parsed_offset_if_unset(parsed_offset);
+        Ok(())
     }
 }
 
@@ -699,38 +1215,38 @@ mod tests {
     }
 
     /// The attach itself: a handle vended by a live document must reach that
-    /// document's resolver.
+    /// document's resolver, and now that uncompressed objects are implemented,
+    /// come back resolved.
     ///
-    /// The two failure modes are different errors and this test tells them
-    /// apart deliberately. `Error::Internal("... belongs to a dropped PDF")`
-    /// is `try_dereference` failing to upgrade its `Weak` — no resolver was
-    /// ever attached, which is what happened before this slice.
-    /// `Error::Unsupported` is the resolver being reached and declining the
-    /// class, which is the whole of what this slice promises. Asserting only
-    /// `is_err()` would pass in both cases and prove nothing.
+    /// The failure this still discriminates against is the one that existed
+    /// before the attach landed: `Error::Internal("... belongs to a dropped
+    /// PDF")` is `try_dereference` failing to upgrade its `Weak`, i.e. no
+    /// resolver attached at all. `expect("...")` alone would report that as a
+    /// generic failure; naming it keeps the two apart.
     #[test]
     fn a_vended_handle_reaches_its_documents_resolver_rather_than_reporting_a_dropped_pdf() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
-        let error = handle
-            .try_dereference()
-            .expect_err("no source class resolves in this slice");
-
-        match &error {
-            Error::Unsupported(message) => {
-                assert!(
-                    message.contains("object 1 0"),
-                    "the rejection should name the reference it declined, got {message:?}"
-                );
-            }
-            Error::Internal(message) if message.contains("belongs to a dropped PDF") => {
+        match handle.try_dereference() {
+            Ok(()) => {}
+            Err(Error::Internal(message)) if message.contains("belongs to a dropped PDF") => {
                 panic!(
                     "`get_object_handle` vended a handle with no resolver attached: {message:?}"
                 );
             }
-            other => panic!("unexpected error from an attached resolver: {other:?}"),
+            Err(other) => panic!("unexpected error from an attached resolver: {other:?}"),
         }
+
+        assert!(handle.is_resolved());
+        assert_eq!(
+            handle
+                .as_dictionary()
+                .expect("the catalog is a dictionary")
+                .get(b"Type".as_slice())
+                .and_then(crate::ObjectHandle::as_name),
+            Some(b"Catalog".to_vec())
+        );
     }
 
     /// Attaching a resolver must not disturb `Pdf::drop`'s teardown.
@@ -863,20 +1379,30 @@ mod tests {
     /// The mark is removed when the resolution returns an *error*, not only
     /// when it returns successfully.
     ///
-    /// Every non-loop reference errors in this slice, so the error exit is the
-    /// only exit `resolve_indirect` currently has — which makes this the test
-    /// that a matched insert/remove pair placed only on the success path would
-    /// fail. Left behind, the mark would make the very next attempt at the
+    /// A matched insert/remove pair placed only on the success path would fail
+    /// this. Left behind, the mark would make the very next attempt at the
     /// same reference report a phantom loop and resolve it to null.
+    ///
+    /// Driven through an object-stream (type 2) entry, which is the class this
+    /// slice does not implement. Object 1 really is uncompressed in the
+    /// fixture, so the entry is overwritten first — without that this would
+    /// resolve successfully and stop testing the error exit at all.
     #[test]
     fn a_resolution_that_returns_an_error_leaves_no_in_progress_mark() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            crate::XrefEntry::Compressed {
+                stream: 9,
+                index: 0,
+            },
+        );
         let handle = pdf.get_object_handle(object_ref);
 
         let error = handle
             .try_dereference()
-            .expect_err("no source class resolves in this slice");
+            .expect_err("object streams are not implemented in this slice");
         assert!(
             matches!(error, Error::Unsupported(_)),
             "the class rejection, not a loop: {error:?}"
@@ -885,6 +1411,48 @@ mod tests {
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "a failed resolution must not leave its reference marked in progress"
+        );
+    }
+
+    /// An unimplemented source class is rejected outright rather than handed
+    /// to `Pdf`'s legacy route — the resolver bridge `flpdf-25kg.3.5`'s
+    /// acceptance criteria forbid.
+    ///
+    /// Object 1 resolves perfectly well through `Pdf::resolve_borrowed`, which
+    /// is what makes this discriminating: a fallback would succeed here, so
+    /// `Unsupported` can only come from the canonical resolver declining.
+    #[test]
+    fn an_unimplemented_class_is_rejected_instead_of_falling_back_to_the_legacy_route() {
+        let object_ref = ObjectRef::new(1, 0);
+        // A separate document, so establishing the baseline cannot resolve the
+        // handle under test: `resolve_borrowed` writes through to the very slot
+        // `try_dereference` would then short-circuit on.
+        assert!(
+            Pdf::open_mem_owned(minimal_pdf_bytes())
+                .expect("open")
+                .resolve_borrowed(object_ref)
+                .is_ok(),
+            "the legacy route can read this object, so a bridge would succeed"
+        );
+
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            crate::XrefEntry::Compressed {
+                stream: 9,
+                index: 0,
+            },
+        );
+        let handle = pdf.get_object_handle(object_ref);
+
+        let error = handle.try_dereference().expect_err("no ObjStm support yet");
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message.contains("object 1 0")),
+            "expected a class rejection naming the reference, got {error:?}"
+        );
+        assert!(
+            !handle.is_resolved(),
+            "a rejected class leaves the slot open"
         );
     }
 
@@ -997,5 +1565,643 @@ mod tests {
             !pdf.resolver.core.borrow().resolving.contains(&object_ref),
             "an unwind must leave the reference resolvable, not permanently marked in progress"
         );
+    }
+
+    /// A three-object document plus a content stream whose `/Length` is an
+    /// *indirect* reference, and the object holding that length.
+    ///
+    /// Object 4's `/Length 5 0 R` is the case `QPDF::readStream` brackets
+    /// (`libqpdf/QPDF.cc:1361-1381`): resolving it re-enters the resolver
+    /// mid-parse, and object 5 sits *after* object 4 in the file, so the
+    /// nested read genuinely moves the input position past the payload.
+    fn indirect_length_pdf_bytes() -> Vec<u8> {
+        let payload = STREAM_PAYLOAD;
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let mut offsets = Vec::new();
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
+        );
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n<< /Length 5 0 R >>\nstream\n");
+        pdf.extend_from_slice(payload);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(format!("5 0 obj\n{}\nendobj\n", payload.len()).as_bytes());
+
+        let xref_start = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for offset in &offsets {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    const STREAM_PAYLOAD: &[u8] = b"BT (hi) Tj ET";
+
+    /// A `Cursor` that counts how many times something pulled bytes from it,
+    /// so "did not re-read" can be asserted rather than inferred.
+    struct CountingReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        reads: usize,
+    }
+
+    impl CountingReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: std::io::Cursor::new(bytes),
+                reads: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for CountingReader {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    /// An uncompressed (xref type 1) object resolves, and a second
+    /// `try_dereference` is a no-op that touches the input source not at all.
+    ///
+    /// The read count is what makes the second half real. `is_resolved()`
+    /// alone would pass even if the second call re-read and re-parsed the
+    /// object, because it would land on the same value; only counting pulls
+    /// distinguishes "cached" from "recomputed". qpdf gets the same property
+    /// from `isUnresolved(og)` (`libqpdf/QPDF.cc:1702-1704`).
+    #[test]
+    fn an_uncompressed_object_resolves_and_a_second_dereference_does_not_re_read() {
+        let mut pdf = Pdf::open(CountingReader::new(minimal_pdf_bytes())).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let before = pdf.resolver.with_reader_mut(|reader| reader.reads);
+
+        handle
+            .try_dereference()
+            .expect("an uncompressed object resolves");
+
+        let after_first = pdf.resolver.with_reader_mut(|reader| reader.reads);
+        assert!(
+            after_first > before,
+            "the first dereference must actually have read the input"
+        );
+        assert_eq!(
+            handle
+                .as_dictionary()
+                .expect("the catalog is a dictionary")
+                .get(b"Type".as_slice())
+                .and_then(crate::ObjectHandle::as_name),
+            Some(b"Catalog".to_vec())
+        );
+
+        handle
+            .try_dereference()
+            .expect("a resolved slot is terminal");
+
+        assert_eq!(
+            pdf.resolver.with_reader_mut(|reader| reader.reads),
+            after_first,
+            "a second dereference must not touch the input source again"
+        );
+    }
+
+    /// A nested `N G R` inside a resolved object is the *same* handle
+    /// `Pdf::get_object_handle` vends for that reference.
+    ///
+    /// This is the property that made the registry move necessary: a
+    /// resolver-local second map would satisfy every other assertion in this
+    /// file and fail only this one. qpdf gets it from `QPDF::getObject`
+    /// (`libqpdf/QPDF.cc:1952-1959`), which the parser calls for exactly this
+    /// purpose and which is entry-or-insert over the one `m->obj_cache`.
+    ///
+    /// Asserted in both directions — child first, then parent first — because
+    /// a map that minted on parse but was not consulted by
+    /// `get_object_handle` would still pass the second ordering.
+    #[test]
+    fn a_nested_reference_resolves_to_the_documents_canonical_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve the catalog");
+        let minted_child = catalog
+            .as_dictionary()
+            .expect("the catalog is a dictionary")
+            .get(b"Pages".as_slice())
+            .expect("the catalog has /Pages")
+            .clone();
+        assert!(
+            minted_child.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(2, 0))),
+            "a child minted during the parse must be the canonical handle"
+        );
+
+        let page = pdf.get_object_handle(ObjectRef::new(3, 0));
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pages.try_dereference().expect("resolve the page tree");
+        let kid = pages
+            .as_dictionary()
+            .expect("the page tree is a dictionary")
+            .get(b"Kids".as_slice())
+            .and_then(crate::ObjectHandle::as_array)
+            .expect("/Kids is an array")
+            .first()
+            .expect("/Kids has one entry")
+            .clone();
+        assert!(
+            kid.is_same_object_as(&page),
+            "an already-registered ref must not be re-minted during a parse"
+        );
+    }
+
+    /// The canonical resolver records the same parsed offset the legacy
+    /// `Pdf::resolve_object_handle` route records, for a plain object and for
+    /// a stream.
+    ///
+    /// Compared against the legacy path rather than against a hand-computed
+    /// number on purpose: "the exact parsed offset" means the one flpdf
+    /// already produces, and a recomputed expectation would just restate this
+    /// implementation's own arithmetic. The stream case is the one that can
+    /// diverge quietly — a stream's parsed offset is its *data* start, not its
+    /// dictionary's, so it depends on `validate_stream_line_end` consuming the
+    /// EOL after `stream` exactly as the legacy scanner does.
+    #[test]
+    fn the_canonical_resolver_records_the_legacy_paths_parsed_offset() {
+        for object_ref in [ObjectRef::new(1, 0), ObjectRef::new(4, 0)] {
+            let mut legacy = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
+            let legacy_handle = legacy.get_object_handle(object_ref);
+            legacy
+                .resolve_object_handle(&legacy_handle)
+                .expect("legacy resolution");
+
+            let mut canonical = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
+            let handle = canonical.get_object_handle(object_ref);
+            handle.try_dereference().expect("canonical resolution");
+
+            assert_ne!(
+                legacy_handle.get_parsed_offset(),
+                NO_PARSED_OFFSET,
+                "the legacy baseline must itself have recorded an offset for {object_ref:?}"
+            );
+            assert_eq!(
+                handle.get_parsed_offset(),
+                legacy_handle.get_parsed_offset(),
+                "parsed offset diverged from the legacy route for {object_ref:?}"
+            );
+        }
+    }
+
+    /// A stream whose `/Length` is an indirect reference resolves, with the
+    /// payload read from the position the resolver explicitly restored.
+    ///
+    /// This is `QPDF::readStream`'s bracketed seam
+    /// (`libqpdf/QPDF.cc:1361-1381`) driven end to end: object 5 lives after
+    /// object 4 in the file, so the nested resolution leaves the input
+    /// somewhere past the payload. Deleting the `seek(stream_offset)` restore
+    /// makes this read the wrong bytes.
+    ///
+    /// The `flpdf-25kg.3.5` slice plan's Task 5 adds the borrow-discipline
+    /// regression on top of this (a `RefCell` double-borrow rather than a
+    /// wrong value) and the self-referential `/Length` case; this one only
+    /// establishes that nested resolution mid-parse produces the right answer.
+    #[test]
+    fn a_streams_indirect_length_resolves_mid_parse_and_the_payload_is_read_from_the_restored_position(
+    ) {
+        let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        stream
+            .try_dereference()
+            .expect("a stream with an indirect /Length resolves");
+
+        assert_eq!(
+            stream.as_stream_data().as_deref(),
+            Some(STREAM_PAYLOAD),
+            "the payload must come from the restored stream offset"
+        );
+        assert!(
+            pdf.get_object_handle(ObjectRef::new(5, 0)).is_resolved(),
+            "the nested /Length resolution really did run"
+        );
+        assert!(
+            pdf.resolver.core.borrow().resolving.is_empty(),
+            "both marks must be gone once the outer resolution returns"
+        );
+    }
+
+    /// The resolver's own reads leave no warnings behind on a clean document.
+    ///
+    /// The framing checks it performs — the object-id match
+    /// (`libqpdf/QPDF.cc:1600-1608`) and the `endobj` check (`:1352-1355`) —
+    /// each warn when they fail, and `scan_forward` runs `frame_object` more
+    /// than once against a growing buffer. This pins that a well-formed
+    /// document produces exactly zero of them, which a warning pushed from
+    /// inside the retried parse would break.
+    #[test]
+    fn resolving_a_well_formed_document_raises_no_warnings() {
+        let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
+        for number in 1..=5 {
+            let handle = pdf.get_object_handle(ObjectRef::new(number, 0));
+            handle.try_dereference().expect("resolve");
+        }
+
+        assert!(
+            pdf.repair_diagnostics().entries().is_empty(),
+            "a clean document must resolve without warnings, got {:?}",
+            pdf.repair_diagnostics().entries()
+        );
+    }
+
+    /// An object whose body is larger than one input chunk still resolves.
+    ///
+    /// `scan_forward` accepts a parse only once it has consumed strictly fewer
+    /// bytes than the buffer holds, so an object that needs several pulls
+    /// exercises the refill path — and, more importantly, the guard against
+    /// accepting a value that a chunk boundary truncated.
+    #[test]
+    fn an_object_longer_than_one_input_chunk_resolves_completely() {
+        let filler = "x".repeat(super::INPUT_CHUNK * 2);
+        let body = format!("1 0 obj\n<< /Type /Catalog /Filler ({filler}) >>\nendobj\n");
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let catalog = pdf.len() as u64;
+        pdf.extend_from_slice(body.as_bytes());
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{catalog:010} 00000 n \n").as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open_mem_owned(pdf).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        handle.try_dereference().expect("resolve");
+
+        assert_eq!(
+            handle
+                .as_dictionary()
+                .expect("dictionary")
+                .get(b"Filler".as_slice())
+                .and_then(crate::ObjectHandle::as_string)
+                .map(|value| value.len()),
+            Some(filler.len()),
+            "a value spanning several input chunks must not be truncated"
+        );
+    }
+
+    /// Build a classic-xref document out of already-framed object bodies,
+    /// `bodies[i]` being object `i + 1`.
+    fn pdf_with_bodies(bodies: &[Vec<u8>]) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for body in bodies {
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(body);
+        }
+
+        let xref_start = pdf.len() as u64;
+        let size = bodies.len() + 1;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for offset in &offsets {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A framing keyword straddling an input-chunk boundary is not accepted as
+    /// the shorter word the truncation makes it look like.
+    ///
+    /// `stream` is placed so that only `str` lands in the first chunk. `str`
+    /// is a perfectly good word token, so an attempt that accepted a parse
+    /// consuming the whole buffer would frame this object as a plain
+    /// dictionary and lose the payload entirely — a wrong answer, not an
+    /// error. [`ResolverHandle::scan_forward`]'s `end < bytes.len()` test is
+    /// what prevents it; qpdf needs no counterpart because its tokenizer
+    /// consumes `m->file` directly and has no buffer to be cut short by.
+    #[test]
+    fn a_framing_keyword_split_across_an_input_chunk_is_not_read_as_a_shorter_word() {
+        let head: &[u8] = b"2 0 obj\n<< /Length 13 /Filler (";
+        let separator: &[u8] = b") >>\n";
+        // The `stream` keyword must begin three bytes before the boundary.
+        let filler = vec![b'x'; super::INPUT_CHUNK - 3 - head.len() - separator.len()];
+
+        let mut body = Vec::new();
+        body.extend_from_slice(head);
+        body.extend_from_slice(&filler);
+        body.extend_from_slice(separator);
+        let keyword_start = body.len();
+        body.extend_from_slice(b"stream\n");
+        body.extend_from_slice(STREAM_PAYLOAD);
+        body.extend_from_slice(b"\nendstream\nendobj\n");
+        assert_eq!(
+            keyword_start,
+            super::INPUT_CHUNK - 3,
+            "the fixture must actually straddle the chunk boundary"
+        );
+
+        let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle.try_dereference().expect("resolve");
+
+        assert_eq!(
+            handle.as_stream_data().as_deref(),
+            Some(STREAM_PAYLOAD),
+            "a `stream` keyword cut by the chunk boundary must not frame the \
+             object as a plain dictionary"
+        );
+    }
+
+    /// Resolve object 2 of a two-object document whose second body is `body`,
+    /// and hand the outcome to `check` **while the document is still alive**.
+    ///
+    /// The closure is not decoration: `Pdf::drop` disconnects every canonical
+    /// handle, so a helper that returned the handle instead would hand back a
+    /// `Destroyed` slot that reads as a resolved null whatever the resolution
+    /// actually did.
+    fn with_second_object<T>(
+        body: &[u8],
+        check: impl FnOnce(&crate::ObjectHandle, Result<(), Error>, Vec<String>) -> T,
+    ) -> T {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            body.to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let outcome = handle.try_dereference();
+        let warnings = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        check(&handle, outcome, warnings)
+    }
+
+    /// An object with no body at all resolves to null.
+    ///
+    /// qpdf: "Nothing in the PDF spec appears to allow empty objects, but they
+    /// have been encountered in actual PDF files and Adobe Reader appears to
+    /// ignore them" (`libqpdf/QPDF.cc:1341-1344`). flpdf's parser recognises
+    /// the case by peeking `endobj` without consuming it, which is what lets
+    /// the framing read below still find that same token.
+    #[test]
+    fn an_empty_object_body_resolves_to_null() {
+        with_second_object(b"2 0 obj\nendobj\n", |handle, outcome, warnings| {
+            outcome.expect("an empty object is recovered, not rejected");
+            assert!(handle.is_null());
+            assert_eq!(
+                handle.get_parsed_offset(),
+                NO_PARSED_OFFSET,
+                "a recovered empty object has no source position of its own"
+            );
+            assert!(
+                warnings.is_empty(),
+                "the framing must still see `endobj`, not the next object's header: {warnings:?}"
+            );
+        });
+    }
+
+    /// A value followed by something other than `endobj` warns and is kept.
+    ///
+    /// qpdf `libqpdf/QPDF.cc:1352-1355`: `if (!token.isWord("endobj")) { warn(
+    /// damagedPDF("expected endobj")); }` and the object is returned anyway.
+    #[test]
+    fn a_value_not_followed_by_endobj_warns_and_is_still_resolved() {
+        with_second_object(b"2 0 obj\n42\nenddobj\n", |handle, outcome, warnings| {
+            outcome.expect("qpdf warns here rather than failing");
+            assert_eq!(handle.as_integer(), Some(42));
+            assert_eq!(warnings, ["expected endobj"]);
+        });
+    }
+
+    /// An object whose header carries a different `N G` than the xref table
+    /// asked for is an error in this slice, not a silent substitution.
+    ///
+    /// See [`super::ResolverHandle::read_object_at_offset`] for why qpdf's own
+    /// outcome (warn, cache under the found id, resolve the *requested* one to
+    /// null) is not reproduced yet.
+    #[test]
+    fn an_object_whose_header_names_a_different_reference_is_rejected() {
+        with_second_object(b"7 0 obj\n42\nendobj\n", |handle, outcome, _| {
+            let error = outcome.expect_err("the id mismatch must not pass silently");
+            assert!(
+                matches!(&error, Error::Parse { message, .. } if message == "expected 2 0 obj"),
+                "expected qpdf's own wording, got {error:?}"
+            );
+            assert!(!handle.is_resolved());
+        });
+    }
+
+    /// Every way `/Length` can fail to yield a byte count.
+    ///
+    /// qpdf reports the null and non-integer cases separately
+    /// (`libqpdf/QPDF.cc:1370-1377`); an absent key reads as null there, so it
+    /// shares the first message.
+    #[test]
+    fn a_stream_whose_length_is_unusable_is_rejected_with_qpdfs_own_distinction() {
+        for (dict, expected) in [
+            (
+                &b"<< /Type /X >>"[..],
+                "stream dictionary lacks /Length key",
+            ),
+            (b"<< /Length null >>", "stream dictionary lacks /Length key"),
+            (
+                b"<< /Length /X >>",
+                "/Length key in stream dictionary is not an integer",
+            ),
+            (
+                b"<< /Length -5 >>",
+                "/Length key in stream dictionary is out of range",
+            ),
+        ] {
+            let mut body = b"2 0 obj\n".to_vec();
+            body.extend_from_slice(dict);
+            body.extend_from_slice(b"\nstream\nabc\nendstream\nendobj\n");
+
+            with_second_object(&body, |_, outcome, _| {
+                let error = outcome.expect_err("an unusable /Length must not resolve");
+                assert!(
+                    matches!(&error, Error::Parse { message, .. } if message == expected),
+                    "for {}: expected {expected:?}, got {error:?}",
+                    String::from_utf8_lossy(dict)
+                );
+            });
+        }
+    }
+
+    /// A `stream` keyword after a non-dictionary value is rejected.
+    ///
+    /// qpdf cannot reach its own equivalent: `readObject` only calls
+    /// `readStream` when `object.isDictionary()` (`libqpdf/QPDF.cc:1350`), so
+    /// this guard stands in for a branch qpdf expresses as a condition.
+    #[test]
+    fn a_stream_keyword_after_a_non_dictionary_is_rejected() {
+        with_second_object(
+            b"2 0 obj\n42\nstream\nabc\nendstream\nendobj\n",
+            |_, outcome, _| {
+                let error = outcome.expect_err("only a dictionary can introduce a stream");
+                assert!(
+                    matches!(&error, Error::Parse { message, .. }
+                        if message == "stream keyword follows an object that is not a dictionary"),
+                    "got {error:?}"
+                );
+            },
+        );
+    }
+
+    /// A `/Length` running past the end of the input, and a payload not
+    /// followed by `endstream`, are both rejected.
+    #[test]
+    fn a_stream_payload_that_does_not_match_its_length_is_rejected() {
+        with_second_object(
+            b"2 0 obj\n<< /Length 100000 >>\nstream\nabc\nendstream\nendobj\n",
+            |_, outcome, _| {
+                assert!(matches!(&outcome.expect_err("length runs past EOF"),
+                    Error::Parse { message, .. }
+                        if message == "stream data ends before its declared /Length"));
+            },
+        );
+
+        with_second_object(
+            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n",
+            |_, outcome, _| {
+                assert!(matches!(&outcome.expect_err("`bc` is not `endstream`"),
+                    Error::Parse { message, .. } if message == "expected endstream"));
+            },
+        );
+    }
+
+    /// A stream not followed by `endobj` warns, matching the direct case.
+    #[test]
+    fn a_stream_not_followed_by_endobj_warns() {
+        with_second_object(
+            b"2 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nenddobj\n",
+            |handle, outcome, warnings| {
+                outcome.expect("qpdf warns here rather than failing");
+                assert_eq!(handle.as_stream_data().as_deref(), Some(&b"abc"[..]));
+                assert_eq!(warnings, ["expected endobj"]);
+            },
+        );
+    }
+
+    /// Every branch of qpdf's `validateStreamLineEnd`
+    /// (`libqpdf/QPDF.cc:1400-1448`), including the exact warning texts.
+    ///
+    /// The payload assertion is the point: each branch decides where the
+    /// stream's *data* starts, so getting one wrong shifts every following
+    /// byte rather than merely mislabelling the warning. The last case's
+    /// separator is empty because that branch is reached only when the byte
+    /// after `stream` is neither whitespace nor a newline — which means it
+    /// must be a delimiter, or the tokenizer would have read one longer word
+    /// instead of `stream`. `(` is that delimiter, and it is therefore part
+    /// of the payload rather than of the framing.
+    #[test]
+    fn the_stream_line_end_check_covers_qpdfs_four_branches() {
+        for (separator, payload, expected_warnings) in [
+            (&b"\n"[..], &b"abc"[..], &[][..]),
+            (b"\r\n", b"abc", &[]),
+            (
+                b"\r",
+                b"abc",
+                &["stream keyword followed by carriage return only"][..],
+            ),
+            (
+                b" \n",
+                b"abc",
+                &["stream keyword followed by extraneous whitespace"][..],
+            ),
+            (
+                b"",
+                b"(abc)",
+                &["stream keyword not followed by proper line terminator"][..],
+            ),
+        ] {
+            let mut body = format!("2 0 obj\n<< /Length {} >>\nstream", payload.len()).into_bytes();
+            body.extend_from_slice(separator);
+            body.extend_from_slice(payload);
+            body.extend_from_slice(b"\nendstream\nendobj\n");
+
+            with_second_object(&body, |handle, outcome, warnings| {
+                outcome.unwrap_or_else(|error| {
+                    panic!("separator {separator:?} must still resolve, got {error:?}")
+                });
+                assert_eq!(
+                    handle.as_stream_data().as_deref(),
+                    Some(payload),
+                    "separator {separator:?} moved the payload"
+                );
+                assert_eq!(warnings, expected_warnings, "separator {separator:?}");
+            });
+        }
+    }
+
+    /// An input source that returns short reads and an `Interrupted` error
+    /// still yields the same object.
+    ///
+    /// `Read::read` is allowed to do both, and qpdf's `InputSource::read`
+    /// contract hides them (`FileInputSource::read` loops over `fread`), so
+    /// [`super::ResolverCore::read`] has to as well. Without the loop a short
+    /// read would silently truncate an object; without the `Interrupted` arm
+    /// it would fail outright.
+    #[test]
+    fn a_reluctant_input_source_still_resolves_the_same_object() {
+        struct Reluctant {
+            inner: std::io::Cursor<Vec<u8>>,
+            interrupted: bool,
+        }
+
+        impl std::io::Read for Reluctant {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let len = buf.len().min(7);
+                self.inner.read(&mut buf[..len])
+            }
+        }
+
+        impl std::io::Seek for Reluctant {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+
+        let mut pdf = Pdf::open(Reluctant {
+            inner: std::io::Cursor::new(indirect_length_pdf_bytes()),
+            interrupted: false,
+        })
+        .expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        handle.try_dereference().expect("resolve");
+
+        assert_eq!(handle.as_stream_data().as_deref(), Some(STREAM_PAYLOAD));
     }
 }
