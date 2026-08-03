@@ -281,9 +281,8 @@ impl ObjectHandle {
     /// pointer serves as both identity and resolver there. See
     /// [`Self::new_indirect_with_resolver`] for why this port splits them and
     /// keeps the resolver link weak.
-    #[allow(dead_code)] // the production caller is `Pdf::get_object_handle`,
-                        // attached in the next step of flpdf-25kg.3.5; today
-                        // only this module's unit tests construct one
+    #[allow(dead_code)] // no non-test caller yet: `Pdf::get_object_handle`
+                        // attaches it in the next step of flpdf-25kg.3.5
     pub(crate) fn new_indirect_for_pdf_with_resolver(
         object_ref: ObjectRef,
         offset: i64,
