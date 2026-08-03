@@ -317,6 +317,25 @@ fn build_direct_kid_with_broken_names_reference_pdf() -> Vec<u8> {
     out
 }
 
+/// Build an indirect embedded-files root whose repaired direct kid reaches a
+/// malformed indirect `/Names` array only when the tree is traversed.
+fn build_indirect_root_with_broken_names_reference_pdf() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
+    let mut off: BTreeMap<u32, u64> = BTreeMap::new();
+
+    off.insert(1, out.len() as u64);
+    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Names 2 0 R >>\nendobj\n");
+    off.insert(2, out.len() as u64);
+    out.extend_from_slice(b"2 0 obj\n<< /EmbeddedFiles 3 0 R >>\nendobj\n");
+    off.insert(3, out.len() as u64);
+    out.extend_from_slice(b"3 0 obj\n<< /Kids [ << /Names 4 0 R >> ] >>\nendobj\n");
+    off.insert(4, out.len() as u64);
+    out.extend_from_slice(b"4 0 obj\n<< /Broken [ >>\nendobj\n");
+
+    finish_pdf(&mut out, &off, 4, 1);
+    out
+}
+
 /// Build a direct embedded-files root whose second direct kid fails only after
 /// the cursor has enumerated a valid first kid.
 fn build_direct_kid_with_broken_names_reference_after_first_entry_pdf() -> Vec<u8> {
@@ -1854,6 +1873,24 @@ fn helper_remove_persists_direct_kid_repair_before_find_error() {
         .get("EmbeddedFiles")
         .and_then(Object::as_dict)
         .expect("direct root");
+    let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
+    assert!(matches!(kids.first(), Some(Object::Reference(_))));
+}
+
+#[test]
+fn helper_remove_persists_indirect_root_repair_before_find_error() {
+    let mut pdf = open(build_indirect_root_with_broken_names_reference_pdf());
+
+    assert!(pdf
+        .embedded_files()
+        .remove_embedded_file(b"missing")
+        .is_err());
+
+    let root = pdf
+        .resolve(ObjectRef::new(3, 0))
+        .expect("root")
+        .into_dict()
+        .expect("root dictionary");
     let kids = root.get("Kids").and_then(Object::as_array).expect("kids");
     assert!(matches!(kids.first(), Some(Object::Reference(_))));
 }
