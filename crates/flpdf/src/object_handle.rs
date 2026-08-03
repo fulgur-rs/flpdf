@@ -2753,6 +2753,56 @@ mod resolution_state_tests {
         assert_eq!(handle.as_integer(), None);
     }
 
+    /// The two null routes are distinct [`IndirectState`] variants that no
+    /// public observation can tell apart.
+    ///
+    /// Named by `set_missing_marks_the_handle_resolved_to_null`'s comment,
+    /// which cited it before it existed. Both halves matter and neither
+    /// implies the other: the *indistinguishable* half is what lets
+    /// `reader/resolver.rs` pick `set_missing` for qpdf's loop branch, where
+    /// qpdf caches a live `QPDF_Null` (`libqpdf/QPDF.cc:1711`); the *distinct
+    /// variant* half is what makes `with_value_mut` behave differently between
+    /// them, which nothing can observe today only because every caller matches
+    /// on a container variant `Null` is not.
+    #[test]
+    fn set_resolved_with_a_null_value_is_indistinguishable_from_the_outside() {
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        missing.set_missing();
+        let null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        null.set_resolved(ObjectValue::Null);
+
+        for observation in [
+            ObjectHandle::is_resolved,
+            ObjectHandle::is_null,
+            ObjectHandle::is_indirect,
+            ObjectHandle::is_direct,
+        ] {
+            assert_eq!(observation(&missing), observation(&null));
+        }
+        assert_eq!(missing.as_integer(), null.as_integer());
+        assert_eq!(missing.as_array().is_none(), null.as_array().is_none());
+        assert_eq!(
+            missing.as_dictionary().is_none(),
+            null.as_dictionary().is_none()
+        );
+        assert_eq!(missing.as_stream_data(), null.as_stream_data());
+        assert_eq!(missing.type_code(), null.type_code());
+        assert_eq!(missing.unparse_resolved(), null.unparse_resolved());
+        assert_eq!(missing.get_parsed_offset(), null.get_parsed_offset());
+
+        let variant = |handle: &ObjectHandle| match &handle.0 {
+            Repr::Indirect(slot) => match slot.borrow().state {
+                IndirectState::Missing => "Missing",
+                IndirectState::Resolved(_) => "Resolved",
+                IndirectState::NotYetResolved => "NotYetResolved",
+                IndirectState::Destroyed => "Destroyed",
+            },
+            Repr::Direct(_) => "Direct",
+        };
+        assert_eq!(variant(&missing), "Missing");
+        assert_eq!(variant(&null), "Resolved");
+    }
+
     #[test]
     fn set_missing_resets_a_previously_recorded_parsed_offset() {
         // Design's Parsed-Offset Contract: "An absent, freed, dangling,

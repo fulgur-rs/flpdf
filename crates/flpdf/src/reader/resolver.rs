@@ -30,9 +30,9 @@
 //! `RefCell` double-borrow panic in production.
 //!
 //! **The qualifier is load-bearing and the hazard is real.**
-//! [`ResolverCore::read_window`] — and every one of the streaming primitives
-//! that replaced it for the resolver's own use — holds `borrow_mut()` across
-//! `R::seek`/`R::read`, which is caller-supplied code. `R` is arbitrary and
+//! [`ResolverCore::seek`], [`ResolverCore::tell`] and [`ResolverCore::read`]
+//! each hold `borrow_mut()` across `R::seek`/`R::read`, which is
+//! caller-supplied code. `R` is arbitrary and
 //! [`ObjectHandle`] is `'static + Clone`, so an `R` that owns a handle from
 //! this same document could call `try_dereference` from inside `read` and
 //! re-enter — reaching a double-borrow panic from entirely safe Rust, once
@@ -105,15 +105,13 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// *wraps* the source so the shift is invisible to every later read —
     /// `m->file = std::shared_ptr<InputSource>(new OffsetInputSource(m->file,
     /// global_offset))` (`libqpdf/QPDF.cc:406`). Keeping the shift beside
-    /// `reader` and applying it in [`Self::seek`], [`Self::tell`] and
-    /// [`Self::read_window`] puts it under the same single owner, without a
-    /// second input-source type.
+    /// `reader` and applying it in [`Self::seek`] and [`Self::tell`] puts it
+    /// under the same single owner, without a second input-source type.
     ///
-    /// It is *not* equivalent, and the difference is visible right here:
-    /// wrapping makes the shift unskippable, so qpdf has no way to read from
-    /// physical zero through `m->file` at all, whereas
-    /// [`Self::read_physical_input`] does exactly that. That method is a
-    /// legacy tenant (see its own note), not a port of anything qpdf does.
+    /// It is *not* equivalent, and the difference is what
+    /// [`Self::rewind_underlying_source`] exists for: wrapping makes the shift
+    /// unskippable, so qpdf reaches the bytes before it through the wrapper's
+    /// `proxied` member rather than through `m->file`.
     header_offset: usize,
     /// qpdf `m->xref_table` (`QPDF.hh:1465`).
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
@@ -233,56 +231,25 @@ impl<R: Read + Seek> ResolverCore<R> {
         Ok(filled)
     }
 
-    /// Read `[offset, next)` — or `[offset, EOF)` when `next` is `None` — from
-    /// the input source, in qpdf-logical coordinates.
+    /// Position the *unwrapped* input source at its own offset zero, before
+    /// the header shift.
     ///
-    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: **this is not a port of anything
-    /// in qpdf, and the resolver never calls it.** Its only callers are
-    /// `Pdf`'s legacy read helpers, which live on the other side of the
-    /// cutover; it sits here solely because the input source it reads now has
-    /// a single owner. Delete it once those callers are gone.
+    /// **The one method here with no `m->file` counterpart, and it is
+    /// deliberately a primitive rather than a helper.** qpdf's wrapped source
+    /// cannot express this: `OffsetInputSource::rewind` is
+    /// `seek(0, SEEK_SET)` (`libqpdf/OffsetInputSource.cc:55-59`), which lands
+    /// on *logical* zero, and every other method adds `global_offset` too. But
+    /// the unwrapped source is not hidden from qpdf either — the wrapper holds
+    /// it as `std::shared_ptr<InputSource> proxied`
+    /// (`libqpdf/qpdf/OffsetInputSource.hh:24`). This is flpdf reaching that
+    /// same member; `header_offset` is what stands in for the wrapper, so the
+    /// member has to become a method.
     ///
-    /// Do not build on its shape. Reading a bounded window into an owned
-    /// `Vec` is an flpdf-ism: qpdf streams from `m->file` and brackets the one
-    /// re-entrant seam by saving and restoring the position
-    /// (`QPDF::readStream`, `libqpdf/QPDF.cc:1360-1398`). The design of record
-    /// names generalising this owned-window shape as a wrong turn that would
-    /// entrench a divergence, so `readObjectAtOffset`/`readStream` port that
-    /// save/restore seam rather than reusing this.
-    fn read_window(&mut self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
-        let physical = (self.header_offset as u64).saturating_add(offset);
-        self.reader.seek(SeekFrom::Start(physical))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => {
-                self.reader
-                    .by_ref()
-                    .take(next.saturating_sub(offset))
-                    .read_to_end(&mut bytes)?;
-            }
-            None => {
-                self.reader.read_to_end(&mut bytes)?;
-            }
-        }
-        Ok(bytes)
-    }
-
-    /// Read the entire input from *physical* offset zero, header shift
-    /// included. Callers that want qpdf-logical coordinates use
-    /// [`Self::read_window`].
-    ///
-    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: same status as
-    /// [`Self::read_window`] — no qpdf counterpart, no resolver caller, here
-    /// only because it needs the input source. qpdf could not express it
-    /// through `m->file` even if it wanted to, since `OffsetInputSource`
-    /// (`libqpdf/QPDF.cc:406`) makes the header shift unskippable. Its one
-    /// caller is `Pdf::source_bytes`, used by the writer to copy the original
-    /// file verbatim.
-    fn read_physical_input(&mut self) -> Result<Vec<u8>> {
+    /// qpdf never reads `proxied` directly. flpdf must, for
+    /// `ResolverHandle::read_physical_input` — see there.
+    fn rewind_underlying_source(&mut self) -> Result<()> {
         self.reader.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        self.reader.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        Ok(())
     }
 }
 
@@ -586,14 +553,73 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .collect()
     }
 
-    /// See [`ResolverCore::read_window`].
+    /// Read `[offset, next)` — or `[offset, EOF)` when `next` is `None` — in
+    /// qpdf-logical coordinates, into an owned buffer.
+    ///
+    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: **not a port of anything in
+    /// qpdf, and the resolver never calls it.** Its only callers are `Pdf`'s
+    /// legacy read helpers, on the other side of the cutover. Delete it once
+    /// they are gone.
+    ///
+    /// It lives on [`ResolverHandle`] rather than on [`ResolverCore`] on
+    /// purpose. `ResolverCore`'s method surface is meant to be checkable
+    /// against qpdf line by line — it is `m->file`'s operations and nothing
+    /// else — and a bounded owned-window read is exactly the flpdf-ism that
+    /// surface must stay free of. Hosting it one level out keeps it built
+    /// *on* the primitives instead of beside them.
+    ///
+    /// Do not build on its shape. qpdf streams from `m->file` and brackets the
+    /// one re-entrant seam by saving and restoring the position
+    /// (`QPDF::readStream`, `libqpdf/QPDF.cc:1360-1398`). The design of record
+    /// names generalising this owned-window shape as a wrong turn that would
+    /// entrench a divergence, so `readObjectAtOffset`/`readStream` port that
+    /// save/restore seam rather than reusing this.
     pub(crate) fn read_window(&self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
-        self.core.borrow_mut().read_window(offset, next)
+        self.seek(offset)?;
+        self.read_to_owned(next.map(|next| next.saturating_sub(offset)))
     }
 
-    /// See [`ResolverCore::read_physical_input`].
+    /// Read the entire input from the *unwrapped* source's offset zero, header
+    /// shift included. Callers that want qpdf-logical coordinates use
+    /// [`Self::read_window`].
+    ///
+    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: same status and same reason for
+    /// living here as [`Self::read_window`]. Its one caller is
+    /// `Pdf::source_bytes`, which the writer uses to copy the original file
+    /// verbatim — which is why the bytes before the header shift have to be
+    /// included, and why [`ResolverCore::rewind_underlying_source`] exists.
     pub(crate) fn read_physical_input(&self) -> Result<Vec<u8>> {
-        self.core.borrow_mut().read_physical_input()
+        self.core.borrow_mut().rewind_underlying_source()?;
+        self.read_to_owned(None)
+    }
+
+    /// Collect `limit` bytes — or everything left when `limit` is `None` —
+    /// from the current position into an owned buffer.
+    ///
+    /// Grows as it goes rather than pre-allocating `limit`, which matters:
+    /// `read_window`'s bound comes from the *next* cross-reference offset, and
+    /// a corrupt table can make that arbitrarily large on a small file.
+    /// `std::io::Read::take(n).read_to_end(..)`, which this replaces, had the
+    /// same property.
+    fn read_to_owned(&self, limit: Option<u64>) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        loop {
+            let remaining =
+                limit.map_or(u64::MAX, |limit| limit.saturating_sub(bytes.len() as u64));
+            if remaining == 0 {
+                return Ok(bytes);
+            }
+            let filled = bytes.len();
+            let want = remaining.min(BULK_READ_CHUNK as u64) as usize;
+            bytes.resize(filled + want, 0);
+            // `ResolverCore::read` already loops to EOF, so a short answer
+            // here means the input is exhausted.
+            let read = self.read(&mut bytes[filled..])?;
+            bytes.truncate(filled + read);
+            if read < want {
+                return Ok(bytes);
+            }
+        }
     }
 
     /// Test-only mutable access to the input source itself, for fixtures that
@@ -674,9 +700,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// restore in [`Self::read_stream`] really is what puts it back. What is
     /// *not* preserved is qpdf's "stop reading at the first bad character":
     /// `attempt` re-runs against a longer buffer, so a malformed object costs
-    /// one pull to EOF. `ResolverCore::read_window`'s bounded-window shape is
+    /// one pull to EOF. [`Self::read_window`]'s bounded-window shape is
     /// **not** what this is — that one takes its extent from the next xref
-    /// entry and leaves no position behind at all.
+    /// entry and leaves no position behind at all, which is why it is a legacy
+    /// tenant out here and not a `ResolverCore` method.
     ///
     /// `attempt` reports `(value, end)` where `end` is how many bytes it
     /// consumed. A result that consumed the *whole* buffer is treated as
@@ -970,6 +997,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
 /// Bytes pulled from the input source per [`ResolverHandle::refill`].
 const INPUT_CHUNK: usize = 4096;
+
+/// Bytes pulled per iteration by [`ResolverHandle::read_to_owned`].
+///
+/// Larger than [`INPUT_CHUNK`] because its callers are the legacy tenants,
+/// one of which reads the whole file: the chunked loop replaced a single
+/// `read_to_end`, and this keeps the iteration count in the same order.
+/// It dies with those callers.
+const BULK_READ_CHUNK: usize = 64 * 1024;
 
 /// What followed an object's value: qpdf's `readObject` reads one token after
 /// the parse and branches on it (`libqpdf/QPDF.cc:1346-1354`).
