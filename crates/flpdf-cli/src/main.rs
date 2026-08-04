@@ -2552,16 +2552,13 @@ fn build_copy_encryption_source(
 
     // Recover the donor's file key.  The error message guides the user to
     // supply the correct password via --encryption-file-password.
-    let file_key: Vec<u8> = donor
-        .encryption_file_key()
-        .ok_or_else(|| {
-            format!(
-                "--copy-encryption-from: failed to recover donor file key for {:?} \
-                 (wrong --encryption-file-password?)",
-                path
-            )
-        })?
-        .to_vec();
+    let file_key: Vec<u8> = donor.encryption_file_key().ok_or_else(|| {
+        format!(
+            "--copy-encryption-from: failed to recover donor file key for {:?} \
+             (wrong --encryption-file-password?)",
+            path
+        )
+    })?;
 
     // Extract the /Encrypt ObjectRef from the donor trailer, then resolve it.
     // Pull the ref while holding the trailer borrow, then drop that borrow
@@ -5101,7 +5098,7 @@ fn run_show_encryption_key(
     let pdf = open_pdf_for_inspection(input, repair, password)?;
     match pdf.encryption_file_key() {
         Some(key) => {
-            println!("{}", hex_lower(key));
+            println!("{}", hex_lower(&key));
             Ok(())
         }
         None => {
