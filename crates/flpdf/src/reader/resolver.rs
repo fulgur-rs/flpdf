@@ -743,9 +743,33 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///
     /// The position advances by exactly what was appended, so `bytes` always
     /// mirrors `[scan start, current position)`.
+    ///
+    /// **The chunk doubles rather than staying at [`INPUT_CHUNK`], and that is
+    /// a complexity fix, not a tuning knob.** [`Self::scan_forward`] re-runs
+    /// its `attempt` from the *start* of `bytes` after every call here, so a
+    /// fixed chunk makes an `N`-byte object cost `N/`[`INPUT_CHUNK`]
+    /// tokenizations of average length `N/2` — quadratic in `N`, for input
+    /// that is perfectly valid and merely large. Doubling makes the number of
+    /// calls logarithmic and the total tokenizing linear.
+    /// `a_large_direct_object_costs_a_logarithmic_number_of_pulls` measures
+    /// it: 258 pulls of the input source before, 11 after, over a 1 MiB
+    /// value — and 1.81 s of debug-build resolution before, 0.05 s after.
+    ///
+    /// **This is a different hazard from the one [`Self::scan_forward`]
+    /// records**, which is a *malformed* object costing one pull to EOF. That
+    /// one is unchanged: a parse that never completes still reaches the end of
+    /// the input, in fewer and larger steps.
+    ///
+    /// The cost of doubling is that a scan can pull up to twice what the
+    /// object needed. It is bounded by the file rather than by the request —
+    /// [`ResolverCore::read`] returns what was actually available and the
+    /// `truncate` below gives the rest back — so the overshoot is at worst the
+    /// bytes between the object's end and EOF, which the malformed case
+    /// already reads in full.
     fn refill(&self, bytes: &mut Vec<u8>) -> Result<bool> {
         let filled = bytes.len();
-        bytes.resize(filled + INPUT_CHUNK, 0);
+        let want = filled.max(INPUT_CHUNK);
+        bytes.resize(filled + want, 0);
         let read = self.read(&mut bytes[filled..])?;
         bytes.truncate(filled + read);
         Ok(read != 0)
@@ -2243,6 +2267,74 @@ mod tests {
                 .map(|value| value.len()),
             Some(filler.len()),
             "a value spanning several input chunks must not be truncated"
+        );
+    }
+
+    /// A large *valid* direct object costs a logarithmic number of pulls, not
+    /// one per chunk.
+    ///
+    /// **This is not the hazard the module doc already records.** That one —
+    /// "a malformed object costs one pull to EOF", [`super::ResolverHandle::scan_forward`]
+    /// — is about an object that never parses; this is about one that parses
+    /// perfectly and is merely big. [`super::ResolverHandle::scan_forward`]
+    /// re-runs `attempt` from the *start* of the accumulated buffer after
+    /// every refill, so a fixed refill makes an `N`-byte object cost `N/chunk`
+    /// tokenizations of average length `N/2` — `O(N²)` — for a multi-megabyte
+    /// array or string that every real reader has to handle.
+    ///
+    /// Counting pulls rather than timing is what makes this assertable:
+    /// geometric growth changes no byte of the result, so the only observable
+    /// is work performed. Measured over the 1 MiB value below: 258 pulls with
+    /// the fixed refill, 11 with the doubling one. The bound sits between the
+    /// two by a wide enough margin that restoring the fixed refill fails it
+    /// outright rather than flickering.
+    ///
+    /// No qpdf correspondence exists to match here: qpdf tokenizes `m->file`
+    /// one character at a time and never re-reads a byte
+    /// (`QPDFTokenizer::presentCharacter`), so its cost is linear by
+    /// construction. This is flpdf paying for its slice-taking parser, and the
+    /// fix is to pay it once.
+    #[test]
+    fn a_large_direct_object_costs_a_logarithmic_number_of_pulls() {
+        // 1 MiB of value.
+        let filler = "x".repeat(super::INPUT_CHUNK * 256);
+        let body = format!("1 0 obj\n<< /Type /Catalog /Filler ({filler}) >>\nendobj\n");
+        let mut bytes = Vec::from(*b"%PDF-1.4\n");
+        let catalog = bytes.len() as u64;
+        bytes.extend_from_slice(body.as_bytes());
+        let xref_start = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{catalog:010} 00000 n \n").as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let mut pdf = Pdf::open(CountingReader::new(bytes)).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+        // `Pdf::open`'s own xref load has already pulled; only the resolution
+        // is under test.
+        let before = pdf.resolver.with_reader_mut(|reader| reader.reads);
+
+        handle.try_dereference().expect("resolve");
+
+        let pulls = pdf.resolver.with_reader_mut(|reader| reader.reads) - before;
+        assert!(
+            pulls <= 32,
+            "a 1 MiB object must be pulled in geometric steps, not one per \
+             {} bytes: took {pulls} pulls",
+            super::INPUT_CHUNK
+        );
+        assert_eq!(
+            handle
+                .as_dictionary()
+                .expect("dictionary")
+                .get(b"Filler".as_slice())
+                .and_then(crate::ObjectHandle::as_string)
+                .map(|value| value.len()),
+            Some(filler.len()),
+            "and the value it reached that way must still be whole"
         );
     }
 
