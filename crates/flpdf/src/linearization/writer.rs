@@ -2611,6 +2611,19 @@ pub fn write_linearized<R: Read + Seek>(
     // returns a 2-element string array — every branch (deterministic
     // placeholder, static-id, default) constructs one — so this is an
     // internal-invariant check, not a reachable error for well-formed input.
+    //
+    // NOTE: when `options.deterministic_id` is set, this array's element 0 is
+    // an ALL-ZERO PLACEHOLDER (`finalize_linearized_id`'s first branch above),
+    // not real key material — the actual content-derived identifier is only
+    // computed after the bytes exist, and is then either direct-written
+    // (classic path) or back-patched in place (ObjStm/xref-stream path) — see
+    // `finalize_linearized_id`'s doc. `id0` is extracted unconditionally
+    // here, so it CAN transiently hold that placeholder. It is only safe to
+    // feed into `build_encryption_context` below because the
+    // `deterministic_id && encrypting` guard immediately below this block
+    // returns `Err` first whenever both are set — see the `debug_assert!` at
+    // this function's `options.encrypt` consumption site, which restates that
+    // invariant at the point it actually matters.
     let id0: Vec<u8> = finalized_id
         .as_array()
         .and_then(|values| values.first())
@@ -2912,6 +2925,20 @@ pub fn write_linearized<R: Read + Seek>(
     // later steps that consume this value.
     let _encrypt_ctx: Option<crate::writer::EncryptionContext> =
         if let Some(params) = options.encrypt.as_ref() {
+            // `id0` (extracted above, before the `deterministic_id &&
+            // encrypting` guard runs) must never be the all-zero placeholder
+            // here: reaching this branch means `options.encrypt.is_some()`,
+            // and the guard above already returns `Err` before this point
+            // whenever `deterministic_id` also holds. Restated here,
+            // self-enforcing, in case a future edit reorders the guard
+            // relative to this block.
+            debug_assert!(
+                !options.deterministic_id,
+                "deterministic_id && encrypting must have already been rejected \
+                 by the guard above `write_linearized`'s /ID finalization — \
+                 reaching here with deterministic_id set would derive the file \
+                 encryption key from an all-zero /ID[0] placeholder"
+            );
             let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
                 // cov:ignore-start: requires > 2^32 objects — impossible in practice
                 crate::Error::Unsupported(
@@ -5889,7 +5916,11 @@ mod tests {
     /// which pins the pre-this-commit behavior (encryption silently ignored,
     /// write succeeds). `#[ignore]`d until the emission step lands and makes
     /// the assertion below true; Task 6's acceptance criteria include
-    /// removing this attribute.
+    /// removing this attribute AND the `cov:ignore-start`/`cov:ignore-end`
+    /// pair wrapping this test below — once the test runs unconditionally,
+    /// leaving the `cov:ignore` markers in place would silently exempt this
+    /// test body from the patch-coverage gate instead of just no longer
+    /// needing the exemption.
     // cov:ignore-start: the test body is instrumented by llvm-cov but never
     // executes because it is `#[ignore]`d until the /Encrypt emission step
     // (see the doc comment above) writes a real object into the reserved
