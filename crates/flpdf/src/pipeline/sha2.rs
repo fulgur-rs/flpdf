@@ -396,10 +396,16 @@ mod tests {
     }
 
     #[test]
-    fn helper_sink_identifiers_are_fixed() {
+    fn helper_sink_identifiers_and_noop_halves_are_exercised() {
         assert_eq!(RecordingSink::default().identifier(), "recording");
+
         assert_eq!(FinishFaultSink.identifier(), "finish-fault");
+        // The half of `FinishFaultSink` that no test above exercises: `write()` is a no-op.
+        FinishFaultSink.write(b"ignored").unwrap();
+
         assert_eq!(WriteFaultSink.identifier(), "write-fault");
+        // The half of `WriteFaultSink` that no test above exercises: `finish()` is a no-op.
+        WriteFaultSink.finish().unwrap();
     }
 
     #[test]
