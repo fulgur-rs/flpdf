@@ -1183,9 +1183,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         // No qpdf counterpart: `QPDF_Stream` keeps `stream_offset` and
         // `length` and reads the payload at pipe time, while
-        // `ObjectValue::Stream` owns its bytes. `read_to_owned` grows to what
-        // the input actually yields rather than pre-allocating `length`, so
-        // even this now-bounded read never trusts the declaration.
+        // `ObjectValue::Stream` carries the bytes themselves (shared, but
+        // still read here rather than at pipe time). `read_to_owned` grows to
+        // what the input actually yields rather than pre-allocating `length`,
+        // so even this now-bounded read never trusts the declaration.
         self.seek(stream_offset)?;
         let data = self.read_to_owned(Some(span))?;
 
@@ -1199,7 +1200,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let dict = ObjectHandle::from_value(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
         Ok((
-            ObjectValue::Stream { dict, data },
+            ObjectValue::Stream {
+                stream_dict: dict,
+                stream_data: Rc::new(data),
+            },
             i64::try_from(stream_offset).unwrap_or(i64::MAX),
         ))
     }
@@ -2171,7 +2175,7 @@ mod tests {
             .expect("a stream with an indirect /Length resolves");
 
         assert_eq!(
-            stream.as_stream_data().as_deref(),
+            stream.as_stream_data().as_deref().map(Vec::as_slice),
             Some(STREAM_PAYLOAD),
             "the payload must come from the restored stream offset"
         );
@@ -2477,7 +2481,7 @@ mod tests {
         handle.try_dereference().expect("resolve");
 
         assert_eq!(
-            handle.as_stream_data().as_deref(),
+            handle.as_stream_data().as_deref().map(Vec::as_slice),
             Some(STREAM_PAYLOAD),
             "a `stream` keyword cut by the chunk boundary must not frame the \
              object as a plain dictionary"
@@ -3038,7 +3042,10 @@ mod tests {
             b"2 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nenddobj\n",
             |handle, outcome, warnings| {
                 outcome.expect("qpdf warns here rather than failing");
-                assert_eq!(handle.as_stream_data().as_deref(), Some(&b"abc"[..]));
+                assert_eq!(
+                    handle.as_stream_data().as_deref().map(Vec::as_slice),
+                    Some(&b"abc"[..])
+                );
                 assert_eq!(warnings, ["expected endobj"]);
             },
         );
@@ -3084,7 +3091,7 @@ mod tests {
             with_second_object(&body, |handle, outcome, warnings| {
                 outcome.expect("every line-ending branch still resolves the stream");
                 assert_eq!(
-                    handle.as_stream_data().as_deref(),
+                    handle.as_stream_data().as_deref().map(Vec::as_slice),
                     Some(payload),
                     "separator {separator:?} moved the payload"
                 );
@@ -3137,7 +3144,10 @@ mod tests {
 
         handle.try_dereference().expect("resolve");
 
-        assert_eq!(handle.as_stream_data().as_deref(), Some(STREAM_PAYLOAD));
+        assert_eq!(
+            handle.as_stream_data().as_deref().map(Vec::as_slice),
+            Some(STREAM_PAYLOAD)
+        );
     }
 
     /// A stream whose `stream` keyword is the last thing in the input.
@@ -3236,7 +3246,7 @@ mod tests {
             .expect("a missing `endobj` warns rather than failing");
 
         assert_eq!(
-            handle.as_stream_data().as_deref(),
+            handle.as_stream_data().as_deref().map(Vec::as_slice),
             Some(&b"abc"[..]),
             "and the payload is still the declared three bytes"
         );
@@ -3347,7 +3357,8 @@ mod tests {
         assert_eq!(
             pdf.get_object_handle(ObjectRef::new(3, 0))
                 .as_stream_data()
-                .as_deref(),
+                .as_deref()
+                .map(Vec::as_slice),
             Some(inner),
             "the inner stream, resolved while the outer frame was live, must \
              have read from its own saved offset"
@@ -3464,7 +3475,7 @@ mod tests {
         );
 
         assert_eq!(
-            n.as_stream_data().as_deref(),
+            n.as_stream_data().as_deref().map(Vec::as_slice),
             Some(appearance_payload),
             "the resolved appearance stream must carry its own payload"
         );

@@ -3220,6 +3220,7 @@ mod tests {
     use super::*;
     use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
+    use std::rc::Rc;
 
     fn number(value: impl ToString) -> serde_json::Value {
         serde_json::from_str(&value.to_string()).expect("number must serialize")
@@ -5924,7 +5925,7 @@ mod tests {
         // Unlike the legacy Object::Stream(Stream { dict: Dictionary, .. }),
         // ObjectHandle::stream's public constructor does not validate its
         // dict argument's own type — a caller can build this directly.
-        let malformed = ObjectHandle::stream(ObjectHandle::integer(1), vec![]);
+        let malformed = ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(vec![]));
         let result = super::pdf_object_to_json(&malformed);
         assert!(
             matches!(result, Err(ConvertError::PdfError(_))),

@@ -13,6 +13,7 @@ use flpdf::{
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
+use std::rc::Rc;
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
 
@@ -288,7 +289,10 @@ fn factories_allocate_after_handle_only_objects() {
 #[test]
 fn filespec_factory_indirectizes_a_direct_embedded_stream() {
     let mut pdf = open(build_attachment_pdf("", "", b"data"));
-    let direct_stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"payload".to_vec());
+    let direct_stream = ObjectHandle::stream(
+        ObjectHandle::dictionary(vec![]),
+        Rc::new(b"payload".to_vec()),
+    );
     let filespec_handle =
         FileSpec::create_file_spec(&mut pdf, "direct.bin", direct_stream).unwrap();
 
@@ -355,7 +359,7 @@ fn direct_embedded_stream_metadata_setters_update_existing_and_new_params() {
         )]),
     )]);
     let mut existing = EmbeddedFileStream::new(
-        ObjectHandle::stream(direct_params, b"existing".to_vec()),
+        ObjectHandle::stream(direct_params, Rc::new(b"existing".to_vec())),
         &mut pdf,
     )
     .unwrap();
@@ -368,7 +372,10 @@ fn direct_embedded_stream_metadata_setters_update_existing_and_new_params() {
     );
 
     let mut absent = EmbeddedFileStream::new(
-        ObjectHandle::stream(ObjectHandle::dictionary(vec![]), b"absent".to_vec()),
+        ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![]),
+            Rc::new(b"absent".to_vec()),
+        ),
         &mut pdf,
     )
     .unwrap();

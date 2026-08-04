@@ -395,6 +395,8 @@ fn write_object_details<R: Read + Seek>(
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::{
         run_test_0_1, stream_decode_error_detail, write_decode_param_type_warning,
         write_object_details,
@@ -975,7 +977,7 @@ mod tests {
             b"Filter".to_vec(),
             ObjectHandle::name(b"FlateDecode".to_vec()),
         )]);
-        let qtest = ObjectHandle::stream(dict, b"abc".to_vec());
+        let qtest = ObjectHandle::stream(dict, Rc::new(b"abc".to_vec()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
@@ -1009,7 +1011,7 @@ mod tests {
             ),
             (b"DecodeParms".to_vec(), ObjectHandle::integer(42)),
         ]);
-        let qtest = ObjectHandle::stream(dict, Vec::new());
+        let qtest = ObjectHandle::stream(dict, Rc::new(Vec::new()));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut diagnostics_written = 0;
