@@ -1676,6 +1676,77 @@ mod tests {
         assert!(resolver.encryption_parameters().borrow().is_none());
     }
 
+    /// AC6 case 1: a document with no `/Encrypt` entry authenticates
+    /// (`Pdf::authenticate_if_encrypted` runs and returns early) and reports
+    /// no encryption parameters through the resolver-side handle — the
+    /// `encryption_initialized == true, encrypted == false` qpdf state,
+    /// pinned separately from
+    /// `a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters`'s
+    /// `encryption_initialized == false`, even though both observe `None`.
+    #[test]
+    fn an_unencrypted_document_reports_no_encryption_parameters() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        assert!(pdf.resolver.encryption_parameters().borrow().is_none());
+    }
+
+    /// AC6 case 2: an RC4-encrypted document authenticates through `Pdf`,
+    /// and the resolver-side handle observes what that authentication wrote
+    /// — proving `Pdf::encryption` and `ResolverCore::encryption_parameters`
+    /// are the same allocation, not two independently-written copies. (A
+    /// design where `Pdf` held its own separate cell would also authenticate
+    /// successfully but leave this resolver-side read at `None`.)
+    #[test]
+    fn an_rc4_document_reports_its_encryption_parameters_through_the_shared_cell() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+        );
+        let bytes = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+        let options = crate::PdfOpenOptions {
+            password: b"user-v2".to_vec(),
+            allow_weak_crypto: true,
+            ..crate::PdfOpenOptions::default()
+        };
+        let pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open RC4 fixture");
+        let cell = pdf.resolver.encryption_parameters();
+        let guard = cell.borrow();
+        let encryption = guard.as_ref().expect("RC4 fixture must authenticate");
+        assert_eq!(encryption.stream_mode, crate::reader::EncryptionMode::Rc4);
+        // RC4-128 derives a 16-byte file key (qpdf Algorithm 2, key length
+        // bits / 8). Asserting only stream_mode would pass even if file_key
+        // never made it through the shared cell -- assert the payload a real
+        // consumer (flpdf-25kg.3.10's decryptStream-equivalent, which needs
+        // the key for getKeyForObject) actually needs.
+        assert_eq!(encryption.file_key.len(), 16);
+    }
+
+    /// AC6 case 3: same shape, an AES-128 document.
+    #[test]
+    fn an_aes_document_reports_its_encryption_parameters_through_the_shared_cell() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+        );
+        let bytes = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+        let options = crate::PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..crate::PdfOpenOptions::default()
+        };
+        let pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open AES fixture");
+        let cell = pdf.resolver.encryption_parameters();
+        let guard = cell.borrow();
+        let encryption = guard.as_ref().expect("AES fixture must authenticate");
+        assert_eq!(
+            encryption.stream_mode,
+            crate::reader::EncryptionMode::Aes128
+        );
+        assert_eq!(encryption.file_key.len(), 16);
+    }
+
     /// The attach itself: a handle vended by a live document must reach that
     /// document's resolver, and now that uncompressed objects are implemented,
     /// come back resolved.
