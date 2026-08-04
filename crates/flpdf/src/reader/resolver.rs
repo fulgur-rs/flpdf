@@ -868,7 +868,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// qpdf's `catch (std::exception&)` arm (`libqpdf/QPDF.cc:2510-2530`):
     /// anything that is not a damaged-PDF diagnosis becomes "error decoding
-    /// stream data for object N G: <what>", and a caller that is going to
+    /// stream data for object N G: `<what>`", and a caller that is going to
     /// retry is told so in a *second* warning at the same position.
     ///
     /// The position is `file->getLastOffset()`, which after a successful read
@@ -1954,7 +1954,7 @@ mod tests {
 
     /// A failure downstream of the read is qpdf's `catch (std::exception&)`
     /// arm (`libqpdf/QPDF.cc:2510-2530`): it warns "error decoding stream data
-    /// for object N G: <what>" at `file->getLastOffset()`, which after a
+    /// for object N G: `<what>`" at `file->getLastOffset()`, which after a
     /// successful read is where that read began
     /// (`BufferInputSource::read` sets `last_offset = cur_offset`,
     /// `libqpdf/BufferInputSource.cc:128`) — the stream's own offset, not the
