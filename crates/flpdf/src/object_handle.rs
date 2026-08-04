@@ -2367,10 +2367,12 @@ impl ObjectHandle {
     /// `self` accepts the same two shapes [`Self::unparse_stream_body`]
     /// does -- a `Dictionary` directly, or a `Stream { stream_dict, .. }`
     /// whose (possibly still-unresolved) `stream_dict` is forced to
-    /// resolve -- with the identical error-propagation and empty-`<< >>`
-    /// degrade behavior for every other shape; see that primitive's own
-    /// doc for the full contract, which this one mirrors exactly except
-    /// for the QDF layout and the missing `refiltered` parameter.
+    /// resolve -- with the identical error-propagation behavior for every
+    /// other shape (degrading to an empty dictionary in this layout's own
+    /// `<<\n>>` shape, not the compact sibling's `<< >>`); see that
+    /// primitive's own doc for the full contract, which this one mirrors
+    /// exactly except for the QDF layout and the missing `refiltered`
+    /// parameter.
     #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
     pub(crate) fn unparse_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         self.try_dereference()?;
