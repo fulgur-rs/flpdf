@@ -365,11 +365,15 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
-// Stack-growth protection for `lift_bounded`'s recursive hub, mirroring
-// `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values (kept as
-// separate local constants rather than imported cross-module, matching this
-// crate's existing per-module duplication of the same two numbers in
-// `object_handle.rs`).
+// Stack-growth protection for this module's two recursive hubs: `lift_bounded`
+// here, and `ResolverHandle::resolve_indirect` in the `resolver` child module,
+// which reaches these as `super::READER_STACK_RED_ZONE`/
+// `super::READER_STACK_GROWTH_SIZE`. The values mirror `parser.rs`'s own
+// `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` (kept as separate local constants
+// rather than imported cross-module, matching this crate's existing per-module
+// duplication of the same two numbers in `object_handle.rs`); `resolver.rs`
+// shares *these* rather than minting a third pair because it is a child of this
+// module, not a module across the crate from it.
 const READER_STACK_RED_ZONE: usize = 32 * 1024;
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 

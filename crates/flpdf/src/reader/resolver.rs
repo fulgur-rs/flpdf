@@ -1376,39 +1376,80 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// has no counterpart for; a fabricated message would be a worse ledger
     /// entry than a propagated error. The damaged-object route arrives with
     /// the recovery work `attempt_recovery` gates.
+    ///
+    /// # Why the body is wrapped in `stacker::maybe_grow`
+    ///
+    /// **This method is re-entrant, and nothing bounds how deep.** A stream
+    /// whose `/Length` is an indirect reference to another stream whose
+    /// `/Length` is an indirect reference to another … recurses
+    /// `resolve_indirect` → [`Self::read_object_at_offset`] →
+    /// [`Self::read_stream`] → [`Self::stream_length`] →
+    /// [`ObjectHandle::try_dereference`] → `resolve_indirect` once per link.
+    /// The loop branch above cannot stop it: `resolving` holds *references*,
+    /// and every link is a different one, so no repeat is ever seen.
+    ///
+    /// **A depth limit would be the wrong fix, because qpdf has none.**
+    /// `QPDF::resolve`'s `m->resolving` test (`libqpdf/QPDF.cc:1706-1712`) is
+    /// the same reference-repeat check and likewise carries no counter; qpdf
+    /// recurses this chain until its own stack runs out. Measured on qpdf
+    /// 11.9.0 over generated fixtures of this exact shape: 4000 links
+    /// (314,083 bytes) exits 3 with recovery warnings, 20,000 links and
+    /// 100,000 links both segfault (exit 139). Refusing at a fixed depth would
+    /// therefore reject documents qpdf accepts.
+    ///
+    /// What is taken instead is this crate's own established answer, the one
+    /// `parser.rs`'s recursive-descent hub (`Parser::object`) and
+    /// [`super::Pdf::lift_bounded`] already use: grow the stack rather than
+    /// bound the recursion, so the depth a caller survives follows available
+    /// memory instead of the thread's initial stack. The rationale beside
+    /// `lift_bounded`'s own call applies verbatim — a production caller on a
+    /// small-stack thread must not abort the process where a value could be
+    /// returned — and this path was the one place in the reader still
+    /// inconsistent with it.
+    ///
+    /// The wrap goes here, not on [`Self::read_stream`], for the same reason
+    /// `parser.rs` wraps `Parser::object`: this is the frame that appears
+    /// exactly once per level, so protecting it protects every level.
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
-        // ---- phase 1: short borrows only ----
+        stacker::maybe_grow(
+            super::READER_STACK_RED_ZONE,
+            super::READER_STACK_GROWTH_SIZE,
+            || {
+                // ---- phase 1: short borrows only ----
 
-        // Bound to a named local, not to `_`: the mark must live until this
-        // method returns or unwinds, and `let Some(_) = ..` would drop it at
-        // the end of this statement.
-        let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
-            // qpdf's order: warn, then cache null (`libqpdf/QPDF.cc:1710-1711`).
-            // Neither call may hold a borrow across the other — `push_warning`
-            // takes its own `borrow_mut`.
-            self.push_warning(format!(
-                "loop detected resolving object {} {}",
-                object_ref.number, object_ref.generation
-            ));
-            handle.set_missing();
-            return Ok(());
-        };
-        let entry = self.xref_entry(object_ref);
+                // Bound to a named local, not to `_`: the mark must live until
+                // this method returns or unwinds, and `let Some(_) = ..` would
+                // drop it at the end of this statement.
+                let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
+                    // qpdf's order: warn, then cache null
+                    // (`libqpdf/QPDF.cc:1710-1711`). Neither call may hold a
+                    // borrow across the other — `push_warning` takes its own
+                    // `borrow_mut`.
+                    self.push_warning(format!(
+                        "loop detected resolving object {} {}",
+                        object_ref.number, object_ref.generation
+                    ));
+                    handle.set_missing();
+                    return Ok(());
+                };
+                let entry = self.xref_entry(object_ref);
 
-        // ---- phase 2: no borrow is held across this ----
-        let Some(XrefEntry::Uncompressed { offset }) = entry else {
-            return Err(Error::Unsupported(format!(
-                "canonical resolver cannot yet resolve object {} {}: \
-                 only uncompressed cross-reference entries are implemented",
-                object_ref.number, object_ref.generation
-            )));
-        };
-        let (value, parsed_offset) = self.read_object_at_offset(offset, object_ref)?;
+                // ---- phase 2: no borrow is held across this ----
+                let Some(XrefEntry::Uncompressed { offset }) = entry else {
+                    return Err(Error::Unsupported(format!(
+                        "canonical resolver cannot yet resolve object {} {}: \
+                         only uncompressed cross-reference entries are implemented",
+                        object_ref.number, object_ref.generation
+                    )));
+                };
+                let (value, parsed_offset) = self.read_object_at_offset(offset, object_ref)?;
 
-        // ---- phase 3: short borrows, then the mark drops ----
-        handle.set_resolved(value);
-        handle.set_parsed_offset_if_unset(parsed_offset);
-        Ok(())
+                // ---- phase 3: short borrows, then the mark drops ----
+                handle.set_resolved(value);
+                handle.set_parsed_offset_if_unset(parsed_offset);
+                Ok(())
+            },
+        )
     }
 }
 
@@ -3024,5 +3065,120 @@ mod tests {
             n.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(5, 0))),
             "the nested handle must be the document's one canonical handle for object 5"
         );
+    }
+
+    /// `links` streams, each declaring its `/Length` as a reference to the
+    /// next, ending in a plain integer — the shape that makes
+    /// [`super::ResolverHandle::resolve_indirect`] re-enter itself once per
+    /// object without ever repeating a reference.
+    ///
+    /// Generated rather than committed: 4000 links is 314,083 bytes, two
+    /// orders of magnitude past anything else in `tests/fixtures`.
+    fn chained_indirect_length_pdf_bytes(links: u32) -> Vec<u8> {
+        let mut pdf = Vec::from(*b"%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for number in 1..=links {
+            offsets.push(pdf.len() as u64);
+            pdf.extend_from_slice(
+                format!(
+                    "{number} 0 obj\n<< /Length {} 0 R >>\nstream\n\nendstream\nendobj\n",
+                    number + 1
+                )
+                .as_bytes(),
+            );
+        }
+        // The chain's foot: a direct integer, so the deepest frame returns a
+        // usable length rather than bottoming out on the input's end.
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(format!("{} 0 obj\n0\nendobj\n", links + 1).as_bytes());
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "{} 0 obj\n<< /Type /Catalog /Pages {} 0 R >>\nendobj\n",
+                links + 2,
+                links + 3
+            )
+            .as_bytes(),
+        );
+        offsets.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "{} 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n",
+                links + 3
+            )
+            .as_bytes(),
+        );
+
+        let size = links + 4;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for offset in &offsets {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {size} /Root {} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n",
+                links + 2
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// A 4000-link `/Length` chain resolves to a diagnosis instead of
+    /// aborting the process, on a thread far too small to hold 4000 frames.
+    ///
+    /// **The depth this pins is qpdf's, not an arbitrary one.** qpdf 11.9.0
+    /// run against this exact generator's output survives 4000 links —
+    /// `qpdf --show-object=1`, exit 3, recovery warnings — and segfaults
+    /// (exit 139) at 20,000 and at 100,000, because `QPDF::resolve`'s
+    /// `m->resolving` check (`libqpdf/QPDF.cc:1706-1712`) is a
+    /// reference-repeat test with no depth counter. A depth limit in flpdf
+    /// would therefore have to refuse documents qpdf reads, which is why
+    /// [`super::ResolverHandle::resolve_indirect`] grows the stack instead.
+    ///
+    /// **The small stack is the point, not a convenience.** Measured before
+    /// the `stacker::maybe_grow` wrap, on libtest's own default thread: this
+    /// resolver aborted the whole test binary — `has overflowed its stack /
+    /// fatal runtime error: stack overflow, aborting`, SIGABRT — at 300 links
+    /// in a debug build and 2000 in a release build, both far under qpdf's
+    /// 4000. Pinning it on a 256 KiB thread makes the assertion independent of
+    /// whichever default a runner happens to give, and reproduces the
+    /// situation `lift_bounded`'s own wrap exists for: a caller that does not
+    /// own the thread it is called on.
+    ///
+    /// The expected outcome is a *diagnosis*: link 1's `/Length` resolves to
+    /// link 2, which is a stream rather than an integer. qpdf reaches the same
+    /// judgement (`/Length key in stream dictionary is not an integer`,
+    /// `libqpdf/QPDF.cc:1377`) and then recovers the length; flpdf stops at
+    /// the first of those, the divergence [`super::ResolverHandle::read_stream`]
+    /// already records.
+    #[test]
+    fn a_long_chain_of_indirect_lengths_grows_the_stack_instead_of_aborting() {
+        // Built inside the closure rather than moved in: `Pdf` and
+        // `ObjectHandle` are not `Send`, the same reason `reader.rs`'s
+        // `trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound`
+        // builds its tree in the spawned thread.
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let bytes = chained_indirect_length_pdf_bytes(4000);
+                let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+                let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+                let error = handle
+                    .try_dereference()
+                    .expect_err("link 2 is a stream, so link 1's /Length is unusable");
+
+                assert!(
+                    matches!(&error, Error::Parse { message, .. }
+                        if message == "/Length key in stream dictionary is not an integer"),
+                    "the chain must come back diagnosed, not aborted: {error:?}"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("a 4000-link chain must not overflow a small stack");
     }
 }
