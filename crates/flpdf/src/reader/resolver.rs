@@ -776,13 +776,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn pipe_stream_data(
         &self,
-        _object_ref: ObjectRef,
+        object_ref: ObjectRef,
         offset: i64,
         length: usize,
         _stream_dict: &ObjectHandle,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
-        _will_retry: bool,
+        will_retry: bool,
     ) -> bool {
         let Ok(start) = u64::try_from(offset) else {
             return false;
@@ -807,13 +807,75 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
                 return false;
             }
-            Err(_) => return false,
+            Err(error) => {
+                return self.report_decoding_failure(
+                    object_ref,
+                    start,
+                    &error.to_string(),
+                    suppress_warnings,
+                    will_retry,
+                )
+            }
         }
         // qpdf `:2502-2504`.
-        if pipeline.write(&buf).is_err() {
-            return false;
+        if let Err(error) = pipeline.write(&buf) {
+            let outcome = self.report_decoding_failure(
+                object_ref,
+                start,
+                &error.to_string(),
+                suppress_warnings,
+                will_retry,
+            );
+            // qpdf `:2531-2537`: `attempted_finish` is set immediately before
+            // `finish()`, so this tail runs only for a pipeline that never got
+            // the call. Its own failure is swallowed.
+            let _ = pipeline.finish();
+            return outcome;
         }
-        pipeline.finish().is_ok()
+        if let Err(error) = pipeline.finish() {
+            return self.report_decoding_failure(
+                object_ref,
+                start,
+                &error.to_string(),
+                suppress_warnings,
+                will_retry,
+            );
+        }
+        true
+    }
+
+    /// qpdf's `catch (std::exception&)` arm (`libqpdf/QPDF.cc:2510-2530`):
+    /// anything that is not a damaged-PDF diagnosis becomes "error decoding
+    /// stream data for object N G: <what>", and a caller that is going to
+    /// retry is told so in a *second* warning at the same position.
+    ///
+    /// The position is `file->getLastOffset()`, which after a successful read
+    /// is where that read began (`BufferInputSource.cc:128`) — the stream's
+    /// own offset.
+    ///
+    /// Always returns `false`, so callers can `return` it directly.
+    fn report_decoding_failure(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        detail: &str,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> bool {
+        if !suppress_warnings {
+            let og = format!("{} {}", object_ref.number, object_ref.generation);
+            self.push_warning_at(
+                offset,
+                format!("error decoding stream data for object {og}: {detail}"),
+            );
+            if will_retry {
+                self.push_warning_at(
+                    offset,
+                    "stream will be re-processed without filtering to avoid data loss",
+                );
+            }
+        }
+        false
     }
 
     /// Test-only mutable access to the input source itself, for fixtures that
@@ -1866,6 +1928,133 @@ mod tests {
 
         assert!(!ok);
         assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    /// A failure downstream of the read is qpdf's `catch (std::exception&)`
+    /// arm (`libqpdf/QPDF.cc:2510-2530`): it warns "error decoding stream data
+    /// for object N G: <what>" at `file->getLastOffset()`, which after a
+    /// successful read is where that read began
+    /// (`BufferInputSource::read` sets `last_offset = cur_offset`,
+    /// `libqpdf/BufferInputSource.cc:128`) — the stream's own offset, not the
+    /// position afterwards.
+    #[test]
+    fn a_failing_sink_warns_against_the_streams_offset() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, false);
+
+        assert!(!ok);
+        let diagnostics = resolver.repair_diagnostics();
+        let entries: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| (d.message.as_str(), d.offset))
+            .collect();
+        assert_eq!(
+            entries,
+            [(
+                "error decoding stream data for object 4 0: sink write failure 1",
+                Some(9)
+            )]
+        );
+    }
+
+    /// `will_retry` adds a second warning at the same position telling the
+    /// reader why the data is about to be produced again
+    /// (`libqpdf/QPDF.cc:2521-2529`). It is a separate warning, after the
+    /// first, not a suffix on it.
+    #[test]
+    fn a_retrying_caller_is_told_the_stream_will_be_reprocessed() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, true);
+
+        assert!(!ok);
+        let diagnostics = resolver.repair_diagnostics();
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "error decoding stream data for object 4 0: sink write failure 1",
+                "stream will be re-processed without filtering to avoid data loss",
+            ]
+        );
+        assert!(diagnostics.entries().iter().all(|d| d.offset == Some(9)));
+    }
+
+    /// qpdf sets `attempted_finish` immediately *before* calling
+    /// `pipeline->finish()` (`libqpdf/QPDF.cc:2502-2503`), so the tail that
+    /// runs after a failure (`:2531-2537`) only finishes a pipeline that never
+    /// got the call. A write failure therefore still finishes the sink once —
+    /// and any error from that attempt is swallowed.
+    #[test]
+    fn a_write_failure_still_finishes_the_sink_once() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        // The recovery finish fails too; qpdf ignores that (`:2534-2536`).
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[1]);
+        let trace = sink.trace();
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
+
+        assert!(!ok);
+        let finishes = trace
+            .borrow()
+            .calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    crate::pipeline::test_support::TraceCall::Finish { .. }
+                )
+            })
+            .count();
+        assert_eq!(finishes, 1, "the sink is finished exactly once");
+    }
+
+    /// The other half of the same rule: a `finish` that fails has already been
+    /// attempted, so the tail must not call it again.
+    #[test]
+    fn a_finish_failure_is_not_retried() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[1]);
+        let trace = sink.trace();
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
+
+        assert!(!ok);
+        let finishes = trace
+            .borrow()
+            .calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    crate::pipeline::test_support::TraceCall::Finish { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            finishes, 1,
+            "a failed finish is not attempted a second time"
+        );
     }
 
     /// AC6 case 1: a document with no `/Encrypt` entry authenticates
