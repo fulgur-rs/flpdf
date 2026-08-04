@@ -1,28 +1,40 @@
 //! qpdf correspondence: Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
 //
-// Three states this port rejects with a `PipelineError::logic` instead of reproducing
+// Four states this port rejects with a `PipelineError::logic` instead of reproducing
 // qpdf, for two different reasons:
 //
-// 1. Memory-unsafe (never-defined in C++, so there is no byte sequence to match).
-//    `Pl_SHA2::write` with `bits=0` (the uncommitted default, never `resetBits`) and
-//    `write` reused after `finish()` without an intervening `resetBits` both dereference
-//    a null/stale crypto-provider pointer, and a digest read before any `finish()` reads
-//    uninitialized `SHA2_native::shaXXXsum` memory. qpdf's own `libtests/sha2.cc` never
-//    exercises any of these (it always calls `resetBits` immediately before each use).
-// 2. Deterministic but unreplicable through this crate's public API. A second `finish()`
-//    is NOT undefined behavior in qpdf: `sph_sha2`'s `md_helper.c` close() helper states
-//    "The context is NOT reinitialized by this function" and leaves the running state
-//    (`sc->val`) and bit count (`sc->count`) untouched, so a repeat close() recompresses
-//    the identical reconstructed padding block on top of the already-finalized state via
-//    `RFUN`, producing a second, different, fully deterministic digest. Reproducing that
-//    exactly is impossible through `sha2`'s safe API for SHA-384 specifically: qpdf's
+// 1. Memory-unsafe (never-defined in C++, so there is no byte sequence to match). Only
+//    one state is actually this: `Pl_SHA2::write` with `bits=0` (the uncommitted
+//    default, `resetBits` never called even once) dereferences a genuinely null
+//    `shared_ptr<QPDFCryptoImpl>` — the constructor only calls `resetBits` when
+//    `bits != 0`. A digest read before any `finish()` similarly reads uninitialized
+//    `SHA2_native::shaXXXsum` memory (those buffers have no default member initializer
+//    and are only ever written by `finalize()`). qpdf's own `libtests/sha2.cc` never
+//    exercises either (it always calls `resetBits` immediately before each use).
+// 2. Deterministic but unreplicable through this crate's public API. Two states land
+//    here, and — importantly — neither is memory-unsafe: `finish()` does not clear the
+//    crypto-provider pointer, so it stays alive and valid afterward.
+//    - A second `finish()`: `sph_sha2`'s `md_helper.c` close() helper states "The
+//      context is NOT reinitialized by this function" and leaves the running state
+//      (`sc->val`) and bit count (`sc->count`) untouched, so a repeat close()
+//      recompresses the identical reconstructed padding block on top of the
+//      already-finalized state via `RFUN`, producing a second, different digest.
+//    - `write()` reused after `finish()` without an intervening `resetBits()`: the same
+//      `sc->count`/`sc->buf` are still there, so new data gets buffered and compressed
+//      starting from the padding-contaminated state `finish()` left behind, again a
+//      deterministic but distinct result.
+//    Both are fully deterministic — not UB — but reproducing either exactly is
+//    impossible through `sha2`'s safe API for SHA-384 specifically: qpdf's
 //    `sph_sha384_close` truncates an 8×u64-word running state to a 48-byte (6-word)
 //    output (`sha2big.c`: `sha384_close(cc, dst, 6)`, vs. 8 for SHA-512), and
 //    `Sha384::finalize()` likewise only yields those 48 bytes — the other two words are
-//    gone, so there is no way to reconstruct the full state `compress512` would need to
-//    recompress. Rather than replicate this for 256/512 (where the crate's public
-//    `compress256`/`compress512` functions would make it possible) and error only for
-//    384, this port rejects repeated `finish()` uniformly across all three bit lengths.
+//    gone, so there is no way to reconstruct the full state a recompression would need.
+//    (Even for 256/512, where the crate's public `compress256`/`compress512` exist, the
+//    leftover partial-block bytes below the padding are not exposed by the safe API
+//    either, so full replication isn't achievable without this pipeline buffering its
+//    own copy of up to one block of trailing input — which no real caller needs.)
+//    Rather than replicate two bit lengths and error only on 384, both states are
+//    rejected uniformly across all three.
 use super::{Pipeline, PipelineError, PipelineResult};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -125,12 +137,22 @@ impl Pipeline for PlSha2<'_> {
     }
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        let identifier = &self.identifier;
-        let digest = self.digest.as_mut().ok_or_else(|| {
-            PipelineError::logic(format!(
-                "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
-            ))
-        })?;
+        let digest = match self.digest.as_mut() {
+            Some(digest) => digest,
+            None => {
+                let identifier = &self.identifier;
+                let message = if self.raw_digest.is_some() {
+                    format!(
+                        "{identifier}: Pl_SHA2: write() reuse after finish() without resetBits() is not reproducible"
+                    )
+                } else {
+                    format!(
+                        "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
+                    )
+                };
+                return Err(PipelineError::logic(message));
+            }
+        };
         self.in_progress = true;
         digest.update(data);
         if let Some(next) = self.next.as_deref_mut() {
@@ -567,10 +589,10 @@ mod tests {
         );
     }
 
-    // ── uncommitted-pipeline safety (qpdf leaves `bits=0` uncommitted; the C++ crypto
-    //    pointer is null and `write()`/`finish()` would dereference it. Converting that
-    //    crash into a defined logic error is the mandatory Rust-safety translation of
-    //    C++ UB — see module doc.) ─────────────────────────────────────────────────
+    // ── never-committed pipeline safety (qpdf leaves `bits=0` uncommitted; the C++
+    //    crypto pointer is genuinely null there and `write()`/`finish()` would
+    //    dereference it. Converting that crash into a defined logic error is the
+    //    mandatory Rust-safety translation of C++ UB — see module doc §1.) ──────────
 
     #[test]
     fn write_before_reset_bits_is_rejected() {
@@ -602,6 +624,11 @@ mod tests {
         );
     }
 
+    // ── deterministic-but-unreplicable safety (the crypto provider stays alive and
+    //    valid after `finish()` — not null, not stale — but reproducing what it would
+    //    deterministically compute next is unreachable through the crate's public API
+    //    for SHA-384; see module doc §2.) ─────────────────────────────────────────────
+
     #[test]
     fn write_after_finish_without_reset_bits_is_rejected() {
         let mut sha2 = PlSha2::new("sha2-stage", None, 256).unwrap();
@@ -610,7 +637,7 @@ mod tests {
         let error = sha2.write(b"more").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "sha2-stage: Pl_SHA2: write() called before resetBits() selected a digest size"
+            "sha2-stage: Pl_SHA2: write() reuse after finish() without resetBits() is not reproducible"
         );
     }
 }
