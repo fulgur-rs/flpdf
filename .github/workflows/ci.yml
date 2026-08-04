@@ -180,6 +180,12 @@ jobs:
           # goldens end-to-end (raw-argv pre-split -> WriteOptions -> write path).
           # Gated behind qpdf-zlib-compat; must be run explicitly here.
           cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
+          # Pins AES-128 (V=4/AESV2) --encrypt output byte-identity vs qpdf,
+          # whole-document (encrypted_document_is_byte_identical_to_qpdf).
+          # Gated behind qpdf-zlib-compat (DEFLATE backend); the plain
+          # `cargo test` step above runs this same file under default
+          # features, where that one test is compiled out.
+          cargo test -p flpdf-cli --features qpdf-zlib-compat --test encrypt_cli_tests
           # Pins the `flpdf rewrite --static-id` baseline snapshot vs qpdf
           # goldens. Gated behind qpdf-zlib-compat so the golden reflects
           # true qpdf byte-parity; under the default miniz backend the test

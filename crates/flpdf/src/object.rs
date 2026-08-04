@@ -860,9 +860,18 @@ impl Dictionary {
     /// `/ID` value is routed through [`write_id_style_value`] to match qpdf's
     /// `writeTrailer` compact `[<hex1><hex2>]` shape (qpdf special-cases the
     /// `/ID` output; it never passes through the generic array serializer).
-    /// Unlike the trailer, the cross-reference *stream* dictionary keeps `/ID`
-    /// at its lexicographic position (it is not forced last), so the closure
-    /// runs mid-iteration when the `/ID` key is reached.
+    ///
+    /// This function backs two internal paths that keep `/ID` (and, when
+    /// present, `/Encrypt`) at their plain lexicographic position instead of
+    /// forcing them last the way [`write_pdf_trailer`](Self::write_pdf_trailer)
+    /// does: the incremental-update trailer, and the full-rewrite
+    /// `XrefForm::Stream` cross-reference stream dictionary. For a real
+    /// qpdf-produced cross-reference stream, `writeTrailer`
+    /// (`QPDFWriter.cc:1160-1236`) still runs (with `xref_stream=true`) and
+    /// applies the *same* `/ID`-and-`/Encrypt`-last special-casing as the
+    /// classic trailer — so the plain order here is a known flpdf
+    /// simplification, not something qpdf itself does. Byte-identical parity
+    /// for xref-stream-form output is a separate, already out-of-scope gap.
     pub(crate) fn write_pdf_with_id_writer(
         &self,
         out: &mut Vec<u8>,
@@ -933,12 +942,21 @@ impl Dictionary {
     /// appending to `out`.
     ///
     /// qpdf writes the trailer with every key in sorted (`BTreeMap`) order
-    /// **except `/ID`, which is pulled out and emitted last** — structurally the
-    /// same special-casing it applies to `/Length` in stream dictionaries (see
-    /// [`write_pdf_stream`](Self::write_pdf_stream)). Verified against
-    /// `qpdf --static-id` 11.9.0: `<< /Info .. /Root .. /Size N /ID [..] >>`.
-    /// Layout otherwise matches [`write_pdf`](Self::write_pdf) (compact, one
-    /// line). If `/ID` is absent the output is plain sorted order.
+    /// **except `/ID` and `/Encrypt`, which are pulled out and emitted last, in
+    /// that order** — structurally the same special-casing it applies to
+    /// `/Length` in stream dictionaries (see
+    /// [`write_pdf_stream`](Self::write_pdf_stream)). `/Encrypt` sorts
+    /// alphabetically before `/ID`, `/Info`, `/Root`, and `/Size`, but qpdf's
+    /// `writeTrailer` writes it last regardless (`QPDFWriter.cc:1224-1231`,
+    /// guarded on `which != t_lin_second`). This function's two callers never
+    /// trip that guard: the classic full-rewrite non-QDF path never runs a
+    /// linearized second pass, and the plain writer's classic-table path only
+    /// ever serializes an unencrypted trailer. So `/Encrypt` is always moved
+    /// when present. Verified against
+    /// `qpdf --static-id --encrypt` 11.9.0:
+    /// `<< /Info .. /Root .. /Size N /ID [..] /Encrypt N 0 R >>`. Layout
+    /// otherwise matches [`write_pdf`](Self::write_pdf) (compact, one line).
+    /// If neither key is present the output is plain sorted order.
     ///
     /// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
     /// (the `b" /ID "` key token is still emitted) instead of serializing the
@@ -955,9 +973,14 @@ impl Dictionary {
     pub(crate) fn write_pdf_trailer(&self, out: &mut Vec<u8>, id_writer: Option<TrailerIdWriter>) {
         out.extend_from_slice(b"<<");
         let mut id_value: Option<&Object> = None;
+        let mut encrypt_value: Option<&Object> = None;
         for (key, value) in self.iter() {
             if key == b"ID" {
                 id_value = Some(value);
+                continue;
+            }
+            if key == b"Encrypt" {
+                encrypt_value = Some(value);
                 continue;
             }
             out.extend_from_slice(b" /");
@@ -971,6 +994,10 @@ impl Dictionary {
                 Some(write_id) => write_id(out),
                 None => write_id_style_value(out, value),
             }
+        }
+        if let Some(value) = encrypt_value {
+            out.extend_from_slice(b" /Encrypt ");
+            value.write_pdf(out);
         }
         out.extend_from_slice(b" >>");
     }
@@ -1573,6 +1600,45 @@ mod stream_dict_order_tests {
         let mut out = Vec::new();
         d.write_pdf_trailer(&mut out, None);
         assert_eq!(out, b"<< /Root 1 0 R /Size 3 >>".to_vec());
+    }
+
+    /// `/Encrypt` sorts alphabetically before `/ID`/`/Info`/`/Root`/`/Size`, but
+    /// qpdf's `writeTrailer` special-cases it too: it is written right after
+    /// `/ID`, at the very end of the trailer (`QPDFWriter.cc:1224-1231`, guarded
+    /// on `which != t_lin_second` — a guard neither of this function's two
+    /// callers ever trips). Pin that qpdf order.
+    #[test]
+    fn trailer_emits_encrypt_right_after_id() {
+        let mut d = Dictionary::new();
+        // Inserted out of order; BTreeMap sorts /Encrypt first alphabetically —
+        // write_pdf_trailer must still move it to the very end, after /ID.
+        d.insert(b"Size", Object::Integer(8));
+        d.insert(b"Encrypt", Object::reference(ObjectRef::new(5, 0)));
+        d.insert(
+            b"ID",
+            Object::Array(vec![Object::Integer(1), Object::Integer(2)]),
+        );
+        d.insert(b"Info", Object::reference(ObjectRef::new(2, 0)));
+        d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
+        let mut out = Vec::new();
+        d.write_pdf_trailer(&mut out, None);
+        assert_eq!(
+            out,
+            b"<< /Info 2 0 R /Root 1 0 R /Size 8 /ID [ 1 2 ] /Encrypt 5 0 R >>".to_vec()
+        );
+    }
+
+    /// A trailer with `/Encrypt` but no `/ID` still moves `/Encrypt` to the end
+    /// (qpdf's special-case fires independently of whether `/ID` is present).
+    #[test]
+    fn trailer_emits_encrypt_last_without_id() {
+        let mut d = Dictionary::new();
+        d.insert(b"Size", Object::Integer(8));
+        d.insert(b"Encrypt", Object::reference(ObjectRef::new(5, 0)));
+        d.insert(b"Root", Object::reference(ObjectRef::new(1, 0)));
+        let mut out = Vec::new();
+        d.write_pdf_trailer(&mut out, None);
+        assert_eq!(out, b"<< /Root 1 0 R /Size 8 /Encrypt 5 0 R >>".to_vec());
     }
 
     /// Re-filtered multi-key dict: the other keys stay sorted, `/Filter` and
