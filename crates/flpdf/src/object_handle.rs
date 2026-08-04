@@ -137,9 +137,25 @@ pub(crate) enum ObjectValue {
     /// payload. The stream value's own parsed offset (see
     /// [`ObjectHandle::get_parsed_offset`]) is the encoded stream-data
     /// start, distinct from the dictionary's.
+    ///
+    /// The payload is shared rather than owned, mirroring qpdf's
+    /// `std::shared_ptr<Buffer> stream_data` (`libqpdf/qpdf/QPDF_Stream.hh:104`).
+    /// The sharing is observable behaviour, not a micro-optimization:
+    /// `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2240,2256-2258`) hands one
+    /// stream's buffer to a second stream — in a different document — with no
+    /// byte copy, and qpdf refuses to duplicate a stream payload at all
+    /// (`QPDF_Stream::copy` throws, `libqpdf/QPDF_Stream.cc:141-144`).
+    ///
+    /// `Rc<Vec<u8>>` rather than `Rc<[u8]>`: `Rc::<[u8]>::from(vec)` cannot
+    /// retrofit its refcount header onto an allocation `Vec` already made, so
+    /// it memcpys the whole payload (the same trap `page_split`'s
+    /// `SharedSource` documents). `Rc::new(vec)` moves the `Vec`'s three words
+    /// and copies nothing, and it matches qpdf's own shape — a pointer to an
+    /// object that owns the bytes. `Rc` rather than `Arc` because [`Repr`]
+    /// itself is `Rc`-based, so this value is `!Send` regardless.
     Stream {
         dict: ObjectHandle,
-        data: Vec<u8>,
+        data: Rc<Vec<u8>>,
     },
     // qpdf-cutover-delete(flpdf-25kg.3.3): qpdf cannot store an indirect
     // handle as another indirect object's replacement value. Delete this
@@ -401,12 +417,10 @@ impl ObjectHandle {
     ///
     /// A `Stream` value's `dict` gets the same `shallow_copy_child`
     /// treatment [`Self::shallow_copy`] gives it, rather than the plain
-    /// `ObjectValue::clone()` every other variant gets: `#[derive(Clone)]`
-    /// would leave `dict` Rc-shared with `self` while deep-cloning `data`,
-    /// so a later `replace_stream_data` on either handle would update the
-    /// other's `/Length`/`/Filter`/`/DecodeParms` without touching its
-    /// (independently cloned) data bytes — the exact asymmetry
-    /// `shallow_copy`'s own doc comment explains for that method.
+    /// `ObjectValue::clone()` every other variant gets — see that method's
+    /// own doc comment for what privatizing a direct child buys. The payload
+    /// is shared either way: it is an `Rc`, matching qpdf's
+    /// `std::shared_ptr<Buffer>` (`libqpdf/qpdf/QPDF_Stream.hh:104`).
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         match &self.0 {
             Repr::Direct(slot) => Some(match &slot.borrow().value {
@@ -770,7 +784,13 @@ impl ObjectHandle {
     /// forbid it, matching [`Self::unparse_resolved`]'s own doc for that
     /// case. Mainly useful for building a handle that is deliberately never
     /// attached to a [`crate::Pdf`]'s object graph, e.g. in tests.
-    pub fn stream(dict: ObjectHandle, data: Vec<u8>) -> Self {
+    ///
+    /// `data` is used as given rather than copied, the way
+    /// `QPDFObjectHandle::newStream(QPDF*, std::shared_ptr<Buffer>)` "use[s]
+    /// the given buffer as the stream data"
+    /// (`include/qpdf/QPDFObjectHandle.hh:546-558`). Handing the same buffer
+    /// to a second stream shares it; nothing here copies the bytes.
+    pub fn stream(dict: ObjectHandle, data: Rc<Vec<u8>>) -> Self {
         Self::new_direct(ObjectValue::Stream { dict, data }, NO_PARSED_OFFSET)
     }
 
@@ -1239,8 +1259,8 @@ impl ObjectHandle {
         }
     }
 
-    /// Replace this handle's stream data, and — when given — its `/Filter`
-    /// and `/DecodeParms` dictionary keys, mirroring
+    /// Replace this handle's stream data with the given buffer, and — when
+    /// given — its `/Filter` and `/DecodeParms` dictionary keys, mirroring
     /// `QPDFObjectHandle::replaceStreamData`'s buffer overload
     /// (`libqpdf/QPDFObjectHandle.cc:1345-1350`, delegating to
     /// `QPDF_Stream::replaceStreamData`/`replaceFilterData`,
@@ -1254,6 +1274,13 @@ impl ObjectHandle {
     /// port (no caller in this crate needs deferred stream production). A
     /// no-op if this handle's value is not a stream.
     ///
+    /// `data` is installed as given, not copied — qpdf's own
+    /// `std::shared_ptr<Buffer>` overload is documented against its
+    /// string overload precisely on that point
+    /// (`include/qpdf/QPDFObjectHandle.hh:1086-1097`). This is what lets one
+    /// buffer back two streams, as `QPDF::copyStreamData` does
+    /// (`libqpdf/QPDF.cc:2240,2256-2258`).
+    ///
     /// See [`Self::replace_key`]'s doc comment for the same
     /// `resolve`/`resolve_borrowed` staleness caveat and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
@@ -1261,7 +1288,7 @@ impl ObjectHandle {
     /// `replace_key` and mutates the stream data in place.
     pub fn replace_stream_data(
         &self,
-        data: Vec<u8>,
+        data: Rc<Vec<u8>>,
         filter: Option<ObjectHandle>,
         decode_parms: Option<ObjectHandle>,
     ) {
@@ -1304,7 +1331,12 @@ impl ObjectHandle {
     /// stream, or `None` otherwise. This never performs resolution itself:
     /// an indirect handle that has not yet been resolved returns `None`
     /// too, the same as a resolved value of a different type.
-    pub fn as_stream_data(&self) -> Option<Vec<u8>> {
+    ///
+    /// The payload is shared, not copied: this hands out the same allocation
+    /// the stream holds, mirroring `QPDF_Stream::getStreamDataBuffer`
+    /// (`libqpdf/qpdf/QPDF_Stream.hh:39`), which returns qpdf's
+    /// `std::shared_ptr<Buffer>` itself.
+    pub fn as_stream_data(&self) -> Option<Rc<Vec<u8>>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Stream { data, .. }) => Some(data.clone()),
             _ => None,
@@ -1674,7 +1706,11 @@ fn materialize_value(value: &ObjectValue, depth: usize) -> Object {
                 // substituted `Object::Null` for it.
                 _ => Dictionary::new(), // cov:ignore: unreachable outside the depth-cap fallback, itself covered separately
             };
-            Object::Stream(Stream::new(dict, data.clone()))
+            // The legacy `Object::Stream` owns its bytes, so crossing into it
+            // copies the payload. That copy is a property of the legacy route,
+            // not of the shared representation above; it disappears with the
+            // route itself.
+            Object::Stream(Stream::new(dict, data.as_ref().clone()))
         }
         ObjectValue::Reference(object_ref) => Object::Reference(*object_ref),
     }
@@ -1720,7 +1756,8 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
                 Object::Dictionary(dict) => dict,
                 _ => Dictionary::new(), // cov:ignore: same invariant as materialize_value's own Stream arm
             };
-            Object::Stream(Stream::new(dict, data.clone()))
+            // Same legacy-route payload copy as `materialize_value`'s arm.
+            Object::Stream(Stream::new(dict, data.as_ref().clone()))
         }
         // No other variant nests a dictionary, so the omission rule cannot
         // apply anywhere beneath it; delegate to the ordinary materializer.
@@ -2532,9 +2569,9 @@ mod object_value_tests {
     #[test]
     fn stream_handle_round_trips_its_dict_and_data() {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]);
-        let stream = ObjectHandle::stream(dict.clone(), b"abc".to_vec());
+        let stream = ObjectHandle::stream(dict.clone(), Rc::new(b"abc".to_vec()));
         assert!(stream.as_stream_dict().expect("stream dict").ptr_eq(&dict));
-        assert_eq!(stream.as_stream_data(), Some(b"abc".to_vec()));
+        assert_eq!(stream.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
         assert_eq!(stream.type_code(), 10, "ot_stream");
     }
 
@@ -2647,6 +2684,97 @@ mod object_value_tests {
         assert_eq!(handle.as_real_literal(), None);
         assert!(handle.as_stream_dict().is_none());
         assert!(handle.as_stream_data().is_none());
+    }
+}
+
+#[cfg(test)]
+mod stream_payload_sharing_tests {
+    use super::*;
+
+    // The address of the bytes a stream handle currently stores. Every
+    // assertion below compares addresses rather than bytes, because a
+    // byte-equality assertion passes for a deep-copying implementation too.
+    fn stored_payload_ptr(handle: &ObjectHandle) -> *const u8 {
+        handle.with_value(|value| match value {
+            Some(ObjectValue::Stream { data, .. }) => data.as_ptr(),
+            _ => panic!("expected a stream value"),
+        })
+    }
+
+    fn stream_with_payload(len: usize) -> ObjectHandle {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Length".to_vec(),
+            ObjectHandle::integer(len as i64),
+        )]);
+        ObjectHandle::stream(dict, Rc::new(vec![0x5a; len]))
+    }
+
+    // `QPDF::copyStreamData` takes the source stream's buffer
+    // (`libqpdf/QPDF.cc:2240`) and installs it on a second stream — in a
+    // different document — with no byte copy (`:2256-2258`), because "if the
+    // source stream is copied multiple times, we don't have to keep
+    // duplicating the memory" (`:2242-2244`). That is only expressible when
+    // both the accessor and the replacement entry point speak in shared
+    // buffers, as qpdf's own `getStreamDataBuffer` /
+    // `replaceStreamData(std::shared_ptr<Buffer>, ...)` pair does.
+    #[test]
+    fn one_buffer_backs_two_streams_without_copying() {
+        let source = stream_with_payload(4096);
+        let shared = source.as_stream_data().expect("stream data");
+        let destination = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]),
+            Rc::new(Vec::new()),
+        );
+
+        destination.replace_stream_data(shared.clone(), None, None);
+
+        assert_eq!(stored_payload_ptr(&source), shared.as_ptr());
+        assert_eq!(stored_payload_ptr(&destination), shared.as_ptr());
+        assert_eq!(
+            destination
+                .as_stream_dict()
+                .expect("stream dict")
+                .get_key(b"Length")
+                .as_integer(),
+            Some(4096),
+        );
+    }
+
+    // qpdf's payload is a `std::shared_ptr<Buffer>`
+    // (`libqpdf/qpdf/QPDF_Stream.hh:104`), so copying a stream value shares
+    // the bytes instead of duplicating them.
+    #[test]
+    fn direct_value_clone_shares_the_stream_payload_allocation() {
+        let stream = stream_with_payload(4096);
+        let before = stored_payload_ptr(&stream);
+
+        let copy = ObjectHandle::from_value(stream.direct_value_clone().expect("direct value"));
+
+        assert_eq!(stored_payload_ptr(&copy), before);
+    }
+
+    #[test]
+    fn shallow_copy_shares_the_stream_payload_allocation() {
+        let stream = stream_with_payload(4096);
+        let before = stored_payload_ptr(&stream);
+
+        let copy = stream.shallow_copy();
+
+        assert_eq!(stored_payload_ptr(&copy), before);
+    }
+
+    // `QPDF_Stream::getStreamDataBuffer` (`libqpdf/qpdf/QPDF_Stream.hh:39`)
+    // hands out the `shared_ptr` itself, which is what lets
+    // `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2240,2256-2258`) give one
+    // buffer to a second stream without duplicating the memory.
+    #[test]
+    fn as_stream_data_hands_out_the_stored_payload_without_copying_it() {
+        let stream = stream_with_payload(4096);
+        let before = stored_payload_ptr(&stream);
+
+        let handed_out = stream.as_stream_data().expect("stream data");
+
+        assert_eq!(handed_out.as_ptr(), before);
     }
 }
 
@@ -3032,7 +3160,7 @@ mod materialize_tests {
             ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(5))]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             dict: dict_handle,
-            data: b"Hello".to_vec(),
+            data: Rc::new(b"Hello".to_vec()),
         });
 
         let Object::Stream(materialized) = stream.materialize() else {
@@ -3246,7 +3374,7 @@ mod type_code_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             dict,
-            data: Vec::new(),
+            data: Rc::new(Vec::new()),
         });
         assert_eq!(stream.type_code(), 10);
         assert_eq!(stream.type_name(), "stream");
@@ -3357,7 +3485,7 @@ mod unparse_tests {
         let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         stream.set_resolved(ObjectValue::Stream {
             dict: ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]),
-            data: Vec::new(),
+            data: Rc::new(Vec::new()),
         });
         let inner_dict = ObjectHandle::dictionary(vec![
             (b"A".to_vec(), ObjectHandle::null()),
@@ -3415,7 +3543,7 @@ mod unparse_tests {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         handle.set_resolved(ObjectValue::Stream {
             dict,
-            data: Vec::new(),
+            data: Rc::new(Vec::new()),
         });
         assert_eq!(handle.unparse(), b"9 0 R");
         assert_eq!(handle.unparse_resolved(), b"9 0 R");
@@ -3450,7 +3578,7 @@ mod unparse_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             dict,
-            data: b"ab".to_vec(),
+            data: Rc::new(b"ab".to_vec()),
         });
         assert_eq!(
             handle.unparse_resolved(),
@@ -3928,10 +4056,10 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             dict: dict.clone(),
-            data: b"old".to_vec(),
+            data: Rc::new(b"old".to_vec()),
         });
-        stream.replace_stream_data(b"new data".to_vec(), None, None);
-        assert_eq!(stream.as_stream_data(), Some(b"new data".to_vec()));
+        stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
+        assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
         assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
     }
 
@@ -3940,12 +4068,16 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             dict: dict.clone(),
-            data: b"old".to_vec(),
+            data: Rc::new(b"old".to_vec()),
         });
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
         let parms =
             ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(12))]);
-        stream.replace_stream_data(b"x".to_vec(), Some(filter.clone()), Some(parms.clone()));
+        stream.replace_stream_data(
+            Rc::new(b"x".to_vec()),
+            Some(filter.clone()),
+            Some(parms.clone()),
+        );
         assert!(dict.get_key(b"Filter").ptr_eq(&filter));
         assert!(dict.get_key(b"DecodeParms").ptr_eq(&parms));
     }
@@ -3958,9 +4090,9 @@ mod mutation_tests {
         )]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             dict: dict.clone(),
-            data: b"old".to_vec(),
+            data: Rc::new(b"old".to_vec()),
         });
-        stream.replace_stream_data(b"new".to_vec(), None, None);
+        stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
         assert_eq!(
             dict.get_key(b"Filter").as_name(),
             Some(b"FlateDecode".to_vec())
@@ -3970,7 +4102,7 @@ mod mutation_tests {
     #[test]
     fn replace_stream_data_on_a_non_stream_handle_is_a_no_op() {
         let scalar = ObjectHandle::integer(1);
-        scalar.replace_stream_data(b"x".to_vec(), None, None);
+        scalar.replace_stream_data(Rc::new(b"x".to_vec()), None, None);
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -4084,12 +4216,12 @@ mod mutation_tests {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Stream {
             dict: ObjectHandle::dictionary(vec![]),
-            data: b"old".to_vec(),
+            data: Rc::new(b"old".to_vec()),
         });
         let copy = indirect.shallow_copy();
-        copy.replace_stream_data(b"new data".to_vec(), None, None);
+        copy.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
 
-        assert_eq!(copy.as_stream_data(), Some(b"new data".to_vec()));
+        assert_eq!(copy.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
         assert_eq!(
             copy.as_stream_dict()
                 .unwrap()
@@ -4097,7 +4229,7 @@ mod mutation_tests {
                 .as_integer(),
             Some(8)
         );
-        assert_eq!(indirect.as_stream_data(), Some(b"old".to_vec()));
+        assert_eq!(indirect.as_stream_data(), Some(Rc::new(b"old".to_vec())));
         assert!(indirect
             .as_stream_dict()
             .unwrap()

@@ -1360,7 +1360,7 @@ impl<R: Read + Seek> Pdf<R> {
             existing_dict.replace_direct_value(dict_value);
             return Ok(ObjectValue::Stream {
                 dict: existing_dict,
-                data: stream.data.clone(),
+                data: Rc::new(stream.data.clone()),
             });
         }
         self.lift(object, 0)
@@ -2248,7 +2248,7 @@ impl<R: Read + Seek> Pdf<R> {
         Ok((
             ObjectValue::Stream {
                 dict: dict_handle,
-                data: stream.data.clone(),
+                data: Rc::new(stream.data.clone()),
             },
             stream_offset,
         ))
@@ -2347,7 +2347,7 @@ impl<R: Read + Seek> Pdf<R> {
                     dict: ObjectHandle::from_value(ObjectValue::Dictionary(
                         self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
                     )),
-                    data: stream.data.clone(),
+                    data: Rc::new(stream.data.clone()),
                 },
                 // A bare top-level reference never comes from a file/ObjStm
                 // parse (`top_level_no_reference` integerizes it there,
@@ -4513,7 +4513,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let mut value = ObjectValue::Stream {
             dict,
-            data: b"stream payload, untouched by string decryption".to_vec(),
+            data: Rc::new(b"stream payload, untouched by string decryption".to_vec()),
         };
 
         decrypt_object_value_strings(object_ref, &mut value, &encryption)
@@ -4554,7 +4554,7 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let stream_child = ObjectHandle::from_value(ObjectValue::Stream {
             dict: stream_dict,
-            data: b"payload".to_vec(),
+            data: Rc::new(b"payload".to_vec()),
         });
         let mut value = ObjectValue::Array(vec![stream_child]);
 
@@ -4660,7 +4660,7 @@ mod tests {
                 b"Deep".to_vec(),
                 nest(crate::object::MAX_INLINE_DEPTH - 1),
             )]),
-            data: Vec::new(),
+            data: Rc::new(Vec::new()),
         };
         decrypt_object_value_strings(object_ref, &mut accepted, &encryption).expect(
             "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
@@ -4672,7 +4672,7 @@ mod tests {
                 b"TooDeep".to_vec(),
                 nest(crate::object::MAX_INLINE_DEPTH),
             )]),
-            data: Vec::new(),
+            data: Rc::new(Vec::new()),
         };
         let err = decrypt_object_value_strings(object_ref, &mut rejected, &encryption)
             .expect_err("one level past the legacy decryptor's own boundary must still error");
@@ -5060,7 +5060,7 @@ mod tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
             dict: dict.clone(),
-            data: b"old".to_vec(),
+            data: Rc::new(b"old".to_vec()),
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let indirect = pdf
@@ -5156,7 +5156,7 @@ mod tests {
         let indirect = pdf
             .make_indirect_object_handle(ObjectHandle::stream(
                 ObjectHandle::dictionary(vec![]),
-                b"stream payload must remain handle-owned".to_vec(),
+                Rc::new(b"stream payload must remain handle-owned".to_vec()),
             ))
             .expect("make indirect");
         let object_ref = indirect.object_ref().expect("indirect ref");
@@ -6182,7 +6182,7 @@ mod tests {
         // `ObjectValue::Null` — so the fallback path now carries the real
         // stream value, matching `resolve_borrowed`, at the no-offset
         // sentinel (this fallback never records a real parsed offset).
-        assert_eq!(handle.as_stream_data(), Some(b"abc".to_vec()));
+        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
         assert_eq!(handle.get_parsed_offset(), -1);
     }
 
@@ -7733,7 +7733,7 @@ mod tests {
         pdf.resolve_object_handle(&handle)
             .expect("resolve recovered stream");
 
-        assert_eq!(handle.as_stream_data(), Some(b"abc".to_vec()));
+        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
         assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
     }
 

@@ -12,6 +12,7 @@
 use flpdf::{Object, ObjectHandle, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::BufReader;
+use std::rc::Rc;
 
 fn minimal_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf")
@@ -169,7 +170,7 @@ fn resolve_object_handle_survives_a_cyclic_indirect_stream_length() {
     // new bridge's own materialized stream data must match.
     let legacy = pdf.resolve(object_ref).expect("legacy resolve");
     assert_eq!(legacy.as_stream().expect("stream").data, b"abc");
-    assert_eq!(handle.as_stream_data(), Some(b"abc".to_vec()));
+    assert_eq!(handle.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
 
     // The stream's own dictionary is a distinct, natively-parsed handle
     // (not folded into the stream value itself), and its /Length entry
@@ -462,7 +463,7 @@ fn stream_handle_and_its_dictionary_handle_have_distinct_offsets() {
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
     pdf.resolve_object_handle(&handle).expect("resolve stream");
 
-    assert_eq!(handle.as_stream_data(), Some(b"Hello".to_vec()));
+    assert_eq!(handle.as_stream_data(), Some(Rc::new(b"Hello".to_vec())));
     assert_eq!(handle.get_parsed_offset(), expected_stream_offset);
 
     let dict_handle = handle.as_stream_dict().expect("stream dictionary handle");
