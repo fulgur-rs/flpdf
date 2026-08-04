@@ -473,7 +473,17 @@ name before using it.
 
 **Step 2: Run tests to verify they fail (or don't compile) first**
 
-Run: `cargo test -p flpdf --lib reader::resolver::tests::an_unencrypted_document_reports_no_encryption_parameters reader::resolver::tests::an_rc4_document_reports_its_encryption_parameters reader::resolver::tests::an_aes_document_reports_its_encryption_parameters`
+`cargo test` accepts only a single positional `[TESTNAME]` filter
+(`cargo test --help`: `Usage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]`)
+— passing three names in one invocation makes the second one an unexpected
+argument and the command exits before running anything. Run each
+individually:
+
+```bash
+cargo test -p flpdf --lib reader::resolver::tests::an_unencrypted_document_reports_no_encryption_parameters
+cargo test -p flpdf --lib reader::resolver::tests::an_rc4_document_reports_its_encryption_parameters_through_the_shared_cell
+cargo test -p flpdf --lib reader::resolver::tests::an_aes_document_reports_its_encryption_parameters_through_the_shared_cell
+```
 
 Before Task 1/2 land, `encryption_parameters` doesn't exist — but by this
 point in the plan it does, so these should compile immediately. If they pass
