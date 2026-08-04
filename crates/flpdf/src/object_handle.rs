@@ -591,7 +591,6 @@ impl ObjectHandle {
     ///
     /// Direct and already-terminal handles are no-ops. An unresolved handle
     /// whose document has been dropped returns an error and stays unresolved.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_dereference(&self) -> Result<()> {
         let (object_ref, resolver) = match &self.0 {
             Repr::Direct(_) => return Ok(()),
@@ -614,7 +613,6 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_is_null(&self) -> Result<bool> {
         self.try_dereference()?;
         Ok(self.is_null())
