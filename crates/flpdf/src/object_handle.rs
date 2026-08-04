@@ -146,6 +146,12 @@ pub(crate) enum ObjectValue {
     /// byte copy, and qpdf refuses to duplicate a stream payload at all
     /// (`QPDF_Stream::copy` throws, `libqpdf/QPDF_Stream.cc:141-144`).
     ///
+    /// Sharing is sound here because the payload is never written through:
+    /// [`ObjectHandle::replace_stream_data`] swaps the whole buffer rather
+    /// than editing bytes in place, and nothing in this crate reaches inside
+    /// one. Two streams holding one buffer therefore cannot become visible to
+    /// each other, and no path needs `Rc::make_mut`'s silent copy-on-write.
+    ///
     /// `Rc<Vec<u8>>` rather than `Rc<[u8]>`: `Rc::<[u8]>::from(vec)` cannot
     /// retrofit its refcount header onto an allocation `Vec` already made, so
     /// it memcpys the whole payload (the same trap `page_split`'s
@@ -422,10 +428,14 @@ impl ObjectHandle {
     ///
     /// A `Stream` value's `dict` gets the same `shallow_copy_child`
     /// treatment [`Self::shallow_copy`] gives it, rather than the plain
-    /// `ObjectValue::clone()` every other variant gets — see that method's
-    /// own doc comment for what privatizing a direct child buys. The payload
-    /// is shared either way: it is an `Rc`, matching qpdf's
-    /// `std::shared_ptr<Buffer>` (`libqpdf/qpdf/QPDF_Stream.hh:104`).
+    /// `ObjectValue::clone()` every other variant gets: leaving it Rc-shared
+    /// with `self` would let a later [`Self::replace_stream_data`] on either
+    /// handle rewrite the other's `/Length`/`/Filter`/`/DecodeParms`, since
+    /// that method installs those keys on the dictionary. That is the only
+    /// difference from a plain clone — the payload is shared either way, as
+    /// an `Rc` mirroring qpdf's `std::shared_ptr<Buffer>`
+    /// (`libqpdf/qpdf/QPDF_Stream.hh:104`), and sharing it is harmless
+    /// because nothing writes through it.
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         match &self.0 {
             Repr::Direct(slot) => Some(match &slot.borrow().value {
@@ -2775,15 +2785,26 @@ mod stream_payload_sharing_tests {
         assert!(Rc::ptr_eq(&handed_out, &shared));
     }
 
-    // An empty payload is still a buffer, not an absent one: the shared
-    // allocation is handed out and shared like any other.
+    // An empty payload is still a buffer, not an absent one: it is handed out
+    // and shared like any other, and replacing with one sets `/Length` to 0
+    // rather than leaving the previous length behind.
     #[test]
     fn an_empty_payload_is_shared_like_any_other() {
         let shared = Rc::new(Vec::new());
-        let stream = ObjectHandle::stream(length_dict(0), Rc::clone(&shared));
+        let stream = ObjectHandle::stream(length_dict(4096), Rc::new(vec![0x5a; 4096]));
+
+        stream.replace_stream_data(Rc::clone(&shared), None, None);
 
         assert!(Rc::ptr_eq(&payload_of(&stream), &shared));
         assert!(Rc::ptr_eq(&payload_of(&stream.shallow_copy()), &shared));
+        assert_eq!(
+            stream
+                .as_stream_dict()
+                .expect("stream dict")
+                .get_key(b"Length")
+                .as_integer(),
+            Some(0),
+        );
     }
 }
 
