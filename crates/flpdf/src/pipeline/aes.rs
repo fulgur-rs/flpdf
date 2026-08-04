@@ -14,20 +14,25 @@ use aes::cipher::{BlockDecryptMut, KeyIvInit};
 use aes::{Aes128, Aes256};
 
 /// qpdf `QPDFCryptoImpl::rijndael_buf_size` (`Pl_AES_PDF.hh:44`).
+#[allow(dead_code)]
 const BUF_SIZE: usize = 16;
 
+#[allow(dead_code)]
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
+#[allow(dead_code)]
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
 /// The initialized cipher, standing in for the state qpdf's crypto provider
 /// holds between `rijndael_init` and `rijndael_finalize`. `None` before the
 /// first block, mirroring qpdf's `first` flag gating `rijndael_init`
 /// (`Pl_AES_PDF.cc:152-181`).
+#[allow(dead_code)]
 enum Cipher {
     Cbc128Decrypt(Box<Aes128CbcDec>),
     Cbc256Decrypt(Box<Aes256CbcDec>),
 }
 
+#[allow(dead_code)]
 impl Cipher {
     fn process(&mut self, inbuf: &[u8; BUF_SIZE], outbuf: &mut [u8; BUF_SIZE]) {
         match self {
@@ -42,6 +47,10 @@ impl Cipher {
 }
 
 /// qpdf `Pl_AES_PDF` (`libqpdf/qpdf/Pl_AES_PDF.hh:12-60`).
+///
+// No production caller until `QPDF::pipeStreamData`'s decrypt path is ported;
+// the same not-yet-wired state `PlRc4` and the other `Pl_*` stages carry.
+#[allow(dead_code)]
 pub(crate) struct PlAesPdf<'a> {
     identifier: String,
     next: &'a mut dyn Pipeline,
@@ -58,6 +67,7 @@ pub(crate) struct PlAesPdf<'a> {
     disable_padding: bool,
 }
 
+#[allow(dead_code)]
 impl<'a> PlAesPdf<'a> {
     /// A decrypting stage, mirroring `Pl_AES_PDF(identifier, next, false, key,
     /// key_bytes)`. The initialization vector is read from the head of the
