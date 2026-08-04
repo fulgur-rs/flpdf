@@ -121,6 +121,32 @@ fn file_output_file_mode_defaults_prefix_to_output_filename() {
 }
 
 #[test]
+fn file_output_file_mode_empty_prefix_defaults_to_output_filename() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let output_path = tempdir.path().join("output.json");
+    let expected_side_file = stream_side_file(&output_path);
+    let mut pdf = open_fixture();
+    let mut bytes = Vec::new();
+
+    write_json(
+        &mut pdf,
+        options(JsonStreamData::File, Some("")),
+        JsonJobOutput::File {
+            filename: &output_path,
+            writer: &mut bytes,
+        },
+    )
+    .unwrap();
+
+    let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        output["qpdf"][1]["obj:7 0 R"]["stream"]["datafile"],
+        expected_side_file.to_string_lossy().as_ref()
+    );
+    assert!(expected_side_file.exists());
+}
+
+#[test]
 fn none_and_inline_modes_do_not_require_prefix() {
     let mut none_pdf = open_fixture();
     let mut none_bytes = Vec::new();

@@ -252,14 +252,14 @@ struct Cli {
 
     /// Prefix for side-file names when --json-stream-data=file.
     /// With --json-output, defaults to the JSON output path. With JSON on
-    /// stdout, file stream data requires an explicit prefix.
+    /// stdout, file stream data requires an explicit non-empty prefix.
     #[arg(
         long = "json-stream-prefix",
         value_name = "PREFIX",
         requires = "json",
         help = "Prefix for side files with --json-stream-data=file. With --json-output, \
                 defaults to the JSON output path; with JSON on stdout, an explicit \
-                prefix is required."
+                non-empty prefix is required. An empty prefix is treated as absent."
     )]
     json_stream_prefix: Option<String>,
 

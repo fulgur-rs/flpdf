@@ -1026,6 +1026,39 @@ fn json_output_file_mode_defaults_stream_prefix() {
 }
 
 #[test]
+fn json_output_file_mode_empty_prefix_defaults_stream_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    let expected_side_file = temp.path().join("output.json-4");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix=",
+            "--json-output",
+        ])
+        .arg(&output_path)
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(
+        json["qpdf"][1]["obj:4 0 R"]["stream"]["datafile"],
+        expected_side_file.to_string_lossy().as_ref()
+    );
+    assert!(expected_side_file.exists());
+}
+
+#[test]
 #[ignore = "live qpdf 11.9.0 missing JSON stream prefix oracle"]
 fn live_qpdf_json_file_stdout_requires_prefix() {
     if skip_unless_qpdf_11_9() {

@@ -8,9 +8,9 @@
 
 Make flpdf's JSON file-mode output selection follow qpdf 11.9.0's
 `QPDFJob::writeJSON` responsibility and call order. In particular, writing JSON
-to stdout with `--json-stream-data=file` must require an explicit
+to stdout with `--json-stream-data=file` must require an explicit non-empty
 `--json-stream-prefix`, while JSON written to a file continues to default the
-stream prefix to the JSON output filename.
+stream prefix to the JSON output filename when the prefix is absent or empty.
 
 This is the first `job/` JSON orchestration slice. It does not claim that the
 whole `QPDFJob` component is complete. The later `flpdf-q2fo` slice moves the
@@ -164,9 +164,12 @@ It resolves `JsonStreamDataMode` exactly once:
 
 - `None` becomes `JsonStreamDataMode::None`.
 - `Inline` becomes `JsonStreamDataMode::Inline`.
-- `File` plus an explicit prefix uses that prefix for either destination.
-- `File` plus no prefix and `JsonJobOutput::File` uses the output filename.
-- `File` plus no prefix and `JsonJobOutput::Stdout` returns
+- `File` plus an explicit non-empty prefix uses that prefix for either
+  destination.
+- `File` plus no prefix or an explicit empty prefix and
+  `JsonJobOutput::File` uses the output filename.
+- `File` plus no prefix or an explicit empty prefix and
+  `JsonJobOutput::Stdout` returns
   `UsageError("please specify --json-stream-prefix since the input file name is unknown")`.
 
 After resolution it calls the existing
@@ -195,7 +198,8 @@ password handling, PDF open, and warning emission. It changes as follows:
 
 The `--json-stream-prefix` help text changes from the incorrect
 `"--json-output path or stream"` default to: file output defaults to the JSON
-output filename; stdout file mode requires an explicit prefix.
+output filename; stdout file mode requires an explicit non-empty prefix. An
+empty prefix follows the absent-prefix behavior.
 
 ## Error and side-effect ordering
 
@@ -234,10 +238,12 @@ TDD begins with a focused CLI regression that fails because current flpdf exits
 Additional tests cover:
 
 - a live qpdf/flpdf differential using `FLPDF_PROGNAME=qpdf`
-- explicit prefix with stdout remains successful and writes the referenced
-  side file
+- explicit non-empty prefix with stdout remains successful and writes the
+  referenced side file
 - JSON file output without an explicit prefix remains successful and uses the
   JSON output filename as the side-file prefix
+- JSON file output with an explicit empty prefix follows the absent-prefix
+  behavior and uses the JSON output filename as the side-file prefix
 - nonexistent input reports the input-open failure rather than the prefix
   usage error
 - malformed unrecoverable input reports its input failure rather than the

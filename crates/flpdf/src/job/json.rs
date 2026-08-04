@@ -24,14 +24,15 @@ pub enum JsonStreamData {
 /// Unresolved JSON output options accepted at the command boundary.
 ///
 /// [`write_json`] resolves [`JsonStreamData::File`] without an explicit
-/// [`stream_prefix`](Self::stream_prefix) from a file output name when one is
-/// available.
+/// non-empty [`stream_prefix`](Self::stream_prefix) from a file output name
+/// when one is available. An empty prefix is treated as absent.
 pub struct JsonJobOptions<'a> {
     /// Level of PDF stream decoding before JSON serialization.
     pub decode_level: DecodeLevel,
     /// How stream payloads are represented in the JSON output.
     pub stream_data: JsonStreamData,
     /// Explicit prefix for stream side files, when stream data uses file mode.
+    /// An empty prefix is treated as absent.
     pub stream_prefix: Option<&'a str>,
     /// Requested top-level qpdf JSON v2 keys.
     pub keys: &'a [JsonKey],
@@ -79,7 +80,7 @@ pub enum JsonJobError {
 /// # Errors
 ///
 /// Returns [`JsonJobError::Usage`] when file stream data is requested for
-/// standard output without an explicit prefix. Returns
+/// standard output without an explicit non-empty prefix. Returns
 /// [`JsonJobError::Output`] when the delegated serializer cannot convert PDF
 /// data or write its output.
 pub fn write_json<R: Read + Seek>(

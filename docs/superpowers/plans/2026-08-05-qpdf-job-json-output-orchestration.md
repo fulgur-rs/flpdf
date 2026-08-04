@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `--json-stream-data=file` reject stdout output without an explicit `--json-stream-prefix`, while introducing the source-faithful `QPDFJob::writeJSON`-equivalent library boundary that owns prefix resolution and output selection.
+**Goal:** Make `--json-stream-data=file` reject stdout output without an explicit non-empty `--json-stream-prefix`, while introducing the source-faithful `QPDFJob::writeJSON`-equivalent library boundary that owns prefix resolution and output selection. An explicit empty prefix follows the same behavior as an absent prefix.
 
 **Architecture:** Add a small `flpdf::job` JSON orchestration layer corresponding to qpdf 11.9.0 `QPDFJob::writeJSON` (`libqpdf/QPDFJob.cc:3094-3115`). It keeps the unresolved stream-data request separate from an optional prefix, resolves the default only after the input PDF has opened, and delegates all JSON construction and stream writing to the existing `json_inspect` writer. The CLI retains argument parsing, input/output safety checks, warning emission, and qpdf-shaped process exit formatting.
 
@@ -16,6 +16,8 @@
 - Do not move or duplicate the existing `doJSON*`/`QPDF::writeJSON`-equivalent serialization in `json_inspect.rs`; the new layer only orchestrates output selection and resolved stream mode.
 - Keep public rustdoc in English and free of Beads IDs or speculative follow-up work.
 - Follow strict RED -> GREEN -> REFACTOR. Run the named failing test before adding the production implementation that makes it pass.
+- Treat an explicit empty prefix as absent, matching qpdf's
+  `json_stream_prefix.empty()` checks.
 - Do not use a fallback prefix such as `"stream"` for stdout file mode.
 
 ---
@@ -144,7 +146,8 @@ Add these tests:
 1. `stdout_file_mode_without_prefix_is_usage_error`: pass `JsonJobOutput::Stdout`, assert `JsonJobError::Usage`, exact message `please specify --json-stream-prefix since the input file name is unknown`, and empty output.
 2. `stdout_file_mode_uses_explicit_prefix`: use a temporary absolute prefix, assert success, valid JSON stdout, and the expected stream side file exists.
 3. `file_output_file_mode_defaults_prefix_to_output_filename`: pass `JsonJobOutput::File { filename: &output_path, writer: &mut bytes }`, assert the JSON contains that filename plus the stream object suffix and the side file exists.
-4. `none_and_inline_modes_do_not_require_prefix`: run both modes through stdout with no prefix and assert success; inline output contains `"data"`, while none output does not contain `"datafile"`.
+4. `file_output_file_mode_empty_prefix_defaults_to_output_filename`: pass an explicit empty prefix with file output and assert the JSON uses the output filename plus the stream object suffix and the side file exists.
+5. `none_and_inline_modes_do_not_require_prefix`: run both modes through stdout with no prefix and assert success; inline output contains `"data"`, while none output does not contain `"datafile"`.
 
 The committed `one-page.pdf` fixture's content stream is object 7, so the positive tests must assert the exact `<prefix>-7` path.
 
@@ -259,7 +262,8 @@ pub fn write_json<R: Read + Seek>(
     options: JsonJobOptions<'_>,
     output: JsonJobOutput<'_>,
 ) -> Result<(), JsonJobError> {
-    let stream_mode = match (options.stream_data, options.stream_prefix, &output) {
+    let stream_prefix = options.stream_prefix.filter(|prefix| !prefix.is_empty());
+    let stream_mode = match (options.stream_data, stream_prefix, &output) {
         (JsonStreamData::None, _, _) => StreamDataMode::None,
         (JsonStreamData::Inline, _, _) => StreamDataMode::Inline,
         (JsonStreamData::File, Some(prefix), _) => StreamDataMode::File {
@@ -303,7 +307,8 @@ Do not add an independent JSON builder, side-file writer, logger abstraction, or
 cargo test -p flpdf --test job_json_tests
 ```
 
-Expected: PASS for usage, explicit-prefix, output-filename default, none, and inline arms.
+Expected: PASS for usage, explicit non-empty-prefix, absent/empty output-filename
+defaults, none, and inline arms.
 
 - [ ] **Step 5: Run the existing JSON writer unit tests**
 
@@ -390,7 +395,9 @@ The explicit trailing newline inside the format string plus `eprintln!`'s newlin
 Update the `json_stream_prefix` documentation/help so it states:
 
 - with `--json-output`, a missing prefix defaults to the JSON output filename;
-- with JSON on stdout and `--json-stream-data=file`, an explicit prefix is required;
+- with JSON on stdout and `--json-stream-data=file`, an explicit non-empty
+  prefix is required;
+- an explicit empty prefix follows the absent-prefix behavior;
 - no `"stream"` fallback exists.
 
 - [ ] **Step 6: Run the focused regression and confirm GREEN**
@@ -407,14 +414,16 @@ Add these focused CLI tests:
 
 1. `missing_stream_prefix_does_not_mask_missing_input`: a missing input with stdout file mode reports the input-open error, not the prefix usage error;
 2. `missing_stream_prefix_does_not_mask_malformed_input`: an unrecoverably malformed input reports the parse/repair error first;
-3. `json_stream_data_file_to_stdout_uses_explicit_prefix`: stdout file mode with an explicit prefix succeeds and creates the synthetic fixture's `<prefix>-4` side file;
-4. `json_output_file_mode_defaults_stream_prefix`: file output with no explicit prefix succeeds and creates `<json-output-path>-4`.
+3. `json_stream_data_file_to_stdout_uses_explicit_prefix`: stdout file mode with an explicit non-empty prefix succeeds and creates the synthetic fixture's `<prefix>-4` side file;
+4. `json_output_file_mode_defaults_stream_prefix`: file output with no explicit prefix succeeds and creates `<json-output-path>-4`;
+5. `json_output_file_mode_empty_prefix_defaults_stream_prefix`: file output with an explicit empty prefix follows the absent-prefix behavior and creates `<json-output-path>-4`.
 
 Run:
 
 ```bash
 cargo test -p flpdf-cli --test cli_json json_stream_data_file_to_stdout_uses_explicit_prefix -- --exact
 cargo test -p flpdf-cli --test cli_json json_output_file_mode_defaults_stream_prefix -- --exact
+cargo test -p flpdf-cli --test cli_json json_output_file_mode_empty_prefix_defaults_stream_prefix -- --exact
 cargo test -p flpdf-cli --test cli_json missing_stream_prefix_does_not_mask_missing_input -- --exact
 cargo test -p flpdf-cli --test cli_json missing_stream_prefix_does_not_mask_malformed_input -- --exact
 ```
@@ -551,7 +560,7 @@ Expected: clean worktree; only the approved design, job JSON orchestration, CLI 
 - [ ] **Step 7: Close and persist the Bead only after all gates pass**
 
 ```bash
-bd close flpdf-oqdj --reason "Implemented qpdf 11.9.0 QPDFJob::writeJSON output selection; stdout file mode now requires an explicit prefix; exact diagnostics, precedence, positive paths, full tests, lint, rustdoc, and 100% changed-line coverage verified"
+bd close flpdf-oqdj --reason "Implemented qpdf 11.9.0 QPDFJob::writeJSON output selection; stdout file mode now requires an explicit non-empty prefix; exact diagnostics, precedence, positive paths, full tests, lint, rustdoc, and 100% changed-line coverage verified"
 bd dolt push
 ```
 
