@@ -786,27 +786,50 @@ fn r5_and_r6_identity_crypt_filters_leave_streams_and_strings_plaintext() {
     }
 }
 
+/// A `/V 5` document whose `/CF` names `/CFM /V2` is an RC4 crypt filter on a
+/// modern revision. qpdf accepts it and reports RC4 rather than refusing the
+/// document:
+///
+/// ```text
+/// $ qpdf --static-id --encrypt --user-password=u --owner-password=o --bits=256 -- in.pdf r6.pdf
+/// $ # substitute /CFM /AESV3 with /CFM /V2 in place, then:
+/// $ qpdf --password=u --show-encryption r6_cfm_v2.pdf
+/// R = 6
+/// ...
+/// stream encryption method: RC4
+/// string encryption method: RC4
+/// file encryption method: RC4
+/// $ echo $?
+/// 0
+/// ```
+///
+/// flpdf used to reject the same document with `UnsupportedHandler`. Only
+/// `/R 5`'s pre-existing weak-crypto gate still refuses it by default, which
+/// is why the option is set here; that gate is unrelated to the crypt filter.
 #[test]
-fn r5_and_r6_reject_unsupported_crypt_filter_methods() {
+fn r5_and_r6_accept_an_rc4_crypt_filter_method() {
     for revision in [5, 6] {
-        let err = match Pdf::open_with_options(
+        let mut pdf = Pdf::open_with_options(
             std::io::Cursor::new(encrypted_r5_or_r6_unsupported_cf_minimal_pdf(revision)),
             PdfOpenOptions {
                 password: b"userpass".to_vec(),
+                allow_weak_crypto: true,
                 ..PdfOpenOptions::default()
             },
-        ) {
-            Ok(_) => panic!("unsupported crypt filter should be rejected"),
-            Err(err) => err,
-        };
+        )
+        .unwrap_or_else(|err| panic!("qpdf opens this document; R={revision} got {err:?}"));
 
-        assert!(
-            matches!(
-                err,
-                Error::Encrypted(EncryptedError::UnsupportedHandler { .. })
-            ),
-            "expected UnsupportedHandler for R={revision}, got {err:?}"
-        );
+        let info = pdf
+            .encryption_info()
+            .expect("encryption info")
+            .expect("document is encrypted");
+        assert_eq!(info.r, revision);
+        // `/StmF /StdCF` resolves through `/CF` to the RC4 method; `/StrF` is
+        // the built-in `/Identity`, i.e. qpdf's `e_none`.
+        assert_eq!(info.stream_method, "RC4", "R={revision}");
+        assert_eq!(info.string_method, "none", "R={revision}");
+        // No `/EFF`, so qpdf mirrors the stream method into the file method.
+        assert_eq!(info.eff_method, "RC4", "R={revision}");
     }
 }
 
@@ -1367,6 +1390,219 @@ fn encrypted_v4_mixed_cf_reader_fixture() -> Vec<u8> {
     bytes
 }
 
+/// qpdf requires `/V` and `/R` together, before any password work, and throws
+/// `damagedPDF` when either is missing (`libqpdf/QPDF_encryption.cc:770-777`).
+/// Observed by blanking `/V 5` in place in a `qpdf --encrypt --bits=256`
+/// output:
+///
+/// ```text
+/// $ qpdf --password=u --show-encryption no_v.pdf
+/// qpdf: no_v.pdf (encryption dictionary, offset 1033): some encryption
+///   dictionary parameters are missing or the wrong type
+/// $ echo $?
+/// 2
+/// ```
+///
+/// The password path already read `/V` through `standard_handler_r5_inputs`;
+/// the `--password-is-hex-key` path did not, and used to open such a document.
+#[test]
+fn an_encrypt_dictionary_without_v_is_rejected_on_every_path() {
+    let mut fixture = encrypted_r5_or_r6_pdf(6, "", &[]);
+    let at = fixture
+        .windows(4)
+        .position(|window| window == b"/V 5")
+        .expect("fixture declares /V 5");
+    fixture[at..at + 4].copy_from_slice(b"    ");
+
+    let paths = [
+        PdfOpenOptions {
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+        PdfOpenOptions {
+            password: b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_vec(),
+            password_is_hex_key: true,
+            ..PdfOpenOptions::default()
+        },
+    ];
+    for options in paths {
+        let hex_key = options.password_is_hex_key;
+        let err = Pdf::open_with_options(std::io::Cursor::new(fixture.clone()), options)
+            .err()
+            .unwrap_or_else(|| panic!("qpdf rejects this document (hex key path: {hex_key})"));
+        assert!(
+            matches!(
+                err,
+                Error::Encrypted(EncryptedError::Malformed { ref reason })
+                    if reason == "missing /V entry"
+            ),
+            "hex key path: {hex_key}, got {err:?}"
+        );
+    }
+}
+
+/// A `/V 4` document whose one crypt filter names a `/CFM` qpdf does not
+/// recognise, carrying two strings and two streams.
+///
+/// qpdf opens it, warns once for strings and once for streams, and decrypts
+/// everything as AES because its `default:` arm rewrites the filter to
+/// `e_aes` (`libqpdf/QPDF_encryption.cc:1121-1133`). Observed on a real
+/// `qpdf --encrypt --use-aes=y` output whose `/CFM` was rewritten to `/AESVX`.
+fn encrypted_v4_unknown_cfm_fixture() -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let file_key = r4_file_key(b"", &o, p, &id0);
+    let u = fixed_r4_u_entry(true);
+
+    let aes_string = |object_number: u32, plaintext: &[u8]| {
+        let key = aes128_object_key(&per_object_aes_key(&file_key, object_number, 0));
+        hex_string(&aes128_cbc_encrypt_with_iv(&key, &[0x11; 16], plaintext))
+    };
+    let aes_stream = |object_number: u32, plaintext: &[u8]| {
+        let key = aes128_object_key(&per_object_aes_key(&file_key, object_number, 0));
+        aes128_cbc_encrypt_with_iv(&key, &[0x22; 16], plaintext)
+    };
+
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut push = |bytes: &mut Vec<u8>, object: Vec<u8>| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(&object);
+    };
+    push(
+        &mut bytes,
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_vec(),
+    );
+    push(
+        &mut bytes,
+        b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n".to_vec(),
+    );
+    push(
+        &mut bytes,
+        format!(
+            "3 0 obj\n<< /Secret <{}> >>\nendobj\n",
+            aes_string(3, b"first")
+        )
+        .into_bytes(),
+    );
+    push(
+        &mut bytes,
+        format!(
+            "4 0 obj\n<< /Secret <{}> >>\nendobj\n",
+            aes_string(4, b"second")
+        )
+        .into_bytes(),
+    );
+    for (object_number, plaintext) in [(5u32, b"stream one".as_slice()), (6, b"stream two")] {
+        let body = aes_stream(object_number, plaintext);
+        let mut object = format!(
+            "{object_number} 0 obj\n<< /Length {} >>\nstream\n",
+            body.len()
+        )
+        .into_bytes();
+        object.extend_from_slice(&body);
+        object.extend_from_slice(b"\nendstream\nendobj\n");
+        push(&mut bytes, object);
+    }
+
+    let xref_offset = bytes.len();
+    let size = offsets.len() + 1;
+    bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 \
+             /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESVX /Length 128 >> >> \
+             /StmF /StdCF /StrF /StdCF /EFF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0)
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// An unrecognised `/CFM` used to make flpdf refuse the document with
+/// `UnsupportedHandler`. qpdf opens it, decrypts as AES, and warns once per
+/// kind — strings before streams.
+#[test]
+fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(encrypted_v4_unknown_cfm_fixture()))
+        .expect("qpdf opens a document with an unknown /CFM");
+
+    let secret = |pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, object_number: u32| {
+        let Object::Dictionary(dict) = pdf.resolve(ObjectRef::new(object_number, 0)).unwrap()
+        else {
+            panic!("object {object_number} is a dictionary");
+        };
+        let Some(Object::String(bytes)) = dict.get("Secret") else {
+            panic!("object {object_number} has a /Secret string");
+        };
+        bytes.clone()
+    };
+    assert_eq!(secret(&mut pdf, 3), b"first");
+    assert_eq!(secret(&mut pdf, 4), b"second");
+
+    for (object_number, plaintext) in [(5u32, b"stream one".as_slice()), (6, b"stream two")] {
+        let Object::Stream(stream) = pdf.resolve(ObjectRef::new(object_number, 0)).unwrap() else {
+            panic!("object {object_number} is a stream");
+        };
+        assert_eq!(stream.data, plaintext);
+    }
+
+    let messages: Vec<String> = pdf
+        .repair_diagnostics()
+        .entries()
+        .iter()
+        .map(|entry| entry.message.to_string())
+        .filter(|message| message.contains("unknown encryption filter"))
+        .collect();
+    assert_eq!(
+        messages,
+        vec![
+            "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
+             strings may be decrypted improperly"
+                .to_string(),
+            "unknown encryption filter for streams (check /StmF from /Encrypt dictionary); \
+             streams may be decrypted improperly"
+                .to_string(),
+        ],
+        "qpdf warns once per kind, strings first, because each arm resets its crypt filter"
+    );
+}
+
+/// The same document reported through `--show-encryption`. qpdf prints
+/// `unknown` for all three methods (`show_encryption_method`,
+/// `libqpdf/QPDFJob.cc:682-684`) and exits 0; the fixture's `/EFF` names the
+/// same crypt filter, which is the branch where qpdf calls `interpretCF` on
+/// `/EFF` rather than mirroring `cf_stream` (`QPDF_encryption.cc:891-904`).
+///
+/// Observed on a `/V 4` qpdf output whose `/CFM` was rewritten to `/AESVX`:
+///
+/// ```text
+/// stream encryption method: unknown
+/// string encryption method: unknown
+/// file encryption method: unknown
+/// ```
+#[test]
+fn an_unknown_crypt_filter_is_reported_as_unknown() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(encrypted_v4_unknown_cfm_fixture()))
+        .expect("qpdf opens a document with an unknown /CFM");
+
+    let info = pdf
+        .encryption_info()
+        .expect("encryption info")
+        .expect("document is encrypted");
+    assert_eq!(info.stream_method, "unknown");
+    assert_eq!(info.string_method, "unknown");
+    assert_eq!(info.eff_method, "unknown");
+}
+
 fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate: bool) -> Vec<u8> {
     encrypted_v4_explicit_crypt_filter_fixture_with_length(identity, crypt_after_flate, true)
 }
@@ -1642,6 +1878,202 @@ fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -
     let mut out = iv.to_vec();
     out.extend_from_slice(encrypted);
     out
+}
+
+/// RC4, implemented here rather than reached for through `flpdf`, so the
+/// fixtures below are an independent check on the reader's decryption rather
+/// than a round trip through the same code.
+fn rc4_process(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut s: [u8; 256] = std::array::from_fn(|i| i as u8);
+    let mut j = 0u8;
+    for i in 0..256 {
+        j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
+        s.swap(i, j as usize);
+    }
+    let (mut i, mut j) = (0u8, 0u8);
+    data.iter()
+        .map(|byte| {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(s[i as usize]);
+            s.swap(i as usize, j as usize);
+            byte ^ s[(s[i as usize].wrapping_add(s[j as usize])) as usize]
+        })
+        .collect()
+}
+
+/// Algorithm 3.1's RC4 variant: no `"sAlT"`, truncated to `min(len + 5, 16)`.
+fn per_object_rc4_key(file_key: &[u8], object_number: u32, generation: u32) -> Vec<u8> {
+    let mut hasher = Md5::new();
+    hasher.update(file_key);
+    hasher.update(&object_number.to_le_bytes()[..3]);
+    hasher.update(&generation.to_le_bytes()[..2]);
+    let digest = hasher.finalize();
+    digest[..(file_key.len() + 5).min(16)].to_vec()
+}
+
+/// Algorithm 2 for `/R 2`, which skips the 50 rehash rounds `r4_file_key` does,
+/// truncated to `length_bytes`.
+fn r2_file_key(password: &[u8], o: &[u8], p: i32, id0: &[u8], length_bytes: usize) -> Vec<u8> {
+    let mut padded = [0u8; 32];
+    let password_len = password.len().min(32);
+    padded[..password_len].copy_from_slice(&password[..password_len]);
+    padded[password_len..].copy_from_slice(&PASSWORD_PADDING[..32 - password_len]);
+
+    let mut hasher = Md5::new();
+    hasher.update(padded);
+    hasher.update(o);
+    hasher.update(p.to_le_bytes());
+    hasher.update(id0);
+    hasher.finalize()[..length_bytes].to_vec()
+}
+
+/// Algorithm 4 (`/R 2`): RC4 the padding string with the file key.
+fn r2_u_entry(file_key: &[u8]) -> Vec<u8> {
+    rc4_process(file_key, &PASSWORD_PADDING)
+}
+
+/// Algorithm 5 (`/R 3` and up): MD5 of the padding and `/ID[0]`, RC4 with the
+/// file key, then 19 more rounds under the key XORed with the round number.
+fn r3_u_entry(file_key: &[u8], id0: &[u8]) -> Vec<u8> {
+    let mut hasher = Md5::new();
+    hasher.update(PASSWORD_PADDING);
+    hasher.update(id0);
+    let mut block = rc4_process(file_key, &hasher.finalize()).to_vec();
+    for round in 1u8..=19 {
+        let key: Vec<u8> = file_key.iter().map(|byte| byte ^ round).collect();
+        block = rc4_process(&key, &block);
+    }
+    // The trailing 16 bytes are arbitrary padding per the algorithm.
+    block.extend_from_slice(&[0u8; 16]);
+    block
+}
+
+/// The plaintext every pre-`/V 4` stream fixture below carries.
+const LEGACY_STREAM_PLAINTEXT: &[u8] = b"BT /F1 12 Tf 20 100 Td (legacy rc4) Tj ET\n";
+
+/// A `/V 1` or `/V 2` document whose one content stream is RC4-encrypted.
+///
+/// The committed `tests/fixtures/encrypted/v*-rc4-*.pdf` fixtures have no
+/// pages and therefore no streams, so nothing else in the suite exercises
+/// stream decryption below `/V 4` — the exact path qpdf reaches by leaving
+/// `use_aes` false and skipping the crypt-filter switch entirely
+/// (`libqpdf/QPDF_encryption.cc:1062-1063`).
+fn encrypted_legacy_rc4_stream_fixture(version: i64) -> Vec<u8> {
+    let id0 = decode_hex_fixture("000102030405060708090a0b0c0d0e0f");
+    let o = [0x42u8; 32];
+    let p = -3904i32;
+    let (revision, length_bits, file_key, u) = if version == 1 {
+        let file_key = r2_file_key(b"", &o, p, &id0, 5);
+        let u = r2_u_entry(&file_key);
+        (2, 40, file_key, u)
+    } else {
+        let file_key = r4_file_key(b"", &o, p, &id0);
+        let u = r3_u_entry(&file_key, &id0);
+        (3, 128, file_key, u)
+    };
+
+    let stream_key = per_object_rc4_key(&file_key, 4, 0);
+    let body = rc4_process(&stream_key, LEGACY_STREAM_PLAINTEXT);
+
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut push = |bytes: &mut Vec<u8>, object: &[u8]| {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(object);
+    };
+    push(
+        &mut bytes,
+        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    );
+    push(
+        &mut bytes,
+        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    );
+    push(
+        &mut bytes,
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\nendobj\n",
+    );
+    let stream_object = {
+        let mut object = format!("4 0 obj\n<< /Length {} >>\nstream\n", body.len()).into_bytes();
+        object.extend_from_slice(&body);
+        object.extend_from_slice(b"\nendstream\nendobj\n");
+        object
+    };
+    push(&mut bytes, &stream_object);
+
+    let xref_offset = bytes.len();
+    let size = offsets.len() + 1;
+    bytes.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Encrypt << /Filter /Standard /V {version} \
+             /R {revision} /Length {length_bits} /P {p} /O <{}> /U <{}> >> \
+             /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            hex_string(&o),
+            hex_string(&u),
+            hex_string(&id0),
+            hex_string(&id0),
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+/// The regression this whole change most risks: making `cf_stream` faithful
+/// leaves it at qpdf's `e_none` for `/V 1` and `/V 2`, and a consumer that
+/// read it without qpdf's `/V >= 4` gate would silently stop decrypting.
+#[test]
+fn pre_v4_documents_still_decrypt_their_streams_with_rc4() {
+    for version in [1, 2] {
+        let mut pdf = Pdf::open_with_options(
+            std::io::Cursor::new(encrypted_legacy_rc4_stream_fixture(version)),
+            PdfOpenOptions {
+                allow_weak_crypto: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .unwrap_or_else(|err| panic!("/V {version} fixture must authenticate: {err:?}"));
+
+        let Object::Stream(stream) = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve stream")
+        else {
+            panic!("object 4 is a stream");
+        };
+        assert_eq!(
+            stream.data, LEGACY_STREAM_PLAINTEXT,
+            "/V {version} stream must be RC4-decrypted"
+        );
+    }
+}
+
+/// The same documents report qpdf's stored crypt-filter state: `e_none`,
+/// because `interpretCF` never runs below `/V 4`
+/// (`libqpdf/QPDF_encryption.cc:860`). `qpdf --show-encryption` prints no
+/// method lines at all for these, since it gates the display on `V >= 4`
+/// (`libqpdf/QPDFJob.cc:736-740`).
+#[test]
+fn pre_v4_documents_report_no_crypt_filter_methods() {
+    for version in [1, 2] {
+        let mut pdf = Pdf::open_with_options(
+            std::io::Cursor::new(encrypted_legacy_rc4_stream_fixture(version)),
+            PdfOpenOptions {
+                allow_weak_crypto: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("fixture must authenticate");
+
+        let info = pdf
+            .encryption_info()
+            .expect("encryption info")
+            .expect("document is encrypted");
+        assert_eq!(info.v, version);
+        assert_eq!(info.stream_method, "none");
+        assert_eq!(info.string_method, "none");
+        assert_eq!(info.eff_method, "none");
+    }
 }
 
 fn hex_string(bytes: &[u8]) -> String {
