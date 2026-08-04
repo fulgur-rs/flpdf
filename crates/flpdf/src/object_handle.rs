@@ -2363,6 +2363,203 @@ fn unparse_stream_dict_entries(
     Ok(())
 }
 
+impl ObjectHandle {
+    /// This trailer-shaped dictionary handle's writer-emission form,
+    /// porting the caller-visible shape of `QPDFWriter::writeTrailer`
+    /// (`QPDFWriter.cc:1160-1236`): the `"trailer <<"` opener (only when
+    /// `xref_stream` is `false` -- the xref-stream dictionary's own `<<`
+    /// and xref-specific keys, e.g. `/Type`/`/W`/`/Index`, are the
+    /// caller's responsibility, matching `writeXRefStream`'s hand-emitted
+    /// literals, `QPDFWriter.cc:2391-2495`, which never route through
+    /// `unparseObject` or this primitive at all), an unconditional
+    /// per-key loop with no `isNull` suppression (`:1174-1192` has no
+    /// such check, unlike `unparseObject`'s dictionary branch that
+    /// [`Self::unparse_object`]/[`Self::unparse_object_qdf`]/
+    /// [`Self::unparse_stream_body`] all apply through
+    /// `visible_dict_entries`), `/ID` and `/Encrypt` excluded from that
+    /// loop and forced last in that order when present, and the closing
+    /// `>>` (`:1235`, written unconditionally in both `xref_stream`
+    /// cases -- this is why `xref_stream = true` still needs a call into
+    /// this function at all, despite skipping the opener). Always
+    /// produces the compact (non-QDF) one-line form -- `writeTrailer`'s
+    /// own `writeStringQDF` calls (`:1169,1175,1190,1195,1233`) are
+    /// QDF-only formatting this primitive does not replicate, matching
+    /// [`crate::object::Dictionary::write_pdf_trailer`]'s identical
+    /// compact-only scope; the QDF classic trailer is a separate,
+    /// pre-existing, hand-rolled writer (`write_qdf_trailer`, `writer.rs`)
+    /// this issue does not touch.
+    ///
+    /// **Narrower than the full C++ function -- read before reusing for a
+    /// new caller.** Real `writeTrailer` first calls `getTrimmedTrailer()`
+    /// (`:1163`, `:2009-2029`) to remove `/ID`, `/Encrypt`, `/Prev`,
+    /// `/Index`, `/W`, `/Length`, `/Filter`, `/DecodeParms`, `/Type`, and
+    /// `/XRefStm` from a *copy* of the live document trailer before this
+    /// shape ever runs; special-cases `/Size`'s *value* from a
+    /// `size: int` parameter, with an additional inline `/Prev <offset>`
+    /// append when `which == t_lin_first` (`:1179-1186`); and derives
+    /// `/ID`'s value from writer state (`generateID()`/`m->id1`/`m->id2`)
+    /// and `/Encrypt`'s from `m->encryption_dict_objid` rather than from
+    /// the (already-stripped) dict at all. None of that lives here.
+    /// Trimming, the `/Size` value substitution, and the `t_lin_first`
+    /// inline `/Prev` are the caller's responsibility -- matching this
+    /// crate's own already-established split, where
+    /// `strip_incremental_trailer_keys`/`strip_xref_stream_trailer_keys`
+    /// (`writer.rs`) do the trimming and `writer.rs:4012`'s
+    /// `trailer.insert("Size", ...)` supplies the correct value before
+    /// either the legacy `Dictionary::write_pdf_trailer` or this
+    /// primitive ever runs. This primitive has no `which`/`size`/`prev`
+    /// parameters at all, so `t_lin_first` is out of scope for the same
+    /// reason `t_lin_second` is (see below). `/ID` and `/Encrypt` are
+    /// read from `self`'s own stored values instead of from writer state
+    /// -- the caller is expected to have already placed the correct
+    /// values there (`apply_encrypt_trailer_entries`/`apply_random_id`/
+    /// `apply_deterministic_id`, `writer.rs`), the same contract
+    /// [`crate::object::Dictionary::write_pdf_trailer`] already
+    /// establishes and this primitive matches for that dimension.
+    ///
+    /// `id_writer`, when `Some`, substitutes for the stored `/ID` value
+    /// (used by the deterministic-`/ID` writer to emit a content-derived
+    /// identifier inline). When `None`, the stored `/ID` value is written
+    /// in qpdf's compact `[<hex1><hex2>]` shape with no spaces
+    /// (mirroring [`crate::object::write_id_style_value`]'s established
+    /// byte shape, reimplemented here directly on `ObjectHandle` rather
+    /// than bridged through `Object` -- see `write_id_style_value_handle`
+    /// below); an indirect `/ID` value writes as its own `"N G R"`
+    /// reference form instead, matching `write_child`'s reference-vs-recurse
+    /// split rather than being inlined.
+    ///
+    /// `self` must resolve to a `Dictionary`; a non-dictionary value
+    /// (including `self` itself, forced via `try_dereference`, the same
+    /// top-level-entry-point pattern [`Self::unparse_object`]/
+    /// [`Self::unparse_stream_body`] already use) degrades to an empty
+    /// trailer shell, mirroring `write_pdf_stream`/`write_pdf_trailer`'s
+    /// own typed-input assumption.
+    ///
+    /// Out of scope, deliberately: `which == t_lin_second`
+    /// (`QPDFWriter.cc:1170-1172`, linearization second pass, `/Size`-only)
+    /// and `which == t_lin_first`'s inline `/Prev` (above) have no
+    /// equivalent here. A linearization-writer consumer needing either
+    /// form is a different primitive.
+    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    pub(crate) fn unparse_trailer(
+        &self,
+        out: &mut Vec<u8>,
+        xref_stream: bool,
+        id_writer: Option<crate::object::TrailerIdWriter>,
+    ) -> Result<()> {
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            unparse_trailer_entries(&entries, xref_stream, id_writer, out)
+        })
+    }
+}
+
+// `unparse_trailer`'s sole callee. Writes the (already-trimmed,
+// already-/Size-correct -- see that method's doc) entries in an
+// unconditional loop -- no `visible_dict_entries` call, deliberately: this
+// is the one dictionary-shaped writer-emission primitive in this family
+// that does not suppress null-valued keys, matching `writeTrailer`'s own
+// key loop (`QPDFWriter.cc:1174-1192`), which has no `isNull` check
+// anywhere in it.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn unparse_trailer_entries(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    xref_stream: bool,
+    mut id_writer: Option<crate::object::TrailerIdWriter>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if !xref_stream {
+        out.extend_from_slice(b"trailer <<");
+    }
+    let mut id_value: Option<&ObjectHandle> = None;
+    let mut encrypt_value: Option<&ObjectHandle> = None;
+    for (key, value) in entries {
+        match key.as_slice() {
+            b"ID" => {
+                id_value = Some(value);
+                continue;
+            }
+            b"Encrypt" => {
+                encrypt_value = Some(value);
+                continue;
+            }
+            _ => {}
+        }
+        out.push(b' ');
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        write_child(value, out)?;
+    }
+    if let Some(value) = id_value {
+        out.extend_from_slice(b" /ID ");
+        match id_writer.as_mut() {
+            Some(write_id) => write_id(out),
+            None => write_id_style_value_handle(value, out)?,
+        }
+    }
+    if let Some(value) = encrypt_value {
+        out.extend_from_slice(b" /Encrypt ");
+        write_child(value, out)?;
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+// Writes a trailer's `/ID` value in qpdf's `writeTrailer` compact shape:
+// `[<hex1><hex2>]`, no spaces (`QPDFWriter.cc:1194-1222`, `/ID [` then the
+// two identifier strings via `QPDF_String::unparse(true)`, then `]`).
+// Mirrors `write_id_style_value` (`object.rs`) byte-for-byte, but walks
+// `value`'s own `ObjectHandle` shape directly rather than bridging through
+// the legacy `Object` type: an indirect `value` (an `/ID` array stored as
+// a reference -- not a shape real qpdf itself ever produces, but nothing
+// at the type level rules it out) writes as its own `"N G R"` form via
+// `write_child`, checked before any shape inspection, matching
+// `write_child`'s own reference-vs-recurse split and never inlining an
+// indirect value regardless of what it resolves to. A direct
+// `Array([String, String])` gets the compact hex-pair form; any other
+// direct shape (wrong arity, non-string elements) falls back to
+// `write_child`'s generic form rather than silently truncating -- the
+// same "fall back, don't truncate" choice `write_id_style_value` makes.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
+    if value.object_ref().is_some() {
+        return write_child(value, out);
+    }
+    let compact: Option<(Vec<u8>, Vec<u8>)> = value.with_value(|v| match v {
+        Some(ObjectValue::Array(items)) if items.len() == 2 => {
+            let string_bytes = |item: &ObjectHandle| {
+                item.with_value(|iv| match iv {
+                    Some(ObjectValue::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+            };
+            match (string_bytes(&items[0]), string_bytes(&items[1])) {
+                (Some(b0), Some(b1)) => Some((b0, b1)),
+                _ => None,
+            }
+        }
+        _ => None,
+    });
+    match compact {
+        Some((b0, b1)) => {
+            out.push(b'[');
+            crate::object::write_hex_string(out, &b0);
+            crate::object::write_hex_string(out, &b1);
+            out.push(b']');
+            Ok(())
+        }
+        None => write_child(value, out),
+    }
+}
+
 // `ObjectHandle::shallow_copy`'s per-variant dispatch: an Array/Dictionary
 // child is recursively shallow-copied through `shallow_copy_child` (which
 // re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
@@ -4826,6 +5023,208 @@ mod unparse_object_tests {
         drop(resolver);
         let mut out = Vec::new();
         assert!(indirect.unparse_stream_body(&mut out, false).is_err());
+    }
+
+    #[test]
+    fn unparse_trailer_classic_forces_id_and_encrypt_last() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Size".to_vec(), ObjectHandle::integer(9)),
+            (b"Root".to_vec(), ObjectHandle::integer(1)), // stand-in reference shape
+            (b"Encrypt".to_vec(), ObjectHandle::integer(9)),
+            (
+                b"ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(vec![0u8; 16]),
+                    ObjectHandle::string(vec![1u8; 16]),
+                ]),
+            ),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("trailer << "));
+        assert!(text.ends_with(">>"));
+        // /Root and /Size appear before /ID, /ID appears before /Encrypt,
+        // regardless of the dict's own (alphabetical) key order.
+        let root_pos = text.find("/Root").unwrap();
+        let id_pos = text.find("/ID").unwrap();
+        let encrypt_pos = text.find("/Encrypt").unwrap();
+        assert!(root_pos < id_pos);
+        assert!(id_pos < encrypt_pos);
+    }
+
+    #[test]
+    fn unparse_trailer_xref_stream_does_not_write_its_own_open_brace() {
+        // The caller (a future `writeXRefStream`-shaped consumer) has
+        // already opened `<<` and hand-emitted the xref-specific keys
+        // before calling this method with `xref_stream = true` -- see
+        // this method's own doc for why those keys are never part of
+        // `entries` here to begin with.
+        let dict = ObjectHandle::dictionary(vec![(b"Size".to_vec(), ObjectHandle::integer(9))]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, true, None).unwrap();
+        assert!(!String::from_utf8_lossy(&out).contains("<<"));
+        assert!(String::from_utf8_lossy(&out).ends_with(">>"));
+    }
+
+    #[test]
+    fn unparse_trailer_without_id_or_encrypt_omits_both() {
+        let dict = ObjectHandle::dictionary(vec![(b"Size".to_vec(), ObjectHandle::integer(9))]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("/ID"));
+        assert!(!text.contains("/Encrypt"));
+    }
+
+    #[test]
+    fn unparse_trailer_does_not_suppress_a_null_valued_key() {
+        // writeTrailer's own key loop has no isNull check anywhere in it
+        // (QPDFWriter.cc:1174-1192) -- unlike unparseObject's dictionary
+        // branch. `/Prev` is chosen only as a convenient never-suppressed
+        // example key for this unit-level test; in production `/Prev`
+        // itself would already have been stripped by the caller before
+        // this primitive ever sees the dict (see this method's own doc on
+        // the `getTrimmedTrailer`-equivalent split), so this does not
+        // claim `/Prev` null survives end to end -- only that *this*
+        // primitive's key loop applies no suppression to whatever keys
+        // the caller does hand it.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Size".to_vec(), ObjectHandle::integer(9)),
+            (b"Prev".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("/Prev null"));
+    }
+
+    #[test]
+    fn unparse_trailer_id_writer_substitutes_the_id_value() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Size".to_vec(), ObjectHandle::integer(9)),
+            (
+                b"ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(vec![0u8; 16]),
+                    ObjectHandle::string(vec![0u8; 16]),
+                ]),
+            ),
+        ]);
+        let mut out = Vec::new();
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"<computed>");
+        dict.unparse_trailer(&mut out, false, Some(&mut id_writer))
+            .unwrap();
+        assert!(String::from_utf8_lossy(&out).contains("/ID <computed>"));
+    }
+
+    #[test]
+    fn unparse_trailer_id_writer_none_uses_qpdf_compact_hex_shape() {
+        // Pins the exact byte shape unparse_trailer_id_writer_substitutes_the_id_value's
+        // dict (all-zero bytes) can't distinguish from a generic array
+        // serialization -- mirrors write_id_style_value_emits_compact_hex_pair
+        // (object.rs) byte-for-byte.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Size".to_vec(), ObjectHandle::integer(9)),
+            (
+                b"ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(vec![0xabu8, 0xcdu8, 0xefu8]),
+                    ObjectHandle::string(vec![0x12u8, 0x34u8, 0x56u8]),
+                ]),
+            ),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        assert_eq!(out, b"trailer << /Size 9 /ID [<abcdef><123456>] >>");
+    }
+
+    #[test]
+    fn unparse_trailer_id_writer_none_falls_back_for_unexpected_id_shape() {
+        // Mirrors write_id_style_value_falls_back_for_unexpected_shapes
+        // (object.rs): wrong arity falls back to the generic array
+        // serializer (spaces) rather than silently truncating to two
+        // elements.
+        let dict = ObjectHandle::dictionary(vec![(
+            b"ID".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(vec![0x00u8]),
+                ObjectHandle::string(vec![0x11u8]),
+                ObjectHandle::string(vec![0x8fu8]),
+            ]),
+        )]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        assert_eq!(out, b"trailer << /ID [ <00> <11> <8f> ] >>");
+    }
+
+    #[test]
+    fn unparse_trailer_writes_an_indirect_id_as_reference_form_not_inlined() {
+        // `object_ref().is_some()` must be checked before shape inspection
+        // in write_id_style_value_handle: an indirect /ID value (not a
+        // shape real qpdf itself ever produces, but nothing at the type
+        // level rules it out) writes as its own "N G R" form, the same
+        // reference-vs-recurse split write_child applies everywhere else
+        // in this primitive family -- never inlined as compact hex even
+        // though it would resolve to a matching Array([String, String])
+        // shape.
+        let (indirect_id, _resolver) = resolver_bearing_handle(ObjectValue::Array(vec![
+            ObjectHandle::string(vec![0u8; 2]),
+            ObjectHandle::string(vec![1u8; 2]),
+        ]));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Size".to_vec(), ObjectHandle::integer(9)),
+            (b"ID".to_vec(), indirect_id),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("/ID 20 0 R"));
+        assert!(!text.contains("[<"));
+    }
+
+    #[test]
+    fn unparse_trailer_writes_empty_shell_for_a_non_dictionary_self() {
+        // Mirrors unparse_stream_body_writes_empty_dict_for_a_non_dictionary_self:
+        // a non-dictionary `self` degrades to an empty trailer shell
+        // rather than panicking or erroring, matching write_pdf_trailer's
+        // own typed-input assumption.
+        let mut out = Vec::new();
+        ObjectHandle::integer(5)
+            .unparse_trailer(&mut out, false, None)
+            .unwrap();
+        assert_eq!(out, b"trailer << >>");
+    }
+
+    #[test]
+    fn unparse_trailer_resolves_an_unresolved_indirect_trailer_dict() {
+        // Without the `self.try_dereference()?` call this method makes
+        // before `with_value`, `with_value` on a not-yet-resolved
+        // indirect handle returns `None` and this would degrade to an
+        // empty `trailer << >>` shell instead of using the resolved
+        // dictionary's entries -- mirrors
+        // unparse_stream_body_resolves_an_unresolved_indirect_stream_dict's
+        // same proof for the same fix pattern.
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [(b"Size".to_vec(), ObjectHandle::integer(9))]
+                .into_iter()
+                .collect(),
+        ));
+        let mut out = Vec::new();
+        indirect.unparse_trailer(&mut out, false, None).unwrap();
+        assert_eq!(out, b"trailer << /Size 9 >>");
+    }
+
+    #[test]
+    fn unparse_trailer_propagates_a_dropped_document_error() {
+        // Mirrors unparse_stream_body_propagates_a_dropped_document_error:
+        // an as-yet-unresolved indirect handle whose document has been
+        // dropped must surface as an error here too, not silently degrade
+        // to an empty `trailer << >>` shell the way an unresolved
+        // `with_value` read alone would.
+        let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(resolver);
+        let mut out = Vec::new();
+        assert!(indirect.unparse_trailer(&mut out, false, None).is_err());
     }
 }
 
