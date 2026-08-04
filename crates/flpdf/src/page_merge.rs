@@ -38,7 +38,7 @@ use std::io::{Cursor, Read, Seek};
 
 /// One merge input: an opened source document and the 0-based page indices to
 /// take from it (arbitrary order, duplicates allowed).
-pub struct MergeInput<'a, R: Read + Seek> {
+pub struct MergeInput<'a, R: Read + Seek + 'static> {
     /// The opened source document.
     pub source: &'a mut Pdf<R>,
     /// 0-based page indices to copy, in output order.

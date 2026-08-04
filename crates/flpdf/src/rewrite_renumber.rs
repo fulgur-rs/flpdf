@@ -896,6 +896,8 @@ fn rewrite<M: NewNumberLookup>(obj: &mut Object, depth: usize, map: &M) -> crate
 mod tests {
     use super::*;
     use crate::object::{Dictionary, Stream};
+    use std::io::Cursor;
+    use std::sync::Arc;
 
     /// Classify a resolved object into the oracle's tag vocabulary.
     ///
@@ -963,7 +965,7 @@ mod tests {
     #[test]
     fn one_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 7);
         assert_eq!(
@@ -975,7 +977,7 @@ mod tests {
     #[test]
     fn catalog_first_null_visibility_matches_qpdf_order_without_mutating_source() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/null-visible-matrix.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let root = pdf.root_ref().expect("root");
         let original_root = pdf.resolve(root).expect("resolve root");
 
@@ -1008,7 +1010,7 @@ mod tests {
         let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
         let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
         let bytes = build_raw_pdf(&[(1, catalog), (2, pages), (3, page), (5, b"null")]);
-        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
 
         let map = CatalogFirstRenumber::build_qpdf(&mut pdf, true).expect("build");
 
@@ -1048,7 +1050,7 @@ mod tests {
             (6, b"null"),
             (10, b"<< >>"),
         ]);
-        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let got =
             resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new()).expect("resurrectable");
         let nums: BTreeSet<u32> = got.iter().map(|r| r.number).collect();
@@ -1092,7 +1094,7 @@ mod tests {
             include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation.pdf");
         let stale = ObjectRef::new(4, 0);
 
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
         let standard = resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new())
             .expect("standard resurrectable");
         assert!(
@@ -1102,7 +1104,7 @@ mod tests {
 
         let mut removed = BTreeSet::new();
         removed.insert(stale);
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
         let filtered =
             resurrectable_null_refs_excluding(&mut pdf, &removed).expect("filtered resurrectable");
         assert!(
@@ -1132,7 +1134,7 @@ mod tests {
         let pages = b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>";
         let page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>";
         let bytes = build_raw_pdf(&[(1, &cat), (2, pages), (3, page)]);
-        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let got = resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new());
         assert!(
             matches!(got, Err(crate::Error::Unsupported(_))),
@@ -1158,7 +1160,7 @@ mod tests {
             &[(1, catalog), (2, pages), (3, page)],
             &trailer_extra,
         );
-        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
 
         let got = resurrectable_null_refs_excluding(&mut pdf, &BTreeSet::new());
         assert!(
@@ -1170,7 +1172,7 @@ mod tests {
     #[test]
     fn two_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/two-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 9);
         assert_eq!(
@@ -1184,7 +1186,7 @@ mod tests {
     #[test]
     fn three_page_tag_sequence_matches_qpdf_oracle() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/three-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(map.len(), 11);
         assert_eq!(
@@ -1199,7 +1201,7 @@ mod tests {
     #[test]
     fn pairs_yield_ascending_new_numbers_from_one() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         let news: Vec<u32> = map.pairs().map(|(new, _old)| new.number).collect();
         assert_eq!(news, vec![1, 2, 3, 4, 5, 6, 7]);
@@ -1218,7 +1220,7 @@ mod tests {
         // receives no number and the rest renumber contiguously.
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
 
         // Six live objects remain (holder dropped), numbered contiguously 1..=6.
@@ -1236,7 +1238,7 @@ mod tests {
         // /Length edge, so the holder (obj 7) is numbered like any other object.
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, false).expect("build");
         assert!(
             map.new_for_original(ObjectRef::new(7, 0)).is_some(),
@@ -1266,7 +1268,7 @@ mod tests {
             (7, b"<< /Held 6 0 R >>"),
         ]);
 
-        let mut pdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert!(
             map.new_for_original(ObjectRef::new(6, 0)).is_none(),
@@ -1278,7 +1280,7 @@ mod tests {
         );
 
         // The linearize universe walk drops them the same way.
-        let mut pdf2 = Pdf::open_mem(&pdf_bytes).expect("open");
+        let mut pdf2 = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
         let reachable = reachable_object_set(&mut pdf2, true).expect("walk");
         assert!(!reachable.contains(&ObjectRef::new(6, 0)));
         assert!(!reachable.contains(&ObjectRef::new(7, 0)));
@@ -1323,7 +1325,7 @@ mod tests {
 
         // skip_length=true (qpdf-faithful): holder kept, numbered at the late
         // non-/Length position (7), AFTER the stream's other child obj 8 (6).
-        let mut pdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert_eq!(
             map.new_for_original(ObjectRef::new(6, 0)),
@@ -1339,7 +1341,7 @@ mod tests {
         // skip_length=false (qdf): the /Length edge IS followed, so the holder and
         // obj 8 take the OPPOSITE numbers — proving the skip actually moves the
         // holder's position (this is the divergence qdf intentionally keeps).
-        let mut pdf_qdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let mut pdf_qdf = Pdf::open_mem(Arc::from(&pdf_bytes[..])).expect("open");
         let map_qdf = CatalogFirstRenumber::build(&mut pdf_qdf, false).expect("build");
         assert_eq!(
             map_qdf.new_for_original(ObjectRef::new(6, 0)),
@@ -1375,7 +1377,7 @@ mod tests {
                 b"<< /Type /ObjStm /N 0 /First 0 /Length 0 /Aux 6 0 R >>\nstream\n\nendstream",
             ),
         ]);
-        let mut pdf = Pdf::open_mem(&pdf_bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned(pdf_bytes).expect("open");
         let map = CatalogFirstRenumber::build(&mut pdf, true).expect("build");
         assert!(
             map.new_for_original(ObjectRef::new(6, 0)).is_none(),
@@ -1393,7 +1395,7 @@ mod tests {
         // /H is a byte offset, not an object reference. qpdf garbage-collects them
         // when re-linearizing, so the reachable universe is the 7 graph objects.
         let bytes = include_bytes!("../../../tests/fixtures/compat/linearized-one-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let reachable = reachable_object_set(&mut pdf, true).expect("walk");
         let mut nums: Vec<u32> = reachable.iter().map(|r| r.number).collect();
         nums.sort_unstable();
@@ -1421,7 +1423,7 @@ mod tests {
             (4, b"null"),
             (5, b"null"),
         ]);
-        let mut pdf = Pdf::open_mem(&bytes).expect("open");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let reachable = reachable_object_set(&mut pdf, true).expect("walk");
 
         assert!(
@@ -1442,7 +1444,7 @@ mod tests {
         // the orphan-/Length-holder GC the linearize universe filter relies on.
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
         let reachable = reachable_object_set(&mut pdf, true).expect("walk");
         assert!(
             !reachable.contains(&ObjectRef::new(7, 0)),
@@ -1461,7 +1463,7 @@ mod tests {
         // from its BFS seeds. Re-linearizing an encrypted input must keep the
         // encryption dictionary (12 0 R here) and its closure (flpdf-phfu).
         let bytes = include_bytes!("../../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let encrypt_ref = pdf
             .trailer()
             .get_ref("Encrypt")
@@ -1477,7 +1479,7 @@ mod tests {
     fn generate_build_drops_orphan_length_holder_via_length_skip() {
         let bytes =
             include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open_mem(Arc::from(&bytes[..])).expect("open");
         // Empty groups: every reachable object is numbered as a plain object, so
         // this isolates the generate walk. With `skip_length = true` the holder
         // (obj 7) is dropped; the page's /Contents stream (obj 4) is still numbered.
@@ -1595,7 +1597,7 @@ mod tests {
     #[test]
     fn renumber_qpdf_refs_in_place_errors_on_unmapped_ref() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber {
             old_to_new: HashMap::new(),
             order: Vec::new(),
@@ -1637,7 +1639,7 @@ mod tests {
     #[test]
     fn renumber_qpdf_refs_in_place_errors_on_excessive_nesting() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let map = CatalogFirstRenumber {
             old_to_new: HashMap::from([(ObjectRef::new(10, 0), ObjectRef::new(1, 0))]),
             order: vec![ObjectRef::new(10, 0)],
@@ -1667,7 +1669,7 @@ mod tests {
     #[test]
     fn collect_qpdf_enqueue_refs_errors_on_excessive_nesting() {
         let bytes = include_bytes!("../../../tests/fixtures/compat/one-page.pdf");
-        let mut pdf = Pdf::open_mem(bytes).expect("open");
+        let mut pdf = Pdf::open(Cursor::new(&bytes[..])).expect("open");
         let obj = nest_in_arrays(
             Object::Reference(ObjectRef::new(10, 0)),
             MAX_INLINE_DEPTH + 5,

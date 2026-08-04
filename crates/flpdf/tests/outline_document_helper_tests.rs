@@ -198,11 +198,13 @@ fn single_outline_with_count(count_object: &str) -> Vec<u8> {
     single_outline_with_item_fields(&format!("/Count {count_object}"))
 }
 
-fn warning_messages(pdf: &Pdf<Cursor<Vec<u8>>>) -> Vec<&str> {
+fn warning_messages(pdf: &Pdf<Cursor<Vec<u8>>>) -> Vec<String> {
+    // Owned rather than borrowed: `repair_diagnostics` hands back a snapshot,
+    // so a `Vec<&str>` here would borrow from a temporary this function drops.
     pdf.repair_diagnostics()
         .entries()
         .iter()
-        .map(|diagnostic| diagnostic.message.as_str())
+        .map(|diagnostic| diagnostic.message.clone())
         .collect()
 }
 
@@ -287,7 +289,7 @@ fn counts_match_qpdf_get_int_value_as_int() {
         match expected_warning {
             Some(expected_warning) => {
                 assert!(
-                    warning_messages.contains(&expected_warning),
+                    warning_messages.iter().any(|m| m == expected_warning),
                     "{count_object}"
                 )
             }
@@ -2547,7 +2549,7 @@ fn malformed_name_tree_structural_errors_warn_repair_and_retry() {
 
         assert_eq!(root_items(&mut pdf)[0].dest, Object::Null, "{label}");
         assert_eq!(
-            warning_messages(&pdf).first().copied(),
+            warning_messages(&pdf).first().map(String::as_str),
             Some(expected_warning),
             "{label}"
         );

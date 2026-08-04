@@ -481,7 +481,7 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
     // Re-open the output and inspect the stream. Output object numbers are
     // renumbered Catalog-first, so navigate via the Catalog's /Metadata ref
     // rather than a hardcoded number.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
 
     // /Filter must be absent.
@@ -515,7 +515,7 @@ fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
 
     // /Filter must be /FlateDecode.

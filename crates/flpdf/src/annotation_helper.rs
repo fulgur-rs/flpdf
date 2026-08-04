@@ -62,7 +62,7 @@ use std::io::{Read, Seek};
 /// All accessors are **leaf-only**: they read only the annotation dictionary
 /// itself, consistent with ISO 32000-1 §12.5 which specifies that annotation
 /// attributes are not inheritable.
-pub struct AnnotationObjectHelper<'a, R: Read + Seek> {
+pub struct AnnotationObjectHelper<'a, R: Read + Seek + 'static> {
     annot_ref: ObjectRef,
     pdf: &'a mut Pdf<R>,
 }

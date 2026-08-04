@@ -22,6 +22,7 @@
 #![cfg(feature = "qpdf-zlib-compat")]
 
 use flpdf::{Pdf, WriteOptions};
+use std::sync::Arc;
 
 /// A minimal one-page classic-xref PDF with NO streams and an `/Info`
 /// dictionary whose keys are intentionally out of sorted order (`/Title`
@@ -134,7 +135,7 @@ fn one_page_non16_id0_fixture() -> Vec<u8> {
 }
 
 fn write_deterministic(fixture: &[u8]) -> Vec<u8> {
-    let mut pdf = Pdf::open_mem(fixture).expect("fixture must open");
+    let mut pdf = Pdf::open_mem(Arc::from(fixture)).expect("fixture must open");
     let mut opts = WriteOptions::default();
     opts.full_rewrite = true;
     opts.deterministic_id = true;

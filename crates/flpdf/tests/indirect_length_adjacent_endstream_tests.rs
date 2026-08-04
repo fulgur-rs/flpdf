@@ -107,7 +107,8 @@ fn assert_metadata_stream_and_warnings<R: std::io::Read + std::io::Seek>(
             .data,
         expected_data
     );
-    let diagnostics = pdf.repair_diagnostics().entries();
+    let snapshot = pdf.repair_diagnostics();
+    let diagnostics = snapshot.entries();
     assert_eq!(
         diagnostics
             .iter()

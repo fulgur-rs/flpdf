@@ -32,7 +32,6 @@ pub type ResourceConflicts =
 /// The document-owned resolver qpdf's `QPDFObject` calls through its owning
 /// `QPDF*` and object identity. Kept crate-private so only the canonical
 /// document implementation can resolve an indirect slot.
-#[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 }
@@ -202,7 +201,6 @@ pub(crate) enum IndirectState {
 struct IndirectSlot {
     object_ref: ObjectRef,
     pdf_unique_id: Option<u64>,
-    #[allow(dead_code)] // read through the flpdf-25kg.3.5 resolver cutover
     resolver: Option<Weak<dyn DocumentResolver>>,
     state: IndirectState,
     parsed_offset: i64,
@@ -247,40 +245,77 @@ impl ObjectHandle {
         self.is_same_object_as(other)
     }
 
-    // Used by this module's identity tests, and by `Pdf::get_object_handle`
-    // (reader.rs) to lazily create the canonical handle it registers into
-    // `handle_registry` the first time a given ref is requested.
+    // An indirect slot with neither a document identity nor a resolver.
+    // Test-only, and necessarily so: every caller is inside a `#[cfg(test)]`
+    // module (this file's own tests, plus `parser.rs`'s
+    // `handle_path_parity_tests` and `reader.rs`'s tests).
+    // `Pdf::get_object_handle` does *not* use this — it needs both the
+    // document identity and the resolver, so it calls
+    // `new_indirect_for_pdf_with_resolver`.
     #[cfg(test)]
     pub(crate) fn new_indirect_unresolved(object_ref: ObjectRef, offset: i64) -> Self {
-        Self::new_indirect_unresolved_with_identity(object_ref, offset, None)
+        Self::new_indirect_unresolved_with_identity(object_ref, offset, None, None)
     }
 
-    pub(crate) fn new_indirect_unresolved_for_pdf(
+    /// Construct a canonical unresolved slot carrying both its owning
+    /// document's identity and that document's resolver — what
+    /// `Pdf::get_object_handle` needs to hand out.
+    ///
+    /// Neither half is sufficient alone. The resolver is what
+    /// [`Self::try_dereference`] upgrades and calls; the identity is what
+    /// [`Self::belongs_to_pdf`] answers on, and what [`Self::set_resolved`]
+    /// stamps onto each direct child for
+    /// [`Self::containing_object_refs_for_pdf`].
+    ///
+    /// `pdf_unique_id` itself ports qpdf's document-level unique id:
+    /// `QPDF::getUniqueId` (`include/qpdf/QPDF.hh:283`,
+    /// `libqpdf/QPDF.cc:2294-2296`) over the member
+    /// `unsigned long long unique_id{0}` (`include/qpdf/QPDF.hh:1454`),
+    /// minted from a function-static atomic counter in the constructor
+    /// (`libqpdf/QPDF.cc:211-212`). `Pdf`'s own `NEXT_PDF_ID.fetch_add`
+    /// (`reader.rs:645`) is that same mechanism, serving the same
+    /// cross-document identity purpose qpdf uses it for: keying
+    /// `m->object_copiers` by the *other* document's id
+    /// (`libqpdf/QPDF.cc:2065`, already noted at `reader.rs:82`) and
+    /// comparing two documents for sameness
+    /// (`libqpdf/QPDFPageObjectHelper.cc:1020`).
+    ///
+    /// What has no qpdf counterpart is storing that id *per object*. A qpdf
+    /// value reaches its document through a raw `QPDF*` back-pointer
+    /// (`libqpdf/qpdf/QPDFValue.hh:150`, `QPDF* qpdf{nullptr}`) which
+    /// `QPDFObject::doResolve` hands straight to `QPDF::Resolver::resolve`
+    /// (`libqpdf/QPDFObject.cc:6-11`), so upstream one pointer is both the
+    /// identity and the route to the resolver. This port splits that single
+    /// pointer into a plain tag plus a `Weak`, which is why both arguments
+    /// have to be supplied together here.
+    pub(crate) fn new_indirect_for_pdf_with_resolver(
         object_ref: ObjectRef,
         offset: i64,
         pdf_unique_id: u64,
+        resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
-        Self::new_indirect_unresolved_with_identity(object_ref, offset, Some(pdf_unique_id))
-    }
-
-    fn new_indirect_unresolved_with_identity(
-        object_ref: ObjectRef,
-        offset: i64,
-        pdf_unique_id: Option<u64>,
-    ) -> Self {
-        let _ = offset; // real Unresolved{offset} state lands in a later task
-        Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
+        Self::new_indirect_unresolved_with_identity(
             object_ref,
-            pdf_unique_id,
-            resolver: None,
-            state: IndirectState::NotYetResolved,
-            parsed_offset: NO_PARSED_OFFSET,
-        }))))
+            offset,
+            Some(pdf_unique_id),
+            Some(resolver),
+        )
     }
 
-    /// Construct a canonical unresolved slot attached to its owning document
-    /// resolver. This is the qpdf-native constructor; the resolver link is
-    /// weak so a surviving handle cannot keep its document alive.
+    /// Construct a canonical unresolved slot attached to a document resolver
+    /// but carrying no document identity tag. The resolver link is weak so a
+    /// surviving handle cannot keep its document alive.
+    ///
+    /// Identity-less, so [`Self::belongs_to_pdf`] answers `false` for every
+    /// document, and the owner [`Self::set_resolved`] records on each direct
+    /// child carries `None` as its document — which makes
+    /// [`Self::containing_object_refs_for_pdf`] empty for every id, since
+    /// `None` matches no `Some`. That makes this the *narrower* of the two
+    /// constructors, not the qpdf-native one — upstream a single `QPDF*`
+    /// carries identity and resolver together, so
+    /// [`Self::new_indirect_for_pdf_with_resolver`] is the shape that
+    /// corresponds to qpdf, and is what a handle vended by a `Pdf` needs.
+    /// This one exists for resolver tests that never consult identity.
     #[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5;
                         // this primitive slice exercises the constructor with
                         // sealed resolver unit tests only
@@ -288,10 +323,25 @@ impl ObjectHandle {
         object_ref: ObjectRef,
         resolver: Weak<dyn DocumentResolver>,
     ) -> Self {
+        Self::new_indirect_unresolved_with_identity(
+            object_ref,
+            NO_PARSED_OFFSET,
+            None,
+            Some(resolver),
+        )
+    }
+
+    fn new_indirect_unresolved_with_identity(
+        object_ref: ObjectRef,
+        offset: i64,
+        pdf_unique_id: Option<u64>,
+        resolver: Option<Weak<dyn DocumentResolver>>,
+    ) -> Self {
+        let _ = offset; // real Unresolved{offset} state lands in a later task
         Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
             object_ref,
-            pdf_unique_id: None,
-            resolver: Some(resolver),
+            pdf_unique_id,
+            resolver,
             state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
         }))))
@@ -2127,6 +2177,62 @@ pub(crate) mod identity_tests {
         assert!(!handle.is_resolved());
     }
 
+    /// A handle needs its owning document's identity *and* that document's
+    /// resolver at once: `Pdf::get_object_handle` hands out one handle that
+    /// must answer both questions.
+    ///
+    /// The identity is not decorative. `set_resolved` stamps the slot's
+    /// `pdf_unique_id` onto every direct child it installs (via
+    /// `associate_value_with_owners`), and that stamp is what
+    /// [`ObjectHandle::belongs_to_pdf`] and
+    /// [`ObjectHandle::containing_object_refs_for_pdf`] read — the
+    /// foreign-object rejection and owner lookup in
+    /// `Pdf::mark_object_handle_dirty`, `filespec_helper`, and
+    /// `embedded_files`. Measured against the current tree, not predicted:
+    /// this is now the constructor `Pdf::get_object_handle` uses — the
+    /// identity-only `new_indirect_unresolved_for_pdf` was deleted when it
+    /// switched over — and patching it to discard its `pdf_unique_id`
+    /// argument fails 62 tests in `cargo test -p flpdf --lib`, not just this
+    /// one.
+    ///
+    /// Note this is *not* what `Pdf::is_canonical_object_handle` compares on:
+    /// that one looks the ref up in `handle_registry` and compares `Rc`
+    /// pointers, never touching `pdf_unique_id`.
+    #[test]
+    fn an_indirect_slot_carries_both_its_pdf_identity_and_its_resolver() {
+        const PDF_ID: u64 = 4242;
+        let object_ref = ObjectRef::new(13, 0);
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            object_ref,
+            NO_PARSED_OFFSET,
+            PDF_ID,
+            Rc::downgrade(&resolver),
+        );
+
+        // Identity: preserved, and specific to this document rather than
+        // matching any id put to it.
+        assert!(handle.belongs_to_pdf(PDF_ID));
+        assert!(!handle.belongs_to_pdf(PDF_ID + 1));
+
+        // Resolver: reachable through `try_dereference`'s real path — upgrade
+        // the `Weak`, call `resolve_indirect` — not merely stored in the slot.
+        // Without it this is the dropped-document error instead.
+        handle.try_dereference().unwrap();
+        assert!(handle.is_resolved());
+
+        // Both at once. The child's owner stamp is written by `set_resolved`
+        // out of the slot's own `pdf_unique_id`, so it can only carry this id
+        // if the identity survived *into* the resolution the resolver drove.
+        let child = handle.get_key(b"A");
+        assert_eq!(child.as_integer(), Some(1));
+        assert_eq!(
+            child.containing_object_refs_for_pdf(PDF_ID),
+            vec![object_ref]
+        );
+        assert!(child.containing_object_refs_for_pdf(PDF_ID + 1).is_empty());
+    }
+
     #[test]
     fn resolver_bearing_indirect_slot_starts_without_a_parsed_offset() {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
@@ -2645,6 +2751,58 @@ mod resolution_state_tests {
         assert!(handle.is_resolved());
         assert!(handle.is_null());
         assert_eq!(handle.as_integer(), None);
+    }
+
+    /// The two null routes are distinct [`IndirectState`] variants that no
+    /// public observation can tell apart.
+    ///
+    /// Named by `set_missing_marks_the_handle_resolved_to_null`'s comment,
+    /// which cited it before it existed. Both halves matter and neither
+    /// implies the other: the *indistinguishable* half is what lets
+    /// `reader/resolver.rs` pick `set_missing` for qpdf's loop branch, where
+    /// qpdf caches a live `QPDF_Null` (`libqpdf/QPDF.cc:1711`); the *distinct
+    /// variant* half is what makes `with_value_mut` behave differently between
+    /// them, which nothing can observe today only because every caller matches
+    /// on a container variant `Null` is not.
+    #[test]
+    fn set_resolved_with_a_null_value_is_indistinguishable_from_the_outside() {
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        missing.set_missing();
+        let null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        null.set_resolved(ObjectValue::Null);
+
+        for observation in [
+            ObjectHandle::is_resolved,
+            ObjectHandle::is_null,
+            ObjectHandle::is_indirect,
+            ObjectHandle::is_direct,
+        ] {
+            assert_eq!(observation(&missing), observation(&null));
+        }
+        assert_eq!(missing.as_integer(), null.as_integer());
+        assert_eq!(missing.as_array().is_none(), null.as_array().is_none());
+        assert_eq!(
+            missing.as_dictionary().is_none(),
+            null.as_dictionary().is_none()
+        );
+        assert_eq!(missing.as_stream_data(), null.as_stream_data());
+        assert_eq!(missing.type_code(), null.type_code());
+        assert_eq!(missing.unparse_resolved(), null.unparse_resolved());
+        assert_eq!(missing.get_parsed_offset(), null.get_parsed_offset());
+
+        // Asserted with `matches!` rather than by mapping the state to a name:
+        // a mapping needs arms for the two variants neither handle can be in,
+        // and an arm nothing reaches is an uncovered line.
+        assert!(
+            matches!(&missing.0, Repr::Indirect(slot)
+                if matches!(slot.borrow().state, IndirectState::Missing)),
+            "`set_missing` must leave the slot in the `Missing` variant"
+        );
+        assert!(
+            matches!(&null.0, Repr::Indirect(slot)
+                if matches!(slot.borrow().state, IndirectState::Resolved(ObjectValue::Null))),
+            "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
+        );
     }
 
     #[test]

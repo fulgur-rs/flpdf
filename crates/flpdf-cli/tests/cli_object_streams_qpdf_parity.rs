@@ -302,7 +302,7 @@ fn disable_mode_emits_no_objstm() {
 
     // Check 2: no /Type /ObjStm stream in the output.
     let bytes = std::fs::read(&disabled).unwrap();
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     let has_objstm = pdf.object_refs().into_iter().any(|r| {
         if let Ok(Object::Stream(s)) = pdf.resolve(r) {
             matches!(s.dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == b"ObjStm")
@@ -345,7 +345,7 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
 
     // Check 2: Catalog and Pages objects resolve correctly via the trailer chain.
     let bytes = std::fs::read(&generated).unwrap();
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
 
     // Find Catalog via trailer /Root.
     let root_ref = pdf
@@ -393,7 +393,7 @@ fn generate_mode_produces_compressed_entries_on_plain_input() {
 /// applied here to a PDF opened with the flpdf public API.
 fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32> {
     let bytes = std::fs::read(path).unwrap();
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
 
     // Defensive guard for the assumption baked into the eligibility check below:
     // we treat every uncompressed gen-0 non-stream non-ObjStm/XRef object as

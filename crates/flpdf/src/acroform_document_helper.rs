@@ -66,7 +66,7 @@ struct FieldInheritance {
 /// prior mutations are immediately visible.
 ///
 /// For a runnable walkthrough see `examples/list_form_fields.rs`.
-pub struct AcroFormDocumentHelper<'a, R: Read + Seek> {
+pub struct AcroFormDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 

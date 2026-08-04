@@ -392,7 +392,7 @@ fn indirect_field_info_values_pdf() -> Vec<u8> {
 #[test]
 fn fields_walks_acroform_field_tree() {
     let bytes = form_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     let fields = pdf.acroform().fields().unwrap();
 
@@ -433,7 +433,7 @@ fn fields_follows_holder_chain_carrier() {
 #[test]
 fn field_infos_materialize_inherited_values_and_full_names() {
     let bytes = inherited_field_info_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     let fields = pdf.acroform().field_infos().unwrap();
 
@@ -478,7 +478,7 @@ fn field_infos_materialize_inherited_values_and_full_names() {
 #[test]
 fn field_infos_skip_pure_widget_kids_but_keep_merged_widget_fields() {
     let bytes = field_info_widget_kids_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     let fields = pdf.acroform().field_infos().unwrap();
 
@@ -503,7 +503,7 @@ fn field_infos_skip_pure_widget_kids_but_keep_merged_widget_fields() {
 #[test]
 fn field_infos_decode_utf16be_field_name_paths() {
     let bytes = unicode_field_names_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     let fields = pdf.acroform().field_infos().unwrap();
 
@@ -516,7 +516,7 @@ fn field_infos_decode_utf16be_field_name_paths() {
 #[test]
 fn field_infos_materialize_indirect_inherited_values() {
     let bytes = indirect_field_info_values_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     let fields = pdf.acroform().field_infos().unwrap();
 
@@ -560,12 +560,12 @@ fn field_infos_materialize_indirect_inherited_values() {
 #[test]
 fn missing_or_malformed_acroform_shapes_are_noops() {
     let empty_bytes = empty_pdf();
-    let mut empty = Pdf::open_mem(&empty_bytes).unwrap();
+    let mut empty = Pdf::open_mem_owned(empty_bytes).unwrap();
     assert!(empty.acroform().fields().unwrap().is_empty());
     empty.acroform().fix_appearance_inheritance().unwrap();
 
     let malformed_bytes = malformed_acroform_pdf();
-    let mut malformed = Pdf::open_mem(&malformed_bytes).unwrap();
+    let mut malformed = Pdf::open_mem_owned(malformed_bytes).unwrap();
     assert!(malformed.acroform().fields().unwrap().is_empty());
     malformed.acroform().fix_appearance_inheritance().unwrap();
 }
@@ -573,7 +573,7 @@ fn missing_or_malformed_acroform_shapes_are_noops() {
 #[test]
 fn malformed_fields_are_ignored_for_listing_and_appearance_fixup() {
     let bytes = malformed_fields_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     assert!(pdf.acroform().fields().unwrap().is_empty());
     pdf.acroform().fix_appearance_inheritance().unwrap();
@@ -582,7 +582,7 @@ fn malformed_fields_are_ignored_for_listing_and_appearance_fixup() {
 #[test]
 fn missing_default_appearance_is_noop_but_fields_still_walk() {
     let bytes = no_default_appearance_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     assert_eq!(pdf.acroform().fields().unwrap(), vec![ObjectRef::new(5, 0)]);
     pdf.acroform().fix_appearance_inheritance().unwrap();
@@ -598,7 +598,7 @@ fn missing_default_appearance_is_noop_but_fields_still_walk() {
 fn indirect_malformed_fields_are_ignored() {
     for fields in ["null", "/Bad"] {
         let bytes = indirect_malformed_fields_pdf(fields);
-        let mut pdf = Pdf::open_mem(&bytes).unwrap();
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
         assert!(pdf.acroform().fields().unwrap().is_empty());
         pdf.acroform().fix_appearance_inheritance().unwrap();
@@ -608,7 +608,7 @@ fn indirect_malformed_fields_are_ignored() {
 #[test]
 fn field_value_get_set_uses_live_document() {
     let bytes = form_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     {
         let mut acroform = AcroFormDocumentHelper::new(&mut pdf);
@@ -631,7 +631,7 @@ fn field_value_get_set_uses_live_document() {
 #[test]
 fn default_appearance_materializes_direct_catalog_acroform() {
     let bytes = direct_acroform_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
     let da = b"/Helv 12 Tf 0 g".to_vec();
 
     pdf.acroform().set_default_appearance(da.clone()).unwrap();
@@ -657,7 +657,7 @@ fn default_appearance_materializes_direct_catalog_acroform() {
 #[test]
 fn default_appearance_is_set_and_inherited_to_fields() {
     let bytes = form_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
     let da = b"/F1 9 Tf 0 0 1 rg".to_vec();
 
     {
@@ -682,7 +682,7 @@ fn default_appearance_is_set_and_inherited_to_fields() {
 #[test]
 fn fix_appearance_inheritance_respects_parent_field_da() {
     let bytes = parent_da_pdf();
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     pdf.acroform().fix_appearance_inheritance().unwrap();
 
@@ -723,7 +723,7 @@ fn fields_errors_when_field_tree_depth_limit_is_exceeded() {
         .map(|(object_number, body)| (*object_number, body.as_str()))
         .collect();
     let bytes = build_pdf(&borrowed, 1);
-    let mut pdf = Pdf::open_mem(&bytes).unwrap();
+    let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
 
     let err = pdf.acroform().fields().unwrap_err();
 
@@ -762,8 +762,8 @@ fn copy_fields_from_errors_when_reference_chain_depth_limit_is_exceeded() {
         .collect();
     let source_bytes = build_pdf(&borrowed, 1);
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let err = target.acroform().copy_fields_from(&mut source).unwrap_err();
 
@@ -793,8 +793,8 @@ fn copy_fields_from_copies_field_appearance_stream() {
         1,
     );
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
     assert_eq!(copied.len(), 1, "the single top-level field is copied");
@@ -831,8 +831,8 @@ fn copy_fields_from_skips_field_p_reference() {
         1,
     );
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
     assert_eq!(copied.len(), 1, "the single top-level field is copied");
@@ -876,8 +876,8 @@ fn copy_fields_from_skips_nested_annotation_page_back_pointer() {
         1,
     );
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
     assert_eq!(copied.len(), 1, "the single top-level field is copied");
@@ -903,8 +903,8 @@ fn copy_fields_from_skips_nested_annotation_page_back_pointer() {
 fn copy_fields_from_appends_copied_fields_to_target_acroform() {
     let source_bytes = form_pdf();
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -924,8 +924,8 @@ fn copy_fields_from_appends_copied_fields_to_target_acroform() {
 fn copy_fields_from_empty_or_defaultless_source_preserves_target_defaults() {
     let empty_source_bytes = empty_pdf();
     let target_bytes = target_form_defaults_pdf();
-    let mut empty_source = Pdf::open_mem(&empty_source_bytes).unwrap();
-    let mut empty_target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut empty_source = Pdf::open_mem_owned(empty_source_bytes).unwrap();
+    let mut empty_target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     assert!(empty_target
         .acroform()
@@ -935,8 +935,8 @@ fn copy_fields_from_empty_or_defaultless_source_preserves_target_defaults() {
 
     let source_bytes = source_without_defaults_pdf();
     let target_bytes = target_form_defaults_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -970,8 +970,8 @@ fn copy_fields_from_empty_or_defaultless_source_preserves_target_defaults() {
 fn copy_fields_from_copies_acroform_da_and_dr_defaults() {
     let source_bytes = form_pdf();
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1023,8 +1023,8 @@ fn copy_fields_from_preserves_dr_resource_named_p() {
     // is dropped from the copy set and remapped to Null.
     let source_bytes = form_dr_p_font_pdf();
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1083,8 +1083,8 @@ fn copy_fields_from_preserves_p_named_resource_in_field_appearance_stream() {
         1,
     );
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
     assert_eq!(copied.len(), 1, "the single top-level field is copied");
@@ -1148,8 +1148,8 @@ fn copy_fields_from_preserves_p_named_resource_in_shared_dr_dictionary() {
         1,
     );
     let target_bytes = empty_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1189,8 +1189,8 @@ fn copy_fields_from_preserves_p_named_resource_in_shared_dr_dictionary() {
 fn copy_fields_from_materializes_source_defaults_when_target_has_defaults() {
     let source_bytes = form_pdf();
     let target_bytes = target_form_defaults_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1228,8 +1228,8 @@ fn copy_fields_from_materializes_source_defaults_when_target_has_defaults() {
 fn copy_fields_from_merges_indirect_source_default_resources() {
     let source_bytes = form_indirect_dr_pdf();
     let target_bytes = target_form_defaults_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1264,8 +1264,8 @@ fn copy_fields_from_merges_indirect_source_default_resources() {
 fn copy_fields_from_merges_indirect_default_resource_categories() {
     let source_bytes = form_indirect_dr_category_pdf();
     let target_bytes = target_indirect_dr_category_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1290,8 +1290,8 @@ fn copy_fields_from_merges_indirect_default_resource_categories() {
 fn copy_fields_from_merges_into_indirect_target_default_resources() {
     let source_bytes = form_pdf();
     let target_bytes = target_indirect_dr_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1326,8 +1326,8 @@ fn copy_fields_from_merges_into_indirect_target_default_resources() {
 fn copy_fields_from_renames_conflicting_default_font_resources() {
     let source_bytes = form_pdf();
     let target_bytes = target_conflicting_font_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 
@@ -1379,8 +1379,8 @@ fn copy_fields_from_renames_conflicting_default_font_resources() {
 fn copy_fields_from_renames_conflicting_direct_field_da_resources() {
     let source_bytes = form_direct_field_da_pdf();
     let target_bytes = target_conflicting_font_pdf();
-    let mut source = Pdf::open_mem(&source_bytes).unwrap();
-    let mut target = Pdf::open_mem(&target_bytes).unwrap();
+    let mut source = Pdf::open_mem_owned(source_bytes).unwrap();
+    let mut target = Pdf::open_mem_owned(target_bytes).unwrap();
 
     let copied = target.acroform().copy_fields_from(&mut source).unwrap();
 

@@ -10,6 +10,7 @@ use flpdf::{
 use std::fs::File;
 use std::io::{BufReader, Cursor};
 use std::path::Path;
+use std::sync::Arc;
 
 fn append_xref_entry(entries: &mut Vec<u8>, kind: u8, field1: u32, field2: u16) {
     entries.push(kind);
@@ -64,7 +65,7 @@ fn preserve_fixture(
     fixture: &[u8],
     configure: impl FnOnce(&mut WriteOptions),
 ) -> flpdf::Result<Vec<u8>> {
-    let mut pdf = Pdf::open(Cursor::new(fixture))?;
+    let mut pdf = Pdf::open_mem(Arc::from(fixture))?;
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
     options.object_streams = ObjectStreamMode::Preserve;
@@ -866,7 +867,7 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
             .any(|w| w == b"/Type /XRef"),
         "an empty Preserve plan must not emit an xref stream"
     );
-    let mut reopened = Pdf::open(Cursor::new(output.as_slice())).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
 
     assert!(
         reopened
@@ -940,7 +941,7 @@ fn preserve_fast_path_retains_direct_trailer_extras() {
         "/Foo << /Held 5 0 R >> /Info << /Producer (direct-info) >> ",
     );
     let output = preserve_fixture(&fixture, |_| {}).unwrap();
-    let mut reopened = Pdf::open(Cursor::new(output.as_slice())).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
 
     let held = match reopened.trailer().get("Foo") {
         Some(Object::Dictionary(dict)) => match dict.get("Held") {

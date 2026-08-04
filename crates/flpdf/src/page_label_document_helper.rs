@@ -366,7 +366,7 @@ fn to_alpha(value: i64, upper: bool) -> String {
 ///
 /// Construct with [`PageLabelDocumentHelper::new`] or [`Pdf::page_labels`]. The
 /// helper caches nothing; methods re-read the live document.
-pub struct PageLabelDocumentHelper<'a, R: Read + Seek> {
+pub struct PageLabelDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 

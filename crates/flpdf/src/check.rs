@@ -76,7 +76,7 @@ pub struct CheckSummary {
 /// }
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn check_reader<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
+pub fn check_reader<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, true)
 }
 
@@ -92,7 +92,7 @@ pub fn check_reader<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
 /// - A failed linearization probe (resolving object `(1, 0)` via
 ///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
 ///   document is treated as non-linearized; the error is not propagated.
-pub fn check_reader_with_options<R: Read + Seek>(
+pub fn check_reader_with_options<R: Read + Seek + 'static>(
     reader: R,
     options: PdfOpenOptions,
 ) -> crate::Result<CheckReport> {
@@ -124,7 +124,7 @@ pub fn check_reader_with_options<R: Read + Seek>(
 /// # Errors
 ///
 /// Same as [`check_reader_with_options`].
-pub fn check_reader_with_options_and_limits<R: Read + Seek>(
+pub fn check_reader_with_options_and_limits<R: Read + Seek + 'static>(
     reader: R,
     options: PdfOpenOptions,
     limits: DecodeLimits,
@@ -146,11 +146,14 @@ pub fn check_reader_with_options_and_limits<R: Read + Seek>(
 /// - A failed linearization probe (resolving object `(1, 0)` via
 ///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
 ///   document is treated as non-linearized; the error is not propagated.
-pub fn check_reader_strict<R: Read + Seek>(reader: R) -> crate::Result<CheckReport> {
+pub fn check_reader_strict<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, false)
 }
 
-fn check_reader_inner<R: Read + Seek>(reader: R, allow_repair: bool) -> crate::Result<CheckReport> {
+fn check_reader_inner<R: Read + Seek + 'static>(
+    reader: R,
+    allow_repair: bool,
+) -> crate::Result<CheckReport> {
     check_reader_inner_with_options(
         reader,
         PdfOpenOptions {
@@ -161,7 +164,7 @@ fn check_reader_inner<R: Read + Seek>(reader: R, allow_repair: bool) -> crate::R
     )
 }
 
-fn check_reader_inner_with_options<R: Read + Seek>(
+fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     reader: R,
     options: PdfOpenOptions,
     limits: DecodeLimits,
@@ -185,8 +188,10 @@ fn check_reader_inner_with_options<R: Read + Seek>(
         Pdf::open_with_options(reader, options)?
     };
 
-    let mut diagnostics = pdf.repair_diagnostics().clone();
-    let repair_diagnostics_start = pdf.repair_diagnostics().entries().len();
+    // `repair_diagnostics` already hands back an owned snapshot, so this is
+    // the copy — no second `.clone()` needed.
+    let mut diagnostics = pdf.repair_diagnostics();
+    let repair_diagnostics_start = diagnostics.entries().len();
     if pdf.uses_weak_crypto() {
         diagnostics.push(Diagnostic::warning(
             "encrypted PDF uses weak crypto; processing continued",

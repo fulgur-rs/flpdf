@@ -181,7 +181,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Verify output is a valid PDF.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "Disable-mode output should be a valid PDF; diagnostics: {:?}",
@@ -189,7 +189,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     );
 
     // Re-open and confirm no object has /Type /ObjStm.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for obj_ref in reopened.object_refs() {
         if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
             let is_objstm = matches!(
@@ -205,7 +205,7 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     }
 
     // Original objects still resolve correctly.
-    let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
     let pages = reopened2.resolve(ObjectRef::new(2, 0)).unwrap();
     match &pages {
         Object::Dictionary(d) => {
@@ -233,7 +233,7 @@ fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut containers = Vec::new();
     for reference in reopened.object_refs() {
         if let Ok(Object::Stream(stream)) = reopened.resolve(reference) {
@@ -322,7 +322,7 @@ fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
             .any(|bytes| bytes == b"\nxref\n"),
         "an empty surviving source container must fall back to a classic xref table"
     );
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewritten output must be valid: {:?}",
@@ -362,7 +362,7 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewritten output must be valid: {:?}",
@@ -436,7 +436,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
     // Verify output is valid.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "Generate-mode output should be a valid PDF; diagnostics: {:?}",
@@ -446,7 +446,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     // Re-open: assert at least one /Type /ObjStm exists and check /N.
     // The fixture has 2 eligible objects (Catalog obj 1 + Pages obj 2), so
     // a correctly-working Generate mode must pack both into the container.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut objstm_n: Option<i64> = None;
     for obj_ref in reopened.object_refs() {
         if let Ok(Object::Stream(s)) = reopened.resolve(obj_ref) {
@@ -473,7 +473,7 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     // numbering puts the ObjStm container FIRST (obj 1), then renumbers its
     // members ascending-source — so the Catalog becomes obj 2 and Pages obj 3,
     // and /Root points at 2 0 R (verified against qpdf 11.9.0 on this fixture).
-    let mut reopened2 = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened2 = Pdf::open(Cursor::new(output.clone())).unwrap();
     let root_ref = reopened2
         .root_ref()
         .expect("trailer must have a resolvable /Root");
@@ -636,7 +636,7 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
         report.diagnostics.entries()
     );
 
-    let mut reopened = Pdf::open_mem(&output).unwrap();
+    let mut reopened = Pdf::open_mem_owned(output).unwrap();
 
     // At least one ObjStm container must exist (otherwise the test would not
     // exercise the renumbered-member path at all).
@@ -779,7 +779,7 @@ fn pdf_with_eligible_orphan() -> Vec<u8> {
 #[test]
 fn generate_mode_full_rewrite_drops_eligible_orphan() {
     let source = pdf_with_eligible_orphan();
-    let mut pdf = Pdf::open_mem(&source).unwrap();
+    let mut pdf = Pdf::open_mem_owned(source).unwrap();
 
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
@@ -800,7 +800,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
     );
 
     // (b) Re-opened output: Catalog/Pages/pages resolve.
-    let mut reopened = Pdf::open_mem(&output).unwrap();
+    let mut reopened = Pdf::open_mem_owned(output).unwrap();
     let root_ref = reopened
         .root_ref()
         .expect("trailer must have a resolvable /Root");
@@ -876,7 +876,7 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "rewrite output must be valid: {:?}",
@@ -896,7 +896,7 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
     );
 
     // The drop must not strand any reference.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     for r in reopened.object_refs() {
         reopened
             .resolve(r)
@@ -956,7 +956,7 @@ fn generate_force_version_below_1_5_suppresses_object_and_xref_streams() {
     );
 
     // The suppressed output is still a valid, re-readable PDF.
-    let report = check_reader(Cursor::new(&output)).unwrap();
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
         report.valid,
         "suppressed output must be a valid PDF; diagnostics: {:?}",
@@ -1148,7 +1148,7 @@ fn force_below_1_5_preserve_downgrades_xref_stream_to_classic_table() {
         !text.contains("/Type /ObjStm"),
         "inherited ObjStm must be dropped (cannot live in a classic table)"
     );
-    let report = check_reader(Cursor::new(&out)).unwrap();
+    let report = check_reader(Cursor::new(out.clone())).unwrap();
     assert!(
         report.valid,
         "downgraded output must be a valid PDF; diagnostics: {:?}",
@@ -1226,7 +1226,7 @@ fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut objstm_ns: Vec<i64> = Vec::new();
     let mut null_objects = 0usize;
     for obj_ref in reopened.object_refs() {
@@ -1324,7 +1324,7 @@ fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
         write_pdf_with_options(&mut pdf, &mut output, &options)
             .unwrap_or_else(|e| panic!("dangling ref ({name}) must not abort generate: {e:?}"));
         // The output must reopen and still resolve the four real objects.
-        let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+        let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
         let root = reopened.root_ref().expect("trailer must have /Root");
         assert!(
             matches!(reopened.resolve(root), Ok(Object::Dictionary(_))),

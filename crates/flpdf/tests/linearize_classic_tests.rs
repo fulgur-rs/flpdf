@@ -61,7 +61,7 @@ fn useoutlines_classic_routes_outlines_to_first_page_and_round_trips() {
     let bytes = linearize_classic("objstm-lin-useoutlines-80-80.pdf");
 
     // The output must parse as a valid linearized PDF and every object resolves.
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
@@ -98,7 +98,7 @@ fn outlines_classic_routes_outlines_to_second_half_and_round_trips() {
     let bytes = linearize_classic("objstm-lin-outlines-80-80.pdf");
 
     // The output must parse as a valid linearized PDF and every object resolves.
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     assert!(!refs.is_empty(), "round-tripped doc must expose objects");
     for r in refs {
@@ -125,7 +125,7 @@ fn crossobj_arr_ref_in_nonpage_obj_places_null_before_first_page_end() {
     let bytes = linearize_classic("resurrect-crossobj-arr-via-live-desc.pdf");
 
     // Verify the output is valid and all objects resolve.
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
         pdf.resolve(r)
@@ -155,7 +155,7 @@ fn revorder_resurrect_deferred_null_before_first_page_end() {
     let bytes = linearize_classic("revorder-resurrect.pdf");
 
     // Verify the output is valid and all objects resolve.
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
         pdf.resolve(r)
@@ -192,7 +192,7 @@ fn page_highnum_content_lownum_page_before_content() {
     let bytes = linearize_classic("page-highnum-content-lownum.pdf");
 
     // Output must round-trip cleanly.
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
         pdf.resolve(r)
@@ -255,7 +255,7 @@ fn relinearize_drops_source_linearization_artifacts_from_universe() {
 fn od_live_arr_null_lands_in_od_section() {
     let bytes = linearize_classic("od-live-arr-null.pdf");
 
-    let mut pdf = Pdf::open(Cursor::new(&bytes)).expect("Pdf::open round-trip");
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("Pdf::open round-trip");
     let refs = pdf.object_refs();
     for r in refs {
         pdf.resolve(r)

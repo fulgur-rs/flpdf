@@ -626,7 +626,7 @@ where
 /// A single overlay/underlay specification: a source document, its kind, and its
 /// `--from`/`--to`/`--repeat` page ranges, as one `--overlay`/`--underlay` group
 /// on the qpdf command line.
-pub struct OverlaySpec<RS: Read + Seek> {
+pub struct OverlaySpec<RS: Read + Seek + 'static> {
     /// The source document supplying the overlay/underlay pages.
     pub source: Pdf<RS>,
     /// Whether the source is drawn beneath or above the destination content.

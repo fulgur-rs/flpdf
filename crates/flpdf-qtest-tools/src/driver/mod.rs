@@ -50,7 +50,7 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
         repair: n != 0,
         ..PdfOpenOptions::default()
     };
-    let mut pdf = match Pdf::open_mem_with_options(&bytes, options) {
+    let mut pdf = match Pdf::open_mem_owned_with_options(bytes, options) {
         Ok(pdf) => pdf,
         Err(error) => {
             return write_open_failure(n, &filename_diagnostic, &error, stdout, stderr);
@@ -320,7 +320,8 @@ pub(crate) fn emit_new_diagnostics<R: io::Read + io::Seek>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> io::Result<()> {
-    let entries = pdf.repair_diagnostics().entries();
+    let diagnostics = pdf.repair_diagnostics();
+    let entries = diagnostics.entries();
     for diagnostic in &entries[*diagnostics_written..] {
         write_warning(filename, diagnostic, stdout, stderr)?;
     }

@@ -87,7 +87,7 @@ use std::io::{Read, Seek};
 /// Construct with [`EmbeddedFileDocumentHelper::new`] or
 /// [`Pdf::embedded_files`]. The helper does not cache name-tree state; each
 /// method observes the document's current object graph.
-pub struct EmbeddedFileDocumentHelper<'a, R: Read + Seek> {
+pub struct EmbeddedFileDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 

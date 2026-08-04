@@ -18,6 +18,7 @@ use flpdf::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+use std::sync::Arc;
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
 ///
@@ -829,14 +830,15 @@ fn page_labels_round_trip_through_extract_then_remerge() {
 
     // "Split": extract each page into its own single-page document, exactly
     // as flpdf's split_pages does per chunk (one entry per selected page,
-    // reconstructed against that page's own source index). Borrow src_bytes
-    // per iteration via a slice cursor — the source is read-only, so no
-    // per-iteration Vec clone is needed. extract_pages still returns a
-    // fresh owned Pdf<Cursor<Vec<u8>>>, so `singles` stays owned.
-    let src_slice: &[u8] = &src_bytes;
+    // reconstructed against that page's own source index). Share one buffer
+    // across iterations — the source is read-only, so no per-iteration copy
+    // is needed, which is exactly what `Pdf::open_mem`'s `Arc<[u8]>` keeps
+    // possible now that `Pdf<R>` requires `R: 'static`. extract_pages still
+    // returns a fresh owned Pdf<Cursor<Vec<u8>>>, so `singles` stays owned.
+    let shared_src: Arc<[u8]> = Arc::from(&src_bytes[..]);
     let mut singles: Vec<Pdf<Cursor<Vec<u8>>>> = Vec::new();
     for (idx, want) in expected.iter().enumerate() {
-        let mut src = Pdf::open(Cursor::new(src_slice)).unwrap();
+        let mut src = Pdf::open_mem(Arc::clone(&shared_src)).unwrap();
         let mut extracted = flpdf::extract_pages(&mut src, &[idx]).unwrap();
         assert_eq!(
             extracted.page_labels().label_string_for_page(0).unwrap(),

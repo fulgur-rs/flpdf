@@ -1,10 +1,12 @@
 //! qpdf correspondence: QPDF.cc document reading, object resolution, recovery, and authentication responsibilities.
 pub(crate) mod file_object;
+pub(crate) mod resolver;
 
 use self::file_object::{
     finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, PendingBody,
     PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
+use self::resolver::ResolverHandle;
 use crate::cache::{CacheEntry, ObjectCache};
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
@@ -25,12 +27,13 @@ use crate::security::standard::{
 use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
 use crate::{
-    Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry,
-    XrefForm,
+    Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static NULL_OBJECT: Object = Object::Null;
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
@@ -55,30 +58,53 @@ static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
 /// let catalog = pdf.resolve(pdf.root_ref().expect("root"))?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub struct Pdf<R: Read + Seek> {
+///
+/// # Why `R: 'static`
+///
+/// A document hands each [`ObjectHandle`] it vends a weak link back to its own
+/// resolver, so that dereferencing a nested reference will not require the
+/// `Pdf` in scope. [`ObjectHandle`] has no lifetime parameter — it is a plain
+/// `'static` type held in the document's registry and handed to callers — so
+/// the trait object that link points at is `dyn DocumentResolver + 'static`,
+/// and everything reachable from it, the input source included, must be
+/// `'static` too.
+///
+/// The practical consequence is that `R` cannot borrow: `Cursor<&[u8]>` is
+/// rejected, while `Cursor<Vec<u8>>`, `Cursor<Arc<[u8]>>`, and
+/// `BufReader<File>` are fine. For in-memory input use [`Pdf::open_mem`],
+/// which shares an `Arc<[u8]>` with the caller, or [`Pdf::open_mem_owned`],
+/// which takes a `Vec<u8>` outright. Neither copies.
+pub struct Pdf<R: Read + Seek + 'static> {
     /// Stable per-document identity used by qpdf-style foreign object copiers.
     unique_id: u64,
-    reader: R,
-    /// Physical byte position corresponding to qpdf's logical input offset 0.
-    /// This is nonzero only when repair found a valid header after leading
-    /// material in the first 1024 bytes.
-    header_offset: usize,
+    /// The canonical resolver and the state it owns — the input source, the
+    /// header offset, and the cross-reference table among them. See
+    /// [`resolver::ResolverCore`] for the full field list and its qpdf
+    /// correspondence.
+    ///
+    /// Held behind an `Rc` because every [`ObjectHandle`] this document vends
+    /// carries a `Weak` to it, so a nested reference can be dereferenced with
+    /// no `&mut Pdf` in scope. `Pdf` holds the only strong reference, so a
+    /// surviving handle can never keep a dropped document's input source
+    /// alive.
+    resolver: Rc<ResolverHandle<R>>,
     version: String,
     trailer: Dictionary,
     startxref: u64,
     last_xref_form: XrefForm,
-    repair_diagnostics: Diagnostics,
     cache: ObjectCache,
-    /// Canonical indirect-object handle registry (`QPDF::getObject`-equivalent
-    /// identity): repeated [`Pdf::get_object_handle`] calls for the same
-    /// `ObjectRef` return the same shared handle. Populated lazily on first
-    /// request; does not perform file I/O or force body parsing.
+    // The canonical indirect-object handle registry that used to live here is
+    // now `ResolverCore::object_cache`, reached through `self.resolver`. It
+    // had to move: `DocumentResolver::resolve_indirect` takes `&self` and
+    // must mint a canonical handle for every nested `N G R` it parses, and a
+    // registry it cannot reach would mean two maps, divergent identity, and
+    // reference cycles `Pdf::drop` could no longer break.
+    //
     // `ObjectHandle`'s Rc<RefCell<..>> identity (see object_handle.rs) makes
     // `Pdf<R>` lose the `Send`/`Sync` auto traits it previously had for any
     // `R: Send`/`Sync`. This is an accepted, intentional consequence of that
     // deviation, not a regression to fix — qpdf's own `QPDF` is likewise not
     // thread-safe for concurrent access to one document.
-    handle_registry: BTreeMap<ObjectRef, ObjectHandle>,
     /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
     foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
@@ -118,7 +144,6 @@ pub struct Pdf<R: Read + Seek> {
     /// of objects whose bodies run to EOF cannot revive the quadratic cost.
     resolution_fallbacks_remaining: u32,
     source_xref_offsets: Vec<(ObjectRef, u64)>,
-    source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
     dirty_object_refs: BTreeSet<ObjectRef>,
     /// Dirty objects whose live ObjectHandle graph was changed directly, so
     /// the legacy object cache may no longer agree with it. `set_object`
@@ -340,11 +365,15 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
-// Stack-growth protection for `lift_bounded`'s recursive hub, mirroring
-// `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values (kept as
-// separate local constants rather than imported cross-module, matching this
-// crate's existing per-module duplication of the same two numbers in
-// `object_handle.rs`).
+// Stack-growth protection for this module's two recursive hubs: `lift_bounded`
+// here, and `ResolverHandle::resolve_indirect` in the `resolver` child module,
+// which reaches these as `super::READER_STACK_RED_ZONE`/
+// `super::READER_STACK_GROWTH_SIZE`. The values mirror `parser.rs`'s own
+// `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` (kept as separate local constants
+// rather than imported cross-module, matching this crate's existing per-module
+// duplication of the same two numbers in `object_handle.rs`); `resolver.rs`
+// shares *these* rather than minting a third pair because it is a child of this
+// module, not a module across the crate from it.
 const READER_STACK_RED_ZONE: usize = 32 * 1024;
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
@@ -364,9 +393,7 @@ impl<R: Read + Seek> Drop for Pdf<R> {
     // registry itself drops ensures no lingering cycle keeps a document's
     // object graph (and any reachable stream buffers) alive past `self`.
     fn drop(&mut self) {
-        for handle in self.handle_registry.values() {
-            handle.disconnect();
-        }
+        self.resolver.disconnect_all();
     }
 }
 
@@ -435,8 +462,19 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Diagnostics emitted while opening the document — typically warnings from the
     /// xref/trailer recovery path. Always non-empty when the parse hit a soft failure.
-    pub fn repair_diagnostics(&self) -> &Diagnostics {
-        &self.repair_diagnostics
+    ///
+    /// Returns an owned snapshot. The collection is qpdf's `m->warnings` and
+    /// lives on the crate-private resolver core rather than on this struct,
+    /// so that `resolve_indirect`, which reaches this document through a
+    /// `Weak` and never holds a `&mut Pdf`, can warn at all — and a
+    /// `&Diagnostics` cannot be handed out from behind the `RefCell` that
+    /// makes that possible. The alternative, `Ref<'_, Diagnostics>`, avoids
+    /// the copy but leaks [`std::cell::Ref`] into the public API and lets a
+    /// caller holding one across a resolving call hit a `BorrowMutError` at
+    /// run time. The copy is cheap: the collection is empty for a document
+    /// that opened cleanly.
+    pub fn repair_diagnostics(&self) -> Diagnostics {
+        self.resolver.repair_diagnostics()
     }
 
     /// Record a non-fatal processing warning on this handle.
@@ -446,9 +484,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// than aborting) so the soft failure is surfaced via [`Pdf::repair_diagnostics`]
     /// instead of being silently swallowed. Mirrors qpdf, which warns and continues
     /// on malformed field trees.
+    ///
+    /// Still takes `&mut self` although the sink no longer requires it: every
+    /// caller already holds a `&mut Pdf`, and the resolver's own warnings go
+    /// through [`resolver::ResolverHandle::push_warning`] instead. Both doors
+    /// reach the one collection.
     pub(crate) fn push_warning(&mut self, message: impl Into<String>) {
-        self.repair_diagnostics
-            .push(Diagnostic::warning(message, None));
+        self.resolver.push_warning(message);
     }
 
     /// Exact source framing removed by an authoritative `endstream` scan.
@@ -641,17 +683,25 @@ impl<R: Read + Seek> Pdf<R> {
         sorted_object_offsets.sort_unstable();
         sorted_object_offsets.dedup();
         let cache = ObjectCache::from_offsets(&loaded.entries);
+        // Hoisted out of the struct literal because the resolver needs the
+        // same id: it stamps `pdf_unique_id` onto every canonical handle it
+        // mints, which `ObjectHandle::belongs_to_pdf` answers on.
+        let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
         let mut pdf = Self {
-            unique_id: NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed),
-            reader,
-            header_offset: loaded_state.header_offset,
+            unique_id,
+            resolver: ResolverHandle::new_shared(
+                reader,
+                loaded_state.header_offset,
+                source_xref_entries,
+                options.repair,
+                loaded.repair_diagnostics,
+                unique_id,
+            ),
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
             last_xref_form: loaded.last_xref_form,
-            repair_diagnostics: loaded.repair_diagnostics,
             cache,
-            handle_registry: BTreeMap::new(),
             foreign_object_maps: BTreeMap::new(),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
@@ -659,7 +709,6 @@ impl<R: Read + Seek> Pdf<R> {
             sorted_object_offsets,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             source_xref_offsets,
-            source_xref_entries,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             recovered_stream_eols: BTreeMap::new(),
@@ -882,8 +931,7 @@ impl<R: Read + Seek> Pdf<R> {
             owner_password_matched,
         });
         if let Some(warning) = r6_perms_warning {
-            self.repair_diagnostics
-                .push(Diagnostic::warning(warning, None));
+            self.push_warning(warning);
         }
         Ok(())
     }
@@ -1057,11 +1105,11 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        self.source_xref_entries.clone()
+        self.resolver.xref_entries()
     }
 
     pub(crate) fn source_header_offset(&self) -> usize {
-        self.header_offset
+        self.resolver.header_offset()
     }
 
     /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
@@ -1074,9 +1122,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// normal resolution, so `stream` text inside strings, names, comments, or
     /// earlier stream payloads cannot be mistaken for the stream marker.
     pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let pending = self.parse_source_file_object_at(offset)?;
@@ -1084,10 +1130,6 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(None);
         };
         Ok(Some(offset.saturating_add(data_start as u64)))
-    }
-
-    fn physical_source_offset(&self, logical_offset: u64) -> u64 {
-        (self.header_offset as u64).saturating_add(logical_offset)
     }
 
     /// Return the source offset of the `/DecodeParms` value paired with one
@@ -1103,9 +1145,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         filter_index: usize,
     ) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
@@ -1128,9 +1168,7 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         object_ref: ObjectRef,
     ) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let body_start =
@@ -1156,9 +1194,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         array_index: usize,
     ) -> Result<Option<u64>> {
-        let Some(XrefEntry::Uncompressed { offset }) =
-            self.source_xref_entries.get(&object_ref).copied()
-        else {
+        let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
         let value_offset = self.qtest_read_source_object_with_retry(offset, |bytes| {
@@ -1182,25 +1218,13 @@ impl<R: Read + Seek> Pdf<R> {
         parse: impl Fn(&[u8]) -> Result<T>,
     ) -> Result<T> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
-        self.reader.seek(SeekFrom::Start(physical_offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => self
-                .reader
-                .by_ref()
-                .take(next.saturating_sub(offset))
-                .read_to_end(&mut bytes)?,
-            None => self.reader.read_to_end(&mut bytes)?,
-        };
+        let bytes = self.resolver.read_window(offset, next)?;
 
         match parse(&bytes) {
             Ok(value) => Ok(value),
             Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(physical_offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
+                let full = self.resolver.read_window(offset, None)?;
                 parse(&full).or(Err(window_error))
             }
             Err(error) => Err(error),
@@ -1233,25 +1257,13 @@ impl<R: Read + Seek> Pdf<R> {
 
     fn parse_source_file_object_at(&mut self, offset: u64) -> Result<PendingFileObject> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
-        self.reader.seek(SeekFrom::Start(physical_offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => self
-                .reader
-                .by_ref()
-                .take(next.saturating_sub(offset))
-                .read_to_end(&mut bytes)?,
-            None => self.reader.read_to_end(&mut bytes)?,
-        };
+        let bytes = self.resolver.read_window(offset, next)?;
 
         match parse_file_object_syntax(&bytes) {
             Ok(pending) => Ok(pending),
             Err(window_error) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(physical_offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
+                let full = self.resolver.read_window(offset, None)?;
                 parse_file_object_syntax(&full).or(Err(window_error))
             }
             Err(error) => Err(error),
@@ -1396,10 +1408,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
-        self.reader.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        self.reader.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        self.resolver.read_physical_input()
     }
 
     /// Number of objects currently resolved in the cache. Useful when you want to
@@ -1504,9 +1513,9 @@ impl<R: Read + Seek> Pdf<R> {
             );
             let has_handle_only_target = self.cache.entry(object_ref).is_none()
                 && self
-                    .handle_registry
-                    .get(&object_ref)
-                    .is_some_and(ObjectHandle::is_resolved);
+                    .resolver
+                    .registered_handle(object_ref)
+                    .is_some_and(|handle| handle.is_resolved());
             if !(has_cached_target || has_handle_only_target) {
                 self.qpdf_dangling_refs.insert(object_ref);
                 if self.cache.entry(object_ref).is_none() {
@@ -1534,18 +1543,16 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// qpdf's `obj_cache` owns both parsed objects and objects created with
     /// `makeIndirectObject`. During the ObjectHandle cutover, the latter live
-    /// solely in `handle_registry`: including resolved cache-miss handles here
-    /// preserves that visibility without cloning their stream payloads into
-    /// the legacy `Object` cache.
+    /// solely in the canonical handle registry: including resolved cache-miss
+    /// handles here preserves that visibility without cloning their stream
+    /// payloads into the legacy `Object` cache.
     fn qpdf_json_live_object_refs(&self) -> Vec<ObjectRef> {
         let mut refs = self.live_object_refs();
         refs.extend(
-            self.handle_registry
-                .iter()
-                .filter_map(|(object_ref, handle)| {
-                    (self.cache.entry(*object_ref).is_none() && handle.is_resolved())
-                        .then_some(*object_ref)
-                }),
+            self.resolver
+                .resolved_object_refs()
+                .into_iter()
+                .filter(|object_ref| self.cache.entry(*object_ref).is_none()),
         );
         refs.sort_unstable();
         refs.dedup();
@@ -1603,22 +1610,29 @@ impl<R: Read + Seek> Pdf<R> {
     /// This does not perform file I/O or force object-body parsing: the
     /// returned handle's value is not read or resolved by this call.
     pub fn get_object_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        self.handle_registry
-            .entry(object_ref)
-            .or_insert_with(|| {
-                ObjectHandle::new_indirect_unresolved_for_pdf(
-                    object_ref,
-                    NO_PARSED_OFFSET,
-                    self.unique_id,
-                )
-            })
-            .clone()
+        // The registry itself lives on the resolver, which is also what mints
+        // the handle: it holds both halves `new_indirect_for_pdf_with_resolver`
+        // needs — the document identity `belongs_to_pdf` answers on and the
+        // `Weak` `try_dereference` upgrades — and it is the same door
+        // `resolve_indirect` uses for a nested `N G R`, so the two can never
+        // hand out different handles for one ref.
+        self.resolver.get_object_handle(object_ref)
+    }
+
+    /// Whether this document holds the only strong reference to its resolver.
+    ///
+    /// Test-only: lets the resolver's own teardown regression assert that
+    /// handing out `Weak`s cannot keep a dropped document's input source
+    /// alive, rather than arguing it from the types.
+    #[cfg(test)]
+    pub(crate) fn resolver_is_uniquely_owned(&self) -> bool {
+        Rc::strong_count(&self.resolver) == 1
     }
 
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.object_ref().is_some_and(|object_ref| {
-            self.handle_registry
-                .get(&object_ref)
+            self.resolver
+                .registered_handle(object_ref)
                 .is_some_and(|canonical| canonical.is_same_object_as(handle))
         })
     }
@@ -1701,7 +1715,7 @@ impl<R: Read + Seek> Pdf<R> {
             .object_refs()
             .iter()
             .map(|r| r.number)
-            .chain(self.handle_registry.keys().map(|r| r.number))
+            .chain(self.resolver.max_object_number())
             .max()
             .unwrap_or(0)
             .checked_add(1)
@@ -1718,12 +1732,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// generation-one occupant reserves the number just as generation zero
     /// does.
     pub(crate) fn object_number_is_available(&self, number: u32) -> bool {
-        !self.cache.contains_object_number(number)
-            && self
-                .handle_registry
-                .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))
-                .next()
-                .is_none()
+        !self.cache.contains_object_number(number) && !self.resolver.holds_object_number(number)
     }
 
     pub(crate) fn unique_id(&self) -> u64 {
@@ -1824,15 +1833,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// registered via [`Pdf::get_object_handle`], which cannot fail.
     pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
         let refs_to_register: Vec<ObjectRef> = self
-            .source_xref_entries
-            .iter()
-            .filter(|(_, entry)| !matches!(entry, XrefEntry::Free { .. }))
-            .map(|(object_ref, _)| *object_ref)
-            .collect();
+            .resolver
+            .xref_refs_matching(|entry| !matches!(entry, XrefEntry::Free { .. }));
         for object_ref in refs_to_register {
             self.get_object_handle(object_ref);
         }
-        Ok(self.handle_registry.values().cloned().collect())
+        Ok(self.resolver.all_object_handles())
     }
 
     // qpdf-cutover-delete(flpdf-25kg.3.3): one-hop legacy bridge. Delete
@@ -1965,7 +1971,7 @@ impl<R: Read + Seek> Pdf<R> {
         // fast native-parse window failed for an unrelated reason — with
         // literal nesting between the two bounds.
         let mut native_parsed = false;
-        let (mut value, parsed_offset) = match self.source_xref_entries.get(&object_ref).copied() {
+        let (mut value, parsed_offset) = match self.resolver.xref_entry(object_ref) {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {
@@ -2597,21 +2603,7 @@ impl<R: Read + Seek> Pdf<R> {
     // computed.
     fn read_bounded_object_window(&mut self, offset: u64) -> Result<Vec<u8>> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
-        self.reader.seek(SeekFrom::Start(physical_offset))?;
-        let mut bytes = Vec::new();
-        match next {
-            Some(next) => {
-                self.reader
-                    .by_ref()
-                    .take(next.saturating_sub(offset))
-                    .read_to_end(&mut bytes)?;
-            }
-            None => {
-                self.reader.read_to_end(&mut bytes)?;
-            }
-        }
-        Ok(bytes)
+        self.resolver.read_window(offset, next)
     }
 
     fn read_object_at_with_policy(
@@ -2622,7 +2614,6 @@ impl<R: Read + Seek> Pdf<R> {
         full_policy: RecoveryPolicy,
     ) -> Result<file_object::FileObjectRead> {
         let next = self.next_object_offset(offset);
-        let physical_offset = self.physical_source_offset(offset);
         let bytes = self.read_bounded_object_window(offset)?;
 
         let initial_policy = if next.is_some() {
@@ -2634,9 +2625,10 @@ impl<R: Read + Seek> Pdf<R> {
             Ok(parsed) => Ok(parsed),
             Err(window_err) if next.is_some() && self.resolution_fallbacks_remaining > 0 => {
                 self.resolution_fallbacks_remaining -= 1;
-                self.reader.seek(SeekFrom::Start(physical_offset))?;
-                let mut full = Vec::new();
-                self.reader.read_to_end(&mut full)?;
+                // A fresh, short borrow: the borrow the window read above took
+                // ended before `parse_and_finish_file_object`, which can
+                // re-enter resolution through an indirect `/Length`.
+                let full = self.resolver.read_window(offset, None)?;
                 self.parse_and_finish_file_object(expected_ref, &full, offset, full_policy)
                     .or(Err(window_err))
             }
@@ -2702,9 +2694,9 @@ impl<R: Read + Seek> Pdf<R> {
     pub(crate) fn resolve_qpdf_json_object(&mut self, object_ref: ObjectRef) -> Result<Object> {
         if self.cache.entry(object_ref).is_none() {
             if let Some(handle) = self
-                .handle_registry
-                .get(&object_ref)
-                .filter(|handle| handle.is_resolved())
+                .resolver
+                .registered_handle(object_ref)
+                .filter(ObjectHandle::is_resolved)
             {
                 return Ok(handle.materialize());
             }
@@ -3047,37 +3039,102 @@ impl<R: Read + Seek> crate::parser::HandleResolver for Pdf<R> {
     }
 }
 
-impl<'a> Pdf<Cursor<&'a [u8]>> {
-    /// Open a PDF document from a borrowed byte slice without wrapping it in a `Cursor` manually.
+impl Pdf<Cursor<Arc<[u8]>>> {
+    /// Open a PDF document from a shared, reference-counted byte buffer.
     ///
-    /// This is a zero-copy convenience wrapper around [`Pdf::open`]. The resulting handle
-    /// borrows `bytes` for its lifetime, so it is not `'static` and cannot be moved out of
-    /// the scope that owns the original slice.
+    /// **This call copies nothing.** The document and the caller share one
+    /// allocation; clone the `Arc` to keep reading the same bytes elsewhere,
+    /// and it is freed once both are done with it. (Producing the `Arc<[u8]>`
+    /// in the first place may copy — `Vec<u8> -> Arc<[u8]>` reallocates so the
+    /// refcount can sit beside the data — but that happens once, in the
+    /// caller's own code, not per open.)
     ///
-    /// For an owned, movable version see [`Pdf::open_mem_owned`].
+    /// ```no_run
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Arc<[u8]> = std::fs::read("input.pdf")?.into();
+    /// let kept = Arc::clone(&bytes);
+    /// let mut pdf = Pdf::open_mem(bytes)?;
+    /// // `kept` and the document are the same bytes, not two copies.
+    /// println!("version {} over {} shared bytes", pdf.version(), kept.len());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Why `Arc<[u8]>` and not `&[u8]`
+    ///
+    /// This took `&[u8]` and returned `Pdf<Cursor<&'a [u8]>>`, borrowing
+    /// without copying. That type is no longer well-formed: `Pdf<R>` requires
+    /// `R: 'static` (see the bound on [`Pdf`] for why), so the input must be
+    /// owned rather than borrowed.
+    ///
+    /// Copying the slice internally would have kept the old signature, and it
+    /// is the wrong trade. qpdf's own in-memory entry point does not copy:
+    /// `QPDF::processMemoryFile` (`libqpdf/QPDF.cc:259-268`) wraps the
+    /// caller's pointer in a `BufferInputSource` over
+    /// `Buffer(unsigned char*, size_t)`, whose contract is "memory is owned by
+    /// the caller and will not be freed when the Buffer is destroyed"
+    /// (`include/qpdf/Buffer.hh:42-45`). Shared ownership is the safe-Rust
+    /// analogue of that contract — no copy on either side — and a caller who
+    /// holds only a slice writes `Arc::from(slice)` itself, so the copy is
+    /// visible at the call site rather than hidden in the library.
+    ///
+    /// `Arc` rather than `Rc` because the buffer, unlike the document, can then
+    /// be shared across threads that each open their own `Pdf`. The `Arc` buys
+    /// sharing of the *input*, not of the document — the two doctests below
+    /// pin both halves of that, so neither can go stale silently.
+    ///
+    /// One buffer, cloned across threads, each clone opening its own document:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// let bytes: Arc<[u8]> = Arc::from(&b"%PDF-1.4\n"[..]);
+    /// let workers: Vec<_> = (0..2)
+    ///     .map(|_| {
+    ///         let shared = Arc::clone(&bytes);
+    ///         std::thread::spawn(move || Pdf::open_mem(shared).is_ok())
+    ///     })
+    ///     .collect();
+    /// for worker in workers {
+    ///     worker.join().unwrap();
+    /// }
+    /// ```
+    ///
+    /// The document itself, by contrast, is not `Send`, and has not been since
+    /// long before the resolver existed: `handle_registry` holds
+    /// [`ObjectHandle`]s whose identity is `Rc<RefCell<..>>`, as that field's
+    /// own comment records. The resolver's `Rc` is a second reason, not the
+    /// reason — compiling the snippet below standalone reports both, and
+    /// `Rc<RefCell<DirectSlot>>` is the one that predates this work.
+    /// `compile_fail` passes on *any* error,
+    /// so this one is only meaningful next to the example above: that one
+    /// builds the same `Arc<[u8]>` and calls the same `open_mem`, and it runs.
+    /// The bound `require_send` adds is therefore the only thing left to
+    /// reject:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Arc;
+    /// use flpdf::Pdf;
+    ///
+    /// fn require_send<T: Send>(_: T) {}
+    /// let bytes: Arc<[u8]> = Arc::from(&b"%PDF-1.4\n"[..]);
+    /// require_send(Pdf::open_mem(bytes));
+    /// ```
     ///
     /// # Errors
     ///
     /// Propagates any error from [`Pdf::open`]; see that method for the full error set.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use flpdf::Pdf;
-    ///
-    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
-    /// let mut pdf = Pdf::open_mem(&bytes)?;
-    /// println!("version {}", pdf.version());
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn open_mem(bytes: &'a [u8]) -> crate::Result<Self> {
+    pub fn open_mem(bytes: Arc<[u8]>) -> crate::Result<Self> {
         Self::open(Cursor::new(bytes))
     }
 
-    /// Open a PDF document from a borrowed byte slice with explicit open options.
+    /// Open a PDF document from a shared byte buffer with explicit open options.
     ///
     /// Like [`Pdf::open_mem`] but accepts a [`PdfOpenOptions`] struct for repair and
-    /// password configuration, mirroring [`Pdf::open_with_options`].
+    /// password configuration, mirroring [`Pdf::open_with_options`]. Shares
+    /// `bytes` without copying, on the same terms.
     ///
     /// # Errors
     ///
@@ -3087,15 +3144,16 @@ impl<'a> Pdf<Cursor<&'a [u8]>> {
     /// # Examples
     ///
     /// ```no_run
+    /// use std::sync::Arc;
     /// use flpdf::{Pdf, PdfOpenOptions};
     ///
-    /// let bytes: Vec<u8> = std::fs::read("input.pdf")?;
+    /// let bytes: Arc<[u8]> = std::fs::read("input.pdf")?.into();
     /// let opts = PdfOpenOptions { repair: true, ..PdfOpenOptions::default() };
-    /// let mut pdf = Pdf::open_mem_with_options(&bytes, opts)?;
+    /// let mut pdf = Pdf::open_mem_with_options(bytes, opts)?;
     /// println!("version {}", pdf.version());
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    pub fn open_mem_with_options(bytes: &'a [u8], options: PdfOpenOptions) -> crate::Result<Self> {
+    pub fn open_mem_with_options(bytes: Arc<[u8]>, options: PdfOpenOptions) -> crate::Result<Self> {
         Self::open_with_options(Cursor::new(bytes), options)
     }
 }
@@ -3103,8 +3161,9 @@ impl<'a> Pdf<Cursor<&'a [u8]>> {
 impl Pdf<Cursor<Vec<u8>>> {
     /// Open a PDF document from an owned byte vector without wrapping it in a `Cursor` manually.
     ///
-    /// This is the owned counterpart to [`Pdf::open_mem`]. The handle takes ownership of
-    /// `bytes` and is therefore `'static`—it can be freely moved and stored in data structures.
+    /// The sole-ownership counterpart to [`Pdf::open_mem`]: the handle takes the
+    /// `Vec` outright rather than sharing an `Arc`. Neither copies; both are
+    /// `'static` and can be freely moved and stored in data structures.
     ///
     /// This is the preferred form for in-memory PDF handling in most contexts (e.g. WASM,
     /// test helpers, fulgur's document pipeline).
@@ -4122,6 +4181,9 @@ mod tests {
     use super::*;
     use crate::pages::page_refs;
     use crate::Stream;
+    // `SeekFrom` left `reader.rs`'s own imports along with the input source;
+    // the fault-injecting cursor below still implements `Seek`.
+    use std::io::SeekFrom;
 
     struct ReadFailingCursor {
         inner: Cursor<Vec<u8>>,
@@ -5346,7 +5408,8 @@ mod tests {
                 .expect("recover compressed stray name"),
             Object::Name(b"a\0\x31x".to_vec())
         );
-        let diagnostics = pdf.repair_diagnostics().entries();
+        let snapshot = pdf.repair_diagnostics();
+        let diagnostics = snapshot.entries();
         assert_eq!(
             diagnostics
                 .iter()
@@ -5377,7 +5440,8 @@ mod tests {
         )
         .expect("parse pending target stream");
 
-        pdf.reader.fail_reads = true;
+        pdf.resolver
+            .with_reader_mut(|reader| reader.fail_reads = true);
         let err = pdf
             .resolve_pending_stream_length(target, &pending, target_offset)
             .expect_err("holder I/O errors must remain unrecoverable");
@@ -6221,7 +6285,8 @@ mod tests {
             normal_first.resolve_qpdf_json_object(object_ref).unwrap(),
             Object::Integer(3)
         );
-        let diagnostics = normal_first.repair_diagnostics().entries();
+        let snapshot = normal_first.repair_diagnostics();
+        let diagnostics = snapshot.entries();
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("expected endobj"));
 
@@ -6287,7 +6352,8 @@ mod tests {
 
         assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
         assert_eq!(pdf.resolve(ObjectRef::new(3, 0)).unwrap(), Object::Null);
-        let diagnostics = pdf.repair_diagnostics().entries();
+        let snapshot = pdf.repair_diagnostics();
+        let diagnostics = snapshot.entries();
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0]
             .message
@@ -6445,13 +6511,52 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Acceptance (2): open_mem(&[u8]) opens an in-memory PDF
+    // Acceptance (2): open_mem(Arc<[u8]>) opens an in-memory PDF
     // ------------------------------------------------------------------
+
+    /// `open_mem` shares the caller's buffer instead of copying it.
+    ///
+    /// This is the contract that makes `Arc<[u8]>` the right parameter rather
+    /// than `&[u8]`: qpdf's own in-memory entry point does not copy either
+    /// (`QPDF::processMemoryFile`, `libqpdf/QPDF.cc:259-268`, over a `Buffer`
+    /// whose "memory is owned by the caller and will not be freed when the
+    /// Buffer is destroyed", `include/qpdf/Buffer.hh:42-45`).
+    ///
+    /// A strong count of 2 is only reachable if the document holds *this*
+    /// allocation. The mutation this guards against has to stay type-correct
+    /// to be meaningful — `Cursor::new(bytes.to_vec())` merely fails to
+    /// compile, since `open_mem` lives in `impl Pdf<Cursor<Arc<[u8]>>>`, and a
+    /// compile error is not this test discriminating. The real one is
+    /// `Self::open(Cursor::new(Arc::from(&bytes[..])))`: same signature, same
+    /// bytes, fresh allocation. It fails the middle assertion below with
+    /// `left: 1, right: 2`, and fails nothing else.
+    #[test]
+    fn open_mem_shares_the_callers_buffer_rather_than_copying_it() {
+        let bytes: Arc<[u8]> = Arc::from(&minimal_pdf_bytes()[..]);
+        let kept = Arc::clone(&bytes);
+        assert_eq!(Arc::strong_count(&kept), 2, "caller's clone plus `bytes`");
+
+        let mut pdf = Pdf::open_mem(bytes).expect("open_mem should succeed");
+        assert_eq!(
+            Arc::strong_count(&kept),
+            2,
+            "the document must hold the caller's allocation, not a copy of it"
+        );
+        assert_eq!(page_refs(&mut pdf).expect("page_refs").len(), 1);
+
+        drop(pdf);
+        assert_eq!(
+            Arc::strong_count(&kept),
+            1,
+            "dropping the document must release its share of the buffer"
+        );
+        assert_eq!(&kept[..9], b"%PDF-1.4\n");
+    }
 
     #[test]
     fn open_mem_opens_minimal_pdf() {
         let bytes = minimal_pdf_bytes();
-        let mut pdf = Pdf::open_mem(&bytes).expect("open_mem should succeed");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open_mem should succeed");
         let refs = page_refs(&mut pdf).expect("page_refs should succeed");
         assert_eq!(refs.len(), 1, "expected 1 page");
         assert_eq!(
@@ -6497,7 +6602,7 @@ mod tests {
         let refs_cursor = page_refs(&mut pdf_cursor).expect("page_refs from cursor");
         let root_cursor = pdf_cursor.root_ref();
 
-        let mut pdf_mem = Pdf::open_mem(&bytes).expect("open_mem should succeed");
+        let mut pdf_mem = Pdf::open_mem_owned(bytes).expect("open_mem should succeed");
         let refs_mem = page_refs(&mut pdf_mem).expect("page_refs from open_mem");
         let root_mem = pdf_mem.root_ref();
 
@@ -6535,9 +6640,32 @@ mod tests {
             repair: true,
             ..PdfOpenOptions::default()
         };
-        let mut pdf = Pdf::open_mem_with_options(&bytes, opts).expect("open_mem_with_options");
+        let mut pdf = Pdf::open_mem_owned_with_options(bytes, opts).expect("open_mem_with_options");
         let refs = page_refs(&mut pdf).expect("page_refs");
         assert_eq!(refs.len(), 1);
+    }
+
+    /// The shared-buffer entry point takes the same options, and shares the
+    /// caller's allocation rather than copying it — the property `open_mem`'s
+    /// own doc rests on (qpdf's `Buffer` contract,
+    /// `include/qpdf/Buffer.hh:42-45`).
+    #[test]
+    fn open_mem_with_options_shares_the_callers_buffer() {
+        let bytes: Arc<[u8]> = Arc::from(&minimal_pdf_bytes()[..]);
+        let kept = Arc::clone(&bytes);
+        let opts = PdfOpenOptions {
+            repair: true,
+            ..PdfOpenOptions::default()
+        };
+
+        let mut pdf = Pdf::open_mem_with_options(bytes, opts).expect("open_mem_with_options");
+
+        assert_eq!(page_refs(&mut pdf).expect("page_refs").len(), 1);
+        assert_eq!(
+            Arc::strong_count(&kept),
+            2,
+            "the document must read the caller's allocation, not a copy"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -7395,7 +7523,7 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.source_xref_entries.insert(
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
@@ -7455,7 +7583,7 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.source_xref_entries.insert(
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
@@ -7547,7 +7675,7 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
-        pdf.source_xref_entries.insert(
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
@@ -7661,7 +7789,7 @@ mod tests {
             "object 0 must never be tracked as an explicitly removed reference"
         );
         assert!(
-            !pdf.handle_registry.contains_key(&free_list_head),
+            pdf.resolver.registered_handle(free_list_head).is_none(),
             "object 0 must not gain a handle just from delete_object"
         );
     }
@@ -7692,7 +7820,7 @@ mod tests {
             "prepare_qpdf_json_objects must have seeded the cache as Missing"
         );
         assert!(
-            !pdf.handle_registry.contains_key(&dangling_ref),
+            pdf.resolver.registered_handle(dangling_ref).is_none(),
             "no handle must exist yet for this ref"
         );
 

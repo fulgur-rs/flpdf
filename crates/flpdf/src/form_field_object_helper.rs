@@ -14,7 +14,7 @@ mod rendering;
 
 /// Typed read-only accessor helper for a PDF AcroForm field or widget
 /// annotation dictionary.
-pub struct FormFieldObjectHelper<'a, R: Read + Seek> {
+pub struct FormFieldObjectHelper<'a, R: Read + Seek + 'static> {
     field_ref: ObjectRef,
     pdf: &'a mut Pdf<R>,
 }

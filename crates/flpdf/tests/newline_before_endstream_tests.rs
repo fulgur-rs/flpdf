@@ -335,7 +335,7 @@ fn run_round_trip_test(policy: NewlineBeforeEndstream) {
 
     // Re-open the rewritten PDF. Output is renumbered Catalog-first, so
     // navigate to the stream via the Catalog's /Metadata reference.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
 
     // Verify the payload is intact.
@@ -443,7 +443,7 @@ fn round_trip_qdf(raw: &[u8], policy: NewlineBeforeEndstream) -> Vec<u8> {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     resolve_metadata_stream(&mut reopened).data
 }
 
@@ -611,7 +611,7 @@ fn e2e_yes_mode_endstream_preceded_by_exactly_one_newline_and_length_correct() {
 
     // Verify /Length in the stream dict via reader. Output is renumbered
     // Catalog-first, so navigate via the Catalog's /Metadata reference.
-    let mut reopened = Pdf::open(Cursor::new(&output)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
     let declared_len = match stream.dict.get("Length") {
         Some(Object::Integer(n)) => *n as usize,

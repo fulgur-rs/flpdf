@@ -82,7 +82,7 @@
 //!
 //! let src = std::fs::read("input.pdf").unwrap();
 //! // `false` = incremental chunks; pass `true` for deterministic-ID full-rewrite chunks.
-//! split_pages(&src, 2, Path::new("output.pdf"), false).unwrap();
+//! split_pages(src, 2, Path::new("output.pdf"), false).unwrap();
 //! // Produces: output-1-2.pdf, output-3-4.pdf, …
 //! ```
 
@@ -92,6 +92,7 @@ use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::fs::File;
 use std::io::{BufWriter, Cursor};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -102,7 +103,14 @@ use std::path::{Path, PathBuf};
 ///
 /// # Arguments
 ///
-/// - `src_bytes`: Raw bytes of the source PDF (read once, reused per chunk).
+/// - `src_bytes`: Raw bytes of the source PDF, **taken by value**. Every chunk
+///   reopens the source, and `Pdf<R>` requires `R: 'static`, so the bytes have
+///   to be owned by something that outlives each chunk's document rather than
+///   borrowed from the caller. Taking the `Vec` means that owner can be the
+///   caller's own allocation, moved in — the whole document is never resident
+///   twice on this account. Callers that need to keep their copy can pass
+///   `bytes.clone()`, which makes the second copy visible at the call site
+///   instead of hiding it in here.
 /// - `chunk_size`: Number of pages per chunk (`N` in `--split-pages=N`). Must
 ///   be ≥ 1. Values ≥ total page count emit a single file containing all pages.
 /// - `output_template`: Output path template. The page suffix is inserted
@@ -127,7 +135,7 @@ use std::path::{Path, PathBuf};
 /// - [`Error::Io`] on any file-system error writing the output files.
 /// - Other [`Error`] variants on structural PDF problems.
 pub fn split_pages(
-    src_bytes: &[u8],
+    src_bytes: Vec<u8>,
     chunk_size: usize,
     output_template: &Path,
     deterministic_id: bool,
@@ -138,8 +146,15 @@ pub fn split_pages(
         ));
     }
 
+    // One allocation, shared by the initial open and every chunk's re-open:
+    // chunks are written sequentially and none of them mutates the source
+    // bytes. `Arc::new` moves the caller's `Vec` into the box rather than
+    // copying its contents — see [`SharedSource`] for why the `Vec` stays a
+    // `Vec` instead of becoming an `Arc<[u8]>`.
+    let shared_source = SharedSource::new(src_bytes);
+
     // Open once to determine page count and collect page refs.
-    let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
+    let mut pdf = Pdf::open(Cursor::new(shared_source.clone()))?;
     let all_page_refs = page_refs(&mut pdf)?;
     let total_pages = all_page_refs.len();
     if total_pages == 0 {
@@ -179,7 +194,7 @@ pub fn split_pages(
 
         // Write the chunk to the output file.
         write_chunk(
-            src_bytes,
+            shared_source.clone(),
             pages_root_ref,
             &chunk_refs,
             chunk_start,
@@ -353,6 +368,43 @@ pub fn digit_width(n: u32) -> usize {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// The source bytes, shared by every chunk's document, in the one shape
+/// [`Cursor`] will read from without copying them.
+///
+/// Each chunk reopens the source, and `Pdf<R>` requires `R: 'static`, so the
+/// chunks cannot read through a borrowed `Cursor<&[u8]>` — they need an owning
+/// source that can be handed out once per chunk. `Arc<[u8]>` is the obvious
+/// shape and is what [`Pdf::open_mem`] takes, but building one from an owned
+/// `Vec` **copies the whole document**: `Arc`'s refcount header sits in front of
+/// the payload, and it cannot be retrofitted onto an allocation `Vec` already
+/// made, so `Arc::<[u8]>::from(vec)` allocates and memcpys. `Arc::new(vec)`
+/// moves the `Vec` — three words — into the box instead and copies nothing.
+///
+/// The newtype is what makes that usable: [`Cursor`]'s [`std::io::Read`] and
+/// [`std::io::Seek`] impls are bounded on `AsRef<[u8]>`, and `Arc<Vec<u8>>`
+/// implements only `AsRef<Vec<u8>>` (`impl<T: ?Sized> AsRef<T> for Arc<T>`),
+/// which is a different trait. This is `Clone` to be handed out per chunk;
+/// cloning bumps the refcount and copies nothing.
+#[derive(Clone)]
+struct SharedSource(Arc<Vec<u8>>);
+
+impl SharedSource {
+    /// Take ownership of `bytes` without copying them: the `Arc` box holds the
+    /// `Vec`'s three words, and the payload stays exactly where the caller
+    /// allocated it. `shared_source_keeps_the_callers_allocation` pins that by
+    /// address, which is the only way to tell this apart from the `Arc<[u8]>`
+    /// shapes that compile just as readily and memcpy the document.
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(bytes))
+    }
+}
+
+impl AsRef<[u8]> for SharedSource {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// Write a single chunk PDF to `out_path`.
 ///
 /// Re-opens `src_bytes` as a fresh `Pdf`, mutates the `/Pages` root so that
@@ -362,7 +414,7 @@ pub fn digit_width(n: u32) -> usize {
 /// *source* document, used to reconstruct `/PageLabels` for the chunk
 /// (qpdf `--split-pages` parity).
 fn write_chunk(
-    src_bytes: &[u8],
+    src_bytes: SharedSource,
     pages_root_ref: ObjectRef,
     chunk_refs: &[ObjectRef],
     chunk_start: usize,
@@ -371,6 +423,7 @@ fn write_chunk(
     deterministic_id: bool,
 ) -> Result<()> {
     // Re-open the source bytes so each chunk starts from the pristine state.
+    // The buffer is shared with every other chunk, not copied per chunk.
     let mut pdf = Pdf::open(Cursor::new(src_bytes))?;
 
     // /PageLabels (qpdf `QPDFJob::doSplitPages` parity): reconstruct the
@@ -758,9 +811,47 @@ mod tests {
     // Integration tests: split_pages
     // -----------------------------------------------------------------------
 
+    /// [`SharedSource::new`] copies nothing: the bytes stay exactly where the
+    /// caller allocated them, and every clone reaches that same allocation.
+    ///
+    /// Pinned by address rather than by size, because size cannot tell the
+    /// difference. The `Arc<[u8]>` shapes compile just as readily here —
+    /// `Arc::<[u8]>::from(bytes)` satisfies the same `AsRef<[u8]>` bound
+    /// `Cursor` needs — and allocate `bytes.len()` and memcpy into it, since an
+    /// `Arc`'s refcount header sits in front of the payload and cannot be
+    /// retrofitted onto an allocation `Vec` has already made. Swapping this
+    /// field to `Arc<[u8]>` still passes every other test in this file; it
+    /// fails here.
+    ///
+    /// This is the absolute companion to the relative measurement in
+    /// `tests/split_pages_allocation_tests.rs`, which compares handing the
+    /// source over against lending it and would stay green if both sides
+    /// gained a copy together.
+    #[test]
+    fn shared_source_keeps_the_callers_allocation() {
+        let bytes = vec![b'x'; 8 * 1024];
+        let address = bytes.as_ptr();
+        let length = bytes.len();
+
+        let shared = SharedSource::new(bytes);
+        assert_eq!(
+            shared.as_ref().as_ptr(),
+            address,
+            "the handover must move the Vec, not copy its contents"
+        );
+        assert_eq!(shared.as_ref().len(), length);
+
+        let per_chunk = shared.clone();
+        assert_eq!(
+            per_chunk.as_ref().as_ptr(),
+            address,
+            "each chunk's re-open must reach the same allocation, not its own copy"
+        );
+    }
+
     /// Open a PDF from bytes and return the page count.
     fn page_count_of(bytes: &[u8]) -> usize {
-        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("should parse");
+        let mut pdf = Pdf::open_mem(Arc::from(bytes)).expect("should parse");
         page_refs(&mut pdf).expect("should get page refs").len()
     }
 
@@ -770,7 +861,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 1, &template, false).expect("split should succeed");
+        split_pages(src, 1, &template, false).expect("split should succeed");
 
         // qpdf 11.9.0: --split-pages=1 → single-number suffix (out-N.pdf),
         // not the range form out-N-N.pdf (flpdf-s5e).
@@ -794,7 +885,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 2, &template, false).expect("split should succeed");
+        split_pages(src, 2, &template, false).expect("split should succeed");
 
         let out12 = tmpdir.path().join("out-1-2.pdf");
         let out34 = tmpdir.path().join("out-3-4.pdf");
@@ -816,7 +907,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 100, &template, false).expect("split should succeed");
+        split_pages(src, 100, &template, false).expect("split should succeed");
 
         let out = tmpdir.path().join("out-1-3.pdf");
         assert!(out.exists(), "single chunk file should exist: {:?}", out);
@@ -830,7 +921,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 2, &template, false).expect("split should succeed");
+        split_pages(src, 2, &template, false).expect("split should succeed");
 
         // First chunk: out-01-02.pdf
         let first = tmpdir.path().join("out-01-02.pdf");
@@ -856,8 +947,12 @@ mod tests {
         let src = build_n_page_pdf(3);
         let d1 = tempfile::tempdir().expect("tmpdir");
         let d2 = tempfile::tempdir().expect("tmpdir");
-        split_pages(&src, 1, &d1.path().join("out.pdf"), true).expect("split should succeed");
-        split_pages(&src, 1, &d2.path().join("out.pdf"), true).expect("split should succeed");
+        // `split_pages` takes ownership, so the second run needs its own copy.
+        // The clone is this test's, not the function's: a single run copies
+        // nothing.
+        split_pages(src.clone(), 1, &d1.path().join("out.pdf"), true)
+            .expect("split should succeed");
+        split_pages(src, 1, &d2.path().join("out.pdf"), true).expect("split should succeed");
 
         let c1 = std::fs::read(d1.path().join("out-1.pdf")).unwrap();
         let c2 = std::fs::read(d2.path().join("out-1.pdf")).unwrap();
@@ -878,7 +973,7 @@ mod tests {
         let src = build_n_page_pdf(2);
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let bad = tmpdir.path().join("no_such_subdir").join("out.pdf");
-        let result = split_pages(&src, 1, &bad, false);
+        let result = split_pages(src, 1, &bad, false);
         assert!(
             result.is_err(),
             "a chunk write failure must propagate out of split_pages"
@@ -890,7 +985,7 @@ mod tests {
         let src = build_n_page_pdf(3);
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
-        let result = split_pages(&src, 0, &template, false);
+        let result = split_pages(src, 0, &template, false);
         assert!(result.is_err(), "chunk_size=0 should return an error");
     }
 
@@ -903,7 +998,7 @@ mod tests {
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
 
-        split_pages(&src, 2, &template, false).expect("split should succeed");
+        split_pages(src, 2, &template, false).expect("split should succeed");
 
         let chunk1 = std::fs::read(tmpdir.path().join("out-1-2.pdf")).unwrap();
         let chunk2 = std::fs::read(tmpdir.path().join("out-3-4.pdf")).unwrap();
@@ -938,7 +1033,7 @@ mod tests {
         let src = build_n_page_pdf(3);
         let tmpdir = tempfile::tempdir().expect("tmpdir");
         let template = tmpdir.path().join("out.pdf");
-        split_pages(&src, 1, &template, false).expect("split should succeed");
+        split_pages(src, 1, &template, false).expect("split should succeed");
 
         let chunk = std::fs::read(tmpdir.path().join("out-1.pdf")).unwrap();
         let mut pdf = Pdf::open(Cursor::new(chunk)).expect("should parse");

@@ -131,7 +131,7 @@ fn full_rewrite_output_is_valid_pdf() {
     .success();
 
     let bytes = std::fs::read(&output).unwrap();
-    let report = check_reader(Cursor::new(&bytes)).unwrap();
+    let report = check_reader(Cursor::new(bytes.clone())).unwrap();
     assert!(
         report.valid,
         "full-rewrite CLI output should be valid; diagnostics: {:?}",
@@ -139,7 +139,7 @@ fn full_rewrite_output_is_valid_pdf() {
     );
 
     // Trailer must not have /Prev.
-    let pdf = Pdf::open(Cursor::new(&bytes)).unwrap();
+    let pdf = Pdf::open(Cursor::new(bytes.clone())).unwrap();
     assert!(
         pdf.trailer().get("Prev").is_none(),
         "full-rewrite output must not have /Prev"

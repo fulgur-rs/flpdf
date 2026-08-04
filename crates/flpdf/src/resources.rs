@@ -881,7 +881,7 @@ const MAX_FORM_DEPTH: usize = 64;
 /// separately. (Keeping the invariant borrows in one parameter also keeps the
 /// recursive call sites on a single line, which stops rustfmt from reflowing a
 /// `)?` onto its own line and fragmenting its coverage region.)
-struct CollectCtx<'a, R: Read + Seek> {
+struct CollectCtx<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
     /// The page's real used-name accumulator — the bubble target for the names
     /// of resource-less Form XObjects, wherever they sit in the Form tree.

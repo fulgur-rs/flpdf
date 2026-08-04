@@ -45,7 +45,7 @@ fn build_minimal_pdf() -> Vec<u8> {
 #[test]
 fn closure_contains_page_ref_itself() {
     let data = build_minimal_pdf();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let page_ref = page_refs[0];
 
@@ -108,7 +108,7 @@ fn build_pdf_with_font() -> Vec<u8> {
 #[test]
 fn closure_includes_font_resource() {
     let data = build_pdf_with_font();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let page_ref = page_refs[0];
     let font_ref = ObjectRef::new(4, 0);
@@ -180,7 +180,7 @@ fn build_two_page_pdf_shared_font() -> Vec<u8> {
 #[test]
 fn shared_object_appears_in_both_page_closures() {
     let data = build_two_page_pdf_shared_font();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let font_ref = ObjectRef::new(5, 0);
 
@@ -261,7 +261,7 @@ fn build_pdf_with_cycle() -> Vec<u8> {
 #[test]
 fn cycle_does_not_loop_forever() {
     let data = build_pdf_with_cycle();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let page_ref = page_refs[0];
 
@@ -321,7 +321,7 @@ fn build_pdf_with_content_stream() -> Vec<u8> {
 #[test]
 fn closure_includes_content_stream() {
     let data = build_pdf_with_content_stream();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let page_ref = page_refs[0];
     let stream_ref = ObjectRef::new(4, 0);
@@ -404,7 +404,7 @@ fn build_pdf_with_cross_page_annotation() -> Vec<u8> {
 #[test]
 fn cross_page_annotation_does_not_pull_in_sibling_content() {
     let data = build_pdf_with_cross_page_annotation();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let page1_ref = page_refs[0];
     let page2_ref = page_refs[1];
@@ -490,7 +490,7 @@ fn build_pdf_with_inherited_resources() -> Vec<u8> {
 #[test]
 fn closure_includes_inherited_resources() {
     let data = build_pdf_with_inherited_resources();
-    let mut pdf = Pdf::open_mem(&data).unwrap();
+    let mut pdf = Pdf::open_mem_owned(data).unwrap();
     let page_refs = pages::page_refs(&mut pdf).unwrap();
     let font_ref = ObjectRef::new(5, 0);
     let pages_ref = ObjectRef::new(2, 0);

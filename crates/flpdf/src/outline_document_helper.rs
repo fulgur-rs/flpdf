@@ -82,7 +82,7 @@ fn object_key(object: &Object, key: &str) -> Object {
 }
 
 /// High-level outline helper for a document. See module docs.
-pub struct OutlineDocumentHelper<'a, R: Read + Seek> {
+pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
 }
 

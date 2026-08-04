@@ -590,7 +590,7 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
     let out_bytes = std::fs::read(&out_path).unwrap();
 
     // Re-open and resolve obj 4 (the JBIG2 stream).
-    let mut pdf = Pdf::open(Cursor::new(&out_bytes)).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(out_bytes.clone())).unwrap();
     let obj = pdf.resolve(ObjectRef::new(4, 0)).unwrap();
     let Object::Stream(stream) = obj else {
         panic!("object 4 should be a stream after rewrite");
@@ -633,7 +633,7 @@ fn cli_show_stream_jbig2_globals_indirect_ref_preserved_after_rewrite() {
     );
 
     // The globals stream (obj 5) must still be resolvable (reference is not dangling).
-    let mut pdf2 = Pdf::open(Cursor::new(&out_bytes)).unwrap();
+    let mut pdf2 = Pdf::open(Cursor::new(out_bytes.clone())).unwrap();
     let globals_obj = pdf2
         .resolve(ObjectRef::new(5, 0))
         .unwrap_or_else(|e| panic!("JBIG2Globals obj 5 must be resolvable after rewrite: {e}"));
