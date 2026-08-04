@@ -1715,10 +1715,12 @@ mod tests {
         let encryption = guard.as_ref().expect("RC4 fixture must authenticate");
         assert_eq!(encryption.stream_mode, crate::reader::EncryptionMode::Rc4);
         // RC4-128 derives a 16-byte file key (qpdf Algorithm 2, key length
-        // bits / 8). Asserting only stream_mode would pass even if file_key
-        // never made it through the shared cell -- assert the payload a real
-        // consumer (flpdf-25kg.3.10's decryptStream-equivalent, which needs
-        // the key for getKeyForObject) actually needs.
+        // bits / 8). stream_mode and file_key are sibling fields of one
+        // EncryptionState behind one Option, so `Some` already proves both
+        // arrived through the shared cell together; this assertion instead
+        // checks the derived payload itself -- a real consumer (the
+        // per-object key derivation a decryptStream port would need) cares
+        // about the key's actual length, not just that a key is present.
         assert_eq!(encryption.file_key.len(), 16);
     }
 
