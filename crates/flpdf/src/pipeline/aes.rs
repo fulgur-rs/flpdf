@@ -26,6 +26,19 @@ const BUF_SIZE: usize = 16;
 /// (`libqpdf/qpdf/Pl_AES_PDF.hh:36-37`).
 static USE_STATIC_IV: AtomicBool = AtomicBool::new(false);
 
+/// The fixed vector qpdf's `--static-aes-iv` produces: `14 * (1 + i)`
+/// (`libqpdf/Pl_AES_PDF.cc:136-139`). CBC writes it at the head of the
+/// ciphertext, so it is part of the output bytes rather than an internal
+/// detail — which is why the writer, whose own encryption path does not yet
+/// run through this stage, reads the value from here rather than repeating it.
+pub(crate) fn static_initialization_vector() -> [u8; BUF_SIZE] {
+    let mut iv = [0u8; BUF_SIZE];
+    for (i, byte) in iv.iter_mut().enumerate() {
+        *byte = 14u8.wrapping_mul(1 + u8::try_from(i).expect("i < BUF_SIZE"));
+    }
+    iv
+}
+
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 type Aes128CbcEnc = cbc::Encryptor<Aes128>;
@@ -218,10 +231,7 @@ impl<'a> PlAesPdf<'a> {
         } else if self.use_specified_iv {
             self.cbc_block = self.specified_iv;
         } else if USE_STATIC_IV.load(Ordering::Relaxed) {
-            // qpdf `:136-139`: `cbc_block[i] = 14 * (1 + i)`.
-            for (i, byte) in self.cbc_block.iter_mut().enumerate() {
-                *byte = 14u8.wrapping_mul(1 + u8::try_from(i).expect("i < 16"));
-            }
+            self.cbc_block = static_initialization_vector();
         } else {
             // qpdf `QUtil::initializeWithRandomBytes` (`:141`).
             // cov:ignore-start: a getrandom failure cannot be injected here
