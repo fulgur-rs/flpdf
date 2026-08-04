@@ -880,10 +880,13 @@ pub(crate) fn compute_o_entry(
 /// as R=3. V=5 R=5/R=6 derive `/U` differently (Algorithm 8) and are not
 /// handled here.
 ///
-/// For R≥3 the spec mandates only the first 16 bytes; this implementation
-/// pads the remaining 16 with zeros for determinism. qpdf, by contrast,
-/// emits non-zero bytes there; readers (including [`check_user_password`])
-/// ignore the trailing 16 for R≥3, so either choice round-trips.
+/// For R≥3 ISO 32000-1 Algorithm 5 mandates only the first 16 bytes and
+/// leaves the remaining 16 arbitrary. Readers — including
+/// [`check_user_password`] — ignore them, so any filler round-trips, but the
+/// bytes are written into the file: they are `(i * i) % 0xff` for `i` in
+/// `16..32`, which is what qpdf writes (`libqpdf/QPDF_encryption.cc:492-496`,
+/// whose own comment is "pad with arbitrary data -- make it consistent for
+/// the sake of testing").
 pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8; 32]> {
     ensure_v_lt_5_revision(r, "/U")?;
 
@@ -896,6 +899,10 @@ pub(crate) fn compute_u_entry(file_key: &[u8], id0: &[u8], r: i64) -> Result<[u8
         let first16 = compute_u_first_16_r3plus(file_key, id0)?;
         let mut u = [0u8; 32];
         u[..16].copy_from_slice(&first16);
+        for (i, byte) in u.iter_mut().enumerate().skip(16) {
+            // qpdf `QPDF_encryption.cc:494-496`. Note `% 0xff`, not `% 0x100`.
+            *byte = u8::try_from((i * i) % 0xff).expect("(i * i) % 255 < 256");
+        }
         Ok(u)
     }
 }
@@ -3445,7 +3452,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_u_entry_matches_qpdf_v2_r3_fixture_first_16_bytes() {
+    fn compute_u_entry_matches_qpdf_v2_r3_fixture() {
         let o = hex32(V2_O_HEX);
         let id0 = from_hex(FIXTURE_ID0_HEX);
         let dummy_u = [0u8; 32];
@@ -3461,12 +3468,36 @@ mod tests {
         };
         let file_key = compute_file_key(V2_USER_PW, &inputs).unwrap();
         let u = compute_u_entry(&file_key, &id0, 3).unwrap();
-        // Per spec, only the first 16 bytes of /U are deterministic for R≥3.
-        // qpdf populates the trailing 16 with non-zero bytes; this
-        // implementation pads with zeros. Compare only the spec-mandated half.
-        let expected = hex32(V2_U_HEX);
-        assert_eq!(u[..16], expected[..16]);
-        assert_eq!(u[16..], [0u8; 16]);
+        // All 32 bytes, not just the 16 the spec pins down. ISO 32000-1
+        // Algorithm 5 leaves the trailing 16 arbitrary, but qpdf fills them
+        // with `(i * i) % 0xff` (`libqpdf/QPDF_encryption.cc:492-496`) and
+        // writes them into the file, so anything else is a different document.
+        // An earlier revision of this test compared only the first half and
+        // asserted zeros for the second, which pinned flpdf against itself.
+        assert_eq!(u, hex32(V2_U_HEX));
+    }
+
+    /// The trailing half of `/U` is arbitrary per Algorithm 5, so it carries
+    /// no key material and can be asserted as the constant it is. qpdf's
+    /// values, recomputed here from its own formula rather than copied, must
+    /// agree with the bytes the fixture above carries.
+    #[test]
+    fn u_entry_padding_is_qpdfs_i_squared_mod_255() {
+        let id0 = from_hex(FIXTURE_ID0_HEX);
+        let expected: Vec<u8> = (16u32..32)
+            .map(|i| u8::try_from((i * i) % 0xff).expect("(i*i) % 255 < 256"))
+            .collect();
+        assert_eq!(
+            expected,
+            hex32(V2_U_HEX)[16..].to_vec(),
+            "the recorded qpdf fixture must match qpdf's own formula"
+        );
+
+        // Independent of key and /ID, and the same for every R >= 3.
+        for r in [3, 4] {
+            let u = compute_u_entry(&[0x5a; 16], &id0, r).expect("supported revision");
+            assert_eq!(u[16..], expected[..], "R={r}");
+        }
     }
 
     /// Algorithm 3 step 1: an empty owner password falls back to the user
@@ -3507,7 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn build_v1_v2_encrypt_dict_v2_r3_matches_qpdf_fixture_modulo_u_tail() {
+    fn build_v1_v2_encrypt_dict_v2_r3_matches_qpdf_fixture() {
         let id0 = from_hex(FIXTURE_ID0_HEX);
         let (dict, _file_key) = build_v1_v2_encrypt_dict(&V1V2EncryptParams {
             v: 2,
@@ -3531,8 +3562,7 @@ mod tests {
             panic!("expected /U String");
         };
         let expected = from_hex(V2_U_HEX);
-        assert_eq!(u[..16], expected[..16]);
-        assert_eq!(u[16..], [0u8; 16]);
+        assert_eq!(u, &expected);
     }
 
     /// Internal round-trip: a dictionary built by [`build_v1_v2_encrypt_dict`]
@@ -3831,8 +3861,7 @@ mod tests {
             panic!("expected /U String");
         };
         let expected = from_hex(V4_RC4_U_HEX);
-        assert_eq!(u[..16], expected[..16]);
-        assert_eq!(u[16..], [0u8; 16]);
+        assert_eq!(u, &expected);
         // /EncryptMetadata=true is omitted (matches qpdf defaults-elision).
         assert!(dict.get("EncryptMetadata").is_none());
         assert_std_cf_entry(&dict, b"V2");
@@ -3860,8 +3889,7 @@ mod tests {
             panic!("expected /U String");
         };
         let expected = from_hex(V4_AES_U_HEX);
-        assert_eq!(u[..16], expected[..16]);
-        assert_eq!(u[16..], [0u8; 16]);
+        assert_eq!(u, &expected);
         assert!(dict.get("EncryptMetadata").is_none());
         assert_std_cf_entry(&dict, b"AESV2");
     }

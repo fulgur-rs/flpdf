@@ -946,9 +946,11 @@ fn static_aes_iv_with_static_id_produces_deterministic_output() {
 /// sits in the trailer — each of which is its own fix. Once those land, this
 /// can become a whole-file assertion.
 ///
-/// No `qpdf-zlib-compat` gate is needed: qpdf's default `--stream-data=preserve`
-/// copies compressed streams verbatim, so no DEFLATE encoder runs on either
-/// side of this comparison.
+/// No `qpdf-zlib-compat` gate is needed, but not for the reason an earlier
+/// revision of this comment gave: flpdf's DEFLATE output *does* differ from
+/// qpdf's without that feature. The assertion is unaffected because it covers
+/// only the initialization vector, which precedes the ciphertext and so is
+/// independent of how the payload was compressed.
 #[test]
 fn static_aes_iv_matches_the_vector_qpdf_writes() {
     if !ensure_qpdf_or_skip() {
