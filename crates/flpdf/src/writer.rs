@@ -2224,10 +2224,6 @@ mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above 
 
 // ── Encryption context (flpdf-9hc.4.9) ───────────────────────────────────────
 
-/// Per-write encryption state used by the full-rewrite path when
-/// [`WriteOptions::encrypt`] is set. Built once at the top of
-/// [`write_pdf_full_rewrite`] via [`build_encryption_context`] and consumed
-/// by the per-object emission loop + the trailer-build step.
 /// How the writer derives per-object string/stream encryption key material.
 ///
 /// Mirrors the reader's per-object dispatch (`EncryptionMode`): V<5 handlers
@@ -2244,6 +2240,13 @@ pub(crate) enum WriteCipher {
     FileKeyAes256,
 }
 
+/// Per-write encryption state used when [`WriteOptions::encrypt`] or
+/// [`WriteOptions::copy_encryption`] is set. Built once via
+/// [`build_encryption_context`] or [`build_copy_encryption_context`] — at the
+/// top of [`write_pdf_full_rewrite`] for the full-rewrite path, or inside
+/// [`crate::linearization::writer::write_linearized`] for linearized output
+/// (`--encrypt` only; `--copy-encryption-from` is not yet supported there) —
+/// and consumed by the per-object emission loop + the trailer-build step.
 pub(crate) struct EncryptionContext {
     /// Built `/Encrypt` dictionary (from a 4.1/4.2/4.3 builder).
     pub(crate) encrypt_dict: Dictionary,
@@ -2281,7 +2284,10 @@ pub(crate) struct EncryptionContext {
 /// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
 /// Used to exempt the XMP metadata stream from encryption under
 /// `--cleartext-metadata`.
-fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
+///
+/// `pub(crate)`: also used by [`crate::linearization::writer::write_linearized`],
+/// which needs the same `--cleartext-metadata` exemption for linearized output.
+pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
     match pdf.resolve_borrowed(root).ok()? {
         Object::Dictionary(dict) => dict.get_ref("Metadata"),
@@ -2289,12 +2295,25 @@ fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<Objec
     }
 }
 
-pub(crate) fn build_encryption_context<R: Read + Seek>(
-    pdf: &Pdf<R>,
+/// `id0` is the `/ID[0]` bytes the file encryption key is derived from
+/// (PDF 1.7 §7.6.3.3 Algorithm 2); the caller must have already decided this
+/// value — typically via [`resolve_id0_for_encryption`] — and must write the
+/// SAME bytes into the output trailer's `/ID[0]`, since a reader re-derives
+/// the file key from `/ID[0]` to validate the password. Taking it as a
+/// parameter (rather than resolving it internally from `pdf`) lets a caller
+/// that already finalized `/ID` elsewhere (the linearized writer, which must
+/// settle `/ID`'s final width before its two-pass probe loop runs) feed that
+/// SAME value in, instead of this function re-deriving an independent one —
+/// mirrors qpdf's own `generateID()`-is-idempotent contract: `/ID` is
+/// computed once, and encryption setup consumes that single value
+/// (`QPDFWriter::setEncryptionParameters` calls `generateID()` itself before
+/// deriving `/O`/`/U`, and `writeTrailer`'s later call is a no-op).
+pub(crate) fn build_encryption_context(
     options: &WriteOptions,
     params: &crate::encrypt_setup::EncryptParams,
     existing_max: u32,
     metadata_ref: Option<ObjectRef>,
+    id0: &[u8],
 ) -> Result<EncryptionContext> {
     use crate::encrypt_setup::EncryptMethod;
     use crate::security::standard::{
@@ -2302,10 +2321,7 @@ pub(crate) fn build_encryption_context<R: Read + Seek>(
         V4CryptMethod, V4EncryptParams,
     };
 
-    // Resolve /ID[0] BEFORE deriving the file key. Algorithm 2 uses /ID[0]
-    // as a salt; the trailer must carry the same bytes so the reader can
-    // re-derive the file key from the password.
-    let id0 = resolve_id0_for_encryption(pdf, options);
+    let id0 = id0.to_vec();
 
     let (encrypt_dict, file_key, cipher) = match params.method {
         EncryptMethod::V4Aes128 => {
@@ -3445,12 +3461,16 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
             )
         })?;
+        // Resolve /ID[0] here (rather than inside `build_encryption_context`) so
+        // this is the single place that decides it — matching qpdf's own
+        // `generateID()`-is-idempotent contract (see that function's doc).
+        let id0 = resolve_id0_for_encryption(pdf, options);
         Some(build_encryption_context(
-            pdf,
             options,
             params,
             base_for_encrypt,
             metadata_ref,
+            &id0,
         )?)
     } else if let Some(ref src) = options.copy_encryption {
         Some(build_copy_encryption_context(src, options, existing_max)?)

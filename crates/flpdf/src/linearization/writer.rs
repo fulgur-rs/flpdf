@@ -2604,6 +2604,25 @@ pub fn write_linearized<R: Read + Seek>(
         };
     let finalized_id =
         finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
+    // Extract `/ID[0]` now, before `finalized_id` moves into `source_trailer`,
+    // for `build_encryption_context` below (PDF 1.7 §7.6.3.3 Algorithm 2 uses
+    // `/ID[0]` as a salt, and the trailer's `/ID[0]` must carry the same bytes
+    // so a reader can re-derive the file key). `finalize_linearized_id` always
+    // returns a 2-element string array — every branch (deterministic
+    // placeholder, static-id, default) constructs one — so this is an
+    // internal-invariant check, not a reachable error for well-formed input.
+    let id0: Vec<u8> = finalized_id
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Object::as_string)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(
+                "linearization writer: finalize_linearized_id did not return a \
+                 well-formed /ID array"
+                    .to_string(),
+            )
+        })?;
     source_trailer.insert("ID", finalized_id);
     let source_trailer = source_trailer;
 
@@ -2623,6 +2642,28 @@ pub fn write_linearized<R: Read + Seek>(
     if options.deterministic_id && encrypting {
         return Err(crate::Error::Unsupported(
             "the deterministic-id option is incompatible with encrypted output files".to_string(),
+        ));
+    }
+
+    // `--copy-encryption-from` is not yet supported for linearized output. The
+    // donor's `/ID[0]` must become the output `/ID[0]` (Algorithm 2 is pinned
+    // to it — see `CopyEncryptionSource::id0`'s doc), which is the OPPOSITE of
+    // the `--encrypt` case above: there, the id0 finalized just above already
+    // is the single source of truth and only needs to be threaded into the
+    // context builder. For a donor, `finalize_linearized_id` would need to
+    // learn the donor's id0 (and its exact byte width, which is unconstrained
+    // — see `CopyEncryptionSource::id0`) BEFORE computing `/ID`, so the width
+    // is settled before the two-pass probe loop below runs. That change
+    // belongs where `/ID` is finalized above, not here. This is a temporary
+    // flpdf implementation gap, not a qpdf restriction — qpdf's own
+    // QPDFWriter supports linearize + copy-encryption together. Reject the
+    // combination rather than build a context whose id0 provably cannot be
+    // reconciled with the already-finalized `/ID` above.
+    if options.copy_encryption.is_some() {
+        return Err(crate::Error::Unsupported(
+            "linearize+copy-encryption-from is not yet supported; use --encrypt \
+             directly, or file a follow-up if you need both"
+                .to_string(),
         ));
     }
 
@@ -2832,6 +2873,70 @@ pub fn write_linearized<R: Read + Seek>(
         ObjStmRelocation::default()
     };
     let container_numbers = relocation.container_numbers.clone();
+
+    // Build the encryption context and reserve the `/Encrypt` dict's object
+    // slot BEFORE anything below reads `param_dict_ref()`, `hint_stream_slot()`,
+    // or `len()` off `renumber` — `reserve_encrypt_dict_slot` shifts every
+    // already-assigned slot at/after the (old) hint-stream position by one,
+    // and `Part1Bytes::build`, `hint_stream_new_num`, `total_count`, and the
+    // Part-1 dict serialization all read those numbers off the SAME
+    // `local_renumber` this mutates — every one of those reads happens
+    // through the `renumber` shadow assigned right after this block, so
+    // placing the reservation here (rather than scattered at each read site)
+    // covers all of them at once.
+    //
+    // `place_objstm_members_per_half` above is guaranteed NOT to have run
+    // when `encrypting` is true (the `emits_object_streams` guard above
+    // returns `Unsupported` first), so this reservation and that call can
+    // never both touch `local_renumber` — see `reserve_encrypt_dict_slot`'s
+    // doc for why the two are mutually exclusive.
+    //
+    // `existing_max` only feeds `build_encryption_context`'s internal
+    // `existing_max + 1` slot guess. That guess is immediately discarded
+    // below in favor of `reserve_encrypt_dict_slot`'s qpdf-aligned
+    // mid-sequence placement (`ctx.encrypt_ref` is overwritten), so
+    // `existing_max`'s exact value has no other effect on the returned
+    // context — any non-overflowing count is safe here.
+    //
+    // `copy_encryption` is rejected above, so `options.encrypt.is_some()` is
+    // the only way `encrypting` can be true — branch on `options.encrypt`
+    // directly (rather than re-testing `encrypting` and then unwrapping
+    // `options.encrypt` with a defensive error arm that could never
+    // actually trigger).
+    //
+    // Not yet read below `_encrypt_ctx`: this commit only builds the context
+    // and reserves its object slot. Emitting the `/Encrypt` object, writing
+    // it into the trailer, and applying it to per-object strings/streams are
+    // later steps that consume this value.
+    let _encrypt_ctx: Option<crate::writer::EncryptionContext> =
+        if let Some(params) = options.encrypt.as_ref() {
+            let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
+                crate::Error::Unsupported(
+                    "linearization writer: object count overflows u32 for /Encrypt slot \
+                     reservation"
+                        .to_string(),
+                )
+            })?;
+            // Resolve /Metadata up front for --cleartext-metadata support, mirroring
+            // the full-rewrite writer's own gating (`!params.encrypt_metadata`).
+            let metadata_ref = if params.encrypt_metadata {
+                None
+            } else {
+                crate::writer::resolve_metadata_stream_ref(pdf)
+            };
+            let mut ctx = crate::writer::build_encryption_context(
+                options,
+                params,
+                existing_max,
+                metadata_ref,
+                &id0,
+            )?;
+            ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
+            Some(ctx)
+        } else {
+            None
+        };
+
     let renumber: &RenumberMap = &local_renumber;
 
     // Floor the header to 1.5 only when the output actually carries an ObjStm
@@ -5619,19 +5724,22 @@ mod tests {
     /// rejected by it — qpdf itself supports `--linearize --encrypt` without
     /// `--deterministic-id` (verified empirically against qpdf 11.9.0).
     ///
-    /// This does not assert full success: encryption is not yet wired into
-    /// the linearized writer (later work implements that), so this fixture
-    /// may still fail for some other reason (e.g. missing encrypt-dict-slot
-    /// wiring), and today it actually succeeds (silently emitting plaintext,
-    /// since nothing downstream of the guards consumes `options.encrypt`
-    /// yet). It is fine for the write to fail here for a DIFFERENT
-    /// `Unsupported` reason — this test only pins that the specific
-    /// deterministic-id guard message is not the cause, so it asserts on the
-    /// `Result`'s `Debug` text rather than matching a specific `Err` arm: a
-    /// pattern-matched arm on an outcome this fixture never reaches (`Err`,
-    /// while the write currently succeeds) would itself sit permanently
-    /// uncovered, whereas a plain string check runs unconditionally on both
-    /// `Ok` and `Err`.
+    /// This does not assert full success: encryption is not fully wired into
+    /// the linearized writer yet (later work completes that), so this
+    /// fixture may still fail for some other reason. Before the encrypt-dict
+    /// object slot was reserved, this fixture actually succeeded (silently
+    /// emitting plaintext, since nothing downstream of the guards consumed
+    /// `options.encrypt`); now that the slot is reserved but the `/Encrypt`
+    /// object itself is not yet emitted (a later step), it fails a
+    /// different, unrelated internal consistency check instead (see
+    /// [`linearize_with_encrypt_reserves_encrypt_dict_object_and_succeeds`]).
+    /// It is fine for the write to fail here for a DIFFERENT `Unsupported`
+    /// reason — this test only pins that the specific deterministic-id guard
+    /// message is not the cause, so it asserts on the `Result`'s `Debug`
+    /// text rather than matching a specific `Err` arm: a pattern-matched arm
+    /// on an outcome this fixture may never reach would itself sit
+    /// permanently uncovered, whereas a plain string check runs
+    /// unconditionally on both `Ok` and `Err`.
     #[test]
     fn non_deterministic_encrypt_linearize_no_longer_rejected_by_guard() {
         let mut pdf = open_tiny_pdf();
@@ -5691,6 +5799,76 @@ mod tests {
             matches!(err, crate::Error::Unsupported(ref m)
                 if m.contains("does not yet support object streams")),
             "got {err:?}"
+        );
+    }
+
+    /// `--copy-encryption-from` combined with linearization is rejected: the
+    /// donor's `/ID[0]` must become the output's `/ID[0]` (Algorithm 2 is
+    /// pinned to it, see `CopyEncryptionSource::id0`'s doc), which conflicts
+    /// with `/ID` already being finalized at a fixed width before this guard
+    /// runs — required for the two-pass probe loop's offset stability. See
+    /// the guard's own comment (right after the `deterministic_id &&
+    /// encrypting` guard) for the full reasoning. Mirrors
+    /// `objstm_encrypt_linearize_combination_is_unsupported`'s style: assert
+    /// the exact message, since `write_linearized` has several other
+    /// `Unsupported` exits that a loose variant-only match could mask.
+    #[test]
+    fn copy_encryption_linearize_combination_is_unsupported() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("linearize+copy-encryption-from is not yet supported")),
+            "got {err:?}"
+        );
+    }
+
+    /// Building the `/Encrypt` object's `EncryptionContext` and reserving its
+    /// object slot for linearized output (non-deterministic `/ID`, no object
+    /// streams). Reserving the slot grows `/Size` (`RenumberMap::len()`) by
+    /// one before any object is actually emitted there, so `write_linearized`
+    /// now fails its own internal consistency check — the Part-1 first-page
+    /// xref subsection covers `[param_dict_slot, /Size)` and finds no offset
+    /// recorded for the reserved-but-unwritten slot
+    /// (`crate::Error::Unsupported("Part-1 xref: covered object N has no
+    /// offset …")`). That is the *expected* failure once emission (a later
+    /// step) writes a real indirect object into that slot, the offset gets
+    /// recorded and this error disappears. Contrast with
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
+    /// which pins the pre-this-commit behavior (encryption silently ignored,
+    /// write succeeds). `#[ignore]`d until the emission step lands and makes
+    /// the assertion below true; Task 6's acceptance criteria include
+    /// removing this attribute.
+    #[test]
+    #[ignore = "awaits /Encrypt object emission; this commit only builds the \
+                context and reserves the slot (write_linearized currently \
+                errors with \"Part-1 xref: covered object N has no offset\")"]
+    fn linearize_with_encrypt_reserves_encrypt_dict_object_and_succeeds() {
+        let out = linearize_with(&tiny_pdf_bytes(), |o| {
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        // The output must contain an indirect object whose dict has
+        // /Filter /Standard (the /Encrypt dict qpdf always includes).
+        let needle: &[u8] = b"/Filter /Standard";
+        assert!(
+            out.windows(needle.len()).any(|w| w == needle),
+            "expected an /Encrypt dictionary with /Filter /Standard in the output"
         );
     }
 
