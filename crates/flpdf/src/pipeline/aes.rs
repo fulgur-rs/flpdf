@@ -226,9 +226,11 @@ impl<'a> PlAesPdf<'a> {
         } else {
             // qpdf `QUtil::initializeWithRandomBytes` (`:141`).
             getrandom::getrandom(&mut self.cbc_block).map_err(|error| {
+                // cov:ignore-start: getrandom failure cannot be injected here
                 PipelineError::runtime(format!(
                     "Pl_AES_PDF: OS CSPRNG unavailable for AES IV generation: {error}"
                 ))
+                // cov:ignore-end
             })?;
         }
         Ok(())
@@ -275,9 +277,11 @@ impl<'a> PlAesPdf<'a> {
 
         let Some(cipher) = self.cipher.as_mut() else {
             // Unreachable: `first` is cleared only where the cipher is built.
+            // cov:ignore-start: `first` is cleared only where the cipher is built
             return Err(PipelineError::logic(
                 "AES pipeline: cipher used before initialization",
             ));
+            // cov:ignore-end
         };
         cipher.process(&self.inbuf, &mut self.outbuf);
 
@@ -654,20 +658,149 @@ mod tests {
         assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT_32);
     }
 
+    // qpdf's padding strip is deliberately not PKCS#7-strict
+    // (`libqpdf/Pl_AES_PDF.cc:184-196`): a trailing byte larger than the block
+    // size is not padding, so the block is emitted whole. flpdf's existing
+    // `decrypt_padded_mut::<Pkcs7>` helpers return an error for this input, so
+    // a document qpdf accepts would be rejected on that path but not here.
+    #[test]
+    fn a_trailing_byte_larger_than_the_block_size_is_not_padding() {
+        let mut plain = PLAINTEXT_32.to_vec();
+        *plain.last_mut().expect("non-empty") = 0xff;
+
+        let out = decrypt_unpadded_ciphertext_of(&plain);
+
+        assert_eq!(out, plain, "255 > 16, so nothing is stripped");
+    }
+
+    // Same rule, other half: the trailing bytes have to agree with the count
+    // (`libqpdf/Pl_AES_PDF.cc:187-193`).
+    #[test]
+    fn disagreeing_trailing_bytes_are_not_padding() {
+        let mut plain = PLAINTEXT_32.to_vec();
+        let len = plain.len();
+        plain[len - 2] = 0x09;
+        plain[len - 1] = 0x02;
+
+        let out = decrypt_unpadded_ciphertext_of(&plain);
+
+        assert_eq!(out, plain, "the byte before the count disagrees with it");
+    }
+
+    // qpdf `:107-118`: "we have encountered files for which the output is not a
+    // multiple of the block size. In this case, pad with zeroes and hope for
+    // the best." The blocks that did arrive whole must still come out intact.
+    #[test]
+    fn a_final_block_shorter_than_the_block_size_is_zero_padded_not_rejected() {
+        let ciphertext = zero_iv_unpadded_ciphertext_of(PLAINTEXT_32);
+        let mut truncated = ciphertext.clone();
+        truncated.extend_from_slice(b"12345");
+
+        let mut sink = Buffer::new("plaintext", None);
+        let mut stage = PlAesPdf::new_decrypt("AES stream decryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.use_zero_iv();
+        stage.write(&truncated).expect("write");
+        stage
+            .finish()
+            .expect("a short final block is tolerated, not rejected");
+
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(&out[..PLAINTEXT_32.len()], PLAINTEXT_32);
+    }
+
+    #[test]
+    fn ecb_aes_256_round_trips() {
+        let key = [0xa5u8; 32];
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage =
+            PlAesPdf::new_encrypt("AES-256 ECB", &mut sink, &key).expect("supported key length");
+        stage.disable_cbc();
+        stage.disable_padding();
+        stage.write(PLAINTEXT_32).expect("write");
+        stage.finish().expect("finish");
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(out[..16], out[16..], "identical blocks encrypt identically");
+
+        let mut back = Buffer::new("plaintext", None);
+        let mut reverse =
+            PlAesPdf::new_decrypt("AES-256 ECB", &mut back, &key).expect("supported key length");
+        reverse.disable_cbc();
+        reverse.disable_padding();
+        reverse.write(&out).expect("write");
+        reverse.finish().expect("finish");
+        assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT_32);
+    }
+
+    #[test]
+    fn the_identifier_is_the_one_the_stage_was_built_with() {
+        let mut sink = Buffer::new("ciphertext", None);
+        let stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+
+        assert_eq!(stage.identifier(), "AES stream encryption");
+    }
+
+    // qpdf `:147-149` guards its own invariant with a logic_error. Nothing on
+    // the public surface can reach it -- `write` and `finish` only call `flush`
+    // with a full buffer -- so it is exercised directly.
+    #[test]
+    fn flushing_a_partial_buffer_is_a_logic_error() {
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.write(b"short").expect("write");
+
+        let Err(error) = stage.flush(false) else {
+            panic!("a partial buffer must not flush");
+        };
+
+        assert!(
+            error.to_string().contains("buffer was not full"),
+            "unexpected message: {error}"
+        );
+    }
+
+    /// Encrypt `plain` with a zero vector and no padding, so the ciphertext is
+    /// exactly `plain.len()` bytes and carries no vector prefix.
+    fn zero_iv_unpadded_ciphertext_of(plain: &[u8]) -> Vec<u8> {
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.use_zero_iv();
+        stage.disable_padding();
+        stage.write(plain).expect("write");
+        stage.finish().expect("finish");
+        sink.take_buffer().expect("buffer")
+    }
+
+    /// Round-trip `plain` through an unpadded encrypt and a *padding-stripping*
+    /// decrypt, which is what puts qpdf's strip rule under test.
+    fn decrypt_unpadded_ciphertext_of(plain: &[u8]) -> Vec<u8> {
+        let ciphertext = zero_iv_unpadded_ciphertext_of(plain);
+        let mut sink = Buffer::new("plaintext", None);
+        let mut stage = PlAesPdf::new_decrypt("AES stream decryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.use_zero_iv();
+        stage.write(&ciphertext).expect("write");
+        stage.finish().expect("finish");
+        sink.take_buffer().expect("buffer")
+    }
+
     // An unsupported key length is rejected: qpdf's own header scopes this
     // pipeline to AES-128 and AES-256 (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
     #[test]
     fn a_key_that_is_neither_128_nor_256_bits_is_rejected() {
         let mut sink = Buffer::new("ciphertext", None);
 
-        let Err(error) = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 24])
-        else {
-            panic!("24 bytes is not a supported AES key length");
-        };
+        let message = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 24])
+            .err()
+            .map(|error| error.to_string());
 
-        assert!(
-            error.to_string().contains("16 or 32 bytes"),
-            "unexpected message: {error}"
+        assert_eq!(
+            message.as_deref().map(|m| m.contains("16 or 32 bytes")),
+            Some(true),
+            "24 bytes is not a supported AES key length: {message:?}"
         );
     }
 
