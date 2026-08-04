@@ -914,6 +914,26 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// side effects that are not idempotent. Minting a canonical child handle
     /// is idempotent ([`Self::get_object_handle`] is entry-or-insert);
     /// warnings are not, and are therefore returned rather than pushed.
+    ///
+    /// **The parse's own diagnostics travel out the same way**, and they are
+    /// warnings in qpdf too: `QPDFParser` calls `warn(tokenizer.getErrorMessage())`
+    /// whenever `QPDFTokenizer::nextToken` reports one — at
+    /// `libqpdf/QPDFParser.cc:38-41` for the first token and `:141-143` for
+    /// every later one — and `QPDFParser::warn` (`:488-496`) forwards to
+    /// `context->warn`, i.e. the enclosing `QPDF`. A malformed name is the
+    /// reachable case: `QPDFTokenizer::inNameHex1` (`libqpdf/QPDFTokenizer.cc:448`)
+    /// and `inNameHex2` (`:463`) both set `"name with stray # will not work
+    /// with PDF >= 1.2"` and recover the token rather than rejecting it, so
+    /// the object resolves *and* warns. Dropping them here resolved the object
+    /// silently.
+    ///
+    /// One divergence stays, and it is inherited rather than introduced:
+    /// `QPDFTokenizer::nextToken` returns `error_message.empty()`
+    /// (`libqpdf/QPDFTokenizer.cc:964`), so qpdf warns for a `tt_bad` token as
+    /// well, whereas flpdf's `Parser::next_token` records a diagnostic only for
+    /// a token it did *not* classify `Bad` and the handle-producing path turns
+    /// a `Bad` token into [`Error::Parse`]. The legacy reader has the same
+    /// shape; nothing here narrows or widens it.
     fn frame_object(&self, bytes: &[u8], offset: u64) -> Result<FramedObject> {
         let mut warnings = Vec::new();
         let mut tokenizer = Tokenizer::new(bytes);
@@ -933,16 +953,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
         let mut minter = ChildHandles { resolver: self };
-        let (value, value_offset, value_end) =
-            crate::parser::parse_qpdf_direct_object_handle_with_end(
-                &bytes[body_start..],
-                file_origin.saturating_add(body_start as i64),
-                &mut minter,
-            )
-            .map_err(|error| error.rebase_offset(body_start))?;
+        let parsed = crate::parser::parse_qpdf_direct_object_handle_with_end(
+            &bytes[body_start..],
+            file_origin.saturating_add(body_start as i64),
+            &mut minter,
+        )
+        .map_err(|error| error.rebase_offset(body_start))?;
+
+        // Ahead of the `endobj` check below, because qpdf raises them ahead of
+        // it too: the tokenizer warnings come out of the parse of the value,
+        // which `QPDF::readObject` completes before it reads the token that
+        // decides `stream` from `endobj` (`libqpdf/QPDF.cc:1345-1354`).
+        //
+        // The offset each diagnostic carries is dropped rather than reported:
+        // qpdf's warning position is `input->getLastOffset()`
+        // (`libqpdf/QPDFParser.cc:516-519`), and this resolver reports no input
+        // position on any warning it raises in this slice — see
+        // `a_detected_loop_warns_with_qpdfs_message_text`, which pins that.
+        warnings.extend(
+            parsed
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.message),
+        );
 
         let mut after = Tokenizer::new(bytes);
-        after.set_position(body_start + value_end)?;
+        after.set_position(body_start + parsed.end)?;
         let token = after.read_token(false, 0)?;
         let end = after.position();
 
@@ -958,8 +994,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         Ok(FramedObject {
             found,
-            value,
-            value_offset,
+            value: parsed.value,
+            value_offset: parsed.parsed_offset,
             end,
             framing,
             warnings,
@@ -2297,6 +2333,100 @@ mod tests {
             outcome.expect("qpdf warns here rather than failing");
             assert_eq!(handle.as_integer(), Some(42));
             assert_eq!(warnings, ["expected endobj"]);
+        });
+    }
+
+    /// A recoverable diagnostic raised *inside* the body's parse reaches the
+    /// document's warnings, and is not dropped with the parser that raised it.
+    ///
+    /// A name with a stray `#` is the reachable case, and qpdf both recovers it
+    /// and warns about it: `QPDFTokenizer::inNameHex1`
+    /// (`libqpdf/QPDFTokenizer.cc:448`) and `inNameHex2` (`:463`) set
+    /// `"name with stray # will not work with PDF >= 1.2"` while leaving the
+    /// token a name, `QPDFTokenizer::nextToken` returns false whenever a
+    /// message was set (`:964`), and `QPDFParser::parseRemainder` turns that
+    /// into `warn(tokenizer.getErrorMessage())`
+    /// (`libqpdf/QPDFParser.cc:141-143`), which reaches the enclosing document
+    /// through `QPDFParser::warn` (`:488-496`).
+    ///
+    /// Asserted as whole vectors rather than with `contains`, because both the
+    /// count and the position matter: the parse's diagnostics precede the
+    /// framing's, since qpdf finishes parsing the value before it reads the
+    /// token that decides `stream` from `endobj` (`libqpdf/QPDF.cc:1345-1354`).
+    #[test]
+    fn a_stray_hash_in_a_name_warns_with_qpdfs_tokenizer_wording() {
+        with_second_object(
+            b"2 0 obj\n<< /A#zB 1 >>\nendobj\n",
+            |handle, outcome, warnings| {
+                outcome.expect("qpdf recovers the name rather than rejecting the object");
+                assert!(
+                    handle.as_dictionary().is_some(),
+                    "the object still resolves; the warning is the only difference"
+                );
+                assert_eq!(
+                    warnings,
+                    ["name with stray # will not work with PDF >= 1.2"]
+                );
+            },
+        );
+
+        with_second_object(
+            b"2 0 obj\n<< /A#zB 1 >>\nenddobj\n",
+            |_, outcome, warnings| {
+                outcome.expect("qpdf recovers the name rather than rejecting the object");
+                assert_eq!(
+                    warnings,
+                    [
+                        "name with stray # will not work with PDF >= 1.2",
+                        "expected endobj",
+                    ]
+                );
+            },
+        );
+    }
+
+    /// The body parse's diagnostics are raised once — from the attempt that
+    /// succeeded, not from every attempt.
+    ///
+    /// [`ResolverHandle::scan_forward`] re-runs [`ResolverHandle::frame_object`]
+    /// against a growing buffer, so a diagnostic pushed as it is raised would
+    /// be duplicated once per attempt; that is the hazard this module's own
+    /// doc records for the framing warnings, and the parse's diagnostics travel
+    /// out the same way for the same reason.
+    ///
+    /// Reaching it needs an attempt that *succeeds* and is still rejected, not
+    /// merely one that fails: `frame_object` returns early on a parse error, so
+    /// a body simply cut in half by the boundary would never get as far as
+    /// reporting anything. `endobj` is therefore placed to begin three bytes
+    /// before the boundary — `end` is a perfectly good word token, so the first
+    /// attempt frames the object, hands back both warnings, and is rejected
+    /// only because it consumed the whole buffer.
+    #[test]
+    fn a_parse_diagnostic_is_raised_once_across_several_scan_forward_attempts() {
+        let head: &[u8] = b"2 0 obj\n<< /A#zB 1 /Filler (";
+        let separator: &[u8] = b") >>\n";
+        let filler = vec![b'x'; super::INPUT_CHUNK - 3 - head.len() - separator.len()];
+
+        let mut body = Vec::new();
+        body.extend_from_slice(head);
+        body.extend_from_slice(&filler);
+        body.extend_from_slice(separator);
+        let keyword_start = body.len();
+        body.extend_from_slice(b"endobj\n");
+        assert_eq!(
+            keyword_start,
+            super::INPUT_CHUNK - 3,
+            "the fixture must actually straddle the chunk boundary"
+        );
+
+        with_second_object(&body, |handle, outcome, warnings| {
+            outcome.expect("resolve");
+            assert!(handle.as_dictionary().is_some());
+            assert_eq!(
+                warnings,
+                ["name with stray # will not work with PDF >= 1.2"],
+                "one diagnostic per object, not one per scan_forward attempt"
+            );
         });
     }
 

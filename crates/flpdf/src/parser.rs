@@ -138,26 +138,56 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
 /// (relative to `input`, not yet shifted by `base_offset`); the caller shifts
 /// it with `Error::rebase_offset`, the same way `reader.rs`'s file-object
 /// syntax parser does for [`parse_qpdf_direct_object`].
+/// The caller that resolves an object *for the first time* is the one that
+/// must report its diagnostics; this wrapper is used by `reader.rs`'s
+/// `native_parse_uncompressed_value`, which re-parses an object the legacy
+/// pipeline has already resolved — and already reported the diagnostics of,
+/// through `Pdf::record_file_object_diagnostics`. Surfacing them again here
+/// would emit each warning twice for the same object, so the field is dropped
+/// deliberately rather than overlooked.
 pub(crate) fn parse_qpdf_direct_object_handle(
     input: &[u8],
     base_offset: i64,
     resolver: &mut dyn HandleResolver,
 ) -> Result<(ObjectValue, i64)> {
-    let (value, parsed_offset, _end) =
-        parse_qpdf_direct_object_handle_with_end(input, base_offset, resolver)?;
-    Ok((value, parsed_offset))
+    let parsed = parse_qpdf_direct_object_handle_with_end(input, base_offset, resolver)?;
+    Ok((parsed.value, parsed.parsed_offset))
+}
+
+/// What [`parse_qpdf_direct_object_handle_with_end`] reports, mirroring
+/// [`ParsedDirectObject`]'s shape for the handle-producing path.
+#[derive(Debug)]
+pub(crate) struct ParsedHandleObject {
+    /// The parsed value.
+    pub(crate) value: ObjectValue,
+    /// Its qpdf `getParsedOffset`, already shifted by `base_offset`.
+    pub(crate) parsed_offset: i64,
+    /// The position in `input` immediately after the value consumed.
+    pub(crate) end: usize,
+    /// Every recoverable diagnostic the parse raised, in the order raised.
+    pub(crate) diagnostics: Vec<ParserDiagnostic>,
 }
 
 /// [`parse_qpdf_direct_object_handle`], additionally reporting the position in
-/// `input` immediately after the value it consumed.
+/// `input` immediately after the value it consumed, and the diagnostics the
+/// parse raised.
 ///
-/// qpdf never needs this: `QPDFParser::parse` consumes `m->file` directly, so
-/// the input source is *already* positioned after the object when it returns
-/// and `QPDF::readObject` can just call `readToken(m->file)` again
+/// qpdf never needs the position: `QPDFParser::parse` consumes `m->file`
+/// directly, so the input source is *already* positioned after the object when
+/// it returns and `QPDF::readObject` can just call `readToken(m->file)` again
 /// (`libqpdf/QPDF.cc:1346`). flpdf's parser runs over a slice, so the caller
 /// has to be told how far it got in order to put its own input source in the
 /// same place. `reader/resolver.rs` is the caller that needs it; the
 /// two-value form above is what every existing caller keeps using.
+///
+/// The diagnostics are reported for the same reason qpdf's are not: qpdf's
+/// parser warns through the document as it goes — `QPDFParser::parse`
+/// (`libqpdf/QPDFParser.cc:38-41`) and `QPDFParser::parseRemainder` (`:141-143`)
+/// each call `warn(tokenizer.getErrorMessage())`, and `QPDFParser::warn`
+/// (`:488-496`) forwards to `context->warn`, the enclosing `QPDF`. flpdf's
+/// parser has no document to warn through, so it accumulates instead and the
+/// caller decides when to raise them — which for `reader/resolver.rs` matters,
+/// because its `scan_forward` runs this parse more than once per object.
 ///
 /// For the recovered-empty-object case the reported position is the start of
 /// the `endobj` token, not past it: `peek_token` does not consume, matching
@@ -166,13 +196,18 @@ pub(crate) fn parse_qpdf_direct_object_handle_with_end(
     input: &[u8],
     base_offset: i64,
     resolver: &mut dyn HandleResolver,
-) -> Result<(ObjectValue, i64, usize)> {
+) -> Result<ParsedHandleObject> {
     let mut tokenizer = Tokenizer::new(input);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
     let token = parser.peek_token()?;
     if token.is_word_value(b"endobj") {
-        return Ok((ObjectValue::Null, NO_PARSED_OFFSET, parser.position()));
+        return Ok(ParsedHandleObject {
+            value: ObjectValue::Null,
+            parsed_offset: NO_PARSED_OFFSET,
+            end: parser.position(),
+            diagnostics: parser.diagnostics,
+        });
     }
 
     let handle = parser.object_handle(base_offset, resolver)?;
@@ -181,7 +216,12 @@ pub(crate) fn parse_qpdf_direct_object_handle_with_end(
         "top_level_no_reference forces the outermost integer_or_ref decision to Integer, \
          so the top-level handle this function just built is always direct",
     );
-    Ok((value, parsed_offset, end))
+    Ok(ParsedHandleObject {
+        value,
+        parsed_offset,
+        end,
+        diagnostics: parser.diagnostics,
+    })
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
