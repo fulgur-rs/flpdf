@@ -201,7 +201,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_StdioFile.cc` | 46 | `pipeline/stdio_file.rs`（positive partial write の継続、zero/error—including `Interrupted`—の即時 Runtime 化、`EBADF` finish のみ Logic 化）+ `json_inspect.rs`（4096-byte buffer、top-level file は close/drop、side file は explicit finish） | ✅ |
 | `Pl_Buffer` | 82 | `pipeline/buffer.rs`（accumulation、optional pass-through、finish readiness、buffer ownership transfer） | ✅ |
 | `Pl_Discard` / `Pl_Function` | 85 | 専用 stage は未実装。使用箇所ごとの discard / closure 実装 | ⚪ |
-| `Pl_SHA2.cc` | 75 | `pipeline/sha2.rs`（SHA-256/384/512 の bit 選択、`resetBits`/`write`/`finish` lifecycle、optional next への forwarding、qpdf 未検証の write-after-finish 再利用パス — crypto provider は null 検査なしで dereference するが flpdf は defined logic error に変換） | ✅ |
+| `Pl_SHA2.cc` | 75 | `pipeline/sha2.rs`（SHA-256/384/512 の bit 選択、`resetBits`/`write`/`finish` lifecycle、optional next への forwarding、二重 `finish()` は qpdf 同様ガード無しで `next` に毎回転送し既存 digest を保持）。⚪ qpdf は `bits=0`（未 `resetBits`）または `write`-after-`finish` 再利用時に null/stale な crypto provider ポインタを非検査で dereference する（`libtests/sha2.cc` はどちらも未検証）。オラクル確定済みの byte 列が存在しないため、flpdf は両方を defined logic error に変換する。出力バイトに影響しない（このパスへ到達する production consumer が存在しない） | ✅ |
 
 `/ID` が qpdf と非 parity だった原因は **アルゴリズム**（qpdf は 2 段階 MD5 で seed を
 作る）であり、Pipeline 抽象の有無ではない。flpdf は全体をバッファするので任意の

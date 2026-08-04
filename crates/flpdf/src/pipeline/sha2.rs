@@ -12,17 +12,17 @@ use super::{Pipeline, PipelineError, PipelineResult};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 enum Sha2Digest {
-    Bits256(Box<Sha256>),
-    Bits384(Box<Sha384>),
-    Bits512(Box<Sha512>),
+    Bits256(Sha256),
+    Bits384(Sha384),
+    Bits512(Sha512),
 }
 
 impl Sha2Digest {
     fn new(bits: i32) -> PipelineResult<Self> {
         match bits {
-            256 => Ok(Self::Bits256(Box::new(Sha256::new()))),
-            384 => Ok(Self::Bits384(Box::new(Sha384::new()))),
-            512 => Ok(Self::Bits512(Box::new(Sha512::new()))),
+            256 => Ok(Self::Bits256(Sha256::new())),
+            384 => Ok(Self::Bits384(Sha384::new())),
+            512 => Ok(Self::Bits512(Sha512::new())),
             _ => Err(PipelineError::logic(
                 "SHA2_native has bits != 256, 384, or 512",
             )),
@@ -31,9 +31,9 @@ impl Sha2Digest {
 
     fn update(&mut self, data: &[u8]) {
         match self {
-            Self::Bits256(hasher) => Digest::update(hasher.as_mut(), data),
-            Self::Bits384(hasher) => Digest::update(hasher.as_mut(), data),
-            Self::Bits512(hasher) => Digest::update(hasher.as_mut(), data),
+            Self::Bits256(hasher) => Digest::update(hasher, data),
+            Self::Bits384(hasher) => Digest::update(hasher, data),
+            Self::Bits512(hasher) => Digest::update(hasher, data),
         }
     }
 
@@ -85,36 +85,6 @@ impl<'a> PlSha2<'a> {
         Ok(())
     }
 
-    pub(crate) fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        let identifier = &self.identifier;
-        let digest = self.digest.as_mut().ok_or_else(|| {
-            PipelineError::logic(format!(
-                "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
-            ))
-        })?;
-        self.in_progress = true;
-        digest.update(data);
-        if let Some(next) = self.next.as_deref_mut() {
-            next.write(data)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish(&mut self) -> PipelineResult<()> {
-        if let Some(next) = self.next.as_deref_mut() {
-            next.finish()?;
-        }
-        let identifier = &self.identifier;
-        let digest = self.digest.take().ok_or_else(|| {
-            PipelineError::logic(format!(
-                "{identifier}: Pl_SHA2: finish() called before resetBits() selected a digest size"
-            ))
-        })?;
-        self.raw_digest = Some(digest.finalize());
-        self.in_progress = false;
-        Ok(())
-    }
-
     pub(crate) fn get_raw_digest(&self) -> PipelineResult<&[u8]> {
         if self.in_progress {
             return Err(PipelineError::logic(
@@ -140,11 +110,41 @@ impl Pipeline for PlSha2<'_> {
     }
 
     fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
-        PlSha2::write(self, data)
+        let identifier = &self.identifier;
+        let digest = self.digest.as_mut().ok_or_else(|| {
+            PipelineError::logic(format!(
+                "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
+            ))
+        })?;
+        self.in_progress = true;
+        digest.update(data);
+        if let Some(next) = self.next.as_deref_mut() {
+            next.write(data)?;
+        }
+        Ok(())
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
-        PlSha2::finish(self)
+        if let Some(next) = self.next.as_deref_mut() {
+            next.finish()?;
+        }
+        if let Some(digest) = self.digest.take() {
+            self.raw_digest = Some(digest.finalize());
+            self.in_progress = false;
+            return Ok(());
+        }
+        if self.raw_digest.is_some() {
+            // Already finished. qpdf's `Pl_SHA2::finish` has no already-finished
+            // guard either (unlike `Pl_RC4::finish`, which is intentionally
+            // reusable) — it just re-forwards to `next` and returns. Matching that
+            // exactly means leaving the existing digest untouched rather than
+            // erroring, since the pipeline genuinely was committed and finished.
+            return Ok(());
+        }
+        let identifier = &self.identifier;
+        Err(PipelineError::logic(format!(
+            "{identifier}: Pl_SHA2: finish() called before resetBits() selected a digest size"
+        )))
     }
 }
 
@@ -284,12 +284,10 @@ mod tests {
         assert_eq!(Pipeline::identifier(&sha2), "pl-sha2-stage");
     }
 
-    /// `sha2.write(...)` / `sha2.finish()` resolve to the inherent methods, which
-    /// the tests above exercise directly. A `PlSha2` chained as another `PlSha2`'s
-    /// `next` is only reachable through `&mut dyn Pipeline`, which forces calls
-    /// through the trait-impl delegation in `impl Pipeline for PlSha2`.
+    /// A `PlSha2` can itself be another `PlSha2`'s `next`, matching qpdf's stackable
+    /// `Pipeline` design (any pipeline is valid downstream of any other).
     #[test]
-    fn chained_as_next_dispatches_through_the_pipeline_trait_impl() {
+    fn a_sha2_pipeline_can_be_chained_as_another_ones_next() {
         let mut inner = PlSha2::new("inner", None, 256).unwrap();
         {
             let mut outer =
@@ -365,6 +363,28 @@ mod tests {
         assert_eq!(
             digest_error.to_string(),
             "digest requested for in-progress SHA2 Pipeline"
+        );
+    }
+
+    /// qpdf's `Pl_SHA2::finish` has no already-finished guard: a second `finish()`
+    /// just re-forwards to `next` and returns normally, leaving the digest as
+    /// computed by the first `finish()` (mirrors `pipeline/rc4.rs`'s
+    /// `repeated_finish_propagates_each_time_and_marks_stage_finished`).
+    #[test]
+    fn repeated_finish_forwards_each_time_and_keeps_the_first_digest() {
+        let mut sink = RecordingSink::default();
+        let hex_digest;
+        {
+            let mut sha2 = PlSha2::new("sha2", Some(&mut sink as &mut dyn Pipeline), 256).unwrap();
+            sha2.write(b"abc").unwrap();
+            sha2.finish().unwrap();
+            sha2.finish().unwrap();
+            hex_digest = sha2.get_hex_digest().unwrap();
+        }
+        assert_eq!(sink.finishes, 2);
+        assert_eq!(
+            hex_digest,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
