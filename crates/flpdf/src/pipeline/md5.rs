@@ -80,6 +80,14 @@ mod tests {
     use crate::pipeline::{Pipeline, PipelineError};
 
     #[test]
+    fn preserves_the_pipeline_identifier() {
+        let mut sink = RecordingSink::new(&[], &[]);
+        let md5 = PlMd5::new("embedded-file-md5", &mut sink);
+
+        assert_eq!(md5.identifier(), "embedded-file-md5");
+    }
+
+    #[test]
     fn forwards_original_chunks_and_reports_the_known_digest() {
         let trace = shared_trace();
         let mut sink = RecordingSink::with_trace(trace.clone(), &[], &[]);
