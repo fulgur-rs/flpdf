@@ -202,14 +202,11 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// because qpdf's `m->encp` is a `std::shared_ptr<EncryptionParameters>`:
     /// a second owner (`ForeignStreamData::encp`, `QPDF.hh:939`) holds the
     /// *same* allocation, constructed from `QPDF::Members::encp` by copying
-    /// the shared_ptr (`QPDF.cc:2266`), not by copying the data. `Pdf` is
-    /// planned to migrate onto a clone of this same `Rc` (flpdf-25kg.3.11's
-    /// Task 2), so its one write (`Pdf::authenticate_if_encrypted`) becomes
-    /// visible here without a second write site — a consumer this slice does
-    /// not yet have. As of this field's introduction, `Pdf::encryption`
-    /// (`reader.rs:182`) is still a separate, unmigrated `Option<EncryptionState>`,
-    /// written independently by `authenticate_if_encrypted` (`reader.rs:921`);
-    /// nothing in this commit connects the two.
+    /// the shared_ptr (`QPDF.cc:2266`), not by copying the data. `Pdf::encryption`
+    /// holds a clone of this same `Rc`, obtained via
+    /// [`ResolverHandle::encryption_parameters`] in `open_with_repair_mode`,
+    /// so `Pdf::authenticate_if_encrypted`'s one write is visible here
+    /// without a second write site.
     ///
     /// Constructed empty (`None`) in [`ResolverHandle::new_shared`] and
     /// populated later, matching `Members::encp(new EncryptionParameters)`
@@ -218,7 +215,6 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// separate `encrypted`/`encryption_initialized` pair — the outer
     /// `Option` serves both; see the field-mapping table in this issue's
     /// design (`bd show flpdf-25kg.3.11`) for the disclosed collapse.
-    #[allow(dead_code)] // flpdf-25kg.3.10's pipe-time read primitive is the first consumer
     encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
 }
 
@@ -620,7 +616,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// primitive) lives under `crate::reader`, so this is not yet known to be
     /// too narrow — but if a later consumer lives outside `crate::reader`,
     /// this will need widening together with `EncryptionState` itself.
-    #[allow(dead_code)] // no caller yet in this slice; flpdf-25kg.3.10 is the first
     pub(in crate::reader) fn encryption_parameters(
         &self,
     ) -> Rc<RefCell<Option<crate::reader::EncryptionState>>> {
@@ -1666,14 +1661,15 @@ mod tests {
     ///
     /// **This does not yet discriminate that state from qpdf's
     /// `encryption_initialized == true, encrypted == false` state** (an
-    /// authenticated-but-unencrypted document). Nothing can populate
-    /// `encryption_parameters` until `Pdf` is wired onto this cell
-    /// (flpdf-25kg.3.11's Task 2), so both states collapse to the same
-    /// `None` by construction today — this assertion is real but not yet
+    /// authenticated-but-unencrypted document). This test builds its
+    /// resolver directly via `bare_resolver()`, bypassing `Pdf::open`
+    /// entirely, so `Pdf::authenticate_if_encrypted` never runs here and
+    /// both states collapse to the same `None` regardless of `Pdf` now
+    /// sharing this cell — this assertion is real but not yet
     /// discriminating. A fixture-backed test that authenticates a real
-    /// unencrypted document and still observes `None` here — the one that
-    /// actually carries the discrimination weight — arrives with Task 3,
-    /// once that wiring exists.
+    /// unencrypted document through `Pdf::open` and still observes `None`
+    /// here — the one that actually carries the discrimination weight —
+    /// arrives with Task 3.
     #[test]
     fn a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters() {
         let resolver = bare_resolver();
