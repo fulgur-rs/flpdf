@@ -855,6 +855,69 @@ fn json_stream_data_file_creates_side_files() {
     );
 }
 
+#[test]
+fn json_stream_data_file_to_stdout_requires_explicit_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "\nqpdf: please specify --json-stream-prefix since the input file name is unknown\n\n\
+For help:\n  qpdf --help=usage       usage information\n  qpdf --help=topic       help on a topic\n  \
+qpdf --help=--option    help on an option\n  qpdf --help             general help and a topic list\n\n"
+    );
+    assert!(!temp.path().join("stream-4").exists());
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 missing JSON stream prefix oracle"]
+fn live_qpdf_json_file_stdout_requires_prefix() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+
+    let qpdf_dir = tempfile::tempdir().unwrap();
+    let flpdf_dir = tempfile::tempdir().unwrap();
+    let qpdf_input = qpdf_dir.path().join("input.pdf");
+    let flpdf_input = flpdf_dir.path().join("input.pdf");
+    let input = one_page_pdf_with_stream();
+    std::fs::write(&qpdf_input, &input).unwrap();
+    std::fs::write(&flpdf_input, input).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .current_dir(qpdf_dir.path())
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&qpdf_input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(flpdf_dir.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&flpdf_input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(!qpdf_dir.path().join("stream-4").exists());
+    assert!(!flpdf_dir.path().join("stream-4").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Regression: --json-output alone must NOT default stream-data to inline.
 //
