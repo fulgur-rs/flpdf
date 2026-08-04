@@ -1183,9 +1183,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         // No qpdf counterpart: `QPDF_Stream` keeps `stream_offset` and
         // `length` and reads the payload at pipe time, while
-        // `ObjectValue::Stream` owns its bytes. `read_to_owned` grows to what
-        // the input actually yields rather than pre-allocating `length`, so
-        // even this now-bounded read never trusts the declaration.
+        // `ObjectValue::Stream` carries the bytes themselves (shared, but
+        // still read here rather than at pipe time). `read_to_owned` grows to
+        // what the input actually yields rather than pre-allocating `length`,
+        // so even this now-bounded read never trusts the declaration.
         self.seek(stream_offset)?;
         let data = self.read_to_owned(Some(span))?;
 

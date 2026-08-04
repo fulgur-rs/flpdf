@@ -5058,11 +5058,13 @@ mod tests {
     #[test]
     fn make_indirect_object_handle_gives_a_stream_its_own_independent_dict() {
         // Regression test: cloning a direct Stream value naively (the
-        // #[derive(Clone)] every other variant gets) would deep-clone
-        // `data` but Rc-share `dict` with the caller's original handle --
-        // the same asymmetry `shallow_copy` was fixed for. Mutating the
-        // *original* handle's stream data after making it indirect must
-        // not affect the new indirect object's dictionary.
+        // #[derive(Clone)] every other variant gets) would Rc-share
+        // `stream_dict` with the caller's original handle, so a later
+        // `replace_stream_data` on either would rewrite the other's
+        // `/Length` -- the same sharing `shallow_copy` privatizes the
+        // dictionary to avoid. Mutating the *original* handle's stream data
+        // after making it indirect must not affect the new indirect object's
+        // dictionary.
         let dict = ObjectHandle::dictionary(vec![]);
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),

@@ -426,7 +426,7 @@ impl ObjectHandle {
     /// cannot assume its caller holds the only reference to the direct
     /// handle it passes in.
     ///
-    /// A `Stream` value's `dict` gets the same `shallow_copy_child`
+    /// A `Stream` value's `stream_dict` gets the same `shallow_copy_child`
     /// treatment [`Self::shallow_copy`] gives it, rather than the plain
     /// `ObjectValue::clone()` every other variant gets: leaving it Rc-shared
     /// with `self` would let a later [`Self::replace_stream_data`] on either
@@ -1184,10 +1184,10 @@ impl ObjectHandle {
     /// cannot be cloned", `libqpdf/QPDF_Stream.cc`), and this crate has no
     /// exception channel to mirror that with — the same precedent
     /// [`Self::unparse_resolved`]'s own doc comment already establishes for
-    /// a different qpdf-throws case. Instead of leaving a stream's `dict`
+    /// a different qpdf-throws case. Instead of leaving a stream's `stream_dict`
     /// Rc-shared with the source (which would let a later
     /// [`Self::replace_stream_data`] on the copy silently corrupt the
-    /// source's `/Length`/`/Filter`/`/DecodeParms`), a stream's `dict` is
+    /// source's `/Length`/`/Filter`/`/DecodeParms`), a stream's `stream_dict` is
     /// treated as a child exactly like an array/dictionary entry: copied
     /// independently when direct, shared when indirect.
     pub fn shallow_copy(&self) -> ObjectHandle {
@@ -1839,11 +1839,12 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
 // re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
 // own `stacker::maybe_grow` wrap — the same hub-per-call shape as
 // `unparse_materialize`/`unparse_materialize_child` above). A `Stream`'s
-// `dict` field is a child in exactly the same sense as an array/dictionary
-// entry and gets the same `shallow_copy_child` treatment, so the copy's
-// dictionary is independent of the source's rather than Rc-shared while
-// only `data` is deep-cloned (see `shallow_copy`'s own doc comment). Every
-// other variant is cloned as-is with no further recursion.
+// `stream_dict` field is a child in exactly the same sense as an
+// array/dictionary entry and gets the same `shallow_copy_child` treatment, so
+// the copy's dictionary is independent of the source's rather than Rc-shared
+// with it (see `shallow_copy`'s own doc comment for why that matters).
+// `stream_data` is shared either way. Every other variant is cloned as-is
+// with no further recursion.
 fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
     match value {
         ObjectValue::Array(items) => {
