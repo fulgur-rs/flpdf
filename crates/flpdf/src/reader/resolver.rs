@@ -85,6 +85,7 @@
 //! object, so duplicates would be the bug instead.
 
 use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
 use std::cell::RefCell;
@@ -731,6 +732,62 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 return Ok(bytes);
             }
         }
+    }
+
+    /// qpdf `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2538`), the only
+    /// path by which a stream's original bytes reach a consumer: `QPDF_Stream`
+    /// keeps no copy of them, so its `pipeStreamData` reads them here from
+    /// `parsed_offset` and `length` (`libqpdf/QPDF_Stream.cc:608-620`).
+    ///
+    /// Returns whether the bytes were delivered, mirroring qpdf's `bool`:
+    /// a damaged source is a warning and a `false`, not an error for the
+    /// caller to propagate.
+    ///
+    /// qpdf allocates `length` and reads it in one operation (`:2497-2501`).
+    /// That is deliberate here even though parsing deliberately does *not*
+    /// pre-allocate a declared `/Length`: by pipe time the offset and length
+    /// have already been validated by the framing scan.
+    ///
+    /// **The decryption stage is not inserted yet.** qpdf prepends one when
+    /// the document is encrypted (`:2490-2492`, `QPDF::decryptStream`); until
+    /// that lands, an encrypted document pipes ciphertext. No test asserts
+    /// that as correct.
+    //
+    // The parameter list is qpdf's (`QPDF.cc:2542-2550` passes seven beyond
+    // the receiver); bundling them would be a shape this port does not have a
+    // counterpart for. Not wired to a production caller until
+    // `QPDF_Stream::pipeStreamData`'s source dispatch lands, the same
+    // not-yet-wired state the other ported primitives carry.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn pipe_stream_data(
+        &self,
+        _object_ref: ObjectRef,
+        offset: i64,
+        length: usize,
+        _stream_dict: &ObjectHandle,
+        pipeline: &mut dyn Pipeline,
+        _suppress_warnings: bool,
+        _will_retry: bool,
+    ) -> bool {
+        let Ok(start) = u64::try_from(offset) else {
+            return false;
+        };
+        // qpdf `:2496-2501`.
+        let mut buf = vec![0u8; length];
+        if self.seek(start).is_err() {
+            return false;
+        }
+        match self.read(&mut buf) {
+            Ok(read) if read == length => {}
+            // qpdf `:2499-2500`: a short read is "unexpected EOF reading
+            // stream data".
+            _ => return false,
+        }
+        // qpdf `:2502-2504`.
+        if pipeline.write(&buf).is_err() {
+            return false;
+        }
+        pipeline.finish().is_ok()
     }
 
     /// Test-only mutable access to the input source itself, for fixtures that
@@ -1677,6 +1734,48 @@ mod tests {
     fn a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters() {
         let resolver = bare_resolver();
         assert!(resolver.encryption_parameters().borrow().is_none());
+    }
+
+    /// A resolver over `bytes`, so a test can hand `pipe_stream_data` an
+    /// offset and length directly instead of parsing a document to reach one.
+    fn resolver_over(bytes: Vec<u8>) -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
+        ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            Diagnostics::default(),
+            0,
+        )
+    }
+
+    /// `QPDF::pipeStreamData` seeks to the parsed offset, reads exactly
+    /// `length` bytes, writes them to the pipeline and finishes it
+    /// (`libqpdf/QPDF.cc:2496-2504`). It reads the declared length and nothing
+    /// around it.
+    #[test]
+    fn piping_copies_the_declared_length_from_the_parsed_offset() {
+        let source = b"%PDF-1.4\nbefore<payload bytes>after".to_vec();
+        let offset = source
+            .windows(7)
+            .position(|w| w == b"payload")
+            .expect("marker") as i64;
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            offset,
+            b"payload bytes".len(),
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(ok, "an in-bounds read succeeds");
+        assert_eq!(sink.take_buffer().expect("buffer"), b"payload bytes");
     }
 
     /// AC6 case 1: a document with no `/Encrypt` entry authenticates
