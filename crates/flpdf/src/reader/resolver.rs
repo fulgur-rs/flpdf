@@ -2170,18 +2170,17 @@ mod tests {
     /// fault-injecting reader shape the resolution tests use.
     #[test]
     fn an_input_source_failure_is_reported_through_the_decoding_arm() {
+        // Reading always fails; seeking fails only in the second case, so one
+        // pass exercises a successful seek followed by a failing read and the
+        // other stops at the seek.
         struct Broken {
             inner: Cursor<Vec<u8>>,
-            fail_reads: bool,
             fail_seeks: bool,
         }
 
         impl std::io::Read for Broken {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                if self.fail_reads {
-                    return Err(std::io::Error::other("read went away"));
-                }
-                self.inner.read(buf)
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("read went away"))
             }
         }
 
@@ -2194,11 +2193,10 @@ mod tests {
             }
         }
 
-        for (fail_reads, fail_seeks) in [(true, false), (false, true)] {
+        for fail_seeks in [false, true] {
             let resolver = ResolverHandle::new_shared(
                 Broken {
                     inner: Cursor::new(b"%PDF-1.4\npayload".to_vec()),
-                    fail_reads,
                     fail_seeks,
                 },
                 0,
@@ -2220,7 +2218,7 @@ mod tests {
                 false,
             );
 
-            assert!(!ok, "reads={fail_reads} seeks={fail_seeks}");
+            assert!(!ok, "seeks={fail_seeks}");
             let messages: Vec<_> = resolver
                 .repair_diagnostics()
                 .entries()
@@ -2230,7 +2228,7 @@ mod tests {
             assert_eq!(messages.len(), 1, "{messages:?}");
             assert!(
                 messages[0].starts_with("error decoding stream data for object 4 0: "),
-                "reads={fail_reads} seeks={fail_seeks}: {messages:?}"
+                "seeks={fail_seeks}: {messages:?}"
             );
         }
     }
