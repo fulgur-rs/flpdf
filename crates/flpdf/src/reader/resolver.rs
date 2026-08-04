@@ -569,6 +569,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .push(Diagnostic::warning(message, None));
     }
 
+    /// [`Self::push_warning`] with the offset qpdf attributes the warning to.
+    ///
+    /// qpdf carries the position inside the exception it throws — every
+    /// `damagedPDF(file, object, offset, message)` overload takes one
+    /// (`include/qpdf/QPDF.hh:1044-1050`) — where flpdf keeps it in
+    /// [`Diagnostic::offset`] beside the text.
+    ///
+    /// Same borrow discipline as [`Self::push_warning`].
+    pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) {
+        self.core
+            .borrow_mut()
+            .repair_diagnostics
+            .push(Diagnostic::warning(message, Some(offset)));
+    }
+
     /// A snapshot of every warning raised on this document so far.
     ///
     /// Returns an owned clone because the collection lives behind a
@@ -766,7 +781,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         length: usize,
         _stream_dict: &ObjectHandle,
         pipeline: &mut dyn Pipeline,
-        _suppress_warnings: bool,
+        suppress_warnings: bool,
         _will_retry: bool,
     ) -> bool {
         let Ok(start) = u64::try_from(offset) else {
@@ -779,9 +794,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         match self.read(&mut buf) {
             Ok(read) if read == length => {}
-            // qpdf `:2499-2500`: a short read is "unexpected EOF reading
-            // stream data".
-            _ => return false,
+            Ok(read) => {
+                // qpdf `:2498-2500` throws
+                // `damagedPDF(file, "", offset + read, ...)`, which its own
+                // `catch (QPDFExc&)` arm turns into a warning (`:2505-2509`).
+                // The position is where the read stopped, not where it began.
+                if !suppress_warnings {
+                    self.push_warning_at(
+                        start.saturating_add(read as u64),
+                        "unexpected EOF reading stream data",
+                    );
+                }
+                return false;
+            }
+            Err(_) => return false,
         }
         // qpdf `:2502-2504`.
         if pipeline.write(&buf).is_err() {
@@ -1776,6 +1802,70 @@ mod tests {
 
         assert!(ok, "an in-bounds read succeeds");
         assert_eq!(sink.take_buffer().expect("buffer"), b"payload bytes");
+    }
+
+    /// qpdf throws `damagedPDF(file, "", offset + read, "unexpected EOF
+    /// reading stream data")` when the source runs out before `length`
+    /// (`libqpdf/QPDF.cc:2498-2500`), catches it as a `QPDFExc`, warns unless
+    /// suppressed (`:2505-2509`), and returns false. The offset it attributes
+    /// the warning to is where the read stopped, not where it started.
+    #[test]
+    fn a_source_shorter_than_the_declared_length_warns_and_fails() {
+        let source = b"%PDF-1.4\nshort".to_vec();
+        let offset = 9i64;
+        let available = source.len() - 9;
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            offset,
+            available + 100,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(!ok, "a truncated read fails");
+        let diagnostics = resolver.repair_diagnostics();
+        let entries: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| (d.message.as_str(), d.offset))
+            .collect();
+        assert_eq!(
+            entries,
+            [(
+                "unexpected EOF reading stream data",
+                #[allow(clippy::cast_possible_truncation)]
+                Some(offset as u64 + available as u64)
+            )]
+        );
+    }
+
+    /// `suppress_warnings` silences the report but not the failure
+    /// (`libqpdf/QPDF.cc:2506`).
+    #[test]
+    fn suppressed_warnings_still_fail_but_report_nothing() {
+        let source = b"%PDF-1.4\nshort".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            9,
+            1_000,
+            &dict,
+            &mut sink,
+            true,
+            false,
+        );
+
+        assert!(!ok);
+        assert!(resolver.repair_diagnostics().entries().is_empty());
     }
 
     /// AC6 case 1: a document with no `/Encrypt` entry authenticates
