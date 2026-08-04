@@ -2183,8 +2183,23 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
         // Every remaining variant (Null, Boolean, Integer, Real, RealLiteral,
         // Name, String, Operator, InlineImage, Reference) has no QDF-specific
         // framing -- reuse `unparse_object_value`'s own arms for them
-        // verbatim rather than duplicating scalar-formatting logic.
-        other => unparse_object_value(other, out)?,
+        // verbatim rather than duplicating scalar-formatting logic. Spelled
+        // out explicitly (rather than an `other =>` catch-all) so this match
+        // stays exhaustive: adding a new `ObjectValue` variant, or removing
+        // one of the three container arms above, is a compile error here
+        // instead of a silent fallthrough -- the same enforcement
+        // `unparse_object_value` itself already gets from having no
+        // catch-all arm at all.
+        ObjectValue::Null
+        | ObjectValue::Boolean(_)
+        | ObjectValue::Integer(_)
+        | ObjectValue::Real(_)
+        | ObjectValue::RealLiteral { .. }
+        | ObjectValue::Name(_)
+        | ObjectValue::String(_)
+        | ObjectValue::Operator(_)
+        | ObjectValue::InlineImage(_)
+        | ObjectValue::Reference(_) => unparse_object_value(value, out)?,
     }
     Ok(())
 }
@@ -4470,6 +4485,36 @@ mod unparse_object_tests {
         drop(resolver);
         let mut out = Vec::new();
         assert!(indirect.unparse_object_qdf(&mut out, 0).is_err());
+    }
+
+    #[test]
+    fn unparse_object_qdf_respects_a_nonzero_starting_indent() {
+        // Every other QDF test in this module calls the public entry point
+        // with `indent = 0`, so the internal `indent + 2` recursion is
+        // exercised but the *argument's own arrival* at the public method
+        // never is -- a stray `indent = 0` hardcoded inside the function
+        // body would still pass every one of them. Start at a nonzero
+        // column instead, so the dict's closing `>>` (written at the
+        // caller's own `indent`, unincremented) and its one entry (written
+        // at `indent + 2`) both prove the argument actually reached them.
+        let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 4).unwrap();
+        assert_eq!(out, b"<<\n      /A 1\n    >>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_writes_an_empty_dict_at_a_nonzero_indent() {
+        // Sibling of the suppresses-null test above, but with *every* entry
+        // gone (here: none to begin with) and at a nonzero starting indent
+        // -- untested at any indent before this. Only the closing `>>`
+        // carries an indent slot when there are no surviving entries; this
+        // pins that it still lands at the caller's own `indent`, not the
+        // default `0`.
+        let handle = ObjectHandle::dictionary(vec![]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 4).unwrap();
+        assert_eq!(out, b"<<\n    >>");
     }
 }
 
