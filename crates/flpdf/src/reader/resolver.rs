@@ -2640,13 +2640,14 @@ mod tests {
     /// about which side of the warn/reject line a token falls on, not about
     /// where it is.
     ///
-    /// *The header check anchors differently.* qpdf's `expected n n obj`
-    /// carries `readObjectAtOffset`'s `offset` argument
-    /// (`libqpdf/QPDF.cc:1600-1608`) — the object's own start — so a
-    /// `2 0 zzz` header at 256 is reported at 256, whereas flpdf reports the
-    /// offending token, 260. Both are absolute after this change; only the
-    /// anchor within the object differs, and matching qpdf's would mean
-    /// discarding the more precise position rather than gaining one.
+    /// *The header check anchors differently.* qpdf throws
+    /// `damagedPDF(offset, "expected n n obj")` (`libqpdf/QPDF.cc:1592-1594`)
+    /// with `readObjectAtOffset`'s `offset` argument — the object's own start
+    /// — so a `2 0 zzz` header at 256 is reported at 256, where flpdf reports
+    /// the offending token at 260 (both observed). Both are absolute after
+    /// this change; only the anchor within the object differs, and matching
+    /// qpdf's would mean discarding the more precise position rather than
+    /// gaining one.
     #[test]
     fn a_malformed_body_reports_its_position_in_the_file_not_in_the_window() {
         // 200 bytes of filler put object 2 far enough into the file that a
