@@ -1684,6 +1684,23 @@ impl ObjectHandle {
     /// suppression rule (`:1490-1491`); an indirect entry that survives
     /// suppression writes as its own `"N G R"` reference form, never
     /// inlined.
+    ///
+    /// If `self` is an *indirect* handle whose resolved value is a `Stream`,
+    /// this call reaches `unparse_object_value`'s `Stream` arm directly (it
+    /// does not go through [`write_child`]'s indirect-reference check the
+    /// way a *child* position would) and inlines just the stream's
+    /// dictionary — `<< ... >>` with no `stream`/`endstream` framing and no
+    /// `/Length`-last repositioning. That is not what qpdf's real
+    /// stream-writing call produces at this position; this primitive simply
+    /// does not implement qpdf's stream-writing path
+    /// (`QPDFWriter::unparseObject` entered with `f_stream` flags). The
+    /// dedicated primitive for that, `unparse_stream_body`, lands in
+    /// a later task of this same plan (flpdf-egzr.3.2.13 Task 6); until
+    /// then, calling `unparse_object` directly on a stream-resolving handle
+    /// is an underspecified, undocumented-by-qpdf shape whose current output
+    /// is pinned, in `unparse_object_tests`, by
+    /// `unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary`
+    /// rather than derived from any qpdf oracle.
     #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
     pub(crate) fn unparse_object(&self, out: &mut Vec<u8>) -> Result<()> {
         unparse_object_walk(self, out)
@@ -1868,12 +1885,16 @@ fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
 
 // Filters `entries` down to the ones `unparseObject`'s dictionary branch
 // would actually write (`QPDFWriter.cc:1490-1491`). Forces resolution of
-// every indirect value via `try_is_null` -- this is the one place in this
-// primitive family that performs the hidden I/O qpdf's own `isNull()`
-// performs and every other accessor in this file deliberately avoids (see
-// `unparse_resolved`'s own doc on why *it* does not resolve on the
-// caller's behalf; `QPDFWriter::unparseObject` is a writer-internal path
-// with no such constraint).
+// every indirect *value* via `try_is_null` to decide suppression -- this is
+// the one place in this primitive family that performs that particular
+// hidden I/O qpdf's own `isNull()` performs and every other *value*
+// accessor in this file deliberately avoids (see `unparse_resolved`'s own
+// doc on why *it* does not resolve on the caller's behalf).
+// `unparse_object_walk` separately forces resolution of `self` -- a
+// different target, for a different reason: dispatching on `self`'s own
+// resolved type, not deciding whether to suppress it. Neither forced
+// resolution is a contract violation here: `QPDFWriter::unparseObject` is a
+// writer-internal path with no no-hidden-I/O constraint to begin with.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn visible_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
@@ -1966,15 +1987,28 @@ fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
             unparse_dict_entries(&entries, out)?;
         }
         ObjectValue::Stream { stream_dict, .. } => {
-            // A stream is only ever a top-level indirect object in valid
-            // qpdf usage, and `write_child` never recurses into an indirect
-            // handle -- so this arm is only reachable for a *direct* Stream
-            // value, a shape with no qpdf counterpart at all. Inlines only
-            // the dictionary, deliberately not the `stream`/`endstream`
-            // framing: that framing (and the `/Length`-last, optionally
-            // re-filtered stream-dictionary layout it wraps) is
-            // `unparse_stream_body`'s own, separately scoped responsibility
-            // (flpdf-egzr.3.2.13 Task 6), not this generic dispatch's.
+            // Reachable two ways, not just one: a *direct* Stream value (no
+            // qpdf counterpart -- a real QPDFObjectHandle's resolved value
+            // is never itself a stream outside an indirect object), and an
+            // *indirect* `self` at the top level of `unparse_object` that
+            // resolves to a stream (a real, reachable qpdf shape -- see
+            // `ObjectHandle::unparse_object`'s own doc). The latter is
+            // reachable here because `unparse_object`/`unparse_object_walk`
+            // call this dispatch directly on `self`, bypassing `write_child`
+            // entirely; `write_child` only gates *child* positions (array
+            // elements, dictionary values) during recursion, where it never
+            // recurses into an indirect handle -- so an *indirect* child
+            // resolving to a stream short-circuits to its own `"N G R"`
+            // form and never reaches this arm. A *direct* child whose value
+            // is a Stream does reach it, by the first case above.
+            //
+            // Either way, this arm inlines only the dictionary, deliberately
+            // not the `stream`/`endstream` framing: that framing (and the
+            // `/Length`-last, optionally re-filtered stream-dictionary
+            // layout it wraps) is `unparse_stream_body`'s own, separately
+            // scoped responsibility (flpdf-egzr.3.2.13 Task 6) -- this
+            // generic dispatch does not implement qpdf's real
+            // stream-writing path for the indirect case either.
             unparse_object_walk(stream_dict, out)?;
         }
         ObjectValue::Reference(object_ref) => {
@@ -4049,6 +4083,29 @@ mod unparse_object_tests {
     }
 
     #[test]
+    fn unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary() {
+        // Unlike the direct-stream case above, this *is* a real, reachable
+        // qpdf shape: an indirect object whose resolved value is a stream.
+        // `unparse_object`/`unparse_object_walk` dispatch on `self` directly
+        // (never through `write_child`'s indirect-reference short-circuit,
+        // which only applies to *child* positions during recursion), so
+        // this reaches the same `ObjectValue::Stream` arm as the direct
+        // case and inlines just the dictionary -- not qpdf's real
+        // stream-writing output at this position (see
+        // `ObjectHandle::unparse_object`'s own doc). Pins today's actual
+        // behavior; `unparse_stream_body` (Task 6) is the primitive that
+        // will implement the real stream-writing path.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
+        });
+        let mut out = Vec::new();
+        indirect.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< /Length 2 >>");
+    }
+
+    #[test]
     fn unparse_object_writes_a_resolved_indirect_reference_value_as_the_targets_own_form() {
         // ObjectValue::Reference is a real, reachable resolution state (a
         // `Pdf::set_object` redirect -- see its own doc and
@@ -4099,6 +4156,15 @@ mod unparse_object_tests {
     }
 
     #[test]
+    fn unparse_object_writes_an_empty_array() {
+        let mut out = Vec::new();
+        ObjectHandle::array(vec![])
+            .unparse_object(&mut out)
+            .unwrap();
+        assert_eq!(out, b"[ ]");
+    }
+
+    #[test]
     fn unparse_object_writes_a_dict_and_suppresses_direct_null() {
         let handle = ObjectHandle::dictionary(vec![
             (b"A".to_vec(), ObjectHandle::integer(1)),
@@ -4119,6 +4185,14 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         handle.unparse_object(&mut out).unwrap();
         assert_eq!(out, b"<< /A 1 >>");
+    }
+
+    #[test]
+    fn unparse_object_writes_an_empty_dict_when_every_entry_is_suppressed() {
+        let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
+        let mut out = Vec::new();
+        handle.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< >>");
     }
 
     #[test]
