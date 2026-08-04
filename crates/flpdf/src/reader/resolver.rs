@@ -866,6 +866,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `read_token(false, ..)` below turns it into an error. Widening that
     /// changes every caller's error surface, so it is recorded rather than
     /// taken here.
+    ///
+    /// A second, smaller one rides on it: that error's offset is relative to
+    /// *this* scan's buffer, which begins wherever the input happened to be —
+    /// after a stream payload, say — so it is neither a file position nor an
+    /// object-relative one. [`Self::read_object_at_offset`] rebases what
+    /// [`Self::frame_object`] raises; nothing rebases this, for the same
+    /// reason [`Self::stream_length`]'s placeholders stay `0`: the position
+    /// the error would need is not carried this far down. It is reachable on
+    /// exactly the input the divergence above is about — a malformed token
+    /// where a framing keyword belonged is the only thing that raises an
+    /// [`Error::Parse`] here — so it is a strict subset of that one, and
+    /// giving qpdf's `allow_bad` treatment to this read removes both at once.
     fn read_token_from_input(&self) -> Result<Token> {
         self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
@@ -2608,6 +2620,86 @@ mod tests {
             ["expected endobj"],
             "the EOF must surface as the missing framing keyword, exactly as \
              it does after `endstream`"
+        );
+    }
+
+    /// A value that ends exactly on an accumulated-buffer boundary, with more
+    /// file after it, still finds its `endobj`.
+    ///
+    /// **This is the hazard `allow_eof` in
+    /// [`super::ResolverHandle::frame_object`] could have created, and it is
+    /// pinned rather than argued.** Before that flag, a trailing-token read
+    /// that ran off the end of the *accumulated buffer* — not the file —
+    /// failed with `unexpected EOF`, and [`super::ResolverHandle::scan_forward`]
+    /// treated the `Err` as "refill and try again". The error was doubling as
+    /// a refill signal. With the flag the same position yields an EOF token
+    /// and an `Ok`, so whether a refill happens now rests entirely on
+    /// `scan_forward`'s `end < bytes.len()` rule.
+    ///
+    /// That rule holds, and the reason is in `Tokenizer::read_token`: its
+    /// closing `if !self.in_token && !self.before_token { self.pos -= 1 }`
+    /// gives back the one delimiter byte a token overshot by, and end of input
+    /// is not an overshoot — `present_eof` advances nothing, and the
+    /// tokenizer is still `before_token` there. So `position()` comes back as
+    /// `bytes.len()`, `complete` is false, and the scan refills.
+    ///
+    /// Were the decrement ever to fire for an EOF token, this fixture would
+    /// come back with a spurious `expected endobj` on an object that has one,
+    /// framed from a buffer the scan never finished filling — a wrong answer
+    /// rather than an error, and exactly what `scan_forward`'s rule exists to
+    /// prevent. None of the other EOF fixtures can catch it: they end at the
+    /// *file's* end, where the result is accepted either way because there is
+    /// nothing left to refill with.
+    #[test]
+    fn a_value_ending_on_a_buffer_boundary_still_finds_its_endobj() {
+        let open = b"2 0 obj\n<< /Type /Whatever /F (";
+        let close = b") >>";
+        // Sized so the value's last byte is the last byte of the first refill.
+        let filler = vec![b'x'; super::INPUT_CHUNK - open.len() - close.len()];
+        let mut body = Vec::new();
+        body.extend_from_slice(open);
+        body.extend_from_slice(&filler);
+        body.extend_from_slice(close);
+        assert_eq!(
+            body.len(),
+            super::INPUT_CHUNK,
+            "the fixture must land the value's end exactly on the boundary"
+        );
+        body.extend_from_slice(b"\nendobj\n");
+
+        // A third object keeps the input going past the boundary, so that a
+        // scan which stopped there would be stopping early rather than at EOF.
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            body,
+            b"3 0 obj\n<< /Type /Filler >>\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle.try_dereference().expect("resolve");
+
+        assert_eq!(
+            handle
+                .as_dictionary()
+                .expect("the value is a dictionary")
+                .get(b"F".as_slice())
+                .and_then(crate::ObjectHandle::as_string)
+                .map(|value| value.len()),
+            Some(filler.len()),
+            "the value must be whole"
+        );
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            Vec::<String>::new(),
+            "the buffer's end is not the input's end, so the framing must \
+             refill and find `endobj` rather than report it missing"
         );
     }
 
