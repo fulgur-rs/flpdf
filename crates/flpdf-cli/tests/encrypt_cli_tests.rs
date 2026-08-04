@@ -940,17 +940,14 @@ fn static_aes_iv_with_static_id_produces_deterministic_output() {
 /// and CBC writes it at the head of every ciphertext (`:161-163`), so it is
 /// observable in the output.
 ///
-/// This compares the vector itself rather than the whole document. Comparing
-/// whole documents showed two further divergences that have nothing to do with
-/// the vector — the `/U` value's trailing 16 padding bytes, and where `/Encrypt`
-/// sits in the trailer — each of which is its own fix. Once those land, this
-/// can become a whole-file assertion.
-///
-/// No `qpdf-zlib-compat` gate is needed, but not for the reason an earlier
-/// revision of this comment gave: flpdf's DEFLATE output *does* differ from
-/// qpdf's without that feature. The assertion is unaffected because it covers
-/// only the initialization vector, which precedes the ciphertext and so is
-/// independent of how the payload was compressed.
+/// This compares the vector itself rather than the whole document — see
+/// `encrypted_document_is_byte_identical_to_qpdf` below for the full-file
+/// comparison, which covers 128-bit only (qpdf's own 256-bit output is not
+/// reproducible run-to-run; see that test's doc for why). That test also
+/// requires the `qpdf-zlib-compat` feature (DEFLATE output must match qpdf's
+/// zlib backend); this one does not, because the initialization vector
+/// precedes the ciphertext and is independent of how the payload was
+/// compressed.
 #[test]
 fn static_aes_iv_matches_the_vector_qpdf_writes() {
     if !ensure_qpdf_or_skip() {
@@ -997,6 +994,81 @@ fn static_aes_iv_matches_the_vector_qpdf_writes() {
             "{bits}-bit AES: the initialization vector must be the one qpdf writes"
         );
     }
+}
+
+/// Whole-document byte parity for AES-128 (V=4/AESV2) encrypted output
+/// against real qpdf.
+///
+/// With the static IV (`static_aes_iv_matches_the_vector_qpdf_writes` above),
+/// the `/U` value's padding, and the trailer `/Encrypt` position all lining up
+/// with qpdf, the only remaining divergence for
+/// `--static-id --static-aes-iv --encrypt <user> <owner> 128 --use-aes=y`
+/// output is the DEFLATE backend — hence the `qpdf-zlib-compat` gate below.
+/// This supersedes the vector-only comparison above as the byte-identical
+/// proof; that test stays too, since it documents the narrower IV claim on
+/// its own and needs no feature gate.
+///
+/// This intentionally does not cover 256-bit (V=5/AESV3, R=6): its file
+/// encryption key is generated with random bytes rather than derived from the
+/// password (`QPDF::compute_encryption_parameters_V5`,
+/// `libqpdf/QPDF_encryption.cc:1198`), and its `/U`, `/UE`, `/O`, `/OE`, and
+/// `/Perms` values each mix in further random salt bytes
+/// (`compute_U_UE_value_V5:610`, `compute_O_OE_value_V5:629`,
+/// `compute_Perms_value_V5_clear:652`). None of that randomness is seeded by
+/// `--static-id` or `--static-aes-iv`, so even qpdf's own 256-bit output is
+/// not stable across repeated runs of the same invocation: two consecutive
+/// `qpdf --static-id --static-aes-iv --encrypt "" "" 256 --` runs on the same
+/// input diverge partway into the first encrypted string. A byte-identical
+/// comparison is therefore not meaningful for the 256-bit case, independent
+/// of flpdf's implementation.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn encrypted_document_is_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ours = tmp.path().join("flpdf.pdf");
+    let theirs = tmp.path().join("qpdf.pdf");
+    let input = fixture(ONE_PAGE_FIXTURE);
+
+    let args = [
+        "--static-id",
+        "--static-aes-iv",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(args)
+        .arg(&input)
+        .arg(&ours)
+        .assert()
+        .success();
+
+    let qpdf = std::process::Command::new("qpdf")
+        .args(args)
+        .arg(&input)
+        .arg(&theirs)
+        .output()
+        .unwrap();
+    assert!(
+        qpdf.status.success(),
+        "qpdf reference run failed: {}",
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+
+    let mine = std::fs::read(&ours).unwrap();
+    let reference = std::fs::read(&theirs).unwrap();
+    assert_eq!(
+        mine, reference,
+        "AES-128 (V=4/AESV2): flpdf output must be byte-identical to qpdf 11.9.0"
+    );
 }
 
 /// The 16 bytes at the head of the first stream payload. Under AES-CBC that is
