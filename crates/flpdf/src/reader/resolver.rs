@@ -908,7 +908,29 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///   positions `updateCache` stores for linearization-hint validation.
     ///   flpdf's `ObjCache` counterpart is a bare `ObjectHandle`, which has
     ///   nowhere to put them; the position is still left after `endobj` so a
-    ///   later slice can take them without changing this shape.
+    ///   later slice can take them without changing this shape. The
+    ///   *whitespace skip* that computes `end_after_space` is skipped with
+    ///   them, and it is not inert: it throws
+    ///   `damagedPDF(tell(), "EOF after endobj")` (`:1660`) when the object is
+    ///   the last thing in the file, which `QPDF::resolve` catches
+    ///   (`:1737-1738`) and turns into a resolve-to-null (`:1745-1748`). Every
+    ///   flpdf fixture whose object ends at EOF therefore resolves where qpdf
+    ///   returns null — see
+    ///   `a_direct_value_ending_the_input_warns_and_is_still_resolved`.
+    ///
+    /// **Positions reported from here are the file's, not the window's.**
+    /// [`Self::frame_object`] tokenizes a buffer that begins at the object, so
+    /// everything it raises is relative to `offset`; qpdf's are relative to
+    /// `m->file`, because `QPDFExc` carries an input position taken from
+    /// `input->getLastOffset()` (`libqpdf/QPDFParser.cc:516-519`). The
+    /// `map_err` below is where the two coordinate systems are reconciled, and
+    /// it is deliberately outside `frame_object` rather than inside it: that
+    /// method's contract is "over a buffer", and only its caller knows where
+    /// the buffer came from. `a_malformed_body_reports_its_position_in_the_file_not_in_the_window`
+    /// pins the result against an offset observed from qpdf.
+    ///
+    /// The mismatch error raised further down needs no rebasing: it is built
+    /// from `offset` directly and is already absolute.
     fn read_object_at_offset(
         &self,
         offset: u64,
@@ -916,7 +938,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ) -> Result<(ObjectValue, i64)> {
         self.seek(offset)?;
         let framed = self.scan_forward(|bytes| {
-            let framed = self.frame_object(bytes, offset)?;
+            let framed = self
+                .frame_object(bytes, offset)
+                .map_err(|error| error.rebase_offset(offset as usize))?;
             let end = framed.end;
             Ok((framed, end))
         })?;
@@ -1214,6 +1238,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Takes no `&self` on purpose: [`ObjectHandle::try_dereference`] below is
     /// the re-entry point, and a method with no access to [`ResolverCore`]
     /// cannot be holding a borrow of it when that happens.
+    ///
+    /// **The `0` offsets below are placeholders, and the right value is
+    /// recorded rather than taken.** [`Self::read_object_at_offset`] rebases
+    /// what [`Self::frame_object`] raises onto the object's position; nothing
+    /// rebases these, because the only caller,
+    /// [`Self::read_stream`], is not given the object's start. qpdf reports
+    /// them at `readObject`'s own `offset` — `m->file->tell()` taken at
+    /// `:1334`, immediately after the `obj` keyword and *before* any
+    /// whitespace is skipped — passed to `damagedPDF(offset, …)` at `:1376`
+    /// and `:1379`. Observed on qpdf 11.9.0 over a chained-`/Length` fixture:
+    /// `/Length key in stream dictionary is not an integer` at 233690 against
+    /// `attempting to recover stream length` at 233721, 31 bytes apart, which
+    /// is exactly `\n<< /Length 4002 0 R >>\nstream\n`. flpdf's nearest
+    /// quantity is `frame_object`'s `body_start`, which is taken *after*
+    /// `skip_ignorable`, so it is that whitespace run short of qpdf's; closing
+    /// the gap means carrying a second position through the framing, which is
+    /// more than this fix needs and is left to the slice that ports
+    /// `end_before_space`.
     fn stream_length(dict: &ObjectValue) -> Result<usize> {
         let ObjectValue::Dictionary(entries) = dict else {
             return Err(Error::parse(
@@ -2566,6 +2608,76 @@ mod tests {
             ["expected endobj"],
             "the EOF must surface as the missing framing keyword, exactly as \
              it does after `endstream`"
+        );
+    }
+
+    /// A malformed body at a nonzero xref offset reports the offending byte's
+    /// position **in the file**, not in the window the resolver read it into.
+    ///
+    /// [`super::ResolverHandle::frame_object`] tokenizes a buffer that starts
+    /// at the object, so every position it produces is relative to the object.
+    /// qpdf's are not: `QPDFExc` carries an input position, and
+    /// `QPDFParser::warn` takes it from `input->getLastOffset()`
+    /// (`libqpdf/QPDFParser.cc:516-519`) on `m->file`, which is the whole
+    /// document. Left unrebased, a body error 30 bytes into an object at 256
+    /// was reported at 30 — a position near the *start of the file*, and one
+    /// that points at an unrelated byte.
+    ///
+    /// **The number below is qpdf's, measured rather than derived.** The
+    /// fixture this builds is byte-identical, over its header and both bodies,
+    /// to one run through qpdf 11.9.0: object 2 begins at 256, the stray `)`
+    /// sits 30 bytes into it, and qpdf reports
+    /// `WARNING: (object 2 0, offset 286): unexpected )` — the same message
+    /// flpdf produces, at the same position, once rebased.
+    ///
+    /// **Two things this does not claim.**
+    ///
+    /// *The diagnostic class still differs.* qpdf treats the stray `)` as
+    /// recoverable — it warns, inserts `/QPDFFake1`, and returns
+    /// `<< /QPDFFake1 (x) /Type /Whatever >>` — where flpdf's parser rejects
+    /// the object. That is the divergence
+    /// [`super::ResolverHandle::frame_object`] already records, and it is
+    /// about which side of the warn/reject line a token falls on, not about
+    /// where it is.
+    ///
+    /// *The header check anchors differently.* qpdf's `expected n n obj`
+    /// carries `readObjectAtOffset`'s `offset` argument
+    /// (`libqpdf/QPDF.cc:1600-1608`) — the object's own start — so a
+    /// `2 0 zzz` header at 256 is reported at 256, whereas flpdf reports the
+    /// offending token, 260. Both are absolute after this change; only the
+    /// anchor within the object differs, and matching qpdf's would mean
+    /// discarding the more precise position rather than gaining one.
+    #[test]
+    fn a_malformed_body_reports_its_position_in_the_file_not_in_the_window() {
+        // 200 bytes of filler put object 2 far enough into the file that a
+        // window-relative position could not be mistaken for a file one.
+        let filler = "z".repeat(200);
+        let bytes = pdf_with_bodies(&[
+            format!("1 0 obj\n<< /Type /Catalog /Filler ({filler}) >>\nendobj\n").into_bytes(),
+            b"2 0 obj\n<< /Type /Whatever /A )x >>\nendobj\n".to_vec(),
+        ]);
+        let malformed_at = bytes
+            .windows(2)
+            .position(|pair| pair == b")x")
+            .expect("the fixture must contain the offending token");
+        assert_eq!(
+            malformed_at, 286,
+            "the fixture must stay byte-compatible with the one qpdf was run \
+             against, or the position below is no longer qpdf's"
+        );
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        let error = handle
+            .try_dereference()
+            .expect_err("a stray `)` is not a value flpdf's parser accepts");
+
+        assert!(
+            matches!(&error, Error::Parse { offset, message }
+                if *offset == malformed_at && message == "unexpected )"),
+            "the error must carry the offending byte's file position ({malformed_at}), \
+             not its position within the object: {error:?}"
         );
     }
 

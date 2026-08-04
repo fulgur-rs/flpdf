@@ -67,10 +67,18 @@ impl Error {
     /// This shifts it back to an absolute offset (`base + offset`) so
     /// diagnostics point at the true byte position. Non-[`Error::Parse`]
     /// variants are returned unchanged.
+    ///
+    /// The addition saturates because `base` is not always a position inside a
+    /// buffer this crate allocated: the reader's object resolution rebases
+    /// onto a cross-reference entry's offset, which is whatever the input
+    /// file's xref table or xref stream declared and can be any `u64`. A
+    /// wrapping add would panic in a debug build on such a file; saturating
+    /// pins the diagnostic at `usize::MAX` instead, which is wrong by the same
+    /// amount the declared offset was.
     pub(crate) fn rebase_offset(self, base: usize) -> Self {
         match self {
             Self::Parse { offset, message } => Self::Parse {
-                offset: base + offset,
+                offset: base.saturating_add(offset),
                 message,
             },
             other => other,
