@@ -202,10 +202,14 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// because qpdf's `m->encp` is a `std::shared_ptr<EncryptionParameters>`:
     /// a second owner (`ForeignStreamData::encp`, `QPDF.hh:939`) holds the
     /// *same* allocation, constructed from `QPDF::Members::encp` by copying
-    /// the shared_ptr (`QPDF.cc:2266`), not by copying the data. `Pdf`
-    /// mirrors that shape: it holds a clone of this same `Rc`, so its one
-    /// write (`Pdf::authenticate_if_encrypted`) is visible here without a
-    /// second write site.
+    /// the shared_ptr (`QPDF.cc:2266`), not by copying the data. `Pdf` is
+    /// planned to migrate onto a clone of this same `Rc` (flpdf-25kg.3.11's
+    /// Task 2), so its one write (`Pdf::authenticate_if_encrypted`) becomes
+    /// visible here without a second write site — a consumer this slice does
+    /// not yet have. As of this field's introduction, `Pdf::encryption`
+    /// (`reader.rs:182`) is still a separate, unmigrated `Option<EncryptionState>`,
+    /// written independently by `authenticate_if_encrypted` (`reader.rs:921`);
+    /// nothing in this commit connects the two.
     ///
     /// Constructed empty (`None`) in [`ResolverHandle::new_shared`] and
     /// populated later, matching `Members::encp(new EncryptionParameters)`
@@ -1658,12 +1662,18 @@ mod tests {
 
     /// AC6 case 4: a resolver on which no authentication step has run at all
     /// reports no encryption parameters. This is qpdf's
-    /// `encryption_initialized == false` state — pinned separately from
-    /// `an_unencrypted_document_reports_no_encryption_parameters` (which runs
-    /// full `Pdf::open` and reaches `encryption_initialized == true,
-    /// encrypted == false`), because both collapse to the same `None` through
-    /// flpdf's `Option<EncryptionState>` and this asserts that collapse holds
-    /// for the pipe-side accessor too.
+    /// `encryption_initialized == false` state.
+    ///
+    /// **This does not yet discriminate that state from qpdf's
+    /// `encryption_initialized == true, encrypted == false` state** (an
+    /// authenticated-but-unencrypted document). Nothing can populate
+    /// `encryption_parameters` until `Pdf` is wired onto this cell
+    /// (flpdf-25kg.3.11's Task 2), so both states collapse to the same
+    /// `None` by construction today — this assertion is real but not yet
+    /// discriminating. A fixture-backed test that authenticates a real
+    /// unencrypted document and still observes `None` here — the one that
+    /// actually carries the discrimination weight — arrives with Task 3,
+    /// once that wiring exists.
     #[test]
     fn a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters() {
         let resolver = bare_resolver();
