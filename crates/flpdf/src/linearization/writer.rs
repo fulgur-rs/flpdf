@@ -6011,8 +6011,7 @@ mod tests {
             object_bytes.windows(needle.len()).any(|w| w == needle),
             "object {expected_encrypt_num} (the reserved /Encrypt slot) must be the \
              /Encrypt dictionary (/Filter /Standard), got {:?}",
-            // cov:ignore: only evaluated when the assertion above fails.
-            String::from_utf8_lossy(object_bytes)
+            String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
         );
 
         // Physical placement, not just a number coincidence:
@@ -6041,8 +6040,7 @@ mod tests {
             hint_header_pos > header_pos,
             "hint stream object {} must appear physically after the /Encrypt \
              object {expected_encrypt_num} in the output",
-            // cov:ignore: only evaluated when the assertion above fails.
-            expected_encrypt_num + 1
+            expected_encrypt_num + 1 // cov:ignore: only evaluated when the assertion above fails.
         );
     }
 
