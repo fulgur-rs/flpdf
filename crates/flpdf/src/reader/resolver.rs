@@ -2451,9 +2451,17 @@ mod tests {
         let cell = pdf.resolver.encryption_parameters();
         let guard = cell.borrow();
         let encryption = guard.as_ref().expect("RC4 fixture must authenticate");
-        assert_eq!(encryption.stream_mode, crate::reader::EncryptionMode::Rc4);
+        // `/V 2`, so qpdf never runs `interpretCF` and leaves `cf_stream` at
+        // its `EncryptionParameters` constructor default of `e_none`
+        // (`libqpdf/QPDF.cc:190`, gated at `libqpdf/QPDF_encryption.cc:860`).
+        // RC4 comes from the consumers' `/V >= 4` gate, not from this field.
+        assert_eq!(encryption.encryption_v, 2);
+        assert_eq!(
+            encryption.cf_stream,
+            crate::reader::EncryptionMode::Identity
+        );
         // RC4-128 derives a 16-byte file key (qpdf Algorithm 2, key length
-        // bits / 8). stream_mode and file_key are sibling fields of one
+        // bits / 8). cf_stream and file_key are sibling fields of one
         // EncryptionState behind one Option, so `Some` already proves both
         // arrived through the shared cell together; this assertion instead
         // checks the derived payload itself -- a real consumer (the
@@ -2480,10 +2488,7 @@ mod tests {
         let cell = pdf.resolver.encryption_parameters();
         let guard = cell.borrow();
         let encryption = guard.as_ref().expect("AES fixture must authenticate");
-        assert_eq!(
-            encryption.stream_mode,
-            crate::reader::EncryptionMode::Aes128
-        );
+        assert_eq!(encryption.cf_stream, crate::reader::EncryptionMode::Aes128);
         assert_eq!(encryption.file_key.len(), 16);
     }
 

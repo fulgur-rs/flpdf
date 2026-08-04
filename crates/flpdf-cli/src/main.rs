@@ -5188,10 +5188,9 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
     if info.v >= 4 {
         println!("stream encryption method: {}", info.stream_method);
         println!("string encryption method: {}", info.string_method);
-        // qpdf prints the embedded-file ("file") method. When the document
-        // declares no /EFF, qpdf falls back to the stream method.
-        let file_method = info.eff_method.unwrap_or(info.stream_method);
-        println!("file encryption method: {file_method}");
+        // qpdf prints the embedded-file ("file") method; the no-/EFF fallback
+        // to the stream method happens where `cf_file` is resolved, not here.
+        println!("file encryption method: {}", info.eff_method);
     }
     Ok(())
 }

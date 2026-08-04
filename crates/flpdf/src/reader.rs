@@ -21,8 +21,8 @@ use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
     check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
-    check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, per_object_key,
-    ObjectKeyAlg, StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
+    check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, StandardHandlerInputs,
+    StandardHandlerR5Inputs, StringCipher,
 };
 use crate::tokenizer::Tokenizer;
 use crate::xref::load_xref_state_with_repair;
@@ -188,11 +188,27 @@ pub(crate) struct QpdfPreparedObjects {
     pub(crate) max_object_id: u32,
 }
 
+/// qpdf `QPDF::EncryptionParameters` (`include/qpdf/QPDF.hh:899-923`).
+///
+/// qpdf's `encrypted` and `encryption_initialized` flags are folded into this
+/// being an `Option<EncryptionState>`; its password fields are consumed during
+/// authentication and not retained.
 #[derive(Debug, Clone)]
 struct EncryptionState {
     file_key: Vec<u8>,
-    stream_mode: EncryptionMode,
-    string_mode: EncryptionMode,
+    /// qpdf `encryption_V` / `encryption_R`. Read together and required, as
+    /// qpdf requires them together before any password work
+    /// (`libqpdf/QPDF_encryption.cc:770-777`).
+    encryption_v: i64,
+    encryption_r: i64,
+    /// qpdf `cf_stream` / `cf_string` / `cf_file`. Only meaningful when
+    /// `encryption_v >= 4`: qpdf leaves them at the constructor's `e_none`
+    /// otherwise (`libqpdf/QPDF.cc:190-192`) and its consumers gate on `/V`
+    /// before reading them. Go through [`Self::stream_method`] /
+    /// [`Self::string_method`] rather than reading these directly.
+    cf_stream: EncryptionMode,
+    cf_string: EncryptionMode,
+    cf_file: EncryptionMode,
     crypt_filters: BTreeMap<Vec<u8>, EncryptionMode>,
     encrypt_metadata: bool,
     encrypt_ref: Option<ObjectRef>,
@@ -204,6 +220,159 @@ struct EncryptionState {
     /// Many real PDFs share an empty password for both, so both flags can
     /// be true simultaneously.
     owner_password_matched: bool,
+    /// qpdf `cached_object_encryption_key` / `cached_key_og`
+    /// (`include/qpdf/QPDF.hh:918-919`). See [`Self::key_for_object`] for why
+    /// the cache key deliberately omits `use_aes`.
+    ///
+    /// qpdf default-constructs `cached_key_og` to `QPDFObjGen(0, 0)` and
+    /// compares with `!=`. Object 0 is never a real indirect object, so
+    /// `Option<ObjectRef>` initialised to `None` is the same predicate in a
+    /// shape that does not require a sentinel `ObjectRef`.
+    cached_object_encryption_key: Vec<u8>,
+    cached_key_og: Option<ObjectRef>,
+}
+
+/// What a crypt-filter switch decided: qpdf's `use_aes` when the object is to
+/// be decrypted, `None` where qpdf `return`s from the `e_none` arm without
+/// prepending anything, plus whether the caller owes an unknown-filter
+/// warning.
+type MethodChoice = (Option<bool>, bool);
+
+impl EncryptionState {
+    /// The crypt-filter switch qpdf writes twice: in `QPDF::decryptString`
+    /// over `cf_string` (`libqpdf/QPDF_encryption.cc:982-1006`) and in
+    /// `QPDF::decryptStream` over a `method` local that defaults to
+    /// `cf_stream` (`:1062-1134`). qpdf does not factor the two together.
+    ///
+    /// `method` is what qpdf switches on; `cf` is the field its unknown-filter
+    /// arm rewrites. They differ only for a stream whose own `/Crypt` filter
+    /// named the method — qpdf still resets `cf_stream` there (`:1131`).
+    fn select_method(
+        method: EncryptionMode,
+        cf: &mut EncryptionMode,
+        encryption_v: i64,
+    ) -> MethodChoice {
+        if encryption_v < 4 {
+            // qpdf initialises `use_aes = false` and enters the switch only
+            // when `/V >= 4` (`:982-983`, `:1062-1063`), so everything older
+            // is RC4 regardless of what the crypt filter fields hold.
+            return (Some(false), false);
+        }
+        match method {
+            EncryptionMode::Identity => (None, false),
+            EncryptionMode::Aes128 | EncryptionMode::Aes256 => (Some(true), false),
+            EncryptionMode::Rc4 => (Some(false), false),
+            EncryptionMode::Unknown => {
+                // qpdf warns once and then rewrites the filter to `e_aes`
+                // specifically so the warning is not repeated for every
+                // remaining object (`:1002-1004`, `:1130-1132`). The rewrite
+                // is observable, so it is part of the port, not an
+                // optimisation.
+                *cf = EncryptionMode::Aes128;
+                (Some(true), true)
+            }
+        }
+    }
+
+    /// qpdf `QPDF::decryptString`'s method selection (`:982-1006`).
+    fn string_method(&mut self) -> MethodChoice {
+        let (method, encryption_v) = (self.cf_string, self.encryption_v);
+        Self::select_method(method, &mut self.cf_string, encryption_v)
+    }
+
+    /// qpdf `QPDF::decryptStream`'s method selection (`:1062-1134`), minus the
+    /// `/Type` and `/Crypt` inspection that chooses `method` ahead of it.
+    ///
+    /// `method` is `None` for a stream that declared no `/Crypt` filter, which
+    /// is qpdf falling back to `cf_stream` at `:1101`.
+    fn stream_method(&mut self, method: Option<EncryptionMode>) -> MethodChoice {
+        let (method, encryption_v) = (method.unwrap_or(self.cf_stream), self.encryption_v);
+        Self::select_method(method, &mut self.cf_stream, encryption_v)
+    }
+
+    /// qpdf `QPDF::compute_data_key` (`libqpdf/QPDF_encryption.cc:325-357`),
+    /// Algorithm 3.1 from the PDF 1.7 Reference Manual.
+    ///
+    /// Not the same function as `security::standard::per_object_key`, which
+    /// truncates to `min(file_key.len() + 5, 16)` and so drops the four salt
+    /// bytes from the length qpdf takes the minimum against. The two agree for
+    /// every `/V` and `/R` pair the standard handler actually admits, because
+    /// AES requires a 128-bit key and `min(21, 16) == min(25, 16)`.
+    fn compute_data_key(&self, og: ObjectRef, use_aes: bool) -> Vec<u8> {
+        let mut result = self.file_key.clone();
+        if self.encryption_v >= 5 {
+            // Algorithm 3.1a (PDF 1.7 extension level 3): the encryption key
+            // is used straight, so an object's key does not depend on its
+            // object or generation number at all.
+            return result;
+        }
+
+        // Low three bytes of the object ID and low two of the generation.
+        let objid = og.number;
+        let generation = u32::from(og.generation);
+        result.push((objid & 0xff) as u8);
+        result.push(((objid >> 8) & 0xff) as u8);
+        result.push(((objid >> 16) & 0xff) as u8);
+        result.push((generation & 0xff) as u8);
+        result.push(((generation >> 8) & 0xff) as u8);
+        if use_aes {
+            result.extend_from_slice(b"sAlT");
+        }
+
+        let digest = crate::security::primitives::md5(&result);
+        digest[..result.len().min(16)].to_vec()
+    }
+
+    /// Build the cipher qpdf keys for one object's strings and hand it to
+    /// `apply`.
+    ///
+    /// qpdf's `if (use_aes) { Pl_AES_PDF } else { RC4 }`
+    /// (`libqpdf/QPDF_encryption.cc:1011-1033`). The AES variant is not a
+    /// separate decision: `Pl_AES_PDF` keys itself from the buffer it is
+    /// handed (`libqpdf/Pl_AES_PDF.cc:12-34`), and `compute_data_key` makes
+    /// that buffer 32 bytes exactly when `/V >= 5`.
+    fn with_object_cipher<T>(
+        &self,
+        og: ObjectRef,
+        use_aes: bool,
+        apply: impl FnOnce(StringCipher<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let key = self.compute_data_key(og, use_aes);
+        if !use_aes {
+            return apply(StringCipher::Rc4 { key: &key });
+        }
+        if let Ok(key) = <&[u8; 32]>::try_from(key.as_slice()) {
+            return apply(StringCipher::Aes256 { key });
+        }
+        let key = aes128_object_key(&key)?;
+        apply(StringCipher::Aes128 { key: &key })
+    }
+
+    /// qpdf `QPDF::getKeyForObject` (`libqpdf/QPDF_encryption.cc:955-974`).
+    ///
+    /// The cache key is the object/generation pair **alone**: qpdf leaves
+    /// `use_aes` out of it (`:962`). A document whose `/StrF` and `/StmF`
+    /// disagree about AES therefore serves whichever key the first caller for
+    /// that object derived, because `compute_data_key` appends `"sAlT"` only
+    /// for AES. Reproducing that is the point of this method existing.
+    ///
+    /// qpdf's `!encrypted` `std::logic_error` guard (`:958-960`) has no
+    /// counterpart: an `EncryptionState` only exists for an encrypted
+    /// document.
+    //
+    // Not yet wired to a production caller. `QPDF::decryptStream`'s port
+    // (the pipe-time decryption stage) is what will call it; until then the
+    // legacy resolve-time route keeps deriving keys per call through
+    // `security::standard::per_object_key`.
+    #[allow(dead_code)]
+    fn key_for_object(&mut self, og: ObjectRef, use_aes: bool) -> &[u8] {
+        if self.cached_key_og != Some(og) {
+            let key = self.compute_data_key(og, use_aes);
+            self.cached_object_encryption_key = key;
+            self.cached_key_og = Some(og);
+        }
+        &self.cached_object_encryption_key
+    }
 }
 
 /// Standard security handler permission bits from an encrypted document's `/P` entry.
@@ -270,19 +439,36 @@ impl Permissions {
     }
 }
 
+/// qpdf `QPDF::encryption_method_e` (`include/qpdf/QPDF.hh:436`).
+///
+/// This names a *crypt filter method*, not a cipher. qpdf never picks the
+/// cipher from the method: it hands `Pl_AES_PDF` whatever `compute_data_key`
+/// returned and that pipeline keys itself from the buffer length
+/// (`libqpdf/Pl_AES_PDF.cc:12-34`), while `compute_data_key` returns the
+/// 32-byte file key unchanged once `/V >= 5`
+/// (`libqpdf/QPDF_encryption.cc:337-340`). So an `/AESV2` crypt filter on a
+/// `/V 5` document decrypts with AES-256, and an `/AESV3` one on a `/V 4`
+/// document decrypts with AES-128. Use
+/// [`EncryptionState::cipher_mode_for`] to go from a method to a cipher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncryptionMode {
     Rc4,
     Aes128,
     Identity,
     Aes256,
+    /// qpdf `e_unknown`: a `/CFM` qpdf does not recognise, or a crypt filter
+    /// name with no `/CF` entry. qpdf deliberately keeps this rather than
+    /// failing, so that a document whose unused crypt filter is unreadable
+    /// still opens (`libqpdf/QPDF_encryption.cc:877-880`).
+    Unknown,
 }
 
 impl EncryptionMode {
     /// qpdf's `show_encryption_method()` spelling for this method.
     ///
-    /// Source: qpdf `libqpdf/QPDFJob.cc` `show_encryption_method()` —
-    /// `e_rc4`→"RC4", `e_aes`→"AESv2", `e_aesv3`→"AESv3", `e_none`→"none".
+    /// Source: qpdf `libqpdf/QPDFJob.cc:674-697` `show_encryption_method()` —
+    /// `e_rc4`→"RC4", `e_aes`→"AESv2", `e_aesv3`→"AESv3", `e_none`→"none",
+    /// `e_unknown`→"unknown".
     /// flpdf's `Identity` (no-op crypt filter) maps to qpdf's `e_none`/"none".
     fn qpdf_name(self) -> &'static str {
         match self {
@@ -290,6 +476,7 @@ impl EncryptionMode {
             EncryptionMode::Aes128 => "AESv2",
             EncryptionMode::Aes256 => "AESv3",
             EncryptionMode::Identity => "none",
+            EncryptionMode::Unknown => "unknown",
         }
     }
 }
@@ -318,9 +505,12 @@ pub struct EncryptionInfo {
     pub stream_method: &'static str,
     /// qpdf-style method name for the string crypt filter (`StrF`).
     pub string_method: &'static str,
-    /// qpdf-style method name for the embedded-file crypt filter (`EFF`),
-    /// when the document declares one.
-    pub eff_method: Option<&'static str>,
+    /// qpdf-style method name for the embedded-file crypt filter (`EFF`).
+    ///
+    /// A document that declares no `/EFF`, or whose `/EFF` is not a name,
+    /// reports the stream method: `/EFF` is informational, and qpdf mirrors
+    /// `cf_stream` into `cf_file` in that case.
+    pub eff_method: &'static str,
     /// Named crypt filters from `/CF` mapped to their qpdf-style method
     /// names, e.g. `StdCF` → `AESv2`.
     pub named_crypt_filters: Vec<(String, &'static str)>,
@@ -576,19 +766,18 @@ impl<R: Read + Seek> Pdf<R> {
     /// Read-only snapshot of the `/Encrypt` parameters for the
     /// `show-encryption` inspection subcommand.
     ///
-    /// Returns `None` for plaintext PDFs. Re-reads the `/Encrypt` dictionary
-    /// (for V/R/Length/Filter/CF, which the authenticated `EncryptionState`
-    /// does not retain verbatim) and combines it with the already-resolved
-    /// crypt-filter methods. This does NOT re-run or alter authentication
-    /// (layer-2 owns that ordering); it only reflects state from a document
-    /// already opened successfully.
+    /// Returns `None` for plaintext PDFs. Version, revision and the
+    /// crypt-filter methods come from the authenticated `EncryptionState`;
+    /// only `/Length` and `/Filter`, which it does not retain, are re-read
+    /// from the `/Encrypt` dictionary. This does NOT re-run or alter
+    /// authentication (layer-2 owns that ordering); it only reflects state
+    /// from a document already opened successfully.
     ///
     /// # Errors
     ///
     /// - [`Error::Encrypted`] ([`EncryptedError::Malformed`]) when the re-read
-    ///   `/Encrypt` dictionary is missing or has the wrong type for `/V`, `/R`,
-    ///   `/Filter`, or the `/EFF` crypt-filter selector. Returns `Ok(None)` for a
-    ///   plaintext document rather than an error.
+    ///   `/Encrypt` dictionary is missing or has the wrong type for `/Filter`.
+    ///   Returns `Ok(None)` for a plaintext document rather than an error.
     /// - [`Error::Io`] / [`Error::Parse`] when the `/Encrypt` entry is an indirect
     ///   reference whose resolution fails.
     pub fn encryption_info(&mut self) -> Result<Option<EncryptionInfo>> {
@@ -598,8 +787,16 @@ impl<R: Read + Seek> Pdf<R> {
         let Some(encrypt) = self.encrypt_dictionary()? else {
             return Ok(None);
         };
-        let v = required_integer(&encrypt, "V")?;
-        let r = required_integer(&encrypt, "R")?;
+        // qpdf: "After we initialize encryption parameters, we must use stored
+        // key information and never look at /Encrypt again"
+        // (`libqpdf/QPDF_encryption.cc:727-729`).
+        let (v, r) = {
+            let guard = self.encryption.borrow();
+            let encryption = guard
+                .as_ref()
+                .expect("checked is_some above; authenticate_if_encrypted set it");
+            (encryption.encryption_v, encryption.encryption_r)
+        };
         let filter = required_name(&encrypt, "Filter")?.to_string();
         // /Length is in bits and absent for V<5 (defaulting to 40 per the
         // Standard handler); V=5 always uses a 256-bit key.
@@ -609,28 +806,19 @@ impl<R: Read + Seek> Pdf<R> {
             _ => 40,
         };
 
-        // EFF: optional crypt-filter selector for embedded files. Resolve it
-        // through the same named-CF map used for StmF/StrF.
-        let eff_selector = crypt_filter_selector(&encrypt, "EFF")?;
-
         let encryption_guard = self.encryption.borrow();
         let encryption = encryption_guard
             .as_ref()
             .expect("checked is_some above; authenticate_if_encrypted set it");
         let permissions = encryption.permissions;
         let encrypt_metadata = encryption.encrypt_metadata;
-        let stream_method = encryption.stream_mode.qpdf_name();
-        let string_method = encryption.string_mode.qpdf_name();
-        let eff_method = eff_selector.and_then(|selector| {
-            if selector == "Identity" {
-                Some(EncryptionMode::Identity.qpdf_name())
-            } else {
-                encryption
-                    .crypt_filters
-                    .get(selector.as_bytes())
-                    .map(|mode| mode.qpdf_name())
-            }
-        });
+        // qpdf reports the stored crypt filter methods rather than re-reading
+        // `/Encrypt`: "After we initialize encryption parameters, we must use
+        // stored key information and never look at /Encrypt again"
+        // (`libqpdf/QPDF_encryption.cc:727-729`).
+        let stream_method = encryption.cf_stream.qpdf_name();
+        let string_method = encryption.cf_string.qpdf_name();
+        let eff_method = encryption.cf_file.qpdf_name();
         let named_crypt_filters = encryption
             .crypt_filters
             .iter()
@@ -745,8 +933,47 @@ impl<R: Read + Seek> Pdf<R> {
         };
 
         let revision = required_revision(&encrypt)?;
+        // qpdf requires `/V` and `/R` together, before any password work
+        // (`libqpdf/QPDF_encryption.cc:770-777`), and stores both
+        // (`:797-798`).
+        let version = required_version(&encrypt)?;
         let permissions = Permissions::new(required_permissions(&encrypt)?);
-        let crypt_filters = crypt_filter_modes(&encrypt, revision)?;
+        let crypt_filters = crypt_filter_modes(&encrypt, version);
+        // qpdf `:886-904`. These do not depend on the password, so qpdf
+        // resolves them in `initializeEncryption` before authenticating; the
+        // three branches below only produce the key and the match flags.
+        let (cf_stream, cf_string, cf_file) = if matches!(version, 4 | 5) {
+            let cf_stream = interpret_cf(&crypt_filters, encrypt.get("StmF"));
+            let cf_string = interpret_cf(&crypt_filters, encrypt.get("StrF"));
+            // `/EFF` is informational in qpdf; when it is not a name the file
+            // method simply mirrors the stream method (`:891-904`).
+            let cf_file = match encrypt.get("EFF") {
+                Some(eff) if eff.as_name().is_some() => interpret_cf(&crypt_filters, Some(eff)),
+                _ => cf_stream,
+            };
+            (cf_stream, cf_string, cf_file)
+        } else {
+            // qpdf leaves all three at the `EncryptionParameters` constructor's
+            // `e_none` for every other `/V` (`libqpdf/QPDF.cc:190-192`); its
+            // consumers never read them without first checking `/V >= 4`.
+            (
+                EncryptionMode::Identity,
+                EncryptionMode::Identity,
+                EncryptionMode::Identity,
+            )
+        };
+        // The method a consumer actually applies. qpdf enters the crypt-filter
+        // switch only when `/V >= 4` and otherwise leaves `use_aes` false,
+        // i.e. RC4 (`:982-983`, `:1062-1063`), so the weak-crypto
+        // classification below has to ask the same question the decryption
+        // sites will.
+        let effective = |cf: EncryptionMode| {
+            if version >= 4 {
+                cf
+            } else {
+                EncryptionMode::Rc4
+            }
+        };
         // Under `--password-is-hex-key` the --password value is a raw hex key,
         // not a password, so password-encoding normalization (which can reject
         // e.g. `--password-mode=unicode` on V<5) must not run and is unused by
@@ -758,10 +985,18 @@ impl<R: Read + Seek> Pdf<R> {
         } else {
             normalize_password(&options.password, options.password_mode, revision)?
         };
+        // The RC4 classification the weak-crypto gate uses on every branch
+        // that is not R=5/R=6. Reads the effective methods, not the raw
+        // `cf_*`, so a pre-`/V 4` document stays classified as RC4.
+        let rc4_in_use = || {
+            matches!(effective(cf_stream), EncryptionMode::Rc4)
+                || matches!(effective(cf_string), EncryptionMode::Rc4)
+                || crypt_filters
+                    .values()
+                    .any(|mode| matches!(mode, EncryptionMode::Rc4))
+        };
         let (
             file_key,
-            stream_mode,
-            string_mode,
             encrypt_metadata,
             weak_crypto,
             user_password_matched,
@@ -775,34 +1010,20 @@ impl<R: Read + Seek> Pdf<R> {
             // sibling branch: the `else` below preserves layer-2's reordered
             // password/weak-crypto logic verbatim (flpdf-9hc.3.21).
             //
-            // revision / crypt_filters / encrypt_ref / permissions are already
-            // determined above and do NOT depend on the password. Modes and
-            // /EncryptMetadata are likewise password-independent; compute them
-            // with the SAME revision-aware split layer-2 uses (the V<5/V=4
-            // helper returns RC4/RC4 unconditionally for V≠4, so it must not
-            // be applied to a V=5 document).
+            // revision / crypt_filters / encrypt_ref / permissions and the
+            // crypt-filter methods are already determined above and do NOT
+            // depend on the password. /EncryptMetadata is likewise
+            // password-independent; compute it with the SAME revision-aware
+            // split layer-2 uses.
             let file_key = decode_hex_file_key(&options.password)?;
-            let (stream_mode, string_mode, encrypt_metadata, weak_crypto) =
-                if matches!(revision, 5 | 6) {
-                    let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
-                    let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
-                    // Same weak-crypto classification as layer-2's R5/R6 branch.
-                    (stream_mode, string_mode, encrypt_metadata, revision == 5)
-                } else {
-                    let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
-                    let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
-                    let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
-                        || matches!(string_mode, EncryptionMode::Rc4)
-                        || crypt_filters
-                            .values()
-                            .any(|mode| matches!(mode, EncryptionMode::Rc4));
-                    (
-                        stream_mode,
-                        string_mode,
-                        inputs.encrypt_metadata,
-                        weak_crypto,
-                    )
-                };
+            let (encrypt_metadata, weak_crypto) = if matches!(revision, 5 | 6) {
+                let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
+                // Same weak-crypto classification as layer-2's R5/R6 branch.
+                (encrypt_metadata, revision == 5)
+            } else {
+                let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
+                (inputs.encrypt_metadata, rc4_in_use())
+            };
             // Honor the weak-crypto gate consistently with the password path:
             // qpdf still requires --allow-weak-crypto for RC4 / R=5 even when a
             // raw key is supplied. Keep the existing post-key gate behavior;
@@ -813,15 +1034,7 @@ impl<R: Read + Seek> Pdf<R> {
             // A raw key bypasses authentication, so neither the user nor the
             // owner password was matched. qpdf likewise reports no password
             // match for `--password-is-hex-key`; report both as false.
-            (
-                file_key,
-                stream_mode,
-                string_mode,
-                encrypt_metadata,
-                weak_crypto,
-                false,
-                false,
-            )
+            (file_key, encrypt_metadata, weak_crypto, false, false)
         } else if matches!(revision, 5 | 6) {
             // Error-variant firing order (must match qpdf, see flpdf-9hc.3.21):
             //
@@ -845,7 +1058,6 @@ impl<R: Read + Seek> Pdf<R> {
             // either branch.
             let inputs =
                 standard_handler_r5_inputs(&encrypt).map_err(map_uo_length_to_bad_password)?;
-            let (stream_mode, string_mode) = standard_r5_or_r6_modes(&encrypt)?;
             let encrypt_metadata = encrypt_metadata_flag(&encrypt)?;
             let weak_crypto = revision == 5;
             let user_attempt = if revision == 5 {
@@ -871,8 +1083,6 @@ impl<R: Read + Seek> Pdf<R> {
             }
             (
                 file_key,
-                stream_mode,
-                string_mode,
                 encrypt_metadata,
                 weak_crypto,
                 user_password_matched,
@@ -880,13 +1090,8 @@ impl<R: Read + Seek> Pdf<R> {
             )
         } else {
             let inputs = standard_handler_inputs(&encrypt, self.trailer())?;
-            let (stream_mode, string_mode) = standard_v4_or_legacy_modes(&encrypt)?;
             let encrypt_metadata = inputs.encrypt_metadata;
-            let weak_crypto = matches!(stream_mode, EncryptionMode::Rc4)
-                || matches!(string_mode, EncryptionMode::Rc4)
-                || crypt_filters
-                    .values()
-                    .any(|mode| matches!(mode, EncryptionMode::Rc4));
+            let weak_crypto = rc4_in_use();
             // Same error-variant firing order as the R=5/R=6 branch above:
             // password authentication runs FIRST (both failing →
             // `BadPassword`); the weak-crypto gate (`WeakCryptoNotAllowed`)
@@ -919,8 +1124,6 @@ impl<R: Read + Seek> Pdf<R> {
             }
             (
                 file_key,
-                stream_mode,
-                string_mode,
                 encrypt_metadata,
                 weak_crypto,
                 user_password_matched,
@@ -934,8 +1137,11 @@ impl<R: Read + Seek> Pdf<R> {
         };
         *self.encryption.borrow_mut() = Some(EncryptionState {
             file_key,
-            stream_mode,
-            string_mode,
+            encryption_v: version,
+            encryption_r: revision,
+            cf_stream,
+            cf_string,
+            cf_file,
             crypt_filters,
             encrypt_metadata,
             encrypt_ref,
@@ -943,6 +1149,8 @@ impl<R: Read + Seek> Pdf<R> {
             permissions,
             user_password_matched,
             owner_password_matched,
+            cached_object_encryption_key: Vec::new(),
+            cached_key_og: None,
         });
         if let Some(warning) = r6_perms_warning {
             self.push_warning(warning);
@@ -2017,10 +2225,17 @@ impl<R: Read + Seek> Pdf<R> {
         // parsed offsets, and round-tripping through `materialize`/`lift` to
         // reach a legacy-engine decryption path would silently reset them.
         if native_parsed {
-            let encryption_guard = self.encryption.borrow();
-            if let Some(encryption) = encryption_guard.as_ref() {
-                decrypt_object_value_strings(object_ref, &mut value, encryption)?;
-            }
+            // `borrow_mut` for the same reason as `decrypt_resolved_object`:
+            // qpdf's unknown-filter arm rewrites `cf_string`.
+            let mut encryption_guard = self.encryption.borrow_mut();
+            let warn = match encryption_guard.as_mut() {
+                Some(encryption) => {
+                    decrypt_object_value_strings(object_ref, &mut value, encryption)?
+                }
+                None => false,
+            };
+            drop(encryption_guard);
+            self.warn_unknown_crypt_filters(warn, false);
         }
         handle.set_resolved(value);
         handle.set_parsed_offset_if_unset(parsed_offset);
@@ -2900,39 +3115,82 @@ impl<R: Read + Seek> Pdf<R> {
         mut object: Object,
         recovered_stream_eol: Option<&[u8]>,
     ) -> Result<(Object, bool)> {
-        let encryption_guard = self.encryption.borrow();
-        let Some(encryption) = encryption_guard.as_ref() else {
+        // `borrow_mut` because qpdf's crypt-filter switch rewrites `cf_string`
+        // and `cf_stream` on its unknown-filter arm. The guard is dropped
+        // before any warning is pushed, since that borrows the resolver.
+        let mut encryption_guard = self.encryption.borrow_mut();
+        let Some(encryption) = encryption_guard.as_mut() else {
             return Ok((object, false));
         };
         if Some(object_ref) == encryption.encrypt_ref {
             return Ok((object, false));
         }
 
-        decrypt_object_strings(
-            object_ref,
-            &mut object,
-            encryption.string_mode,
-            &encryption.file_key,
-            encryption.encrypt_ref,
-        )?;
+        // qpdf `QPDF::decryptString` (`libqpdf/QPDF_encryption.cc:977-1039`).
+        let (string_use_aes, warn_unknown_string) = encryption.string_method();
+        if let Some(use_aes) = string_use_aes {
+            decrypt_object_strings(object_ref, &mut object, use_aes, encryption)?;
+        }
+
         let mut stream_payload_transformed = false;
+        let mut warn_unknown_stream = false;
         if let Object::Stream(stream) = &mut object {
             if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
+                drop(encryption_guard);
+                self.warn_unknown_crypt_filters(warn_unknown_string, false);
                 return Ok((object, false));
             } else if stream_has_explicit_crypt_filter(&stream.dict) {
-                apply_explicit_crypt_filters(object_ref, stream, encryption, recovered_stream_eol)?;
+                warn_unknown_stream = apply_explicit_crypt_filters(
+                    object_ref,
+                    stream,
+                    encryption,
+                    recovered_stream_eol,
+                )?;
                 stream_payload_transformed = true;
             } else {
-                decrypt_stream_bytes(
-                    object_ref,
-                    &mut stream.data,
-                    encryption.stream_mode,
-                    &encryption.file_key,
-                )?;
-                stream_payload_transformed = encryption.stream_mode != EncryptionMode::Identity;
+                // qpdf `QPDF::decryptStream`'s method selection
+                // (`libqpdf/QPDF_encryption.cc:1062-1134`), for a stream that
+                // declared no `/Crypt` filter of its own.
+                //
+                // qpdf runs this at pipe time, against the pipeline it is
+                // about to prepend a stage to, not here at resolve time. This
+                // is the resolve-time route's copy of the same switch; the
+                // pipe-time home is `ResolverHandle::pipe_stream_data`, and
+                // this copy goes away with the rest of the resolve-time
+                // decryption when its consumers move over.
+                let (use_aes, warn) = encryption.stream_method(None);
+                warn_unknown_stream = warn;
+                if let Some(use_aes) = use_aes {
+                    decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
+                    stream_payload_transformed = true;
+                }
             }
         }
+        drop(encryption_guard);
+        self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream);
         Ok((object, stream_payload_transformed))
+    }
+
+    /// qpdf's unknown-crypt-filter warnings, in the order qpdf emits them for
+    /// one object: strings from `QPDF::decryptString`
+    /// (`libqpdf/QPDF_encryption.cc:1000-1001`) before streams from
+    /// `QPDF::decryptStream` (`:1123-1129`).
+    ///
+    /// Each fires at most once per document because the selection that
+    /// requests it also rewrites the crypt filter it complained about.
+    fn warn_unknown_crypt_filters(&self, strings: bool, streams: bool) {
+        if strings {
+            self.resolver.push_warning(
+                "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
+                 strings may be decrypted improperly",
+            );
+        }
+        if streams {
+            self.resolver.push_warning(
+                "unknown encryption filter for streams (check /StmF from /Encrypt dictionary); \
+                 streams may be decrypted improperly",
+            );
+        }
     }
 
     fn parse_object_stream_chain_entry(
@@ -3240,54 +3498,18 @@ fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Opti
     }
 }
 
+/// qpdf `QPDF::decryptString`'s decryption half (`:1009-1038`), applied to
+/// every string reachable from `object`.
 fn decrypt_object_strings(
     object_ref: ObjectRef,
     object: &mut Object,
-    mode: EncryptionMode,
-    file_key: &[u8],
-    encrypt_ref: Option<ObjectRef>,
+    use_aes: bool,
+    encryption: &EncryptionState,
 ) -> Result<()> {
-    match mode {
-        EncryptionMode::Rc4 => {
-            let key = per_object_key(
-                file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                ObjectKeyAlg::Rc4,
-            );
-            decrypt_strings_in_object(
-                object_ref,
-                object,
-                StringCipher::Rc4 { key: &key },
-                encrypt_ref,
-            )
-        }
-        EncryptionMode::Aes128 => {
-            let key = per_object_key(
-                file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                ObjectKeyAlg::Aes,
-            );
-            let key = aes128_object_key(&key)?;
-            decrypt_strings_in_object(
-                object_ref,
-                object,
-                StringCipher::Aes128 { key: &key },
-                encrypt_ref,
-            )
-        }
-        EncryptionMode::Identity => Ok(()),
-        EncryptionMode::Aes256 => {
-            let key = aes256_file_key(file_key)?;
-            decrypt_strings_in_object(
-                object_ref,
-                object,
-                StringCipher::Aes256 { key: &key },
-                encrypt_ref,
-            )
-        }
-    }
+    let encrypt_ref = encryption.encrypt_ref;
+    encryption.with_object_cipher(object_ref, use_aes, |cipher| {
+        decrypt_strings_in_object(object_ref, object, cipher, encrypt_ref)
+    })
 }
 
 // Mirrors `decrypt_object_strings`'s mode dispatch exactly (same key
@@ -3300,41 +3522,26 @@ fn decrypt_object_strings(
 // called on it without materializing and re-lifting -- which would silently
 // reset every nested child's already-recorded parsed offset, the exact
 // invariant `native_parse_uncompressed_value`'s own doc protects.
+//
+// Returns whether the caller must emit the unknown-crypt-filter warning for
+// strings, exactly as `decrypt_resolved_object`'s string half does; the crypt
+// filter selection is shared, so a document only ever warns once.
 fn decrypt_object_value_strings(
     object_ref: ObjectRef,
     value: &mut ObjectValue,
-    encryption: &EncryptionState,
-) -> Result<()> {
+    encryption: &mut EncryptionState,
+) -> Result<bool> {
     if Some(object_ref) == encryption.encrypt_ref {
-        return Ok(());
+        return Ok(false);
     }
-    let file_key = &encryption.file_key;
-    match encryption.string_mode {
-        EncryptionMode::Rc4 => {
-            let key = per_object_key(
-                file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                ObjectKeyAlg::Rc4,
-            );
-            decrypt_strings_in_object_value(value, StringCipher::Rc4 { key: &key })
-        }
-        EncryptionMode::Aes128 => {
-            let key = per_object_key(
-                file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                ObjectKeyAlg::Aes,
-            );
-            let key = aes128_object_key(&key)?;
-            decrypt_strings_in_object_value(value, StringCipher::Aes128 { key: &key })
-        }
-        EncryptionMode::Identity => Ok(()),
-        EncryptionMode::Aes256 => {
-            let key = aes256_file_key(file_key)?;
-            decrypt_strings_in_object_value(value, StringCipher::Aes256 { key: &key })
-        }
-    }
+    let (use_aes, warn) = encryption.string_method();
+    let Some(use_aes) = use_aes else {
+        return Ok(warn);
+    };
+    encryption.with_object_cipher(object_ref, use_aes, |cipher| {
+        decrypt_strings_in_object_value(value, cipher)
+    })?;
+    Ok(warn)
 }
 
 // The top-level value itself: a bare `ObjectValue::String` is mutated
@@ -3451,46 +3658,35 @@ fn decrypt_stream_dict_strings_in_place(
     Ok(())
 }
 
+/// qpdf `QPDF::decryptStream`'s decryption half (`:1136-1153`).
+///
+/// qpdf prepends `Pl_RC4` for streams where `decryptString` uses the bare
+/// `RC4` class (`:1024-1031` versus `:1146-1151`); this keeps that split.
 fn decrypt_stream_bytes(
     object_ref: ObjectRef,
     bytes: &mut Vec<u8>,
-    mode: EncryptionMode,
-    file_key: &[u8],
+    use_aes: bool,
+    encryption: &EncryptionState,
 ) -> Result<()> {
-    match mode {
-        EncryptionMode::Rc4 => {
-            let key = per_object_key(
-                file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                ObjectKeyAlg::Rc4,
-            );
-            PlRc4::transform_in_place("RC4 stream decryption", bytes, &key).map_err(Into::into)
-        }
-        EncryptionMode::Aes128 => {
-            let key = per_object_key(
-                file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                ObjectKeyAlg::Aes,
-            );
-            let key = aes128_object_key(&key)?;
-            decrypt_cipher_bytes(bytes, StringCipher::Aes128 { key: &key })
-        }
-        EncryptionMode::Identity => Ok(()),
-        EncryptionMode::Aes256 => {
-            let key = aes256_file_key(file_key)?;
-            decrypt_cipher_bytes(bytes, StringCipher::Aes256 { key: &key })
-        }
+    if !use_aes {
+        let key = encryption.compute_data_key(object_ref, false);
+        return PlRc4::transform_in_place("RC4 stream decryption", bytes, &key).map_err(Into::into);
     }
+    encryption.with_object_cipher(object_ref, true, |cipher| {
+        decrypt_cipher_bytes(bytes, cipher)
+    })
 }
 
+/// Returns whether the caller must emit the unknown-crypt-filter warning for
+/// streams: a `/Crypt` filter naming a method qpdf does not recognise still
+/// goes through `QPDF::decryptStream`'s switch, whose unknown arm warns and
+/// resets `cf_stream` (`libqpdf/QPDF_encryption.cc:1121-1133`).
 fn apply_explicit_crypt_filters(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
-    encryption: &EncryptionState,
+    encryption: &mut EncryptionState,
     recovered_stream_eol: Option<&[u8]>,
-) -> Result<()> {
+) -> Result<bool> {
     let filter = stream
         .dict
         .get("Filter")
@@ -3504,17 +3700,21 @@ fn apply_explicit_crypt_filters(
         stream.data.extend_from_slice(eol);
     }
 
+    let mut warn_unknown = false;
+
     if matches!(filter, Object::Name(ref name) if name.as_slice() == b"Crypt") {
-        let mode = explicit_crypt_mode(encryption, decode_params.as_ref())?;
-        if mode != EncryptionMode::Identity {
+        let mode = explicit_crypt_mode(encryption, decode_params.as_ref());
+        let (use_aes, warn) = encryption.stream_method(Some(mode));
+        warn_unknown |= warn;
+        if let Some(use_aes) = use_aes {
             if let Some(eol) = recovered_stream_eol {
                 stream.data.truncate(stream.data.len() - eol.len());
             }
-            decrypt_stream_bytes(object_ref, &mut stream.data, mode, &encryption.file_key)?;
+            decrypt_stream_bytes(object_ref, &mut stream.data, use_aes, encryption)?;
         }
         stream.dict.remove("Filter");
         stream.dict.remove("DecodeParms");
-        return Ok(());
+        return Ok(warn_unknown);
     }
 
     let mut filters = filter
@@ -3527,9 +3727,11 @@ fn apply_explicit_crypt_filters(
         .position(|filter| matches!(filter, Object::Name(name) if name.as_slice() == b"Crypt"))
     {
         let crypt_params = decode_params_at(decode_params.as_ref(), crypt_index).cloned();
-        let mode = explicit_crypt_mode(encryption, crypt_params.as_ref())?;
+        let mode = explicit_crypt_mode(encryption, crypt_params.as_ref());
+        let (use_aes, warn) = encryption.stream_method(Some(mode));
+        warn_unknown |= warn;
 
-        if mode != EncryptionMode::Identity {
+        if let Some(use_aes) = use_aes {
             let prefix_dict = filter_prefix_dict(&filters, decode_params.as_ref(), crypt_index);
             let mut encoded = stream.data.clone();
             if crypt_index == 0 {
@@ -3538,7 +3740,7 @@ fn apply_explicit_crypt_filters(
                 }
             }
             let mut decoded_prefix = crate::filters::decode_stream_data(&prefix_dict, &encoded)?;
-            decrypt_stream_bytes(object_ref, &mut decoded_prefix, mode, &encryption.file_key)?;
+            decrypt_stream_bytes(object_ref, &mut decoded_prefix, use_aes, encryption)?;
             stream.data = crate::filters::encode_stream_data(&prefix_dict, &decoded_prefix)?;
         }
 
@@ -3566,7 +3768,7 @@ fn apply_explicit_crypt_filters(
             }
         };
     }
-    Ok(())
+    Ok(warn_unknown)
 }
 
 fn decode_params_at(decode_params: Option<&Object>, index: usize) -> Option<&Object> {
@@ -3598,28 +3800,18 @@ fn filter_prefix_dict(
     prefix
 }
 
+/// The crypt filter a stream's own `/Crypt` `/DecodeParms` names, read the way
+/// qpdf reads it inside `QPDF::decryptStream` (`:1069-1073`, `:1083-1088`):
+/// through `interpretCF`, so an unrecognised name is `e_unknown` rather than
+/// an error.
 fn explicit_crypt_mode(
     encryption: &EncryptionState,
     decode_params: Option<&Object>,
-) -> Result<EncryptionMode> {
+) -> EncryptionMode {
     let Some(params) = decode_params.and_then(Object::as_dict) else {
-        return Ok(EncryptionMode::Identity);
+        return EncryptionMode::Identity;
     };
-    let name: &[u8] = match params.get("Name") {
-        None => return Ok(EncryptionMode::Identity),
-        Some(object) => object.as_name().ok_or_else(|| EncryptedError::Malformed {
-            reason: "/Crypt /DecodeParms /Name is not a name".into(),
-        })?,
-    };
-    if name == b"Identity" {
-        return Ok(EncryptionMode::Identity);
-    }
-    encryption.crypt_filters.get(name).copied().ok_or_else(|| {
-        EncryptedError::Malformed {
-            reason: format!("/CF entry '{}' not found", String::from_utf8_lossy(name)),
-        }
-        .into()
-    })
+    interpret_cf(&encryption.crypt_filters, params.get("Name"))
 }
 
 fn stream_has_explicit_crypt_filter(dict: &Dictionary) -> bool {
@@ -3637,15 +3829,6 @@ fn is_metadata_stream(dict: &Dictionary) -> bool {
     dict.get("Type")
         .and_then(Object::as_name)
         .is_some_and(|name| name == b"Metadata")
-}
-
-fn aes256_file_key(file_key: &[u8]) -> Result<[u8; 32]> {
-    file_key.try_into().map_err(|_| {
-        EncryptedError::Malformed {
-            reason: "AES-256 file key is not 32 bytes".into(),
-        }
-        .into()
-    })
 }
 
 fn aes128_object_key(key: &[u8]) -> Result<[u8; 16]> {
@@ -3920,142 +4103,71 @@ fn required_revision(encrypt: &Dictionary) -> Result<i64> {
     required_integer(encrypt, "R")
 }
 
-fn standard_v4_or_legacy_modes(encrypt: &Dictionary) -> Result<(EncryptionMode, EncryptionMode)> {
-    if required_integer(encrypt, "V").ok() != Some(4) {
-        return Ok((EncryptionMode::Rc4, EncryptionMode::Rc4));
+/// qpdf's `/V` requirement, checked alongside `/R` before any password work
+/// (`libqpdf/QPDF_encryption.cc:770-777`) and stored at `:797`.
+fn required_version(encrypt: &Dictionary) -> Result<i64> {
+    required_integer(encrypt, "V")
+}
+
+/// qpdf `QPDF::interpretCF` (`libqpdf/QPDF_encryption.cc:700-716`).
+///
+/// The branch order is load-bearing: the `/CF` lookup runs **before** the
+/// built-in `/Identity`, so a document that defines a crypt filter actually
+/// named `/Identity` shadows the built-in and gets that filter's method. A
+/// selector that is not a name at all is qpdf's "Default: /Identity" and
+/// yields `e_none`.
+fn interpret_cf(
+    crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
+    cf: Option<&Object>,
+) -> EncryptionMode {
+    let Some(filter) = cf.and_then(Object::as_name) else {
+        return EncryptionMode::Identity;
+    };
+    if let Some(mode) = crypt_filters.get(filter) {
+        return *mode;
     }
-    Ok((
-        v4_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StmF")?)?,
-        v4_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StrF")?)?,
-    ))
-}
-
-fn standard_r5_or_r6_modes(encrypt: &Dictionary) -> Result<(EncryptionMode, EncryptionMode)> {
-    Ok((
-        r5_or_r6_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StmF")?)?,
-        r5_or_r6_mode_for_selector(encrypt, crypt_filter_selector(encrypt, "StrF")?)?,
-    ))
-}
-
-fn v4_mode_for_selector(encrypt: &Dictionary, selector: Option<String>) -> Result<EncryptionMode> {
-    let Some(selector) = selector else {
-        return Ok(EncryptionMode::Identity);
-    };
-    if selector == "Identity" {
-        return Ok(EncryptionMode::Identity);
+    if filter == b"Identity" {
+        return EncryptionMode::Identity;
     }
-    let cfm = crypt_filter_method_for_name(encrypt, &selector)?.unwrap_or_else(|| "V2".into());
-    match cfm.as_str() {
-        "V2" => Ok(EncryptionMode::Rc4),
-        "AESV2" => Ok(EncryptionMode::Aes128),
-        "Identity" => Ok(EncryptionMode::Identity),
-        _ => unsupported_crypt_filter(encrypt, Some(cfm)),
-    }
+    EncryptionMode::Unknown
 }
 
-fn r5_or_r6_mode_for_selector(
-    encrypt: &Dictionary,
-    selector: Option<String>,
-) -> Result<EncryptionMode> {
-    let Some(selector) = selector else {
-        return Ok(EncryptionMode::Aes256);
-    };
-    if selector == "Identity" {
-        return Ok(EncryptionMode::Identity);
-    }
-    let cfm = crypt_filter_method_for_name(encrypt, &selector)?.unwrap_or_else(|| "AESV3".into());
-    match cfm.as_str() {
-        "AESV3" => Ok(EncryptionMode::Aes256),
-        "Identity" => Ok(EncryptionMode::Identity),
-        _ => unsupported_crypt_filter(encrypt, Some(cfm)),
-    }
-}
-
-fn crypt_filter_selector(encrypt: &Dictionary, key: &str) -> Result<Option<String>> {
-    let Some(value) = encrypt.get(key) else {
-        return Ok(None);
-    };
-    let name = value.as_name().ok_or_else(|| EncryptedError::Malformed {
-        reason: format!("/{key} entry is not a name"),
-    })?;
-    Ok(Some(String::from_utf8_lossy(name).into_owned()))
-}
-
-fn crypt_filter_method_for_name(encrypt: &Dictionary, name: &str) -> Result<Option<String>> {
-    let Some(cf) = encrypt.get("CF").and_then(Object::as_dict) else {
-        return Err(EncryptedError::Malformed {
-            reason: format!("/CF entry '{name}' not found"),
-        }
-        .into());
-    };
-    let Some(filter) = cf.get(name).and_then(Object::as_dict) else {
-        return Err(EncryptedError::Malformed {
-            reason: format!("/CF entry '{name}' not found"),
-        }
-        .into());
-    };
-    let Some(value) = filter.get("CFM") else {
-        return Ok(None);
-    };
-    let cfm = value.as_name().ok_or_else(|| EncryptedError::Malformed {
-        reason: format!("/CF/{name}/CFM entry is not a name"),
-    })?;
-    Ok(Some(String::from_utf8_lossy(cfm).into_owned()))
-}
-
-fn crypt_filter_modes(
-    encrypt: &Dictionary,
-    revision: i64,
-) -> Result<BTreeMap<Vec<u8>, EncryptionMode>> {
+/// qpdf's `/CF` loop inside `QPDF::initializeEncryption`
+/// (`libqpdf/QPDF_encryption.cc:860-884`).
+///
+/// Deliberately total: a `/CF` value that is not a dictionary is skipped, and
+/// a `/CFM` that is not a name leaves the entry at `e_none`. Neither is an
+/// error for qpdf, which defers judgement because the document may never
+/// reference that filter ("Don't complain now -- maybe we won't need to
+/// reference this type", `:878-879`). An unrecognised `/CFM` becomes
+/// `e_unknown` for the same reason.
+fn crypt_filter_modes(encrypt: &Dictionary, v: i64) -> BTreeMap<Vec<u8>, EncryptionMode> {
     let mut modes = BTreeMap::new();
+    // qpdf gates the whole block on `/V`, not `/R` (`:860`).
+    if !matches!(v, 4 | 5) {
+        return modes;
+    }
     let Some(cf) = encrypt.get("CF").and_then(Object::as_dict) else {
-        return Ok(modes);
+        return modes;
     };
     for (name, value) in cf.iter() {
         let Some(filter) = value.as_dict() else {
-            return Err(EncryptedError::Malformed {
-                reason: format!(
-                    "/CF entry '{}' is not a dictionary",
-                    String::from_utf8_lossy(name)
-                ),
-            }
-            .into());
+            continue;
         };
-        let cfm = match filter.get("CFM") {
-            None if revision >= 5 => "AESV3".to_string(),
-            None => "V2".to_string(),
-            Some(Object::Name(cfm)) => String::from_utf8_lossy(cfm).to_string(),
-            Some(_) => {
-                return Err(EncryptedError::Malformed {
-                    reason: format!(
-                        "/CF/{}/CFM entry is not a name",
-                        String::from_utf8_lossy(name)
-                    ),
-                }
-                .into())
-            }
-        };
-        let mode = match (revision, cfm.as_str()) {
-            (_, "Identity") => EncryptionMode::Identity,
-            (5 | 6, "AESV3") => EncryptionMode::Aes256,
-            (5 | 6, _) => unsupported_crypt_filter(encrypt, Some(cfm))?,
-            (_, "V2") => EncryptionMode::Rc4,
-            (_, "AESV2") => EncryptionMode::Aes128,
-            (_, _) => unsupported_crypt_filter(encrypt, Some(cfm))?,
-        };
+        // qpdf initialises to `e_none` and only enters the `/CFM` branch when
+        // the entry is a name, so a missing or non-name `/CFM` is `e_none`.
+        let mut mode = EncryptionMode::Identity;
+        if let Some(cfm) = filter.get("CFM").and_then(Object::as_name) {
+            mode = match cfm {
+                b"V2" => EncryptionMode::Rc4,
+                b"AESV2" => EncryptionMode::Aes128,
+                b"AESV3" => EncryptionMode::Aes256,
+                _ => EncryptionMode::Unknown,
+            };
+        }
         modes.insert(name.to_vec(), mode);
     }
-    Ok(modes)
-}
-
-fn unsupported_crypt_filter<T>(encrypt: &Dictionary, cfm: Option<String>) -> Result<T> {
-    Err(EncryptedError::UnsupportedHandler {
-        filter: required_name(encrypt, "Filter")?.to_string(),
-        v: required_integer(encrypt, "V")?,
-        r: required_integer(encrypt, "R")?,
-        cfm,
-    }
-    .into())
+    modes
 }
 
 fn required_integer(dict: &Dictionary, key: &'static str) -> Result<i64> {
@@ -4382,11 +4494,285 @@ mod tests {
         );
     }
 
+    /// An `/Encrypt` dictionary carrying `entries`, for the `/CF` and
+    /// `interpretCF` ports below.
+    fn encrypt_dict(entries: &[(&str, Object)]) -> Dictionary {
+        let mut dict = Dictionary::new();
+        for (key, value) in entries {
+            dict.insert(key, value.clone());
+        }
+        dict
+    }
+
+    fn cf_dict(entries: &[(&str, Object)]) -> Object {
+        Object::Dictionary(encrypt_dict(entries))
+    }
+
+    /// qpdf `QPDF_encryption.cc:866-880`: the recognised `/CFM` names.
+    #[test]
+    fn crypt_filter_modes_maps_the_three_recognised_cfm_names() {
+        let encrypt = encrypt_dict(&[(
+            "CF",
+            cf_dict(&[
+                ("Rc4CF", cf_dict(&[("CFM", Object::Name(b"V2".to_vec()))])),
+                (
+                    "AesCF",
+                    cf_dict(&[("CFM", Object::Name(b"AESV2".to_vec()))]),
+                ),
+                (
+                    "Aes3CF",
+                    cf_dict(&[("CFM", Object::Name(b"AESV3".to_vec()))]),
+                ),
+            ]),
+        )]);
+
+        let modes = crypt_filter_modes(&encrypt, 4);
+
+        assert_eq!(modes[b"Rc4CF".as_slice()], EncryptionMode::Rc4);
+        assert_eq!(modes[b"AesCF".as_slice()], EncryptionMode::Aes128);
+        assert_eq!(modes[b"Aes3CF".as_slice()], EncryptionMode::Aes256);
+    }
+
+    /// An unrecognised `/CFM` is `e_unknown`, not an error: qpdf defers because
+    /// the document may never reference the filter (`:877-880`). Observed with
+    /// `qpdf --password=u --show-encryption` on a `/V 4` file whose `/CFM` was
+    /// rewritten to `/AESVX`, which reports `unknown` and exits 0.
+    #[test]
+    fn crypt_filter_modes_keeps_an_unrecognised_cfm_as_unknown() {
+        let encrypt = encrypt_dict(&[(
+            "CF",
+            cf_dict(&[(
+                "StdCF",
+                cf_dict(&[("CFM", Object::Name(b"AESVX".to_vec()))]),
+            )]),
+        )]);
+
+        let modes = crypt_filter_modes(&encrypt, 4);
+
+        assert_eq!(modes[b"StdCF".as_slice()], EncryptionMode::Unknown);
+    }
+
+    /// A missing or non-name `/CFM` leaves qpdf's `e_none` initialiser in place
+    /// (`:865-866`). Observed: blanking `/CFM /AESV2`, and replacing it with
+    /// `/CFM 12345`, both make qpdf report `none` and decline to decrypt.
+    #[test]
+    fn crypt_filter_modes_treats_a_missing_or_non_name_cfm_as_none() {
+        let encrypt = encrypt_dict(&[(
+            "CF",
+            cf_dict(&[
+                ("NoCFM", cf_dict(&[("Length", Object::Integer(16))])),
+                ("BadCFM", cf_dict(&[("CFM", Object::Integer(12345))])),
+            ]),
+        )]);
+
+        let modes = crypt_filter_modes(&encrypt, 4);
+
+        assert_eq!(modes[b"NoCFM".as_slice()], EncryptionMode::Identity);
+        assert_eq!(modes[b"BadCFM".as_slice()], EncryptionMode::Identity);
+    }
+
+    /// A `/CF` value that is not a dictionary is skipped rather than rejected
+    /// (`:864`), so the name has no entry and later resolves to `e_unknown`.
+    /// Observed: replacing the `/StdCF` value with `null` makes qpdf report
+    /// `unknown` and exit 0.
+    #[test]
+    fn crypt_filter_modes_skips_a_non_dictionary_cf_entry() {
+        let encrypt = encrypt_dict(&[("CF", cf_dict(&[("StdCF", Object::Null)]))]);
+
+        let modes = crypt_filter_modes(&encrypt, 4);
+
+        assert!(modes.is_empty());
+        assert_eq!(
+            interpret_cf(&modes, Some(&Object::Name(b"StdCF".to_vec()))),
+            EncryptionMode::Unknown
+        );
+    }
+
+    /// The `/CF` block is gated on `/V`, not `/R` (`:860`).
+    #[test]
+    fn crypt_filter_modes_only_runs_for_v4_and_v5() {
+        let encrypt = encrypt_dict(&[(
+            "CF",
+            cf_dict(&[("StdCF", cf_dict(&[("CFM", Object::Name(b"V2".to_vec()))]))]),
+        )]);
+
+        for v in [4, 5] {
+            assert_eq!(crypt_filter_modes(&encrypt, v).len(), 1, "/V {v}");
+        }
+        for v in [0, 1, 2, 3, 6] {
+            assert!(crypt_filter_modes(&encrypt, v).is_empty(), "/V {v}");
+        }
+    }
+
+    /// qpdf `interpretCF` (`:700-716`). The `/CF` lookup runs before the
+    /// built-in `/Identity`, so a document that names a crypt filter
+    /// `/Identity` shadows the built-in. Observed: a `/V 4` file with
+    /// `/CF << /Identity << /CFM /AESV2 …>> >>` and `/StmF /Identity` makes
+    /// qpdf report `AESv2` for streams.
+    #[test]
+    fn interpret_cf_prefers_a_named_filter_over_the_builtin_identity() {
+        let modes = BTreeMap::from([(b"Identity".to_vec(), EncryptionMode::Aes128)]);
+
+        assert_eq!(
+            interpret_cf(&modes, Some(&Object::Name(b"Identity".to_vec()))),
+            EncryptionMode::Aes128
+        );
+        assert_eq!(
+            interpret_cf(&BTreeMap::new(), Some(&Object::Name(b"Identity".to_vec()))),
+            EncryptionMode::Identity
+        );
+    }
+
+    /// A selector with no `/CF` entry is `e_unknown` (`:710`); one that is not
+    /// a name at all is qpdf's "Default: /Identity" (`:712-714`).
+    #[test]
+    fn interpret_cf_separates_an_absent_entry_from_a_non_name_selector() {
+        let modes = BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Aes128)]);
+
+        assert_eq!(
+            interpret_cf(&modes, Some(&Object::Name(b"NoSuchCF".to_vec()))),
+            EncryptionMode::Unknown
+        );
+        assert_eq!(
+            interpret_cf(&modes, Some(&Object::Integer(7))),
+            EncryptionMode::Identity
+        );
+        assert_eq!(interpret_cf(&modes, None), EncryptionMode::Identity);
+    }
+
+    /// qpdf enters the crypt-filter switch only for `/V >= 4` (`:982-983`,
+    /// `:1062-1063`), leaving `use_aes` false — so a pre-`/V 4` document is
+    /// RC4 no matter what the crypt filter fields hold.
+    #[test]
+    fn select_method_is_rc4_below_v4_whatever_the_crypt_filter_says() {
+        for method in [
+            EncryptionMode::Identity,
+            EncryptionMode::Rc4,
+            EncryptionMode::Aes128,
+            EncryptionMode::Aes256,
+            EncryptionMode::Unknown,
+        ] {
+            let mut cf = method;
+            assert_eq!(
+                EncryptionState::select_method(method, &mut cf, 2),
+                (Some(false), false),
+                "{method:?}"
+            );
+            assert_eq!(cf, method, "the pre-/V 4 path must not rewrite the filter");
+        }
+    }
+
+    /// The `e_none` arm returns without decrypting; the two AES arms and the
+    /// RC4 arm map onto `use_aes` (`:1105-1120`).
+    #[test]
+    fn select_method_maps_each_known_filter_onto_use_aes() {
+        let cases = [
+            (EncryptionMode::Identity, None),
+            (EncryptionMode::Rc4, Some(false)),
+            (EncryptionMode::Aes128, Some(true)),
+            (EncryptionMode::Aes256, Some(true)),
+        ];
+        for (method, expected) in cases {
+            let mut cf = method;
+            assert_eq!(
+                EncryptionState::select_method(method, &mut cf, 4),
+                (expected, false),
+                "{method:?}"
+            );
+            assert_eq!(cf, method, "only the unknown arm rewrites the filter");
+        }
+    }
+
+    /// `compute_data_key`'s `/V >= 5` shortcut (`:337-340`): the file key is
+    /// used straight, so the object and generation numbers do not enter it.
+    #[test]
+    fn compute_data_key_uses_the_file_key_straight_from_v5() {
+        let encryption = EncryptionState {
+            file_key: (0..32).collect(),
+            encryption_v: 5,
+            encryption_r: 6,
+            ..explicit_rc4_encryption_state()
+        };
+
+        for use_aes in [false, true] {
+            assert_eq!(
+                encryption.compute_data_key(ObjectRef::new(9, 3), use_aes),
+                encryption.file_key
+            );
+        }
+        assert_eq!(
+            encryption.compute_data_key(ObjectRef::new(1, 0), true),
+            encryption.compute_data_key(ObjectRef::new(4242, 7), true)
+        );
+    }
+
+    /// Algorithm 3.1 below `/V 5` (`:342-356`): the low three bytes of the
+    /// object number, the low two of the generation, then `"sAlT"` for AES,
+    /// hashed and truncated to `min(len, 16)`.
+    #[test]
+    fn compute_data_key_follows_algorithm_3_1_below_v5() {
+        let encryption = EncryptionState {
+            file_key: (0..16).collect(),
+            encryption_v: 4,
+            encryption_r: 4,
+            ..explicit_rc4_encryption_state()
+        };
+        let og = ObjectRef::new(0x03_0201, 0x0605);
+
+        let expect = |use_aes: bool| {
+            let mut input: Vec<u8> = (0..16).collect();
+            input.extend_from_slice(&[0x01, 0x02, 0x03, 0x05, 0x06]);
+            if use_aes {
+                input.extend_from_slice(b"sAlT");
+            }
+            let digest = crate::security::primitives::md5(&input);
+            digest[..input.len().min(16)].to_vec()
+        };
+
+        assert_eq!(encryption.compute_data_key(og, false), expect(false));
+        assert_eq!(encryption.compute_data_key(og, true), expect(true));
+        assert_ne!(
+            encryption.compute_data_key(og, false),
+            encryption.compute_data_key(og, true),
+            "the AES salt must change the key"
+        );
+    }
+
+    /// qpdf caches the object key on the object/generation pair alone, leaving
+    /// `use_aes` out of the key (`:962`). A document whose `/StrF` and `/StmF`
+    /// disagree about AES therefore reuses whichever key was derived first.
+    #[test]
+    fn key_for_object_caches_on_the_object_alone_and_ignores_use_aes() {
+        let mut encryption = EncryptionState {
+            file_key: (0..16).collect(),
+            encryption_v: 4,
+            encryption_r: 4,
+            ..explicit_rc4_encryption_state()
+        };
+        let og = ObjectRef::new(3, 0);
+
+        let rc4_key = encryption.key_for_object(og, false).to_vec();
+        assert_eq!(rc4_key, encryption.compute_data_key(og, false));
+
+        // Same object, now asking for AES: qpdf returns the cached RC4-derived
+        // key rather than re-deriving with the salt.
+        assert_eq!(encryption.key_for_object(og, true), rc4_key);
+        assert_ne!(rc4_key, encryption.compute_data_key(og, true));
+
+        // A different object misses the cache and derives afresh.
+        let other = ObjectRef::new(4, 0);
+        let expected = encryption.compute_data_key(other, true);
+        assert_eq!(encryption.key_for_object(other, true), expected);
+    }
+
     fn explicit_rc4_encryption_state() -> EncryptionState {
         EncryptionState {
             file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
-            stream_mode: EncryptionMode::Identity,
-            string_mode: EncryptionMode::Identity,
+            encryption_v: 4,
+            encryption_r: 4,
+            cf_stream: EncryptionMode::Identity,
+            cf_string: EncryptionMode::Identity,
+            cf_file: EncryptionMode::Identity,
             crypt_filters: BTreeMap::from([(b"StdCF".to_vec(), EncryptionMode::Rc4)]),
             encrypt_metadata: true,
             encrypt_ref: None,
@@ -4394,6 +4780,8 @@ mod tests {
             permissions: Permissions::new(-4),
             user_password_matched: true,
             owner_password_matched: false,
+            cached_object_encryption_key: Vec::new(),
+            cached_key_og: None,
         }
     }
 
@@ -4403,32 +4791,26 @@ mod tests {
         encryption: &EncryptionState,
     ) -> Vec<u8> {
         let mut ciphertext = plaintext.to_vec();
-        decrypt_stream_bytes(
-            object_ref,
-            &mut ciphertext,
-            EncryptionMode::Rc4,
-            &encryption.file_key,
-        )
-        .expect("RC4 encryption");
+        decrypt_stream_bytes(object_ref, &mut ciphertext, false, encryption)
+            .expect("RC4 encryption");
         ciphertext
     }
 
     #[test]
     fn rc4_stream_decryption_preserves_payload_allocation() {
         let object_ref = ObjectRef::new(7, 0);
-        let file_key = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let encryption = explicit_rc4_encryption_state();
         let plaintext = vec![0x42; crate::pipeline::rc4::DEFAULT_OUT_BUFFER_SIZE + 17];
         let mut bytes = plaintext.clone();
         let original_ptr = bytes.as_ptr();
         let original_capacity = bytes.capacity();
 
-        decrypt_stream_bytes(object_ref, &mut bytes, EncryptionMode::Rc4, &file_key)
-            .expect("RC4 transform");
+        decrypt_stream_bytes(object_ref, &mut bytes, false, &encryption).expect("RC4 transform");
         assert_eq!(bytes.as_ptr(), original_ptr);
         assert_eq!(bytes.capacity(), original_capacity);
         assert_ne!(bytes, plaintext);
 
-        decrypt_stream_bytes(object_ref, &mut bytes, EncryptionMode::Rc4, &file_key)
+        decrypt_stream_bytes(object_ref, &mut bytes, false, &encryption)
             .expect("RC4 inverse transform");
         assert_eq!(bytes.as_ptr(), original_ptr);
         assert_eq!(bytes, plaintext);
@@ -4436,7 +4818,7 @@ mod tests {
 
     fn explicit_rc4_string_encryption_state() -> EncryptionState {
         EncryptionState {
-            string_mode: EncryptionMode::Rc4,
+            cf_string: EncryptionMode::Rc4,
             ..explicit_rc4_encryption_state()
         }
     }
@@ -4444,11 +4826,11 @@ mod tests {
     #[test]
     fn decrypt_object_value_strings_rc4_top_level_string() {
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let mut value =
             ObjectValue::String(rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption));
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("RC4 top-level string decryption");
 
         let ObjectValue::String(bytes) = &value else {
@@ -4465,7 +4847,7 @@ mod tests {
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
         let mut value = ObjectValue::String(ciphertext.clone());
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("the /Encrypt object's own strings are exempt, not an error");
 
         let ObjectValue::String(bytes) = &value else {
@@ -4482,11 +4864,11 @@ mod tests {
     #[test]
     fn decrypt_object_value_strings_decrypts_a_string_inside_a_direct_array() {
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
         let mut value = ObjectValue::Array(vec![ObjectHandle::string(ciphertext)]);
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("array-contained string decryption");
 
         let ObjectValue::Array(items) = &value else {
@@ -4501,13 +4883,13 @@ mod tests {
     #[test]
     fn decrypt_object_value_strings_decrypts_a_string_inside_a_nested_dictionary() {
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
         let inner =
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Nested".to_vec(), inner)]));
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("nested-dictionary string decryption");
 
         let ObjectValue::Dictionary(entries) = &value else {
@@ -4525,7 +4907,7 @@ mod tests {
     #[test]
     fn decrypt_object_value_strings_decrypts_a_string_inside_a_stream_dictionary() {
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
         let dict =
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
@@ -4534,7 +4916,7 @@ mod tests {
             stream_data: Rc::new(b"stream payload, untouched by string decryption".to_vec()),
         };
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("stream-dictionary string decryption");
 
         let ObjectValue::Stream {
@@ -4570,7 +4952,7 @@ mod tests {
         // test documents: a nested `Object::Stream` passed to
         // `Pdf::set_object` inside an array or dictionary.
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
         let stream_dict =
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
@@ -4580,7 +4962,7 @@ mod tests {
         });
         let mut value = ObjectValue::Array(vec![stream_child]);
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("directly nested stream string decryption");
 
         let ObjectValue::Array(items) = &value else {
@@ -4601,10 +4983,10 @@ mod tests {
     #[test]
     fn decrypt_object_value_strings_leaves_a_top_level_scalar_untouched() {
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let mut value = ObjectValue::Integer(42);
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("a bare scalar object has no string to decrypt");
 
         assert!(matches!(value, ObjectValue::Integer(42)));
@@ -4618,12 +5000,12 @@ mod tests {
         // child to a string that would decrypt to something else entirely
         // under the parent's key, then asserting it is untouched.
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(4, 0), 0);
         child.set_resolved(ObjectValue::String(b"unrelated ciphertext".to_vec()));
         let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Ref".to_vec(), child.clone())]));
 
-        decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("indirect children are skipped, not an error");
 
         assert_eq!(
@@ -4636,14 +5018,14 @@ mod tests {
     #[test]
     fn decrypt_handle_strings_in_place_rejects_excess_direct_nesting() {
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let mut handle = ObjectHandle::string(b"leaf".to_vec());
         for _ in 0..=crate::object::MAX_INLINE_DEPTH {
             handle = ObjectHandle::array(vec![handle]);
         }
         let mut value = ObjectValue::Array(vec![handle]);
 
-        let err = decrypt_object_value_strings(object_ref, &mut value, &encryption)
+        let err = decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect_err("excess direct nesting must error, not overflow the stack");
         assert!(
             matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
@@ -4666,7 +5048,7 @@ mod tests {
         // matches decrypt_strings_in_value's own depth+1-at-entries
         // accounting) versus MAX_INLINE_DEPTH+1 (rejected, one level over).
         let object_ref = ObjectRef::new(3, 0);
-        let encryption = explicit_rc4_string_encryption_state();
+        let mut encryption = explicit_rc4_string_encryption_state();
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
 
         let nest = |extra_levels: usize| {
@@ -4684,7 +5066,7 @@ mod tests {
             )]),
             stream_data: Rc::new(Vec::new()),
         };
-        decrypt_object_value_strings(object_ref, &mut accepted, &encryption).expect(
+        decrypt_object_value_strings(object_ref, &mut accepted, &mut encryption).expect(
             "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
              the legacy decryptor's own boundary, must be accepted",
         );
@@ -4696,7 +5078,7 @@ mod tests {
             )]),
             stream_data: Rc::new(Vec::new()),
         };
-        let err = decrypt_object_value_strings(object_ref, &mut rejected, &encryption)
+        let err = decrypt_object_value_strings(object_ref, &mut rejected, &mut encryption)
             .expect_err("one level past the legacy decryptor's own boundary must still error");
         assert!(
             matches!(err, Error::Unsupported(ref m) if m.contains("inline object nesting exceeds maximum")),
@@ -4731,14 +5113,14 @@ mod tests {
 
     #[test]
     fn explicit_crypt_rejects_overlong_identity_chain_before_mutation() {
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let mut stream = explicit_identity_crypt_chain(17);
         let original = stream.clone();
 
         let err = apply_explicit_crypt_filters(
             ObjectRef::new(4, 0),
             &mut stream,
-            &encryption,
+            &mut encryption,
             Some(b"\n"),
         )
         .expect_err("17 explicit Crypt filters must exceed the shared decode cap");
@@ -4759,10 +5141,10 @@ mod tests {
 
     #[test]
     fn explicit_crypt_accepts_max_length_identity_chain() {
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let mut stream = explicit_identity_crypt_chain(16);
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
             .expect("16 explicit Crypt filters are within the shared decode cap");
 
         assert_eq!(stream.data, b"identity");
@@ -4770,9 +5152,13 @@ mod tests {
         assert_eq!(stream.dict.get("DecodeParms"), None);
     }
 
+    /// A `/Crypt` `/DecodeParms` whose `/Name` is not a name is qpdf's
+    /// "Default: /Identity" in `interpretCF` (`libqpdf/QPDF_encryption.cc:712-714`):
+    /// `e_none`, so the payload is left alone. It used to be an flpdf-only
+    /// `Malformed` error, which would refuse to open documents qpdf reads.
     #[test]
-    fn explicit_crypt_within_limit_still_rejects_malformed_name_param() {
-        let encryption = explicit_rc4_encryption_state();
+    fn explicit_crypt_with_a_non_name_param_leaves_the_payload_alone() {
+        let mut encryption = explicit_rc4_encryption_state();
         let mut malformed = Dictionary::new();
         malformed.insert("Name", Object::Integer(1));
         let mut dict = Dictionary::new();
@@ -4786,31 +5172,77 @@ mod tests {
         );
         let mut stream = Stream::new(dict, b"ciphertext".to_vec());
 
-        let err =
-            apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
-                .expect_err("malformed /Crypt /Name remains an error");
+        let warn =
+            apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
+                .expect("a non-name /Crypt /Name is qpdf's Identity default, not an error");
 
-        assert!(
-            matches!(
-                err,
-                Error::Encrypted(EncryptedError::Malformed { ref reason })
-                    if reason == "/Crypt /DecodeParms /Name is not a name"
-            ),
-            "got {err:?}"
+        assert!(!warn, "e_none does not warn; only e_unknown does");
+        assert_eq!(stream.data, b"ciphertext");
+        assert_eq!(stream.dict.get("Filter"), None);
+        assert_eq!(stream.dict.get("DecodeParms"), None);
+    }
+
+    /// The `/Crypt` counterpart of the same lookup: a `/Name` with no `/CF`
+    /// entry is `e_unknown` (`:710`), which reaches `decryptStream`'s
+    /// `default:` arm — warn, rewrite `cf_stream` to `e_aes`, decrypt anyway
+    /// (`:1121-1133`).
+    #[test]
+    fn explicit_crypt_with_an_unknown_filter_name_warns_and_rewrites_cf_stream() {
+        let mut encryption = EncryptionState {
+            // `/V 4` always carries a 128-bit key, which is what the rewritten
+            // `e_aes` arm needs to derive a 16-byte object key from.
+            file_key: (0..16).collect(),
+            ..explicit_rc4_encryption_state()
+        };
+        let mut params = Dictionary::new();
+        params.insert("Name", Object::Name(b"NoSuchCF".to_vec()));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(params));
+        // Real AES-128 ciphertext under the object key the rewritten `e_aes`
+        // arm derives, so the assertion covers the decryption too, not just
+        // the selection.
+        let object_ref = ObjectRef::new(4, 0);
+        let object_key = aes128_object_key(&encryption.compute_data_key(object_ref, true))
+            .expect("V=4 AES object key");
+        let mut payload = b"crypt filter payload".to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut payload,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &object_key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext");
+        let mut stream = Stream::new(dict, payload);
+
+        let warn = apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, None)
+            .expect("unknown crypt filters decrypt as AES rather than failing");
+
+        assert!(warn, "an unknown crypt filter must ask the caller to warn");
+        assert_eq!(
+            encryption.cf_stream,
+            EncryptionMode::Aes128,
+            "qpdf resets cf_stream so the warning is not repeated"
         );
+        assert_eq!(stream.data, b"crypt filter payload");
+
+        // The rewrite is what suppresses the second warning: the same state
+        // now takes the `e_aes` arm silently.
+        let (use_aes, warn_again) = encryption.stream_method(None);
+        assert_eq!(use_aes, Some(true));
+        assert!(!warn_again, "cf_stream was reset, so qpdf warns only once");
     }
 
     #[test]
     fn explicit_named_crypt_removes_recovered_framing_before_rc4() {
         let object_ref = ObjectRef::new(4, 0);
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let plaintext = b"named explicit crypt";
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"Crypt".to_vec()));
         dict.insert("DecodeParms", crypt_params(b"StdCF"));
         let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, plaintext, &encryption));
 
-        apply_explicit_crypt_filters(object_ref, &mut stream, &encryption, Some(b"\n"))
+        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, Some(b"\n"))
             .expect("remove named Crypt");
 
         assert_eq!(stream.data, plaintext);
@@ -4821,7 +5253,7 @@ mod tests {
     #[test]
     fn explicit_crypt_first_removes_recovered_framing_before_rc4() {
         let object_ref = ObjectRef::new(4, 0);
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let plaintext = b"array explicit crypt";
         let compressed = flate_encoded(plaintext);
         let mut dict = Dictionary::new();
@@ -4838,7 +5270,7 @@ mod tests {
         );
         let mut stream = Stream::new(dict, rc4_ciphertext(object_ref, &compressed, &encryption));
 
-        apply_explicit_crypt_filters(object_ref, &mut stream, &encryption, Some(b"\n"))
+        apply_explicit_crypt_filters(object_ref, &mut stream, &mut encryption, Some(b"\n"))
             .expect("remove first Crypt");
 
         assert_eq!(
@@ -4858,7 +5290,7 @@ mod tests {
 
     #[test]
     fn singleton_explicit_crypt_array_removes_filter_entries() {
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let mut dict = Dictionary::new();
         dict.insert(
             "Filter",
@@ -4870,7 +5302,7 @@ mod tests {
         );
         let mut stream = Stream::new(dict, b"identity".to_vec());
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
             .expect("remove singleton Crypt");
 
         assert_eq!(stream.data, b"identity");
@@ -4880,7 +5312,7 @@ mod tests {
 
     #[test]
     fn explicit_crypt_array_without_decode_params_keeps_remaining_filter() {
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let plaintext = b"no decode params";
         let mut dict = Dictionary::new();
         dict.insert(
@@ -4892,7 +5324,7 @@ mod tests {
         );
         let mut stream = Stream::new(dict, flate_encoded(plaintext));
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
             .expect("remove Crypt without DecodeParms");
 
         assert_eq!(
@@ -4905,7 +5337,7 @@ mod tests {
 
     #[test]
     fn explicit_crypt_preserves_short_decode_params_array() {
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let plaintext = b"short decode params";
         let mut dict = Dictionary::new();
         dict.insert(
@@ -4918,7 +5350,7 @@ mod tests {
         dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
         let mut stream = Stream::new(dict, flate_encoded(plaintext));
 
-        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &encryption, None)
+        apply_explicit_crypt_filters(ObjectRef::new(4, 0), &mut stream, &mut encryption, None)
             .expect("remove Crypt with short DecodeParms");
 
         assert_eq!(
@@ -7777,7 +8209,9 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open recovered-stream fixture");
         let object_ref = ObjectRef::new(1, 0);
         *pdf.encryption.borrow_mut() = Some(EncryptionState {
-            stream_mode: EncryptionMode::Rc4,
+            encryption_v: 2,
+            encryption_r: 3,
+            cf_stream: EncryptionMode::Identity,
             ..explicit_rc4_encryption_state()
         });
 
