@@ -541,12 +541,30 @@ fn renumber_object_with_removed<R: Read + Seek>(
 
 /// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
 /// `N G obj` header (i.e. the start of the object).
-fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> usize {
+///
+/// When `encrypt_ctx` is `Some` and `new_ref` is not the `/Encrypt` dict's own
+/// ref, every string in `object`'s graph is encrypted in place first (mirrors
+/// `crate::writer`'s per-object emission loop, which calls
+/// `encrypt_strings_in_object_for_writer` before serializing). The `new_ref ==
+/// ctx.encrypt_ref` self-skip is what keeps the `/Encrypt` dict itself
+/// plaintext (PDF 1.7 §7.6.1) when this same function is reused for its
+/// emission.
+fn append_object(
+    bytes: &mut Vec<u8>,
+    new_ref: ObjectRef,
+    mut object: Object,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+) -> Result<usize> {
+    if let Some(ctx) = encrypt_ctx {
+        if new_ref != ctx.encrypt_ref {
+            crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut object, ctx)?;
+        }
+    }
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     object.write_pdf(bytes);
     bytes.extend_from_slice(b"\nendobj\n");
-    offset
+    Ok(offset)
 }
 
 /// Append a renumbered body object, routing `Object::Stream` payloads through
@@ -573,30 +591,67 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
 /// and the `newline_before_endstream` policy is honoured so the framing matches
 /// the option the caller passed.
 ///
-/// Non-stream objects are delegated to [`append_object`] unchanged.
+/// Non-stream objects are delegated to [`append_object`] unchanged (which
+/// applies string encryption itself).
+///
+/// When `encrypt_ctx` is `Some` and `new_ref` is not the `/Encrypt` dict's own
+/// ref, a stream object's dictionary strings are encrypted BEFORE re-encoding
+/// and its payload is encrypted AFTER re-encoding — mirroring
+/// `crate::writer`'s per-object emission loop, which calls
+/// `encrypt_strings_in_object_for_writer` on the whole resolved object first,
+/// then `encrypt_stream_payload_for_writer` on the stream's payload once
+/// `reencode_stream_for_compress` has produced the final on-disk bytes (so
+/// `/Length` is set from the ciphertext, not the plaintext, byte count).
 fn append_body_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
-    object: &Object,
+    object: Object,
     options: &WriteOptions,
     recovered_stream_eol: Option<&[u8]>,
-) -> usize {
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+) -> Result<usize> {
     let Object::Stream(stream) = object else {
-        return append_object(bytes, new_ref, object);
+        return append_object(bytes, new_ref, object, encrypt_ctx);
     };
+
+    // Encrypt any strings inside the stream's dictionary before re-encoding —
+    // same ordering as crate::writer's loop (string encryption runs on the
+    // whole resolved object before the compress-policy reencode).
+    let mut wrapped = Object::Stream(stream);
+    if let Some(ctx) = encrypt_ctx {
+        if new_ref != ctx.encrypt_ref {
+            crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut wrapped, ctx)?;
+        }
+    }
+    // cov:ignore-start: unreachable — `wrapped` was just constructed as
+    // Object::Stream above, and encrypt_strings_in_object_for_writer never
+    // changes an object's variant.
+    let Object::Stream(stream) = wrapped else {
+        unreachable!("wrapped is always Object::Stream")
+    };
+    // cov:ignore-end
 
     let policy = effective_stream_policy(options);
     let (reencoded, source_filter_is_lone_flate) =
-        reencode_stream_for_compress(stream.clone(), options, true, recovered_stream_eol);
+        reencode_stream_for_compress(stream, options, true, recovered_stream_eol);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.
     // cov:ignore-start: unreachable — apply_stream_compress_policy always
     // returns Object::Stream, so the else arm is dead.
-    let Object::Stream(ref s) = reencoded else {
+    let Object::Stream(mut s) = reencoded else {
         unreachable!("apply_stream_compress_policy always returns Object::Stream")
     };
     // cov:ignore-end
+
+    // Encrypt the stream payload AFTER re-encoding, so the encryption operates
+    // on the on-disk bytes; updates /Length to the encrypted byte count (AES
+    // adds a 16-byte IV prefix plus PKCS#7 padding).
+    if let Some(ctx) = encrypt_ctx {
+        if new_ref != ctx.encrypt_ref {
+            crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut s, ctx)?;
+        }
+    }
 
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
@@ -617,9 +672,9 @@ fn append_body_object(
     // route to `Never`); force `Never` so the framing matches qpdf.  The
     // primary hint stream keeps its newline via the separate
     // `append_hint_stream_object`, matching qpdf's hint-stream framing.
-    write_stream_to_buf_qpdf_order(bytes, s, NewlineBeforeEndstream::Never, refiltered);
+    write_stream_to_buf_qpdf_order(bytes, &s, NewlineBeforeEndstream::Never, refiltered);
     bytes.extend_from_slice(b"\nendobj\n");
-    offset
+    Ok(offset)
 }
 
 /// Byte width of a single classic cross-reference entry:
@@ -1554,6 +1609,17 @@ fn hint_stream_convergence_len(
 /// `\nendstream\nendobj\n`) is byte-identical to [`append_object`]. The newline
 /// before `endstream` is written only when the payload does not already end in
 /// one (qpdf, QPDFWriter.cc:2327).
+///
+/// The hint stream IS encrypted when `encrypt_ctx` is `Some` — unlike the
+/// `/Encrypt` dict and the xref table/stream, it carries no exemption in
+/// qpdf: `writeHintStream` calls `setDataKey(hint_id)` before writing the
+/// dict/payload (QPDFWriter.cc:2297), so the emitted `/Length` reflects the
+/// *encrypted* byte count. `new_ref` (the hint stream's own reserved object
+/// number) is always distinct from `ctx.encrypt_ref` — the `/Encrypt` dict's
+/// slot is reserved by inserting immediately before the (then-current) hint
+/// slot and shifting the latter by one (`RenumberMap::reserve_encrypt_dict_slot`)
+/// — so no self-skip check is needed here, unlike [`append_object`] and
+/// [`append_body_object`].
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
@@ -1561,7 +1627,22 @@ fn append_hint_stream_object(
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
     filtered: bool,
-) -> usize {
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+) -> Result<usize> {
+    // Encrypt the payload BEFORE computing the dict prefix, so `/Length`
+    // reflects the on-disk (encrypted) byte count — mirrors qpdf's
+    // `adjustAESStreamLength` call between `setDataKey` and writing `/Length`.
+    let encrypted_payload;
+    let payload: &[u8] = match encrypt_ctx {
+        Some(ctx) => {
+            let mut stream = crate::Stream::new(Dictionary::new(), payload.to_vec());
+            crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut stream, ctx)?;
+            encrypted_payload = stream.data;
+            &encrypted_payload
+        }
+        None => payload,
+    };
+
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     bytes.extend_from_slice(
@@ -1579,11 +1660,13 @@ fn append_hint_stream_object(
     // The hint payload is FlateDecode output, whose final byte is data-dependent;
     // when it happens to be `\n` (e.g. with an Outlines hint table present) the
     // unconditional newline would add a spurious byte and diverge from qpdf.
+    // The same holds for encrypted output: AES-CBC ciphertext bytes are
+    // effectively random, so the same data-dependent check applies unchanged.
     if payload.last() != Some(&b'\n') {
         bytes.extend_from_slice(b"\n");
     }
     bytes.extend_from_slice(b"endstream\nendobj\n");
-    offset
+    Ok(offset)
 }
 
 /// Loop-invariant inputs for the Outlines Hint Table (qpdf's `c_outline_data`).
@@ -1964,10 +2047,11 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             catalog_new_ref,
-            &renumbered,
+            renumbered,
             options,
             recovered_eol,
-        );
+            encrypt_ctx,
+        )?;
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
     }
@@ -1995,7 +2079,14 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2027,15 +2118,16 @@ fn do_write_pass<R: Read + Seek>(
     // every pass, so this is not gated on `pass1_digest`. The dict itself is
     // never encrypted (PDF 1.7 §7.6.1 — a reader must parse it before it can
     // derive the file key needed to decrypt anything else), so this reuses
-    // the same plain [`append_object`] every other unencrypted structural
-    // object in this function uses; no data key is ever applied to these
-    // bytes.
+    // the same [`append_object`] every other body object in this function
+    // uses; its `new_ref == ctx.encrypt_ref` self-skip is exactly what keeps
+    // no data key from ever being applied to these bytes.
     if let Some(ctx) = encrypt_ctx {
         let offset = append_object(
             &mut bytes,
             ctx.encrypt_ref,
-            &Object::Dictionary(ctx.encrypt_dict.clone()),
-        );
+            Object::Dictionary(ctx.encrypt_dict.clone()),
+            encrypt_ctx,
+        )?;
         xref_offsets.insert(ctx.encrypt_ref.number, offset);
     }
 
@@ -2057,7 +2149,8 @@ fn do_write_pass<R: Read + Seek>(
             hint_shared_section_offset,
             hint_outline_section_offset,
             structural_streams_filtered,
-        );
+            encrypt_ctx,
+        )?;
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
     }
@@ -2089,7 +2182,14 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2120,7 +2220,14 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2161,7 +2268,14 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2227,8 +2341,14 @@ fn do_write_pass<R: Read + Seek>(
                 let recovered_eol = pdf.recovered_stream_eol(*original_ref);
                 let renumbered =
                     renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-                let offset =
-                    append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+                let offset = append_body_object(
+                    &mut bytes,
+                    new_ref,
+                    renumbered,
+                    options,
+                    recovered_eol,
+                    encrypt_ctx,
+                )?;
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
@@ -6161,6 +6281,250 @@ mod tests {
         );
     }
 
+    /// Build a linearizable single-page PDF with a page content stream (raw
+    /// `content` bytes, no `/Filter`) and an `/Info` dictionary carrying a
+    /// `/Producer` string — the two distinct kinds of body data Task 8 must
+    /// encrypt: a stream payload and a dictionary string.
+    fn tiny_pdf_with_content_and_producer(content: &[u8], producer: &[u8]) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"5 0 obj\n<< /Producer (");
+        pdf.extend_from_slice(producer);
+        pdf.extend_from_slice(b") >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Resolve `/Info /Producer` and the (single) page's `/Contents` stream
+    /// payload — the two body values [`tiny_pdf_with_content_and_producer`]
+    /// plants, read back through the ordinary `Pdf` reader API (which
+    /// transparently decrypts when opened with the right password).
+    fn resolve_producer_and_content<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
+        let info_ref = match rt.trailer().get("Info") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("trailer /Info must be a reference, got {other:?}"),
+        };
+        let producer = match rt.resolve(info_ref).expect("resolve /Info") {
+            Object::Dictionary(d) => match d.get("Producer") {
+                Some(Object::String(s)) => s.clone(),
+                other => panic!("/Producer must be a string, got {other:?}"),
+            },
+            other => panic!("/Info must be a dictionary, got {other:?}"),
+        };
+
+        let root_ref = rt.root_ref().expect("root_ref");
+        let pages_ref = match rt.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get("Pages") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("/Pages must be a reference, got {other:?}"),
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"),
+        };
+        let page_ref = match rt.resolve(pages_ref).expect("resolve /Pages") {
+            Object::Dictionary(d) => match d.get("Kids") {
+                Some(Object::Array(kids)) => match kids.first() {
+                    Some(Object::Reference(r)) => *r,
+                    other => panic!("Kids[0] must be a reference, got {other:?}"),
+                },
+                other => panic!("/Kids must be an array, got {other:?}"),
+            },
+            other => panic!("/Pages must be a dictionary, got {other:?}"),
+        };
+        let contents_ref = match rt.resolve(page_ref).expect("resolve page") {
+            Object::Dictionary(d) => match d.get("Contents") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("/Contents must be a reference, got {other:?}"),
+            },
+            other => panic!("page must be a dictionary, got {other:?}"),
+        };
+        let content = match rt.resolve(contents_ref).expect("resolve /Contents") {
+            Object::Stream(s) => s.data,
+            other => panic!("/Contents must be a stream, got {other:?}"),
+        };
+        (producer, content)
+    }
+
+    /// Task 8: `append_object`/`append_body_object` must actually encrypt
+    /// every body object's strings and stream payloads, not merely leave a
+    /// plaintext document underneath a declared `/Encrypt` dictionary (Task
+    /// 6) and trailer reference (Task 7). This fixture carries a page
+    /// content stream with a recognizable plaintext marker and an `/Info
+    /// /Producer` string: both must be absent from the raw output bytes once
+    /// encrypted, and — the actual security property, not just
+    /// "ciphertext-shaped bytes appeared" — both must round-trip back to
+    /// their exact original plaintext when the output is reopened with the
+    /// correct password.
+    #[test]
+    fn linearize_with_encrypt_body_strings_and_streams_are_ciphertext() {
+        let marker: &[u8] = b"BT /F1 12 Tf (flpdf linearize-encrypt content marker) Tj ET\n";
+        let producer: &[u8] = b"flpdf linearize-encrypt producer marker";
+        let src = tiny_pdf_with_content_and_producer(marker, producer);
+
+        // Sanity/premise: with stream_data = Uncompress (no re-encoding) and
+        // NO encryption, the content stream's raw bytes carry the marker
+        // verbatim. This proves the fixture would actually leak plaintext if
+        // encryption were a no-op, so the negative assertion below is
+        // meaningful (not merely hidden by compression).
+        let unencrypted = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+        });
+        assert!(
+            unencrypted.windows(marker.len()).any(|w| w == marker),
+            "test premise: unencrypted output must carry the plaintext marker verbatim"
+        );
+
+        // Empty user password (qpdf's `--encrypt "" "" 128` convention, also
+        // used by this file's other `/Encrypt`-emission tests): lets
+        // `check_linearization_bytes` below — which opens with no password —
+        // and the explicit reopen further down both decrypt transparently.
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        assert!(
+            !out.windows(marker.len()).any(|w| w == marker),
+            "content stream plaintext leaked into encrypted linearized output"
+        );
+        assert!(
+            !out.windows(producer.len()).any(|w| w == producer),
+            "/Info /Producer plaintext leaked into encrypted linearized output"
+        );
+
+        // The /Encrypt dictionary itself must stay plaintext (Task 6): the
+        // reader has to parse it before it can derive the file key.
+        let standard_needle: &[u8] = b"/Filter /Standard";
+        assert!(
+            out.windows(standard_needle.len())
+                .any(|w| w == standard_needle),
+            "/Encrypt dictionary must remain plaintext"
+        );
+
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("encrypted linearized output must still pass the linearization checker");
+
+        // The real security property: reopening (with the empty user
+        // password) decrypts BOTH the string and the stream back to their
+        // exact original plaintext (proves the xref table itself also
+        // stayed plaintext and correctly locates every object — a garbled
+        // or encrypted xref table would fail this reopen outright).
+        let mut reopened =
+            Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
+                .expect("re-open of encrypted linearized output with the empty user password");
+        let (decrypted_producer, decrypted_content) = resolve_producer_and_content(&mut reopened);
+        assert_eq!(
+            decrypted_producer, producer,
+            "/Info /Producer must decrypt back to its original plaintext"
+        );
+        assert_eq!(
+            decrypted_content, marker,
+            "content stream must decrypt back to its original plaintext"
+        );
+    }
+
+    /// Task 8: the hint stream is encrypted like any other stream payload —
+    /// qpdf's `writeHintStream` calls `setDataKey(hint_id)` before writing
+    /// the dict/payload (QPDFWriter.cc:2297), unlike the xref table/stream
+    /// and the `/Encrypt` dict, which stay plaintext unconditionally.
+    /// Constructs an `EncryptionContext` directly (mirroring
+    /// `crate::writer::tests::rc4_stream_encryption_preserves_payload_allocation`)
+    /// to exercise `append_hint_stream_object` in isolation.
+    #[test]
+    fn append_hint_stream_object_encrypts_payload_when_ctx_present() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        let payload = b"page offset hint table + shared object hint table payload".to_vec();
+        let object_ref = ObjectRef::new(9, 0);
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encrypt_ref: ObjectRef::new(2, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        // Independently compute the ciphertext encrypt_stream_payload_for_writer
+        // produces for this object ref + key material — the oracle for what
+        // append_hint_stream_object must embed.
+        let mut expected_stream = crate::Stream::new(Dictionary::new(), payload.clone());
+        crate::writer::encrypt_stream_payload_for_writer(object_ref, &mut expected_stream, &ctx)
+            .expect("compute expected ciphertext");
+        let expected_ciphertext = expected_stream.data;
+
+        let mut bytes = Vec::new();
+        let offset = append_hint_stream_object(
+            &mut bytes,
+            object_ref,
+            &payload,
+            46,
+            None,
+            false,
+            Some(&ctx),
+        )
+        .expect("emit with encrypt_ctx");
+        assert_eq!(offset, 0);
+
+        assert!(
+            !bytes
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice()),
+            "hint stream payload must not appear in plaintext when encrypt_ctx is Some"
+        );
+        assert!(
+            bytes
+                .windows(expected_ciphertext.len())
+                .any(|w| w == expected_ciphertext.as_slice()),
+            "hint stream must embed the same ciphertext encrypt_stream_payload_for_writer \
+             produces for this object ref + key material"
+        );
+
+        let length_marker = format!("/Length {}", expected_ciphertext.len());
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(&length_marker),
+            "/Length must reflect the encrypted (not plaintext) byte count"
+        );
+    }
+
     /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
     /// source-side ObjStm: object 4 (`/Info`) exists ONLY inside object 5's
     /// ObjStm — there is no plain indirect object 4 in the file. Used to
@@ -6295,8 +6659,16 @@ mod tests {
     fn append_hint_stream_object_emits_qpdf_key_order() {
         let payload = vec![0u8; 53];
         let mut bytes = Vec::new();
-        let offset =
-            append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46, None, true);
+        let offset = append_hint_stream_object(
+            &mut bytes,
+            ObjectRef::new(9, 0),
+            &payload,
+            46,
+            None,
+            true,
+            None,
+        )
+        .expect("no encrypt_ctx: emission cannot fail");
         assert_eq!(offset, 0, "emitter returns its start offset");
 
         let mut expected = Vec::new();
@@ -6320,7 +6692,9 @@ mod tests {
             46,
             Some(51),
             false,
-        );
+            None,
+        )
+        .expect("no encrypt_ctx: emission cannot fail");
 
         assert_eq!(
             bytes,
