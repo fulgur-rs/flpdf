@@ -82,8 +82,11 @@ flpdf の既存コードは「既に qpdf に合っているもの」と「未�
   根拠に使わない。
 - 特に、公開 API と `pub(crate)` 内部機構を混同しない。qpdf 側で公開
   クラスなら、flpdf 側の内部専用ヘルパーの流儀は前例にならない。
-- [`docs/qpdf-correspondence.md`](../../docs/qpdf-correspondence.md) の
-  ⚪ 行（既知の逸脱）に該当していないか確認する。
+- [`docs/qpdf-correspondence.md`](../../docs/qpdf-correspondence.md) で
+  該当行を引く。**⚪ は「既知の逸脱」ではなく「逸脱候補（要承認）」**なので、
+  ⚪ が付いていることを承認済みの根拠にしない。逆に、確定済みの逸脱は
+  ✅ 等の行の本文にインラインで書かれていることがあるため、分類記号だけを
+  見て「逸脱なし」と判断しない。行の注記と承認状態の両方を読む。
 
 ### 該当例
 `TokenFilter` が `PipelineResult` を返しているから `StreamDataProvider` も、
@@ -120,15 +123,22 @@ C++ から Rust へ写すとき、qpdf 側にある要素を落とすのも、�
 - **基底クラスの既定実装は契約の一部**。qpdf の virtual メソッドが
   既定実装（委譲・throw）を持つなら、Rust の trait デフォルトメソッドへ
   写す。「契約だけにする」と称して落とさない。
-- **`throw` は panic ではない**。qpdf の例外は catch 可能で、このクレートでは
-  `crate::Error::Internal`（`std::logic_error`）/ `Error::System`
-  （`std::runtime_error`）に対応する。panic は不可逆な abort 相当で別物。
+- **`throw` は panic ではない**。qpdf の例外は呼び出し側が通常の制御フローとして
+  catch するもので、このクレートでは `crate::Error::Internal`
+  （`std::logic_error`）/ `Error::System`（`std::runtime_error`）に対応する。
+  panic は（このワークスペースの profile では unwind するとはいえ）Rust の
+  一般的なエラー処理手段ではなく、`catch_unwind` は本リポジトリでも panic の
+  発生を検証するテストでしか使っていない。両者を等価に扱わない。
 - 分岐ロジックの置き場所も写す。qpdf が呼び出し側に持つ分岐
   （例: `supportsRetry()` を見てどちらを呼ぶか）を、被呼び出し側の
   既定実装に移さない。
 - 同一シグネチャファミリーの単純な委譲オーバーロード（`QPDFObjGen` 版と
   `int, int` 版など）の 1 本化は、出力バイトに影響しない「入れ物」の統合として
-  CLAUDE.md の逸脱分類 (B) に該当する。doc に 1 行残す。
+  CLAUDE.md の逸脱分類 (B) に該当する。記録は **2 箇所必須** — 当該モジュールの
+  doc に逸脱理由を 1 行、かつ
+  [`docs/qpdf-correspondence.md`](../../docs/qpdf-correspondence.md) の
+  ⚪ 行に該当箇所を記載する（CLAUDE.md 分類 (B) 条件 3）。片方だけでは
+  対応表が stale になる。
 
 ### 該当例
 `StreamDataProvider` trait の形を、既定実装を全廃 → 復活 → panic を
