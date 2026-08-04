@@ -5767,18 +5767,19 @@ mod tests {
         );
     }
 
-    /// `--cleartext-metadata` (`encrypt_metadata: false`) takes the
-    /// `crate::writer::resolve_metadata_stream_ref` branch when building the
+    /// `--cleartext-metadata` (`encrypt_metadata: false`) calls
+    /// `crate::writer::resolve_metadata_stream_ref` when building the
     /// `EncryptionContext`, mirroring the full-rewrite writer's own
-    /// `--cleartext-metadata` gating (`!params.encrypt_metadata`). As with
-    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
-    /// the write still fails downstream — the reserved `/Encrypt` slot has
-    /// no offset yet (see
-    /// [`linearize_with_encrypt_reserves_encrypt_dict_object_and_succeeds`])
-    /// — so this only pins that reaching that point does not depend on
-    /// `encrypt_metadata`'s value.
+    /// `--cleartext-metadata` gating (`!params.encrypt_metadata`).
+    /// `tiny_pdf_bytes()`'s catalog has no `/Metadata` entry, so this only
+    /// pins that setting the option doesn't change *where* the write stops
+    /// (same downstream "Part-1 xref … has no offset" error as
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`]);
+    /// it does NOT pin the `Some(metadata_ref)` exemption path's actual
+    /// effect (which needs a `/Metadata`-bearing fixture, and matters once
+    /// per-object encryption is implemented and can act on it).
     #[test]
-    fn non_deterministic_encrypt_linearize_cleartext_metadata_reaches_same_point() {
+    fn non_deterministic_encrypt_linearize_cleartext_metadata_option_reaches_same_point() {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
@@ -5895,7 +5896,7 @@ mod tests {
     // slot. The context-building and slot-reservation code this test targets
     // IS exercised today — see
     // non_deterministic_encrypt_linearize_no_longer_rejected_by_guard and
-    // non_deterministic_encrypt_linearize_cleartext_metadata_reaches_same_point,
+    // non_deterministic_encrypt_linearize_cleartext_metadata_option_reaches_same_point,
     // both of which run the same `if let Some(params) = options.encrypt...`
     // block above. Keeping this test here (rather than deferring it to a
     // later commit) means the intended end state and its `/Filter /Standard`
