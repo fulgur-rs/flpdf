@@ -34,6 +34,8 @@ pub(crate) mod qpdf_tokenizer;
 
 pub(crate) mod run_length;
 
+pub(crate) mod sha2;
+
 #[cfg(test)]
 mod stream_codecs_oracle;
 

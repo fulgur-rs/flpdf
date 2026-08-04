@@ -200,7 +200,8 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `Pl_Base64` / `Pl_Concatenate` / `Pl_OStream` / `Pl_String` | 282 | `pipeline/base64.rs` / `pipeline/concatenate.rs` / `pipeline/ostream.rs` / `pipeline/string.rs`（JSON serialization/output の本番 consumer を含む） | ✅ |
 | `Pl_StdioFile.cc` | 46 | `pipeline/stdio_file.rs`（positive partial write の継続、zero/error—including `Interrupted`—の即時 Runtime 化、`EBADF` finish のみ Logic 化）+ `json_inspect.rs`（4096-byte buffer、top-level file は close/drop、side file は explicit finish） | ✅ |
 | `Pl_Buffer` | 82 | `pipeline/buffer.rs`（accumulation、optional pass-through、finish readiness、buffer ownership transfer） | ✅ |
-| `Pl_Discard` / `Pl_Function` / `Pl_SHA2` | 160 | 専用 stage は未実装。使用箇所ごとの discard / closure / digest 実装 | ⚪ |
+| `Pl_Discard` / `Pl_Function` | 85 | 専用 stage は未実装。使用箇所ごとの discard / closure 実装 | ⚪ |
+| `Pl_SHA2.cc` | 75 | `pipeline/sha2.rs`（SHA-256/384/512 の bit 選択、`resetBits`/`write`/`finish` lifecycle、optional next への forwarding、qpdf 未検証の write-after-finish 再利用パス — crypto provider は null 検査なしで dereference するが flpdf は defined logic error に変換） | ✅ |
 
 `/ID` が qpdf と非 parity だった原因は **アルゴリズム**（qpdf は 2 段階 MD5 で seed を
 作る）であり、Pipeline 抽象の有無ではない。flpdf は全体をバッファするので任意の
@@ -458,10 +459,10 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ 境界一致 | 3,625 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
+| ✅ 境界一致 | 3,700 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
 | 🔀 smeared | 27,653 | 再配置の主対象。qpdf 全体の 67% |
 | ❌ missing | 1,209 | `QPDF_json.cc` 入力側(833) / `Pl_DCT`(326) / `QTC`(50) |
-| ⚪ 逸脱候補 | 6,735 | 要承認（下記の方針矛盾を参照） |
+| ⚪ 逸脱候補 | 6,660 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
 
