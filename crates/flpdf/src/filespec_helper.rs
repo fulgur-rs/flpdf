@@ -854,10 +854,7 @@ struct ChecksumDiscard;
 
 impl Pipeline for ChecksumDiscard {
     #[rustfmt::skip]
-    fn identifier(&self) -> &str { // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
-        "embedded file checksum discard" // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
-    } // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
-
+    fn identifier(&self) -> &str { "embedded file checksum discard" } // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
     fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
         Ok(())
     }
