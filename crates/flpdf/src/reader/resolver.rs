@@ -802,8 +802,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
         };
         // qpdf `:2496-2501`.
         let mut buf = vec![0u8; length];
-        if self.seek(start).is_err() {
-            return false;
+        if let Err(error) = self.seek(start) {
+            // qpdf's `InputSource::seek` throws on failure, so this lands in
+            // the same `catch (std::exception&)` arm the read failure does
+            // rather than failing without a word.
+            return self.report_decoding_failure(
+                object_ref,
+                start,
+                &error.to_string(),
+                suppress_warnings,
+                will_retry,
+            );
         }
         match self.read(&mut buf) {
             Ok(read) if read == length => {}
@@ -2153,6 +2162,77 @@ mod tests {
         assert!(ok);
         assert!(sink.take_buffer().expect("buffer").is_empty());
         assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    /// An input source that fails is reported, not swallowed: qpdf's seek and
+    /// read both throw and land in the decoding-failure arm
+    /// (`libqpdf/QPDF.cc:2510-2520`). Exercised through the same
+    /// fault-injecting reader shape the resolution tests use.
+    #[test]
+    fn an_input_source_failure_is_reported_through_the_decoding_arm() {
+        struct Broken {
+            inner: Cursor<Vec<u8>>,
+            fail_reads: bool,
+            fail_seeks: bool,
+        }
+
+        impl std::io::Read for Broken {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.fail_reads {
+                    return Err(std::io::Error::other("read went away"));
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        impl std::io::Seek for Broken {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                if self.fail_seeks {
+                    return Err(std::io::Error::other("seek went away"));
+                }
+                self.inner.seek(position)
+            }
+        }
+
+        for (fail_reads, fail_seeks) in [(true, false), (false, true)] {
+            let resolver = ResolverHandle::new_shared(
+                Broken {
+                    inner: Cursor::new(b"%PDF-1.4\npayload".to_vec()),
+                    fail_reads,
+                    fail_seeks,
+                },
+                0,
+                BTreeMap::<ObjectRef, XrefEntry>::new(),
+                false,
+                Diagnostics::default(),
+                0,
+            );
+            let dict = crate::ObjectHandle::dictionary(vec![]);
+            let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+            let ok = resolver.pipe_stream_data(
+                ObjectRef::new(4, 0),
+                9,
+                7,
+                &dict,
+                &mut sink,
+                false,
+                false,
+            );
+
+            assert!(!ok, "reads={fail_reads} seeks={fail_seeks}");
+            let messages: Vec<_> = resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|d| d.message.clone())
+                .collect();
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            assert!(
+                messages[0].starts_with("error decoding stream data for object 4 0: "),
+                "reads={fail_reads} seeks={fail_seeks}: {messages:?}"
+            );
+        }
     }
 
     /// AC6 case 1: a document with no `/Encrypt` entry authenticates
