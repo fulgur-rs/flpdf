@@ -4619,16 +4619,32 @@ mod unparse_object_tests {
 
     #[test]
     fn unparse_stream_body_writes_length_last_preserved() {
+        // `/DecodeParms` is a non-null (empty-dictionary) value here, not
+        // `ObjectHandle::null()`: a null value would already be excluded by
+        // `visible_dict_entries`'s own null-suppression pass before the
+        // `refiltered` check ever saw the key, which would let this test
+        // pass even if `unparse_stream_dict_entries` unconditionally
+        // dropped `/DecodeParms` regardless of `refiltered`. With
+        // `refiltered == false`, both `/DecodeParms` and `/Filter` must
+        // survive at their natural (`BTreeMap`) lexicographic positions
+        // (`DecodeParms` < `Filter` < the pulled-out-and-appended
+        // `Length`), unlike the refiltered case pinned by
+        // `unparse_stream_body_refiltered_drops_filter_and_decodeparms_appends_flate`
+        // below, where both are dropped.
         let dict = ObjectHandle::dictionary(vec![
             (
                 b"Filter".to_vec(),
                 ObjectHandle::name(b"FlateDecode".to_vec()),
             ),
+            (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
         dict.unparse_stream_body(&mut out, false).unwrap();
-        assert_eq!(out, b"<< /Filter /FlateDecode /Length 3 >>");
+        assert_eq!(
+            out,
+            b"<< /DecodeParms << >> /Filter /FlateDecode /Length 3 >>"
+        );
     }
 
     #[test]
