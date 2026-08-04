@@ -1724,6 +1724,11 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
 /// all-zero array), which is exactly what qpdf's pass-1 buffer contains. The
 /// flag is honoured on the classic (`objstm_layout.is_empty()`) path only; the
 /// caller never sets it for ObjStm-bearing output.
+///
+/// `encrypt_ctx`, when `Some`, is emitted as a plaintext `/Encrypt` indirect
+/// object right after the catalog/open-document-plain objects, in every pass
+/// (qpdf writes it unconditionally on `m->encrypted`, independent of pass
+/// number — see the call site's doc for the qpdf source reference).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
@@ -1745,6 +1750,7 @@ fn do_write_pass<R: Read + Seek>(
     options: &WriteOptions,
     pass1_digest: bool,
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -1957,6 +1963,27 @@ fn do_write_pass<R: Read + Seek>(
             structural_streams_filtered,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
+    }
+
+    // `/Encrypt` dictionary object (qpdf `writeEncryptionDictionary`, called
+    // from `writeLinearized` right after `part4_end_marker` —
+    // QPDFWriter.cc:2793-2796). Emitted right after the Part-4
+    // (open-document) objects — plain and ObjStm-container — and before the
+    // hint stream, matching qpdf's insertion point. qpdf calls
+    // `writeEncryptionDictionary` unconditionally on `m->encrypted`, on
+    // every pass, so this is not gated on `pass1_digest`. The dict itself is
+    // never encrypted (PDF 1.7 §7.6.1 — a reader must parse it before it can
+    // derive the file key needed to decrypt anything else), so this reuses
+    // the same plain [`append_object`] every other unencrypted structural
+    // object in this function uses; no data key is ever applied to these
+    // bytes.
+    if let Some(ctx) = encrypt_ctx {
+        let offset = append_object(
+            &mut bytes,
+            ctx.encrypt_ref,
+            &Object::Dictionary(ctx.encrypt_dict.clone()),
+        );
+        xref_offsets.insert(ctx.encrypt_ref.number, offset);
     }
 
     // Hint stream object.
@@ -2924,11 +2951,14 @@ pub fn write_linearized<R: Read + Seek>(
     // `options.encrypt` with a defensive error arm that could never
     // actually trigger).
     //
-    // Not yet read below `_encrypt_ctx`: this commit only builds the context
-    // and reserves its object slot. Emitting the `/Encrypt` object, writing
-    // it into the trailer, and applying it to per-object strings/streams are
+    // `encrypt_ctx` is threaded into every `do_write_pass` call below, which
+    // emits `ctx.encrypt_dict` as a plaintext indirect object right after the
+    // catalog/open-document-plain objects (mirrors qpdf's `writeLinearized`
+    // calling `writeEncryptionDictionary()` right after `part4_end_marker`,
+    // unconditionally on `m->encrypted` — QPDFWriter.cc:2793-2796). Writing
+    // it into the trailer, and applying it to per-object strings/streams, are
     // later steps that consume this value.
-    let _encrypt_ctx: Option<crate::writer::EncryptionContext> =
+    let encrypt_ctx: Option<crate::writer::EncryptionContext> =
         if let Some(params) = options.encrypt.as_ref() {
             // `id0` (extracted above, before the `deterministic_id &&
             // encrypting` guard runs) must never be the all-zero placeholder
@@ -3216,6 +3246,15 @@ pub fn write_linearized<R: Read + Seek>(
             options,
             true,
             None,
+            // `deterministic_id && encrypting` is rejected earlier in this
+            // function (see the guard right after `/ID` is finalized above),
+            // so this branch (`options.deterministic_id`) and `encrypt_ctx`
+            // being `Some` are mutually exclusive — `encrypt_ctx` is always
+            // `None` here in practice. Threaded through anyway rather than
+            // hardcoding `None`, so this pass-1 buffer stays byte-consistent
+            // with the probe/final passes below if that guard is ever
+            // relaxed.
+            encrypt_ctx.as_ref(),
         )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeed on these same inputs, so it cannot introduce a new Err.
             // Whole-buffer digest: a linearized file repeats `/ID` at several
             // sites, so there is no single `[` cutoff; pass the last index as the
@@ -3279,6 +3318,12 @@ pub fn write_linearized<R: Read + Seek>(
             // placeholder is the same fixed width as the final direct-written
             // identifier, so probe offsets match the final pass regardless.
             None,
+            // The `/Encrypt` dict's bytes are fixed (plaintext, no data key)
+            // and identical in every pass, so the probe passes emit it too —
+            // both to get its object's offset/length right for hint
+            // convergence, and because omitting it here would shift every
+            // downstream object's measured offset relative to the final pass.
+            encrypt_ctx.as_ref(),
         )?;
 
         // ------------------------------------------------------------------
@@ -3754,6 +3799,7 @@ pub fn write_linearized<R: Read + Seek>(
                 options,
                 false,
                 id_writer,
+                encrypt_ctx.as_ref(),
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;
@@ -5760,22 +5806,12 @@ mod tests {
     /// rejected by it — qpdf itself supports `--linearize --encrypt` without
     /// `--deterministic-id` (verified empirically against qpdf 11.9.0).
     ///
-    /// This does not assert full success: encryption is not fully wired into
-    /// the linearized writer yet (later work completes that), so this
-    /// fixture may still fail for some other reason. Before the encrypt-dict
-    /// object slot was reserved, this fixture actually succeeded (silently
-    /// emitting plaintext, since nothing downstream of the guards consumed
-    /// `options.encrypt`); now that the slot is reserved but the `/Encrypt`
-    /// object itself is not yet emitted (a later step), it fails a
-    /// different, unrelated internal consistency check instead (see
-    /// [`linearize_with_encrypt_reserves_encrypt_dict_object_and_succeeds`]).
-    /// It is fine for the write to fail here for a DIFFERENT `Unsupported`
-    /// reason — this test only pins that the specific deterministic-id guard
-    /// message is not the cause, so it asserts on the `Result`'s `Debug`
-    /// text rather than matching a specific `Err` arm: a pattern-matched arm
-    /// on an outcome this fixture may never reach would itself sit
-    /// permanently uncovered, whereas a plain string check runs
-    /// unconditionally on both `Ok` and `Err`.
+    /// The write now succeeds outright (the `/Encrypt` object is emitted at
+    /// its reserved slot — see
+    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`]
+    /// for the dedicated object-placement assertion), so this asserts full
+    /// success directly rather than merely excluding the deterministic-id
+    /// guard's message from an otherwise-unconstrained `Result`.
     #[test]
     fn non_deterministic_encrypt_linearize_no_longer_rejected_by_guard() {
         let mut pdf = open_tiny_pdf();
@@ -5790,13 +5826,8 @@ mod tests {
             ..WriteOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
-        let result = write_linearized(&plan, &renumber, &mut pdf2, &opts);
-        let debug_text = format!("{result:?}");
-        assert!(
-            !debug_text.contains("deterministic-id option is incompatible"),
-            "non-deterministic-id encrypting must not hit the deterministic-id \
-             guard: {debug_text}"
-        );
+        write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("non-deterministic-id encrypting must not hit the deterministic-id guard");
     }
 
     /// `--cleartext-metadata` (`encrypt_metadata: false`) calls
@@ -5804,9 +5835,11 @@ mod tests {
     /// `EncryptionContext`, mirroring the full-rewrite writer's own
     /// `--cleartext-metadata` gating (`!params.encrypt_metadata`).
     /// `tiny_pdf_bytes()`'s catalog has no `/Metadata` entry, so this only
-    /// pins that setting the option doesn't change *where* the write stops
-    /// (same downstream "Part-1 xref … has no offset" error as
-    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`]);
+    /// pins that setting the option doesn't change *whether* the write
+    /// succeeds (same as
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
+    /// now that the `/Encrypt` object is actually emitted — see
+    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`]);
     /// it does NOT pin the `Some(metadata_ref)` exemption path's actual
     /// effect (which needs a `/Metadata`-bearing fixture, and matters once
     /// per-object encryption is implemented and can act on it).
@@ -5826,12 +5859,8 @@ mod tests {
             ..WriteOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
-        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m.contains("Part-1 xref") && m.contains("has no offset")),
-            "got {err:?}"
-        );
+        write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("cleartext-metadata must not change whether the write succeeds");
     }
 
     /// linearize+encrypt+ObjStm is out of scope for now: the ObjStm
@@ -5906,41 +5935,43 @@ mod tests {
         );
     }
 
-    /// Building the `/Encrypt` object's `EncryptionContext` and reserving its
-    /// object slot for linearized output (non-deterministic `/ID`, no object
-    /// streams). Reserving the slot grows `/Size` (`RenumberMap::len()`) by
-    /// one before any object is actually emitted there, so `write_linearized`
-    /// now fails its own internal consistency check — the Part-1 first-page
-    /// xref subsection covers `[param_dict_slot, /Size)` and finds no offset
-    /// recorded for the reserved-but-unwritten slot
-    /// (`crate::Error::Unsupported("Part-1 xref: covered object N has no
-    /// offset …")`). That is the *expected* failure once emission (a later
-    /// step) writes a real indirect object into that slot, the offset gets
-    /// recorded and this error disappears. Contrast with
-    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
-    /// which pins the pre-this-commit behavior (encryption silently ignored,
-    /// write succeeds). `#[ignore]`d until the emission step lands and makes
-    /// the assertion below true; Task 6's acceptance criteria include
-    /// removing this attribute AND the paired coverage-exclusion comments
-    /// wrapping this test below — once the test runs unconditionally, leaving
-    /// those markers in place would silently exempt this test body from the
-    /// patch-coverage gate instead of just no longer needing the exemption.
-    // cov:ignore-start: the test body is instrumented by llvm-cov but never
-    // executes because it is `#[ignore]`d until the /Encrypt emission step
-    // (see the doc comment above) writes a real object into the reserved
-    // slot. The context-building and slot-reservation code this test targets
-    // IS exercised today — see
-    // non_deterministic_encrypt_linearize_no_longer_rejected_by_guard and
-    // non_deterministic_encrypt_linearize_cleartext_metadata_option_reaches_same_point,
-    // both of which run the same `if let Some(params) = options.encrypt...`
-    // block above. Keeping this test here (rather than deferring it to a
-    // later commit) means the intended end state and its `/Filter /Standard`
-    // assertion land alongside the commit that starts building toward it.
+    /// Building the `/Encrypt` object's `EncryptionContext`, reserving its
+    /// object slot, and emitting its bytes for linearized output
+    /// (non-deterministic `/ID`, no object streams). Before this task the
+    /// slot was reserved but never emitted, so `write_linearized` failed its
+    /// own Part-1 xref consistency check (`crate::Error::Unsupported("Part-1
+    /// xref: covered object N has no offset …")`, see
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`]'s
+    /// doc for the pre-emission history). Now that the object is emitted at
+    /// its reserved slot, `write_linearized` succeeds outright: this test
+    /// pins BOTH that the write no longer errors AND that the reserved
+    /// object number (`renumber.hint_stream_slot()` before reservation —
+    /// see [`RenumberMap::reserve_encrypt_dict_slot`]'s doc for why that
+    /// equals the assigned `/Encrypt` object number for this ObjStm-free
+    /// fixture) carries the `/Encrypt` dictionary specifically, not merely
+    /// that `/Filter /Standard` appears somewhere in the output. This does
+    /// NOT assert trailer wiring (`/Encrypt` in the trailer — Task 7) or
+    /// per-object string/stream encryption (Task 8); those remain separate
+    /// follow-up work.
     #[test]
-    #[ignore = "awaits /Encrypt object emission; this commit only builds the \
-                context and reserves the slot (write_linearized currently \
-                errors with \"Part-1 xref: covered object N has no offset\")"]
-    fn linearize_with_encrypt_reserves_encrypt_dict_object_and_succeeds() {
+    fn linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number() {
+        // Independently recompute the object number `write_linearized` will
+        // assign to `/Encrypt`, from the same plan/renumber construction
+        // `linearize_with` performs internally on the same source bytes.
+        // `RenumberMap::reserve_encrypt_dict_slot` (invoked inside
+        // `write_linearized` on its own clone of an equivalent map) always
+        // returns `ObjectRef::new(hint_stream_slot(), 0)` — reading
+        // `hint_stream_slot()` here, before any reservation, gives the same
+        // number without duplicating the reservation call itself. No ObjStm
+        // relocation runs for this fixture (`tiny_pdf_bytes()` carries no
+        // source ObjStm and the default `ObjectStreamMode` is a no-op on an
+        // ObjStm-free source), so nothing shifts `hint_stream_slot()` between
+        // this computation and `write_linearized`'s internal one.
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let expected_encrypt_num = renumber.hint_stream_slot();
+
         let out = linearize_with(&tiny_pdf_bytes(), |o| {
             o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
                 b"user".to_vec(),
@@ -5948,15 +5979,60 @@ mod tests {
             ));
         });
 
-        // The output must contain an indirect object whose dict has
-        // /Filter /Standard (the /Encrypt dict qpdf always includes).
+        // Locate "<N> 0 obj" for the reserved number, then confirm
+        // /Filter /Standard (the /Encrypt dict qpdf always includes) appears
+        // inside THAT object's body (before its own "endobj"), not just
+        // somewhere in the file. Every object header in this writer is
+        // preceded by a newline (`append_object` emits "\nendobj\n" for the
+        // prior object, or a trailer/xref section ends in "\n"), so search
+        // for "\n<N> 0 obj" rather than "<N> 0 obj" alone — an unprefixed
+        // search for e.g. "4 0 obj" would also match inside "14 0 obj" /
+        // "24 0 obj" for larger fixtures.
+        let header = format!("\n{expected_encrypt_num} 0 obj");
+        let header_pos = out
+            .windows(header.len())
+            .position(|w| w == header.as_bytes())
+            .unwrap_or_else(|| {
+                panic!("expected \"{header}\" (the reserved /Encrypt object header) in output")
+            })
+            + 1;
+        let body = &out[header_pos..];
+        let body_end = body
+            .windows(b"endobj".len())
+            .position(|w| w == b"endobj")
+            .unwrap_or(body.len());
+        let object_bytes = &body[..body_end];
         let needle: &[u8] = b"/Filter /Standard";
         assert!(
-            out.windows(needle.len()).any(|w| w == needle),
-            "expected an /Encrypt dictionary with /Filter /Standard in the output"
+            object_bytes.windows(needle.len()).any(|w| w == needle),
+            "object {expected_encrypt_num} (the reserved /Encrypt slot) must be the \
+             /Encrypt dictionary (/Filter /Standard), got {:?}",
+            String::from_utf8_lossy(object_bytes)
+        );
+
+        // Physical placement, not just a number coincidence:
+        // `reserve_encrypt_dict_slot` inserts the `/Encrypt` slot at the OLD
+        // `hint_stream_slot` and shifts the hint stream to `old + 1` (see its
+        // own doc and `reserve_encrypt_dict_slot_inserts_before_hint_and_shifts_it`
+        // in renumber.rs), so the hint stream's new object number is
+        // `expected_encrypt_num + 1` — confirm ITS header appears physically
+        // after the `/Encrypt` object's header, pinning the qpdf insertion
+        // point (right after Part-4/open-document objects, before the hint
+        // stream — QPDFWriter.cc:2793-2796) in file byte order, not just
+        // object-number order.
+        let hint_header = format!("\n{} 0 obj", expected_encrypt_num + 1);
+        let hint_header_pos = out
+            .windows(hint_header.len())
+            .position(|w| w == hint_header.as_bytes())
+            .unwrap_or_else(|| panic!("expected hint stream header \"{hint_header}\" in output"))
+            + 1;
+        assert!(
+            hint_header_pos > header_pos,
+            "hint stream object {} must appear physically after the /Encrypt \
+             object {expected_encrypt_num} in the output",
+            expected_encrypt_num + 1
         );
     }
-    // cov:ignore-end
 
     /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
     /// source-side ObjStm: object 4 (`/Info`) exists ONLY inside object 5's
