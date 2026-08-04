@@ -324,6 +324,35 @@ pub fn encode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
     encode_stream_data_with_filters(dict.get("Filter"), dict.get("DecodeParms"), stream_data)
 }
 
+/// Encode `stream_data` using `/Filter` and `/DecodeParms` read from an
+/// `ObjectHandle` stream dictionary.
+///
+/// qpdf reads both keys through the resolving `stream_dict.getKey` accessor
+/// (`libqpdf/QPDF_Stream.cc:386`, `:441`) and reads array children through
+/// `getArrayItem` (`:400`, `:448`). `try_get_key` plus
+/// `decode_filter_specs_from_handle` preserves that indirect-object behavior.
+/// The encode pipeline remains the same one used by [`encode_stream_data`];
+/// qpdf builds stream pipelines in reverse order and installs Flate deflate at
+/// `libqpdf/QPDF_Stream.cc:529-568`. Predictor encoding remains qpdf's fixed
+/// Up-row algorithm (`libqpdf/Pl_PNGFilter.cc:215-228`), and RunLength packet
+/// plus EOD emission remains `libqpdf/Pl_RunLength.cc:105-145`.
+///
+/// # Errors
+///
+/// Returns the same filter and predictor errors as [`encode_stream_data`],
+/// plus [`Error::Internal`] if an indirect holder or child still needs a
+/// document resolver after its document has been dropped.
+#[allow(dead_code)] // promoted when flpdf-egzr.3.2.5 migrates writer consumers
+pub(crate) fn encode_stream_data_from_handle(
+    stream_dict: &ObjectHandle,
+    stream_data: &[u8],
+) -> Result<Vec<u8>> {
+    let filter = stream_dict.try_get_key(b"Filter")?;
+    let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+    let specs = decode_filter_specs_from_handle(&filter, &decode_params, None)?;
+    encode_stream_data_from_specs(specs, stream_data)
+}
+
 fn decode_stream_data_with_filters(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -842,6 +871,10 @@ fn encode_stream_data_with_filters(
     // The encode path is writer output rather than untrusted input, so it is
     // uncapped — see `MAX_FILTER_CHAIN_LEN`'s own doc.
     let specs = decode_filter_specs_from_object(filter, decode_params, None)?;
+    encode_stream_data_from_specs(specs, stream_data)
+}
+
+fn encode_stream_data_from_specs(specs: Vec<FilterSpec>, stream_data: &[u8]) -> Result<Vec<u8>> {
     // ISO 32000-1 §7.4.2: the /Filter array names filters in *decode*
     // order, so encoding must apply them in reverse for round-tripping.
     let mut encoded = stream_data.to_vec();
@@ -929,7 +962,7 @@ mod tests {
     use crate::object_handle::identity_tests::resolver_bearing_handle;
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
-    use crate::stream_filter::ParamValue;
+    use crate::stream_filter::{tests::handle_from_object, ParamValue};
 
     #[test]
     fn decode_limits_default_to_unbounded_output_and_sixteen_filters() {
@@ -2143,6 +2176,194 @@ mod tests {
         let names: Vec<Object> = filters.iter().map(|f| Object::Name(f.to_vec())).collect();
         dict.insert("Filter", Object::Array(names));
         dict
+    }
+
+    fn native_encode_dictionary(dictionary: &Dictionary) -> ObjectHandle {
+        ObjectHandle::dictionary(
+            dictionary
+                .iter()
+                .map(|(key, value)| (key.to_vec(), handle_from_object(Some(value))))
+                .collect(),
+        )
+    }
+
+    fn comparable_encode(result: Result<Vec<u8>>) -> std::result::Result<Vec<u8>, String> {
+        result.map_err(|error| error.to_string())
+    }
+
+    fn named_filter_dictionary(name: &[u8]) -> Dictionary {
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Filter", Object::Name(name.to_vec()));
+        dictionary
+    }
+
+    #[test]
+    fn handle_encode_matches_dictionary_encode_for_the_full_filter_matrix() {
+        let plain = b"ObjectHandle encode matrix: AAABBBCCCDDDEEE".to_vec();
+        let mut rows: Vec<(String, Dictionary, Vec<u8>)> = Vec::new();
+
+        rows.push((
+            "missing /Filter".to_string(),
+            Dictionary::new(),
+            plain.clone(),
+        ));
+
+        for name in [
+            b"FlateDecode".as_slice(),
+            b"Fl",
+            b"ASCII85Decode",
+            b"A85",
+            b"ASCIIHexDecode",
+            b"AHx",
+            b"RunLengthDecode",
+            b"RL",
+            b"LZWDecode",
+            b"LZW",
+            b"DCTDecode",
+            b"DCT",
+            b"CCITTFaxDecode",
+            b"CCF",
+            b"JBIG2Decode",
+            b"JPXDecode",
+            b"NoSuchDecode",
+        ] {
+            rows.push((
+                String::from_utf8_lossy(name).into_owned(),
+                named_filter_dictionary(name),
+                plain.clone(),
+            ));
+        }
+
+        rows.push((
+            "ASCII85 then Flate chain".to_string(),
+            array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]),
+            plain.clone(),
+        ));
+
+        for predictor in 10..=15 {
+            rows.push((
+                format!("PNG predictor {predictor}"),
+                png_predictor_dict(predictor, 4),
+                sample_raw_4x2(),
+            ));
+        }
+
+        let mut malformed_filter = Dictionary::new();
+        malformed_filter.insert("Filter", Object::Integer(1));
+        rows.push((
+            "malformed /Filter".to_string(),
+            malformed_filter,
+            plain.clone(),
+        ));
+
+        let mut malformed_parms = named_filter_dictionary(b"FlateDecode");
+        malformed_parms.insert(
+            "DecodeParms",
+            Object::Array(vec![Object::Null, Object::Null]),
+        );
+        rows.push((
+            "misaligned /DecodeParms".to_string(),
+            malformed_parms,
+            plain.clone(),
+        ));
+
+        for (label, legacy, input) in rows {
+            let native = native_encode_dictionary(&legacy);
+            assert_eq!(
+                comparable_encode(encode_stream_data(&legacy, &input)),
+                comparable_encode(encode_stream_data_from_handle(&native, &input)),
+                "encode paths diverged for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_encode_has_absolute_missing_run_length_and_chain_outputs() {
+        let plain = b"AA";
+        assert_eq!(
+            encode_stream_data_from_handle(&ObjectHandle::dictionary(vec![]), plain).unwrap(),
+            plain
+        );
+
+        let run_length = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"RunLengthDecode".to_vec()),
+        )]);
+        assert_eq!(
+            encode_stream_data_from_handle(&run_length, plain).unwrap(),
+            [0xff, b'A', 0x80]
+        );
+
+        let chain = array_filter_dict(&[b"ASCII85Decode", b"FlateDecode"]);
+        let native_chain = native_encode_dictionary(&chain);
+        let payload = b"reverse-order chain payload";
+        let encoded = encode_stream_data_from_handle(&native_chain, payload).unwrap();
+        assert_eq!(decode_stream_data(&chain, &encoded).unwrap(), payload);
+    }
+
+    #[test]
+    fn handle_encode_resolves_indirect_holder_filter_decode_parms_and_parameter_value() {
+        let (columns, columns_resolver) = resolver_bearing_handle(ObjectValue::Integer(4));
+        let (decode_params, decode_params_resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(
+                [
+                    (b"Predictor".to_vec(), ObjectHandle::integer(12)),
+                    (b"Columns".to_vec(), columns.clone()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+        let (filter, filter_resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"FlateDecode".to_vec()));
+        let (stream_dictionary, dictionary_resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(
+                [
+                    (b"Filter".to_vec(), filter.clone()),
+                    (b"DecodeParms".to_vec(), decode_params.clone()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+        let _resolvers = (
+            columns_resolver,
+            decode_params_resolver,
+            filter_resolver,
+            dictionary_resolver,
+        );
+
+        assert!(!stream_dictionary.is_resolved());
+        assert!(!filter.is_resolved());
+        assert!(!decode_params.is_resolved());
+        assert!(!columns.is_resolved());
+
+        let raw = sample_raw_4x2();
+        let actual = encode_stream_data_from_handle(&stream_dictionary, &raw).unwrap();
+        let expected = encode_stream_data(&png_predictor_dict(12, 4), &raw).unwrap();
+
+        assert!(stream_dictionary.is_resolved());
+        assert!(filter.is_resolved());
+        assert!(decode_params.is_resolved());
+        assert!(columns.is_resolved());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn handle_encode_surfaces_a_dropped_document_from_the_dictionary_holder() {
+        let (stream_dictionary, resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        drop(resolver);
+
+        let error = encode_stream_data_from_handle(&stream_dictionary, b"payload")
+            .expect_err("a dropped document must not read as an empty filter chain");
+
+        assert!(matches!(error, Error::Internal(_)));
+        assert_eq!(error.to_string(), "object 20 0 belongs to a dropped PDF");
     }
 
     #[test]
