@@ -4633,11 +4633,18 @@ mod unparse_object_tests {
 
     #[test]
     fn unparse_stream_body_refiltered_drops_filter_and_decodeparms_appends_flate() {
+        // `/DecodeParms` is a non-null (empty-dictionary) value here, not
+        // `ObjectHandle::null()`: a null value would already be excluded by
+        // `visible_dict_entries`'s own null-suppression pass before the
+        // refiltered check ever saw the key, which would let this test pass
+        // even if the `key.as_slice() == b"DecodeParms"` disjunct were
+        // dropped from that check entirely.
         let dict = ObjectHandle::dictionary(vec![
             (
                 b"Filter".to_vec(),
                 ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
             ),
+            (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
             (b"Length".to_vec(), ObjectHandle::integer(3)),
         ]);
         let mut out = Vec::new();
