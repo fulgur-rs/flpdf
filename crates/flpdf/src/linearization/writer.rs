@@ -5993,7 +5993,11 @@ mod tests {
             .windows(header.len())
             .position(|w| w == header.as_bytes())
             .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the assertion below would
+                // fail — the object header is always found once Task 6's
+                // emission is correct, which is the state under test.
                 panic!("expected \"{header}\" (the reserved /Encrypt object header) in output")
+                // cov:ignore-end
             })
             + 1;
         let body = &out[header_pos..];
@@ -6007,6 +6011,7 @@ mod tests {
             object_bytes.windows(needle.len()).any(|w| w == needle),
             "object {expected_encrypt_num} (the reserved /Encrypt slot) must be the \
              /Encrypt dictionary (/Filter /Standard), got {:?}",
+            // cov:ignore: only evaluated when the assertion above fails.
             String::from_utf8_lossy(object_bytes)
         );
 
@@ -6024,12 +6029,19 @@ mod tests {
         let hint_header_pos = out
             .windows(hint_header.len())
             .position(|w| w == hint_header.as_bytes())
-            .unwrap_or_else(|| panic!("expected hint stream header \"{hint_header}\" in output"))
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the assertion below would
+                // fail — the hint stream header is always found once Task 6's
+                // emission is correct, which is the state under test.
+                panic!("expected hint stream header \"{hint_header}\" in output")
+                // cov:ignore-end
+            })
             + 1;
         assert!(
             hint_header_pos > header_pos,
             "hint stream object {} must appear physically after the /Encrypt \
              object {expected_encrypt_num} in the output",
+            // cov:ignore: only evaluated when the assertion above fails.
             expected_encrypt_num + 1
         );
     }
