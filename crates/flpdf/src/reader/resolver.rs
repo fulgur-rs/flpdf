@@ -784,8 +784,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
         suppress_warnings: bool,
         will_retry: bool,
     ) -> bool {
-        let Ok(start) = u64::try_from(offset) else {
-            return false;
+        let start = match u64::try_from(offset) {
+            Ok(start) => start,
+            // qpdf's input source throws `std::logic_error("INTERNAL ERROR:
+            // BufferInputSource offset < 0")` here
+            // (`libqpdf/BufferInputSource.cc:119-121`), which its
+            // `catch (std::exception&)` arm reports rather than swallowing.
+            Err(_) => {
+                return self.report_decoding_failure(
+                    object_ref,
+                    0,
+                    &format!("stream offset {offset} is negative"),
+                    suppress_warnings,
+                    will_retry,
+                )
+            }
         };
         // qpdf `:2496-2501`.
         let mut buf = vec![0u8; length];
@@ -2055,6 +2068,91 @@ mod tests {
             finishes, 1,
             "a failed finish is not attempted a second time"
         );
+    }
+
+    /// An offset past the end reads nothing, so qpdf's short-read throw fires
+    /// with `read == 0` and attributes the warning to the requested offset
+    /// itself (`libqpdf/QPDF.cc:2498-2500`).
+    #[test]
+    fn an_offset_past_the_end_warns_against_the_requested_offset() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let past_end = source.len() as i64 + 500;
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            past_end,
+            7,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(!ok);
+        let diagnostics = resolver.repair_diagnostics();
+        let entries: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| (d.message.as_str(), d.offset))
+            .collect();
+        assert_eq!(
+            entries,
+            [(
+                "unexpected EOF reading stream data",
+                #[allow(clippy::cast_sign_loss)]
+                Some(past_end as u64)
+            )]
+        );
+    }
+
+    /// A negative offset is not silently unreadable: qpdf's input source
+    /// throws `std::logic_error("INTERNAL ERROR: BufferInputSource offset <
+    /// 0")` (`libqpdf/BufferInputSource.cc:119-121`), which lands in the
+    /// decoding-failure arm and produces a warning. Only the detail after the
+    /// colon is flpdf's own, since the text qpdf appends there names a C++
+    /// input-source class this port does not have.
+    #[test]
+    fn a_negative_offset_warns_rather_than_failing_silently() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), -1, 7, &dict, &mut sink, false, false);
+
+        assert!(!ok);
+        let messages: Vec<_> = resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].starts_with("error decoding stream data for object 4 0: "),
+            "{messages:?}"
+        );
+    }
+
+    /// A zero-length stream is not a failure: qpdf allocates nothing, reads
+    /// nothing, writes nothing and finishes (`libqpdf/QPDF.cc:2497-2504`).
+    #[test]
+    fn a_zero_length_stream_succeeds_and_finishes_the_sink() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 0, &dict, &mut sink, false, false);
+
+        assert!(ok);
+        assert!(sink.take_buffer().expect("buffer").is_empty());
+        assert!(resolver.repair_diagnostics().entries().is_empty());
     }
 
     /// AC6 case 1: a document with no `/Encrypt` entry authenticates
