@@ -408,6 +408,38 @@ mod tests {
         WriteFaultSink.finish().unwrap();
     }
 
+    /// qpdf FIPS 180-4 empty-string digest. `Pl_SHA2::finish` finalizes unconditionally
+    /// (no `in_progress` check), so a committed pipeline that never received a `write()`
+    /// must still produce the hash of zero bytes.
+    #[test]
+    fn finish_with_no_prior_write_computes_the_empty_input_digest() {
+        let mut sha2 = PlSha2::new("sha2", None, 256).unwrap();
+        sha2.finish().unwrap();
+        assert_eq!(
+            sha2.get_hex_digest().unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// qpdf's `Pl_SHA2::write` does not special-case `len == 0`: it unconditionally sets
+    /// `in_progress` and unconditionally forwards to `next`, unlike e.g. `Pl_Count`/`Pl_RC4`
+    /// in this codebase which skip empty writes.
+    #[test]
+    fn empty_write_still_sets_in_progress_and_forwards_an_empty_chunk() {
+        let mut sink = RecordingSink::default();
+        {
+            let mut sha2 = PlSha2::new("sha2", Some(&mut sink as &mut dyn Pipeline), 256).unwrap();
+            sha2.write(b"").unwrap();
+            let in_progress_error = sha2.get_raw_digest().unwrap_err();
+            assert_eq!(
+                in_progress_error.to_string(),
+                "digest requested for in-progress SHA2 Pipeline"
+            );
+            sha2.finish().unwrap();
+        }
+        assert_eq!(sink.chunks, vec![Vec::<u8>::new()]);
+    }
+
     #[test]
     fn no_next_pipeline_still_computes_a_digest() {
         let mut sha2 = PlSha2::new("sha2", None, 256).unwrap();
