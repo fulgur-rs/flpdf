@@ -448,8 +448,10 @@ impl Permissions {
 /// 32-byte file key unchanged once `/V >= 5`
 /// (`libqpdf/QPDF_encryption.cc:337-340`). So an `/AESV2` crypt filter on a
 /// `/V 5` document decrypts with AES-256, and an `/AESV3` one on a `/V 4`
-/// document decrypts with AES-128. Use
-/// [`EncryptionState::cipher_mode_for`] to go from a method to a cipher.
+/// document decrypts with AES-128. Go from a method to a cipher through
+/// [`EncryptionState::select_method`] and
+/// [`EncryptionState::with_object_cipher`], which carry qpdf's `use_aes` for
+/// exactly this reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncryptionMode {
     Rc4,
