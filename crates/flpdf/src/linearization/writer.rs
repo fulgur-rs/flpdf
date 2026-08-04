@@ -672,7 +672,14 @@ struct Part1XrefPatch {
 /// `/Prev`, and `/ID` — matching qpdf's key order and content for linearized
 /// PDFs.  The `/Prev` value is written as a left-justified decimal integer
 /// padded on the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes so it
-/// can be back-patched in-place once the Part 6 xref offset is known.
+/// can be back-patched in-place once the Part 6 xref offset is known.  When
+/// `encrypt_ctx` is `Some`, `/Encrypt {N} 0 R` is written immediately after
+/// `/ID` — qpdf's `writeTrailer` (QPDFWriter.cc:1221-1228) writes `/ID` then,
+/// for every trailer form except `t_lin_second` (the main/second-half
+/// trailer), ` /Encrypt {objid} 0 R`. Verified empirically against qpdf
+/// 11.9.0 (`qpdf --linearize --static-id --static-aes-iv --encrypt "" "" 128
+/// --use-aes=y`), whose first-page trailer ends `... /ID [<...><...>]
+/// /Encrypt 4 0 R >>`.
 ///
 /// Returns `(xref_keyword_offset, prev_value_byte_range, patch)`.
 #[allow(clippy::too_many_arguments)]
@@ -685,6 +692,7 @@ fn write_part1_xref_and_trailer(
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
     id_writer: Option<crate::object::ReborrowableIdWriter>,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> (usize, std::ops::Range<usize>, Part1XrefPatch) {
     // The param-dict object's trailing pad (reserved by `Part1Bytes::build`)
     // ends with spaces; qpdf starts the first-page `xref` on a fresh line, so
@@ -777,6 +785,23 @@ fn write_part1_xref_and_trailer(
             Some(write_id) => write_id(bytes),
             None => crate::object::write_id_style_value(bytes, id_obj),
         }
+    }
+
+    // /Encrypt — reference to the `/Encrypt` dictionary object, written right
+    // after `/ID` (qpdf `writeTrailer`, QPDFWriter.cc:1221-1228: `/ID` first,
+    // then — for every trailer form except `t_lin_second`, the main/
+    // second-half trailer — ` /Encrypt {objid} 0 R`). The main (Part-6)
+    // trailer is produced by `write_main_xref_and_trailer`, a separate
+    // function that never receives `encrypt_ctx`, so that omission is
+    // structural rather than a runtime branch here.
+    if let Some(ctx) = encrypt_ctx {
+        bytes.extend_from_slice(
+            format!(
+                " /Encrypt {} {} R",
+                ctx.encrypt_ref.number, ctx.encrypt_ref.generation
+            )
+            .as_bytes(),
+        );
     }
 
     bytes.extend_from_slice(b" >>");
@@ -1126,6 +1151,19 @@ fn patch_linearized_deterministic_id(
 /// `/Prev → main xref` (qpdf's first-half → main chain direction); the main
 /// (Part-6) xref at EOF carries no `/Prev`, so the chain is acyclic. Its
 /// `/Index [second_half_count, first_half_count)` covers the FIRST-half objects.
+//
+// Scope note: this function has no `encrypt_ctx` parameter, unlike its
+// classic-path sibling `write_part1_xref_and_trailer`. `write_linearized`
+// rejects encryption combined with any ObjStm-emitting mode before
+// `relocation`/`objstm_layout` are built, so this xref-stream path (called
+// only when `!objstm_layout.is_empty()`) and `encrypt_ctx.is_some()` can
+// never coincide in the same call to `do_write_pass` — adding an /Encrypt
+// arm here would be dead code unreachable through the public API. qpdf's own
+// `writeTrailer` (QPDFWriter.cc:1160-1231) writes `/Encrypt` identically for
+// both the classic and xref-stream trailer forms (right after `/ID`, for
+// every `which != t_lin_second`), so if this scope limitation is ever
+// lifted, thread `encrypt_ctx` here the same way and emit `/Encrypt {N} {G}
+// R` right after the `/ID` array in `write_object`/`write_object_with_id_writer`.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
@@ -1857,6 +1895,7 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
             id_writer.as_deref_mut(),
+            encrypt_ctx,
         );
         part1_classic_xref_offset = p1_xref_offset;
         part1_xref_patch = Some(patch);
@@ -5949,10 +5988,18 @@ mod tests {
     /// see [`RenumberMap::reserve_encrypt_dict_slot`]'s doc for why that
     /// equals the assigned `/Encrypt` object number for this ObjStm-free
     /// fixture) carries the `/Encrypt` dictionary specifically, not merely
-    /// that `/Filter /Standard` appears somewhere in the output. This does
-    /// NOT assert trailer wiring (`/Encrypt` in the trailer — Task 7) or
-    /// per-object string/stream encryption (Task 8); those remain separate
-    /// follow-up work.
+    /// that `/Filter /Standard` appears somewhere in the output. It also
+    /// pins the trailer wiring: the first-page (Part-1) trailer carries
+    /// `/Encrypt {N} 0 R` right after `/ID` (qpdf `writeTrailer`,
+    /// QPDFWriter.cc:1224-1228 — the reference is written for every trailer
+    /// form except `t_lin_second`, the main/second-half trailer), and the
+    /// main trailer at EOF carries no `/Encrypt` at all — checked both by
+    /// scanning the main trailer's own bytes and by confirming `/Encrypt`
+    /// appears exactly once across the whole output. Verified empirically
+    /// against qpdf 11.9.0 (`qpdf --linearize --static-id --static-aes-iv
+    /// --encrypt "" "" 128 --use-aes=y`), which produces the same `/ID [...]
+    /// /Encrypt N 0 R >>` sequence in its first-page trailer. Per-object
+    /// string/stream encryption (Task 8) remains separate follow-up work.
     #[test]
     fn linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number() {
         // Independently recompute the object number `write_linearized` will
@@ -6041,6 +6088,68 @@ mod tests {
             "hint stream object {} must appear physically after the /Encrypt \
              object {expected_encrypt_num} in the output",
             expected_encrypt_num + 1 // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Trailer wiring (Task 7): the classic path emits two `trailer <<`
+        // sections — the Part-1 first-page trailer, then the main (Part-6)
+        // trailer at EOF. `/Encrypt` belongs in the first only.
+        let trailer_needle: &[u8] = b"trailer << ";
+        let first_trailer_pos = out
+            .windows(trailer_needle.len())
+            .position(|w| w == trailer_needle)
+            .expect("classic linearized output must have a Part-1 trailer");
+        let second_trailer_pos = out[first_trailer_pos + trailer_needle.len()..]
+            .windows(trailer_needle.len())
+            .position(|w| w == trailer_needle)
+            .map(|p| p + first_trailer_pos + trailer_needle.len())
+            .expect("classic linearized output must have a main (Part-6) trailer");
+
+        let first_trailer = &out[first_trailer_pos..second_trailer_pos];
+        let main_trailer = &out[second_trailer_pos..];
+
+        // qpdf's key order is `/ID` then `/Encrypt` (QPDFWriter.cc:1221-1228:
+        // `/ID` is written first, then — for every `which != t_lin_second`
+        // trailer form — ` /Encrypt {objid} 0 R` right after it).
+        let encrypt_ref_needle = format!("/Encrypt {expected_encrypt_num} 0 R");
+        assert!(
+            first_trailer
+                .windows(encrypt_ref_needle.len())
+                .any(|w| w == encrypt_ref_needle.as_bytes()),
+            "Part-1 first-page trailer must contain \"{encrypt_ref_needle}\", got {:?}",
+            String::from_utf8_lossy(first_trailer) // cov:ignore: only evaluated when the assertion above fails.
+        );
+        let id_pos = first_trailer
+            .windows(b"/ID".len())
+            .position(|w| w == b"/ID")
+            .expect("Part-1 trailer must carry /ID");
+        let encrypt_pos = first_trailer
+            .windows(b"/Encrypt".len())
+            .position(|w| w == b"/Encrypt")
+            .expect("Part-1 trailer must carry /Encrypt");
+        assert!(
+            encrypt_pos > id_pos,
+            "/Encrypt must come after /ID in the Part-1 trailer (qpdf key order), \
+             got /ID at {id_pos} and /Encrypt at {encrypt_pos}"
+        );
+
+        assert!(
+            !main_trailer
+                .windows(b"/Encrypt".len())
+                .any(|w| w == b"/Encrypt"),
+            "main (Part-6) trailer must NOT contain /Encrypt (qpdf omits it for \
+             t_lin_second), got {:?}",
+            String::from_utf8_lossy(main_trailer) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        let total_encrypt_occurrences = out
+            .windows(b"/Encrypt".len())
+            .filter(|w| *w == b"/Encrypt")
+            .count();
+        assert_eq!(
+            total_encrypt_occurrences, 1,
+            "/Encrypt must appear exactly once in the whole output (the Part-1 \
+             trailer reference); the /Encrypt dictionary object itself never \
+             contains the literal key /Encrypt"
         );
     }
 
