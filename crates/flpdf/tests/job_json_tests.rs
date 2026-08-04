@@ -64,7 +64,7 @@ fn stdout_file_mode_uses_explicit_prefix() {
 
     let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
-        output["qpdf"]["obj:7 0 R"]["stream"]["datafile"],
+        output["qpdf"][1]["obj:7 0 R"]["stream"]["datafile"],
         expected_side_file.to_string_lossy().as_ref()
     );
     assert!(expected_side_file.exists());
@@ -90,7 +90,7 @@ fn file_output_file_mode_defaults_prefix_to_output_filename() {
 
     let output: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
-        output["qpdf"]["obj:7 0 R"]["stream"]["datafile"],
+        output["qpdf"][1]["obj:7 0 R"]["stream"]["datafile"],
         expected_side_file.to_string_lossy().as_ref()
     );
     assert!(expected_side_file.exists());
