@@ -5627,8 +5627,11 @@ mod tests {
     /// yet). It is fine for the write to fail here for a DIFFERENT
     /// `Unsupported` reason — this test only pins that the specific
     /// deterministic-id guard message is not the cause, so it asserts on the
-    /// error message content (unconditionally, so the assertion executes
-    /// regardless of `Ok`/`Err`) rather than the whole `Result`.
+    /// `Result`'s `Debug` text rather than matching a specific `Err` arm: a
+    /// pattern-matched arm on an outcome this fixture never reaches (`Err`,
+    /// while the write currently succeeds) would itself sit permanently
+    /// uncovered, whereas a plain string check runs unconditionally on both
+    /// `Ok` and `Err`.
     #[test]
     fn non_deterministic_encrypt_linearize_no_longer_rejected_by_guard() {
         let mut pdf = open_tiny_pdf();
@@ -5644,15 +5647,11 @@ mod tests {
         };
         let mut pdf2 = open_tiny_pdf();
         let result = write_linearized(&plan, &renumber, &mut pdf2, &opts);
-        let hit_deterministic_id_guard = matches!(
-            &result,
-            Err(crate::Error::Unsupported(m))
-                if m.contains("deterministic-id option is incompatible")
-        );
+        let debug_text = format!("{result:?}");
         assert!(
-            !hit_deterministic_id_guard,
+            !debug_text.contains("deterministic-id option is incompatible"),
             "non-deterministic-id encrypting must not hit the deterministic-id \
-             guard: {result:?}"
+             guard: {debug_text}"
         );
     }
 
