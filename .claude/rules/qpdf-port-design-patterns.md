@@ -80,8 +80,9 @@ flpdf の既存コードは「既に qpdf に合っているもの」と「未�
 - 「flpdf では既に X がこうしている」を設計根拠にする前に、**その X 自体の
   qpdf 対応を確認する**。qpdf 側の対応物が何で、等価かを言えないなら
   根拠に使わない。
-- 特に、公開 API と `pub(crate)` 内部機構を混同しない。qpdf 側で公開
-  クラスなら、flpdf 側の内部専用ヘルパーの流儀は前例にならない。
+- 前例が「同じ形」でも「同じ責務」とは限らない。エラー型・戻り値の選択は、
+  その失敗が **どのコンポーネントの責務に属するか** で決まる。可視性や
+  シグネチャの見た目が似ているだけの前例を根拠にしない。
 - [`docs/qpdf-correspondence.md`](../../docs/qpdf-correspondence.md) で
   該当行を引く。**⚪ は「既知の逸脱」ではなく「逸脱候補（要承認）」**なので、
   ⚪ が付いていることを承認済みの根拠にしない。逆に、確定済みの逸脱は
@@ -90,11 +91,19 @@ flpdf の既存コードは「既に qpdf に合っているもの」と「未�
 
 ### 該当例
 `TokenFilter` が `PipelineResult` を返しているから `StreamDataProvider` も、
-と判断したが誤り。`TokenFilter` は `pub(crate)` の flpdf 内部専用、qpdf の
-`StreamDataProvider` は公開クラス（`include/qpdf/QPDFObjectHandle.hh:72-127`）。
-qpdf の `throw` の移送先は `crate::Error::Internal`/`System`
-（`crate::Error` 自身の doc が「qpdf の `std::logic_error`/`std::runtime_error`
-の公開分類に対応」と明記）。
+と判断したが誤り。可視性の違い（`TokenFilter` は `pub(crate)`）を根拠に
+持ち出したのも誤りで、公開 API であること自体は型を決めない —
+`pub trait Pipeline` の `write`/`finish` 自身が `PipelineResult` を返す。
+
+決めるのは責務の所在。`PipelineError` は pipeline 機構自身の失敗を表す型で、
+qpdf でも `Pipeline` サブクラスが投げる例外に対応する。`StreamDataProvider`
+は pipeline の段ではなく pipeline へ **書き込む側** であり、qpdf でも
+`Pipeline` の派生ではなく `QPDFObjectHandle` の入れ子クラス
+（`include/qpdf/QPDFObjectHandle.hh:72-127`）で、基底クラスの契約違反も
+object handle 層から `std::logic_error` を投げる
+（`libqpdf/QPDFObjectHandle.cc:75`）。失敗は object 層の責務に属するので、
+移送先は `crate::Error::Internal`/`System`（`crate::Error` 自身の doc が
+「qpdf の `std::logic_error`/`std::runtime_error` の公開分類に対応」と明記）。
 
 ## 4. 記録された依存順序を疑う
 
