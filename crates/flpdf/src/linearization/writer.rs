@@ -1163,7 +1163,21 @@ fn patch_linearized_deterministic_id(
 // both the classic and xref-stream trailer forms (right after `/ID`, for
 // every `which != t_lin_second`), so if this scope limitation is ever
 // lifted, thread `encrypt_ctx` here the same way and emit `/Encrypt {N} {G}
-// R` right after the `/ID` array in `write_object`/`write_object_with_id_writer`.
+// R` right after the `/ID` array.
+//
+// CAUTION for that future change: `write_object`/`write_object_with_id_writer`
+// (crate::writer::serialize::xref_stream) are SHARED with the plain
+// (non-linearized) writer's own xref-stream path
+// (crates/flpdf/src/writer/plain/xref.rs), which already deliberately
+// strips "Encrypt" out of its passthrough trailer dict before calling into
+// them (writer/plain/xref.rs's key filter list) — i.e. today, neither
+// caller emits `/Encrypt` there. Do NOT add an unconditional `/Encrypt`
+// write inside those shared functions' bodies: every xref-stream object
+// written through the plain writer would then gain a spurious /Encrypt
+// reference (or, once the plain writer supports encrypt+xref-stream, a
+// doubled one via its trailer passthrough). Add a new opt-in field (e.g.
+// `Option<ObjectRef>` on `XrefStreamDict`) instead, left `None` at the
+// plain writer's call sites, so this stays per-caller.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
@@ -5991,7 +6005,7 @@ mod tests {
     /// that `/Filter /Standard` appears somewhere in the output. It also
     /// pins the trailer wiring: the first-page (Part-1) trailer carries
     /// `/Encrypt {N} 0 R` right after `/ID` (qpdf `writeTrailer`,
-    /// QPDFWriter.cc:1224-1228 — the reference is written for every trailer
+    /// QPDFWriter.cc:1224-1231 — the reference is written for every trailer
     /// form except `t_lin_second`, the main/second-half trailer), and the
     /// main trailer at EOF carries no `/Encrypt` at all — checked both by
     /// scanning the main trailer's own bytes and by confirming `/Encrypt`
