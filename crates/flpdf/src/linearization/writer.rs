@@ -2731,6 +2731,13 @@ pub fn write_linearized<R: Read + Seek>(
     // /Info there); Part-4 batches are interleaved among the second-half
     // objects at their part position.
     //
+    // Unlike the `deterministic_id && encrypting` guard above (which mirrors
+    // a restriction qpdf itself enforces — verified empirically, see
+    // flpdf-txag's design), this one does NOT mirror any qpdf restriction:
+    // qpdf's own QPDFWriter supports linearize+encrypt+ObjStm together. This
+    // is a temporary flpdf implementation gap, not a spec/qpdf constraint —
+    // do not "fix" it by trying to match a nonexistent qpdf behavior.
+    //
     // linearize+encrypt does not yet implement the ObjStm relocation path:
     // `RenumberMap::reserve_encrypt_dict_slot` (wired in by a later encrypting
     // step) and `RenumberMap::place_objstm_members_per_half` are mutually
