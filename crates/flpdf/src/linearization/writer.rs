@@ -5916,11 +5916,10 @@ mod tests {
     /// which pins the pre-this-commit behavior (encryption silently ignored,
     /// write succeeds). `#[ignore]`d until the emission step lands and makes
     /// the assertion below true; Task 6's acceptance criteria include
-    /// removing this attribute AND the `cov:ignore-start`/`cov:ignore-end`
-    /// pair wrapping this test below — once the test runs unconditionally,
-    /// leaving the `cov:ignore` markers in place would silently exempt this
-    /// test body from the patch-coverage gate instead of just no longer
-    /// needing the exemption.
+    /// removing this attribute AND the paired coverage-exclusion comments
+    /// wrapping this test below — once the test runs unconditionally, leaving
+    /// those markers in place would silently exempt this test body from the
+    /// patch-coverage gate instead of just no longer needing the exemption.
     // cov:ignore-start: the test body is instrumented by llvm-cov but never
     // executes because it is `#[ignore]`d until the /Encrypt emission step
     // (see the doc comment above) writes a real object into the reserved
