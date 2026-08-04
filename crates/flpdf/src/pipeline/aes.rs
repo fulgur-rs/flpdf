@@ -10,11 +10,22 @@
 //! cipher rather than beside it.
 
 use super::{Pipeline, PipelineError, PipelineResult};
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{
+    BlockDecrypt, BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit,
+};
 use aes::{Aes128, Aes256};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// qpdf `QPDFCryptoImpl::rijndael_buf_size` (`Pl_AES_PDF.hh:44`).
 const BUF_SIZE: usize = 16;
+
+/// qpdf `Pl_AES_PDF::use_static_iv` (`libqpdf/Pl_AES_PDF.cc:11`), a *static*
+/// member rather than a per-instance flag: `QPDFWriter` turns it on
+/// (`libqpdf/QPDFWriter.cc:296`) with no handle on the individual stages
+/// created inside `QPDF_encryption`, so the switch has to be reachable
+/// without one. Documented "for testing only" in qpdf's own header
+/// (`libqpdf/qpdf/Pl_AES_PDF.hh:36-37`).
+static USE_STATIC_IV: AtomicBool = AtomicBool::new(false);
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -30,6 +41,11 @@ enum Cipher {
     Cbc256Decrypt(Box<Aes256CbcDec>),
     Cbc128Encrypt(Box<Aes128CbcEnc>),
     Cbc256Encrypt(Box<Aes256CbcEnc>),
+    /// `disableCBC` leaves each block independent, with no chaining state.
+    Ecb128Decrypt(Box<Aes128>),
+    Ecb256Decrypt(Box<Aes256>),
+    Ecb128Encrypt(Box<Aes128>),
+    Ecb256Encrypt(Box<Aes256>),
 }
 
 impl Cipher {
@@ -48,6 +64,10 @@ impl Cipher {
             Self::Cbc256Encrypt(cipher) => {
                 cipher.encrypt_block_b2b_mut(inbuf.into(), outbuf.into())
             }
+            Self::Ecb128Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Ecb256Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Ecb128Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Ecb256Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
         }
     }
 }
@@ -163,12 +183,46 @@ impl<'a> PlAesPdf<'a> {
         Ok(())
     }
 
+    /// qpdf `Pl_AES_PDF::useZeroIV` (`Pl_AES_PDF.cc:36-40`): use an all-zero
+    /// vector, which AESV3 key wrapping needs. Like a specified vector it is
+    /// not written to the output.
+    pub(crate) fn use_zero_iv(&mut self) {
+        self.use_zero_iv = true;
+    }
+
+    /// qpdf `Pl_AES_PDF::disablePadding` (`Pl_AES_PDF.cc:42-46`): append no
+    /// padding block when encrypting and strip none when decrypting, which
+    /// AESV3 key wrapping needs.
+    pub(crate) fn disable_padding(&mut self) {
+        self.disable_padding = true;
+    }
+
+    /// qpdf `Pl_AES_PDF::disableCBC` (`Pl_AES_PDF.cc:60-64`), marked "For
+    /// testing only; PDF always uses CBC" in qpdf's header
+    /// (`libqpdf/qpdf/Pl_AES_PDF.hh:34-35`).
+    pub(crate) fn disable_cbc(&mut self) {
+        self.cbc_mode = false;
+    }
+
+    /// qpdf `Pl_AES_PDF::useStaticIV` (`Pl_AES_PDF.cc:66-70`): switch every
+    /// stage in the process to a fixed vector. Marked "For testing only" in
+    /// qpdf's header (`libqpdf/qpdf/Pl_AES_PDF.hh:36-37`), and global for the
+    /// reason [`USE_STATIC_IV`] records.
+    pub(crate) fn use_static_iv() {
+        USE_STATIC_IV.store(true, Ordering::Relaxed);
+    }
+
     /// qpdf `Pl_AES_PDF::initializeVector` (`Pl_AES_PDF.cc:126-143`).
     fn initialize_vector(&mut self) -> PipelineResult<()> {
         if self.use_zero_iv {
             self.cbc_block = [0; BUF_SIZE];
         } else if self.use_specified_iv {
             self.cbc_block = self.specified_iv;
+        } else if USE_STATIC_IV.load(Ordering::Relaxed) {
+            // qpdf `:136-139`: `cbc_block[i] = 14 * (1 + i)`.
+            for (i, byte) in self.cbc_block.iter_mut().enumerate() {
+                *byte = 14u8.wrapping_mul(1 + u8::try_from(i).expect("i < 16"));
+            }
         } else {
             // qpdf `QUtil::initializeWithRandomBytes` (`:141`).
             getrandom::getrandom(&mut self.cbc_block).map_err(|error| {
@@ -248,23 +302,25 @@ impl<'a> PlAesPdf<'a> {
     /// size and direction the constructor already validated.
     fn build_cipher(&self) -> Cipher {
         let iv = &self.cbc_block;
-        match (self.encrypt, self.key.len()) {
-            (false, 16) => {
-                let key: &[u8; 16] = self.key.as_slice().try_into().expect("checked in new");
-                Cipher::Cbc128Decrypt(Box::new(Aes128CbcDec::new(key.into(), iv.into())))
+        let key16 = || -> &[u8; 16] { self.key.as_slice().try_into().expect("checked in new") };
+        let key32 = || -> &[u8; 32] { self.key.as_slice().try_into().expect("checked in new") };
+        match (self.cbc_mode, self.encrypt, self.key.len()) {
+            (true, false, 16) => {
+                Cipher::Cbc128Decrypt(Box::new(Aes128CbcDec::new(key16().into(), iv.into())))
             }
-            (false, _) => {
-                let key: &[u8; 32] = self.key.as_slice().try_into().expect("checked in new");
-                Cipher::Cbc256Decrypt(Box::new(Aes256CbcDec::new(key.into(), iv.into())))
+            (true, false, _) => {
+                Cipher::Cbc256Decrypt(Box::new(Aes256CbcDec::new(key32().into(), iv.into())))
             }
-            (true, 16) => {
-                let key: &[u8; 16] = self.key.as_slice().try_into().expect("checked in new");
-                Cipher::Cbc128Encrypt(Box::new(Aes128CbcEnc::new(key.into(), iv.into())))
+            (true, true, 16) => {
+                Cipher::Cbc128Encrypt(Box::new(Aes128CbcEnc::new(key16().into(), iv.into())))
             }
-            (true, _) => {
-                let key: &[u8; 32] = self.key.as_slice().try_into().expect("checked in new");
-                Cipher::Cbc256Encrypt(Box::new(Aes256CbcEnc::new(key.into(), iv.into())))
+            (true, true, _) => {
+                Cipher::Cbc256Encrypt(Box::new(Aes256CbcEnc::new(key32().into(), iv.into())))
             }
+            (false, false, 16) => Cipher::Ecb128Decrypt(Box::new(Aes128::new(key16().into()))),
+            (false, false, _) => Cipher::Ecb256Decrypt(Box::new(Aes256::new(key32().into()))),
+            (false, true, 16) => Cipher::Ecb128Encrypt(Box::new(Aes128::new(key16().into()))),
+            (false, true, _) => Cipher::Ecb256Encrypt(Box::new(Aes256::new(key32().into()))),
         }
     }
 }
@@ -322,6 +378,34 @@ impl Pipeline for PlAesPdf<'_> {
             self.flush(!self.disable_padding)?;
         }
         self.next.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests_support {
+    use super::{Ordering, USE_STATIC_IV};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `USE_STATIC_IV` is process-global exactly as qpdf's is, so tests that
+    /// depend on its value have to run one at a time and leave it off.
+    // The guard is held for its lifetime, not read; `Drop` is what turns the
+    // switch back off.
+    pub(super) struct StaticIvGuard(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for StaticIvGuard {
+        fn drop(&mut self) {
+            USE_STATIC_IV.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn static_iv_guard() -> StaticIvGuard {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        USE_STATIC_IV.store(false, Ordering::Relaxed);
+        StaticIvGuard(guard)
     }
 }
 
@@ -419,6 +503,172 @@ mod tests {
         let out = sink.take_buffer().expect("buffer");
         assert_eq!(out.len(), PLAINTEXT_32.len() + 16, "one full padding block");
         assert_eq!(out, CIPHERTEXT_32);
+    }
+
+    // `useStaticIV` is a *process-global* switch in qpdf
+    // (`libqpdf/Pl_AES_PDF.cc:11`, `:66-70`), because `QPDFWriter` sets it
+    // (`libqpdf/QPDFWriter.cc:296`) without a handle on the individual stages
+    // created deep inside `QPDF_encryption`. `initializeVector` then fills the
+    // block with `14 * (1 + i)` (`:133-137`), and CBC writes it ahead of the
+    // ciphertext, so it is observable in the output.
+    #[test]
+    fn the_static_vector_is_qpdfs_fourteen_times_one_plus_index() {
+        let _guard = super::tests_support::static_iv_guard();
+        PlAesPdf::use_static_iv();
+
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.write(PLAINTEXT).expect("write");
+        stage.finish().expect("finish");
+
+        let out = sink.take_buffer().expect("buffer");
+        let expected: Vec<u8> = (0..16u8).map(|i| 14u8.wrapping_mul(1 + i)).collect();
+        assert_eq!(&out[..16], expected.as_slice());
+        assert_eq!(
+            &out[..16],
+            &[14, 28, 42, 56, 70, 84, 98, 112, 126, 140, 154, 168, 182, 196, 210, 224],
+            "matches the bytes /usr/bin/qpdf 11.9.0 writes for --static-aes-iv"
+        );
+    }
+
+    // `useZeroIV` zeroes the vector and, being one the reader reconstructs,
+    // keeps it out of the output (`libqpdf/Pl_AES_PDF.cc:38-42`, `:126-130`,
+    // `:160-163`). AESV3 key wrapping needs exactly that.
+    #[test]
+    fn a_zero_vector_is_not_written_to_the_output() {
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES key wrap", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.use_zero_iv();
+        stage.write(PLAINTEXT).expect("write");
+        stage.finish().expect("finish");
+
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(out.len(), 32, "no vector prefix, one padding block");
+
+        let mut back = Buffer::new("plaintext", None);
+        let mut reverse = PlAesPdf::new_decrypt("AES key unwrap", &mut back, &KEY128)
+            .expect("AES-128 key is a supported length");
+        reverse.use_zero_iv();
+        reverse.write(&out).expect("write");
+        reverse.finish().expect("finish");
+        assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT);
+    }
+
+    // `disablePadding` suppresses both the block qpdf would append when
+    // encrypting and the strip it would perform when decrypting
+    // (`libqpdf/Pl_AES_PDF.cc:44-48`, `:98`, `:120`). AESV3 needs it because
+    // the wrapped key is already a block multiple.
+    #[test]
+    fn padding_can_be_disabled_in_both_directions() {
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES key wrap", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.use_zero_iv();
+        stage.disable_padding();
+        stage.write(PLAINTEXT_32).expect("write");
+        stage.finish().expect("finish");
+
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(out.len(), 32, "no padding block appended");
+
+        let mut back = Buffer::new("plaintext", None);
+        let mut reverse = PlAesPdf::new_decrypt("AES key unwrap", &mut back, &KEY128)
+            .expect("AES-128 key is a supported length");
+        reverse.use_zero_iv();
+        reverse.disable_padding();
+        reverse.write(&out).expect("write");
+        reverse.finish().expect("finish");
+        assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT_32);
+    }
+
+    // AES-256 travels the same path; only the key length picks the cipher
+    // (`rijndael_init`'s key_bytes argument, `libqpdf/Pl_AES_PDF.cc:176-177`).
+    #[test]
+    fn aes_256_round_trips_through_the_generated_vector() {
+        let key = [0x5au8; 32];
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES-256 stream encryption", &mut sink, &key)
+            .expect("AES-256 key is a supported length");
+        stage.write(PLAINTEXT).expect("write");
+        stage.finish().expect("finish");
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(out.len(), 16 + 32, "generated vector, then two blocks");
+
+        let mut back = Buffer::new("plaintext", None);
+        let mut reverse = PlAesPdf::new_decrypt("AES-256 stream decryption", &mut back, &key)
+            .expect("AES-256 key is a supported length");
+        reverse.write(&out).expect("write");
+        reverse.finish().expect("finish");
+        assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT);
+    }
+
+    // Without a static, zero or specified vector the stage draws a fresh one
+    // per instance (`QUtil::initializeWithRandomBytes`,
+    // `libqpdf/Pl_AES_PDF.cc:140-142`), so two encryptions of the same input
+    // differ in their leading block.
+    #[test]
+    fn a_generated_vector_differs_between_two_encryptions() {
+        let _guard = super::tests_support::static_iv_guard();
+
+        let encrypt_once = || {
+            let mut sink = Buffer::new("ciphertext", None);
+            let mut stage = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &KEY128)
+                .expect("AES-128 key is a supported length");
+            stage.write(PLAINTEXT).expect("write");
+            stage.finish().expect("finish");
+            sink.take_buffer().expect("buffer")
+        };
+
+        assert_ne!(encrypt_once()[..16], encrypt_once()[..16]);
+    }
+
+    // `disableCBC` drops the chaining entirely, so each block stands alone and
+    // no vector is established (`libqpdf/Pl_AES_PDF.cc:60-64`, and the
+    // `if (this->cbc_mode)` guard at `:155`). Two identical plaintext blocks
+    // therefore encrypt to two identical ciphertext blocks -- the property
+    // that makes ECB unsuitable for real data and is why qpdf marks this
+    // "For testing only".
+    #[test]
+    fn disabling_cbc_leaves_identical_blocks_identical() {
+        let mut sink = Buffer::new("ciphertext", None);
+        let mut stage = PlAesPdf::new_encrypt("AES ECB", &mut sink, &KEY128)
+            .expect("AES-128 key is a supported length");
+        stage.disable_cbc();
+        stage.disable_padding();
+        stage.write(PLAINTEXT_32).expect("write");
+        stage.finish().expect("finish");
+
+        let out = sink.take_buffer().expect("buffer");
+        assert_eq!(out.len(), 32, "no vector prefix and no padding block");
+        assert_eq!(out[..16], out[16..], "identical blocks encrypt identically");
+
+        let mut back = Buffer::new("plaintext", None);
+        let mut reverse = PlAesPdf::new_decrypt("AES ECB", &mut back, &KEY128)
+            .expect("AES-128 key is a supported length");
+        reverse.disable_cbc();
+        reverse.disable_padding();
+        reverse.write(&out).expect("write");
+        reverse.finish().expect("finish");
+        assert_eq!(back.take_buffer().expect("buffer"), PLAINTEXT_32);
+    }
+
+    // An unsupported key length is rejected: qpdf's own header scopes this
+    // pipeline to AES-128 and AES-256 (`libqpdf/qpdf/Pl_AES_PDF.hh:8-9`).
+    #[test]
+    fn a_key_that_is_neither_128_nor_256_bits_is_rejected() {
+        let mut sink = Buffer::new("ciphertext", None);
+
+        let Err(error) = PlAesPdf::new_encrypt("AES stream encryption", &mut sink, &[0u8; 24])
+        else {
+            panic!("24 bytes is not a supported AES key length");
+        };
+
+        assert!(
+            error.to_string().contains("16 or 32 bytes"),
+            "unexpected message: {error}"
+        );
     }
 
     // `setIV` throws when the vector is not exactly the block size
