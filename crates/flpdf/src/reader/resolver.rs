@@ -101,18 +101,14 @@ use std::rc::{Rc, Weak};
 /// `foreign_object_maps`, dirty tracking, and every legacy field already
 /// carrying a `qpdf-cutover-delete` marker — stays on `Pdf`.
 ///
-/// **One member of that restriction is deliberately missing.**
-///
-/// *The string decrypter's encryption parameters* (qpdf `m->encp`). qpdf
-/// builds a `StringDecrypter` per object inside `readObjectAtOffset`'s parse
-/// and passes it to `QPDFParser` only when the document is encrypted —
-/// `StringDecrypter* decrypter_ptr = m->encp->encrypted ? &decrypter : nullptr`
-/// (`libqpdf/QPDF.cc:1337-1339`). Encrypted documents are out of scope for
-/// this slice, so there is nothing here for `encp` to feed; the field arrives
-/// with the code that decrypts strings during resolution. `Pdf::encryption`
-/// holds flpdf's equivalent state meanwhile. Note this is *string*
-/// decryption only — stream decryption is not part of the resolver at all
-/// (qpdf decrypts streams at pipe time, `decryptStream`, `QPDF.cc:2491`).
+/// One member is present for a consumer this slice does not yet have: the
+/// encryption parameters (qpdf `m->encp`), added in flpdf-25kg.3.11 so
+/// flpdf-25kg.3.10's pipe-time stream decryption has something to read.
+/// Resolve-time *string* decryption is unrelated and unchanged — qpdf
+/// decrypts strings during `readObjectAtOffset`'s parse
+/// (`StringDecrypter`, `libqpdf/QPDF.cc:1337-1339`) but streams only at pipe
+/// time (`decryptStream`, `QPDF.cc:2491`); wiring the string decrypter in is
+/// still flpdf-25kg.3.5 AC2. See [`ResolverCore::encryption_parameters`].
 pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// qpdf `m->file` (`QPDF.hh:1456`).
     reader: R,
@@ -197,6 +193,29 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// each of those takes and drops its own borrow, so nothing is held when
     /// the push happens.
     repair_diagnostics: Diagnostics,
+    /// qpdf `m->encp` (`include/qpdf/QPDF.hh:1463`), the encryption
+    /// parameters `QPDF::pipeStreamData`'s static overload takes as its first
+    /// argument and consults before piping a stream
+    /// (`libqpdf/QPDF.cc:2477-2492`) — the primitive flpdf-25kg.3.10 adds.
+    ///
+    /// `Rc<RefCell<..>>` rather than a bare `Option<EncryptionState>`,
+    /// because qpdf's `m->encp` is a `std::shared_ptr<EncryptionParameters>`:
+    /// a second owner (`ForeignStreamData::encp`, `QPDF.hh:939`) holds the
+    /// *same* allocation, constructed from `QPDF::Members::encp` by copying
+    /// the shared_ptr (`QPDF.cc:2266`), not by copying the data. `Pdf::encryption`
+    /// holds a clone of this same `Rc`, obtained via
+    /// [`ResolverHandle::encryption_parameters`] in `open_with_repair_mode`,
+    /// so `Pdf::authenticate_if_encrypted`'s one write is visible here
+    /// without a second write site.
+    ///
+    /// Constructed empty (`None`) in [`ResolverHandle::new_shared`] and
+    /// populated later, matching `Members::encp(new EncryptionParameters)`
+    /// (`QPDF.cc:201`): default-constructed at document-construction time,
+    /// `encrypted = false` until `initializeEncryption()` runs. flpdf has no
+    /// separate `encrypted`/`encryption_initialized` pair — the outer
+    /// `Option` serves both; see the field-mapping table in this issue's
+    /// design (`bd show flpdf-25kg.3.11`) for the disclosed collapse.
+    encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -427,6 +446,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolved_object_streams: BTreeSet::new(),
                 attempt_recovery,
                 repair_diagnostics,
+                encryption_parameters: Rc::new(RefCell::new(None)),
             }),
             self_weak: self_weak.clone(),
             pdf_unique_id,
@@ -575,6 +595,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// [`ResolverCore::header_offset`].
     pub(crate) fn header_offset(&self) -> usize {
         self.core.borrow().header_offset
+    }
+
+    /// This document's encryption parameters, in their shared, mutable-in-
+    /// place form — the pipe-side door onto [`ResolverCore::encryption_parameters`].
+    ///
+    /// Clones the `Rc` under a single short borrow, matching every other
+    /// accessor here: nothing is held once this returns, so a caller that
+    /// then does I/O through `self` cannot double-borrow.
+    ///
+    /// `pub(in crate::reader)` rather than the plan's `pub(crate)`: the
+    /// return type names `EncryptionState`, which is private to `reader.rs`
+    /// (`pub(self)`), so a `pub(crate)` signature trips rustc's
+    /// `private_interfaces` lint (denied under this workspace's
+    /// `-D warnings` clippy gate) — a real signature is at most as visible
+    /// as the least visible type it names. Narrowing the *accessor* to match
+    /// is the fix that stays inside `resolver.rs`; widening `EncryptionState`
+    /// itself would touch `reader.rs`, out of scope for this task. Every
+    /// caller identified so far (`Pdf` and flpdf-25kg.3.10's pipe-time read
+    /// primitive) lives under `crate::reader`, so this is not yet known to be
+    /// too narrow — but if a later consumer lives outside `crate::reader`,
+    /// this will need widening together with `EncryptionState` itself.
+    pub(in crate::reader) fn encryption_parameters(
+        &self,
+    ) -> Rc<RefCell<Option<crate::reader::EncryptionState>>> {
+        self.core.borrow().encryption_parameters.clone()
     }
 
     /// This document's cross-reference entry for `object_ref`, if the source
@@ -1560,8 +1605,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 #[cfg(test)]
 mod tests {
     use super::ResolveMark;
+    use super::ResolverHandle;
     use crate::object_handle::NO_PARSED_OFFSET;
-    use crate::{Error, ObjectRef, Pdf, Severity};
+    use crate::{Diagnostics, Error, ObjectRef, Pdf, Severity, XrefEntry};
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::sync::Arc;
 
     /// A three-object document with a classic cross-reference table: catalog,
@@ -1591,6 +1639,117 @@ mod tests {
                 .as_bytes(),
         );
         pdf
+    }
+
+    /// A resolver built directly, bypassing `Pdf::open` entirely — the state
+    /// qpdf's `Members::encp(new EncryptionParameters)` is in immediately
+    /// after `QPDF` construction, before `initializeEncryption()` has run.
+    fn bare_resolver() -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
+        ResolverHandle::new_shared(
+            Cursor::new(minimal_pdf_bytes()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            Diagnostics::default(),
+            0,
+        )
+    }
+
+    /// AC6 case 4: a resolver on which no authentication step has run at all
+    /// reports no encryption parameters. This is qpdf's
+    /// `encryption_initialized == false` state.
+    ///
+    /// **This does not discriminate that state from qpdf's
+    /// `encryption_initialized == true, encrypted == false` state** (an
+    /// authenticated-but-unencrypted document, see
+    /// [`an_unencrypted_document_reports_no_encryption_parameters`] below).
+    /// This test builds its resolver directly via `bare_resolver()`,
+    /// bypassing `Pdf::open` entirely, so `Pdf::authenticate_if_encrypted`
+    /// never runs here and both states collapse to the same `None`
+    /// regardless of `Pdf` sharing this cell — that collapse is qpdf's
+    /// `encrypted`/`encryption_initialized` pair mapping onto one
+    /// `Option<EncryptionState>` (see the field-mapping table in this
+    /// issue's design, `bd show flpdf-25kg.3.11`), not evidence one way or
+    /// the other about whether `Pdf` and `ResolverCore` share an allocation
+    /// — [`an_rc4_document_reports_its_encryption_parameters_through_the_shared_cell`]
+    /// and its AES sibling are what pin the sharing itself.
+    #[test]
+    fn a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters() {
+        let resolver = bare_resolver();
+        assert!(resolver.encryption_parameters().borrow().is_none());
+    }
+
+    /// AC6 case 1: a document with no `/Encrypt` entry authenticates
+    /// (`Pdf::authenticate_if_encrypted` runs and returns early) and reports
+    /// no encryption parameters through the resolver-side handle — the
+    /// `encryption_initialized == true, encrypted == false` qpdf state,
+    /// pinned separately from
+    /// `a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters`'s
+    /// `encryption_initialized == false`, even though both observe `None`.
+    #[test]
+    fn an_unencrypted_document_reports_no_encryption_parameters() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        assert!(pdf.resolver.encryption_parameters().borrow().is_none());
+    }
+
+    /// AC6 case 2: an RC4-encrypted document authenticates through `Pdf`,
+    /// and the resolver-side handle observes what that authentication wrote
+    /// — proving `Pdf::encryption` and `ResolverCore::encryption_parameters`
+    /// are the same allocation, not two independently-written copies. (A
+    /// design where `Pdf` held its own separate cell would also authenticate
+    /// successfully but leave this resolver-side read at `None`.)
+    #[test]
+    fn an_rc4_document_reports_its_encryption_parameters_through_the_shared_cell() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+        );
+        let bytes = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+        let options = crate::PdfOpenOptions {
+            password: b"user-v2".to_vec(),
+            allow_weak_crypto: true,
+            ..crate::PdfOpenOptions::default()
+        };
+        let pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open RC4 fixture");
+        let cell = pdf.resolver.encryption_parameters();
+        let guard = cell.borrow();
+        let encryption = guard.as_ref().expect("RC4 fixture must authenticate");
+        assert_eq!(encryption.stream_mode, crate::reader::EncryptionMode::Rc4);
+        // RC4-128 derives a 16-byte file key (qpdf Algorithm 2, key length
+        // bits / 8). stream_mode and file_key are sibling fields of one
+        // EncryptionState behind one Option, so `Some` already proves both
+        // arrived through the shared cell together; this assertion instead
+        // checks the derived payload itself -- a real consumer (the
+        // per-object key derivation a decryptStream port would need) cares
+        // about the key's actual length, not just that a key is present.
+        assert_eq!(encryption.file_key.len(), 16);
+    }
+
+    /// AC6 case 3: same shape, an AES-128 document.
+    #[test]
+    fn an_aes_document_reports_its_encryption_parameters_through_the_shared_cell() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v4-aes-128-r4.pdf"
+        );
+        let bytes = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v4-aes-128-r4.pdf");
+        let options = crate::PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..crate::PdfOpenOptions::default()
+        };
+        let pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open AES fixture");
+        let cell = pdf.resolver.encryption_parameters();
+        let guard = cell.borrow();
+        let encryption = guard.as_ref().expect("AES fixture must authenticate");
+        assert_eq!(
+            encryption.stream_mode,
+            crate::reader::EncryptionMode::Aes128
+        );
+        assert_eq!(encryption.file_key.len(), 16);
     }
 
     /// The attach itself: a handle vended by a live document must reach that

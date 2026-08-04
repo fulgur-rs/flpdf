@@ -29,6 +29,7 @@ use crate::xref::load_xref_state_with_repair;
 use crate::{
     Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
 use std::rc::Rc;
@@ -179,7 +180,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     qpdf_removed_refs: BTreeSet<ObjectRef>,
     /// Monotonic observation matching qpdf's `everCalledGetAllPages()`.
     ever_called_get_all_pages: bool,
-    encryption: Option<EncryptionState>,
+    encryption: Rc<RefCell<Option<EncryptionState>>>,
 }
 
 pub(crate) struct QpdfPreparedObjects {
@@ -512,11 +513,12 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Whether this document authenticated an `/Encrypt` dictionary while opening.
     pub fn is_encrypted(&self) -> bool {
-        self.encryption.is_some()
+        self.encryption.borrow().is_some()
     }
 
     pub(crate) fn encryption_ref(&self) -> Option<ObjectRef> {
         self.encryption
+            .borrow()
             .as_ref()
             .and_then(|encryption| encryption.encrypt_ref)
     }
@@ -524,6 +526,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Whether opening this document required the weak-crypto opt-in.
     pub fn uses_weak_crypto(&self) -> bool {
         self.encryption
+            .borrow()
             .as_ref()
             .is_some_and(|encryption| encryption.weak_crypto)
     }
@@ -531,6 +534,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Advisory standard security handler permissions from `/P`, if the document is encrypted.
     pub fn permissions(&self) -> Option<Permissions> {
         self.encryption
+            .borrow()
             .as_ref()
             .map(|encryption| encryption.permissions)
     }
@@ -539,6 +543,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// document's user password (`/U`). Always `false` for plaintext PDFs.
     pub fn user_password_matched(&self) -> bool {
         self.encryption
+            .borrow()
             .as_ref()
             .is_some_and(|encryption| encryption.user_password_matched)
     }
@@ -549,6 +554,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// same time as [`Pdf::user_password_matched`].
     pub fn owner_password_matched(&self) -> bool {
         self.encryption
+            .borrow()
             .as_ref()
             .is_some_and(|encryption| encryption.owner_password_matched)
     }
@@ -557,11 +563,14 @@ impl<R: Read + Seek> Pdf<R> {
     /// encrypted file. `None` for plaintext PDFs.
     ///
     /// Read-only accessor for the `show-encryption-key` inspection
-    /// subcommand; does not run or alter authentication.
-    pub fn encryption_file_key(&self) -> Option<&[u8]> {
+    /// subcommand; does not run or alter authentication. Returns an owned
+    /// copy rather than a borrowed slice, since this is an inspection
+    /// accessor rather than a hot path.
+    pub fn encryption_file_key(&self) -> Option<Vec<u8>> {
         self.encryption
+            .borrow()
             .as_ref()
-            .map(|encryption| encryption.file_key.as_slice())
+            .map(|encryption| encryption.file_key.clone())
     }
 
     /// Read-only snapshot of the `/Encrypt` parameters for the
@@ -583,7 +592,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// - [`Error::Io`] / [`Error::Parse`] when the `/Encrypt` entry is an indirect
     ///   reference whose resolution fails.
     pub fn encryption_info(&mut self) -> Result<Option<EncryptionInfo>> {
-        if self.encryption.is_none() {
+        if self.encryption.borrow().is_none() {
             return Ok(None);
         }
         let Some(encrypt) = self.encrypt_dictionary()? else {
@@ -604,8 +613,8 @@ impl<R: Read + Seek> Pdf<R> {
         // through the same named-CF map used for StmF/StrF.
         let eff_selector = crypt_filter_selector(&encrypt, "EFF")?;
 
-        let encryption = self
-            .encryption
+        let encryption_guard = self.encryption.borrow();
+        let encryption = encryption_guard
             .as_ref()
             .expect("checked is_some above; authenticate_if_encrypted set it");
         let permissions = encryption.permissions;
@@ -687,16 +696,21 @@ impl<R: Read + Seek> Pdf<R> {
         // same id: it stamps `pdf_unique_id` onto every canonical handle it
         // mints, which `ObjectHandle::belongs_to_pdf` answers on.
         let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
+        let resolver = ResolverHandle::new_shared(
+            reader,
+            loaded_state.header_offset,
+            source_xref_entries,
+            options.repair,
+            loaded.repair_diagnostics,
+            unique_id,
+        );
+        // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
+        // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
+        // separate copy kept in sync.
+        let encryption = resolver.encryption_parameters();
         let mut pdf = Self {
             unique_id,
-            resolver: ResolverHandle::new_shared(
-                reader,
-                loaded_state.header_offset,
-                source_xref_entries,
-                options.repair,
-                loaded.repair_diagnostics,
-                unique_id,
-            ),
+            resolver,
             version: loaded.version,
             trailer: loaded.trailer,
             startxref: loaded.startxref,
@@ -718,7 +732,7 @@ impl<R: Read + Seek> Pdf<R> {
             qpdf_parsed_xref_streams: loaded_state.parsed_xref_streams,
             qpdf_removed_refs: BTreeSet::new(),
             ever_called_get_all_pages: false,
-            encryption: None,
+            encryption,
         };
         pdf.authenticate_if_encrypted(&options)?;
         Ok(pdf)
@@ -918,7 +932,7 @@ impl<R: Read + Seek> Pdf<R> {
         } else {
             None
         };
-        self.encryption = Some(EncryptionState {
+        *self.encryption.borrow_mut() = Some(EncryptionState {
             file_key,
             stream_mode,
             string_mode,
@@ -2003,7 +2017,8 @@ impl<R: Read + Seek> Pdf<R> {
         // parsed offsets, and round-tripping through `materialize`/`lift` to
         // reach a legacy-engine decryption path would silently reset them.
         if native_parsed {
-            if let Some(encryption) = &self.encryption {
+            let encryption_guard = self.encryption.borrow();
+            if let Some(encryption) = encryption_guard.as_ref() {
                 decrypt_object_value_strings(object_ref, &mut value, encryption)?;
             }
         }
@@ -2885,7 +2900,8 @@ impl<R: Read + Seek> Pdf<R> {
         mut object: Object,
         recovered_stream_eol: Option<&[u8]>,
     ) -> Result<(Object, bool)> {
-        let Some(encryption) = &self.encryption else {
+        let encryption_guard = self.encryption.borrow();
+        let Some(encryption) = encryption_guard.as_ref() else {
             return Ok((object, false));
         };
         if Some(object_ref) == encryption.encrypt_ref {
@@ -7760,7 +7776,7 @@ mod tests {
         let bytes = recovered_stream_fixture(b"", b"\n", None);
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open recovered-stream fixture");
         let object_ref = ObjectRef::new(1, 0);
-        pdf.encryption = Some(EncryptionState {
+        *pdf.encryption.borrow_mut() = Some(EncryptionState {
             stream_mode: EncryptionMode::Rc4,
             ..explicit_rc4_encryption_state()
         });
