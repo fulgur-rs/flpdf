@@ -2233,6 +2233,106 @@ fn unparse_dict_entries_qdf(
     Ok(())
 }
 
+impl ObjectHandle {
+    /// This stream-dictionary handle's writer-emission form, matching
+    /// `Dictionary::write_pdf_stream`'s established layout (`object.rs`)
+    /// -- the `/Length`-last, optionally re-filtered
+    /// stream-dictionary shape `QPDFWriter::unparseObject`'s stream branch
+    /// produces when it delegates to its own dictionary branch
+    /// (`QPDFWriter.cc:1440-1442` enters with `flags |= f_stream`;
+    /// `1451-1455`, only when `refiltered`, drops `/Filter`/`/DecodeParms`;
+    /// `1488-1527` is the dictionary-branch loop that writes the surviving
+    /// keys, `/Length`, and, when `refiltered`, a fresh `/Filter
+    /// /FlateDecode`) -- plus the same null-suppression rule as
+    /// [`Self::unparse_object`], since this delegation target is the
+    /// identical dictionary branch.
+    ///
+    /// Like `write_pdf_stream` itself, this primitive does not replicate
+    /// every qpdf step in that line range: the unconditional
+    /// empty-`/DecodeParms`-array removal (`1444-1449`), the
+    /// `/Crypt`-filter stripping in the non-refiltered branch
+    /// (`1456-1485`), qpdf's `compress && (flags & f_filtered)` gate on the
+    /// trailing `/Filter /FlateDecode` append (`1519`, driven by
+    /// `refiltered` alone here), and qpdf's own computed `/Length` *value*
+    /// (`1508-1518`: `stream_length`/`cur_stream_length_id`, not the
+    /// dictionary's own stored value) are all out of scope -- inherited
+    /// unchanged from `write_pdf_stream`'s own established simplifications
+    /// (see that function's doc for the full qpdf-correspondence caveat).
+    ///
+    /// `self` must resolve to a `Dictionary`; a non-dictionary value writes
+    /// as an empty `<< >>` mirroring `write_pdf_stream`'s own typed-input
+    /// assumption (this crate's writer never calls it on anything else).
+    ///
+    /// Forces resolution of `self` before dispatch, the same as
+    /// [`Self::unparse_object`]/[`Self::unparse_object_qdf`]'s own
+    /// top-level entry points -- this primitive's usual caller already
+    /// holds an already-resolved stream's dictionary handle, but nothing
+    /// enforces that at the type level, and an as-yet-unresolved indirect
+    /// handle whose document has been dropped must surface as an error
+    /// here too, not silently degrade to an empty `<< >>` the way an
+    /// unresolved [`Self::with_value`] read alone would (see
+    /// `unparse_stream_body_propagates_a_dropped_document_error`, which
+    /// fails without this call).
+    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    pub(crate) fn unparse_stream_body(&self, out: &mut Vec<u8>, refiltered: bool) -> Result<()> {
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries(&entries, refiltered, out)
+        })
+    }
+}
+
+// Writes a stream dictionary's own body -- `unparse_stream_body`'s sole
+// callee -- matching `Dictionary::write_pdf_stream`'s established shape
+// (`object.rs`) with `visible_dict_entries`'s null-suppression layered on
+// top, the same delegation `unparse_dict_entries` above makes to that
+// helper for the plain (non-stream) dictionary case. `/Length` is captured
+// during the single suppressed-entries pass and written last rather than in
+// its natural (sorted) position; when `refiltered`, `/Filter` and
+// `/DecodeParms` are dropped from that pass and a fresh `/Filter
+// /FlateDecode` is appended after `/Length` instead -- both spellings
+// verified byte-for-byte against `write_pdf_stream` (`object.rs`) before
+// this primitive's tests were written.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn unparse_stream_dict_entries(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    refiltered: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if key.as_slice() == b"Length" {
+            length_value = Some(value);
+            continue;
+        }
+        if refiltered && (key.as_slice() == b"Filter" || key.as_slice() == b"DecodeParms") {
+            continue;
+        }
+        out.push(b' ');
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        write_child(value, out)?;
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child(length, out)?;
+    }
+    if refiltered {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
 // `ObjectHandle::shallow_copy`'s per-variant dispatch: an Array/Dictionary
 // child is recursively shallow-copied through `shallow_copy_child` (which
 // re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
@@ -4515,6 +4615,70 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         handle.unparse_object_qdf(&mut out, 4).unwrap();
         assert_eq!(out, b"<<\n    >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_writes_length_last_preserved() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(out, b"<< /Filter /FlateDecode /Length 3 >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_refiltered_drops_filter_and_decodeparms_appends_flate() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+            ),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body(&mut out, true).unwrap();
+        assert_eq!(out, b"<< /Length 3 /Filter /FlateDecode >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_suppresses_a_null_valued_key() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+            (b"Metadata".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(out, b"<< /Length 3 >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_writes_empty_dict_for_a_non_dictionary_self() {
+        // Pins the doc comment's typed-input-assumption claim: a
+        // non-dictionary `self` (mirroring `write_pdf_stream`'s own
+        // assumption that it is only ever called on a stream's dictionary)
+        // writes an empty `<< >>` rather than panicking or erroring.
+        let mut out = Vec::new();
+        ObjectHandle::integer(5)
+            .unparse_stream_body(&mut out, false)
+            .unwrap();
+        assert_eq!(out, b"<< >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_propagates_a_dropped_document_error() {
+        // Mirrors unparse_object_propagates_a_dropped_document_error: an
+        // as-yet-unresolved indirect handle whose document has been dropped
+        // must surface as an error here too, not silently degrade to an
+        // empty `<< >>` the way an unresolved `with_value` read alone would.
+        let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(resolver);
+        let mut out = Vec::new();
+        assert!(indirect.unparse_stream_body(&mut out, false).is_err());
     }
 }
 
