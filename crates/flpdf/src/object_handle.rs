@@ -1705,6 +1705,41 @@ impl ObjectHandle {
     pub(crate) fn unparse_object(&self, out: &mut Vec<u8>) -> Result<()> {
         unparse_object_walk(self, out)
     }
+
+    /// QDF-mode counterpart of [`Self::unparse_object`] — same qpdf function
+    /// and the same call shape (`QPDFWriter::unparseObject`,
+    /// `QPDFWriter.cc:1318-1527`, `level=0, flags=0`), but with the writer's
+    /// own `m->qdf_mode` member set to `true` rather than `false` — a mode
+    /// flag `unparseObject` checks internally, not an alternate set of call
+    /// arguments. Carries forward this port's existing split between compact
+    /// and QDF container framing (`Object::write_pdf` / `Object::write_pdf_qdf`, this crate's
+    /// `object.rs`; see `docs/qpdf-correspondence.md`'s `QPDFWriter.cc` row,
+    /// classified 🔀, for that split) rather than re-deriving the indent
+    /// arithmetic from scratch: `indent` is the column (number of leading
+    /// spaces) at which *this* value's own opening delimiter sits, an array
+    /// or dictionary's children are written at `indent + 2`, and its closing
+    /// delimiter (`]` / `>>`) returns to column `indent` on its own line —
+    /// exactly [`Object::write_pdf_qdf`]'s own documented contract. Every
+    /// scalar (including a resolved-indirect [`ObjectValue::Reference`], no
+    /// qpdf counterpart, same as [`Self::unparse_object`]'s own choice for
+    /// it) writes byte-identically to the non-QDF form; only array,
+    /// dictionary, and stream-dictionary-inlining framing differ.
+    ///
+    /// Applies the exact same null-suppression rule as [`Self::unparse_object`]
+    /// (dictionary entries only — `QPDFWriter.cc:1490-1491`; an array keeps
+    /// null elements verbatim, `QPDF_Array::unparse` has no such rule) via
+    /// the same [`visible_dict_entries`] helper, and the same forced
+    /// top-level resolution of `self` before dispatch. See
+    /// [`Self::unparse_object`]'s own doc for the identical
+    /// indirect-handle-resolving-to-a-`Stream` caveat: this call dispatches
+    /// on `self` directly, bypassing the child-position reference check, so
+    /// it inlines just the dictionary rather than implementing qpdf's real
+    /// stream-writing framing (`unparse_stream_body`, a later task of this
+    /// same plan).
+    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    pub(crate) fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+        unparse_object_walk_qdf(self, indent, out)
+    }
 }
 
 // The sole recursion hub for `ObjectHandle::materialize` — every nested
@@ -2047,6 +2082,139 @@ fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) 
         write_child(value, out)?;
     }
     out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+// Append `n` ASCII space bytes to `out` — the QDF family's own copy of
+// `object.rs`'s private `push_spaces` helper. Not reusable across the module
+// boundary (that one is not `pub(crate)`, and this task's scope is
+// `object_handle.rs` only), but the two are one-line bodies, not logic worth
+// sharing at the cost of widening `object.rs`'s API for a single call site.
+fn push_spaces(out: &mut Vec<u8>, n: usize) {
+    out.resize(out.len() + n, b' ');
+}
+
+// QDF-mode sibling of `write_child` above: an indirect child always writes
+// as its own `"N G R"` reference form regardless of QDF mode — qpdf never
+// inlines an indirect object at a child position in either mode, the same
+// unconditional split `unparse_materialize_child` already applies. A direct
+// child recurses through `unparse_object_walk_qdf` at `indent`, the same
+// column its own container already committed to for this child (an array
+// element or dict value sits at its container's `indent + 2`; see
+// `unparse_object_value_qdf`'s own Array/Dictionary arms for where that
+// `+ 2` is actually applied before calling this).
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
+    if let Some(object_ref) = handle.object_ref() {
+        out.extend_from_slice(object_ref.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_qdf(handle, indent, out)
+}
+
+// QDF-mode sibling of `unparse_object_walk` above, threading an `indent`
+// column through the same forced-top-level-resolution / stack-growth-wrapped
+// recursion hub shape. See that function's own doc for why `try_dereference`
+// is forced here rather than left to `with_value`'s ordinary no-hidden-I/O
+// contract, and for the same conservative-null fallback rationale on the
+// `None` arm below.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn unparse_object_walk_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.try_dereference()?;
+        handle.with_value(|value| match value {
+            Some(value) => unparse_object_value_qdf(value, indent, out),
+            None => {
+                // cov:ignore-start: unreachable once `try_dereference()`
+                // above has returned `Ok` -- see `unparse_object_walk`'s own
+                // identical arm for why.
+                out.extend_from_slice(b"null");
+                Ok(())
+                // cov:ignore-end
+            }
+        })
+    })
+}
+
+// QDF-mode sibling of `unparse_object_value` above. Only the container arms
+// (`Array`, `Dictionary`, the `Stream` dictionary-inlining arm) differ from
+// the plain form -- every scalar/name/string/reference arm is byte-identical
+// between the two modes (`Object::write_pdf_qdf`'s own fallthrough to
+// `self.write_pdf(out)` for everything but its three container arms is the
+// same split), so this delegates that whole fallthrough set to
+// `unparse_object_value` itself rather than duplicating its match arms.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8>) -> Result<()> {
+    match value {
+        ObjectValue::Array(children) => {
+            // Object::write_pdf_qdf's Array arm (object.rs): `[`, a newline,
+            // then per element `indent + 2` leading spaces + the child's own
+            // QDF form + a trailing newline, then `indent` leading spaces and
+            // `]`.
+            out.push(b'[');
+            out.push(b'\n');
+            for child in children {
+                push_spaces(out, indent + 2);
+                write_child_qdf(child, indent + 2, out)?;
+                out.push(b'\n');
+            }
+            push_spaces(out, indent);
+            out.push(b']');
+        }
+        ObjectValue::Dictionary(entries) => {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            unparse_dict_entries_qdf(&entries, indent, out)?;
+        }
+        ObjectValue::Stream { stream_dict, .. } => {
+            // Same reachability and "inlines only the dictionary" caveat as
+            // `unparse_object_value`'s own `Stream` arm (see its doc): this
+            // recurses into the stream's dictionary handle at the *same*
+            // `indent`, not `indent + 2` -- a stream dictionary is not a
+            // child sitting inside a container the way an array element or
+            // dict value is; it occupies this same value's own position,
+            // exactly as `Object::write_pdf_qdf`'s `Stream` arm calls
+            // `stream.dict.write_pdf_qdf(out, indent)` at the unincremented
+            // indent before appending its `stream`/`endstream` framing.
+            unparse_object_walk_qdf(stream_dict, indent, out)?;
+        }
+        // Every remaining variant (Null, Boolean, Integer, Real, RealLiteral,
+        // Name, String, Operator, InlineImage, Reference) has no QDF-specific
+        // framing -- reuse `unparse_object_value`'s own arms for them
+        // verbatim rather than duplicating scalar-formatting logic.
+        other => unparse_object_value(other, out)?,
+    }
+    Ok(())
+}
+
+// QDF-mode sibling of `unparse_dict_entries` above: `<<\n`, then one
+// `  /Key value\n` line per surviving entry (indented `indent + 2`, keys in
+// the same lexicographic order `visible_dict_entries` preserves), then `>>`
+// at column `indent` on its own line -- matches `Dictionary::write_pdf_qdf`'s
+// own layout (`object.rs`) exactly, including its documented empty-dictionary
+// shape (`<<\n<indent spaces>>>`) when every entry is absent or suppressed.
+// Suppression itself is `visible_dict_entries`, unchanged from the plain
+// path -- QDF mode does not alter *which* entries survive, only how the
+// survivors are laid out.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn unparse_dict_entries_qdf(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<\n");
+    for (key, value) in visible_dict_entries(entries)? {
+        push_spaces(out, indent + 2);
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        write_child_qdf(value, indent + 2, out)?;
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
     Ok(())
 }
 
@@ -4210,6 +4378,98 @@ mod unparse_object_tests {
         drop(resolver);
         let mut out = Vec::new();
         assert!(indirect.unparse_object(&mut out).is_err());
+    }
+
+    #[test]
+    fn unparse_object_qdf_writes_a_scalar_like_plain_unparse() {
+        let mut out = Vec::new();
+        ObjectHandle::integer(42)
+            .unparse_object_qdf(&mut out, 0)
+            .unwrap();
+        assert_eq!(out, b"42");
+    }
+
+    #[test]
+    fn unparse_object_qdf_writes_an_array_with_newline_indent() {
+        let handle = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"[\n  1\n]");
+    }
+
+    #[test]
+    fn unparse_object_qdf_writes_a_dict_with_newline_indent_and_suppresses_null() {
+        let handle = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::integer(1)),
+            (b"B".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /A 1\n>>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_nests_indent_one_level_deeper() {
+        let handle = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(1)]),
+        )]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /Kids [\n    1\n  ]\n>>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_writes_a_retained_indirect_entry_as_reference_form() {
+        // QDF-mode sibling of unparse_object_writes_a_retained_indirect_entry_as_reference_form:
+        // exercises write_child_qdf's indirect arm, which the four
+        // plan-specified literals above never reach (every handle in them is
+        // direct).
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
+        let handle = ObjectHandle::dictionary(vec![(b"A".to_vec(), indirect)]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /A 20 0 R\n>>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary() {
+        // QDF-mode sibling of
+        // unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary:
+        // exercises unparse_object_value_qdf's Stream arm, unreached by the
+        // four plan-specified literals above.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
+        });
+        let mut out = Vec::new();
+        indirect.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /Length 2\n>>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_nests_a_dict_inside_a_dict_at_every_indent_slot() {
+        // The plan-specified nesting literal only stretches the *array*
+        // closing bracket's indent slot (unparse_object_qdf_nests_indent_one_level_deeper).
+        // A dict nested in a dict stretches unparse_dict_entries_qdf's own
+        // closing `>>` indent slot too, which that test leaves at the
+        // top-level `indent = 0` default.
+        let handle = ObjectHandle::dictionary(vec![(
+            b"D".to_vec(),
+            ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]),
+        )]);
+        let mut out = Vec::new();
+        handle.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /D <<\n    /A 1\n  >>\n>>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_propagates_a_dropped_document_error() {
+        let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(resolver);
+        let mut out = Vec::new();
+        assert!(indirect.unparse_object_qdf(&mut out, 0).is_err());
     }
 }
 
