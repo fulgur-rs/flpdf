@@ -848,6 +848,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the `endobj` half, stops *resolving at all* — there the difference is
     /// not the message but whether the object comes back.
     ///
+    /// **`allow_eof` is not this method's alone.** qpdf reaches every one of
+    /// the three token reads above through the same `QPDF::readToken` over the
+    /// same document-owned tokenizer, so the policy is a property of the
+    /// tokenizer rather than of a call site.
+    /// [`Self::frame_object`]'s trailing read — `readObject`'s `:1347`, the
+    /// one that decides `stream` from `endobj` for a *direct* value — runs
+    /// over the framing buffer rather than through here, and applies it
+    /// itself. It did not, for a while: it was left behind when this method
+    /// gained `allow_eof`, and a direct value that ended the input failed with
+    /// `unexpected EOF` while the identical stream failed with `expected
+    /// endobj`.
+    ///
     /// One divergence stays: qpdf passes `allow_bad = true`
     /// (`QPDF::readToken`, `:1536-1539`), so a *malformed* token is returned
     /// as `tt_bad` and likewise reported as the missing keyword, whereas
@@ -1006,6 +1018,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let mut after = Tokenizer::new(bytes);
         after.set_position(body_start + parsed.end)?;
+        // Same `allow_eof` as [`Self::read_token_from_input`], and for the
+        // same reason: qpdf reads *this* token and the one after `readStream`
+        // through one `QPDF::readToken` (`libqpdf/QPDF.cc:1347-1354`) over one
+        // tokenizer, the document's, which had `allowEOF()` applied at
+        // construction (`:208`). A value that ends the input therefore reaches
+        // the check below as `tt_eof` and is reported as the missing `endobj`,
+        // not as a complaint about the EOF — see
+        // `a_direct_value_ending_the_input_warns_and_is_still_resolved` for
+        // the observed qpdf output and for the one divergence that follows it.
+        after.allow_eof();
         let token = after.read_token(false, 0)?;
         let end = after.position();
 
@@ -2472,6 +2494,81 @@ mod tests {
         });
     }
 
+    /// A *direct* value that ends the input warns about the `endobj` that
+    /// never arrives and is still resolved — the same outcome the stream path
+    /// already reaches.
+    ///
+    /// qpdf makes no distinction between the two: `QPDF::readObject` reads one
+    /// token after the value and again after `readStream`, through the very
+    /// same `QPDF::readToken` (`libqpdf/QPDF.cc:1347-1354`), which passes
+    /// `allow_bad = true` (`:1536-1539`) over a tokenizer that had
+    /// `allowEOF()` applied at construction (`:208`). End of input therefore
+    /// arrives as `tt_eof`, the check reports the keyword it wanted, and the
+    /// object comes back.
+    ///
+    /// **Observed on qpdf 11.9.0**, over a generated fixture of exactly this
+    /// shape — `3 0 obj << /Type /Whatever /A (bcd) >>` appended past `%%EOF`
+    /// with the xref entry pointing at it:
+    /// `WARNING: (object 3 0, offset 291): expected endobj`. The matching
+    /// stream fixture — `<< /Length 3 >> stream abc endstream`, no `endobj` —
+    /// produces the identical warning, which is what makes flpdf's asymmetry
+    /// flpdf's own rather than inherited.
+    ///
+    /// **One divergence follows, and it is shared with the stream path rather
+    /// than introduced here.** qpdf does not stop at that warning when the
+    /// object is the last thing in the file: `readObjectAtOffset` then skips
+    /// trailing whitespace to record `end_after_space` (`:1651-1663`) and
+    /// throws `damagedPDF(tell(), "EOF after endobj")` (`:1660`) when the skip
+    /// reaches the end, which `QPDF::resolve` catches (`:1737-1738`) and turns
+    /// into a resolve-to-null (`:1745-1748`). qpdf's *net* outcome for both
+    /// fixtures above is therefore two warnings and `null`, exit 3. flpdf
+    /// ports neither `end_after_space` nor the resolve-to-null fallback — see
+    /// [`super::ResolverHandle::read_object_at_offset`] — so it stops after
+    /// the first warning with the object resolved. Closing that belongs with
+    /// the recovery slice.
+    #[test]
+    fn a_direct_value_ending_the_input_warns_and_is_still_resolved() {
+        let mut bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec()]);
+        let appended_at = bytes.len() as u64;
+        bytes.extend_from_slice(b"9 0 obj\n<< /Type /Whatever /A (bcd) >>");
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(9, 0),
+            crate::XrefEntry::Uncompressed {
+                offset: appended_at,
+            },
+        );
+        let handle = pdf.get_object_handle(ObjectRef::new(9, 0));
+
+        handle
+            .try_dereference()
+            .expect("a missing `endobj` warns rather than failing");
+
+        assert_eq!(
+            handle
+                .as_dictionary()
+                .expect("the value is a dictionary")
+                .get(b"A".as_slice())
+                .and_then(crate::ObjectHandle::as_string)
+                .as_deref(),
+            Some(&b"bcd"[..]),
+            "and the value the parse reached must come back whole"
+        );
+        let messages: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            ["expected endobj"],
+            "the EOF must surface as the missing framing keyword, exactly as \
+             it does after `endstream`"
+        );
+    }
+
     /// A recoverable diagnostic raised *inside* the body's parse reaches the
     /// document's warnings, and is not dropped with the parser that raised it.
     ///
@@ -2895,8 +2992,21 @@ mod tests {
     /// they return at the check before it. qpdf takes the same two steps:
     /// `readToken` gives back `tt_eof` rather than a bad token
     /// (`libqpdf/QPDF.cc:208`), so `readObject`'s trailing check reports the
-    /// keyword it wanted and returns the object anyway
-    /// (`:1352-1355`) instead of failing on the EOF itself.
+    /// keyword it wanted and returns the object anyway (`:1352-1355`) instead
+    /// of failing on the EOF itself.
+    ///
+    /// **That describes `readObject`, not qpdf's net answer, and an earlier
+    /// revision of this comment stopped one step too early.** Because the
+    /// object is the last thing in the file, `readObjectAtOffset` goes on to
+    /// throw `EOF after endobj` (`:1660`) while recording `end_after_space`,
+    /// `QPDF::resolve` catches it (`:1737-1738`), and the object resolves to
+    /// null (`:1745-1748`) — observed on qpdf 11.9.0 over this exact fixture
+    /// shape: two warnings, `null`, exit 3. flpdf ports neither of those, so
+    /// it stops with the object resolved. The gap is
+    /// [`super::ResolverHandle::read_object_at_offset`]'s already-recorded
+    /// `end_before_space`/`end_after_space` omission, and it is the same for
+    /// the direct path — see
+    /// `a_direct_value_ending_the_input_warns_and_is_still_resolved`.
     ///
     /// Appended past `%%EOF` with a hand-written xref entry for the same
     /// reason as the fixture above: a well-formed document always has a
@@ -3243,7 +3353,7 @@ mod tests {
     /// The expected outcome is a *diagnosis*: link 1's `/Length` resolves to
     /// link 2, which is a stream rather than an integer. qpdf reaches the same
     /// judgement (`/Length key in stream dictionary is not an integer`,
-    /// `libqpdf/QPDF.cc:1377`) and then recovers the length; flpdf stops at
+    /// `libqpdf/QPDF.cc:1379`) and then recovers the length; flpdf stops at
     /// the first of those, the divergence [`super::ResolverHandle::read_stream`]
     /// already records.
     #[test]
