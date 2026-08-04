@@ -102,6 +102,7 @@
 | `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |
 | `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
 | `crates/flpdf/src/pipeline/run_length.rs` | correspondence | Pl_RunLength.cc incremental encode and decode state, output, error, and finish semantics |
+| `crates/flpdf/src/pipeline/sha2.rs` | correspondence | Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough |
 | `crates/flpdf/src/pipeline/stdio_file.rs` | correspondence | Pl_StdioFile.cc partial-write, error, and finish semantics for an externally owned writer |
 | `crates/flpdf/src/pipeline/stream_codecs_oracle.rs` | correspondence | live differential instrumentation for Pl_ASCII85Decoder.cc, Pl_ASCIIHexDecoder.cc, and Pl_RunLength.cc |
 | `crates/flpdf/src/pipeline/string.rs` | correspondence | Pl_String.cc accumulation, optional pass-through, and finish forwarding |
