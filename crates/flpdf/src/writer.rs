@@ -224,13 +224,16 @@ pub struct WriteOptions {
     /// random value.
     ///
     /// **TESTING ONLY — NOT for production.**  When `true`, both stream-level
-    /// and string-level AES encryption (AES-128 CBC and future AES-256 CBC)
-    /// use an all-zero IV, making the ciphertext deterministic and enabling
-    /// byte-identical output tests.  Without this flag (the default `false`)
-    /// every encryption call generates a fresh random IV via the OS CSPRNG.
+    /// and string-level AES encryption use the same fixed initialization
+    /// vector qpdf's `--static-aes-iv` uses — byte `i` is `14 * (1 + i)` —
+    /// making the ciphertext deterministic and comparable with qpdf's output.
+    /// Without this flag (the default `false`) every encryption call generates
+    /// a fresh random IV via the OS CSPRNG.
     ///
-    /// Mirrors `qpdf --static-aes-iv`.  Must never be set in production code;
-    /// deterministic IVs make AES CBC completely insecure.
+    /// Under CBC the vector is written at the head of the ciphertext, so it is
+    /// part of the output bytes: a different vector means a different file.
+    /// Must never be set in production code; deterministic IVs make AES CBC
+    /// completely insecure.
     pub static_aes_iv: bool,
 
     /// Enforce a minimum PDF version in the output header.
@@ -2747,7 +2750,7 @@ fn encrypt_strings_in_object_for_writer(
 
     let mut iv_gen = || {
         if ctx.static_aes_iv {
-            [0u8; 16]
+            crate::pipeline::aes::static_initialization_vector()
         } else {
             let mut iv = [0u8; 16];
             getrandom::getrandom(&mut iv)
@@ -2832,7 +2835,11 @@ fn encrypt_stream_payload_for_writer(
         ctx.cipher,
         WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
     );
-    let mut iv = [0u8; 16];
+    let mut iv = if ctx.static_aes_iv {
+        crate::pipeline::aes::static_initialization_vector()
+    } else {
+        [0u8; 16]
+    };
     if needs_aes_iv && !ctx.static_aes_iv {
         getrandom::getrandom(&mut iv).map_err(|e| {
             crate::Error::Unsupported(format!(
@@ -6298,7 +6305,7 @@ mod tests {
     /// `/ID[0]` — is deterministic; without that the file key itself changes
     /// between runs and the stream IV bytes would vary regardless.
     #[test]
-    fn static_aes_iv_forces_all_zero_ivs_for_streams_and_strings() {
+    fn static_aes_iv_uses_the_vector_qpdf_writes_for_streams_and_strings() {
         use std::io::Cursor;
 
         // build_string_and_stream_fixture has a content stream reachable from
@@ -6341,7 +6348,14 @@ mod tests {
         // `\nendstream\n` terminator cannot alias this needle — the byte before
         // `stream` there is `d`, not `\n`. The encrypted path forces a classic
         // xref *table* and disables ObjStm, so every stream in the output is an
-        // AES-encrypted content/metadata stream whose IV must be all-zero.
+        // AES-encrypted content/metadata stream whose IV must be qpdf's.
+        //
+        // The vector is qpdf's `14 * (1 + i)` (`libqpdf/Pl_AES_PDF.cc:136-139`),
+        // not zeros: `--static-aes-iv` exists so that output is comparable with
+        // qpdf's, and CBC writes the vector into the file, so a different
+        // vector means a different file. An earlier revision of this test
+        // asserted zeros, which pinned flpdf against itself.
+        let expected = crate::pipeline::aes::static_initialization_vector();
         const NEEDLE: &[u8] = b"\nstream\n";
         let mut checked = 0usize;
         let mut pos = 0usize;
@@ -6350,8 +6364,8 @@ mod tests {
             let iv = &out[payload..payload + 16];
             assert_eq!(
                 iv,
-                &[0u8; 16],
-                "static_aes_iv: stream payload at byte {payload} must begin with a zero AES IV, got {iv:02x?}"
+                &expected,
+                "static_aes_iv: stream payload at byte {payload} must begin with qpdf's AES IV, got {iv:02x?}"
             );
             checked += 1;
             pos = payload;

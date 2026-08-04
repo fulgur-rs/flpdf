@@ -931,6 +931,85 @@ fn static_aes_iv_with_static_id_produces_deterministic_output() {
     );
 }
 
+/// `--static-aes-iv` exists so that output can be compared with qpdf's, so the
+/// bytes have to match *qpdf's*, not merely be stable across flpdf runs. The
+/// test above pins determinism and would stay green for any vector at all.
+///
+/// qpdf's static vector is `14 * (1 + i)` (`libqpdf/Pl_AES_PDF.cc:133-137`,
+/// reached from `QPDFWriter::setStaticAesIV`, `libqpdf/QPDFWriter.cc:292-297`)
+/// and CBC writes it at the head of every ciphertext (`:161-163`), so it is
+/// observable in the output.
+///
+/// This compares the vector itself rather than the whole document. Comparing
+/// whole documents showed two further divergences that have nothing to do with
+/// the vector — the `/U` value's trailing 16 padding bytes, and where `/Encrypt`
+/// sits in the trailer — each of which is its own fix. Once those land, this
+/// can become a whole-file assertion.
+///
+/// No `qpdf-zlib-compat` gate is needed: qpdf's default `--stream-data=preserve`
+/// copies compressed streams verbatim, so no DEFLATE encoder runs on either
+/// side of this comparison.
+#[test]
+fn static_aes_iv_matches_the_vector_qpdf_writes() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let ours = tmp.path().join("flpdf.pdf");
+    let theirs = tmp.path().join("qpdf.pdf");
+    let input = fixture(ONE_PAGE_FIXTURE);
+
+    // 128 exercises V=4 (AESV2) and needs --use-aes to select AES over RC4;
+    // 256 exercises V=5 (AESV3), where AES is implied and --use-aes is
+    // rejected. Both write a CBC vector ahead of the stream ciphertext.
+    for (bits, aes_flag) in [("128", Some("--use-aes=y")), ("256", None)] {
+        let mut args = vec!["--static-id", "--static-aes-iv", "--encrypt", "", "", bits];
+        args.extend(aes_flag);
+        args.push("--");
+
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(&args)
+            .arg(&input)
+            .arg(&ours)
+            .assert()
+            .success();
+
+        let qpdf = std::process::Command::new("qpdf")
+            .args(&args)
+            .arg(&input)
+            .arg(&theirs)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "qpdf reference run failed for {bits}: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+
+        let mine = leading_stream_vector(&std::fs::read(&ours).unwrap());
+        let reference = leading_stream_vector(&std::fs::read(&theirs).unwrap());
+
+        assert_eq!(
+            mine, reference,
+            "{bits}-bit AES: the initialization vector must be the one qpdf writes"
+        );
+    }
+}
+
+/// The 16 bytes at the head of the first stream payload. Under AES-CBC that is
+/// the initialization vector, which the encrypting side writes ahead of the
+/// ciphertext.
+fn leading_stream_vector(pdf: &[u8]) -> Vec<u8> {
+    let needle = b"stream\n";
+    let at = pdf
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("an encrypted document has at least one stream")
+        + needle.len();
+    pdf[at..at + 16].to_vec()
+}
+
 /// Without `--static-aes-iv` (but with `--static-id` to pin `/ID`),
 /// two encryptions of the same file produce different bytes because
 /// AES IVs are freshly random each run.
