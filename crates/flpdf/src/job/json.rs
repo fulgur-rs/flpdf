@@ -1,3 +1,5 @@
+//! qpdf correspondence: QPDFJob.cc writeJSON output selection and stream-prefix resolution.
+
 use crate::json_inspect::{
     write_qpdf_json_v2_selected_objects_to_output_with_options, DecodeLevel, JsonKey,
     JsonObjectSelector, JsonOutput, JsonOutputError, StreamDataMode,

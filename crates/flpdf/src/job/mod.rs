@@ -1,3 +1,4 @@
+//! qpdf correspondence: QPDFJob.cc command orchestration with only JSON output selection currently exposed.
 //! Command-level operations corresponding to qpdf's `QPDFJob` layer.
 //!
 //! The current surface implements the JSON output-selection responsibility

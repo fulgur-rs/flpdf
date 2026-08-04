@@ -26,6 +26,8 @@
 | `crates/flpdf/src/fonts.rs` | correspondence | flpdf-only font-resource inspection surface |
 | `crates/flpdf/src/form_field_object_helper.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` |
 | `crates/flpdf/src/form_field_object_helper/rendering.rs` | correspondence | \`QPDFFormFieldObjectHelper.cc\` rendering primitives |
+| `crates/flpdf/src/job/json.rs` | correspondence | QPDFJob.cc writeJSON output selection and stream-prefix resolution |
+| `crates/flpdf/src/job/mod.rs` | correspondence | QPDFJob.cc command orchestration with only JSON output selection currently exposed |
 | `crates/flpdf/src/json/handler.rs` | correspondence | JSONHandler.cc recursive dispatch responsibilities with Rust shared ownership |
 | `crates/flpdf/src/json/message.rs` | correspondence | JSON.cc and JSONHandler.cc use byte-oriented std::string diagnostics |
 | `crates/flpdf/src/json/mod.rs` | correspondence | JSON.cc and JSONHandler.cc pipeline-native value, parse, callback, and serialization responsibilities |
