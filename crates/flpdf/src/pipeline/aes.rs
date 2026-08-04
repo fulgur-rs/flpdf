@@ -225,13 +225,13 @@ impl<'a> PlAesPdf<'a> {
             }
         } else {
             // qpdf `QUtil::initializeWithRandomBytes` (`:141`).
+            // cov:ignore-start: a getrandom failure cannot be injected here
             getrandom::getrandom(&mut self.cbc_block).map_err(|error| {
-                // cov:ignore-start: getrandom failure cannot be injected here
                 PipelineError::runtime(format!(
                     "Pl_AES_PDF: OS CSPRNG unavailable for AES IV generation: {error}"
                 ))
-                // cov:ignore-end
             })?;
+            // cov:ignore-end
         }
         Ok(())
     }
@@ -751,13 +751,14 @@ mod tests {
             .expect("AES-128 key is a supported length");
         stage.write(b"short").expect("write");
 
-        let Err(error) = stage.flush(false) else {
-            panic!("a partial buffer must not flush");
-        };
+        let message = stage.flush(false).err().map(|error| error.to_string());
 
-        assert!(
-            error.to_string().contains("buffer was not full"),
-            "unexpected message: {error}"
+        assert_eq!(
+            message
+                .as_deref()
+                .map(|m| m.contains("buffer was not full")),
+            Some(true),
+            "a partial buffer must not flush: {message:?}"
         );
     }
 
