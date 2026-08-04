@@ -1465,7 +1465,7 @@ fn encrypted_v4_unknown_cfm_fixture() -> Vec<u8> {
         format!(
             "trailer\n<< /Size {size} /Root 1 0 R /Encrypt << /Filter /Standard /V 4 /R 4 \
              /Length 128 /P {p} /O <{}> /U <{}> /CF << /StdCF << /CFM /AESVX /Length 128 >> >> \
-             /StmF /StdCF /StrF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
+             /StmF /StdCF /StrF /StdCF /EFF /StdCF >> /ID [<{}><{}>] >>\nstartxref\n{xref_offset}\n%%EOF\n",
             hex_string(&o),
             hex_string(&u),
             hex_string(&id0),
@@ -1523,6 +1523,33 @@ fn an_unknown_crypt_filter_warns_once_per_kind_and_still_decrypts() {
         ],
         "qpdf warns once per kind, strings first, because each arm resets its crypt filter"
     );
+}
+
+/// The same document reported through `--show-encryption`. qpdf prints
+/// `unknown` for all three methods (`show_encryption_method`,
+/// `libqpdf/QPDFJob.cc:682-684`) and exits 0; the fixture's `/EFF` names the
+/// same crypt filter, which is the branch where qpdf calls `interpretCF` on
+/// `/EFF` rather than mirroring `cf_stream` (`QPDF_encryption.cc:891-904`).
+///
+/// Observed on a `/V 4` qpdf output whose `/CFM` was rewritten to `/AESVX`:
+///
+/// ```text
+/// stream encryption method: unknown
+/// string encryption method: unknown
+/// file encryption method: unknown
+/// ```
+#[test]
+fn an_unknown_crypt_filter_is_reported_as_unknown() {
+    let mut pdf = Pdf::open(std::io::Cursor::new(encrypted_v4_unknown_cfm_fixture()))
+        .expect("qpdf opens a document with an unknown /CFM");
+
+    let info = pdf
+        .encryption_info()
+        .expect("encryption info")
+        .expect("document is encrypted");
+    assert_eq!(info.stream_method, "unknown");
+    assert_eq!(info.string_method, "unknown");
+    assert_eq!(info.eff_method, "unknown");
 }
 
 fn encrypted_v4_explicit_crypt_filter_fixture(identity: bool, crypt_after_flate: bool) -> Vec<u8> {
