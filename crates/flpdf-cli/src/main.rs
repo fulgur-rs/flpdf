@@ -3,6 +3,9 @@
 use clap::{ArgGroup, Args as ClapArgs, CommandFactory, Parser, Subcommand, ValueEnum};
 use flpdf::disable_digital_signatures;
 use flpdf::filespec_helper::ascii_filename_fallback;
+use flpdf::job::{
+    write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
+};
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p, outline_dest_remap::remap_outline_and_dests,
@@ -14,10 +17,7 @@ use flpdf::{
 use flpdf::{
     check_reader_with_options_and_limits, enumerate_document_annotations, filters,
     flatten_rotation_on_pages, fonts,
-    json_inspect::{
-        write_qpdf_json_v2_selected_objects_to_output_with_options, DecodeLevel, JsonKey,
-        JsonObjectSelector, JsonOutput, StreamDataMode as JsonStreamDataMode,
-    },
+    json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
         LinearizationCheckError, LinearizationPlan, RenumberMap, ShowLinearizationError,
@@ -251,12 +251,15 @@ struct Cli {
     json_stream_data: Option<String>,
 
     /// Prefix for side-file names when --json-stream-data=file.
-    /// Defaults to the --json-output path (if given) or \"stream\".
+    /// With --json-output, defaults to the JSON output path. With JSON on
+    /// stdout, file stream data requires an explicit prefix.
     #[arg(
         long = "json-stream-prefix",
         value_name = "PREFIX",
         requires = "json",
-        help = "Prefix for side files with --json-stream-data=file"
+        help = "Prefix for side files with --json-stream-data=file. With --json-output, \
+                defaults to the JSON output path; with JSON on stdout, an explicit \
+                prefix is required."
     )]
     json_stream_prefix: Option<String>,
 
@@ -1890,9 +1893,22 @@ fn main() {
             }
             std::process::exit(exit_err.code.as_i32());
         }
+        if let Some(usage_error) = error.downcast_ref::<UsageError>() {
+            usage_exit(usage_error);
+        }
         eprintln!("{}: {error}", progname());
         std::process::exit(2);
     }
+}
+
+fn usage_exit(error: &UsageError) -> ! {
+    let who = progname();
+    eprintln!(
+        "\n{who}: {error}\n\nFor help:\n  {who} --help=usage       usage information\n  \
+{who} --help=topic       help on a topic\n  {who} --help=--option    help on an option\n  \
+{who} --help             general help and a topic list\n"
+    );
+    std::process::exit(2);
 }
 
 fn run_json(cli: &Cli) -> CliResult<()> {
@@ -1947,25 +1963,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // never embedded or written to disk unless the caller explicitly opts
     // in via --json-stream-data, even when --json-output is used: leaking
     // stream contents based on an unrelated flag would be surprising.
-    let stream_data_raw = cli.json_stream_data.as_deref().unwrap_or("none");
-
-    let prefix_default = || -> String {
-        cli.json_stream_prefix
-            .clone()
-            .or_else(|| {
-                cli.json_output
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "stream".to_string())
-    };
-
-    let stream_mode = match stream_data_raw {
-        "none" => JsonStreamDataMode::None,
-        "inline" => JsonStreamDataMode::Inline,
-        "file" => JsonStreamDataMode::File {
-            prefix: prefix_default(),
-        },
+    let stream_data = match cli.json_stream_data.as_deref().unwrap_or("none") {
+        "none" => JsonStreamData::None,
+        "inline" => JsonStreamData::Inline,
+        "file" => JsonStreamData::File,
         other => {
             eprintln!("flpdf: --json-stream-data must be none, inline, or file; got: {other}");
             std::process::exit(2);
@@ -1991,20 +1992,28 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // 6. Write JSON incrementally.
     //
     // `decode_level` governs both inline `data` payloads and file-mode side files
-    // emitted by write_qpdf_json_v2_selected_objects_to_output_with_options.
-    let decode_level = DecodeLevel::Generalized;
+    // emitted by the job-owned JSON output pipeline.
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
     let had_open_warnings = diagnostics_start > 0;
     let json_result = if let Some(ref path) = cli.json_output {
         match open_verified_json_output(&input_identity, path) {
-            Ok(mut file) => write_qpdf_json_v2_selected_objects_to_output_with_options(
-                &mut pdf,
-                decode_level,
-                &stream_mode,
-                &json_keys,
-                &json_objects,
-                JsonOutput::File(&mut file),
-            ),
+            Ok(mut file) => {
+                let options = JsonJobOptions {
+                    decode_level: DecodeLevel::Generalized,
+                    stream_data,
+                    stream_prefix: cli.json_stream_prefix.as_deref(),
+                    keys: &json_keys,
+                    objects: &json_objects,
+                };
+                write_json(
+                    &mut pdf,
+                    options,
+                    JsonJobOutput::File {
+                        filename: path,
+                        writer: &mut file,
+                    },
+                )
+            }
             Err(error) => {
                 emit_warnings_since(input, &pdf, diagnostics_start);
                 return Err(error);
@@ -2013,21 +2022,22 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     } else {
         let stdout = std::io::stdout();
         let mut locked = stdout.lock();
-        write_qpdf_json_v2_selected_objects_to_output_with_options(
-            &mut pdf,
-            decode_level,
-            &stream_mode,
-            &json_keys,
-            &json_objects,
-            JsonOutput::Stdout(&mut locked),
-        )
+        let options = JsonJobOptions {
+            decode_level: DecodeLevel::Generalized,
+            stream_data,
+            stream_prefix: cli.json_stream_prefix.as_deref(),
+            keys: &json_keys,
+            objects: &json_objects,
+        };
+        write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut locked))
     };
     match json_result {
         Ok(()) => {}
-        Err(error) => {
+        Err(JsonJobError::Output(error)) => {
             emit_warnings_since(input, &pdf, diagnostics_start);
             return Err(Box::new(error));
         }
+        Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
     }
 
     // qpdf exits 3 after successful JSON output when either opening or later
