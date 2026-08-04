@@ -24,6 +24,8 @@ pub(crate) mod lzw;
 #[cfg(test)]
 mod lzw_png_oracle;
 
+pub(crate) mod md5;
+
 pub(crate) mod png_filter;
 
 pub(crate) mod rc4;
