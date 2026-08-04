@@ -83,9 +83,10 @@
 use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
 use crate::pdf_string::{new_unicode_string, utf8_value};
+use crate::pipeline::md5::PlMd5;
+use crate::pipeline::{Pipeline, PipelineResult};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
-use md5::{Digest, Md5};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
@@ -849,13 +850,36 @@ pub fn format_pdf_date(year: u16, month: u8, day: u8, hour: u8, minute: u8, seco
 // pass raw logical bytes straight to `Object::Name`. The canonical escaper now
 // lives at `crate::object::escape_name_bytes` and is serializer-internal.
 
+struct ChecksumDiscard;
+
+impl Pipeline for ChecksumDiscard {
+    fn identifier(&self) -> &str {
+        "embedded file checksum discard"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
 /// Compute the MD5 checksum of `data` and return it as a 16-byte `Vec<u8>`.
 ///
 /// This is the checksum stored in `/Params /CheckSum` (ISO 32000-1 §7.11.4).
 pub fn md5_checksum(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Md5::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
+    let mut discard = ChecksumDiscard;
+    let mut md5 = PlMd5::new("EF md5", &mut discard);
+    md5.write(data)
+        .expect("embedded-file MD5 discard write is infallible");
+    md5.finish()
+        .expect("embedded-file MD5 discard finish is infallible");
+    let hex_digest = md5
+        .get_hex_digest()
+        .expect("embedded-file MD5 pipeline remains enabled");
+    hex::decode(hex_digest).expect("PlMd5 always returns lowercase hexadecimal")
 }
 
 // ── FileSpecBuilder ───────────────────────────────────────────────────────────
@@ -2020,8 +2044,11 @@ mod tests {
         );
         assert_eq!(
             checksum,
-            md5_checksum(raw),
-            "/Params /CheckSum must match MD5 of raw bytes"
+            vec![
+                0xcf, 0x5e, 0x73, 0xd1, 0x4d, 0xf5, 0xca, 0xd1, 0x94, 0xb0, 0x9e, 0xe5, 0x79, 0xf2,
+                0x54, 0x9d,
+            ],
+            "/Params /CheckSum must be the MD5 of raw bytes"
         );
     }
 
