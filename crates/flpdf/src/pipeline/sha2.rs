@@ -1,13 +1,28 @@
 //! qpdf correspondence: Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
 //
-// `Pl_SHA2::write` in qpdf 11.9.0 only flips `in_progress`; unlike `Pl_MD5::write` it
-// never re-initializes the crypto object on reuse after `finish()`. With `bits=0` (the
-// uncommitted default) the crypto pointer is never set at all. Both paths dereference a
-// null/stale C++ object — undefined behavior qpdf's own `libtests/sha2.cc` never
-// exercises (it always calls `resetBits` before each use). There is no oracle-observed
-// byte sequence for either path, so this port converts both into a defined logic error
-// instead of guessing at unverified C++ UB. `resetBits` remains the one supported way
-// to (re)commit to a digest size, matching qpdf's own test usage.
+// Three states this port rejects with a `PipelineError::logic` instead of reproducing
+// qpdf, for two different reasons:
+//
+// 1. Memory-unsafe (never-defined in C++, so there is no byte sequence to match).
+//    `Pl_SHA2::write` with `bits=0` (the uncommitted default, never `resetBits`) and
+//    `write` reused after `finish()` without an intervening `resetBits` both dereference
+//    a null/stale crypto-provider pointer, and a digest read before any `finish()` reads
+//    uninitialized `SHA2_native::shaXXXsum` memory. qpdf's own `libtests/sha2.cc` never
+//    exercises any of these (it always calls `resetBits` immediately before each use).
+// 2. Deterministic but unreplicable through this crate's public API. A second `finish()`
+//    is NOT undefined behavior in qpdf: `sph_sha2`'s `md_helper.c` close() helper states
+//    "The context is NOT reinitialized by this function" and leaves the running state
+//    (`sc->val`) and bit count (`sc->count`) untouched, so a repeat close() recompresses
+//    the identical reconstructed padding block on top of the already-finalized state via
+//    `RFUN`, producing a second, different, fully deterministic digest. Reproducing that
+//    exactly is impossible through `sha2`'s safe API for SHA-384 specifically: qpdf's
+//    `sph_sha384_close` truncates an 8×u64-word running state to a 48-byte (6-word)
+//    output (`sha2big.c`: `sha384_close(cc, dst, 6)`, vs. 8 for SHA-512), and
+//    `Sha384::finalize()` likewise only yields those 48 bytes — the other two words are
+//    gone, so there is no way to reconstruct the full state `compress512` would need to
+//    recompress. Rather than replicate this for 256/512 (where the crate's public
+//    `compress256`/`compress512` functions would make it possible) and error only for
+//    384, this port rejects repeated `finish()` uniformly across all three bit lengths.
 use super::{Pipeline, PipelineError, PipelineResult};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -125,6 +140,8 @@ impl Pipeline for PlSha2<'_> {
     }
 
     fn finish(&mut self) -> PipelineResult<()> {
+        // qpdf forwards to `next` unconditionally on every `finish()` call, including
+        // repeats, before touching its own digest state — that part is unconditional.
         if let Some(next) = self.next.as_deref_mut() {
             next.finish()?;
         }
@@ -133,15 +150,12 @@ impl Pipeline for PlSha2<'_> {
             self.in_progress = false;
             return Ok(());
         }
-        if self.raw_digest.is_some() {
-            // Already finished. qpdf's `Pl_SHA2::finish` has no already-finished
-            // guard either (unlike `Pl_RC4::finish`, which is intentionally
-            // reusable) — it just re-forwards to `next` and returns. Matching that
-            // exactly means leaving the existing digest untouched rather than
-            // erroring, since the pipeline genuinely was committed and finished.
-            return Ok(());
-        }
         let identifier = &self.identifier;
+        if self.raw_digest.is_some() {
+            return Err(PipelineError::logic(format!(
+                "{identifier}: Pl_SHA2: repeated finish() is not reproducible without resetBits()"
+            )));
+        }
         Err(PipelineError::logic(format!(
             "{identifier}: Pl_SHA2: finish() called before resetBits() selected a digest size"
         )))
@@ -366,26 +380,26 @@ mod tests {
         );
     }
 
-    /// qpdf's `Pl_SHA2::finish` has no already-finished guard: a second `finish()`
-    /// just re-forwards to `next` and returns normally, leaving the digest as
-    /// computed by the first `finish()` (mirrors `pipeline/rc4.rs`'s
-    /// `repeated_finish_propagates_each_time_and_marks_stage_finished`).
+    /// qpdf's `Pl_SHA2::finish` forwards to `next` on every call including repeats
+    /// (unconditional, verified against `next.finish()` running before any digest
+    /// state is touched), but a second `finish()`'s digest is genuinely different
+    /// from the first (see module doc: `sph_sha2`'s close() recompresses the same
+    /// padding block onto the already-finalized state) and unreplicable for
+    /// SHA-384 through this crate's public API, so the digest itself is rejected.
     #[test]
-    fn repeated_finish_forwards_each_time_and_keeps_the_first_digest() {
+    fn repeated_finish_forwards_to_next_each_time_but_rejects_the_second_digest() {
         let mut sink = RecordingSink::default();
-        let hex_digest;
         {
             let mut sha2 = PlSha2::new("sha2", Some(&mut sink as &mut dyn Pipeline), 256).unwrap();
             sha2.write(b"abc").unwrap();
             sha2.finish().unwrap();
-            sha2.finish().unwrap();
-            hex_digest = sha2.get_hex_digest().unwrap();
+            let error = sha2.finish().unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "sha2: Pl_SHA2: repeated finish() is not reproducible without resetBits()"
+            );
         }
         assert_eq!(sink.finishes, 2);
-        assert_eq!(
-            hex_digest,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 
     struct WriteFaultSink;
