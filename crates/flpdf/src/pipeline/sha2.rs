@@ -284,6 +284,25 @@ mod tests {
         assert_eq!(Pipeline::identifier(&sha2), "pl-sha2-stage");
     }
 
+    /// `sha2.write(...)` / `sha2.finish()` resolve to the inherent methods, which
+    /// the tests above exercise directly. A `PlSha2` chained as another `PlSha2`'s
+    /// `next` is only reachable through `&mut dyn Pipeline`, which forces calls
+    /// through the trait-impl delegation in `impl Pipeline for PlSha2`.
+    #[test]
+    fn chained_as_next_dispatches_through_the_pipeline_trait_impl() {
+        let mut inner = PlSha2::new("inner", None, 256).unwrap();
+        {
+            let mut outer =
+                PlSha2::new("outer", Some(&mut inner as &mut dyn Pipeline), 384).unwrap();
+            outer.write(b"abc").unwrap();
+            outer.finish().unwrap();
+        }
+        assert_eq!(
+            inner.get_hex_digest().unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     #[test]
     fn write_forwards_unmodified_bytes_to_next_once_per_call() {
         let mut sink = RecordingSink::default();
@@ -377,6 +396,13 @@ mod tests {
     }
 
     #[test]
+    fn helper_sink_identifiers_are_fixed() {
+        assert_eq!(RecordingSink::default().identifier(), "recording");
+        assert_eq!(FinishFaultSink.identifier(), "finish-fault");
+        assert_eq!(WriteFaultSink.identifier(), "write-fault");
+    }
+
+    #[test]
     fn no_next_pipeline_still_computes_a_digest() {
         let mut sha2 = PlSha2::new("sha2", None, 256).unwrap();
         sha2.write(b"abc").unwrap();
@@ -424,10 +450,9 @@ mod tests {
 
     #[test]
     fn invalid_bit_length_is_rejected_at_construction() {
-        let error = match PlSha2::new("sha2", None, 128) {
-            Err(error) => error,
-            Ok(_) => panic!("bits=128 must be rejected"),
-        };
+        let error = PlSha2::new("sha2", None, 128)
+            .err()
+            .expect("bits=128 must be rejected");
         assert_eq!(
             error.to_string(),
             "SHA2_native has bits != 256, 384, or 512"
