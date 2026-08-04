@@ -2657,6 +2657,18 @@ pub fn write_linearized<R: Read + Seek>(
     // unchanged.
     // ------------------------------------------------------------------
     let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
+
+    // Whether this write schedules any ObjStm container/member relocation —
+    // true for Generate (always builds fresh containers) or for Preserve on a
+    // source that already carries object streams; always false for Disable
+    // and for Preserve on an ObjStm-free source. Computed once here (and
+    // reused below both by the encrypt guard and by the 1.5 version floor)
+    // from the writer-filtered batch plan, so it reflects every path that can
+    // make a batch non-empty, not just `ObjectStreamMode::Generate`.
+    let emits_object_streams = !resolved_batch_plan.open_document_batches.is_empty()
+        || !resolved_batch_plan.part3_batches.is_empty()
+        || !resolved_batch_plan.part4_batches.is_empty();
+
     let mut local_renumber = renumber.clone();
     // Per Part-4 batch, the second-half plain object after which its container is
     // emitted (its part-group's last plain object) so each second-half container
@@ -2718,14 +2730,43 @@ pub fn write_linearized<R: Read + Seek>(
     // the first half (qpdf packs the first-page shared dicts + /Pages tree +
     // /Info there); Part-4 batches are interleaved among the second-half
     // objects at their part position.
-    let relocation = local_renumber.place_objstm_members_per_half(
-        &resolved_batch_plan.open_document_batches,
-        &resolved_batch_plan.part3_batches,
-        &part4_members,
-        &second_half_anchors,
-        &second_half_post_plain,
-        &first_half_post_plain,
-    );
+    //
+    // linearize+encrypt does not yet implement the ObjStm relocation path:
+    // `RenumberMap::reserve_encrypt_dict_slot` (wired in by a later encrypting
+    // step) and `RenumberMap::place_objstm_members_per_half` are mutually
+    // exclusive — the latter's rebuild loop treats any renumber-map sentinel
+    // it does not recognize (including a reserved `/Encrypt` slot) as
+    // "unexpected" and silently drops it (see `reserve_encrypt_dict_slot`'s
+    // doc comment). Reject the combination and skip the call to
+    // `place_objstm_members_per_half` entirely — rather than merely ordering
+    // it relative to a future `reserve_encrypt_dict_slot` call — so the two
+    // can never coincide in the same execution, regardless of
+    // `ObjectStreamMode` (this also covers `Preserve` on an already-ObjStm
+    // source, not just `Generate`). When `emits_object_streams` is false the
+    // call would have taken `place_objstm_members_per_half`'s own fast path
+    // (leaving the map untouched and returning
+    // [`ObjStmRelocation::default`]), so using that default directly here is
+    // behaviorally identical for every non-rejected combination.
+    let relocation = if emits_object_streams {
+        if encrypting {
+            return Err(crate::Error::Unsupported(
+                "linearize+encrypt does not yet support object streams; use \
+                 --object-streams=disable with --linearize --encrypt, or file a \
+                 follow-up if you need both"
+                    .to_string(),
+            ));
+        }
+        local_renumber.place_objstm_members_per_half(
+            &resolved_batch_plan.open_document_batches,
+            &resolved_batch_plan.part3_batches,
+            &part4_members,
+            &second_half_anchors,
+            &second_half_post_plain,
+            &first_half_post_plain,
+        )
+    } else {
+        ObjStmRelocation::default()
+    };
     let container_numbers = relocation.container_numbers.clone();
     let renumber: &RenumberMap = &local_renumber;
 
@@ -2733,9 +2774,6 @@ pub fn write_linearized<R: Read + Seek>(
     // container (qpdf raises the minimum on real emission, not on mode). When
     // all batch lists are empty the placement early-returned and no container
     // is written, so the non-ObjStm linearized goldens stay at the 1.2 floor.
-    let emits_object_streams = !resolved_batch_plan.open_document_batches.is_empty()
-        || !resolved_batch_plan.part3_batches.is_empty()
-        || !resolved_batch_plan.part4_batches.is_empty();
     let eff_version = effective_pdf_version(pdf.version(), options, true, emits_object_streams);
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
@@ -5537,6 +5575,170 @@ mod tests {
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &opts)
             .expect("deterministic-id without encryption must succeed");
+    }
+
+    /// linearize+encrypt+ObjStm is out of scope for now: the ObjStm
+    /// relocation path (`RenumberMap::place_objstm_members_per_half`) and the
+    /// encrypt-dict slot reservation it will need
+    /// (`RenumberMap::reserve_encrypt_dict_slot`) are mutually exclusive, so
+    /// the combination must be rejected rather than silently mis-encrypted or
+    /// silently linearized without the requested object streams.
+    /// `ObjectStreamMode::Generate` always builds fresh containers regardless
+    /// of the source's own form, so `tiny_pdf_bytes()` (no source ObjStm)
+    /// still reliably produces a non-empty batch here — see
+    /// `deterministic_id_linearized_all_ids_match`, which pins the same
+    /// fixture+mode pair to the xref-stream output shape.
+    ///
+    /// Asserts the exact rejection message (not just the `Unsupported`
+    /// variant): `write_linearized` has several other `Unsupported` exits
+    /// upstream and downstream of this guard (missing `/Root`, xref/renumber
+    /// inconsistencies, …), so a loose variant-only match could pass for the
+    /// wrong reason if this fixture ever tripped one of those instead.
+    #[test]
+    fn objstm_encrypt_linearize_combination_is_unsupported() {
+        let mut pdf = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("does not yet support object streams")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
+    /// source-side ObjStm: object 4 (`/Info`) exists ONLY inside object 5's
+    /// ObjStm — there is no plain indirect object 4 in the file. Used to
+    /// exercise `ObjectStreamMode::Preserve` (the default), which reuses the
+    /// *source's* ObjStm membership rather than repacking, as opposed to
+    /// `Generate`, which always builds fresh containers regardless of source
+    /// form.
+    fn objstm_bearing_pdf_bytes() -> Vec<u8> {
+        fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_be_bytes()[1..]);
+        }
+        fn append_xref_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
+            entries.push(entry_type);
+            append_u24_be(entries, field1);
+            entries.push(field2);
+        }
+
+        let objstm_num: u32 = 5;
+        let xref_num: u32 = 6;
+        let total_size: u32 = xref_num + 1;
+
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let page_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        // Object 4 (/Info) lives ONLY inside the ObjStm (object 5) — no plain
+        // indirect object 4 exists in the file.
+        let header: &[u8] = b"4 0 ";
+        let info_bytes: &[u8] = b"<< /Title (x) >>";
+        let first = header.len();
+        let mut stream_data = Vec::new();
+        stream_data.extend_from_slice(header);
+        stream_data.extend_from_slice(info_bytes);
+
+        let objstm_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "{objstm_num} 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = bytes.len();
+        let mut xref_entries: Vec<u8> = Vec::new();
+        append_xref_entry(&mut xref_entries, 0, 0, 0); // 0: free
+        append_xref_entry(&mut xref_entries, 1, catalog_offset as u32, 0); // 1: Catalog
+        append_xref_entry(&mut xref_entries, 1, pages_offset as u32, 0); // 2: Pages
+        append_xref_entry(&mut xref_entries, 1, page_offset as u32, 0); // 3: Page
+        append_xref_entry(&mut xref_entries, 2, objstm_num, 0); // 4: Info, compressed
+        append_xref_entry(&mut xref_entries, 1, objstm_offset as u32, 0); // 5: ObjStm
+        append_xref_entry(&mut xref_entries, 1, xref_offset as u32, 0); // 6: XRef
+
+        bytes.extend_from_slice(
+            format!(
+                "{xref_num} 0 obj\n<< /Type /XRef /Size {total_size} /Root 1 0 R /Info 4 0 R \
+                 /W [1 3 1] /Index [0 {total_size}] /Length {} >>\nstream\n",
+                xref_entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    /// As [`objstm_encrypt_linearize_combination_is_unsupported`], but for
+    /// `ObjectStreamMode::Preserve` (the default) on a source that already
+    /// carries an ObjStm — the path Task 2's code review specifically flagged
+    /// as a way to reach a non-empty batch plan *without*
+    /// `ObjectStreamMode::Generate`. Confirms the guard is keyed on the
+    /// resolved batch plan (which reflects the source's real membership under
+    /// Preserve), not on the write-mode enum variant.
+    #[test]
+    fn preserve_objstm_encrypt_linearize_combination_is_unsupported() {
+        let mut pdf = Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf_with_object_stream_mode(
+            &mut pdf,
+            crate::writer::ObjectStreamMode::Preserve,
+        )
+        .expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Preserve,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        // Precondition: the source's ObjStm membership actually survives
+        // planning under Preserve, so this test exercises the relocation
+        // path rather than being vacuously true on an empty batch plan.
+        let mut precheck_pdf =
+            Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
+        let resolved = ObjStmLayout::resolve_batches(&plan, &mut precheck_pdf, &opts)
+            .expect("resolve_batches");
+        assert!(
+            !resolved.open_document_batches.is_empty()
+                || !resolved.part3_batches.is_empty()
+                || !resolved.part4_batches.is_empty(),
+            "test precondition: Preserve on an ObjStm-bearing source must \
+             yield a non-empty batch plan"
+        );
+        let mut pdf2 = Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("does not yet support object streams")),
+            "got {err:?}"
+        );
     }
 
     /// The primary hint-stream object must serialize its filtered dict in
