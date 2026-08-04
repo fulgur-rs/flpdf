@@ -2413,7 +2413,7 @@ impl ObjectHandle {
     /// read from `self`'s own stored values instead of from writer state
     /// -- the caller is expected to have already placed the correct
     /// values there (`apply_encrypt_trailer_entries`/`apply_random_id`/
-    /// `apply_deterministic_id`, `writer.rs`), the same contract
+    /// `apply_deterministic_id_placeholder`, `writer.rs`), the same contract
     /// [`crate::object::Dictionary::write_pdf_trailer`] already
     /// establishes and this primitive matches for that dimension.
     ///
@@ -5155,6 +5155,35 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         dict.unparse_trailer(&mut out, false, None).unwrap();
         assert_eq!(out, b"trailer << /ID [ <00> <11> <8f> ] >>");
+    }
+
+    #[test]
+    fn unparse_trailer_id_writer_none_falls_back_for_non_string_element() {
+        // Mirrors write_id_style_value_falls_back_for_unexpected_shapes
+        // (object.rs): right arity (2 elements) but a non-String element
+        // type falls back to the generic array serializer rather than
+        // treating the element as a string.
+        let dict = ObjectHandle::dictionary(vec![(
+            b"ID".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(1),
+                ObjectHandle::string(vec![0x8fu8]),
+            ]),
+        )]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        assert_eq!(out, b"trailer << /ID [ 1 <8f> ] >>");
+    }
+
+    #[test]
+    fn unparse_trailer_id_writer_none_falls_back_for_scalar_id() {
+        // Mirrors write_id_style_value_falls_back_for_unexpected_shapes
+        // (object.rs): a non-array /ID value is delegated to write_child
+        // verbatim rather than being routed through the compact-pair path.
+        let dict = ObjectHandle::dictionary(vec![(b"ID".to_vec(), ObjectHandle::integer(7))]);
+        let mut out = Vec::new();
+        dict.unparse_trailer(&mut out, false, None).unwrap();
+        assert_eq!(out, b"trailer << /ID 7 >>");
     }
 
     #[test]
