@@ -1,5 +1,5 @@
 use flpdf::job::{write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData};
-use flpdf::json_inspect::DecodeLevel;
+use flpdf::json_inspect::{DecodeLevel, JsonKey};
 use flpdf::Pdf;
 use std::fs::File;
 use std::io::BufReader;
@@ -38,6 +38,30 @@ fn stdout_file_mode_without_prefix_is_usage_error() {
         JsonJobOutput::Stdout(&mut bytes),
     )
     .expect_err("file stream data without a prefix on stdout must be a usage error");
+
+    assert!(matches!(error, JsonJobError::Usage(_)));
+    assert_eq!(
+        error.to_string(),
+        "please specify --json-stream-prefix since the input file name is unknown"
+    );
+    assert!(bytes.is_empty());
+}
+
+#[test]
+fn stdout_file_mode_empty_prefix_is_usage_error() {
+    let mut pdf = open_fixture();
+    let mut bytes = Vec::new();
+    let keys = [JsonKey::Pages];
+    let options = JsonJobOptions {
+        decode_level: DecodeLevel::Generalized,
+        stream_data: JsonStreamData::File,
+        stream_prefix: Some(""),
+        keys: &keys,
+        objects: &[],
+    };
+
+    let error = write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut bytes))
+        .expect_err("an empty file-stream prefix on stdout must be a usage error");
 
     assert!(matches!(error, JsonJobError::Usage(_)));
     assert_eq!(

@@ -87,7 +87,8 @@ pub fn write_json<R: Read + Seek>(
     options: JsonJobOptions<'_>,
     output: JsonJobOutput<'_>,
 ) -> Result<(), JsonJobError> {
-    let stream_mode = match (options.stream_data, options.stream_prefix, &output) {
+    let stream_prefix = options.stream_prefix.filter(|prefix| !prefix.is_empty());
+    let stream_mode = match (options.stream_data, stream_prefix, &output) {
         (JsonStreamData::None, _, _) => StreamDataMode::None,
         (JsonStreamData::Inline, _, _) => StreamDataMode::Inline,
         (JsonStreamData::File, Some(prefix), _) => StreamDataMode::File {
