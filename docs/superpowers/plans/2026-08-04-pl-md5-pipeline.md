@@ -469,7 +469,7 @@ Expected: FAIL showing actual empty-input digest bytes instead of the literal `c
 - [ ] **Step 7: Prove the old filespec route is gone and the writer is untouched**
 
 ```bash
-rg -n "md5::|\bMd5\b" crates/flpdf/src/filespec_helper.rs
+rg -n "use md5::|\bMd5\b" crates/flpdf/src/filespec_helper.rs
 git diff -- crates/flpdf/src/writer.rs
 git diff --check
 ```
