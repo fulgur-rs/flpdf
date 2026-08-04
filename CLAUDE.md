@@ -60,6 +60,14 @@ v1.0 以降は想定 consumer の要件に応じて qpdf 完全トレースを�
 
 この方針の bd メモリ版（`bd prime` で自動注入）: `bd recall pre-v1-0-qpdf-byte-identical-qtest-parity`。
 
+### 設計に入る前に
+
+issue に着手する前・設計やブレインストーミングを始める前に、
+[`.claude/rules/qpdf-port-design-patterns.md`](.claude/rules/qpdf-port-design-patterns.md)
+を読むこと。flpdf の現状から出発して設計を誤るパターンを 5 カテゴリで
+予防ルール化したもの（出発点／中断シグナル／前例の検証／依存順序／逐語訳の粒度）。
+**設計を誤ったまま実装に入ると、下の Coding Rules はもう効かない。**
+
 ## Coding Rules
 
 Before writing or reviewing code, consult the review patterns in
