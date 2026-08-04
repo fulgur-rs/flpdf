@@ -2545,6 +2545,11 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
 /// limitation, not a qpdf restriction: qpdf itself supports
 /// linearize+encrypt+object-streams together.
 ///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::copy_encryption`]
+/// is set. This is a temporary flpdf scope limitation, not a qpdf
+/// restriction: qpdf itself supports linearize+copy-encryption together.
+/// [`WriteOptions::encrypt`] is not affected by this restriction.
+///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
 /// object (catalog, page, shared, or body object) has no entry in the
