@@ -4315,7 +4315,11 @@ fn run_page_extraction(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_pages(&bytes, n, output, options.deterministic_id)?;
+        // `bytes` is handed over rather than lent: the split branch is the last
+        // use of it (the `std::fs::write` below belongs to the other branch), so
+        // moving it in keeps the rewritten document resident once instead of
+        // twice for the whole of the split.
+        let written = split_pages(bytes, n, output, options.deterministic_id)?;
         if verbose {
             for path in &written {
                 eprintln!("flpdf: wrote file {}", path.display());
@@ -4408,7 +4412,11 @@ fn run_rewrite_with_page_ops(
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
-        let written = split_pages(&bytes, n, output, options.deterministic_id)?;
+        // `bytes` is handed over rather than lent: the split branch is the last
+        // use of it (the `std::fs::write` below belongs to the other branch), so
+        // moving it in keeps the rewritten document resident once instead of
+        // twice for the whole of the split.
+        let written = split_pages(bytes, n, output, options.deterministic_id)?;
         if verbose {
             for path in &written {
                 eprintln!("flpdf: wrote file {}", path.display());
