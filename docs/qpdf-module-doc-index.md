@@ -96,6 +96,7 @@
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
 | `crates/flpdf/src/pipeline/lzw.rs` | correspondence | Pl_LZWDecoder.cc bit accumulation, table growth, code-width transitions, end-of-data latching, output boundaries, and error text |
 | `crates/flpdf/src/pipeline/lzw_png_oracle.rs` | correspondence | live differential instrumentation for Pl_LZWDecoder.cc and Pl_PNGFilter.cc |
+| `crates/flpdf/src/pipeline/md5.rs` | correspondence | libqpdf/Pl_MD5.cc:5-65 and libqpdf/qpdf/Pl_MD5.hh:4-33 — unchanged forwarding, enable/persist state, reusable finish lifecycle, and hexadecimal digest retrieval |
 | `crates/flpdf/src/pipeline/ostream.rs` | correspondence | Pl_OStream.cc terminal adapter for an externally owned writer |
 | `crates/flpdf/src/pipeline/png_filter.rs` | correspondence | Pl_PNGFilter.cc row geometry, buffer rotation, per-filter decoding, hard-coded Up encoding, partial-row finish, and constructor validation |
 | `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |

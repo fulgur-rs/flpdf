@@ -31,6 +31,7 @@
 | `crates/flpdf/src/pipeline.rs` | crate-private module registration only |
 | `crates/flpdf/src/filespec_helper.rs` | private discard sink and EmbeddedFile checksum consumer cutover |
 | `docs/qpdf-correspondence.md` | truthful `Pl_MD5` implementation and consumer ledger entry |
+| `docs/qpdf-module-doc-index.md` | generated module-correspondence index including `pipeline/md5.rs` |
 
 No new public exports, dependencies, fixtures, or writer changes are required.
 
@@ -494,6 +495,7 @@ If `crates/flpdf/tests/filespec_helper_tests.rs` remains unchanged, omit it from
 
 **Files:**
 - Modify: `docs/qpdf-correspondence.md:184-210`
+- Generate: `docs/qpdf-module-doc-index.md`
 - Verify: all files changed since `origin/main`
 
 **Interfaces:**
@@ -509,6 +511,12 @@ Change the `Pl_MD5.cc` row from missing to implemented, naming both the componen
 ```
 
 Leave the separate `Pl_Discard / Pl_Function / Pl_SHA2` row unchanged.
+
+Regenerate the module-doc index after adding the `pipeline/md5.rs` correspondence annotation:
+
+```bash
+python3 scripts/qpdf-module-docs.py --write
+```
 
 - [ ] **Step 2: Re-resolve and recheck the pinned qpdf evidence**
 
@@ -573,6 +581,7 @@ Expected: `patch-coverage: OK` and 100% coverage on every changed executable lin
 - [ ] **Step 7: Audit the final diff and acceptance criteria**
 
 ```bash
+python3 scripts/qpdf-module-docs.py --check
 git diff --check origin/main...HEAD
 git diff --stat origin/main...HEAD
 git diff origin/main...HEAD -- \
@@ -581,6 +590,7 @@ git diff origin/main...HEAD -- \
   crates/flpdf/src/filespec_helper.rs \
   crates/flpdf/tests/filespec_helper_tests.rs \
   docs/qpdf-correspondence.md \
+  docs/qpdf-module-doc-index.md \
   docs/superpowers/specs/2026-08-04-pl-md5-pipeline-design.md \
   docs/superpowers/plans/2026-08-04-pl-md5-pipeline.md
 git status --short --branch

@@ -62,7 +62,7 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
   アドホック分岐ゼロ / 対応行 / ゲート通過）を満たす必要がある
 
 したがって「本表で ✅ なら `Mirrors` にできる」は成り立たない。
-現状は **mirror 5 / correspondence 127**（`content_normalizer` / `matrix` /
+現状は **mirror 5 / correspondence 129**（`content_normalizer` / `matrix` /
 `pdf_version` / `security/rc4` / `tokenizer` のみが `Mirrors`）。
 本表で ✅ の `nntree.rs` / `json/` / `xref_entry.rs` / `bit_stream.rs` /
 `bit_writer.rs` / `optimization.rs` / `pipeline.rs` が `correspondence` のままである
