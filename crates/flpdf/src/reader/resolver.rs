@@ -1853,6 +1853,24 @@ mod tests {
         assert!(resolver.encryption_parameters().borrow().is_none());
     }
 
+    /// How many times a [`crate::pipeline::test_support::RecordingSink`] was
+    /// finished. Shared so every finish-counting test agrees on what it means.
+    fn finish_count(
+        trace: &std::rc::Rc<std::cell::RefCell<crate::pipeline::test_support::Trace>>,
+    ) -> usize {
+        trace
+            .borrow()
+            .calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    crate::pipeline::test_support::TraceCall::Finish { .. }
+                )
+            })
+            .count()
+    }
+
     /// A resolver over `bytes`, so a test can hand `pipe_stream_data` an
     /// offset and length directly instead of parsing a document to reach one.
     fn resolver_over(bytes: Vec<u8>) -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
@@ -2041,17 +2059,7 @@ mod tests {
             resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
 
         assert!(!ok);
-        let finishes = trace
-            .borrow()
-            .calls
-            .iter()
-            .filter(|call| {
-                matches!(
-                    call,
-                    crate::pipeline::test_support::TraceCall::Finish { .. }
-                )
-            })
-            .count();
+        let finishes = finish_count(&trace);
         assert_eq!(finishes, 1, "the sink is finished exactly once");
     }
 
@@ -2069,17 +2077,7 @@ mod tests {
             resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
 
         assert!(!ok);
-        let finishes = trace
-            .borrow()
-            .calls
-            .iter()
-            .filter(|call| {
-                matches!(
-                    call,
-                    crate::pipeline::test_support::TraceCall::Finish { .. }
-                )
-            })
-            .count();
+        let finishes = finish_count(&trace);
         assert_eq!(
             finishes, 1,
             "a failed finish is not attempted a second time"
@@ -2266,17 +2264,7 @@ mod tests {
             );
 
             assert!(!ok, "offset={offset} length={length}");
-            let finishes = trace
-                .borrow()
-                .calls
-                .iter()
-                .filter(|call| {
-                    matches!(
-                        call,
-                        crate::pipeline::test_support::TraceCall::Finish { .. }
-                    )
-                })
-                .count();
+            let finishes = finish_count(&trace);
             assert_eq!(finishes, 1, "offset={offset} length={length}");
         }
     }
