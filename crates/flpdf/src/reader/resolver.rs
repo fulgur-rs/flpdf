@@ -85,6 +85,7 @@
 //! object, so duplicates would be the bug instead.
 
 use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
 use std::cell::RefCell;
@@ -216,6 +217,17 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// `Option` serves both; see the field-mapping table in this issue's
     /// design (`bd show flpdf-25kg.3.11`) for the disclosed collapse.
     encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    /// qpdf `InputSource::last_offset` (`include/qpdf/InputSource.hh:88`),
+    /// which `getLastOffset()` reports and which every warning raised from a
+    /// failed pipe is attributed to (`libqpdf/QPDF.cc:2513,2525`).
+    ///
+    /// Only a *read* updates it: both input sources set it to the position
+    /// they are about to read from, before the read can fail
+    /// (`BufferInputSource.cc:128`, `FileInputSource.cc:118-119`), and
+    /// **`seek` never touches it**. Reporting the requested seek target
+    /// instead would attribute a rejected seek to a byte the reader never
+    /// reached.
+    last_offset: u64,
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -302,6 +314,10 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// loop here is what makes a short `Read::read` — legal for any `R` —
     /// indistinguishable from that contract.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // Both of qpdf's input sources record where the read starts before it
+        // can fail, so a failing read is still attributed to the byte it
+        // reached for.
+        self.last_offset = self.tell().unwrap_or(self.last_offset);
         let mut filled = 0;
         while filled < buf.len() {
             match self.reader.read(&mut buf[filled..]) {
@@ -447,6 +463,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 attempt_recovery,
                 repair_diagnostics,
                 encryption_parameters: Rc::new(RefCell::new(None)),
+                last_offset: 0,
             }),
             self_weak: self_weak.clone(),
             pdf_unique_id,
@@ -566,6 +583,28 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .borrow_mut()
             .repair_diagnostics
             .push(Diagnostic::warning(message, None));
+    }
+
+    /// [`Self::push_warning`] with the offset qpdf attributes the warning to.
+    ///
+    /// qpdf carries the position inside the exception it throws — every
+    /// `damagedPDF(file, object, offset, message)` overload takes one
+    /// (`include/qpdf/QPDF.hh:1044-1050`) — where flpdf keeps it in
+    /// [`Diagnostic::offset`] beside the text.
+    ///
+    /// Same borrow discipline as [`Self::push_warning`].
+    /// qpdf `InputSource::getLastOffset` (`include/qpdf/InputSource.hh:55`).
+    ///
+    /// Borrow discipline: taken and dropped inside this expression.
+    fn last_offset(&self) -> u64 {
+        self.core.borrow().last_offset
+    }
+
+    pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) {
+        self.core
+            .borrow_mut()
+            .repair_diagnostics
+            .push(Diagnostic::warning(message, Some(offset)));
     }
 
     /// A snapshot of every warning raised on this document so far.
@@ -731,6 +770,169 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 return Ok(bytes);
             }
         }
+    }
+
+    /// qpdf `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2538`), the only
+    /// path by which a stream's original bytes reach a consumer: `QPDF_Stream`
+    /// keeps no copy of them, so its `pipeStreamData` reads them here from
+    /// `parsed_offset` and `length` (`libqpdf/QPDF_Stream.cc:608-620`).
+    ///
+    /// Returns whether the bytes were delivered, mirroring qpdf's `bool`:
+    /// a damaged source is a warning and a `false`, not an error for the
+    /// caller to propagate.
+    ///
+    /// qpdf allocates `length` and reads it in one operation (`:2497-2501`).
+    /// That is deliberate here even though parsing deliberately does *not*
+    /// pre-allocate a declared `/Length`: by pipe time the offset and length
+    /// have already been validated by the framing scan.
+    ///
+    /// **The decryption stage is not inserted yet.** qpdf prepends one when
+    /// the document is encrypted (`:2490-2492`, `QPDF::decryptStream`); until
+    /// that lands, an encrypted document pipes ciphertext. No test asserts
+    /// that as correct.
+    //
+    // The parameter list is qpdf's (`QPDF.cc:2542-2550` passes seven beyond
+    // the receiver); bundling them would be a shape this port does not have a
+    // counterpart for. Not wired to a production caller until
+    // `QPDF_Stream::pipeStreamData`'s source dispatch lands, the same
+    // not-yet-wired state the other ported primitives carry.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn pipe_stream_data(
+        &self,
+        object_ref: ObjectRef,
+        offset: i64,
+        length: usize,
+        _stream_dict: &ObjectHandle,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> bool {
+        // qpdf's shape is one `try` whose every escape lands in a `catch`,
+        // followed by a tail common to all of them (`libqpdf/QPDF.cc:2494-2538`).
+        // `attempted_finish` is what the tail consults, and it is set
+        // immediately before `finish()` so that the tail finishes exactly the
+        // pipelines that never got the call.
+        let mut attempted_finish = false;
+        let Some(failure) =
+            self.attempt_pipe_stream_data(offset, length, pipeline, &mut attempted_finish)
+        else {
+            return true;
+        };
+
+        if !suppress_warnings {
+            match failure {
+                // qpdf `:2498-2500` throws `damagedPDF(file, "", offset +
+                // read, ...)`, which its `catch (QPDFExc&)` arm reports
+                // (`:2505-2509`). The position is where the read stopped, not
+                // where it began.
+                PipeFailure::ShortRead { at } => {
+                    self.push_warning_at(at, "unexpected EOF reading stream data");
+                }
+                // qpdf `:2510-2530`.
+                PipeFailure::Decoding { at, ref detail } => {
+                    let og = format!("{} {}", object_ref.number, object_ref.generation);
+                    self.push_warning_at(
+                        at,
+                        format!("error decoding stream data for object {og}: {detail}"),
+                    );
+                    if will_retry {
+                        self.push_warning_at(
+                            at,
+                            "stream will be re-processed without filtering to avoid data loss",
+                        );
+                    }
+                }
+            }
+        }
+
+        // qpdf `:2531-2537`, reached from either arm. Its own failure is
+        // swallowed.
+        if !attempted_finish {
+            let _ = pipeline.finish();
+        }
+        false
+    }
+
+    /// qpdf's `try` block (`libqpdf/QPDF.cc:2495-2504`). `None` is its
+    /// `return true`; anything else is what it would have thrown.
+    fn attempt_pipe_stream_data(
+        &self,
+        offset: i64,
+        length: usize,
+        pipeline: &mut dyn Pipeline,
+        attempted_finish: &mut bool,
+    ) -> Option<PipeFailure> {
+        let start = match u64::try_from(offset) {
+            Ok(start) => start,
+            // qpdf's input source throws `std::logic_error("INTERNAL ERROR:
+            // BufferInputSource offset < 0")` here
+            // (`libqpdf/BufferInputSource.cc:119-121`).
+            Err(_) => {
+                return Some(PipeFailure::Decoding {
+                    at: self.last_offset(),
+                    detail: format!("stream offset {offset} is negative"),
+                })
+            }
+        };
+
+        // qpdf `:2496-2497`: the seek comes *before* the allocation, so an
+        // offset the source rejects is diagnosed without first trusting the
+        // declared length for a buffer.
+        if let Err(error) = self.seek(start) {
+            // `getLastOffset()` is where the last *read* happened; a seek
+            // never sets it, so a rejected seek is not attributed to the byte
+            // it was asked for.
+            return Some(PipeFailure::Decoding {
+                at: self.last_offset(),
+                detail: error.to_string(),
+            });
+        }
+
+        // qpdf `:2497` allocates with `make_unique<char[]>`, whose
+        // `std::bad_alloc` its own `catch (std::exception&)` arm reports
+        // (`:2510-2520`). An infallible `vec![0u8; length]` would abort the
+        // process instead, so a hostile declared length has to go through a
+        // fallible reservation.
+        let mut buf: Vec<u8> = Vec::new();
+        if let Err(error) = buf.try_reserve_exact(length) {
+            return Some(PipeFailure::Decoding {
+                at: self.last_offset(),
+                detail: format!("cannot allocate {length} bytes of stream data: {error}"),
+            });
+        }
+        buf.resize(length, 0);
+
+        // qpdf `:2498-2500`.
+        match self.read(&mut buf) {
+            Ok(read) if read == length => {}
+            Ok(read) => {
+                return Some(PipeFailure::ShortRead {
+                    at: start.saturating_add(read as u64),
+                })
+            }
+            Err(error) => {
+                return Some(PipeFailure::Decoding {
+                    at: self.last_offset(),
+                    detail: error.to_string(),
+                })
+            }
+        }
+
+        // qpdf `:2501-2504`.
+        if let Err(error) = pipeline.write(&buf) {
+            return Some(PipeFailure::Decoding {
+                at: self.last_offset(),
+                detail: error.to_string(),
+            });
+        }
+        *attempted_finish = true;
+        if let Err(error) = pipeline.finish() {
+            return Some(PipeFailure::Decoding {
+                at: self.last_offset(),
+                detail: error.to_string(),
+            });
+        }
+        None
     }
 
     /// Test-only mutable access to the input source itself, for fixtures that
@@ -1346,6 +1548,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
 /// Bytes pulled from the input source per [`ResolverHandle::refill`].
 const INPUT_CHUNK: usize = 4096;
 
+/// What qpdf's `pipeStreamData` `try` block would have thrown
+/// (`libqpdf/QPDF.cc:2495-2504`), carrying the position each exception is
+/// attributed to. The two variants are qpdf's two `catch` arms.
+enum PipeFailure {
+    /// `damagedPDF(file, "", offset + read, "unexpected EOF reading stream
+    /// data")` (`:2498-2500`), caught as a `QPDFExc` (`:2505-2509`).
+    ShortRead { at: u64 },
+    /// Anything else (`:2510-2530`).
+    Decoding { at: u64, detail: String },
+}
+
 /// Bytes pulled per iteration by [`ResolverHandle::read_to_owned`].
 ///
 /// Larger than [`INPUT_CHUNK`] because its callers are the legacy tenants,
@@ -1677,6 +1890,528 @@ mod tests {
     fn a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters() {
         let resolver = bare_resolver();
         assert!(resolver.encryption_parameters().borrow().is_none());
+    }
+
+    /// How many times a [`crate::pipeline::test_support::RecordingSink`] was
+    /// finished. Shared so every finish-counting test agrees on what it means.
+    fn finish_count(
+        trace: &std::rc::Rc<std::cell::RefCell<crate::pipeline::test_support::Trace>>,
+    ) -> usize {
+        trace
+            .borrow()
+            .calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    crate::pipeline::test_support::TraceCall::Finish { .. }
+                )
+            })
+            .count()
+    }
+
+    /// A resolver over `bytes`, so a test can hand `pipe_stream_data` an
+    /// offset and length directly instead of parsing a document to reach one.
+    fn resolver_over(bytes: Vec<u8>) -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
+        ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            Diagnostics::default(),
+            0,
+        )
+    }
+
+    /// `QPDF::pipeStreamData` seeks to the parsed offset, reads exactly
+    /// `length` bytes, writes them to the pipeline and finishes it
+    /// (`libqpdf/QPDF.cc:2496-2504`). It reads the declared length and nothing
+    /// around it.
+    #[test]
+    fn piping_copies_the_declared_length_from_the_parsed_offset() {
+        let source = b"%PDF-1.4\nbefore<payload bytes>after".to_vec();
+        let offset = source
+            .windows(7)
+            .position(|w| w == b"payload")
+            .expect("marker") as i64;
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            offset,
+            b"payload bytes".len(),
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(ok, "an in-bounds read succeeds");
+        assert_eq!(sink.take_buffer().expect("buffer"), b"payload bytes");
+    }
+
+    /// qpdf throws `damagedPDF(file, "", offset + read, "unexpected EOF
+    /// reading stream data")` when the source runs out before `length`
+    /// (`libqpdf/QPDF.cc:2498-2500`), catches it as a `QPDFExc`, warns unless
+    /// suppressed (`:2505-2509`), and returns false. The offset it attributes
+    /// the warning to is where the read stopped, not where it started.
+    #[test]
+    fn a_source_shorter_than_the_declared_length_warns_and_fails() {
+        let source = b"%PDF-1.4\nshort".to_vec();
+        let offset = 9i64;
+        let available = source.len() - 9;
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            offset,
+            available + 100,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(!ok, "a truncated read fails");
+        let diagnostics = resolver.repair_diagnostics();
+        let entries: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| (d.message.as_str(), d.offset))
+            .collect();
+        assert_eq!(
+            entries,
+            [(
+                "unexpected EOF reading stream data",
+                #[allow(clippy::cast_possible_truncation)]
+                Some(offset as u64 + available as u64)
+            )]
+        );
+    }
+
+    /// `suppress_warnings` silences the report but not the failure
+    /// (`libqpdf/QPDF.cc:2506`).
+    #[test]
+    fn suppressed_warnings_still_fail_but_report_nothing() {
+        let source = b"%PDF-1.4\nshort".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            9,
+            1_000,
+            &dict,
+            &mut sink,
+            true,
+            false,
+        );
+
+        assert!(!ok);
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    /// A failure downstream of the read is qpdf's `catch (std::exception&)`
+    /// arm (`libqpdf/QPDF.cc:2510-2530`): it warns "error decoding stream data
+    /// for object N G: `<what>`" at `file->getLastOffset()`, which after a
+    /// successful read is where that read began
+    /// (`BufferInputSource::read` sets `last_offset = cur_offset`,
+    /// `libqpdf/BufferInputSource.cc:128`) — the stream's own offset, not the
+    /// position afterwards.
+    #[test]
+    fn a_failing_sink_warns_against_the_streams_offset() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, false);
+
+        assert!(!ok);
+        let diagnostics = resolver.repair_diagnostics();
+        let entries: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| (d.message.as_str(), d.offset))
+            .collect();
+        assert_eq!(
+            entries,
+            [(
+                "error decoding stream data for object 4 0: sink write failure 1",
+                Some(9)
+            )]
+        );
+    }
+
+    /// `will_retry` adds a second warning at the same position telling the
+    /// reader why the data is about to be produced again
+    /// (`libqpdf/QPDF.cc:2521-2529`). It is a separate warning, after the
+    /// first, not a suffix on it.
+    #[test]
+    fn a_retrying_caller_is_told_the_stream_will_be_reprocessed() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, true);
+
+        assert!(!ok);
+        let diagnostics = resolver.repair_diagnostics();
+        let messages: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "error decoding stream data for object 4 0: sink write failure 1",
+                "stream will be re-processed without filtering to avoid data loss",
+            ]
+        );
+        assert!(diagnostics.entries().iter().all(|d| d.offset == Some(9)));
+    }
+
+    /// qpdf sets `attempted_finish` immediately *before* calling
+    /// `pipeline->finish()` (`libqpdf/QPDF.cc:2502-2503`), so the tail that
+    /// runs after a failure (`:2531-2537`) only finishes a pipeline that never
+    /// got the call. A write failure therefore still finishes the sink once —
+    /// and any error from that attempt is swallowed.
+    #[test]
+    fn a_write_failure_still_finishes_the_sink_once() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        // The recovery finish fails too; qpdf ignores that (`:2534-2536`).
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[1]);
+        let trace = sink.trace();
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
+
+        assert!(!ok);
+        let finishes = finish_count(&trace);
+        assert_eq!(finishes, 1, "the sink is finished exactly once");
+    }
+
+    /// The other half of the same rule: a `finish` that fails has already been
+    /// attempted, so the tail must not call it again.
+    #[test]
+    fn a_finish_failure_is_not_retried() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[1]);
+        let trace = sink.trace();
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
+
+        assert!(!ok);
+        let finishes = finish_count(&trace);
+        assert_eq!(
+            finishes, 1,
+            "a failed finish is not attempted a second time"
+        );
+    }
+
+    /// An offset past the end reads nothing, so qpdf's short-read throw fires
+    /// with `read == 0` and attributes the warning to the requested offset
+    /// itself (`libqpdf/QPDF.cc:2498-2500`).
+    #[test]
+    fn an_offset_past_the_end_warns_against_the_requested_offset() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let past_end = source.len() as i64 + 500;
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            past_end,
+            7,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(!ok);
+        let diagnostics = resolver.repair_diagnostics();
+        let entries: Vec<_> = diagnostics
+            .entries()
+            .iter()
+            .map(|d| (d.message.as_str(), d.offset))
+            .collect();
+        assert_eq!(
+            entries,
+            [(
+                "unexpected EOF reading stream data",
+                #[allow(clippy::cast_sign_loss)]
+                Some(past_end as u64)
+            )]
+        );
+    }
+
+    /// A negative offset is not silently unreadable: qpdf's input source
+    /// throws `std::logic_error("INTERNAL ERROR: BufferInputSource offset <
+    /// 0")` (`libqpdf/BufferInputSource.cc:119-121`), which lands in the
+    /// decoding-failure arm and produces a warning. Only the detail after the
+    /// colon is flpdf's own, since the text qpdf appends there names a C++
+    /// input-source class this port does not have.
+    #[test]
+    fn a_negative_offset_warns_rather_than_failing_silently() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), -1, 7, &dict, &mut sink, false, false);
+
+        assert!(!ok);
+        let messages: Vec<_> = resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].starts_with("error decoding stream data for object 4 0: "),
+            "{messages:?}"
+        );
+    }
+
+    /// A zero-length stream is not a failure: qpdf allocates nothing, reads
+    /// nothing, writes nothing and finishes (`libqpdf/QPDF.cc:2497-2504`).
+    #[test]
+    fn a_zero_length_stream_succeeds_and_finishes_the_sink() {
+        let source = b"%PDF-1.4\npayload".to_vec();
+        let resolver = resolver_over(source);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok =
+            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 0, &dict, &mut sink, false, false);
+
+        assert!(ok);
+        assert!(sink.take_buffer().expect("buffer").is_empty());
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    /// An input source that fails is reported, not swallowed: qpdf's seek and
+    /// read both throw and land in the decoding-failure arm
+    /// (`libqpdf/QPDF.cc:2510-2520`). Exercised through the same
+    /// fault-injecting reader shape the resolution tests use.
+    #[test]
+    fn an_input_source_failure_is_reported_through_the_decoding_arm() {
+        // Reading always fails; seeking fails only in the second case, so one
+        // pass exercises a successful seek followed by a failing read and the
+        // other stops at the seek.
+        struct Broken {
+            inner: Cursor<Vec<u8>>,
+            fail_seeks: bool,
+        }
+
+        impl std::io::Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("read went away"))
+            }
+        }
+
+        impl std::io::Seek for Broken {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                if self.fail_seeks {
+                    return Err(std::io::Error::other("seek went away"));
+                }
+                self.inner.seek(position)
+            }
+        }
+
+        for fail_seeks in [false, true] {
+            let resolver = ResolverHandle::new_shared(
+                Broken {
+                    inner: Cursor::new(b"%PDF-1.4\npayload".to_vec()),
+                    fail_seeks,
+                },
+                0,
+                BTreeMap::<ObjectRef, XrefEntry>::new(),
+                false,
+                Diagnostics::default(),
+                0,
+            );
+            let dict = crate::ObjectHandle::dictionary(vec![]);
+            let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+            let ok = resolver.pipe_stream_data(
+                ObjectRef::new(4, 0),
+                9,
+                7,
+                &dict,
+                &mut sink,
+                false,
+                false,
+            );
+
+            assert!(!ok, "seeks={fail_seeks}");
+            let messages: Vec<_> = resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|d| d.message.clone())
+                .collect();
+            assert_eq!(messages.len(), 1, "{messages:?}");
+            assert!(
+                messages[0].starts_with("error decoding stream data for object 4 0: "),
+                "seeks={fail_seeks}: {messages:?}"
+            );
+        }
+    }
+
+    /// qpdf's cleanup tail (`libqpdf/QPDF.cc:2531-2537`) sits after *both*
+    /// catch arms, so every failure that never reached `finish()` still gets
+    /// one — not just a failing write. A downstream stage that buffers or
+    /// releases resources in `finish` would otherwise be left hanging before
+    /// the caller retries.
+    #[test]
+    fn every_failure_before_finish_still_finishes_the_sink_once() {
+        // (offset, length): a short read, an offset past the end, and a
+        // negative offset. None of them reaches qpdf's `finish()` call.
+        for (offset, length) in [(9i64, 1_000usize), (10_000, 7), (-1, 7)] {
+            let resolver = resolver_over(b"%PDF-1.4\npayload".to_vec());
+            let dict = crate::ObjectHandle::dictionary(vec![]);
+            let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[]);
+            let trace = sink.trace();
+
+            let ok = resolver.pipe_stream_data(
+                ObjectRef::new(4, 0),
+                offset,
+                length,
+                &dict,
+                &mut sink,
+                true,
+                false,
+            );
+
+            assert!(!ok, "offset={offset} length={length}");
+            let finishes = finish_count(&trace);
+            assert_eq!(finishes, 1, "offset={offset} length={length}");
+        }
+    }
+
+    /// A rejected seek is attributed to `getLastOffset()`, which a seek never
+    /// updates (`include/qpdf/InputSource.hh:88`; neither input source touches
+    /// it in `seek`). So the warning names the byte the reader actually last
+    /// reached, not the one it was asked to jump to.
+    #[test]
+    fn a_rejected_seek_is_attributed_to_the_last_read_not_the_requested_target() {
+        struct Fickle {
+            inner: Cursor<Vec<u8>>,
+            fail_seeks: bool,
+        }
+
+        impl std::io::Read for Fickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+
+        impl std::io::Seek for Fickle {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+                if self.fail_seeks {
+                    return Err(std::io::Error::other("seek went away"));
+                }
+                self.inner.seek(position)
+            }
+        }
+
+        let resolver = ResolverHandle::new_shared(
+            Fickle {
+                inner: Cursor::new(b"%PDF-1.4\npayload".to_vec()),
+                fail_seeks: false,
+            },
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            Diagnostics::default(),
+            0,
+        );
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+
+        // One good pipe, so the last read is at offset 9.
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+        assert!(resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            9,
+            7,
+            &dict,
+            &mut sink,
+            false,
+            false
+        ));
+
+        resolver.with_reader_mut(|reader| reader.fail_seeks = true);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+        assert!(!resolver.pipe_stream_data(
+            ObjectRef::new(5, 0),
+            1_000,
+            7,
+            &dict,
+            &mut sink,
+            false,
+            false
+        ));
+
+        let offsets: Vec<_> = resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|d| d.offset)
+            .collect();
+        assert_eq!(offsets, [Some(9)], "not the requested 1000");
+    }
+
+    /// qpdf allocates the declared length with `make_unique<char[]>`, whose
+    /// `std::bad_alloc` its decoding-failure arm reports
+    /// (`libqpdf/QPDF.cc:2497`, `:2510-2520`). An infallible allocation would
+    /// abort the process on a hostile length instead of warning.
+    #[test]
+    fn a_length_too_large_to_allocate_warns_rather_than_aborting() {
+        let resolver = resolver_over(b"%PDF-1.4\npayload".to_vec());
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        let ok = resolver.pipe_stream_data(
+            ObjectRef::new(4, 0),
+            9,
+            usize::MAX,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        );
+
+        assert!(!ok);
+        let messages: Vec<_> = resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].starts_with("error decoding stream data for object 4 0: cannot allocate "),
+            "{messages:?}"
+        );
     }
 
     /// AC6 case 1: a document with no `/Encrypt` entry authenticates
