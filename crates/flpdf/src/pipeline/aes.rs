@@ -1,5 +1,4 @@
-//! qpdf correspondence: Pl_AES_PDF.cc — AES-128/256 CBC with the PDF block
-//! padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time.
+//! qpdf correspondence: Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time.
 //!
 //! qpdf reaches AES through `QPDFCryptoImpl::rijndael_init`/`rijndael_process`
 //! (`libqpdf/qpdf/Pl_AES_PDF.hh:47`), a provider abstraction this crate replaces

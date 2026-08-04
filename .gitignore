@@ -7,3 +7,8 @@
 target/
 .worktrees/
 .claude/worktrees/
+
+# Python bytecode from scripts/ and its tests (scripts/qpdf-module-docs.py,
+# scripts/tests/). Regenerated on every run and never part of a change.
+__pycache__/
+*.pyc
