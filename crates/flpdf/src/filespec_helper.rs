@@ -853,12 +853,10 @@ pub fn format_pdf_date(year: u16, month: u8, day: u8, hour: u8, minute: u8, seco
 struct ChecksumDiscard;
 
 impl Pipeline for ChecksumDiscard {
-    // cov:ignore-start: the private infallible sink's identifier has no runtime
-    // caller in the qpdf-shaped PlMd5 -> discard checksum topology.
-    fn identifier(&self) -> &str {
-        "embedded file checksum discard"
-    }
-    // cov:ignore-end
+    #[rustfmt::skip]
+    fn identifier(&self) -> &str { // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
+        "embedded file checksum discard" // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
+    } // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
 
     fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
         Ok(())
