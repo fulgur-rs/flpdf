@@ -2234,7 +2234,7 @@ mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above 
 /// derive a per-object key via Algorithm 1, while V=5 uses the 32-byte file
 /// key directly with AES-256 (no per-object derivation).
 #[derive(Debug, Clone, Copy)]
-enum WriteCipher {
+pub(crate) enum WriteCipher {
     /// V=1/V=2/V=4: per-object key via Algorithm 1, then RC4 or AES-128
     /// (the [`ObjectKeyAlg`](crate::security::standard::ObjectKeyAlg) selects
     /// the `sAlT` salt and the resulting cipher).
@@ -2244,38 +2244,38 @@ enum WriteCipher {
     FileKeyAes256,
 }
 
-struct EncryptionContext {
+pub(crate) struct EncryptionContext {
     /// Built `/Encrypt` dictionary (from a 4.1/4.2/4.3 builder).
-    encrypt_dict: Dictionary,
+    pub(crate) encrypt_dict: Dictionary,
     /// File encryption key derived from passwords + `/ID[0]` (Algorithm 2),
     /// or — for V=5 — the random 32-byte file key (FEK).
-    file_key: Vec<u8>,
+    pub(crate) file_key: Vec<u8>,
     /// How per-object string/stream key material is derived (V<5 per-object
     /// vs V=5 file-key-direct).
-    cipher: WriteCipher,
+    pub(crate) cipher: WriteCipher,
     /// Indirect reference of the freshly-allocated `/Encrypt` object. The
     /// emission loop skips this ref so the `/Encrypt` dict itself stays
     /// plaintext (PDF 1.7 §7.6.1).
-    encrypt_ref: ObjectRef,
+    pub(crate) encrypt_ref: ObjectRef,
     /// The 16-byte `/ID[0]` bytes that were fed into the file-key derivation.
     /// The output trailer's `/ID` array MUST start with these same bytes —
     /// readers re-derive the file key from `/ID[0]` to validate the password.
-    id0: Vec<u8>,
+    pub(crate) id0: Vec<u8>,
     /// When `true`, all AES CBC IVs are forced to `[0u8; 16]` instead of
     /// being drawn from the OS CSPRNG.  Testing only — mirrors
     /// [`WriteOptions::static_aes_iv`].
-    static_aes_iv: bool,
+    pub(crate) static_aes_iv: bool,
     /// Whether the `/Metadata` stream is encrypted alongside the rest of the
     /// document (mirrors [`crate::EncryptParams::encrypt_metadata`]). When `false`
     /// (qpdf `--cleartext-metadata`, V=4/V=5 only), the `/Metadata` stream in
     /// [`metadata_ref`](Self::metadata_ref) is left in the clear and tagged
     /// with `/Crypt /Identity` instead of being run through the cipher.
-    encrypt_metadata: bool,
+    pub(crate) encrypt_metadata: bool,
     /// Indirect reference of the document `/Catalog`'s `/Metadata` stream, when
     /// one exists AND `encrypt_metadata` is `false`. Used by the emission loop
     /// to exempt exactly that object from encryption. `None` whenever metadata
     /// is encrypted (the common case) or the document has no `/Metadata`.
-    metadata_ref: Option<ObjectRef>,
+    pub(crate) metadata_ref: Option<ObjectRef>,
 }
 
 /// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
@@ -2289,7 +2289,7 @@ fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<Objec
     }
 }
 
-fn build_encryption_context<R: Read + Seek>(
+pub(crate) fn build_encryption_context<R: Read + Seek>(
     pdf: &Pdf<R>,
     options: &WriteOptions,
     params: &crate::encrypt_setup::EncryptParams,
@@ -2452,7 +2452,7 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
 /// decrypted with the donor's original user or owner password because all the
 /// ingredients of Algorithm 2 (key-length, `/O`, `/P`, `/ID[0]`) are
 /// reproduced exactly.
-fn build_copy_encryption_context(
+pub(crate) fn build_copy_encryption_context(
     src: &crate::encrypt_setup::CopyEncryptionSource,
     options: &WriteOptions,
     existing_max: u32,
@@ -2739,7 +2739,7 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
 /// a per-object key derived via Algorithm 1 and the cipher implied by
 /// `ctx.object_key_alg`. The `/Encrypt` dict itself is skipped by the
 /// caller (this function is not called on `ctx.encrypt_ref`).
-fn encrypt_strings_in_object_for_writer(
+pub(crate) fn encrypt_strings_in_object_for_writer(
     object_ref: ObjectRef,
     object: &mut Object,
     ctx: &EncryptionContext,
@@ -2818,7 +2818,7 @@ fn encrypt_strings_in_object_for_writer(
 /// Encrypt a stream's payload bytes in place (after filter re-encoding) and
 /// update its `/Length` entry. AES grows the buffer by 16 bytes (IV prefix)
 /// plus up to one full block of PKCS#7 padding.
-fn encrypt_stream_payload_for_writer(
+pub(crate) fn encrypt_stream_payload_for_writer(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     ctx: &EncryptionContext,
