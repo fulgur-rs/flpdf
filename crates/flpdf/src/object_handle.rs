@@ -149,10 +149,15 @@ pub(crate) enum ObjectValue {
     /// `Rc<Vec<u8>>` rather than `Rc<[u8]>`: `Rc::<[u8]>::from(vec)` cannot
     /// retrofit its refcount header onto an allocation `Vec` already made, so
     /// it memcpys the whole payload (the same trap `page_split`'s
-    /// `SharedSource` documents). `Rc::new(vec)` moves the `Vec`'s three words
-    /// and copies nothing, and it matches qpdf's own shape — a pointer to an
-    /// object that owns the bytes. `Rc` rather than `Arc` because [`Repr`]
-    /// itself is `Rc`-based, so this value is `!Send` regardless.
+    /// `SharedSource` documents), and every payload arrives as a `Vec`.
+    /// `Rc::new(vec)` moves the `Vec`'s three words and copies nothing. That
+    /// this happens to be two levels of indirection like `shared_ptr<Buffer>`
+    /// is coincidence, not correspondence: qpdf needs a `Buffer` object
+    /// because C++ cannot say borrow-or-own in the type system, so `Buffer`
+    /// carries a runtime flag for it (`include/qpdf/Buffer.hh:35-46` offers
+    /// both an owning and a non-owning constructor). `Rc` rather than `Arc`
+    /// because [`Repr`] itself is `Rc`-based, so this value is `!Send`
+    /// regardless.
     Stream {
         dict: ObjectHandle,
         data: Rc<Vec<u8>>,
@@ -786,8 +791,8 @@ impl ObjectHandle {
     /// attached to a [`crate::Pdf`]'s object graph, e.g. in tests.
     ///
     /// `data` is used as given rather than copied, the way
-    /// `QPDFObjectHandle::newStream(QPDF*, std::shared_ptr<Buffer>)` "use[s]
-    /// the given buffer as the stream data"
+    /// `QPDFObjectHandle::newStream(QPDF*, std::shared_ptr<Buffer>)` uses "the
+    /// given buffer as the stream data"
     /// (`include/qpdf/QPDFObjectHandle.hh:546-558`). Handing the same buffer
     /// to a second stream shares it; nothing here copies the bytes.
     pub fn stream(dict: ObjectHandle, data: Rc<Vec<u8>>) -> Self {
