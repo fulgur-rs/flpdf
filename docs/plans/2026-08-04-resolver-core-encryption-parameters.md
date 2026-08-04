@@ -569,16 +569,33 @@ Expected: everything green, no new failures.
 
 Per CLAUDE.md, run the qpdf-zlib-compat gated byte-identical tests — this
 issue must not change a single output byte (nothing consumes the new
-parameters yet):
+parameters yet). A loose substring filter (`compat_baseline`, `byte_identical`)
+is not sufficient here: it can match zero tests and report success without
+running anything, silently skipping the real gate. Use the explicit target
+list `.github/workflows/ci.yml` actually runs (currently lines 147-197 —
+re-`grep -n "qpdf-zlib-compat" .github/workflows/ci.yml` rather than trusting
+a cached line range, since CI's target list can grow):
 
 ```bash
-cargo test -p flpdf --features qpdf-zlib-compat compat_baseline
-cargo test -p flpdf --features qpdf-zlib-compat byte_identical
+cargo test -p flpdf --features qpdf-zlib-compat --test zlib_compat_tests
+cargo test -p flpdf --features qpdf-zlib-compat --test cmp_diff_zero_tests
+cargo test -p flpdf --features qpdf-zlib-compat --test cmp_null_visibility_tests
+cargo test -p flpdf --features qpdf-zlib-compat --test deterministic_id_qpdf_parity_tests
+cargo test -p flpdf --features qpdf-zlib-compat --test cmp_generate_objstm_tests
+cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
+cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
+cargo test -p flpdf --features qpdf-zlib-compat --lib overlay::byte_gate
+cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical
+cargo test -p flpdf-cli --features qpdf-zlib-compat --test cli_byte_identical_overlay
+cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_baseline_static_id -- --nocapture
+cargo test -p flpdf-cli --features qpdf-zlib-compat --test compat_matrix_baseline -- --nocapture
+cargo test -p flpdf-qtest-tools --features qpdf-zlib-compat --test e2e
 ```
-(Adjust the filter to whatever this repo's actual byte-identical test names
-are — `grep -rn "fn.*byte_identical\|fn.*compat_baseline" crates/flpdf/` if
-unsure. If nothing changed at the byte level, as expected, these should be
-unaffected — but confirm rather than assume.)
+Every one of these must report `0 failed` with a nonzero pass count (a
+`0 passed` result for any of them means the target name is stale, not that
+the gate is satisfied). If nothing changed at the byte level, as expected,
+all of these should be unaffected — but confirm by reading the pass counts
+rather than assuming from a clean exit code.
 
 **Step 4: Patch coverage**
 
