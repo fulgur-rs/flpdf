@@ -1390,6 +1390,57 @@ fn encrypted_v4_mixed_cf_reader_fixture() -> Vec<u8> {
     bytes
 }
 
+/// qpdf requires `/V` and `/R` together, before any password work, and throws
+/// `damagedPDF` when either is missing (`libqpdf/QPDF_encryption.cc:770-777`).
+/// Observed by blanking `/V 5` in place in a `qpdf --encrypt --bits=256`
+/// output:
+///
+/// ```text
+/// $ qpdf --password=u --show-encryption no_v.pdf
+/// qpdf: no_v.pdf (encryption dictionary, offset 1033): some encryption
+///   dictionary parameters are missing or the wrong type
+/// $ echo $?
+/// 2
+/// ```
+///
+/// The password path already read `/V` through `standard_handler_r5_inputs`;
+/// the `--password-is-hex-key` path did not, and used to open such a document.
+#[test]
+fn an_encrypt_dictionary_without_v_is_rejected_on_every_path() {
+    let mut fixture = encrypted_r5_or_r6_pdf(6, "", &[]);
+    let at = fixture
+        .windows(4)
+        .position(|window| window == b"/V 5")
+        .expect("fixture declares /V 5");
+    fixture[at..at + 4].copy_from_slice(b"    ");
+
+    let paths = [
+        PdfOpenOptions {
+            password: b"userpass".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+        PdfOpenOptions {
+            password: b"00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_vec(),
+            password_is_hex_key: true,
+            ..PdfOpenOptions::default()
+        },
+    ];
+    for options in paths {
+        let hex_key = options.password_is_hex_key;
+        let err = Pdf::open_with_options(std::io::Cursor::new(fixture.clone()), options)
+            .err()
+            .unwrap_or_else(|| panic!("qpdf rejects this document (hex key path: {hex_key})"));
+        assert!(
+            matches!(
+                err,
+                Error::Encrypted(EncryptedError::Malformed { ref reason })
+                    if reason == "missing /V entry"
+            ),
+            "hex key path: {hex_key}, got {err:?}"
+        );
+    }
+}
+
 /// A `/V 4` document whose one crypt filter names a `/CFM` qpdf does not
 /// recognise, carrying two strings and two streams.
 ///
