@@ -1,7 +1,7 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_trailer`).
+//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
@@ -1734,8 +1734,13 @@ impl ObjectHandle {
     /// indirect-handle-resolving-to-a-`Stream` caveat: this call dispatches
     /// on `self` directly, bypassing the child-position reference check, so
     /// it inlines just the dictionary rather than implementing qpdf's real
-    /// stream-writing framing (`unparse_stream_body`, a later task of this
-    /// same plan).
+    /// stream-writing framing. The dedicated primitive for *this* (QDF-mode)
+    /// shape is [`Self::unparse_stream_body_qdf`] -- not
+    /// [`Self::unparse_stream_body`], which has no `indent` parameter and
+    /// only ever produces the compact single-line form; that one is the
+    /// dedicated primitive for [`Self::unparse_object`]'s own (non-QDF)
+    /// identical caveat instead. Do not conflate the two when fixing this
+    /// shape at a real call site.
     #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
     pub(crate) fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
@@ -2170,14 +2175,20 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
         }
         ObjectValue::Stream { stream_dict, .. } => {
             // Same reachability and "inlines only the dictionary" caveat as
-            // `unparse_object_value`'s own `Stream` arm (see its doc): this
-            // recurses into the stream's dictionary handle at the *same*
-            // `indent`, not `indent + 2` -- a stream dictionary is not a
-            // child sitting inside a container the way an array element or
-            // dict value is; it occupies this same value's own position,
-            // exactly as `Object::write_pdf_qdf`'s `Stream` arm calls
-            // `stream.dict.write_pdf_qdf(out, indent)` at the unincremented
-            // indent before appending its `stream`/`endstream` framing.
+            // `unparse_object_value`'s own `Stream` arm (see its doc) --
+            // but note that arm's doc names `unparse_stream_body` (the
+            // *compact* primitive) as the dedicated responsible primitive
+            // for its own caveat; for *this* QDF arm the dedicated
+            // primitive is `unparse_stream_body_qdf` instead, not that one
+            // (it has no `indent` parameter and only ever produces the
+            // compact single-line form). This recurses into the stream's
+            // dictionary handle at the *same* `indent`, not `indent + 2` --
+            // a stream dictionary is not a child sitting inside a container
+            // the way an array element or dict value is; it occupies this
+            // same value's own position, exactly as `Object::write_pdf_qdf`'s
+            // `Stream` arm calls `stream.dict.write_pdf_qdf(out, indent)` at
+            // the unincremented indent before appending its
+            // `stream`/`endstream` framing.
             unparse_object_walk_qdf(stream_dict, indent, out)?;
         }
         // Every remaining variant (Null, Boolean, Integer, Real, RealLiteral,
@@ -2317,6 +2328,77 @@ impl ObjectHandle {
             unparse_stream_dict_entries(&entries, refiltered, out)
         })
     }
+
+    /// QDF-mode counterpart of [`Self::unparse_stream_body`] -- same
+    /// delegation-target dimension as [`Self::unparse_object_qdf`] is to
+    /// [`Self::unparse_object`] (`m->qdf_mode` set to `true` inside the
+    /// same `QPDFWriter::unparseObject` dictionary branch,
+    /// `QPDFWriter.cc:1346-1527`; the `f_stream`/`f_filtered` handling at
+    /// `:1440-1455` and the `/Length`-then-`/Filter` tail at `:1508-1524`
+    /// run unconditionally there, regardless of `m->qdf_mode` -- only
+    /// `indent`/`writeStringQDF` differ between the two modes), matching
+    /// `Dictionary::write_pdf_stream_qdf`'s established layout
+    /// (`object.rs:1036`) -- multi-line QDF framing (`<<\n`, each
+    /// surviving key at `indent + 2` with a trailing `\n`, closing `>>` at
+    /// `indent`), with `/Length` pulled out of the iteration and written
+    /// last, immediately before `>>` -- plus the same null-suppression
+    /// rule as [`Self::unparse_object_qdf`]/[`Self::unparse_stream_body`],
+    /// via the same [`visible_dict_entries`] helper.
+    ///
+    /// Unlike [`Self::unparse_stream_body`], this primitive has **no
+    /// `refiltered` parameter** -- matching `Dictionary::write_pdf_stream_qdf`'s
+    /// own signature exactly, which has none either. This is not fixed by
+    /// the caller already holding a settled `/Filter`/`/Length`: unlike a
+    /// stored *value*, `refiltered` in the compact path controls emitted
+    /// *key order* (`/Filter` pulled after `/Length` vs. left at its plain
+    /// alphabetical position) regardless of what `/Filter` already
+    /// contains, so a settled dict does not make the dimension moot on its
+    /// own. Real qpdf's `unparseObject` *does* apply the identical
+    /// `f_filtered` key-pull-and-reappend logic inside `m->qdf_mode` too
+    /// (`QPDFWriter.cc:1451-1455`/`:1519-1522`, the same `if` guards,
+    /// unguarded by `qdf_mode`) -- so a genuinely re-filtered stream on the
+    /// QDF full-rewrite path is, like `write_pdf_stream_qdf` itself, an
+    /// existing, out-of-scope simplification this primitive matches rather
+    /// than one this task introduces or is asked to fix: this primitive's
+    /// signature simply mirrors its delegation target's real (already
+    /// simplified) shape, the same convention every other primitive in
+    /// this family follows for the legacy function it ports.
+    ///
+    /// `self` accepts the same two shapes [`Self::unparse_stream_body`]
+    /// does -- a `Dictionary` directly, or a `Stream { stream_dict, .. }`
+    /// whose (possibly still-unresolved) `stream_dict` is forced to
+    /// resolve -- with the identical error-propagation and empty-`<< >>`
+    /// degrade behavior for every other shape; see that primitive's own
+    /// doc for the full contract, which this one mirrors exactly except
+    /// for the QDF layout and the missing `refiltered` parameter.
+    #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+    pub(crate) fn unparse_stream_body_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    // Mirrors `unparse_stream_body`'s identical
+                    // `stream_dict.try_dereference()?` -- see that
+                    // primitive's own doc for why this is needed rather
+                    // than a plain `with_value` read.
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_qdf(&entries, indent, out)
+        })
+    }
 }
 
 // Writes a stream dictionary's own body -- `unparse_stream_body`'s sole
@@ -2360,6 +2442,49 @@ fn unparse_stream_dict_entries(
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(b" >>");
+    Ok(())
+}
+
+// QDF-mode sibling of `unparse_stream_dict_entries` above --
+// `unparse_stream_body_qdf`'s sole callee -- matching
+// `Dictionary::write_pdf_stream_qdf`'s established shape (`object.rs`)
+// with `visible_dict_entries`'s null-suppression layered on top, the same
+// delegation `unparse_dict_entries_qdf` makes to that helper for the
+// plain (non-stream) QDF dictionary case. `/Length` is captured during
+// the single suppressed-entries pass and written last, at `indent + 2`,
+// immediately before the closing `>>` at `indent` -- no `refiltered`
+// dimension exists here, matching `write_pdf_stream_qdf`'s own signature
+// (see `unparse_stream_body_qdf`'s own doc for why). Verified byte-for-byte
+// against `write_pdf_stream_qdf` (`object.rs`) before this primitive's
+// tests were written.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn unparse_stream_dict_entries_qdf(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    indent: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<\n");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if key.as_slice() == b"Length" {
+            length_value = Some(value);
+            continue;
+        }
+        push_spaces(out, indent + 2);
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        write_child_qdf(value, indent + 2, out)?;
+        out.push(b'\n');
+    }
+    if let Some(length) = length_value {
+        push_spaces(out, indent + 2);
+        out.extend_from_slice(b"/Length ");
+        write_child_qdf(length, indent + 2, out)?;
+        out.push(b'\n');
+    }
+    push_spaces(out, indent);
+    out.extend_from_slice(b">>");
     Ok(())
 }
 
@@ -5023,6 +5148,251 @@ mod unparse_object_tests {
         drop(resolver);
         let mut out = Vec::new();
         assert!(indirect.unparse_stream_body(&mut out, false).is_err());
+    }
+
+    // QDF-mode sibling suite of the `unparse_stream_body_*` tests above,
+    // for `unparse_stream_body_qdf`. Every hardcoded expected byte string
+    // below was cross-checked against a live call to
+    // `Dictionary::write_pdf_stream_qdf` (`object.rs`) with an equivalent
+    // dictionary before being pinned here, not hand-derived from reading
+    // the algorithm alone -- see this primitive's own doc for the full
+    // qpdf-correspondence and the deliberate absence of a `refiltered`
+    // parameter.
+
+    #[test]
+    fn unparse_stream_body_qdf_writes_length_last_preserved() {
+        // No `refiltered` dimension exists for the QDF shape (see
+        // `unparse_stream_body_qdf`'s own doc for why), so unlike its
+        // compact sibling this has only one shape to pin: every other key
+        // stays at its natural alphabetical position, and `/Length` is
+        // pulled out and written last, immediately before the closing
+        // `>>`. Deliberately includes `/Width`, which sorts *after*
+        // `/Length` alphabetically (`DecodeParms` < `Filter` < `Length` <
+        // `Width`): with only `{Filter, DecodeParms, Length}` (no key past
+        // `Length`), `/Length`'s natural BTreeMap position already happens
+        // to be last, so a broken implementation that forgot the pull-out
+        // entirely would still pass -- `/Width` makes the two shapes
+        // actually diverge (mutation-tested: deleting the pull-out
+        // `key.as_slice() == b"Length"` branch does not fail this suite
+        // without `/Width` present). Cross-checked against
+        // `Dictionary::write_pdf_stream_qdf` with the equivalent dict:
+        // `<<\n  /DecodeParms <<\n  >>\n  /Filter /FlateDecode\n  /Width 100\n  /Length 3\n>>`.
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+            (b"Width".to_vec(), ObjectHandle::integer(100)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(
+            out,
+            b"<<\n  /DecodeParms <<\n  >>\n  /Filter /FlateDecode\n  /Width 100\n  /Length 3\n>>"
+        );
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_suppresses_a_null_valued_key() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+            (b"Metadata".to_vec(), ObjectHandle::null()),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        // Cross-checked against a direct `Dictionary::write_pdf_stream_qdf`
+        // call on the equivalent dict *without* the null key removed: that
+        // call writes `/Metadata null` verbatim (`write_pdf_stream_qdf`
+        // itself applies no null suppression -- that is layered on top by
+        // `visible_dict_entries`, exactly like the compact
+        // `unparse_stream_dict_entries` does), confirming the suppression
+        // observed here is this primitive's own added behavior, not
+        // something already built into the legacy function it delegates
+        // scalar/container formatting to.
+        assert_eq!(out, b"<<\n  /Length 3\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_writes_an_empty_dict_when_every_entry_is_suppressed() {
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::null())]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        // No surviving entries and no `/Length`: matches
+        // `write_pdf_stream_qdf`'s own empty-input shape `<<\n>>` (no
+        // interior spaces at indent 0 -- `push_spaces(indent)` only adds
+        // spaces when `indent > 0`).
+        assert_eq!(out, b"<<\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_respects_a_nonzero_indent() {
+        // Mirrors unparse_object_qdf_respects_a_nonzero_starting_indent:
+        // every other QDF test in this suite pins `indent = 0`, which would
+        // still pass with a stray hardcoded `0` inside the function body.
+        // Both values here are scalars, so this alone does not prove the
+        // `indent + 2` passed to `write_child_qdf` for each entry actually
+        // carries the caller's `indent` -- a scalar ignores that argument
+        // entirely (see `unparse_stream_body_qdf_respects_a_nonzero_indent_for_a_nested_container_value`
+        // below for the test that does). Cross-checked against
+        // `Dictionary::write_pdf_stream_qdf(&mut out, 4)` on the equivalent
+        // dict: `<<\n      /A 1\n      /Length 2\n    >>`.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), ObjectHandle::integer(1)),
+            (b"Length".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 4).unwrap();
+        assert_eq!(out, b"<<\n      /A 1\n      /Length 2\n    >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_respects_a_nonzero_indent_for_a_nested_container_value() {
+        // The test above only proves `indent` reaches the closing `>>`'s
+        // own `push_spaces` and the entry lines' *leading* `push_spaces(out,
+        // indent + 2)` -- both scalar values in it ignore the `indent + 2`
+        // this primitive also threads through `write_child_qdf(value,
+        // indent + 2, out)` for each entry (a scalar's own QDF form does
+        // not depend on indent at all). A nested container value does: its
+        // own children land at `(indent + 2) + 2`, and a hardcoded `2` in
+        // place of that `indent + 2` argument would still pass every other
+        // test in this suite (mutation-tested: it survives without this
+        // test). Cross-checked against `Dictionary::write_pdf_stream_qdf`
+        // with the equivalent dict at indent 4:
+        // `<<\n      /DecodeParms <<\n        /Predictor 12\n      >>\n      /Length 3\n    >>`.
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), ObjectHandle::integer(12))]),
+            ),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 4).unwrap();
+        assert_eq!(
+            out,
+            b"<<\n      /DecodeParms <<\n        /Predictor 12\n      >>\n      /Length 3\n    >>"
+        );
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_writes_a_retained_indirect_entry_as_reference_form() {
+        // QDF-mode sibling of unparse_stream_body_writes_length_last_preserved
+        // that exercises write_child_qdf's indirect arm instead of a direct
+        // scalar -- unreached by the tests above, whose every value is
+        // direct.
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"A".to_vec(), indirect),
+            (b"Length".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /A 20 0 R\n  /Length 2\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_uses_the_dictionary_of_a_direct_stream_value() {
+        // Mirrors unparse_stream_body_uses_the_dictionary_of_a_direct_stream_value:
+        // a *direct* Stream ObjectValue has no qpdf counterpart, but this
+        // primitive must still use its `stream_dict`'s entries rather than
+        // falling into the non-dictionary-self `<< >>` degrade below.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
+        });
+        let mut out = Vec::new();
+        handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /Length 2\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_on_an_indirect_handle_resolving_to_a_stream_uses_the_dictionary() {
+        // Mirrors unparse_stream_body_on_an_indirect_handle_resolving_to_a_stream_uses_the_dictionary:
+        // a real, reachable qpdf shape -- an indirect object whose resolved
+        // value is a stream (e.g. a production reader's own resolution of a
+        // stream object).
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
+        });
+        let mut out = Vec::new();
+        indirect.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /Length 2\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_resolves_an_unresolved_indirect_stream_dict() {
+        // Mirrors unparse_stream_body_resolves_an_unresolved_indirect_stream_dict:
+        // `stream_dict` is itself an `ObjectHandle` that may not yet be
+        // resolved. `self` stays a *direct* Stream value here so the only
+        // variable under test is `stream_dict`'s own resolution state:
+        // without the `stream_dict.try_dereference()?` call this primitive
+        // makes, `with_value` on a not-yet-resolved indirect handle returns
+        // `None` and this would degrade to `<< >>` instead of using the
+        // resolved dictionary's entries.
+        let (inner, _resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [(b"Length".to_vec(), ObjectHandle::integer(2))]
+                .into_iter()
+                .collect(),
+        ));
+        let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+        let mut out = Vec::new();
+        handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n  /Length 2\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_propagates_a_dropped_document_error_from_stream_dict() {
+        // Mirrors unparse_stream_body_propagates_a_dropped_document_error_from_stream_dict:
+        // the dropped document lives behind `stream_dict`, not `self`
+        // directly (`self` is a *direct* Stream value; only `stream_dict`
+        // is the as-yet-unresolved indirect handle whose resolver is
+        // dropped).
+        let (inner, resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(resolver);
+        let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+        let mut out = Vec::new();
+        assert!(handle.unparse_stream_body_qdf(&mut out, 0).is_err());
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_writes_empty_dict_when_stream_dict_is_not_a_dictionary() {
+        // Mirrors unparse_stream_body_writes_empty_dict_when_stream_dict_is_not_a_dictionary:
+        // `stream_dict` is itself typed as an `ObjectHandle`, so nothing at
+        // the type level prevents it from resolving to something other than
+        // a `Dictionary`.
+        let handle = ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
+        let mut out = Vec::new();
+        handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(out, b"<<\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_writes_empty_dict_for_a_non_dictionary_self() {
+        // Mirrors unparse_stream_body_writes_empty_dict_for_a_non_dictionary_self:
+        // pins the doc comment's typed-input-assumption claim.
+        let mut out = Vec::new();
+        ObjectHandle::integer(5)
+            .unparse_stream_body_qdf(&mut out, 0)
+            .unwrap();
+        assert_eq!(out, b"<<\n>>");
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_propagates_a_dropped_document_error() {
+        // Mirrors unparse_stream_body_propagates_a_dropped_document_error:
+        // an as-yet-unresolved indirect handle whose document has been
+        // dropped must surface as an error here too, not silently degrade
+        // to an empty `<< >>` the way an unresolved `with_value` read alone
+        // would.
+        let (indirect, resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(resolver);
+        let mut out = Vec::new();
+        assert!(indirect.unparse_stream_body_qdf(&mut out, 0).is_err());
     }
 
     #[test]
