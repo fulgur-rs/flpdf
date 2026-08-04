@@ -62,7 +62,7 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
   アドホック分岐ゼロ / 対応行 / ゲート通過）を満たす必要がある
 
 したがって「本表で ✅ なら `Mirrors` にできる」は成り立たない。
-現状は **mirror 5 / correspondence 127**（`content_normalizer` / `matrix` /
+現状は **mirror 5 / correspondence 129**（`content_normalizer` / `matrix` /
 `pdf_version` / `security/rc4` / `tokenizer` のみが `Mirrors`）。
 本表で ✅ の `nntree.rs` / `json/` / `xref_entry.rs` / `bit_stream.rs` /
 `bit_writer.rs` / `optimization.rs` / `pipeline.rs` が `correspondence` のままである
@@ -184,7 +184,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `Pipeline.cc`（積層シンク基盤のみ。個々の `Pl_*` は下記の各行で個別に分類） | 114 | `pipeline.rs`（public `Pipeline` trait、identifier/write/finish lifecycle、logic/runtime error channel） | ✅ |
 | `Pl_Count.cc` | 48 | `pipeline/count.rs`（byte count、last byte、forwarding、finish lifecycle） | ✅ |
-| `Pl_MD5.cc` | 66 | 専用 Pipeline stage は無い | ❌ |
+| `Pl_MD5.cc` | 66 | `pipeline/md5.rs`（enable/persist/reuse、hex digest、forwarding/error order）+ `filespec_helper.rs`（EmbeddedFile `/Params /CheckSum` production consumer） | ✅ |
 | `Pl_Flate` / `SF_FlateLzwDecode` | 946 | `pipeline/flate.rs` + `stream_filter.rs` の `FlateLzwStreamFilter`（`/Predictor` `/Columns` `/Colors` `/BitsPerComponent` `/EarlyChange` の解釈、codec → predictor の chain 構築、`QIntC::to_uint` の range error timing） | ✅ |
 | `Pl_LZWDecoder` | 189 | `pipeline/lzw.rs`（3-byte rotating buffer、1 入力 byte あたり 1 code、table 成長と code 幅遷移、eod latch、qpdf の 7 種の診断文言）+ `stream_filter.rs` 経由の production decode | ✅ |
 | `Pl_PNGFilter` | 232 | `pipeline/png_filter.rs`（32-bit wrapping の row 幅算出、constructor の 3 種 rejection、未知 filter byte の無視、finish の zero-pad row、Up 固定 encoder）+ `filters.rs` / `writer/serialize.rs` の production consumer。⚪ row buffer の確保だけは constructor ではなく最初の write まで遅延（出力バイト・呼び出し境界・エラー timing に影響しない） | ✅ |
@@ -458,9 +458,9 @@ CI で走らない。11 件中 `cmp_null_visibility_tests` のみが漏れてい
 
 | 状態 | qpdf 側の該当行数 | 内訳 |
 |---|---|---|
-| ✅ 境界一致 | 3,559 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
+| ✅ 境界一致 | 3,625 | 責務境界は一致。**再配置は不要だが「完成」ではない** — DoD D1〜D5 の充足は各スライスで別途検証する |
 | 🔀 smeared | 27,653 | 再配置の主対象。qpdf 全体の 67% |
-| ❌ missing | 1,275 | `QPDF_json.cc` 入力側(833) / `Pl_DCT`(326) / `Pl_MD5`(66) / `QTC`(50) |
+| ❌ missing | 1,209 | `QPDF_json.cc` 入力側(833) / `Pl_DCT`(326) / `QTC`(50) |
 | ⚪ 逸脱候補 | 6,735 | 要承認（下記の方針矛盾を参照） |
 | ➖ 対象外 | 2,237 | C API |
 | **合計** | **41,459** | qpdf `libqpdf/*.cc` の実測 41,459 行と一致 |
