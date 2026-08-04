@@ -241,13 +241,17 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
-| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6491) + **`json_inspect.rs` の `doJSON*` 族相当**（下記）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(1074: `QPDFJob.cc:876-911` の `doListAttachments` 移植。`<file> has no embedded files` は infilename を要するため CLI 側に残す) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `QPDFJob` に相当する独立モジュールが**存在しない**。集約は `flpdf-q2fo`(D1) / `flpdf-ukux`(D2) / `flpdf-s5cw`(D3) |
+| `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6796) + `job/json.rs`（`QPDFJob::writeJSON` の出力選択部分、`QPDFJob.cc:3094-3115`）+ **`json_inspect.rs` の `doJSON*` / `QPDF::writeJSON` 相当の serialization**（下記）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(1074: `QPDFJob.cc:876-911` の `doListAttachments` 移植。`<file> has no embedded files` は infilename を要するため CLI 側に残す) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `job/json.rs` は JSON 出力選択だけを移植した slice で、`QPDFJob` 全体の移植ではない。完全な `QPDFJob` 集約モジュールは依然**存在しない**。集約は `flpdf-q2fo`(D1) / `flpdf-ukux`(D2) / `flpdf-s5cw`(D3) |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
 | `QPDFLogger.cc` | 255 | `diagnostics.rs`(80) | 🔀 |
 
 ### `QPDFJob.cc` の `doJSON*` 族 — `json_inspect.rs` に埋没
 
 `QPDFJob.cc:958-1620` の JSON セクション生成が `json_inspect.rs` にある。
+同ファイルは `QPDF::writeJSON` 相当の serialization も担う。一方、
+`QPDFJob::writeJSON` の `QPDFJob.cc:3094-3115` にある top-level 出力先・
+stream side-file prefix の選択だけは `job/json.rs` が担い、その後の JSON
+構築と出力 lifecycle は `json_inspect.rs` へ委譲する。
 **§8 の `QPDF_json.cc` 行と混同しないこと**（`QPDF_json.cc` は JSON 入力と
 `writeJSON` であって、セクション生成ではない）。
 

@@ -103,6 +103,7 @@ pub mod filespec_helper;
 pub mod filters;
 pub mod fonts;
 pub mod form_field_object_helper;
+pub mod job;
 pub mod json;
 pub mod json_inspect;
 pub mod linearization;

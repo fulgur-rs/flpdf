@@ -855,6 +855,291 @@ fn json_stream_data_file_creates_side_files() {
     );
 }
 
+#[test]
+fn json_stream_data_file_to_stdout_requires_explicit_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "\nqpdf: please specify --json-stream-prefix since the input file name is unknown\n\n\
+For help:\n  qpdf --help=usage       usage information\n  qpdf --help=topic       help on a topic\n  \
+qpdf --help=--option    help on an option\n  qpdf --help             general help and a topic list\n\n"
+    );
+    assert!(!temp.path().join("stream-4").exists());
+}
+
+#[test]
+fn json_stream_data_file_to_stdout_empty_prefix_requires_explicit_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(temp.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix=",
+        ])
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "\nqpdf: please specify --json-stream-prefix since the input file name is unknown\n\n\
+For help:\n  qpdf --help=usage       usage information\n  qpdf --help=topic       help on a topic\n  \
+qpdf --help=--option    help on an option\n  qpdf --help             general help and a topic list\n\n"
+    );
+    assert!(!temp.path().join("-4").exists());
+}
+
+#[test]
+fn missing_stream_prefix_does_not_mask_missing_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("missing.pdf");
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("open {}:", input_path.display())),
+        "expected input-open error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("please specify --json-stream-prefix"),
+        "the unresolved prefix must not mask the input-open error: {stderr}"
+    );
+}
+
+#[test]
+fn missing_stream_prefix_does_not_mask_malformed_input() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("malformed.pdf");
+    std::fs::write(&input_path, b"not a PDF").unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&input_path.display().to_string()),
+        "expected malformed-input diagnostic, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("please specify --json-stream-prefix"),
+        "the unresolved prefix must not mask the malformed-input diagnostic: {stderr}"
+    );
+}
+
+#[test]
+fn json_stream_data_file_to_stdout_uses_explicit_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let prefix = temp.path().join("streams");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix",
+        ])
+        .arg(&prefix)
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"datafile\""),
+        "expected JSON to refer to stream side file: {output:?}"
+    );
+    assert!(
+        temp.path().join("streams-4").exists(),
+        "expected explicit-prefix side file"
+    );
+}
+
+#[test]
+fn json_output_file_mode_defaults_stream_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args(["--json=2", "--json-stream-data=file", "--json-output"])
+        .arg(&output_path)
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(
+        std::fs::read_to_string(&output_path)
+            .unwrap()
+            .contains("\"datafile\""),
+        "expected JSON to refer to default-prefix side file"
+    );
+    assert!(
+        temp.path().join("output.json-4").exists(),
+        "expected output filename to be the default stream prefix"
+    );
+}
+
+#[test]
+fn json_output_file_mode_empty_prefix_defaults_stream_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let input_path = temp.path().join("input.pdf");
+    let output_path = temp.path().join("output.json");
+    let expected_side_file = temp.path().join("output.json-4");
+    std::fs::write(&input_path, one_page_pdf_with_stream()).unwrap();
+
+    let output = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix=",
+            "--json-output",
+        ])
+        .arg(&output_path)
+        .arg(&input_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+    assert_eq!(
+        json["qpdf"][1]["obj:4 0 R"]["stream"]["datafile"],
+        expected_side_file.to_string_lossy().as_ref()
+    );
+    assert!(expected_side_file.exists());
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 missing JSON stream prefix oracle"]
+fn live_qpdf_json_file_stdout_requires_prefix() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+
+    let qpdf_dir = tempfile::tempdir().unwrap();
+    let flpdf_dir = tempfile::tempdir().unwrap();
+    let qpdf_input = qpdf_dir.path().join("input.pdf");
+    let flpdf_input = flpdf_dir.path().join("input.pdf");
+    let input = one_page_pdf_with_stream();
+    std::fs::write(&qpdf_input, &input).unwrap();
+    std::fs::write(&flpdf_input, input).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .current_dir(qpdf_dir.path())
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&qpdf_input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(flpdf_dir.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(["--json=2", "--json-stream-data=file"])
+        .arg(&flpdf_input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(!qpdf_dir.path().join("stream-4").exists());
+    assert!(!flpdf_dir.path().join("stream-4").exists());
+}
+
+#[test]
+#[ignore = "live qpdf 11.9.0 empty JSON stream prefix oracle"]
+fn live_qpdf_json_file_stdout_empty_prefix_requires_prefix() {
+    if skip_unless_qpdf_11_9() {
+        return;
+    }
+
+    let qpdf_dir = tempfile::tempdir().unwrap();
+    let flpdf_dir = tempfile::tempdir().unwrap();
+    let qpdf_input = qpdf_dir.path().join("input.pdf");
+    let flpdf_input = flpdf_dir.path().join("input.pdf");
+    let input = one_page_pdf_with_stream();
+    std::fs::write(&qpdf_input, &input).unwrap();
+    std::fs::write(&flpdf_input, input).unwrap();
+
+    let qpdf = ShellCommand::new("qpdf")
+        .current_dir(qpdf_dir.path())
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix=",
+        ])
+        .arg(&qpdf_input)
+        .output()
+        .unwrap();
+    let flpdf = Command::cargo_bin("flpdf")
+        .unwrap()
+        .current_dir(flpdf_dir.path())
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args([
+            "--json=2",
+            "--json-stream-data=file",
+            "--json-stream-prefix=",
+        ])
+        .arg(&flpdf_input)
+        .output()
+        .unwrap();
+
+    assert_eq!(flpdf.status, qpdf.status);
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert_eq!(flpdf.stderr, qpdf.stderr);
+    assert!(!qpdf_dir.path().join("-4").exists());
+    assert!(!flpdf_dir.path().join("-4").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Regression: --json-output alone must NOT default stream-data to inline.
 //
