@@ -674,9 +674,9 @@ struct Part1XrefPatch {
 /// padded on the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes so it
 /// can be back-patched in-place once the Part 6 xref offset is known.  When
 /// `encrypt_ctx` is `Some`, `/Encrypt {N} 0 R` is written immediately after
-/// `/ID` — qpdf's `writeTrailer` (QPDFWriter.cc:1221-1228) writes `/ID` then,
-/// for every trailer form except `t_lin_second` (the main/second-half
-/// trailer), ` /Encrypt {objid} 0 R`. Verified empirically against qpdf
+/// `/ID` — qpdf's `writeTrailer` writes `/ID` first, then, for every trailer
+/// form except `t_lin_second` (the main/second-half trailer),
+/// ` /Encrypt {objid} 0 R` (QPDFWriter.cc:1224-1231). Verified empirically against qpdf
 /// 11.9.0 (`qpdf --linearize --static-id --static-aes-iv --encrypt "" "" 128
 /// --use-aes=y`), whose first-page trailer ends `... /ID [<...><...>]
 /// /Encrypt 4 0 R >>`.
@@ -788,9 +788,9 @@ fn write_part1_xref_and_trailer(
     }
 
     // /Encrypt — reference to the `/Encrypt` dictionary object, written right
-    // after `/ID` (qpdf `writeTrailer`, QPDFWriter.cc:1221-1228: `/ID` first,
-    // then — for every trailer form except `t_lin_second`, the main/
-    // second-half trailer — ` /Encrypt {objid} 0 R`). The main (Part-6)
+    // after `/ID` (qpdf `writeTrailer` writes `/ID` first, then — for every
+    // trailer form except `t_lin_second`, the main/second-half trailer —
+    // ` /Encrypt {objid} 0 R`, QPDFWriter.cc:1224-1231). The main (Part-6)
     // trailer is produced by `write_main_xref_and_trailer`, a separate
     // function that never receives `encrypt_ctx`, so that omission is
     // structural rather than a runtime branch here.
@@ -6107,29 +6107,23 @@ mod tests {
         let first_trailer = &out[first_trailer_pos..second_trailer_pos];
         let main_trailer = &out[second_trailer_pos..];
 
-        // qpdf's key order is `/ID` then `/Encrypt` (QPDFWriter.cc:1221-1228:
-        // `/ID` is written first, then — for every `which != t_lin_second`
-        // trailer form — ` /Encrypt {objid} 0 R` right after it).
-        let encrypt_ref_needle = format!("/Encrypt {expected_encrypt_num} 0 R");
+        // qpdf's key order and exact spacing is `/ID` then `/Encrypt`, right
+        // before the dict's closing `>>`: `/ID` is written first, then — for
+        // every `which != t_lin_second` trailer form — ` /Encrypt {objid} 0
+        // R` (QPDFWriter.cc:1224-1231); the dict close follows
+        // unconditionally. Pin the exact byte run observed against qpdf
+        // 11.9.0 (`] /Encrypt 4 0 R >>`, this test's own oracle sample)
+        // rather than just "contains /Encrypt somewhere after /ID": a
+        // substring-only check can't distinguish qpdf's spacing from e.g.
+        // `]/Encrypt N 0 R>>` or extra spaces, which would still be a byte
+        // divergence in this qpdf-byte-identical project.
+        let tail = format!("] /Encrypt {expected_encrypt_num} 0 R >>");
         assert!(
             first_trailer
-                .windows(encrypt_ref_needle.len())
-                .any(|w| w == encrypt_ref_needle.as_bytes()),
-            "Part-1 first-page trailer must contain \"{encrypt_ref_needle}\", got {:?}",
+                .windows(tail.len())
+                .any(|w| w == tail.as_bytes()),
+            "Part-1 trailer must end with qpdf's exact byte run \"{tail}\", got {:?}",
             String::from_utf8_lossy(first_trailer) // cov:ignore: only evaluated when the assertion above fails.
-        );
-        let id_pos = first_trailer
-            .windows(b"/ID".len())
-            .position(|w| w == b"/ID")
-            .expect("Part-1 trailer must carry /ID");
-        let encrypt_pos = first_trailer
-            .windows(b"/Encrypt".len())
-            .position(|w| w == b"/Encrypt")
-            .expect("Part-1 trailer must carry /Encrypt");
-        assert!(
-            encrypt_pos > id_pos,
-            "/Encrypt must come after /ID in the Part-1 trailer (qpdf key order), \
-             got /ID at {id_pos} and /Encrypt at {encrypt_pos}"
         );
 
         assert!(
