@@ -5,6 +5,8 @@ use std::fmt;
 
 pub(crate) mod ascii85;
 
+pub(crate) mod aes;
+
 pub(crate) mod ascii_hex;
 
 pub(crate) mod buffer;
