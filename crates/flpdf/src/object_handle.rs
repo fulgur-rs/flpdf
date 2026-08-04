@@ -2259,9 +2259,23 @@ impl ObjectHandle {
     /// unchanged from `write_pdf_stream`'s own established simplifications
     /// (see that function's doc for the full qpdf-correspondence caveat).
     ///
-    /// `self` must resolve to a `Dictionary`; a non-dictionary value writes
-    /// as an empty `<< >>` mirroring `write_pdf_stream`'s own typed-input
-    /// assumption (this crate's writer never calls it on anything else).
+    /// `self` normally resolves to a `Dictionary` directly -- this
+    /// primitive's usual caller already holds an already-resolved stream's
+    /// dictionary handle (see below). It also accepts `self` resolving to a
+    /// `Stream { stream_dict, .. }`, the same shape [`Self::unparse_object`]'s
+    /// own `Stream` arm accepts when an indirect handle resolves to a stream
+    /// (see that primitive's own doc for why this shape is reachable): in
+    /// that case `stream_dict` -- itself an [`ObjectHandle`], not
+    /// necessarily already resolved -- is forced to resolve (propagating any
+    /// error, e.g. a dropped document, the same way the top-level `self`
+    /// resolution below does; see `unparse_stream_body_resolves_an_unresolved_indirect_stream_dict`
+    /// and `unparse_stream_body_propagates_a_dropped_document_error_from_stream_dict`,
+    /// which fail without this call) and its entries are used exactly as if
+    /// `self` had been that dictionary handle to begin with. Any other
+    /// resolved shape for `self`, or a `stream_dict` that itself resolves to
+    /// something other than a `Dictionary`, degrades to an empty `<< >>`,
+    /// mirroring `write_pdf_stream`'s own typed-input assumption (this
+    /// crate's writer never calls it on anything else).
     ///
     /// Forces resolution of `self` before dispatch, the same as
     /// [`Self::unparse_object`]/[`Self::unparse_object_qdf`]'s own
@@ -2282,6 +2296,22 @@ impl ObjectHandle {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    // `stream_dict` is itself an `ObjectHandle` that may not
+                    // yet be resolved (e.g. a mock-resolver-bearing indirect
+                    // handle whose value is a `Stream` wrapping another
+                    // indirect dictionary handle) -- force its own
+                    // resolution, mirroring the `self.try_dereference()?`
+                    // above, before reading its value.
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
                 _ => Vec::new(),
             };
             unparse_stream_dict_entries(&entries, refiltered, out)
@@ -4677,6 +4707,100 @@ mod unparse_object_tests {
         let mut out = Vec::new();
         dict.unparse_stream_body(&mut out, false).unwrap();
         assert_eq!(out, b"<< /Length 3 >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_uses_the_dictionary_of_a_direct_stream_value() {
+        // Mirrors unparse_object_inlines_only_the_dictionary_of_a_direct_stream_value
+        // above: a *direct* Stream ObjectValue has no qpdf counterpart (a
+        // real QPDFObjectHandle's resolved value is never itself a stream
+        // outside an indirect object), but `unparse_stream_body` must still
+        // use its `stream_dict`'s entries rather than falling into the
+        // non-dictionary-self `<< >>` degrade below -- keeping the promise
+        // those two `unparse_object`/`unparse_object_qdf` tests made on this
+        // primitive's behalf ("`unparse_stream_body` (Task 6) is separately
+        // responsible for this").
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let handle = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
+        });
+        let mut out = Vec::new();
+        handle.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(out, b"<< /Length 2 >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_on_an_indirect_handle_resolving_to_a_stream_uses_the_dictionary() {
+        // Mirrors unparse_object_on_an_indirect_handle_resolving_to_a_stream_inlines_the_dictionary
+        // above: a real, reachable qpdf shape -- an indirect object whose
+        // resolved value is a stream (e.g. a production reader's own
+        // resolution of a stream object). The mock-resolver harness resolves
+        // `self` to `Stream { stream_dict, .. }` the same way that reader
+        // would; `stream_dict`'s own entries must still surface here rather
+        // than the non-dictionary-self `<< >>` degrade.
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
+        let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
+        });
+        let mut out = Vec::new();
+        indirect.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(out, b"<< /Length 2 >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_resolves_an_unresolved_indirect_stream_dict() {
+        // `stream_dict` is itself an `ObjectHandle` that may not yet be
+        // resolved (e.g. a production reader's lazily-resolved stream
+        // dictionary), not just an already-direct one as the two tests
+        // above build. `self` stays a *direct* Stream value here so the
+        // only variable under test is `stream_dict`'s own resolution state:
+        // without the `stream_dict.try_dereference()?` call this fix added,
+        // `with_value` on a not-yet-resolved indirect handle returns `None`
+        // and this would degrade to `<< >>` instead of using the resolved
+        // dictionary's entries.
+        let (inner, _resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+            [(b"Length".to_vec(), ObjectHandle::integer(2))]
+                .into_iter()
+                .collect(),
+        ));
+        let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+        let mut out = Vec::new();
+        handle.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(out, b"<< /Length 2 >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_propagates_a_dropped_document_error_from_stream_dict() {
+        // Mirrors unparse_stream_body_propagates_a_dropped_document_error
+        // below, but for the new Stream-handling path added by this fix:
+        // the dropped document lives behind `stream_dict`, not `self`
+        // directly (`self` is a *direct* Stream value; only `stream_dict`
+        // is the as-yet-unresolved indirect handle whose resolver is
+        // dropped). The new `stream_dict.try_dereference()?` call must
+        // surface this error too, not silently degrade to an empty `<< >>`
+        // the way an unresolved `with_value` read alone would.
+        let (inner, resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(resolver);
+        let handle = ObjectHandle::stream(inner, Rc::new(b"ab".to_vec()));
+        let mut out = Vec::new();
+        assert!(handle.unparse_stream_body(&mut out, false).is_err());
+    }
+
+    #[test]
+    fn unparse_stream_body_writes_empty_dict_when_stream_dict_is_not_a_dictionary() {
+        // `stream_dict` is itself typed as an `ObjectHandle`, so nothing at
+        // the type level prevents it from resolving to something other than
+        // a `Dictionary` -- mirroring the same typed-input assumption
+        // `self` itself is held to by
+        // unparse_stream_body_writes_empty_dict_for_a_non_dictionary_self
+        // below. Exercises the new nested `_ => Vec::new()` arm for
+        // `stream_dict`'s own resolved value.
+        let handle = ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()));
+        let mut out = Vec::new();
+        handle.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(out, b"<< >>");
     }
 
     #[test]
