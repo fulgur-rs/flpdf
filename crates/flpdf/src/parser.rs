@@ -182,9 +182,9 @@ pub(crate) struct ParsedHandleObject {
 ///
 /// The diagnostics are reported for the same reason qpdf's are not: qpdf's
 /// parser warns through the document as it goes — `QPDFParser::parse`
-/// (`libqpdf/QPDFParser.cc:38-41`) and `QPDFParser::parseRemainder` (`:141-143`)
+/// (`libqpdf/QPDFParser.cc:38-40`) and `QPDFParser::parseRemainder` (`:141-143`)
 /// each call `warn(tokenizer.getErrorMessage())`, and `QPDFParser::warn`
-/// (`:488-496`) forwards to `context->warn`, the enclosing `QPDF`. flpdf's
+/// (`:488`) forwards to `context->warn` (`:494`), the enclosing `QPDF`. flpdf's
 /// parser has no document to warn through, so it accumulates instead and the
 /// caller decides when to raise them — which for `reader/resolver.rs` matters,
 /// because its `scan_forward` runs this parse more than once per object.

@@ -918,9 +918,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// **The parse's own diagnostics travel out the same way**, and they are
     /// warnings in qpdf too: `QPDFParser` calls `warn(tokenizer.getErrorMessage())`
     /// whenever `QPDFTokenizer::nextToken` reports one — at
-    /// `libqpdf/QPDFParser.cc:38-41` for the first token and `:141-143` for
-    /// every later one — and `QPDFParser::warn` (`:488-496`) forwards to
-    /// `context->warn`, i.e. the enclosing `QPDF`. A malformed name is the
+    /// `libqpdf/QPDFParser.cc:38-40` for the first token and `:141-143` for
+    /// every later one — and `QPDFParser::warn` (`:488`) forwards to
+    /// `context->warn` (`:494`), i.e. the enclosing `QPDF`. A malformed name is the
     /// reachable case: `QPDFTokenizer::inNameHex1` (`libqpdf/QPDFTokenizer.cc:448`)
     /// and `inNameHex2` (`:463`) both set `"name with stray # will not work
     /// with PDF >= 1.2"` and recover the token rather than rejecting it, so
@@ -933,7 +933,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// well, whereas flpdf's `Parser::next_token` records a diagnostic only for
     /// a token it did *not* classify `Bad` and the handle-producing path turns
     /// a `Bad` token into [`Error::Parse`]. The legacy reader has the same
-    /// shape; nothing here narrows or widens it.
+    /// shape — both paths read through that one `next_token`, and
+    /// `Parser::object_inner`'s `Bad` arm outside `ParserMode::Content` is the
+    /// same `Error::Parse` as `object_inner_handle`'s. Nothing here narrows or
+    /// widens it.
     fn frame_object(&self, bytes: &[u8], offset: u64) -> Result<FramedObject> {
         let mut warnings = Vec::new();
         let mut tokenizer = Tokenizer::new(bytes);
@@ -2347,7 +2350,8 @@ mod tests {
     /// message was set (`:964`), and `QPDFParser::parseRemainder` turns that
     /// into `warn(tokenizer.getErrorMessage())`
     /// (`libqpdf/QPDFParser.cc:141-143`), which reaches the enclosing document
-    /// through `QPDFParser::warn` (`:488-496`).
+    /// through `QPDFParser::warn` (`:488`), which forwards to `context->warn`
+    /// (`:494`).
     ///
     /// Asserted as whole vectors rather than with `contains`, because both the
     /// count and the position matter: the parse's diagnostics precede the
