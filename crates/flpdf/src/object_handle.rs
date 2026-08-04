@@ -2691,22 +2691,18 @@ mod object_value_tests {
 mod stream_payload_sharing_tests {
     use super::*;
 
-    // The address of the bytes a stream handle currently stores. Every
-    // assertion below compares addresses rather than bytes, because a
-    // byte-equality assertion passes for a deep-copying implementation too.
-    fn stored_payload_ptr(handle: &ObjectHandle) -> *const u8 {
-        handle.with_value(|value| match value {
-            Some(ObjectValue::Stream { data, .. }) => data.as_ptr(),
-            _ => panic!("expected a stream value"),
-        })
+    // Every assertion below compares buffer identity against the buffer the
+    // test itself created, never bytes: a byte-equality assertion passes for a
+    // deep-copying implementation too.
+    fn payload_of(handle: &ObjectHandle) -> Rc<Vec<u8>> {
+        handle.as_stream_data().expect("stream value")
     }
 
-    fn stream_with_payload(len: usize) -> ObjectHandle {
-        let dict = ObjectHandle::dictionary(vec![(
+    fn length_dict(len: usize) -> ObjectHandle {
+        ObjectHandle::dictionary(vec![(
             b"Length".to_vec(),
             ObjectHandle::integer(len as i64),
-        )]);
-        ObjectHandle::stream(dict, Rc::new(vec![0x5a; len]))
+        )])
     }
 
     // `QPDF::copyStreamData` takes the source stream's buffer
@@ -2719,17 +2715,14 @@ mod stream_payload_sharing_tests {
     // `replaceStreamData(std::shared_ptr<Buffer>, ...)` pair does.
     #[test]
     fn one_buffer_backs_two_streams_without_copying() {
-        let source = stream_with_payload(4096);
-        let shared = source.as_stream_data().expect("stream data");
-        let destination = ObjectHandle::stream(
-            ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]),
-            Rc::new(Vec::new()),
-        );
+        let shared = Rc::new(vec![0x5a; 4096]);
+        let source = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
+        let destination = ObjectHandle::stream(length_dict(0), Rc::new(Vec::new()));
 
-        destination.replace_stream_data(shared.clone(), None, None);
+        destination.replace_stream_data(source.as_stream_data().expect("stream data"), None, None);
 
-        assert_eq!(stored_payload_ptr(&source), shared.as_ptr());
-        assert_eq!(stored_payload_ptr(&destination), shared.as_ptr());
+        assert!(Rc::ptr_eq(&payload_of(&source), &shared));
+        assert!(Rc::ptr_eq(&payload_of(&destination), &shared));
         assert_eq!(
             destination
                 .as_stream_dict()
@@ -2745,22 +2738,22 @@ mod stream_payload_sharing_tests {
     // the bytes instead of duplicating them.
     #[test]
     fn direct_value_clone_shares_the_stream_payload_allocation() {
-        let stream = stream_with_payload(4096);
-        let before = stored_payload_ptr(&stream);
+        let shared = Rc::new(vec![0x5a; 4096]);
+        let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
 
         let copy = ObjectHandle::from_value(stream.direct_value_clone().expect("direct value"));
 
-        assert_eq!(stored_payload_ptr(&copy), before);
+        assert!(Rc::ptr_eq(&payload_of(&copy), &shared));
     }
 
     #[test]
     fn shallow_copy_shares_the_stream_payload_allocation() {
-        let stream = stream_with_payload(4096);
-        let before = stored_payload_ptr(&stream);
+        let shared = Rc::new(vec![0x5a; 4096]);
+        let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
 
         let copy = stream.shallow_copy();
 
-        assert_eq!(stored_payload_ptr(&copy), before);
+        assert!(Rc::ptr_eq(&payload_of(&copy), &shared));
     }
 
     // `QPDF_Stream::getStreamDataBuffer` (`libqpdf/qpdf/QPDF_Stream.hh:39`)
@@ -2769,12 +2762,23 @@ mod stream_payload_sharing_tests {
     // buffer to a second stream without duplicating the memory.
     #[test]
     fn as_stream_data_hands_out_the_stored_payload_without_copying_it() {
-        let stream = stream_with_payload(4096);
-        let before = stored_payload_ptr(&stream);
+        let shared = Rc::new(vec![0x5a; 4096]);
+        let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
 
         let handed_out = stream.as_stream_data().expect("stream data");
 
-        assert_eq!(handed_out.as_ptr(), before);
+        assert!(Rc::ptr_eq(&handed_out, &shared));
+    }
+
+    // An empty payload is still a buffer, not an absent one: the shared
+    // allocation is handed out and shared like any other.
+    #[test]
+    fn an_empty_payload_is_shared_like_any_other() {
+        let shared = Rc::new(Vec::new());
+        let stream = ObjectHandle::stream(length_dict(0), Rc::clone(&shared));
+
+        assert!(Rc::ptr_eq(&payload_of(&stream), &shared));
+        assert!(Rc::ptr_eq(&payload_of(&stream.shallow_copy()), &shared));
     }
 }
 
