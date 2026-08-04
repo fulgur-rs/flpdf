@@ -455,3 +455,83 @@ fn all_subcommands_have_help() {
             .stdout(predicate::str::contains(sub));
     }
 }
+
+// ---------------------------------------------------------------------------
+// show-encryption: crypt-filter method reporting (flpdf-25kg.3.13)
+//
+// qpdf keeps an unrecognised /CFM as `e_unknown` and a missing one as `e_none`
+// rather than refusing the document (libqpdf/QPDF_encryption.cc:865-880).
+// Ground truth captured from qpdf 11.9.0 by rewriting `/CFM /AESV2` in place
+// (same byte length, so the xref stays valid) in a V=4 AES file:
+//
+//   $ qpdf --password=u --show-encryption cfm_unknown.pdf   # /CFM /AESVX
+//   stream encryption method: unknown
+//   string encryption method: unknown
+//   file encryption method: unknown
+//   $ echo $?
+//   0
+//   $ qpdf --password=u --show-encryption cfm_absent.pdf    # /CFM /AESV2 blanked
+//   stream encryption method: none
+//   string encryption method: none
+//   file encryption method: none
+//   $ echo $?
+//   0
+//
+// flpdf used to exit 2 on the first (`unsupported encryption handler`) and
+// report RC4 on the second, which additionally tripped the weak-crypto gate.
+// ---------------------------------------------------------------------------
+
+/// Rewrite `/CFM /AESV2` in the committed V=4 AES fixture, keeping the byte
+/// length so every recorded offset stays valid, and return the new file's path.
+fn v4_aes_with_cfm(replacement: &[u8], dir: &tempfile::TempDir) -> std::path::PathBuf {
+    const CFM: &[u8] = b"/CFM /AESV2";
+    assert_eq!(
+        replacement.len(),
+        CFM.len(),
+        "substitution must be in place"
+    );
+    let bytes = std::fs::read(V4_AES).expect("committed V=4 AES fixture");
+    let at = bytes
+        .windows(CFM.len())
+        .position(|window| window == CFM)
+        .expect("fixture declares /CFM /AESV2");
+    let mut rewritten = bytes.clone();
+    rewritten[at..at + CFM.len()].copy_from_slice(replacement);
+    let path = dir.path().join("rewritten.pdf");
+    std::fs::write(&path, rewritten).expect("write rewritten fixture");
+    path
+}
+
+#[test]
+fn show_encryption_reports_an_unrecognised_cfm_as_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v4_aes_with_cfm(b"/CFM /AESVX", &dir);
+
+    flpdf()
+        .args(["show-encryption", "--password=user-v4-aes"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "stream encryption method: unknown",
+        ))
+        .stdout(predicate::str::contains(
+            "string encryption method: unknown",
+        ))
+        .stdout(predicate::str::contains("file encryption method: unknown"));
+}
+
+#[test]
+fn show_encryption_reports_a_missing_cfm_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = v4_aes_with_cfm(b"           ", &dir);
+
+    flpdf()
+        .args(["show-encryption", "--password=user-v4-aes"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stream encryption method: none"))
+        .stdout(predicate::str::contains("string encryption method: none"))
+        .stdout(predicate::str::contains("file encryption method: none"));
+}
