@@ -559,12 +559,12 @@ and coverage must compare the committed `HEAD` with `origin/main`.
 
 ```bash
 git diff --check
-git add docs/qpdf-correspondence.md docs/superpowers/plans/2026-08-04-pl-md5-pipeline.md
+git add docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md docs/superpowers/plans/2026-08-04-pl-md5-pipeline.md
 git commit -m "docs: record Pl_MD5 production parity"
 ```
 
-Expected: the docs commit contains only the truthful ledger update and this
-clean-tree coverage ordering correction.
+Expected: the docs commit contains only the truthful ledger update, the
+regenerated module-doc index, and this clean-tree coverage ordering correction.
 
 - [ ] **Step 6: Generate fresh LCOV and enforce changed-line coverage**
 
