@@ -2617,12 +2617,14 @@ pub fn write_linearized<R: Read + Seek>(
         .and_then(Object::as_string)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| {
+            // cov:ignore-start: unreachable — every branch of finalize_linearized_id
+            // constructs a well-formed 2-element string array (see its own body)
             crate::Error::Unsupported(
                 "linearization writer: finalize_linearized_id did not return a \
                  well-formed /ID array"
                     .to_string(),
             )
-        })?;
+        })?; // cov:ignore-end
     source_trailer.insert("ID", finalized_id);
     let source_trailer = source_trailer;
 
@@ -2911,26 +2913,28 @@ pub fn write_linearized<R: Read + Seek>(
     let _encrypt_ctx: Option<crate::writer::EncryptionContext> =
         if let Some(params) = options.encrypt.as_ref() {
             let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
+                // cov:ignore-start: requires > 2^32 objects — impossible in practice
                 crate::Error::Unsupported(
                     "linearization writer: object count overflows u32 for /Encrypt slot \
                      reservation"
                         .to_string(),
                 )
-            })?;
-            // Resolve /Metadata up front for --cleartext-metadata support, mirroring
-            // the full-rewrite writer's own gating (`!params.encrypt_metadata`).
+            })?; // cov:ignore-end
+                 // Resolve /Metadata up front for --cleartext-metadata support, mirroring
+                 // the full-rewrite writer's own gating (`!params.encrypt_metadata`).
             let metadata_ref = if params.encrypt_metadata {
                 None
             } else {
                 crate::writer::resolve_metadata_stream_ref(pdf)
             };
-            let mut ctx = crate::writer::build_encryption_context(
+            let ctx_result = crate::writer::build_encryption_context(
                 options,
                 params,
                 existing_max,
                 metadata_ref,
                 &id0,
-            )?;
+            );
+            let mut ctx = ctx_result?;
             ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
             Some(ctx)
         } else {
@@ -5763,6 +5767,40 @@ mod tests {
         );
     }
 
+    /// `--cleartext-metadata` (`encrypt_metadata: false`) takes the
+    /// `crate::writer::resolve_metadata_stream_ref` branch when building the
+    /// `EncryptionContext`, mirroring the full-rewrite writer's own
+    /// `--cleartext-metadata` gating (`!params.encrypt_metadata`). As with
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
+    /// the write still fails downstream — the reserved `/Encrypt` slot has
+    /// no offset yet (see
+    /// [`linearize_with_encrypt_reserves_encrypt_dict_object_and_succeeds`])
+    /// — so this only pins that reaching that point does not depend on
+    /// `encrypt_metadata`'s value.
+    #[test]
+    fn non_deterministic_encrypt_linearize_cleartext_metadata_reaches_same_point() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams {
+                encrypt_metadata: false,
+                ..crate::encrypt_setup::EncryptParams::v4_aes128(
+                    b"user".to_vec(),
+                    b"owner".to_vec(),
+                )
+            }),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("Part-1 xref") && m.contains("has no offset")),
+            "got {err:?}"
+        );
+    }
+
     /// linearize+encrypt+ObjStm is out of scope for now: the ObjStm
     /// relocation path (`RenumberMap::place_objstm_members_per_half`) and the
     /// encrypt-dict slot reservation it will need
@@ -5851,6 +5889,17 @@ mod tests {
     /// write succeeds). `#[ignore]`d until the emission step lands and makes
     /// the assertion below true; Task 6's acceptance criteria include
     /// removing this attribute.
+    // cov:ignore-start: the test body is instrumented by llvm-cov but never
+    // executes because it is `#[ignore]`d until the /Encrypt emission step
+    // (see the doc comment above) writes a real object into the reserved
+    // slot. The context-building and slot-reservation code this test targets
+    // IS exercised today — see
+    // non_deterministic_encrypt_linearize_no_longer_rejected_by_guard and
+    // non_deterministic_encrypt_linearize_cleartext_metadata_reaches_same_point,
+    // both of which run the same `if let Some(params) = options.encrypt...`
+    // block above. Keeping this test here (rather than deferring it to a
+    // later commit) means the intended end state and its `/Filter /Standard`
+    // assertion land alongside the commit that starts building toward it.
     #[test]
     #[ignore = "awaits /Encrypt object emission; this commit only builds the \
                 context and reserves the slot (write_linearized currently \
@@ -5871,6 +5920,7 @@ mod tests {
             "expected an /Encrypt dictionary with /Filter /Standard in the output"
         );
     }
+    // cov:ignore-end
 
     /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
     /// source-side ObjStm: object 4 (`/Info`) exists ONLY inside object 5's
