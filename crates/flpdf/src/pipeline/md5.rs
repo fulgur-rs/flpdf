@@ -83,8 +83,9 @@ mod tests {
     fn preserves_the_pipeline_identifier() {
         let mut sink = RecordingSink::new(&[], &[]);
         let md5 = PlMd5::new("embedded-file-md5", &mut sink);
+        let pipeline: &dyn Pipeline = &md5;
 
-        assert_eq!(md5.identifier(), "embedded-file-md5");
+        assert_eq!(pipeline.identifier(), "embedded-file-md5");
     }
 
     #[test]
