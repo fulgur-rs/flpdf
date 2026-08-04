@@ -2365,49 +2365,6 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Write a complete linearized PDF to an in-memory buffer.
-///
-/// Given a [`LinearizationPlan`] (which partitions all objects into the four
-/// body parts) and a [`RenumberMap`] (which assigns the correct linearized
-/// object numbers), this function:
-///
-/// 1. Emits Part 1: header + linearization param dict (whose object number is
-///    `renumber.param_dict_ref().number` — typically 3 with the qpdf-aligned
-///    slot allocation, never assumed to be 1) with placeholder numeric values,
-///    followed by a one-object xref subsection and trailer.
-/// 2. Emits the hint stream object at `renumber.hint_stream_slot()` (Annex F
-///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
-/// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
-/// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
-/// 5. Emits the remaining body objects (`Plan.part4_objects()` — Annex F Part 5).
-/// 6. Emits the main cross-reference table and trailer (Annex F Part 6).
-///
-/// Uses a convergence loop (max 3 iterations) to ensure the hint stream's
-/// compressed byte length is stable before the final write.
-///
-/// Returns [`LinearizedDocument`] containing both the bytes and the
-/// [`LinearizedOffsets`] needed for back-patching.
-///
-/// With [`WriteOptions::deterministic_id`] the `/ID` is derived from an MD5
-/// over the assembled layout (the same digest feeds every trailer / xref-stream
-/// dict), so the identifier is reproducible across runs for identical input.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
-/// is combined with encrypted output ([`WriteOptions::encrypt`] or
-/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
-/// produced once the bytes are encrypted, so the combination is rejected up
-/// front (the linearized writer emits plaintext only).
-///
-/// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
-/// inconsistent or a layout value does not fit its slot — for example an
-/// object (catalog, page, shared, or body object) has no entry in the
-/// [`RenumberMap`], the plan has no page hints or a `per_page_private_objects`
-/// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
-/// object lacks a probed byte length, or the hint-stream compressed length
-/// fails to converge within the iteration budget.
-///
 /// For each second-half ObjStm batch, return its insertion point among plain
 /// objects so the container lands at its qpdf part/object-key position.
 ///
@@ -2538,6 +2495,63 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     Ok(())
 }
 
+/// Write a complete linearized PDF to an in-memory buffer.
+///
+/// Given a [`LinearizationPlan`] (which partitions all objects into the four
+/// body parts) and a [`RenumberMap`] (which assigns the correct linearized
+/// object numbers), this function:
+///
+/// 1. Emits Part 1: header + linearization param dict (whose object number is
+///    `renumber.param_dict_ref().number` — typically 3 with the qpdf-aligned
+///    slot allocation, never assumed to be 1) with placeholder numeric values,
+///    followed by a one-object xref subsection and trailer.
+/// 2. Emits the hint stream object at `renumber.hint_stream_slot()` (Annex F
+///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
+/// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
+/// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
+/// 5. Emits the remaining body objects (`Plan.part4_objects()` — Annex F Part 5).
+/// 6. Emits the main cross-reference table and trailer (Annex F Part 6).
+///
+/// Uses a convergence loop (max 3 iterations) to ensure the hint stream's
+/// compressed byte length is stable before the final write.
+///
+/// Returns [`LinearizedDocument`] containing both the bytes and the
+/// [`LinearizedOffsets`] needed for back-patching.
+///
+/// With [`WriteOptions::deterministic_id`] the `/ID` is derived from an MD5
+/// over the assembled layout (the same digest feeds every trailer / xref-stream
+/// dict), so the identifier is reproducible across runs for identical input.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
+/// is combined with encrypted output ([`WriteOptions::encrypt`] or
+/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
+/// produced once the bytes are encrypted, because the identifier would need to
+/// be known before the file encryption key that protects every string and
+/// stream can be derived (the key derives from `/ID[0]`, PDF 1.7 §7.6.3.3
+/// Algorithm 2). This guard mirrors only that specific restriction — qpdf itself accepts
+/// a *non*-deterministic-id `/ID` alongside encryption (observed on qpdf
+/// 11.9.0: `qpdf --linearize --encrypt "" "" 128 --use-aes=y -- in.pdf
+/// out.pdf` succeeds, while adding `--deterministic-id` to that same command
+/// fails with qpdf's own `QPDFWriter::generateID has no data for
+/// deterministic ID` internal error), so linearize+encrypt on its own is not
+/// rejected by this guard.
+///
+/// Returns [`crate::Error::Unsupported`] when encryption is combined with
+/// object-stream emission (any [`crate::writer::ObjectStreamMode`] that
+/// actually emits ObjStm containers — `Generate`, or `Preserve` on a source
+/// that already carries object streams). This is a temporary flpdf scope
+/// limitation, not a qpdf restriction: qpdf itself supports
+/// linearize+encrypt+object-streams together.
+///
+/// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
+/// inconsistent or a layout value does not fit its slot — for example an
+/// object (catalog, page, shared, or body object) has no entry in the
+/// [`RenumberMap`], the plan has no page hints or a `per_page_private_objects`
+/// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
+/// object lacks a probed byte length, or the hint-stream compressed length
+/// fails to converge within the iteration budget.
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -2555,13 +2569,56 @@ pub fn write_linearized<R: Read + Seek>(
         ));
     }
 
-    // The linearized writer emits plaintext only — it does not implement
-    // encryption. A deterministic `/ID` feeds the encryption key, so a
-    // content-derived `/ID` cannot be computed before the encrypted bytes
-    // exist; qpdf rejects the same combination. Mirror the flat
+    // Finalize the file identifier exactly once here — before the plan/
+    // renumber-map rebuild below, before `Optimization::prepare_for_linearized_write`,
+    // and before the convergence loop — and store it back on the working
+    // trailer. The Part-1 trailer and every split xref/trailer then read this
+    // single value, so one linearized output carries one consistent /ID, and
+    // it stays stable across the up-to-3 convergence iterations.
+    //
+    // Computed this early (rather than just before the convergence loop,
+    // where this block used to sit) so `/ID[0]` is available before the
+    // renumber map is consumed: the file encryption key derives from
+    // `/ID[0]` (PDF 1.7 §7.6.3.3 Algorithm 2), and qpdf itself computes
+    // `/ID` once, early, via `generateID()`'s idempotent guard
+    // (`QPDFWriter::write` calls it before `unparseObject`-ing the trailer).
+    // This computation depends only on `options` and the source trailer's
+    // `/ID`/`/Info` — neither the plan/renumber rebuild nor
+    // `Optimization::prepare_for_linearized_write` below ever mutates the
+    // trailer, so moving it here does not change any output byte for an
+    // existing (non-encrypting) caller.
+    //
+    // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
+    // BEFORE the all-zero placeholder overwrites `/ID` below. `/ID[0]` is the
+    // preserved permanent identifier and the `/Info`-derived suffix feeds the
+    // seed; reading either after the placeholder is installed would mistake the
+    // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
+    let mut source_trailer = pdf.trailer().clone();
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
+        if options.deterministic_id {
+            let id0 = crate::writer::source_permanent_id(&source_trailer);
+            let suffix = crate::writer::deterministic_id_info_suffix(pdf);
+            (id0, suffix)
+        } else {
+            (None, Vec::new())
+        };
+    let finalized_id =
+        finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
+    source_trailer.insert("ID", finalized_id);
+    let source_trailer = source_trailer;
+
+    // This guard mirrors a real qpdf restriction, not a blanket rejection of
+    // linearize+encrypt — verified empirically against qpdf 11.9.0: `qpdf
+    // --linearize --encrypt "" "" 128 --use-aes=y --` succeeds on its own (a
+    // non-deterministic `/ID` alongside encryption), while adding
+    // `--deterministic-id` to that same command fails with qpdf's own
+    // `QPDFWriter::generateID has no data for deterministic ID` internal
+    // error. The reason is circularity: a deterministic (content-derived)
+    // `/ID` cannot be computed before the encrypted bytes exist, yet the file
+    // encryption key that produces those bytes itself derives from `/ID[0]`
+    // (PDF 1.7 §7.6.3.3 Algorithm 2). Mirror the flat
     // (`crate::writer::write_pdf_full_rewrite`) guard so both write paths
-    // behave identically rather than silently producing a plaintext file with
-    // a deterministic `/ID`.
+    // reject exactly the same combination.
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     if options.deterministic_id && encrypting {
         return Err(crate::Error::Unsupported(
@@ -2973,34 +3030,6 @@ pub fn write_linearized<R: Read + Seek>(
     };
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
     let mut current_hint_outline_o = hint_bytes_initial.outline_section_offset_in_uncompressed;
-
-    // Capture the source trailer once; it does not change across iterations.
-    //
-    // Finalize the file identifier exactly once here (before the convergence
-    // loop) and store it back on the working trailer.  The Part-1 trailer and
-    // every split xref/trailer then read this single value, so one linearized
-    // output carries one consistent /ID — and it also stays stable across the
-    // up-to-3 convergence iterations.
-    let mut source_trailer = pdf.trailer().clone();
-
-    // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
-    // BEFORE the all-zero placeholder overwrites `/ID` below. `/ID[0]` is the
-    // preserved permanent identifier and the `/Info`-derived suffix feeds the
-    // seed; reading either after the placeholder is installed would mistake the
-    // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
-        if options.deterministic_id {
-            let id0 = crate::writer::source_permanent_id(&source_trailer);
-            let suffix = crate::writer::deterministic_id_info_suffix(pdf);
-            (id0, suffix)
-        } else {
-            (None, Vec::new())
-        };
-
-    let finalized_id =
-        finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
-    source_trailer.insert("ID", finalized_id);
-    let source_trailer = source_trailer;
 
     // ------------------------------------------------------------------
     // Classic deterministic-`/ID`: compute qpdf's content-derived identifier
@@ -5582,6 +5611,49 @@ mod tests {
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &opts)
             .expect("deterministic-id without encryption must succeed");
+    }
+
+    /// The `deterministic_id && encrypting` guard is scoped to exactly that
+    /// combination (mirroring qpdf's real restriction, see the guard's own
+    /// comment). A *non*-deterministic-id encrypting request must not be
+    /// rejected by it — qpdf itself supports `--linearize --encrypt` without
+    /// `--deterministic-id` (verified empirically against qpdf 11.9.0).
+    ///
+    /// This does not assert full success: encryption is not yet wired into
+    /// the linearized writer (later work implements that), so this fixture
+    /// may still fail for some other reason (e.g. missing encrypt-dict-slot
+    /// wiring), and today it actually succeeds (silently emitting plaintext,
+    /// since nothing downstream of the guards consumes `options.encrypt`
+    /// yet). It is fine for the write to fail here for a DIFFERENT
+    /// `Unsupported` reason — this test only pins that the specific
+    /// deterministic-id guard message is not the cause, so it asserts on the
+    /// error message content (unconditionally, so the assertion executes
+    /// regardless of `Ok`/`Err`) rather than the whole `Result`.
+    #[test]
+    fn non_deterministic_encrypt_linearize_no_longer_rejected_by_guard() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            // `deterministic_id` left at its default `false`.
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let result = write_linearized(&plan, &renumber, &mut pdf2, &opts);
+        let hit_deterministic_id_guard = matches!(
+            &result,
+            Err(crate::Error::Unsupported(m))
+                if m.contains("deterministic-id option is incompatible")
+        );
+        assert!(
+            !hit_deterministic_id_guard,
+            "non-deterministic-id encrypting must not hit the deterministic-id \
+             guard: {result:?}"
+        );
     }
 
     /// linearize+encrypt+ObjStm is out of scope for now: the ObjStm
