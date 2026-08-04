@@ -543,7 +543,22 @@ cargo test
 
 Expected: every command exits 0; read each final summary and confirm 0 failures. Ignored live-oracle tests may remain ignored exactly as on the clean baseline.
 
-- [ ] **Step 5: Generate fresh LCOV and enforce changed-line coverage**
+- [ ] **Step 5: Commit the ledger before fresh coverage**
+
+Commit the correspondence ledger and this ordering correction before generating
+coverage: `scripts/patch-coverage.sh` deliberately rejects a dirty worktree,
+and coverage must compare the committed `HEAD` with `origin/main`.
+
+```bash
+git diff --check
+git add docs/qpdf-correspondence.md docs/superpowers/plans/2026-08-04-pl-md5-pipeline.md
+git commit -m "docs: record Pl_MD5 production parity"
+```
+
+Expected: the docs commit contains only the truthful ledger update and this
+clean-tree coverage ordering correction.
+
+- [ ] **Step 6: Generate fresh LCOV and enforce changed-line coverage**
 
 ```bash
 cargo llvm-cov clean --workspace
@@ -554,16 +569,6 @@ bash scripts/patch-coverage.sh --base origin/main \
 ```
 
 Expected: `patch-coverage: OK` and 100% coverage on every changed executable line. If any line is uncovered, add only a behavior test that fails under a realistic mutation, observe that failure, restore the implementation, and rerun the focused and full gates; do not add a coverage-only assertion or default to `cov:ignore`.
-
-- [ ] **Step 6: Commit the ledger after all source and behavior gates pass**
-
-```bash
-git diff --check
-git add docs/qpdf-correspondence.md
-git commit -m "docs: record Pl_MD5 production parity"
-```
-
-Expected: the docs commit contains only the truthful ledger update.
 
 - [ ] **Step 7: Audit the final diff and acceptance criteria**
 
