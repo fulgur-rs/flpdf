@@ -1659,17 +1659,20 @@ mod tests {
     /// reports no encryption parameters. This is qpdf's
     /// `encryption_initialized == false` state.
     ///
-    /// **This does not yet discriminate that state from qpdf's
+    /// **This does not discriminate that state from qpdf's
     /// `encryption_initialized == true, encrypted == false` state** (an
-    /// authenticated-but-unencrypted document). This test builds its
-    /// resolver directly via `bare_resolver()`, bypassing `Pdf::open`
-    /// entirely, so `Pdf::authenticate_if_encrypted` never runs here and
-    /// both states collapse to the same `None` regardless of `Pdf` now
-    /// sharing this cell — this assertion is real but not yet
-    /// discriminating. A fixture-backed test that authenticates a real
-    /// unencrypted document through `Pdf::open` and still observes `None`
-    /// here — the one that actually carries the discrimination weight —
-    /// arrives with Task 3.
+    /// authenticated-but-unencrypted document, see
+    /// [`an_unencrypted_document_reports_no_encryption_parameters`] below).
+    /// This test builds its resolver directly via `bare_resolver()`,
+    /// bypassing `Pdf::open` entirely, so `Pdf::authenticate_if_encrypted`
+    /// never runs here and both states collapse to the same `None`
+    /// regardless of `Pdf` sharing this cell — that collapse is qpdf's
+    /// `encrypted`/`encryption_initialized` pair mapping onto one
+    /// `Option<EncryptionState>` (see the field-mapping table in this
+    /// issue's design, `bd show flpdf-25kg.3.11`), not evidence one way or
+    /// the other about whether `Pdf` and `ResolverCore` share an allocation
+    /// — [`an_rc4_document_reports_its_encryption_parameters_through_the_shared_cell`]
+    /// and its AES sibling are what pin the sharing itself.
     #[test]
     fn a_resolver_with_no_authentication_attempted_reports_no_encryption_parameters() {
         let resolver = bare_resolver();
