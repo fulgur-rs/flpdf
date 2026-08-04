@@ -1200,8 +1200,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         dict.set_parsed_offset_if_unset(dict_offset);
         Ok((
             ObjectValue::Stream {
-                dict,
-                data: Rc::new(data),
+                stream_dict: dict,
+                stream_data: Rc::new(data),
             },
             i64::try_from(stream_offset).unwrap_or(i64::MAX),
         ))

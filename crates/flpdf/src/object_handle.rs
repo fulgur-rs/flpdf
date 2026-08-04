@@ -165,8 +165,8 @@ pub(crate) enum ObjectValue {
     /// because [`Repr`] itself is `Rc`-based, so this value is `!Send`
     /// regardless.
     Stream {
-        dict: ObjectHandle,
-        data: Rc<Vec<u8>>,
+        stream_dict: ObjectHandle,
+        stream_data: Rc<Vec<u8>>,
     },
     // qpdf-cutover-delete(flpdf-25kg.3.3): qpdf cannot store an indirect
     // handle as another indirect object's replacement value. Delete this
@@ -439,9 +439,12 @@ impl ObjectHandle {
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         match &self.0 {
             Repr::Direct(slot) => Some(match &slot.borrow().value {
-                ObjectValue::Stream { dict, data } => ObjectValue::Stream {
-                    dict: shallow_copy_child(dict),
-                    data: data.clone(),
+                ObjectValue::Stream {
+                    stream_dict,
+                    stream_data,
+                } => ObjectValue::Stream {
+                    stream_dict: shallow_copy_child(stream_dict),
+                    stream_data: stream_data.clone(),
                 },
                 other => other.clone(),
             }),
@@ -806,7 +809,13 @@ impl ObjectHandle {
     /// (`include/qpdf/QPDFObjectHandle.hh:546-558`). Handing the same buffer
     /// to a second stream shares it; nothing here copies the bytes.
     pub fn stream(dict: ObjectHandle, data: Rc<Vec<u8>>) -> Self {
-        Self::new_direct(ObjectValue::Stream { dict, data }, NO_PARSED_OFFSET)
+        Self::new_direct(
+            ObjectValue::Stream {
+                stream_dict: dict,
+                stream_data: data,
+            },
+            NO_PARSED_OFFSET,
+        )
     }
 
     /// Construct a direct real value that preserves a non-canonical source
@@ -1108,7 +1117,7 @@ impl ObjectHandle {
         let children = match value {
             ObjectValue::Array(children) => children.clone(),
             ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
-            ObjectValue::Stream { dict, .. } => vec![dict.clone()],
+            ObjectValue::Stream { stream_dict, .. } => vec![stream_dict.clone()],
             _ => return,
         };
         for child in children {
@@ -1129,7 +1138,7 @@ impl ObjectHandle {
             match &slot.value {
                 ObjectValue::Array(children) => children.clone(),
                 ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
-                ObjectValue::Stream { dict, .. } => vec![dict.clone()],
+                ObjectValue::Stream { stream_dict, .. } => vec![stream_dict.clone()],
                 _ => Vec::new(),
             }
         };
@@ -1321,7 +1330,11 @@ impl ObjectHandle {
             ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
         );
         self.with_value_mut(|v| {
-            if let Some(ObjectValue::Stream { data: existing, .. }) = v {
+            if let Some(ObjectValue::Stream {
+                stream_data: existing,
+                ..
+            }) = v
+            {
                 *existing = data;
             }
         });
@@ -1336,7 +1349,7 @@ impl ObjectHandle {
     /// than copying its subtree.
     pub fn as_stream_dict(&self) -> Option<ObjectHandle> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream { dict, .. }) => Some(dict.clone()),
+            Some(ObjectValue::Stream { stream_dict, .. }) => Some(stream_dict.clone()),
             _ => None,
         })
     }
@@ -1353,7 +1366,7 @@ impl ObjectHandle {
     /// `std::shared_ptr<Buffer>` itself.
     pub fn as_stream_data(&self) -> Option<Rc<Vec<u8>>> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream { data, .. }) => Some(data.clone()),
+            Some(ObjectValue::Stream { stream_data, .. }) => Some(stream_data.clone()),
             _ => None,
         })
     }
@@ -1710,8 +1723,11 @@ fn materialize_value(value: &ObjectValue, depth: usize) -> Object {
             }
             Object::Dictionary(dict)
         }
-        ObjectValue::Stream { dict, data } => {
-            let dict = match materialize_bounded(dict, depth + 1) {
+        ObjectValue::Stream {
+            stream_dict,
+            stream_data,
+        } => {
+            let dict = match materialize_bounded(stream_dict, depth + 1) {
                 Object::Dictionary(dict) => dict,
                 // A stream's own dictionary handle is always constructed as
                 // a direct `ObjectValue::Dictionary` (see
@@ -1725,7 +1741,7 @@ fn materialize_value(value: &ObjectValue, depth: usize) -> Object {
             // copies the payload. That copy is a property of the legacy route,
             // not of the shared representation above; it disappears with the
             // route itself.
-            Object::Stream(Stream::new(dict, data.as_ref().clone()))
+            Object::Stream(Stream::new(dict, stream_data.as_ref().clone()))
         }
         ObjectValue::Reference(object_ref) => Object::Reference(*object_ref),
     }
@@ -1766,13 +1782,16 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
             }
             Object::Dictionary(dict)
         }
-        ObjectValue::Stream { dict, data } => {
-            let dict = match unparse_materialize(dict) {
+        ObjectValue::Stream {
+            stream_dict,
+            stream_data,
+        } => {
+            let dict = match unparse_materialize(stream_dict) {
                 Object::Dictionary(dict) => dict,
                 _ => Dictionary::new(), // cov:ignore: same invariant as materialize_value's own Stream arm
             };
             // Same legacy-route payload copy as `materialize_value`'s arm.
-            Object::Stream(Stream::new(dict, data.as_ref().clone()))
+            Object::Stream(Stream::new(dict, stream_data.as_ref().clone()))
         }
         // No other variant nests a dictionary, so the omission rule cannot
         // apply anywhere beneath it; delegate to the ordinary materializer.
@@ -1836,9 +1855,12 @@ fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
                 .map(|(k, v)| (k.clone(), shallow_copy_child(v)))
                 .collect(),
         ),
-        ObjectValue::Stream { dict, data } => ObjectValue::Stream {
-            dict: shallow_copy_child(dict),
-            data: data.clone(),
+        ObjectValue::Stream {
+            stream_dict,
+            stream_data,
+        } => ObjectValue::Stream {
+            stream_dict: shallow_copy_child(stream_dict),
+            stream_data: stream_data.clone(),
         },
         other => other.clone(),
     }
@@ -3189,8 +3211,8 @@ mod materialize_tests {
         let dict_handle =
             ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(5))]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            dict: dict_handle,
-            data: Rc::new(b"Hello".to_vec()),
+            stream_dict: dict_handle,
+            stream_data: Rc::new(b"Hello".to_vec()),
         });
 
         let Object::Stream(materialized) = stream.materialize() else {
@@ -3403,8 +3425,8 @@ mod type_code_tests {
     fn stream_handle_type_code_is_stream() {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            dict,
-            data: Rc::new(Vec::new()),
+            stream_dict: dict,
+            stream_data: Rc::new(Vec::new()),
         });
         assert_eq!(stream.type_code(), 10);
         assert_eq!(stream.type_name(), "stream");
@@ -3514,8 +3536,11 @@ mod unparse_tests {
         // rather than chasing a depth number.
         let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         stream.set_resolved(ObjectValue::Stream {
-            dict: ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]),
-            data: Rc::new(Vec::new()),
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"Length".to_vec(),
+                ObjectHandle::integer(0),
+            )]),
+            stream_data: Rc::new(Vec::new()),
         });
         let inner_dict = ObjectHandle::dictionary(vec![
             (b"A".to_vec(), ObjectHandle::null()),
@@ -3572,8 +3597,8 @@ mod unparse_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(0))]);
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         handle.set_resolved(ObjectValue::Stream {
-            dict,
-            data: Rc::new(Vec::new()),
+            stream_dict: dict,
+            stream_data: Rc::new(Vec::new()),
         });
         assert_eq!(handle.unparse(), b"9 0 R");
         assert_eq!(handle.unparse_resolved(), b"9 0 R");
@@ -3607,8 +3632,8 @@ mod unparse_tests {
         // never assigned an object number/generation.
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
-            dict,
-            data: Rc::new(b"ab".to_vec()),
+            stream_dict: dict,
+            stream_data: Rc::new(b"ab".to_vec()),
         });
         assert_eq!(
             handle.unparse_resolved(),
@@ -4085,8 +4110,8 @@ mod mutation_tests {
     fn replace_stream_data_updates_data_and_length() {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            dict: dict.clone(),
-            data: Rc::new(b"old".to_vec()),
+            stream_dict: dict.clone(),
+            stream_data: Rc::new(b"old".to_vec()),
         });
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
@@ -4097,8 +4122,8 @@ mod mutation_tests {
     fn replace_stream_data_sets_filter_and_decode_parms_when_given() {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            dict: dict.clone(),
-            data: Rc::new(b"old".to_vec()),
+            stream_dict: dict.clone(),
+            stream_data: Rc::new(b"old".to_vec()),
         });
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
         let parms =
@@ -4119,8 +4144,8 @@ mod mutation_tests {
             ObjectHandle::name(b"FlateDecode".to_vec()),
         )]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
-            dict: dict.clone(),
-            data: Rc::new(b"old".to_vec()),
+            stream_dict: dict.clone(),
+            stream_data: Rc::new(b"old".to_vec()),
         });
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
         assert_eq!(
@@ -4245,8 +4270,8 @@ mod mutation_tests {
         // silently corrupt the source stream's /Length/Filter/DecodeParms.
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Stream {
-            dict: ObjectHandle::dictionary(vec![]),
-            data: Rc::new(b"old".to_vec()),
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: Rc::new(b"old".to_vec()),
         });
         let copy = indirect.shallow_copy();
         copy.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);

@@ -1359,8 +1359,8 @@ impl<R: Read + Seek> Pdf<R> {
             let dict_value = ObjectValue::Dictionary(self.lift_dictionary(&stream.dict, 0)?);
             existing_dict.replace_direct_value(dict_value);
             return Ok(ObjectValue::Stream {
-                dict: existing_dict,
-                data: Rc::new(stream.data.clone()),
+                stream_dict: existing_dict,
+                stream_data: Rc::new(stream.data.clone()),
             });
         }
         self.lift(object, 0)
@@ -2247,8 +2247,8 @@ impl<R: Read + Seek> Pdf<R> {
         let stream_offset = file_origin + data_start as i64;
         Ok((
             ObjectValue::Stream {
-                dict: dict_handle,
-                data: Rc::new(stream.data.clone()),
+                stream_dict: dict_handle,
+                stream_data: Rc::new(stream.data.clone()),
             },
             stream_offset,
         ))
@@ -2344,10 +2344,10 @@ impl<R: Read + Seek> Pdf<R> {
                 // `Pdf::lift_for_set_object`, so an established parsed offset
                 // is not lost on a plain round trip.
                 Object::Stream(stream) => ObjectValue::Stream {
-                    dict: ObjectHandle::from_value(ObjectValue::Dictionary(
+                    stream_dict: ObjectHandle::from_value(ObjectValue::Dictionary(
                         self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
                     )),
-                    data: Rc::new(stream.data.clone()),
+                    stream_data: Rc::new(stream.data.clone()),
                 },
                 // A bare top-level reference never comes from a file/ObjStm
                 // parse (`top_level_no_reference` integerizes it there,
@@ -3345,7 +3345,9 @@ fn decrypt_strings_in_object_value(
             }
             Ok(())
         }
-        ObjectValue::Stream { dict, .. } => decrypt_stream_dict_strings_in_place(dict, cipher, 1),
+        ObjectValue::Stream { stream_dict, .. } => {
+            decrypt_stream_dict_strings_in_place(stream_dict, cipher, 1)
+        }
         ObjectValue::Null
         | ObjectValue::Boolean(_)
         | ObjectValue::Integer(_)
@@ -4512,24 +4514,28 @@ mod tests {
         let dict =
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let mut value = ObjectValue::Stream {
-            dict,
-            data: Rc::new(b"stream payload, untouched by string decryption".to_vec()),
+            stream_dict: dict,
+            stream_data: Rc::new(b"stream payload, untouched by string decryption".to_vec()),
         };
 
         decrypt_object_value_strings(object_ref, &mut value, &encryption)
             .expect("stream-dictionary string decryption");
 
-        let ObjectValue::Stream { dict, data } = &value else {
+        let ObjectValue::Stream {
+            stream_dict,
+            stream_data,
+        } = &value
+        else {
             panic!("value must still be a stream"); // cov:ignore: unreachable given this test's own construction of value
         };
-        let stream_dict = dict.as_dictionary().expect("stream dict");
+        let stream_dict = stream_dict.as_dictionary().expect("stream dict");
         let title = stream_dict.get(b"Title".as_slice()).expect("Title entry");
         assert_eq!(
             title.as_string().as_deref(),
             Some(b"TopSecretTitle".as_slice())
         );
         assert_eq!(
-            data.as_slice(),
+            stream_data.as_slice(),
             b"stream payload, untouched by string decryption",
             "stream payload bytes are never touched by string decryption"
         );
@@ -4553,8 +4559,8 @@ mod tests {
         let stream_dict =
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let stream_child = ObjectHandle::from_value(ObjectValue::Stream {
-            dict: stream_dict,
-            data: Rc::new(b"payload".to_vec()),
+            stream_dict,
+            stream_data: Rc::new(b"payload".to_vec()),
         });
         let mut value = ObjectValue::Array(vec![stream_child]);
 
@@ -4656,11 +4662,11 @@ mod tests {
         };
 
         let mut accepted = ObjectValue::Stream {
-            dict: ObjectHandle::dictionary(vec![(
+            stream_dict: ObjectHandle::dictionary(vec![(
                 b"Deep".to_vec(),
                 nest(crate::object::MAX_INLINE_DEPTH - 1),
             )]),
-            data: Rc::new(Vec::new()),
+            stream_data: Rc::new(Vec::new()),
         };
         decrypt_object_value_strings(object_ref, &mut accepted, &encryption).expect(
             "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
@@ -4668,11 +4674,11 @@ mod tests {
         );
 
         let mut rejected = ObjectValue::Stream {
-            dict: ObjectHandle::dictionary(vec![(
+            stream_dict: ObjectHandle::dictionary(vec![(
                 b"TooDeep".to_vec(),
                 nest(crate::object::MAX_INLINE_DEPTH),
             )]),
-            data: Rc::new(Vec::new()),
+            stream_data: Rc::new(Vec::new()),
         };
         let err = decrypt_object_value_strings(object_ref, &mut rejected, &encryption)
             .expect_err("one level past the legacy decryptor's own boundary must still error");
@@ -5059,8 +5065,8 @@ mod tests {
         // not affect the new indirect object's dictionary.
         let dict = ObjectHandle::dictionary(vec![]);
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
-            dict: dict.clone(),
-            data: Rc::new(b"old".to_vec()),
+            stream_dict: dict.clone(),
+            stream_data: Rc::new(b"old".to_vec()),
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let indirect = pdf
