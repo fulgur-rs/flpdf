@@ -87,6 +87,7 @@
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |
 | `crates/flpdf/src/pipeline.rs` | correspondence | Pipeline.cc write/finish chaining lifecycle represented by a public Rust trait; PipelineError models qpdf's logic_error/runtime_error exception channel |
+| `crates/flpdf/src/pipeline/aes.rs` | correspondence | Pl_AES_PDF.cc AES-128/256 CBC with the PDF block padding of ISO 32000-1 section 7.6.2, streamed one 16-byte block at a time |
 | `crates/flpdf/src/pipeline/ascii85.rs` | correspondence | Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/ascii_hex.rs` | correspondence | Pl_ASCIIHexDecoder.cc incremental decode state, output, error, and finish semantics |
 | `crates/flpdf/src/pipeline/base64.rs` | correspondence | Pl_Base64.cc streaming encode/decode, aliases, padding, and lifecycle |
