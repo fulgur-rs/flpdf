@@ -2829,12 +2829,13 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 
         // Deliberately conservative and shape-independent: reject on ANY
         // indirect reference found anywhere in the subtree, even ones that
-        // a finer-grained analysis might prove safe (e.g. an unrelated
-        // developer-prefix key next to /ADBE that would actually survive
-        // intact). Reusing the same "reject the rare/unusual structure
-        // loudly" pattern applied elsewhere in this crate (e.g. the
-        // ObjStm+encrypt scope-out) rather than special-casing which
-        // reference positions are provably safe.
+        // a finer-grained analysis might prove safe (e.g., for a
+        // Dictionary-shaped /Extensions, an unrelated developer-prefix key
+        // next to /ADBE that would actually survive intact). Reusing the
+        // same "reject the rare/unusual structure loudly" pattern applied
+        // elsewhere in this crate (e.g. the ObjStm+encrypt scope-out)
+        // rather than special-casing which reference positions are
+        // provably safe.
         let mut refs = Vec::new();
         collect_direct_refs(raw_extensions, 0, &mut refs)?;
         let orphans = !refs.is_empty();
@@ -2847,18 +2848,20 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
                 });
             }
             Object::Reference(r) => (*r, orphans),
-            // cov:ignore-start: /Extensions present but neither Dict nor Ref
-            // is structurally malformed input; no test-fixture path
-            // produces it. `orphans` still reflects whatever
-            // collect_direct_refs found in this scalar (never anything, but
-            // computed generically rather than hardcoded), so this stays
-            // correct if ever reached.
+            // /Extensions present but neither Dict nor Ref: structurally
+            // non-conformant per ISO 32000 (which defines /Extensions as a
+            // dictionary), but this scans untrusted input, so it is
+            // handled rather than assumed away. There is no dict to look
+            // `/ADBE` up in, so `has_adbe` is unconditionally `false`;
+            // `orphans` still reflects whatever `collect_direct_refs` found
+            // while walking this value (generic, not hardcoded per shape).
+            // See `linearize_encrypt_v5_rejects_array_extensions_with_indirect_element`.
             _ => {
                 return Ok(CatalogAdbeStatus {
                     has_adbe: false,
                     orphans_indirect_object: orphans,
                 })
-            } // cov:ignore-end
+            }
         }
     };
 
@@ -7244,6 +7247,80 @@ mod tests {
     #[test]
     fn linearize_encrypt_v5_rejects_indirect_extension_level() {
         let src = tiny_pdf_with_indirect_extension_level_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as a DIRECT
+    /// Array (not a Dictionary at all — non-conformant per ISO 32000, which
+    /// defines `/Extensions` as a dictionary) with one element being an
+    /// INDIRECT reference (object 4). Regression fixture for
+    /// `resolve_catalog_adbe_status`'s catch-all match arm (`/Extensions`
+    /// present but neither `Object::Dictionary` nor `Object::Reference`):
+    /// `has_adbe` is unconditionally `false` there (there is no dict to
+    /// look `/ADBE` up in), but `collect_direct_refs` still walks the array
+    /// element and must still flag the nested reference.
+    fn tiny_pdf_with_array_extensions_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions [4 0 R] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n<< /BaseVersion /1.6 /ExtensionLevel 2 >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Code-quality review follow-up: exercises `resolve_catalog_adbe_status`'s
+    /// catch-all match arm (`/Extensions` present but neither `Dictionary`
+    /// nor `Reference`) with a committed fixture, which is what lets the
+    /// coverage-exclusion marker this arm previously carried be dropped. An
+    /// Array-shaped `/Extensions` is non-conformant per ISO 32000
+    /// (`/Extensions` is defined as a dictionary), so real qpdf never has to
+    /// handle this shape from a conforming file; flpdf still rejects the
+    /// indirect reference inside it defensively rather than mis-handling
+    /// untrusted input, which is a flpdf scope limitation, not a parity
+    /// requirement.
+    #[test]
+    fn linearize_encrypt_v5_rejects_array_extensions_with_indirect_element() {
+        let src = tiny_pdf_with_array_extensions_bytes();
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
