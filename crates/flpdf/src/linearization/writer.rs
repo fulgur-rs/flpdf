@@ -3421,13 +3421,7 @@ pub fn write_linearized<R: Read + Seek>(
     // never read; `[0u8; 16]` is a harmless placeholder.
     let hint_stream_aes_iv: [u8; 16] = match &encrypt_ctx {
         Some(ctx) if ctx.static_aes_iv => crate::pipeline::aes::static_initialization_vector(),
-        Some(ctx)
-            if matches!(
-                ctx.cipher,
-                crate::writer::WriteCipher::PerObject(crate::ObjectKeyAlg::Aes)
-                    | crate::writer::WriteCipher::FileKeyAes256
-            ) =>
-        {
+        Some(ctx) if crate::writer::cipher_needs_aes_iv(ctx.cipher) => {
             let mut iv = [0u8; 16];
             getrandom::getrandom(&mut iv).map_err(|e| {
                 crate::Error::Unsupported(format!(
@@ -8145,13 +8139,19 @@ mod tests {
         let needle = format!("{key}: ");
         for line in dump.lines() {
             if let Some(rest) = line.strip_prefix(&needle) {
+                // cov:ignore-start: defensive — show_linearization_bytes's
+                // dump_* helpers always write these fields as plain decimal
+                // via `{}` on a numeric value, so `rest` is always parseable
+                // for a well-formed dump; this only guards a future format
+                // change in show.rs from failing silently instead of loudly.
                 return rest
                     .trim()
                     .parse()
                     .unwrap_or_else(|e| panic!("field {key:?} = {rest:?} is not decimal: {e}"));
+                // cov:ignore-end
             }
         }
-        panic!("dump has no \"{needle}\" line:\n{dump}");
+        panic!("dump has no \"{needle}\" line:\n{dump}"); // cov:ignore: defensive — every dump this test module produces contains every field it queries; only guards a future show.rs field-name rename from failing silently.
     }
 
     /// End-to-end proof (task item 5): a real linearized + AES-128-encrypted

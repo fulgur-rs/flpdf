@@ -2836,6 +2836,22 @@ pub(crate) fn encrypt_strings_in_object_for_writer(
     }
 }
 
+/// Whether `cipher` needs an AES CBC initialization vector: `true` for both
+/// AES variants (V=4 AESV2 `PerObject(Aes)` and V=5 AESV3 `FileKeyAes256`),
+/// `false` for RC4 (a stream cipher with no IV concept).
+///
+/// Shared by [`encrypt_stream_payload_for_writer`] (which draws its own IV
+/// only when this is `true`) and
+/// `crate::linearization::writer::write_linearized` (which draws the hint
+/// stream's single per-invocation IV under the same condition).
+pub(crate) fn cipher_needs_aes_iv(cipher: WriteCipher) -> bool {
+    use crate::security::standard::ObjectKeyAlg;
+    matches!(
+        cipher,
+        WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
+    )
+}
+
 /// Encrypt a stream's payload bytes in place (after filter re-encoding) and
 /// update its `/Length` entry. AES grows the buffer by 16 bytes (IV prefix)
 /// plus up to one full block of PKCS#7 padding.
@@ -2855,15 +2871,10 @@ pub(crate) fn encrypt_stream_payload_for_writer(
     stream: &mut crate::Stream,
     ctx: &EncryptionContext,
 ) -> Result<()> {
-    use crate::security::standard::ObjectKeyAlg;
-
     // AES (V=4 AESV2 or V=5 AESV3) prefixes a random 16-byte CBC IV; RC4 does
     // not. Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
     // entropy in a chroot at boot) as `Unsupported` instead of panicking.
-    let needs_aes_iv = matches!(
-        ctx.cipher,
-        WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
-    );
+    let needs_aes_iv = cipher_needs_aes_iv(ctx.cipher);
     let mut iv = if ctx.static_aes_iv {
         crate::pipeline::aes::static_initialization_vector()
     } else {
