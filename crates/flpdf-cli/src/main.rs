@@ -561,7 +561,7 @@ struct Cli {
             "check", "dump_object", "show_info", "show_catalog",
             "show_metadata", "show_outline", "show_fonts",
             "show_npages", "show_pages", "show_linearization",
-            "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt",
             "copy_encryption_from",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
@@ -591,7 +591,7 @@ struct Cli {
             "check", "dump_object", "show_info", "show_catalog",
             "show_metadata", "show_outline", "show_fonts",
             "show_npages", "show_pages", "show_linearization",
-            "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
                 pair with --encryption-file-password"
@@ -964,7 +964,7 @@ struct RewriteCommand {
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
         conflicts_with_all = [
-            "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt",
             "copy_encryption_from",
         ]
     )]
@@ -987,7 +987,7 @@ struct RewriteCommand {
         value_name = "FILE",
         conflicts_with_all = [
             "encrypt",
-            "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
                 pair with --encryption-file-password"

@@ -16,8 +16,9 @@ use std::io::Cursor;
 use std::process::Command;
 
 use flpdf::{
-    write_pdf_with_options, EncryptMethod, EncryptParams, Object, ObjectRef, ObjectStreamMode, Pdf,
-    PdfOpenOptions, StreamDataMode, WriteOptions,
+    load_xref_and_trailer, write_pdf_with_options, CopyEncryptionSource, Dictionary, EncryptMethod,
+    EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions,
+    StreamDataMode, WriteOptions, XrefEntry,
 };
 
 const INFO_PLAINTEXT: &[u8] = b"Task4NestedPrintable";
@@ -479,19 +480,100 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
         "/Info must be stored as an ObjStm member, not a plain indirect object"
     );
 
-    let container_number = object_number_before_marker(&bytes, b"/Type /ObjStm");
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes.as_slice()))
+        .expect("load encrypted output xref");
+    let (container_number, member_index) = match loaded.entries.get(&info_ref) {
+        Some(XrefEntry::Compressed { stream, index }) => (*stream, *index),
+        other => panic!("/Info must have a type-2 xref entry, got {other:?}"),
+    };
+    assert_eq!(
+        container_number,
+        object_number_before_marker(&bytes, b"/Type /ObjStm"),
+        "/Info type-2 xref entry must name the emitted ObjStm container"
+    );
     let container = reopened
         .resolve(ObjectRef::new(container_number, 0))
         .expect("resolve and decrypt ObjStm container");
     let stream = container.as_stream().expect("ObjStm object is a stream");
     let decoded = flpdf::filters::decode_stream_data(&stream.dict, &stream.data)
         .expect("decode decrypted ObjStm payload");
+    let first = match stream.dict.get("First") {
+        Some(Object::Integer(value)) => usize::try_from(*value).expect("non-negative /First"),
+        other => panic!("ObjStm /First must be an integer, got {other:?}"),
+    };
+    let member_count = match stream.dict.get("N") {
+        Some(Object::Integer(value)) => u32::try_from(*value).expect("non-negative /N"),
+        other => panic!("ObjStm /N must be an integer, got {other:?}"),
+    };
     assert!(
-        decoded
+        member_index < member_count,
+        "type-2 index must be within /N"
+    );
+    let header_fields: Vec<usize> = std::str::from_utf8(&decoded[..first])
+        .expect("ObjStm header is ASCII")
+        .split_ascii_whitespace()
+        .map(|field| field.parse().expect("ObjStm header field is decimal"))
+        .collect();
+    let member_pair = usize::try_from(member_index).expect("member index fits usize") * 2;
+    assert_eq!(
+        header_fields.get(member_pair).copied(),
+        Some(usize::try_from(info_ref.number).expect("object number fits usize")),
+        "type-2 index must select the /Info member header"
+    );
+    let member_start = first
+        + header_fields
+            .get(member_pair + 1)
+            .copied()
+            .expect("member offset follows object number");
+    let member_end = if member_index + 1 < member_count {
+        first
+            + header_fields
+                .get(member_pair + 3)
+                .copied()
+                .expect("next member offset follows next object number")
+    } else {
+        decoded.len()
+    };
+    assert!(
+        decoded[member_start..member_end]
             .windows(INFO_PLAINTEXT.len())
             .any(|part| part == INFO_PLAINTEXT),
         "ObjStm member string must stay plaintext inside the encrypted container"
     );
+}
+
+#[test]
+fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+
+    for qdf in [false, true] {
+        let mut pdf = Pdf::open(Cursor::new(input.clone())).expect("open copy-encryption fixture");
+        let mut output = Vec::new();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.qdf = qdf;
+        options.static_id = true;
+        options.static_aes_iv = true;
+        options.copy_encryption = Some(CopyEncryptionSource {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x31; 15],
+            id0: b"0123456789abcdef".to_vec(),
+            object_key_alg: ObjectKeyAlg::Aes,
+        });
+
+        let error = write_pdf_with_options(&mut pdf, &mut output, &options)
+            .expect_err("short public copy-encryption key must be rejected");
+        assert!(matches!(
+            error,
+            flpdf::Error::Unsupported(message)
+                if message
+                    == "copy-encryption V=4 AES-128 file key must be 16 bytes; got 15"
+        ));
+        assert!(
+            output.is_empty(),
+            "{qdf:?} copy-encryption validation must precede output emission"
+        );
+    }
 }
 
 /// RC4-128 keeps qpdf's normal content heuristic after encryption. Cover every

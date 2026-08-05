@@ -461,7 +461,7 @@ Expected: pinned source path resolves cleanly and binary reports qpdf 11.9.0.
 
 - [x] **Step 2: Regenerate and verify module correspondence docs**
 
-Run: `python3 scripts/qpdf-module-docs.py`
+Run: `python3 scripts/qpdf-module-docs.py --write`
 
 Run: `python3 scripts/qpdf-module-docs.py --check`
 

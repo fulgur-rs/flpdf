@@ -433,8 +433,8 @@ pub struct WriteOptions {
     ///
     /// - `full_rewrite` is implicitly forced to `true` (the incremental
     ///   path cannot rewrite source object bytes).
-    /// - `qdf` must be `false` (QDF mode emits plaintext for human
-    ///   inspection; the combination is rejected with `Unsupported`).
+    /// - `qdf` may be enabled; encrypted strings and stream dictionaries retain
+    ///   QDF layout while their encrypted bytes remain ciphertext.
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
 
     /// Copy the `/Encrypt` dictionary verbatim from a donor PDF and re-use its
@@ -2499,6 +2499,13 @@ pub(crate) fn build_copy_encryption_context(
     options: &WriteOptions,
     existing_max: u32,
 ) -> Result<EncryptionContext> {
+    if src.file_key.len() != 16 {
+        return Err(crate::Error::Unsupported(format!(
+            "copy-encryption V=4 AES-128 file key must be 16 bytes; got {}",
+            src.file_key.len()
+        )));
+    }
+
     let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
         crate::Error::Unsupported(
             "full-rewrite copy-encryption: /Encrypt object number overflows u32".to_string(),
@@ -3471,7 +3478,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         let mut next_emission: u32 = 0;
         for (cf_ref, old_ref) in &renumbered {
             if Some(*old_ref) == pdf.encryption_ref() {
-                continue; // cov:ignore: QDF + encryption not covered by existing tests
+                continue;
             }
             if old_ref.number == 0 || skip_refs.contains(old_ref) {
                 continue; // cov:ignore: free/deleted refs don't appear in renumbered
@@ -3552,7 +3559,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             base_for_encrypt,
             metadata_ref,
             &id0,
-        )?) // cov:ignore: validated parameters leave only a non-injectable OS CSPRNG failure
+        )?)
     } else if let Some(ref src) = options.copy_encryption {
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
@@ -3563,7 +3570,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             src,
             options,
             base_for_encrypt,
-        )?) // cov:ignore: contiguous emission numbering cannot overflow u32 here
+        )?)
     } else {
         None
     };
@@ -3894,7 +3901,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                         encrypted_strings.as_mut(),
                         emit_ref,
-                    )?; // cov:ignore: validated encryption state leaves only non-injectable CSPRNG failure
+                    )?;
                 } else {
                     // cov:ignore-start: unreachable — this arm is inside the
                     // stream branch and reencode_stream_for_compress always
@@ -3912,7 +3919,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     options,
                     encrypted_strings.as_mut(),
                     emit_ref,
-                )?; // cov:ignore: validated encryption state leaves only non-injectable CSPRNG failure
+                )?;
             }
         } else if let Some(emitter) = encrypted_strings.as_mut() {
             emitter.write_object(&mut bytes, emit_ref, None, &object, options.qdf)?;
@@ -3977,7 +3984,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     Ok(())
                 }
             },
-        )?; // cov:ignore: validated ObjStm members and encryption state make callback propagation unreachable
+        )?;
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container

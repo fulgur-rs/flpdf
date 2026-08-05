@@ -6,16 +6,26 @@ use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::{EncryptionContext, WriteCipher};
 use crate::{Dictionary, Object, ObjectRef};
 
+type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> crate::Result<()>;
+
 /// Writer-owned adapter that encrypts strings while an emitted object's data
 /// key is active, without changing the source [`Object`] tree.
 pub(crate) struct EncryptedStringEmitter {
     state: WriterEncryptionState,
     cipher: WriteCipher,
     static_aes_iv: bool,
+    aes_iv_generator: Box<AesIvGenerator>,
 }
 
 impl EncryptedStringEmitter {
     pub(crate) fn from_context(ctx: &EncryptionContext) -> Self {
+        Self::from_context_with_boxed_iv_generator(ctx, Box::new(fill_aes_iv_from_os))
+    }
+
+    fn from_context_with_boxed_iv_generator(
+        ctx: &EncryptionContext,
+        aes_iv_generator: Box<AesIvGenerator>,
+    ) -> Self {
         Self {
             state: WriterEncryptionState::new(
                 true,
@@ -26,7 +36,16 @@ impl EncryptedStringEmitter {
             ),
             cipher: ctx.cipher,
             static_aes_iv: ctx.static_aes_iv,
+            aes_iv_generator,
         }
+    }
+
+    #[cfg(test)]
+    fn from_context_with_iv_generator(
+        ctx: &EncryptionContext,
+        aes_iv_generator: impl FnMut(&mut [u8; 16]) -> crate::Result<()> + 'static,
+    ) -> Self {
+        Self::from_context_with_boxed_iv_generator(ctx, Box::new(aes_iv_generator))
     }
 
     pub(crate) fn write_object(
@@ -39,10 +58,18 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         let cipher = self.cipher;
         let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
         self.state
             .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
                 let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
-                    write_encrypted_or_plain_string(state, cipher, static_aes_iv, out, plaintext)
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
                 };
                 if qdf {
                     object.try_write_pdf_qdf_with_string_writer(out, 0, &mut write_string)
@@ -63,10 +90,18 @@ impl EncryptedStringEmitter {
     ) -> crate::Result<()> {
         let cipher = self.cipher;
         let static_aes_iv = self.static_aes_iv;
+        let aes_iv_generator = self.aes_iv_generator.as_mut();
         self.state
             .with_object_data_key(emitted_ref.number, object_stream_index, |state| {
                 let mut write_string = |out: &mut Vec<u8>, plaintext: &[u8]| {
-                    write_encrypted_or_plain_string(state, cipher, static_aes_iv, out, plaintext)
+                    write_encrypted_or_plain_string(
+                        state,
+                        cipher,
+                        static_aes_iv,
+                        aes_iv_generator,
+                        out,
+                        plaintext,
+                    )
                 };
                 if qdf {
                     dict.try_write_pdf_stream_qdf_with_string_writer(out, 0, &mut write_string)
@@ -86,6 +121,7 @@ fn write_encrypted_or_plain_string(
     state: &WriterEncryptionState,
     cipher: WriteCipher,
     static_aes_iv: bool,
+    aes_iv_generator: &mut AesIvGenerator,
     out: &mut Vec<u8>,
     plaintext: &[u8],
 ) -> crate::Result<()> {
@@ -93,7 +129,7 @@ fn write_encrypted_or_plain_string(
         write_string_value(out, plaintext);
         return Ok(());
     };
-    let ciphertext = encrypt_string(cipher, static_aes_iv, data_key, plaintext)?;
+    let ciphertext = encrypt_string(cipher, static_aes_iv, aes_iv_generator, data_key, plaintext)?;
     serialize_encrypted_string(out, &ciphertext, crate::writer::cipher_needs_aes_iv(cipher));
     Ok(())
 }
@@ -101,6 +137,7 @@ fn write_encrypted_or_plain_string(
 fn encrypt_string(
     cipher: WriteCipher,
     static_aes_iv: bool,
+    aes_iv_generator: &mut AesIvGenerator,
     data_key: &[u8],
     plaintext: &[u8],
 ) -> crate::Result<Vec<u8>> {
@@ -111,13 +148,7 @@ fn encrypt_string(
         [0; 16]
     };
     if crate::writer::cipher_needs_aes_iv(cipher) && !static_aes_iv {
-        // cov:ignore-start: the OS CSPRNG failure is not injectable in the local test harness.
-        getrandom::getrandom(&mut iv).map_err(|error| {
-            crate::Error::Unsupported(format!(
-                "OS CSPRNG (getrandom) unavailable for AES IV generation: {error}"
-            ))
-        })?;
-        // cov:ignore-end
+        aes_iv_generator(&mut iv)?;
     }
     match cipher {
         WriteCipher::PerObject(ObjectKeyAlg::Rc4) => {
@@ -137,6 +168,14 @@ fn encrypt_string(
         }
     }
     Ok(bytes)
+}
+
+fn fill_aes_iv_from_os(iv: &mut [u8; 16]) -> crate::Result<()> {
+    getrandom::getrandom(iv).map_err(|error| {
+        crate::Error::Unsupported(format!(
+            "OS CSPRNG (getrandom) unavailable for AES IV generation: {error}"
+        ))
+    })
 }
 
 /// Serialize encrypted bytes using qpdf's cipher-specific representation:
@@ -300,13 +339,11 @@ mod tests {
 
         for key in [b"O".as_slice(), b"U", b"OE", b"UE", b"Perms"] {
             let expected = [key, b" <7072696e7461626c65>"].concat();
-            let key_display = String::from_utf8_lossy(key);
-            let wire_display = String::from_utf8_lossy(&wire);
             assert!(
                 wire.windows(expected.len()).any(|part| part == expected),
                 "direct /{} must be hexadecimal: {}",
-                key_display,
-                wire_display,
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(&wire),
             );
         }
         assert!(wire
@@ -456,6 +493,87 @@ mod tests {
             crate::Error::Unsupported(message)
                 if message == "V=5 AES-256 data key is not 32 bytes"
         ));
+        assert_eq!(emitter.current_data_key_for_test(), None);
+    }
+
+    #[test]
+    fn iv_rng_failure_clears_key_and_does_not_contaminate_later_emission() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let mut context = fixed_context(
+            vec![0x42; 16],
+            WriteCipher::PerObject(ObjectKeyAlg::Aes),
+            4,
+            4,
+        );
+        context.static_aes_iv = false;
+        let rng_calls = Rc::new(Cell::new(0));
+        let observed_calls = Rc::clone(&rng_calls);
+        let mut emitter =
+            EncryptedStringEmitter::from_context_with_iv_generator(&context, move |iv| {
+                let call = observed_calls.get();
+                observed_calls.set(call + 1);
+                if call == 0 {
+                    return Err(crate::Error::Unsupported(
+                        "injected AES IV RNG failure".to_string(),
+                    ));
+                }
+                *iv = crate::pipeline::aes::static_initialization_vector();
+                Ok(())
+            });
+
+        let mut failed_output = Vec::new();
+        let error = emitter
+            .write_object(
+                &mut failed_output,
+                ObjectRef::new(10, 0),
+                None,
+                &Object::String(b"failed plaintext".to_vec()),
+                false,
+            )
+            .expect_err("injected IV RNG failure must propagate");
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message) if message == "injected AES IV RNG failure"
+        ));
+        assert!(
+            failed_output.is_empty(),
+            "failed emission must write no token"
+        );
+        assert_eq!(emitter.current_data_key_for_test(), None);
+        assert_eq!(rng_calls.get(), 1);
+
+        let mut member_output = Vec::new();
+        emitter
+            .write_object(
+                &mut member_output,
+                ObjectRef::new(11, 0),
+                Some(0),
+                &Object::String(b"later member".to_vec()),
+                false,
+            )
+            .expect("later ObjStm-member emission");
+        assert_eq!(member_output, b"(later member)");
+        assert_eq!(rng_calls.get(), 1, "ObjStm member must not draw an IV");
+        assert_eq!(emitter.current_data_key_for_test(), None);
+
+        let later_ref = ObjectRef::new(12, 0);
+        let mut later_output = Vec::new();
+        emitter
+            .write_object(
+                &mut later_output,
+                later_ref,
+                None,
+                &Object::String(b"later top-level".to_vec()),
+                false,
+            )
+            .expect("later top-level emission must recover cleanly");
+        assert_eq!(rng_calls.get(), 2);
+        assert_eq!(
+            decrypt_emitted_string(&later_output, later_ref, &context.file_key, context.cipher),
+            b"later top-level"
+        );
         assert_eq!(emitter.current_data_key_for_test(), None);
     }
 

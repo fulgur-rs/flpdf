@@ -1700,7 +1700,7 @@ fn append_hint_stream_object(
                 &mut stream,
                 ctx,
                 hint_stream_aes_iv,
-            )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass with encrypt_ctx present.
+            )?;
             encrypted_payload = stream.data;
             &encrypted_payload
         }
@@ -2119,7 +2119,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        )?;
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
     }
@@ -2156,7 +2156,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2226,7 +2226,7 @@ fn do_write_pass<R: Read + Seek>(
             structural_streams_filtered,
             encrypt_ctx,
             hint_stream_aes_iv,
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        )?;
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
     }
@@ -2267,7 +2267,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2307,7 +2307,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2357,7 +2357,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        )?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2432,7 +2432,7 @@ fn do_write_pass<R: Read + Seek>(
                     recovered_eol,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
-                )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+                )?;
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
