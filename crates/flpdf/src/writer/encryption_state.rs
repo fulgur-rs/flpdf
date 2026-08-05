@@ -1,6 +1,33 @@
 //! qpdf correspondence: QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state.
 
-use crate::security::standard::{per_object_key, ObjectKeyAlg};
+use crate::security::primitives::md5;
+
+/// qpdf's `QPDF::compute_data_key` for writer object emission.
+///
+/// The output length is based on the complete MD5 input. In particular, qpdf
+/// counts the four-byte AES salt, so short AES file keys can produce a longer
+/// data key than RC4 keys of the same file-key length.
+fn compute_data_key(
+    encryption_key: &[u8],
+    object_number: u32,
+    use_aes: bool,
+    encryption_v: i32,
+    _encryption_r: i32,
+) -> Vec<u8> {
+    let mut input = encryption_key.to_vec();
+    if encryption_v >= 5 {
+        return input;
+    }
+
+    input.extend_from_slice(&object_number.to_le_bytes()[..3]);
+    input.extend_from_slice(&[0, 0]);
+    if use_aes {
+        input.extend_from_slice(b"sAlT");
+    }
+
+    let digest = md5(&input);
+    digest[..input.len().min(16)].to_vec()
+}
 
 /// Writer-owned encryption parameters and the key for the object being emitted.
 ///
@@ -78,17 +105,13 @@ impl WriterEncryptionState {
     }
 
     fn set_data_key(&mut self, emitted_object_number: u32) {
-        let key = if self.encryption_v >= 5 {
-            self.encryption_key.clone()
-        } else {
-            let algorithm = if self.encrypt_use_aes {
-                ObjectKeyAlg::Aes
-            } else {
-                ObjectKeyAlg::Rc4
-            };
-            per_object_key(&self.encryption_key, emitted_object_number, 0, algorithm)
-        };
-        self.cur_data_key = Some(key);
+        self.cur_data_key = Some(compute_data_key(
+            &self.encryption_key,
+            emitted_object_number,
+            self.encrypt_use_aes,
+            self.encryption_v,
+            self.encryption_r,
+        ));
     }
 }
 
@@ -122,6 +145,24 @@ mod tests {
                 [
                     0x4c, 0x7a, 0xd3, 0x28, 0xa6, 0x8a, 0x6a, 0xcb, 0x8b, 0x81, 0xf6, 0x8c, 0x86,
                     0x75, 0x6b, 0x7a,
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn aes_short_file_key_uses_qpdfs_salted_output_length() {
+        let mut state = WriterEncryptionState::new(true, vec![0x42; 7], true, 4, 4);
+
+        state.set_data_key(10);
+
+        assert_eq!(
+            state.current_data_key(),
+            Some(
+                [
+                    0x8f, 0xac, 0x28, 0x25, 0xd4, 0xb5, 0x04, 0x0f, 0x9f, 0xe9, 0x99, 0x96, 0x68,
+                    0x7f, 0x8a, 0x17,
                 ]
                 .as_slice()
             )
