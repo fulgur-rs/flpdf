@@ -1656,7 +1656,7 @@ fn hint_stream_convergence_len(
 /// or the cipher is RC4 (no IV concept); callers may pass any value in
 /// those cases.
 ///
-/// # Why the IV must stay fixed across passes: the offset/length invariant
+/// # Why pinning the IV is a defensive alignment with qpdf, not a proven-necessary fix
 ///
 /// Every downstream hint-table field this writer patches from a probed pass
 /// (`so_table.header.location`, [`build_outline_hint_table`]'s
@@ -1674,19 +1674,26 @@ fn hint_stream_convergence_len(
 /// IV-dependent framing decision), and AES-encrypted strings are written by
 /// [`crate::object::use_hex_string`]'s content-dependent heuristic, which
 /// forces hex for realistic AES-CBC-with-IV-prefix ciphertext with
-/// overwhelming probability (two independent triggers, each individually
-/// near-certain past ~20 bytes) — matching qpdf's own unconditional
-/// `unparse(true)` for AES-encrypted strings closely enough that no
-/// observed-length variance has ever been produced from it. So the ONLY
-/// actual source of pass-to-pass length variance in this writer is the hint
-/// stream's own conditional newline-before-`endstream` (below), and pinning
-/// its IV removes that source entirely instead of relying on the
-/// cancellation to absorb it. Pinning also converts what would otherwise be
-/// an emergent property of this writer's specific formulas into a
-/// structural one: a future hint-table field that stores a raw pass-local
-/// offset (instead of subtracting `hint_stream_obj_total_len` from it) would
-/// silently reintroduce the risk this comment describes if the IV were still
-/// drawn fresh per pass.
+/// overwhelming empirical probability (zero counterexamples in 2,000,000
+/// brute-forced IV trials against a minimal ciphertext) — but this is a
+/// *probabilistic* observation, not a proven guarantee: unlike qpdf, which
+/// unconditionally forces hex for every AES-encrypted string
+/// (`QPDF_String::unparse(true)`, `QPDFWriter.cc:1567-1599`), flpdf's
+/// `use_hex_string` is a content-dependent heuristic applied identically
+/// regardless of encryption method. That gap (tracked separately as
+/// flpdf-a32l, not fixed by this pinning) is the reason the "every OTHER
+/// object has pass-invariant length" precondition above is stated
+/// probabilistically rather than proven. Pinning the hint stream's own IV
+/// removes the ONE source of
+/// pass-to-pass variance this writer's algebraic cancellation does NOT
+/// already absorb regardless of that gap — the hint stream's own conditional
+/// newline-before-`endstream` — and matches qpdf's own "encrypt once, reuse
+/// the bytes" architecture. Note: mutation testing during review found the
+/// accompanying regression tests do not distinguish pinned from unpinned IVs
+/// (the cancellation already holds either way for every fixture tried), so
+/// treat this pinning as a defensive alignment with qpdf's real behavior
+/// rather than as a fix empirically proven necessary for a reproduced
+/// failure.
 #[allow(clippy::too_many_arguments)]
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
