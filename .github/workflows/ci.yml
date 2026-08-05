@@ -99,11 +99,29 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y qpdf
 
+      # The qpdf executable is statically linked to libqpdf but still needs
+      # these Homebrew-provided runtime libraries. Keep them outside the cache
+      # so the cached executable runs against the runner's current libraries.
+      - name: Install qpdf runtime libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install jpeg-turbo openssl@3 zlib
+
+      # qpdf 11.9.0 has no macOS release binary. The build below takes about
+      # three minutes, so cache its verified installed output. The key includes
+      # the qpdf version, architecture, and static/OpenSSL build contract.
+      - name: Restore qpdf 11.9.0 (macOS)
+        id: qpdf-cache
+        if: runner.os == 'macOS'
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        with:
+          path: ${{ runner.temp }}/qpdf-${{ env.QPDF_VERSION }}-install
+          key: qpdf-${{ runner.os }}-${{ runner.arch }}-${{ env.QPDF_VERSION }}-static-openssl-v1
+
       # qpdf 11.9.0 has no macOS release binary. Build the verified upstream
       # source archive with the same OpenSSL-backed crypto configuration that
-      # its distributed binaries use.
-      - name: Install qpdf 11.9.0 (macOS)
-        if: runner.os == 'macOS'
+      # its distributed binaries use when the installed output was not cached.
+      - name: Build qpdf 11.9.0 (macOS)
+        if: runner.os == 'macOS' && steps.qpdf-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -124,7 +142,7 @@ jobs:
           test -n "${expected}"
           test "${actual}" = "${expected}"
 
-          brew install cmake jpeg-turbo openssl@3 pkg-config zlib
+          brew install cmake pkg-config
           tar -xzf "${archive}" -C "${RUNNER_TEMP}"
           export PKG_CONFIG_PATH="$(brew --prefix jpeg-turbo)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
           cmake -S "${source_dir}" -B "${build_dir}" \
@@ -136,7 +154,14 @@ jobs:
             -DREQUIRE_CRYPTO_OPENSSL=ON
           cmake --build "${build_dir}" --parallel 2
           cmake --install "${build_dir}"
-          printf '%s\n' "${install_dir}/bin" >> "${GITHUB_PATH}"
+
+      - name: Add qpdf 11.9.0 to PATH (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s\n' "${RUNNER_TEMP}/qpdf-${QPDF_VERSION}-install/bin" >> "${GITHUB_PATH}"
 
       - name: Install qpdf 11.9.0 (Windows)
         if: runner.os == 'Windows'
