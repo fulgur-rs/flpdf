@@ -634,6 +634,20 @@ impl ObjectHandle {
         Ok(self.as_name())
     }
 
+    /// True when this handle lazily resolves to the requested decoded name.
+    ///
+    /// Ports `QPDFObjectHandle::isNameAndEquals`
+    /// (`libqpdf/QPDFObjectHandle.cc:456-459`). qpdf's canonical name string
+    /// includes its leading slash; [`ObjectValue::Name`] follows this crate's
+    /// existing representation and stores the same decoded bytes without it.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_is_name_and_equals(&self, name: &[u8]) -> Result<bool> {
+        self.try_dereference()?;
+        Ok(self.with_value(
+            |value| matches!(value, Some(ObjectValue::Name(actual)) if actual.as_slice() == name),
+        ))
+    }
+
     /// qpdf-compatible array inspection with lazy dereference. Only the array
     /// itself is resolved; each returned child keeps its own identity.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
@@ -3485,6 +3499,57 @@ pub(crate) mod identity_tests {
 
         assert_eq!(handle.try_as_name().unwrap(), Some(b"FlateDecode".to_vec()));
         assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_is_name_and_equals_compares_direct_decoded_name_bytes() {
+        let name = ObjectHandle::name(b"Crypt".to_vec());
+
+        assert!(name.try_is_name_and_equals(b"Crypt").unwrap());
+        assert!(!name.try_is_name_and_equals(b"FlateDecode").unwrap());
+        assert!(!ObjectHandle::integer(1)
+            .try_is_name_and_equals(b"Crypt")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_name_and_equals_resolves_an_indirect_name() {
+        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Name(b"Crypt".to_vec()));
+
+        assert!(!handle.is_resolved());
+        assert!(handle.try_is_name_and_equals(b"Crypt").unwrap());
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_is_name_and_equals_propagates_resolver_errors() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(22, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(
+            handle
+                .try_is_name_and_equals(b"Crypt")
+                .unwrap_err()
+                .to_string(),
+            "resolver failed"
+        );
+    }
+
+    #[test]
+    fn try_is_name_and_equals_reports_a_dropped_document() {
+        let (handle, resolver) = resolver_bearing_handle(ObjectValue::Name(b"Crypt".to_vec()));
+        drop(resolver);
+
+        assert_eq!(
+            handle
+                .try_is_name_and_equals(b"Crypt")
+                .unwrap_err()
+                .to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
     }
 
     #[test]
