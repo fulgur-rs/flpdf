@@ -642,12 +642,12 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                 ));
             }
             self.good_count += 2;
-            if let (Ok(number), Ok(generation)) = (u32::try_from(first), u16::try_from(second)) {
-                if number >= 1 && generation < 65535 {
-                    return Ok(self
-                        .resolver
-                        .indirect_handle(ObjectRef::new(number, generation)));
-                }
+            let number = qpdf_int(first, &token)?;
+            let generation = qpdf_int(second, &second_token)?;
+            if number >= 1 && (0..65535).contains(&generation) {
+                return Ok(self
+                    .resolver
+                    .indirect_handle(ObjectRef::new(number as u32, generation as u16)));
             }
             return Ok(ObjectHandle::null());
         }
@@ -677,13 +677,16 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
     }
 
     fn next_token(&mut self) -> Result<Token> {
-        let token = if let Some(token) = self.buffered.pop_front() {
+        let mut token = if let Some(token) = self.buffered.pop_front() {
             token
         } else {
             self.tokens.next_token()?
         };
-        if let Some(message) = token.error_message.as_deref() {
-            self.warn(token.start, String::from_utf8_lossy(message))?;
+        // qpdf reports a tokenizer error when it reads the physical token
+        // (`QPDFParser.cc:140-143`). Buffered lookahead is parser-local, so
+        // consume that one-shot diagnostic before the token can be replayed.
+        if let Some(message) = token.error_message.take() {
+            self.warn(token.start, String::from_utf8_lossy(&message))?;
         }
         Ok(token)
     }
@@ -730,7 +733,7 @@ mod live_input_tests {
     };
     use crate::object_handle::{ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
-    use crate::{ObjectRef, Result};
+    use crate::{Error, ObjectRef, Result};
 
     struct CountingInput {
         bytes: &'static [u8],
@@ -1082,11 +1085,15 @@ mod live_input_tests {
             .as_array()
             .is_some_and(|items| items.len() == 1 && items[0].is_null()));
 
-        let overflowing_reference = parse_with_null_resolver(b"[ 4294967296 0 R ]");
-        assert!(overflowing_reference
-            .value
-            .as_array()
-            .is_some_and(|items| items.len() == 1 && items[0].is_null()));
+        let mut input = CountingInput::new(b"[ 2147483648 0 R ]");
+        let mut resolver = NullResolver;
+        let error = parse_live_file_object(&mut input, &mut resolver)
+            .expect_err("qpdf rejects indirect object numbers outside signed int");
+        assert!(matches!(
+            error,
+            Error::Parse { offset: 2, message }
+                if message == "integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+        ));
 
         let nested_reference = parse_with_null_resolver(b"[ 1 0 R ]");
         let nested_reference_items = nested_reference.value.as_array().expect("array");
@@ -1095,6 +1102,21 @@ mod live_input_tests {
                 .first()
                 .and_then(ObjectHandle::object_ref),
             Some(ObjectRef::new(1, 0))
+        );
+    }
+
+    #[test]
+    fn live_file_parser_reports_a_replayed_tokenizer_error_once() {
+        let parsed = parse_with_null_resolver(b"[1 0 /A#zB]");
+
+        assert!(parsed.value.as_array().is_some());
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["name with stray # will not work with PDF >= 1.2"]
         );
     }
 
@@ -2056,6 +2078,20 @@ fn parse_integer_token(token: &Token) -> Result<i64> {
         .ok()
         .and_then(|text| text.parse::<i64>().ok())
         .ok_or_else(|| Error::parse(token.start, "invalid integer"))
+}
+
+/// qpdf converts indirect-reference components from its `long long` token
+/// buffer to signed `int` before testing whether the object/generation pair
+/// is valid (`QPDFParser.cc:166-175`, `QIntC.hh:87-108`).
+fn qpdf_int(value: i64, token: &Token) -> Result<i32> {
+    i32::try_from(value).map_err(|_| {
+        Error::parse(
+            token.start,
+            format!(
+                "integer out of range converting {value} from a 8-byte signed type to a 4-byte signed type"
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
