@@ -2770,13 +2770,26 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
 /// be rejected loudly (`Unsupported`) instead of silently producing wrong
 /// bytes.
 fn catalog_extensions_is_indirect<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    // cov:ignore-start: defensive /Root guard, mirroring
+    // `catalog_has_extensions_adbe`. `write_linearized`'s only caller
+    // context reaches this point with a `plan` whose `root_ref` is
+    // `Some` (`plan.root_ref.ok_or_else(Unsupported)` below, on the SAME
+    // source bytes as `pdf`), so `pdf.root_ref()` is `None` here only for a
+    // caller that deliberately passes a `plan`/`pdf` pair built from
+    // different sources — not exercised by any fixture in this test module.
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(false);
     };
+    // cov:ignore-end
     let catalog = pdf.resolve_borrowed(root_ref)?;
+    // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
+    // `catalog_has_extensions_adbe`. Every well-formed fixture that reaches
+    // this point (a linearizable document with a resolved `plan.root_ref`)
+    // has a dictionary Catalog.
     let Some(catalog_dict) = catalog.as_dict() else {
         return Ok(false);
     };
+    // cov:ignore-end
     Ok(matches!(
         catalog_dict.get("Extensions"),
         Some(Object::Reference(_))
