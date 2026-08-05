@@ -5242,7 +5242,7 @@ mod tests {
         let content = b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n";
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
-        let mut offs = [0usize; 11];
+        let mut offs = [0usize; 12];
 
         offs[1] = pdf.len();
         pdf.extend_from_slice(
@@ -5301,13 +5301,22 @@ mod tests {
         pdf.extend_from_slice(content);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
+        // Nested printable body strings make this same Part-8/Outlines
+        // fixture exercise AES wire syntax on every randomized write pass.
+        offs[11] = pdf.len();
+        pdf.extend_from_slice(
+            b"11 0 obj\n<< /Nested [(array-printable) << /Inner (inner-printable) >>] \
+              /Producer (outline-producer-printable) >>\nendobj\n",
+        );
+
         let xref = pdf.len();
-        pdf.extend_from_slice(b"xref\n0 11\n0000000000 65535 f \n");
+        pdf.extend_from_slice(b"xref\n0 12\n0000000000 65535 f \n");
         for off in offs.iter().skip(1) {
             pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
         }
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<< /Size 12 /Root 1 0 R /Info 11 0 R >>\nstartxref\n{xref}\n%%EOF\n")
+                .as_bytes(),
         );
         pdf
     }
@@ -6701,8 +6710,9 @@ mod tests {
     /// Build a linearizable single-page PDF with a page content stream (raw
     /// `content` bytes, no `/Filter`) and an `/Info` dictionary carrying a
     /// `/Producer` string plus nested printable strings — the distinct kinds
-    /// of body data the encrypted writer must handle: a stream payload and
-    /// scalar strings at every container depth.
+    /// of body data the encrypted writer must handle: a stream payload, a
+    /// printable stream-dictionary string, and strings at every container
+    /// depth in an ordinary dictionary.
     fn tiny_pdf_with_content_and_producer(content: &[u8], producer: &[u8]) -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -6721,9 +6731,9 @@ mod tests {
         );
 
         offs.push(pdf.len() as u64);
-        pdf.extend_from_slice(
-            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
-        );
+        pdf.extend_from_slice(b"4 0 obj\n<< /Label (");
+        pdf.extend_from_slice(STREAM_DICTIONARY_LABEL);
+        pdf.extend_from_slice(format!(") /Length {} >>\nstream\n", content.len()).as_bytes());
         pdf.extend_from_slice(content);
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
@@ -6749,9 +6759,10 @@ mod tests {
         pdf
     }
 
-    /// Assert the three strings in
-    /// [`tiny_pdf_with_content_and_producer`]'s `/Info` object use raw hex
-    /// string tokens after AES encryption. The source values are all printable
+    const STREAM_DICTIONARY_LABEL: &[u8] = b"stream-dict-printable";
+
+    /// Assert the three strings in the AES fixtures' `/Info` object use raw
+    /// hex string tokens after encryption. The source values are all printable
     /// and nested at scalar/array/dictionary positions, so literal `(...)`
     /// syntax anywhere in this object is a regression to generic emission.
     fn assert_encrypted_body_strings_are_hex(out: &[u8]) {
@@ -6806,6 +6817,70 @@ mod tests {
             3,
             "all three AES-encrypted /Info strings must use hex tokens: {:?}",
             String::from_utf8_lossy(info_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+    }
+
+    /// Assert the page-content stream dictionary's printable `/Label` string
+    /// is emitted as raw AES ciphertext hex and resolves back to its plaintext
+    /// after the reader authenticates with the empty user password.
+    fn assert_encrypted_stream_dictionary_string_is_hex_and_decrypts(out: &[u8]) {
+        let mut reopened = Pdf::open(Cursor::new(out.to_vec()))
+            .expect("encrypted output must reopen with the empty user password");
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let pages_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get("Pages") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: fixture invariant
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
+        };
+        let page_ref = match reopened.resolve(pages_ref).expect("resolve /Pages") {
+            Object::Dictionary(d) => match d.get("Kids") {
+                Some(Object::Array(kids)) => match kids.first() {
+                    Some(Object::Reference(r)) => *r,
+                    other => panic!("Kids[0] must be a reference, got {other:?}"), // cov:ignore: fixture invariant
+                },
+                other => panic!("/Kids must be an array, got {other:?}"), // cov:ignore: fixture invariant
+            },
+            other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
+        };
+        let contents_ref = match reopened.resolve(page_ref).expect("resolve page") {
+            Object::Dictionary(d) => match d.get("Contents") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: fixture invariant
+            },
+            other => panic!("page must be a dictionary, got {other:?}"), // cov:ignore: fixture invariant
+        };
+
+        let stream_bytes = find_object_bytes(out, contents_ref.number);
+        assert!(
+            stream_bytes
+                .windows(b"/Label <".len())
+                .any(|part| part == b"/Label <"),
+            "stream dictionary /Label string must start with a hex token: {:?}",
+            String::from_utf8_lossy(stream_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+        assert!(
+            !stream_bytes
+                .windows(b"/Label (".len())
+                .any(|part| part == b"/Label ("),
+            "stream dictionary /Label must not use a literal token: {:?}",
+            String::from_utf8_lossy(stream_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+
+        let decrypted_label = match reopened
+            .resolve(contents_ref)
+            .expect("resolve encrypted /Contents")
+        {
+            Object::Stream(stream) => match stream.dict.get("Label") {
+                Some(Object::String(label)) => label.clone(),
+                other => panic!("stream /Label must be a string, got {other:?}"), // cov:ignore: fixture invariant
+            },
+            other => panic!("/Contents must be a stream, got {other:?}"), // cov:ignore: fixture invariant
+        };
+        assert_eq!(
+            decrypted_label, STREAM_DICTIONARY_LABEL,
+            "stream dictionary /Label must decrypt back to its original plaintext"
         );
     }
 
@@ -6955,6 +7030,7 @@ mod tests {
         });
 
         assert_encrypted_body_strings_are_hex(&out);
+        assert_encrypted_stream_dictionary_string_is_hex_and_decrypts(&out);
         crate::linearization::check_linearization_bytes(&out)
             .expect("AES-encrypted output must pass linearization checks");
     }
@@ -8304,6 +8380,7 @@ mod tests {
 
             crate::linearization::check_linearization_bytes(&out)
                 .expect("encrypted linearized output must pass the linearization checker");
+            assert_encrypted_body_strings_are_hex(&out);
 
             let dump = crate::linearization::show_linearization_bytes(&out, "test")
                 .expect("hint stream must decode (decryption + bit-unpacking)");
