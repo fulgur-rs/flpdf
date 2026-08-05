@@ -1,13 +1,12 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue`
-//! identity and payload ownership; `QPDFObjectHandle.cc:456-466,759-785,1027-1039`
-//! name/dictionary/array inspection (`try_is_name_and_equals`,
+//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
+//!
+//! `QPDFObjectHandle.cc:456-466,759-785,1027-1039` supplies the
+//! name/dictionary/array inspection mirrored by `try_is_name_and_equals`,
 //! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
-//! `try_is_or_has_name`); plus `QPDFWriter.cc` `unparseObject`/`writeTrailer`
-//! writer-emission primitives (`unparse_object`/`unparse_object_qdf`/
-//! `unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
+//! `try_is_or_has_name`.
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
