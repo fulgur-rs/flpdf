@@ -15,6 +15,10 @@ use std::process::Command as ShellCommand;
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
+// Exercise actual page/content traversal in qpdf's QDF + encryption oracle.
+// `minimal.pdf` has an empty page tree; qpdf 12.3.0--12.3.2 crashes on it
+// during `--check` (qpdf#1674) before reaching the QDF/AES properties.
+const QDF_ENCRYPTION_FIXTURE: &str = ONE_PAGE_FIXTURE;
 // Only referenced by the qpdf-zlib-compat-gated byte-identical oracle test
 // below; under default features they'd otherwise be dead code.
 #[cfg(feature = "qpdf-zlib-compat")]
@@ -213,7 +217,7 @@ fn qdf_direct_encryption_works_on_top_level_and_rewrite_surfaces() {
                 "--use-aes=y",
                 "--",
             ])
-            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(fixture(QDF_ENCRYPTION_FIXTURE))
             .arg(&output)
             .assert()
             .success();
@@ -1330,7 +1334,7 @@ fn qdf_copy_encryption_works_on_top_level_and_rewrite_surfaces() {
             .arg("--copy-encryption-from")
             .arg(&donor)
             .args(["--encryption-file-password", "donor-user"])
-            .arg(fixture(UNENCRYPTED_FIXTURE))
+            .arg(fixture(QDF_ENCRYPTION_FIXTURE))
             .arg(&output)
             .assert()
             .success();
