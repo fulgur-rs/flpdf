@@ -602,7 +602,7 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 /// (whitespace, `/`, `<<`, string parentheses, …) — the writer's caller
 /// falls back to the canonical shortest-decimal form so nothing outside a
 /// numeric token can slip into the emitted PDF at a real's position.
-fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
+pub(crate) fn real_literal_is_safe(literal: &[u8], value: f64) -> bool {
     if literal.is_empty() {
         return false;
     }
