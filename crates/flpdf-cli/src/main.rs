@@ -549,15 +549,19 @@ struct Cli {
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
         // Reject combinations that don't make sense on the rewrite path.
-        // --linearize / --remove-restrictions / --decrypt overlaps with
-        // --encrypt are rejected because they imply contradictory output
-        // forms; --check / --dump-object / --show-* are inspection paths
-        // that don't produce an output file at all.
+        // --remove-restrictions / --decrypt overlap with --encrypt and are
+        // rejected because they imply contradictory output forms; --check /
+        // --dump-object / --show-* are inspection paths that don't produce an
+        // output file at all. --linearize is NOT rejected: qpdf itself
+        // supports `--linearize --encrypt ...` (verified: `qpdf --linearize
+        // --encrypt "" "" 128 --use-aes=y --` produces a valid,
+        // `qpdf --check`-clean linearized+encrypted file), and
+        // `write_linearized` threads `options.encrypt` through correctly.
         conflicts_with_all = [
             "check", "dump_object", "show_info", "show_catalog",
             "show_metadata", "show_outline", "show_fonts",
             "show_npages", "show_pages", "show_linearization",
-            "linearize", "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt", "qdf",
             "copy_encryption_from",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
@@ -574,7 +578,11 @@ struct Cli {
     /// supported; other schemes are rejected
     /// with a "not yet supported" diagnostic.
     ///
-    /// Mutually exclusive with `--encrypt`.
+    /// Mutually exclusive with `--encrypt`. `--linearize` is accepted at the
+    /// clap layer (qpdf itself supports the combination), but the linearized
+    /// writer currently returns a clean `Unsupported` error for this specific
+    /// pairing (reconciling the donor's `/ID[0]` with the linearized writer's
+    /// early `/ID`-computation requirement is a separate implementation gap).
     #[arg(
         long = "copy-encryption-from",
         value_name = "FILE",
@@ -583,7 +591,7 @@ struct Cli {
             "check", "dump_object", "show_info", "show_catalog",
             "show_metadata", "show_outline", "show_fonts",
             "show_npages", "show_pages", "show_linearization",
-            "linearize", "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt", "qdf",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
                 pair with --encryption-file-password"
@@ -946,6 +954,9 @@ struct RewriteCommand {
     /// Encrypt the output (qpdf `--encrypt` compatible). See the top-level
     /// `--encrypt` documentation for the full syntax and the current
     /// restrictions (KEY-LEN=128 + --use-aes=y only, default permissions).
+    /// `--linearize` is not rejected: qpdf itself supports
+    /// `--linearize --encrypt ...`, and `write_linearized` threads
+    /// `options.encrypt` through correctly.
     #[arg(
         long = "encrypt",
         num_args = 3..,
@@ -953,7 +964,7 @@ struct RewriteCommand {
         allow_hyphen_values = true,
         value_name = "USER-PW OWNER-PW KEY-LEN [sub-flags]",
         conflicts_with_all = [
-            "linearize", "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt", "qdf",
             "copy_encryption_from",
         ]
     )]
@@ -966,13 +977,17 @@ struct RewriteCommand {
     /// supported; other schemes are rejected
     /// with a "not yet supported" diagnostic.
     ///
-    /// Mutually exclusive with `--encrypt`.
+    /// Mutually exclusive with `--encrypt`. `--linearize` is accepted at the
+    /// clap layer (qpdf itself supports the combination), but the linearized
+    /// writer currently returns a clean `Unsupported` error for this specific
+    /// pairing (reconciling the donor's `/ID[0]` with the linearized writer's
+    /// early `/ID`-computation requirement is a separate implementation gap).
     #[arg(
         long = "copy-encryption-from",
         value_name = "FILE",
         conflicts_with_all = [
             "encrypt",
-            "linearize", "remove_restrictions", "decrypt", "qdf",
+            "remove_restrictions", "decrypt", "qdf",
         ],
         help = "Copy /Encrypt from donor PDF (qpdf --copy-encryption-from); \
                 pair with --encryption-file-password"
@@ -1690,6 +1705,20 @@ fn main() {
                 }
             }
         }
+        // Top-level --encrypt / --copy-encryption-from on the --linearize
+        // alias: wire encryption onto WriteOptions (shared with the
+        // non-linearize branch below and the `rewrite` subcommand via
+        // apply_encryption_options). Without this call the linearize branch
+        // would silently drop --encrypt/--copy-encryption-from (WriteOptions
+        // built here is separate from the non-linearize branch's), emitting
+        // plaintext output even though the user asked for encryption.
+        apply_encryption_options(
+            &mut options,
+            &args.encrypt,
+            args.copy_encryption_from.as_deref(),
+            args.encryption_file_password.as_deref(),
+            args.password.allow_weak_crypto,
+        );
         let result = run_rewrite(
             args.input,
             args.output.clone(),

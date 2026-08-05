@@ -66,16 +66,19 @@ use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
 use crate::linearization::hint_shared::SharedObjectHintTable;
 use crate::linearization::hint_stream::{encode_hint_stream, OutlineHintTable};
 use crate::linearization::part1::{Part1Bytes, Part1Placeholders};
-use crate::linearization::plan::{ContainerPart, LinearizationPlan, RoutedObjStmBatch};
+use crate::linearization::plan::{
+    collect_direct_refs, ContainerPart, LinearizationPlan, RoutedObjStmBatch,
+};
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
 use crate::object::MAX_INLINE_DEPTH;
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
 use crate::writer::{
-    effective_pdf_version, effective_stream_policy, is_lone_flate, reencode_stream_for_compress,
-    serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order, serialize::xref_stream,
-    CompressStreams, NewlineBeforeEndstream, WriteOptions, QPDF_STATIC_ID,
+    effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension, is_lone_flate,
+    reencode_stream_for_compress, serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order,
+    serialize::xref_stream, strip_adbe_extension, CompressStreams, NewlineBeforeEndstream,
+    WriteOptions, QPDF_STATIC_ID,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -541,12 +544,28 @@ fn renumber_object_with_removed<R: Read + Seek>(
 
 /// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
 /// `N G obj` header (i.e. the start of the object).
-fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> usize {
+///
+/// When `encrypt_ctx` is `Some` and `new_ref` is not the `/Encrypt` dict's own
+/// ref, every string in `object`'s graph is encrypted in place first (mirrors
+/// `crate::writer`'s per-object emission loop, which calls
+/// `encrypt_strings_in_object_for_writer` before serializing). The `new_ref ==
+/// ctx.encrypt_ref` self-skip is what keeps the `/Encrypt` dict itself
+/// plaintext (PDF 1.7 §7.6.1) when this same function is reused for its
+/// emission.
+fn append_object(
+    bytes: &mut Vec<u8>,
+    new_ref: ObjectRef,
+    mut object: Object,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+) -> Result<usize> {
+    if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
+        crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut object, ctx)?;
+    }
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     object.write_pdf(bytes);
     bytes.extend_from_slice(b"\nendobj\n");
-    offset
+    Ok(offset)
 }
 
 /// Append a renumbered body object, routing `Object::Stream` payloads through
@@ -573,30 +592,86 @@ fn append_object(bytes: &mut Vec<u8>, new_ref: ObjectRef, object: &Object) -> us
 /// and the `newline_before_endstream` policy is honoured so the framing matches
 /// the option the caller passed.
 ///
-/// Non-stream objects are delegated to [`append_object`] unchanged.
+/// Non-stream objects are delegated to [`append_object`] unchanged (which
+/// applies string encryption itself).
+///
+/// When `encrypt_ctx` is `Some` and `new_ref` is not the `/Encrypt` dict's own
+/// ref, a stream object's dictionary strings are encrypted BEFORE re-encoding
+/// and its payload is encrypted AFTER re-encoding — mirroring
+/// `crate::writer`'s per-object emission loop, which calls
+/// `encrypt_strings_in_object_for_writer` on the whole resolved object first,
+/// then `encrypt_stream_payload_for_writer` on the stream's payload once
+/// `reencode_stream_for_compress` has produced the final on-disk bytes (so
+/// `/Length` is set from the ciphertext, not the plaintext, byte count).
+///
+/// `original_ref` is the object's PRE-renumber ref (matching `crate::writer`'s
+/// `old_ref`), used only to check it against `ctx.metadata_ref` (also an
+/// original ref — see [`crate::writer::resolve_metadata_stream_ref`]) for the
+/// `--cleartext-metadata` exemption below. `new_ref` must not be substituted
+/// here: `metadata_ref` is populated before renumbering, so comparing against
+/// the renumbered ref would never match.
 fn append_body_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
-    object: &Object,
+    original_ref: ObjectRef,
+    object: Object,
     options: &WriteOptions,
     recovered_stream_eol: Option<&[u8]>,
-) -> usize {
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+) -> Result<usize> {
     let Object::Stream(stream) = object else {
-        return append_object(bytes, new_ref, object);
+        return append_object(bytes, new_ref, object, encrypt_ctx);
     };
+
+    // Encrypt any strings inside the stream's dictionary before re-encoding —
+    // same ordering as crate::writer's loop (string encryption runs on the
+    // whole resolved object before the compress-policy reencode).
+    let mut wrapped = Object::Stream(stream);
+    if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
+        crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut wrapped, ctx)?;
+    }
+    // cov:ignore-start: unreachable — `wrapped` was just constructed as
+    // Object::Stream above, and encrypt_strings_in_object_for_writer never
+    // changes an object's variant.
+    let Object::Stream(stream) = wrapped else {
+        unreachable!("wrapped is always Object::Stream")
+    };
+    // cov:ignore-end
 
     let policy = effective_stream_policy(options);
     let (reencoded, source_filter_is_lone_flate) =
-        reencode_stream_for_compress(stream.clone(), options, true, recovered_stream_eol);
+        reencode_stream_for_compress(stream, options, true, recovered_stream_eol);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.
     // cov:ignore-start: unreachable — apply_stream_compress_policy always
     // returns Object::Stream, so the else arm is dead.
-    let Object::Stream(ref s) = reencoded else {
+    let Object::Stream(mut s) = reencoded else {
         unreachable!("apply_stream_compress_policy always returns Object::Stream")
     };
     // cov:ignore-end
+
+    // Encrypt the stream payload AFTER re-encoding, so the encryption operates
+    // on the on-disk bytes; updates /Length to the encrypted byte count (AES
+    // adds a 16-byte IV prefix plus PKCS#7 padding).
+    //
+    // `--cleartext-metadata` exemption (mirrors crate::writer's
+    // write_pdf_full_rewrite loop, writer.rs's Object::Stream branch): when
+    // `ctx.metadata_ref` is this object's original ref, leave the payload in
+    // the clear and prepend /Crypt /Identity so a reader knows not to decrypt
+    // it, instead of running it through the cipher. /Length stays the
+    // un-encrypted byte count. Every OTHER stream (metadata_ref is None, or
+    // this isn't it) takes the normal encrypt_stream_payload_for_writer path.
+    if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
+        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref) {
+            crate::security::standard::prepend_crypt_filter_to_stream_dict(
+                &mut s.dict,
+                b"Identity",
+            );
+        } else {
+            crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut s, ctx)?;
+        }
+    }
 
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
@@ -617,9 +692,9 @@ fn append_body_object(
     // route to `Never`); force `Never` so the framing matches qpdf.  The
     // primary hint stream keeps its newline via the separate
     // `append_hint_stream_object`, matching qpdf's hint-stream framing.
-    write_stream_to_buf_qpdf_order(bytes, s, NewlineBeforeEndstream::Never, refiltered);
+    write_stream_to_buf_qpdf_order(bytes, &s, NewlineBeforeEndstream::Never, refiltered);
     bytes.extend_from_slice(b"\nendobj\n");
-    offset
+    Ok(offset)
 }
 
 /// Byte width of a single classic cross-reference entry:
@@ -672,7 +747,14 @@ struct Part1XrefPatch {
 /// `/Prev`, and `/ID` — matching qpdf's key order and content for linearized
 /// PDFs.  The `/Prev` value is written as a left-justified decimal integer
 /// padded on the right with spaces to [`PREV_PLACEHOLDER_WIDTH`] bytes so it
-/// can be back-patched in-place once the Part 6 xref offset is known.
+/// can be back-patched in-place once the Part 6 xref offset is known.  When
+/// `encrypt_ctx` is `Some`, `/Encrypt {N} 0 R` is written immediately after
+/// `/ID` — qpdf's `writeTrailer` writes `/ID` first, then, for every trailer
+/// form except `t_lin_second` (the main/second-half trailer),
+/// ` /Encrypt {objid} 0 R` (QPDFWriter.cc:1224-1231). Verified empirically against qpdf
+/// 11.9.0 (`qpdf --linearize --static-id --static-aes-iv --encrypt "" "" 128
+/// --use-aes=y`), whose first-page trailer ends `... /ID [<...><...>]
+/// /Encrypt 4 0 R >>`.
 ///
 /// Returns `(xref_keyword_offset, prev_value_byte_range, patch)`.
 #[allow(clippy::too_many_arguments)]
@@ -685,6 +767,7 @@ fn write_part1_xref_and_trailer(
     info_new_ref: Option<ObjectRef>,
     source_trailer: &Dictionary,
     id_writer: Option<crate::object::ReborrowableIdWriter>,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> (usize, std::ops::Range<usize>, Part1XrefPatch) {
     // The param-dict object's trailing pad (reserved by `Part1Bytes::build`)
     // ends with spaces; qpdf starts the first-page `xref` on a fresh line, so
@@ -777,6 +860,23 @@ fn write_part1_xref_and_trailer(
             Some(write_id) => write_id(bytes),
             None => crate::object::write_id_style_value(bytes, id_obj),
         }
+    }
+
+    // /Encrypt — reference to the `/Encrypt` dictionary object, written right
+    // after `/ID` (qpdf `writeTrailer` writes `/ID` first, then — for every
+    // trailer form except `t_lin_second`, the main/second-half trailer —
+    // ` /Encrypt {objid} 0 R`, QPDFWriter.cc:1224-1231). The main (Part-6)
+    // trailer is produced by `write_main_xref_and_trailer`, a separate
+    // function that never receives `encrypt_ctx`, so that omission is
+    // structural rather than a runtime branch here.
+    if let Some(ctx) = encrypt_ctx {
+        bytes.extend_from_slice(
+            format!(
+                " /Encrypt {} {} R",
+                ctx.encrypt_ref.number, ctx.encrypt_ref.generation
+            )
+            .as_bytes(),
+        );
     }
 
     bytes.extend_from_slice(b" >>");
@@ -1126,6 +1226,33 @@ fn patch_linearized_deterministic_id(
 /// `/Prev → main xref` (qpdf's first-half → main chain direction); the main
 /// (Part-6) xref at EOF carries no `/Prev`, so the chain is acyclic. Its
 /// `/Index [second_half_count, first_half_count)` covers the FIRST-half objects.
+//
+// Scope note: this function has no `encrypt_ctx` parameter, unlike its
+// classic-path sibling `write_part1_xref_and_trailer`. `write_linearized`
+// rejects encryption combined with any ObjStm-emitting mode before
+// `relocation`/`objstm_layout` are built, so this xref-stream path (called
+// only when `!objstm_layout.is_empty()`) and `encrypt_ctx.is_some()` can
+// never coincide in the same call to `do_write_pass` — adding an /Encrypt
+// arm here would be dead code unreachable through the public API. qpdf's own
+// `writeTrailer` (QPDFWriter.cc:1160-1231) writes `/Encrypt` identically for
+// both the classic and xref-stream trailer forms (right after `/ID`, for
+// every `which != t_lin_second`), so if this scope limitation is ever
+// lifted, thread `encrypt_ctx` here the same way and emit `/Encrypt {N} {G}
+// R` right after the `/ID` array.
+//
+// CAUTION for that future change: `write_object`/`write_object_with_id_writer`
+// (crate::writer::serialize::xref_stream) are SHARED with the plain
+// (non-linearized) writer's own xref-stream path
+// (crates/flpdf/src/writer/plain/xref.rs), which already deliberately
+// strips "Encrypt" out of its passthrough trailer dict before calling into
+// them (writer/plain/xref.rs's key filter list) — i.e. today, neither
+// caller emits `/Encrypt` there. Do NOT add an unconditional `/Encrypt`
+// write inside those shared functions' bodies: every xref-stream object
+// written through the plain writer would then gain a spurious /Encrypt
+// reference (or, once the plain writer supports encrypt+xref-stream, a
+// doubled one via its trailer passthrough). Add a new opt-in field (e.g.
+// `Option<ObjectRef>` on `XrefStreamDict`) instead, left `None` at the
+// plain writer's call sites, so this stays per-caller.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
@@ -1502,6 +1629,72 @@ fn hint_stream_convergence_len(
 /// `\nendstream\nendobj\n`) is byte-identical to [`append_object`]. The newline
 /// before `endstream` is written only when the payload does not already end in
 /// one (qpdf, QPDFWriter.cc:2327).
+///
+/// The hint stream IS encrypted when `encrypt_ctx` is `Some` — unlike the
+/// `/Encrypt` dict and the xref table/stream, it carries no exemption in
+/// qpdf: `writeHintStream` calls `setDataKey(hint_id)` before writing the
+/// dict/payload (QPDFWriter.cc:2297), so the emitted `/Length` reflects the
+/// *encrypted* byte count. `new_ref` (the hint stream's own reserved object
+/// number) is always distinct from `ctx.encrypt_ref` — the `/Encrypt` dict's
+/// slot is reserved by inserting immediately before the (then-current) hint
+/// slot and shifting the latter by one (`RenumberMap::reserve_encrypt_dict_slot`)
+/// — so no self-skip check is needed here, unlike [`append_object`] and
+/// [`append_body_object`].
+///
+/// `hint_stream_aes_iv` is the single AES IV [`write_linearized`] draws once
+/// per invocation and passes to every call this function makes across the
+/// whole convergence loop (probe passes and the final pass alike), via
+/// [`crate::writer::encrypt_stream_payload_with_iv`] rather than
+/// [`crate::writer::encrypt_stream_payload_for_writer`] (which would draw a
+/// fresh IV on every call). This mirrors qpdf's own architecture: qpdf
+/// encrypts the hint stream exactly once, on its internal linearization
+/// "pass 1", and replays those exact bytes (`writeBuffer(hint_buffer)`) on
+/// "pass 2" without re-invoking `writeHintStream` (QPDFWriter.cc:2860-2884,
+/// the `pass == 1`/`else { writeBuffer(hint_buffer) }` split) — one IV per
+/// file for the hint stream, same as every other encrypted object gets one
+/// IV per file. `hint_stream_aes_iv` is unused when `encrypt_ctx` is `None`
+/// or the cipher is RC4 (no IV concept); callers may pass any value in
+/// those cases.
+///
+/// # Why pinning the IV is a defensive alignment with qpdf, not a proven-necessary fix
+///
+/// Every downstream hint-table field this writer patches from a probed pass
+/// (`so_table.header.location`, [`build_outline_hint_table`]'s
+/// `first_object_offset`, and every per-object/per-page length in
+/// [`compute_byte_lengths`]) is computed as either (a) a same-pass offset
+/// *after* the hint stream minus that same pass's `hint_stream_obj_total_len`,
+/// or (b) the difference between two same-pass offsets both after the hint
+/// stream. Both forms cancel the hint stream's own byte length out of the
+/// stored value entirely, so they are safe against a hint stream whose
+/// length varies from pass to pass — **provided** every OTHER object's own
+/// serialized length is pass-invariant, i.e. does not itself depend on that
+/// pass's random IV draws. That precondition holds here: AES-CBC ciphertext
+/// length depends only on plaintext length (PKCS#7 padding, not the IV),
+/// non-hint-stream stream objects use `NewlineBeforeEndstream::Never` (no
+/// IV-dependent framing decision), and AES-encrypted strings are written by
+/// [`crate::object::use_hex_string`]'s content-dependent heuristic, which
+/// forces hex for realistic AES-CBC-with-IV-prefix ciphertext with
+/// overwhelming empirical probability (zero counterexamples in 2,000,000
+/// brute-forced IV trials against a minimal ciphertext) — but this is a
+/// *probabilistic* observation, not a proven guarantee: unlike qpdf, which
+/// unconditionally forces hex for every AES-encrypted string
+/// (`QPDF_String::unparse(true)`, `QPDFWriter.cc:1567-1599`), flpdf's
+/// `use_hex_string` is a content-dependent heuristic applied identically
+/// regardless of encryption method. That gap (tracked separately as
+/// flpdf-a32l, not fixed by this pinning) is the reason the "every OTHER
+/// object has pass-invariant length" precondition above is stated
+/// probabilistically rather than proven. Pinning the hint stream's own IV
+/// removes the ONE source of
+/// pass-to-pass variance this writer's algebraic cancellation does NOT
+/// already absorb regardless of that gap — the hint stream's own conditional
+/// newline-before-`endstream` — and matches qpdf's own "encrypt once, reuse
+/// the bytes" architecture. Note: mutation testing during review found the
+/// accompanying regression tests do not distinguish pinned from unpinned IVs
+/// (the cancellation already holds either way for every fixture tried), so
+/// treat this pinning as a defensive alignment with qpdf's real behavior
+/// rather than as a fix empirically proven necessary for a reproduced
+/// failure.
+#[allow(clippy::too_many_arguments)]
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
@@ -1509,7 +1702,28 @@ fn append_hint_stream_object(
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
     filtered: bool,
-) -> usize {
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    hint_stream_aes_iv: [u8; 16],
+) -> Result<usize> {
+    // Encrypt the payload BEFORE computing the dict prefix, so `/Length`
+    // reflects the on-disk (encrypted) byte count — mirrors qpdf's
+    // `adjustAESStreamLength` call between `setDataKey` and writing `/Length`.
+    let encrypted_payload;
+    let payload: &[u8] = match encrypt_ctx {
+        Some(ctx) => {
+            let mut stream = crate::Stream::new(Dictionary::new(), payload.to_vec());
+            crate::writer::encrypt_stream_payload_with_iv(
+                new_ref,
+                &mut stream,
+                ctx,
+                hint_stream_aes_iv,
+            )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass with encrypt_ctx present.
+            encrypted_payload = stream.data;
+            &encrypted_payload
+        }
+        None => payload,
+    };
+
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
     bytes.extend_from_slice(
@@ -1527,11 +1741,13 @@ fn append_hint_stream_object(
     // The hint payload is FlateDecode output, whose final byte is data-dependent;
     // when it happens to be `\n` (e.g. with an Outlines hint table present) the
     // unconditional newline would add a spurious byte and diverge from qpdf.
+    // The same holds for encrypted output: AES-CBC ciphertext bytes are
+    // effectively random, so the same data-dependent check applies unchanged.
     if payload.last() != Some(&b'\n') {
         bytes.extend_from_slice(b"\n");
     }
     bytes.extend_from_slice(b"endstream\nendobj\n");
-    offset
+    Ok(offset)
 }
 
 /// Loop-invariant inputs for the Outlines Hint Table (qpdf's `c_outline_data`).
@@ -1724,6 +1940,11 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
 /// all-zero array), which is exactly what qpdf's pass-1 buffer contains. The
 /// flag is honoured on the classic (`objstm_layout.is_empty()`) path only; the
 /// caller never sets it for ObjStm-bearing output.
+///
+/// `encrypt_ctx`, when `Some`, is emitted as a plaintext `/Encrypt` indirect
+/// object right after the catalog/open-document-plain objects, in every pass
+/// (qpdf writes it unconditionally on `m->encrypted`, independent of pass
+/// number — see the call site's doc for the qpdf source reference).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn do_write_pass<R: Read + Seek>(
     plan: &LinearizationPlan,
@@ -1745,6 +1966,8 @@ fn do_write_pass<R: Read + Seek>(
     options: &WriteOptions,
     pass1_digest: bool,
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    hint_stream_aes_iv: [u8; 16],
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -1851,6 +2074,7 @@ fn do_write_pass<R: Read + Seek>(
             info_new_ref,
             source_trailer,
             id_writer.as_deref_mut(),
+            encrypt_ctx,
         );
         part1_classic_xref_offset = p1_xref_offset;
         part1_xref_patch = Some(patch);
@@ -1905,10 +2129,12 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             catalog_new_ref,
-            &renumbered,
+            catalog_orig,
+            renumbered,
             options,
             recovered_eol,
-        );
+            encrypt_ctx,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
     }
@@ -1936,7 +2162,15 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            *original_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -1959,6 +2193,28 @@ fn do_write_pass<R: Read + Seek>(
         xref_offsets.insert(container.container_new_num, offset);
     }
 
+    // `/Encrypt` dictionary object (qpdf `writeEncryptionDictionary`, called
+    // from `writeLinearized` right after `part4_end_marker` —
+    // QPDFWriter.cc:2793-2796). Emitted right after the Part-4
+    // (open-document) objects — plain and ObjStm-container — and before the
+    // hint stream, matching qpdf's insertion point. qpdf calls
+    // `writeEncryptionDictionary` unconditionally on `m->encrypted`, on
+    // every pass, so this is not gated on `pass1_digest`. The dict itself is
+    // never encrypted (PDF 1.7 §7.6.1 — a reader must parse it before it can
+    // derive the file key needed to decrypt anything else), so this reuses
+    // the same [`append_object`] every other body object in this function
+    // uses; its `new_ref == ctx.encrypt_ref` self-skip is exactly what keeps
+    // no data key from ever being applied to these bytes.
+    if let Some(ctx) = encrypt_ctx {
+        let offset = append_object(
+            &mut bytes,
+            ctx.encrypt_ref,
+            Object::Dictionary(ctx.encrypt_dict.clone()),
+            encrypt_ctx,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+        xref_offsets.insert(ctx.encrypt_ref.number, offset);
+    }
+
     // Hint stream object.
     //
     // In pass-1-digest mode the hint stream is absent (qpdf reserves its xref
@@ -1977,7 +2233,9 @@ fn do_write_pass<R: Read + Seek>(
             hint_shared_section_offset,
             hint_outline_section_offset,
             structural_streams_filtered,
-        );
+            encrypt_ctx,
+            hint_stream_aes_iv,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
     }
@@ -2009,7 +2267,15 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            *original_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2040,7 +2306,15 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            *original_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2081,7 +2355,15 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+        let offset = append_body_object(
+            &mut bytes,
+            new_ref,
+            *original_ref,
+            renumbered,
+            options,
+            recovered_eol,
+            encrypt_ctx,
+        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2147,8 +2429,15 @@ fn do_write_pass<R: Read + Seek>(
                 let recovered_eol = pdf.recovered_stream_eol(*original_ref);
                 let renumbered =
                     renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-                let offset =
-                    append_body_object(&mut bytes, new_ref, &renumbered, options, recovered_eol);
+                let offset = append_body_object(
+                    &mut bytes,
+                    new_ref,
+                    *original_ref,
+                    renumbered,
+                    options,
+                    recovered_eol,
+                    encrypt_ctx,
+                )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {
@@ -2365,49 +2654,6 @@ fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize 
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Write a complete linearized PDF to an in-memory buffer.
-///
-/// Given a [`LinearizationPlan`] (which partitions all objects into the four
-/// body parts) and a [`RenumberMap`] (which assigns the correct linearized
-/// object numbers), this function:
-///
-/// 1. Emits Part 1: header + linearization param dict (whose object number is
-///    `renumber.param_dict_ref().number` — typically 3 with the qpdf-aligned
-///    slot allocation, never assumed to be 1) with placeholder numeric values,
-///    followed by a one-object xref subsection and trailer.
-/// 2. Emits the hint stream object at `renumber.hint_stream_slot()` (Annex F
-///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
-/// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
-/// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
-/// 5. Emits the remaining body objects (`Plan.part4_objects()` — Annex F Part 5).
-/// 6. Emits the main cross-reference table and trailer (Annex F Part 6).
-///
-/// Uses a convergence loop (max 3 iterations) to ensure the hint stream's
-/// compressed byte length is stable before the final write.
-///
-/// Returns [`LinearizedDocument`] containing both the bytes and the
-/// [`LinearizedOffsets`] needed for back-patching.
-///
-/// With [`WriteOptions::deterministic_id`] the `/ID` is derived from an MD5
-/// over the assembled layout (the same digest feeds every trailer / xref-stream
-/// dict), so the identifier is reproducible across runs for identical input.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
-/// is combined with encrypted output ([`WriteOptions::encrypt`] or
-/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
-/// produced once the bytes are encrypted, so the combination is rejected up
-/// front (the linearized writer emits plaintext only).
-///
-/// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
-/// inconsistent or a layout value does not fit its slot — for example an
-/// object (catalog, page, shared, or body object) has no entry in the
-/// [`RenumberMap`], the plan has no page hints or a `per_page_private_objects`
-/// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
-/// object lacks a probed byte length, or the hint-stream compressed length
-/// fails to converge within the iteration budget.
-///
 /// For each second-half ObjStm batch, return its insertion point among plain
 /// objects so the container lands at its qpdf part/object-key position.
 ///
@@ -2538,6 +2784,221 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     Ok(())
 }
 
+/// Resolved state of the destination Catalog's `/Extensions /ADBE` entry —
+/// gathered in a single Catalog/`/Extensions` resolve pass.
+struct CatalogAdbeStatus {
+    /// Whether an `/ADBE` key exists under `/Extensions`, in ANY form —
+    /// Dictionary or Reference. Matches qpdf's key-existence-based removal
+    /// trigger (QPDFWriter.cc L1387: `keys.count("/ADBE") > 0`), not
+    /// `/ExtensionLevel` validity.
+    has_adbe: bool,
+    /// Whether [`inject_adbe_extension`]/[`strip_adbe_extension`] mutating
+    /// the Catalog in place would silently drop an indirect reference.
+    ///
+    /// The underlying invariant is shape-independent: both helpers replace
+    /// `/Extensions` (when it is itself indirect) or its `/ADBE` entry
+    /// (`extensions.insert("ADBE", ..)` / `extensions.remove("ADBE")`)
+    /// *wholesale*, never incrementally patching a value that was already
+    /// there. So **any** indirect reference reachable anywhere within the
+    /// ORIGINAL `/Extensions` subtree — the `/Extensions` value itself, or
+    /// any dictionary value / array element nested within it at any depth
+    /// (e.g. a direct `/ADBE` dict whose own `/ExtensionLevel` is an
+    /// indirect reference, not just `/ADBE` itself) — loses its only edge
+    /// once the enclosing value is replaced. This field is `true` whenever
+    /// [`collect_direct_refs`] finds at least one [`Object::Reference`]
+    /// anywhere in that subtree; no case-by-case shape enumeration is
+    /// needed or attempted.
+    ///
+    /// `crate::writer::write_pdf_full_rewrite_inner` can absorb any such
+    /// case safely: it mutates the Catalog and THEN builds its
+    /// `CatalogFirstRenumber` from the SAME (now-mutated) handle
+    /// (`writer.rs:3154-3238`), so a dropped object simply never gets a
+    /// slot. [`write_linearized`] cannot: its `plan`/`renumber` are built
+    /// by the CALLER from a SEPARATE `Pdf` handle BEFORE this function ever
+    /// runs (see the doc above the `Optimization::prepare_for_linearized_write`
+    /// call below), so an object dropped this way is already counted in
+    /// that frozen `plan` and would still be walked and emitted — with its
+    /// STALE, now-orphaned, pre-mutation content — a genuine byte
+    /// divergence from qpdf, not a cosmetic one. [`write_linearized`]
+    /// checks this so any such case is rejected loudly (`Unsupported`)
+    /// instead of silently producing wrong bytes.
+    orphans_indirect_object: bool,
+}
+
+/// Resolve [`CatalogAdbeStatus`] for `pdf`'s destination Catalog.
+fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<CatalogAdbeStatus> {
+    const NONE: CatalogAdbeStatus = CatalogAdbeStatus {
+        has_adbe: false,
+        orphans_indirect_object: false,
+    };
+
+    // cov:ignore-start: defensive /Root guard. `write_linearized`'s only
+    // caller context reaches this point with a `plan` whose `root_ref` is
+    // `Some` (`plan.root_ref.ok_or_else(Unsupported)` below, on the SAME
+    // source bytes as `pdf`), so `pdf.root_ref()` is `None` here only for a
+    // caller that deliberately passes a `plan`/`pdf` pair built from
+    // different sources — not exercised by any fixture in this test module.
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(NONE);
+    };
+    // cov:ignore-end
+
+    // Resolve the Catalog once. From within that single borrow: (a)
+    // conservatively scan the ORIGINAL, pre-mutation `/Extensions` value for
+    // ANY indirect reference anywhere in its subtree via `collect_direct_refs`
+    // — reused unchanged from the linearization closure walk, which already
+    // answers exactly this "does this value contain a Reference anywhere"
+    // question for its own edges — and (b) decide `has_adbe` right away if
+    // `/Extensions` is already a direct dict, or extract the ref to resolve
+    // one more level otherwise.
+    let (extensions_ref, orphans_indirect_object) = {
+        let catalog = pdf.resolve_borrowed(root_ref)?;
+        // cov:ignore-start: defensive non-Dict Catalog guard. Every
+        // well-formed fixture that reaches this point (a linearizable
+        // document with a resolved `plan.root_ref`) has a dictionary
+        // Catalog.
+        let Some(catalog_dict) = catalog.as_dict() else {
+            return Ok(NONE);
+        };
+        // cov:ignore-end
+        let Some(raw_extensions) = catalog_dict.get("Extensions") else {
+            return Ok(NONE);
+        };
+
+        // Deliberately conservative and shape-independent: reject on ANY
+        // indirect reference found anywhere in the subtree, even ones that
+        // a finer-grained analysis might prove safe (e.g., for a
+        // Dictionary-shaped /Extensions, an unrelated developer-prefix key
+        // next to /ADBE that would actually survive intact). Reusing the
+        // same "reject the rare/unusual structure loudly" pattern applied
+        // elsewhere in this crate (e.g. the ObjStm+encrypt scope-out)
+        // rather than special-casing which reference positions are
+        // provably safe.
+        let mut refs = Vec::new();
+        collect_direct_refs(raw_extensions, 0, &mut refs)?;
+        let orphans = !refs.is_empty();
+
+        match raw_extensions {
+            Object::Dictionary(d) => {
+                return Ok(CatalogAdbeStatus {
+                    has_adbe: d.get("ADBE").is_some(),
+                    orphans_indirect_object: orphans,
+                });
+            }
+            Object::Reference(r) => (*r, orphans),
+            // /Extensions present but neither Dict nor Ref: structurally
+            // non-conformant per ISO 32000 (which defines /Extensions as a
+            // dictionary), but this scans untrusted input, so it is
+            // handled rather than assumed away. There is no dict to look
+            // `/ADBE` up in, so `has_adbe` is unconditionally `false`;
+            // `orphans` still reflects whatever `collect_direct_refs` found
+            // while walking this value (generic, not hardcoded per shape).
+            // See `linearize_encrypt_v5_rejects_array_extensions_with_indirect_element`.
+            _ => {
+                return Ok(CatalogAdbeStatus {
+                    has_adbe: false,
+                    orphans_indirect_object: orphans,
+                })
+            }
+        }
+    };
+
+    // /Extensions itself is indirect: `orphans_indirect_object` is already
+    // `true` here (collect_direct_refs saw the top-level Reference itself),
+    // regardless of what this resolves to below — a type-agnostic result
+    // that correctly rejects even when the target ISN'T a Dictionary at all,
+    // matching qpdf's own resolve-and-inline behavior (which loses the
+    // reference either way) rather than silently waving through a malformed
+    // target. This second resolve exists purely to compute `has_adbe` by
+    // mirroring qpdf's `keys.count("/ADBE")` on the resolved dict.
+    let extensions = pdf.resolve_borrowed(extensions_ref)?;
+    let has_adbe = extensions
+        .as_dict()
+        .is_some_and(|d| d.get("ADBE").is_some());
+    Ok(CatalogAdbeStatus {
+        has_adbe,
+        orphans_indirect_object,
+    })
+}
+
+/// Write a complete linearized PDF to an in-memory buffer.
+///
+/// Given a [`LinearizationPlan`] (which partitions all objects into the four
+/// body parts) and a [`RenumberMap`] (which assigns the correct linearized
+/// object numbers), this function:
+///
+/// 1. Emits Part 1: header + linearization param dict (whose object number is
+///    `renumber.param_dict_ref().number` — typically 3 with the qpdf-aligned
+///    slot allocation, never assumed to be 1) with placeholder numeric values,
+///    followed by a one-object xref subsection and trailer.
+/// 2. Emits the hint stream object at `renumber.hint_stream_slot()` (Annex F
+///    Part 2). /Size in both trailers is `renumber.len() as u32 + 1`.
+/// 3. Emits the first-page body objects (`Plan.part2_objects` — Annex F Part 3).
+/// 4. Emits the shared/catalog/info objects (`Plan.part3_objects` — Annex F Part 4).
+/// 5. Emits the remaining body objects (`Plan.part4_objects()` — Annex F Part 5).
+/// 6. Emits the main cross-reference table and trailer (Annex F Part 6).
+///
+/// Uses a convergence loop (max 3 iterations) to ensure the hint stream's
+/// compressed byte length is stable before the final write.
+///
+/// Returns [`LinearizedDocument`] containing both the bytes and the
+/// [`LinearizedOffsets`] needed for back-patching.
+///
+/// With [`WriteOptions::deterministic_id`] the `/ID` is derived from an MD5
+/// over the assembled layout (the same digest feeds every trailer / xref-stream
+/// dict), so the identifier is reproducible across runs for identical input.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
+/// is combined with encrypted output ([`WriteOptions::encrypt`] or
+/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
+/// produced once the bytes are encrypted, because the identifier would need to
+/// be known before the file encryption key that protects every string and
+/// stream can be derived (the key derives from `/ID[0]`, PDF 1.7 §7.6.3.3
+/// Algorithm 2). This guard mirrors only that specific restriction — qpdf itself accepts
+/// a *non*-deterministic-id `/ID` alongside encryption (observed on qpdf
+/// 11.9.0: `qpdf --linearize --encrypt "" "" 128 --use-aes=y -- in.pdf
+/// out.pdf` succeeds, while adding `--deterministic-id` to that same command
+/// fails with qpdf's own `QPDFWriter::generateID has no data for
+/// deterministic ID` internal error), so linearize+encrypt on its own is not
+/// rejected by this guard.
+///
+/// Returns [`crate::Error::Unsupported`] when encryption is combined with
+/// object-stream emission (any [`crate::writer::ObjectStreamMode`] that
+/// actually emits ObjStm containers — `Generate`, or `Preserve` on a source
+/// that already carries object streams). This is a temporary flpdf scope
+/// limitation, not a qpdf restriction: qpdf itself supports
+/// linearize+encrypt+object-streams together.
+///
+/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::copy_encryption`]
+/// is set. This is a temporary flpdf scope limitation, not a qpdf
+/// restriction: qpdf itself supports linearize+copy-encryption together.
+/// [`WriteOptions::encrypt`] is not affected by this restriction.
+///
+/// Returns [`crate::Error::Unsupported`] when the effective Adobe developer
+/// extension level (`/Extensions /ADBE /ExtensionLevel` — contributed by
+/// [`WriteOptions::encrypt`]'s method, [`WriteOptions::min_extension_level`],
+/// or the source document itself) would change AND applying that change
+/// would orphan an indirect object: an indirect reference is reachable
+/// anywhere within the source Catalog's `/Extensions` subtree — the
+/// `/Extensions` value itself, or any dictionary value / array element
+/// nested within it at any depth (for example a direct `/ADBE` dict whose
+/// own `/ExtensionLevel` is an indirect reference, not only `/ADBE` itself).
+/// This is a temporary flpdf scope limitation, not a qpdf restriction:
+/// dropping such a reference here would orphan its already-numbered object
+/// slot (this function's object numbering is fixed by its `plan`/`renumber`
+/// parameters before it runs). A source `/Extensions` that is absent, or
+/// contains no indirect reference anywhere in its subtree, is always
+/// handled correctly.
+///
+/// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
+/// inconsistent or a layout value does not fit its slot — for example an
+/// object (catalog, page, shared, or body object) has no entry in the
+/// [`RenumberMap`], the plan has no page hints or a `per_page_private_objects`
+/// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
+/// object lacks a probed byte length, or the hint-stream compressed length
+/// fails to converge within the iteration budget.
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -2555,17 +3016,116 @@ pub fn write_linearized<R: Read + Seek>(
         ));
     }
 
-    // The linearized writer emits plaintext only — it does not implement
-    // encryption. A deterministic `/ID` feeds the encryption key, so a
-    // content-derived `/ID` cannot be computed before the encrypted bytes
-    // exist; qpdf rejects the same combination. Mirror the flat
+    // Finalize the file identifier exactly once here — before the plan/
+    // renumber-map rebuild below, before `Optimization::prepare_for_linearized_write`,
+    // and before the convergence loop — and store it back on the working
+    // trailer. The Part-1 trailer and every split xref/trailer then read this
+    // single value, so one linearized output carries one consistent /ID, and
+    // it stays stable across the up-to-3 convergence iterations.
+    //
+    // Computed this early (rather than just before the convergence loop,
+    // where this block used to sit) so `/ID[0]` is available before the
+    // renumber map is consumed: the file encryption key derives from
+    // `/ID[0]` (PDF 1.7 §7.6.3.3 Algorithm 2), and qpdf itself computes
+    // `/ID` once, early, via `generateID()`'s idempotent guard
+    // (`QPDFWriter::write` calls it before `unparseObject`-ing the trailer).
+    // This computation depends only on `options` and the source trailer's
+    // `/ID`/`/Info` — neither the plan/renumber rebuild nor
+    // `Optimization::prepare_for_linearized_write` below ever mutates the
+    // trailer, so moving it here does not change any output byte for an
+    // existing (non-encrypting) caller.
+    //
+    // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
+    // BEFORE the all-zero placeholder overwrites `/ID` below. `/ID[0]` is the
+    // preserved permanent identifier and the `/Info`-derived suffix feeds the
+    // seed; reading either after the placeholder is installed would mistake the
+    // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
+    let mut source_trailer = pdf.trailer().clone();
+    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
+        if options.deterministic_id {
+            let id0 = crate::writer::source_permanent_id(&source_trailer);
+            let suffix = crate::writer::deterministic_id_info_suffix(pdf);
+            (id0, suffix)
+        } else {
+            (None, Vec::new())
+        };
+    let finalized_id =
+        finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
+    // Extract `/ID[0]` now, before `finalized_id` moves into `source_trailer`,
+    // for `build_encryption_context` below (PDF 1.7 §7.6.3.3 Algorithm 2 uses
+    // `/ID[0]` as a salt, and the trailer's `/ID[0]` must carry the same bytes
+    // so a reader can re-derive the file key). `finalize_linearized_id` always
+    // returns a 2-element string array — every branch (deterministic
+    // placeholder, static-id, default) constructs one — so this is an
+    // internal-invariant check, not a reachable error for well-formed input.
+    //
+    // NOTE: when `options.deterministic_id` is set, this array's element 0 is
+    // an ALL-ZERO PLACEHOLDER (`finalize_linearized_id`'s first branch above),
+    // not real key material — the actual content-derived identifier is only
+    // computed after the bytes exist, and is then either direct-written
+    // (classic path) or back-patched in place (ObjStm/xref-stream path) — see
+    // `finalize_linearized_id`'s doc. `id0` is extracted unconditionally
+    // here, so it CAN transiently hold that placeholder. It is only safe to
+    // feed into `build_encryption_context` below because the
+    // `deterministic_id && encrypting` guard immediately below this block
+    // returns `Err` first whenever both are set — see the `debug_assert!` at
+    // this function's `options.encrypt` consumption site, which restates that
+    // invariant at the point it actually matters.
+    let id0: Vec<u8> = finalized_id
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Object::as_string)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            // cov:ignore-start: unreachable — every branch of finalize_linearized_id
+            // constructs a well-formed 2-element string array (see its own body)
+            crate::Error::Unsupported(
+                "linearization writer: finalize_linearized_id did not return a \
+                 well-formed /ID array"
+                    .to_string(),
+            )
+        })?; // cov:ignore-end
+    source_trailer.insert("ID", finalized_id);
+    let source_trailer = source_trailer;
+
+    // This guard mirrors a real qpdf restriction, not a blanket rejection of
+    // linearize+encrypt — verified empirically against qpdf 11.9.0: `qpdf
+    // --linearize --encrypt "" "" 128 --use-aes=y --` succeeds on its own (a
+    // non-deterministic `/ID` alongside encryption), while adding
+    // `--deterministic-id` to that same command fails with qpdf's own
+    // `QPDFWriter::generateID has no data for deterministic ID` internal
+    // error. The reason is circularity: a deterministic (content-derived)
+    // `/ID` cannot be computed before the encrypted bytes exist, yet the file
+    // encryption key that produces those bytes itself derives from `/ID[0]`
+    // (PDF 1.7 §7.6.3.3 Algorithm 2). Mirror the flat
     // (`crate::writer::write_pdf_full_rewrite`) guard so both write paths
-    // behave identically rather than silently producing a plaintext file with
-    // a deterministic `/ID`.
+    // reject exactly the same combination.
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     if options.deterministic_id && encrypting {
         return Err(crate::Error::Unsupported(
             "the deterministic-id option is incompatible with encrypted output files".to_string(),
+        ));
+    }
+
+    // `--copy-encryption-from` is not yet supported for linearized output. The
+    // donor's `/ID[0]` must become the output `/ID[0]` (Algorithm 2 is pinned
+    // to it — see `CopyEncryptionSource::id0`'s doc), which is the OPPOSITE of
+    // the `--encrypt` case above: there, the id0 finalized just above already
+    // is the single source of truth and only needs to be threaded into the
+    // context builder. For a donor, `finalize_linearized_id` would need to
+    // learn the donor's id0 (and its exact byte width, which is unconstrained
+    // — see `CopyEncryptionSource::id0`) BEFORE computing `/ID`, so the width
+    // is settled before the two-pass probe loop below runs. That change
+    // belongs where `/ID` is finalized above, not here. This is a temporary
+    // flpdf implementation gap, not a qpdf restriction — qpdf's own
+    // QPDFWriter supports linearize + copy-encryption together. Reject the
+    // combination rather than build a context whose id0 provably cannot be
+    // reconciled with the already-finalized `/ID` above.
+    if options.copy_encryption.is_some() {
+        return Err(crate::Error::Unsupported(
+            "linearize+copy-encryption-from is not yet supported; use --encrypt \
+             directly, or file a follow-up if you need both"
+                .to_string(),
         ));
     }
 
@@ -2657,6 +3217,18 @@ pub fn write_linearized<R: Read + Seek>(
     // unchanged.
     // ------------------------------------------------------------------
     let resolved_batch_plan = ObjStmLayout::resolve_batches(plan, pdf, options)?;
+
+    // Whether this write schedules any ObjStm container/member relocation —
+    // true for Generate (always builds fresh containers) or for Preserve on a
+    // source that already carries object streams; always false for Disable
+    // and for Preserve on an ObjStm-free source. Computed once here (and
+    // reused below both by the encrypt guard and by the 1.5 version floor)
+    // from the writer-filtered batch plan, so it reflects every path that can
+    // make a batch non-empty, not just `ObjectStreamMode::Generate`.
+    let emits_object_streams = !resolved_batch_plan.open_document_batches.is_empty()
+        || !resolved_batch_plan.part3_batches.is_empty()
+        || !resolved_batch_plan.part4_batches.is_empty();
+
     let mut local_renumber = renumber.clone();
     // Per Part-4 batch, the second-half plain object after which its container is
     // emitted (its part-group's last plain object) so each second-half container
@@ -2718,25 +3290,210 @@ pub fn write_linearized<R: Read + Seek>(
     // the first half (qpdf packs the first-page shared dicts + /Pages tree +
     // /Info there); Part-4 batches are interleaved among the second-half
     // objects at their part position.
-    let relocation = local_renumber.place_objstm_members_per_half(
-        &resolved_batch_plan.open_document_batches,
-        &resolved_batch_plan.part3_batches,
-        &part4_members,
-        &second_half_anchors,
-        &second_half_post_plain,
-        &first_half_post_plain,
-    );
+    //
+    // Unlike the `deterministic_id && encrypting` guard above (which mirrors
+    // a restriction qpdf itself enforces — verified empirically, see
+    // flpdf-txag's design), this one does NOT mirror any qpdf restriction:
+    // qpdf's own QPDFWriter supports linearize+encrypt+ObjStm together. This
+    // is a temporary flpdf implementation gap, not a spec/qpdf constraint —
+    // do not "fix" it by trying to match a nonexistent qpdf behavior.
+    //
+    // linearize+encrypt does not yet implement the ObjStm relocation path:
+    // `RenumberMap::reserve_encrypt_dict_slot` (wired in by a later encrypting
+    // step) and `RenumberMap::place_objstm_members_per_half` are mutually
+    // exclusive — the latter's rebuild loop treats any renumber-map sentinel
+    // it does not recognize (including a reserved `/Encrypt` slot) as
+    // "unexpected" and silently drops it (see `reserve_encrypt_dict_slot`'s
+    // doc comment). Reject the combination and skip the call to
+    // `place_objstm_members_per_half` entirely — rather than merely ordering
+    // it relative to a future `reserve_encrypt_dict_slot` call — so the two
+    // can never coincide in the same execution, regardless of
+    // `ObjectStreamMode` (this also covers `Preserve` on an already-ObjStm
+    // source, not just `Generate`). When `emits_object_streams` is false the
+    // call would have taken `place_objstm_members_per_half`'s own fast path
+    // (leaving the map untouched and returning
+    // [`ObjStmRelocation::default`]), so using that default directly here is
+    // behaviorally identical for every non-rejected combination.
+    let relocation = if emits_object_streams {
+        if encrypting {
+            return Err(crate::Error::Unsupported(
+                "linearize+encrypt does not yet support object streams; use \
+                 --object-streams=disable with --linearize --encrypt, or file a \
+                 follow-up if you need both"
+                    .to_string(),
+            ));
+        }
+        local_renumber.place_objstm_members_per_half(
+            &resolved_batch_plan.open_document_batches,
+            &resolved_batch_plan.part3_batches,
+            &part4_members,
+            &second_half_anchors,
+            &second_half_post_plain,
+            &first_half_post_plain,
+        )
+    } else {
+        ObjStmRelocation::default()
+    };
     let container_numbers = relocation.container_numbers.clone();
+
+    // Build the encryption context and reserve the `/Encrypt` dict's object
+    // slot BEFORE anything below reads `param_dict_ref()`, `hint_stream_slot()`,
+    // or `len()` off `renumber` — `reserve_encrypt_dict_slot` shifts every
+    // already-assigned slot at/after the (old) hint-stream position by one,
+    // and `Part1Bytes::build`, `hint_stream_new_num`, `total_count`, and the
+    // Part-1 dict serialization all read those numbers off the SAME
+    // `local_renumber` this mutates — every one of those reads happens
+    // through the `renumber` shadow assigned right after this block, so
+    // placing the reservation here (rather than scattered at each read site)
+    // covers all of them at once.
+    //
+    // `place_objstm_members_per_half` above is guaranteed NOT to have run
+    // when `encrypting` is true (the `emits_object_streams` guard above
+    // returns `Unsupported` first), so this reservation and that call can
+    // never both touch `local_renumber` — see `reserve_encrypt_dict_slot`'s
+    // doc for why the two are mutually exclusive.
+    //
+    // `existing_max` only feeds `build_encryption_context`'s internal
+    // `existing_max + 1` slot guess. That guess is immediately discarded
+    // below in favor of `reserve_encrypt_dict_slot`'s qpdf-aligned
+    // mid-sequence placement (`ctx.encrypt_ref` is overwritten), so
+    // `existing_max`'s exact value has no other effect on the returned
+    // context — any non-overflowing count is safe here.
+    //
+    // `copy_encryption` is rejected above, so `options.encrypt.is_some()` is
+    // the only way `encrypting` can be true — branch on `options.encrypt`
+    // directly (rather than re-testing `encrypting` and then unwrapping
+    // `options.encrypt` with a defensive error arm that could never
+    // actually trigger).
+    //
+    // `encrypt_ctx` is threaded into every `do_write_pass` call below, which
+    // emits `ctx.encrypt_dict` as a plaintext indirect object right after the
+    // catalog/open-document-plain objects (mirrors qpdf's `writeLinearized`
+    // calling `writeEncryptionDictionary()` right after `part4_end_marker`,
+    // unconditionally on `m->encrypted` — QPDFWriter.cc:2793-2796). Writing
+    // it into the trailer, and applying it to per-object strings/streams, are
+    // later steps that consume this value.
+    let encrypt_ctx: Option<crate::writer::EncryptionContext> =
+        if let Some(params) = options.encrypt.as_ref() {
+            // `id0` (extracted above, before the `deterministic_id &&
+            // encrypting` guard runs) must never be the all-zero placeholder
+            // here: reaching this branch means `options.encrypt.is_some()`,
+            // and the guard above already returns `Err` before this point
+            // whenever `deterministic_id` also holds. Restated here,
+            // self-enforcing, in case a future edit reorders the guard
+            // relative to this block.
+            debug_assert!(
+                !options.deterministic_id,
+                "deterministic_id && encrypting must have already been rejected \
+                 by the guard above `write_linearized`'s /ID finalization — \
+                 reaching here with deterministic_id set would derive the file \
+                 encryption key from an all-zero /ID[0] placeholder"
+            );
+            let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
+                // cov:ignore-start: requires > 2^32 objects — impossible in practice
+                crate::Error::Unsupported(
+                    "linearization writer: object count overflows u32 for /Encrypt slot \
+                     reservation"
+                        .to_string(),
+                )
+            })?; // cov:ignore-end
+                 // Resolve /Metadata up front for --cleartext-metadata support, mirroring
+                 // the full-rewrite writer's own gating (`!params.encrypt_metadata`).
+            let metadata_ref = if params.encrypt_metadata {
+                None
+            } else {
+                crate::writer::resolve_metadata_stream_ref(pdf)
+            };
+            let ctx_result = crate::writer::build_encryption_context(
+                options,
+                params,
+                existing_max,
+                metadata_ref,
+                &id0,
+            );
+            let mut ctx = ctx_result?;
+            ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
+            Some(ctx)
+        } else {
+            None
+        };
+
+    // Draw the hint stream's AES IV once for this whole invocation, reused
+    // for every `append_hint_stream_object` call the convergence loop below
+    // makes (probe passes and the final pass alike) — see that function's
+    // doc for why a fresh-per-call draw would be unsafe. `--static-aes-iv`
+    // keeps using the same fixed test vector every other AES call in this
+    // writer already uses, so that path is byte-for-byte unchanged. When no
+    // AES cipher is in play (RC4, or `encrypt_ctx` is `None`) the value is
+    // never read; `[0u8; 16]` is a harmless placeholder.
+    let hint_stream_aes_iv: [u8; 16] = match &encrypt_ctx {
+        Some(ctx) if ctx.static_aes_iv => crate::pipeline::aes::static_initialization_vector(),
+        Some(ctx) if crate::writer::cipher_needs_aes_iv(ctx.cipher) => {
+            let mut iv = [0u8; 16];
+            // cov:ignore-start: defensive — the OS CSPRNG does not fail on
+            // any platform this crate's test suite runs on; mirrors the
+            // same untested-in-practice getrandom failure arm in
+            // `crate::writer::encrypt_stream_payload_for_writer`.
+            getrandom::getrandom(&mut iv).map_err(|e| {
+                crate::Error::Unsupported(format!(
+                    "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
+                ))
+            })?;
+            // cov:ignore-end
+            iv
+        }
+        _ => [0u8; 16],
+    };
+
     let renumber: &RenumberMap = &local_renumber;
 
     // Floor the header to 1.5 only when the output actually carries an ObjStm
     // container (qpdf raises the minimum on real emission, not on mode). When
     // all batch lists are empty the placement early-returned and no container
     // is written, so the non-ObjStm linearized goldens stay at the 1.2 floor.
-    let emits_object_streams = !resolved_batch_plan.open_document_batches.is_empty()
-        || !resolved_batch_plan.part3_batches.is_empty()
-        || !resolved_batch_plan.part4_batches.is_empty();
-    let eff_version = effective_pdf_version(pdf.version(), options, true, emits_object_streams);
+    //
+    // Adobe developer-extension propagation (qpdf QPDFWriter.cc L1355-1450
+    // `addDeveloperExtension`, and the pairwise `setMinimumPDFVersion`
+    // contributions at L806-815 that give V=5 R=6/R=5 `--encrypt` their
+    // `/Extensions /ADBE /ExtensionLevel` 8/3 floor) — mirrors
+    // `crate::writer::write_pdf_full_rewrite_inner`'s handling
+    // (writer.rs:3154-3238), reusing the SAME pairwise-combine function so
+    // the injected `/BaseVersion` always agrees with the header version
+    // computed from the identical `(eff_version, eff_ext)` pair. `source_ver`
+    // is cloned to an owned `String` first so the borrow-checker sees no
+    // conflict between the immutable `pdf.version()` read and the `&mut self`
+    // `pdf.adobe_extension_level()` call just below it (mirrors the flat
+    // writer's own `source_ver`/`source_ext` locals).
+    let source_ver = pdf.version().to_string();
+    let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+    let (eff_version, eff_ext) =
+        effective_pdf_version_and_ext(&source_ver, source_ext, options, true, emits_object_streams);
+    let adbe_status = resolve_catalog_adbe_status(pdf)?;
+    if eff_ext > 0 || adbe_status.has_adbe {
+        // See `CatalogAdbeStatus::orphans_indirect_object`'s doc for why any
+        // indirect reference reachable anywhere within the source
+        // `/Extensions` subtree is rejected here rather than inlined:
+        // unlike the flat writer, this function's `plan`/`renumber` were
+        // already frozen by the caller from a separate `Pdf` handle before
+        // this point, so dropping such a reference here would orphan its
+        // already-counted slot while still emitting it with stale content.
+        if adbe_status.orphans_indirect_object {
+            return Err(crate::Error::Unsupported(
+                "linearize: a source Catalog /Extensions subtree containing \
+                 an indirect reference (the /Extensions value itself, or \
+                 any nested dictionary value / array element within it) is \
+                 not yet supported when the effective Adobe extension \
+                 level changes; inline /Extensions in the source or file a \
+                 follow-up if you need this combination"
+                    .to_string(),
+            ));
+        }
+        if eff_ext > 0 {
+            inject_adbe_extension(pdf, eff_version, eff_ext)?;
+        } else {
+            strip_adbe_extension(pdf)?;
+        }
+    }
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
     let part1_dict_region = part1.dict_writable_region.clone();
@@ -2929,34 +3686,6 @@ pub fn write_linearized<R: Read + Seek>(
     let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
     let mut current_hint_outline_o = hint_bytes_initial.outline_section_offset_in_uncompressed;
 
-    // Capture the source trailer once; it does not change across iterations.
-    //
-    // Finalize the file identifier exactly once here (before the convergence
-    // loop) and store it back on the working trailer.  The Part-1 trailer and
-    // every split xref/trailer then read this single value, so one linearized
-    // output carries one consistent /ID — and it also stays stable across the
-    // up-to-3 convergence iterations.
-    let mut source_trailer = pdf.trailer().clone();
-
-    // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
-    // BEFORE the all-zero placeholder overwrites `/ID` below. `/ID[0]` is the
-    // preserved permanent identifier and the `/Info`-derived suffix feeds the
-    // seed; reading either after the placeholder is installed would mistake the
-    // 16 zero bytes for a real source `/ID[0]` and corrupt the result.
-    let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
-        if options.deterministic_id {
-            let id0 = crate::writer::source_permanent_id(&source_trailer);
-            let suffix = crate::writer::deterministic_id_info_suffix(pdf);
-            (id0, suffix)
-        } else {
-            (None, Vec::new())
-        };
-
-    let finalized_id =
-        finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
-    source_trailer.insert("ID", finalized_id);
-    let source_trailer = source_trailer;
-
     // ------------------------------------------------------------------
     // Classic deterministic-`/ID`: compute qpdf's content-derived identifier
     // up front, then direct-write it in the final pass (qpdf's 2-pass scheme).
@@ -3001,6 +3730,19 @@ pub fn write_linearized<R: Read + Seek>(
             options,
             true,
             None,
+            // `deterministic_id && encrypting` is rejected earlier in this
+            // function (see the guard right after `/ID` is finalized above),
+            // so this branch (`options.deterministic_id`) and `encrypt_ctx`
+            // being `Some` are mutually exclusive — `encrypt_ctx` is always
+            // `None` here in practice. Threaded through anyway rather than
+            // hardcoding `None`, so this pass-1 buffer stays byte-consistent
+            // with the probe/final passes below if that guard is ever
+            // relaxed.
+            encrypt_ctx.as_ref(),
+            // Pass-1 digest mode never emits the hint stream (`pass1_digest =
+            // true` above), so this value is never read; threaded through
+            // for signature uniformity with the probe/final calls below.
+            hint_stream_aes_iv,
         )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeed on these same inputs, so it cannot introduce a new Err.
             // Whole-buffer digest: a linearized file repeats `/ID` at several
             // sites, so there is no single `[` cutoff; pass the last index as the
@@ -3064,6 +3806,16 @@ pub fn write_linearized<R: Read + Seek>(
             // placeholder is the same fixed width as the final direct-written
             // identifier, so probe offsets match the final pass regardless.
             None,
+            // The `/Encrypt` dict's bytes are fixed (plaintext, no data key)
+            // and identical in every pass, so the probe passes emit it too —
+            // both to get its object's offset/length right for hint
+            // convergence, and because omitting it here would shift every
+            // downstream object's measured offset relative to the final pass.
+            encrypt_ctx.as_ref(),
+            // Reused across every probe pass AND the final pass below — see
+            // `append_hint_stream_object`'s doc for why a fresh-per-call IV
+            // would be unsafe.
+            hint_stream_aes_iv,
         )?;
 
         // ------------------------------------------------------------------
@@ -3539,6 +4291,10 @@ pub fn write_linearized<R: Read + Seek>(
                 options,
                 false,
                 id_writer,
+                encrypt_ctx.as_ref(),
+                // Same IV as every probe pass above — see
+                // `append_hint_stream_object`'s doc.
+                hint_stream_aes_iv,
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;
@@ -4466,6 +5222,91 @@ mod tests {
         }
         pdf.extend_from_slice(
             format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    /// Three pages + a `/Outlines` root, built so the writer's plan populates
+    /// BOTH hint tables the reviewer-flagged bug named: page 0 has its own
+    /// private font (5 0 R, referenced only by page 0, so it stays a
+    /// first-page-private object) while pages 1 and 2 share a DIFFERENT font
+    /// (9 0 R) that page 0 never references — per qpdf's classification, a
+    /// shared object is Part 3 (first half) only when page 0 is among its
+    /// referencing pages; shared *without* page 0 among the referencers goes
+    /// to Part 8 (`part4_other_pages_shared`, second half), which is what
+    /// populates `so_table.header.location`. The empty `/Outlines` dict gives
+    /// `compute_outline_hint_info` a non-empty retained outline set, which
+    /// populates the Outlines Hint Table's `first_object_offset`.
+    fn outlines_and_part8_shared_pdf_bytes() -> Vec<u8> {
+        let content = b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n";
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0usize; 11];
+
+        offs[1] = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Outlines << /Type /Outlines /Count 0 >> >>\nendobj\n",
+        );
+        offs[2] = pdf.len();
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R 10 0 R] /Count 3 >>\nendobj\n",
+        );
+
+        // Page 0: private font 5 0 R, not shared with any other page.
+        offs[3] = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+        );
+        offs[4] = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offs[5] = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        // Page 1: shares font 9 0 R with page 2 (below), never page 0.
+        offs[6] = pdf.len();
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 7 0 R /Resources << /Font << /F2 9 0 R >> >> >>\nendobj\n",
+        );
+        offs[7] = pdf.len();
+        pdf.extend_from_slice(
+            format!("7 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offs[9] = pdf.len();
+        pdf.extend_from_slice(
+            b"9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n",
+        );
+
+        // Page 2: also references the shared font 9 0 R.
+        offs[10] = pdf.len();
+        pdf.extend_from_slice(
+            b"10 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 8 0 R /Resources << /Font << /F2 9 0 R >> >> >>\nendobj\n",
+        );
+        offs[8] = pdf.len();
+        pdf.extend_from_slice(
+            format!("8 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 11\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
         pdf
     }
@@ -5450,9 +6291,16 @@ mod tests {
     }
 
     /// `--deterministic-id` combined with encryption is rejected up front:
-    /// the linearized writer emits plaintext only, and a content-derived `/ID`
-    /// cannot be computed once the bytes are encrypted. Mirrors the flat
-    /// (`write_pdf_full_rewrite`) guard, including its wording.
+    /// a content-derived `/ID` cannot be computed once the bytes are
+    /// encrypted, and the file encryption key itself derives from `/ID[0]`
+    /// (PDF Algorithm 2) — the same restriction qpdf enforces (verified
+    /// empirically: `qpdf --deterministic-id --linearize --encrypt ...`
+    /// fails with qpdf's own `QPDFWriter::generateID` internal error). This
+    /// guard does not mean linearize+encrypt is unsupported in general —
+    /// non-deterministic (default) and `--static-id` `/ID`s combine with
+    /// encryption just fine; see [`write_linearized`]'s `# Errors` section.
+    /// Mirrors the flat (`write_pdf_full_rewrite`) guard, including its
+    /// wording.
     #[test]
     fn deterministic_id_linearized_rejects_encrypt() {
         let mut pdf = open_tiny_pdf();
@@ -5539,6 +6387,2248 @@ mod tests {
             .expect("deterministic-id without encryption must succeed");
     }
 
+    /// The `deterministic_id && encrypting` guard is scoped to exactly that
+    /// combination (mirroring qpdf's real restriction, see the guard's own
+    /// comment). A *non*-deterministic-id encrypting request must not be
+    /// rejected by it — qpdf itself supports `--linearize --encrypt` without
+    /// `--deterministic-id` (verified empirically against qpdf 11.9.0).
+    ///
+    /// The write now succeeds outright (the `/Encrypt` object is emitted at
+    /// its reserved slot — see
+    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`]
+    /// for the dedicated object-placement assertion), so this asserts full
+    /// success directly rather than merely excluding the deterministic-id
+    /// guard's message from an otherwise-unconstrained `Result`.
+    #[test]
+    fn non_deterministic_encrypt_linearize_no_longer_rejected_by_guard() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            // `deterministic_id` left at its default `false`.
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("non-deterministic-id encrypting must not hit the deterministic-id guard");
+    }
+
+    /// `--cleartext-metadata` (`encrypt_metadata: false`) calls
+    /// `crate::writer::resolve_metadata_stream_ref` when building the
+    /// `EncryptionContext`, mirroring the full-rewrite writer's own
+    /// `--cleartext-metadata` gating (`!params.encrypt_metadata`).
+    /// `tiny_pdf_bytes()`'s catalog has no `/Metadata` entry, so this only
+    /// pins that setting the option doesn't change *whether* the write
+    /// succeeds (same as
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
+    /// now that the `/Encrypt` object is actually emitted — see
+    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`]).
+    /// The `Some(metadata_ref)` exemption path's actual effect (leaving the
+    /// `/Metadata` stream in the clear while every other body value is still
+    /// encrypted) is pinned by
+    /// [`linearize_with_encrypt_cleartext_metadata_exempts_only_metadata_stream`],
+    /// which uses a `/Metadata`-bearing fixture.
+    #[test]
+    fn non_deterministic_encrypt_linearize_cleartext_metadata_option_reaches_same_point() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams {
+                encrypt_metadata: false,
+                ..crate::encrypt_setup::EncryptParams::v4_aes128(
+                    b"user".to_vec(),
+                    b"owner".to_vec(),
+                )
+            }),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        write_linearized(&plan, &renumber, &mut pdf2, &opts)
+            .expect("cleartext-metadata must not change whether the write succeeds");
+    }
+
+    /// linearize+encrypt+ObjStm is out of scope for now: the ObjStm
+    /// relocation path (`RenumberMap::place_objstm_members_per_half`) and the
+    /// encrypt-dict slot reservation it will need
+    /// (`RenumberMap::reserve_encrypt_dict_slot`) are mutually exclusive, so
+    /// the combination must be rejected rather than silently mis-encrypted or
+    /// silently linearized without the requested object streams.
+    /// `ObjectStreamMode::Generate` always builds fresh containers regardless
+    /// of the source's own form, so `tiny_pdf_bytes()` (no source ObjStm)
+    /// still reliably produces a non-empty batch here — see
+    /// `deterministic_id_linearized_all_ids_match`, which pins the same
+    /// fixture+mode pair to the xref-stream output shape.
+    ///
+    /// Asserts the exact rejection message (not just the `Unsupported`
+    /// variant): `write_linearized` has several other `Unsupported` exits
+    /// upstream and downstream of this guard (missing `/Root`, xref/renumber
+    /// inconsistencies, …), so a loose variant-only match could pass for the
+    /// wrong reason if this fixture ever tripped one of those instead.
+    #[test]
+    fn objstm_encrypt_linearize_combination_is_unsupported() {
+        let mut pdf = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, true).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("does not yet support object streams")),
+            "got {err:?}"
+        );
+    }
+
+    /// `--copy-encryption-from` combined with linearization is rejected: the
+    /// donor's `/ID[0]` must become the output's `/ID[0]` (Algorithm 2 is
+    /// pinned to it, see `CopyEncryptionSource::id0`'s doc), which conflicts
+    /// with `/ID` already being finalized at a fixed width before this guard
+    /// runs — required for the two-pass probe loop's offset stability. See
+    /// the guard's own comment (right after the `deterministic_id &&
+    /// encrypting` guard) for the full reasoning. Mirrors
+    /// `objstm_encrypt_linearize_combination_is_unsupported`'s style: assert
+    /// the exact message, since `write_linearized` has several other
+    /// `Unsupported` exits that a loose variant-only match could mask.
+    #[test]
+    fn copy_encryption_linearize_combination_is_unsupported() {
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = open_tiny_pdf();
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("linearize+copy-encryption-from is not yet supported")),
+            "got {err:?}"
+        );
+    }
+
+    /// Building the `/Encrypt` object's `EncryptionContext`, reserving its
+    /// object slot, and emitting its bytes for linearized output
+    /// (non-deterministic `/ID`, no object streams). Before this task the
+    /// slot was reserved but never emitted, so `write_linearized` failed its
+    /// own Part-1 xref consistency check (`crate::Error::Unsupported("Part-1
+    /// xref: covered object N has no offset …")`, see
+    /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`]'s
+    /// doc for the pre-emission history). Now that the object is emitted at
+    /// its reserved slot, `write_linearized` succeeds outright: this test
+    /// pins BOTH that the write no longer errors AND that the reserved
+    /// object number (`renumber.hint_stream_slot()` before reservation —
+    /// see [`RenumberMap::reserve_encrypt_dict_slot`]'s doc for why that
+    /// equals the assigned `/Encrypt` object number for this ObjStm-free
+    /// fixture) carries the `/Encrypt` dictionary specifically, not merely
+    /// that `/Filter /Standard` appears somewhere in the output. It also
+    /// pins the trailer wiring: the first-page (Part-1) trailer carries
+    /// `/Encrypt {N} 0 R` right after `/ID` (qpdf `writeTrailer`,
+    /// QPDFWriter.cc:1224-1231 — the reference is written for every trailer
+    /// form except `t_lin_second`, the main/second-half trailer), and the
+    /// main trailer at EOF carries no `/Encrypt` at all — checked both by
+    /// scanning the main trailer's own bytes and by confirming `/Encrypt`
+    /// appears exactly once across the whole output. Verified empirically
+    /// against qpdf 11.9.0 (`qpdf --linearize --static-id --static-aes-iv
+    /// --encrypt "" "" 128 --use-aes=y`), which produces the same `/ID [...]
+    /// /Encrypt N 0 R >>` sequence in its first-page trailer. Per-object
+    /// string/stream encryption (Task 8) remains separate follow-up work.
+    #[test]
+    fn linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number() {
+        // Independently recompute the object number `write_linearized` will
+        // assign to `/Encrypt`, from the same plan/renumber construction
+        // `linearize_with` performs internally on the same source bytes.
+        // `RenumberMap::reserve_encrypt_dict_slot` (invoked inside
+        // `write_linearized` on its own clone of an equivalent map) always
+        // returns `ObjectRef::new(hint_stream_slot(), 0)` — reading
+        // `hint_stream_slot()` here, before any reservation, gives the same
+        // number without duplicating the reservation call itself. No ObjStm
+        // relocation runs for this fixture (`tiny_pdf_bytes()` carries no
+        // source ObjStm and the default `ObjectStreamMode` is a no-op on an
+        // ObjStm-free source), so nothing shifts `hint_stream_slot()` between
+        // this computation and `write_linearized`'s internal one.
+        let mut pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let expected_encrypt_num = renumber.hint_stream_slot();
+
+        let out = linearize_with(&tiny_pdf_bytes(), |o| {
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        // Locate "<N> 0 obj" for the reserved number, then confirm
+        // /Filter /Standard (the /Encrypt dict qpdf always includes) appears
+        // inside THAT object's body (before its own "endobj"), not just
+        // somewhere in the file. Every object header in this writer is
+        // preceded by a newline (`append_object` emits "\nendobj\n" for the
+        // prior object, or a trailer/xref section ends in "\n"), so search
+        // for "\n<N> 0 obj" rather than "<N> 0 obj" alone — an unprefixed
+        // search for e.g. "4 0 obj" would also match inside "14 0 obj" /
+        // "24 0 obj" for larger fixtures.
+        let header = format!("\n{expected_encrypt_num} 0 obj");
+        let header_pos = out
+            .windows(header.len())
+            .position(|w| w == header.as_bytes())
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the assertion below would
+                // fail — the object header is always found once Task 6's
+                // emission is correct, which is the state under test.
+                panic!("expected \"{header}\" (the reserved /Encrypt object header) in output")
+                // cov:ignore-end
+            })
+            + 1;
+        let body = &out[header_pos..];
+        let body_end = body
+            .windows(b"endobj".len())
+            .position(|w| w == b"endobj")
+            .unwrap_or(body.len());
+        let object_bytes = &body[..body_end];
+        let needle: &[u8] = b"/Filter /Standard";
+        assert!(
+            object_bytes.windows(needle.len()).any(|w| w == needle),
+            "object {expected_encrypt_num} (the reserved /Encrypt slot) must be the \
+             /Encrypt dictionary (/Filter /Standard), got {:?}",
+            String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Physical placement, not just a number coincidence:
+        // `reserve_encrypt_dict_slot` inserts the `/Encrypt` slot at the OLD
+        // `hint_stream_slot` and shifts the hint stream to `old + 1` (see its
+        // own doc and `reserve_encrypt_dict_slot_inserts_before_hint_and_shifts_it`
+        // in renumber.rs), so the hint stream's new object number is
+        // `expected_encrypt_num + 1` — confirm ITS header appears physically
+        // after the `/Encrypt` object's header, pinning the qpdf insertion
+        // point (right after Part-4/open-document objects, before the hint
+        // stream — QPDFWriter.cc:2793-2796) in file byte order, not just
+        // object-number order.
+        let hint_header = format!("\n{} 0 obj", expected_encrypt_num + 1);
+        let hint_header_pos = out
+            .windows(hint_header.len())
+            .position(|w| w == hint_header.as_bytes())
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the assertion below would
+                // fail — the hint stream header is always found once Task 6's
+                // emission is correct, which is the state under test.
+                panic!("expected hint stream header \"{hint_header}\" in output")
+                // cov:ignore-end
+            })
+            + 1;
+        assert!(
+            hint_header_pos > header_pos,
+            "hint stream object {} must appear physically after the /Encrypt \
+             object {expected_encrypt_num} in the output",
+            expected_encrypt_num + 1 // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Trailer wiring (Task 7): the classic path emits two `trailer <<`
+        // sections — the Part-1 first-page trailer, then the main (Part-6)
+        // trailer at EOF. `/Encrypt` belongs in the first only.
+        let trailer_needle: &[u8] = b"trailer << ";
+        let first_trailer_pos = out
+            .windows(trailer_needle.len())
+            .position(|w| w == trailer_needle)
+            .expect("classic linearized output must have a Part-1 trailer");
+        let second_trailer_pos = out[first_trailer_pos + trailer_needle.len()..]
+            .windows(trailer_needle.len())
+            .position(|w| w == trailer_needle)
+            .map(|p| p + first_trailer_pos + trailer_needle.len())
+            .expect("classic linearized output must have a main (Part-6) trailer");
+
+        let first_trailer = &out[first_trailer_pos..second_trailer_pos];
+        let main_trailer = &out[second_trailer_pos..];
+
+        // qpdf's key order and exact spacing is `/ID` then `/Encrypt`, right
+        // before the dict's closing `>>`: `/ID` is written first, then — for
+        // every `which != t_lin_second` trailer form — ` /Encrypt {objid} 0
+        // R` (QPDFWriter.cc:1224-1231); the dict close follows
+        // unconditionally. Pin the exact byte run observed against qpdf
+        // 11.9.0 (`] /Encrypt 4 0 R >>`, this test's own oracle sample)
+        // rather than just "contains /Encrypt somewhere after /ID": a
+        // substring-only check can't distinguish qpdf's spacing from e.g.
+        // `]/Encrypt N 0 R>>` or extra spaces, which would still be a byte
+        // divergence in this qpdf-byte-identical project.
+        let tail = format!("] /Encrypt {expected_encrypt_num} 0 R >>");
+        assert!(
+            first_trailer
+                .windows(tail.len())
+                .any(|w| w == tail.as_bytes()),
+            "Part-1 trailer must end with qpdf's exact byte run \"{tail}\", got {:?}",
+            String::from_utf8_lossy(first_trailer) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        assert!(
+            !main_trailer
+                .windows(b"/Encrypt".len())
+                .any(|w| w == b"/Encrypt"),
+            "main (Part-6) trailer must NOT contain /Encrypt (qpdf omits it for \
+             t_lin_second), got {:?}",
+            String::from_utf8_lossy(main_trailer) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        let total_encrypt_occurrences = out
+            .windows(b"/Encrypt".len())
+            .filter(|w| *w == b"/Encrypt")
+            .count();
+        assert_eq!(
+            total_encrypt_occurrences, 1,
+            "/Encrypt must appear exactly once in the whole output (the Part-1 \
+             trailer reference); the /Encrypt dictionary object itself never \
+             contains the literal key /Encrypt"
+        );
+    }
+
+    /// Build a linearizable single-page PDF with a page content stream (raw
+    /// `content` bytes, no `/Filter`) and an `/Info` dictionary carrying a
+    /// `/Producer` string — the two distinct kinds of body data Task 8 must
+    /// encrypt: a stream payload and a dictionary string.
+    fn tiny_pdf_with_content_and_producer(content: &[u8], producer: &[u8]) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"5 0 obj\n<< /Producer (");
+        pdf.extend_from_slice(producer);
+        pdf.extend_from_slice(b") >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Resolve `/Info /Producer` and the (single) page's `/Contents` stream
+    /// payload — the two body values [`tiny_pdf_with_content_and_producer`]
+    /// plants, read back through the ordinary `Pdf` reader API (which
+    /// transparently decrypts when opened with the right password).
+    fn resolve_producer_and_content<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
+        let info_ref = match rt.trailer().get("Info") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+        };
+        let producer = match rt.resolve(info_ref).expect("resolve /Info") {
+            Object::Dictionary(d) => match d.get("Producer") {
+                Some(Object::String(s)) => s.clone(),
+                other => panic!("/Producer must be a string, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+            },
+            other => panic!("/Info must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+        };
+
+        let root_ref = rt.root_ref().expect("root_ref");
+        let pages_ref = match rt.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get("Pages") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+        };
+        let page_ref = match rt.resolve(pages_ref).expect("resolve /Pages") {
+            Object::Dictionary(d) => match d.get("Kids") {
+                Some(Object::Array(kids)) => match kids.first() {
+                    Some(Object::Reference(r)) => *r,
+                    other => panic!("Kids[0] must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+                },
+                other => panic!("/Kids must be an array, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+            },
+            other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+        };
+        let contents_ref = match rt.resolve(page_ref).expect("resolve page") {
+            Object::Dictionary(d) => match d.get("Contents") {
+                Some(Object::Reference(r)) => *r,
+                other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+            },
+            other => panic!("page must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+        };
+        let content = match rt.resolve(contents_ref).expect("resolve /Contents") {
+            Object::Stream(s) => s.data,
+            other => panic!("/Contents must be a stream, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
+        };
+        (producer, content)
+    }
+
+    /// Task 8: `append_object`/`append_body_object` must actually encrypt
+    /// every body object's strings and stream payloads, not merely leave a
+    /// plaintext document underneath a declared `/Encrypt` dictionary (Task
+    /// 6) and trailer reference (Task 7). This fixture carries a page
+    /// content stream with a recognizable plaintext marker and an `/Info
+    /// /Producer` string: both must be absent from the raw output bytes once
+    /// encrypted, and — the actual security property, not just
+    /// "ciphertext-shaped bytes appeared" — both must round-trip back to
+    /// their exact original plaintext when the output is reopened with the
+    /// correct password.
+    #[test]
+    fn linearize_with_encrypt_body_strings_and_streams_are_ciphertext() {
+        let marker: &[u8] = b"BT /F1 12 Tf (flpdf linearize-encrypt content marker) Tj ET\n";
+        let producer: &[u8] = b"flpdf linearize-encrypt producer marker";
+        let src = tiny_pdf_with_content_and_producer(marker, producer);
+
+        // Sanity/premise: with stream_data = Uncompress (no re-encoding) and
+        // NO encryption, the content stream's raw bytes carry the marker
+        // verbatim. This proves the fixture would actually leak plaintext if
+        // encryption were a no-op, so the negative assertion below is
+        // meaningful (not merely hidden by compression).
+        let unencrypted = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+        });
+        assert!(
+            unencrypted.windows(marker.len()).any(|w| w == marker),
+            "test premise: unencrypted output must carry the plaintext marker verbatim"
+        );
+
+        // Empty user password (qpdf's `--encrypt "" "" 128` convention, also
+        // used by this file's other `/Encrypt`-emission tests): lets
+        // `check_linearization_bytes` below — which opens with no password —
+        // and the explicit reopen further down both decrypt transparently.
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        assert!(
+            !out.windows(marker.len()).any(|w| w == marker),
+            "content stream plaintext leaked into encrypted linearized output"
+        );
+        assert!(
+            !out.windows(producer.len()).any(|w| w == producer),
+            "/Info /Producer plaintext leaked into encrypted linearized output"
+        );
+
+        // The /Encrypt dictionary itself must stay plaintext (Task 6): the
+        // reader has to parse it before it can derive the file key.
+        let standard_needle: &[u8] = b"/Filter /Standard";
+        assert!(
+            out.windows(standard_needle.len())
+                .any(|w| w == standard_needle),
+            "/Encrypt dictionary must remain plaintext"
+        );
+
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("encrypted linearized output must still pass the linearization checker");
+
+        // The real security property: reopening (with the empty user
+        // password) decrypts BOTH the string and the stream back to their
+        // exact original plaintext (proves the xref table itself also
+        // stayed plaintext and correctly locates every object — a garbled
+        // or encrypted xref table would fail this reopen outright).
+        let mut reopened =
+            Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
+                .expect("re-open of encrypted linearized output with the empty user password");
+        let (decrypted_producer, decrypted_content) = resolve_producer_and_content(&mut reopened);
+        assert_eq!(
+            decrypted_producer, producer,
+            "/Info /Producer must decrypt back to its original plaintext"
+        );
+        assert_eq!(
+            decrypted_content, marker,
+            "content stream must decrypt back to its original plaintext"
+        );
+    }
+
+    /// Task 11: every prior test in this module (Tasks 6-10) only exercised
+    /// `EncryptMethod::V4Aes128`. V=5 R=6 AES-256 takes a genuinely
+    /// different code path through `crate::writer::build_encryption_context`
+    /// — `WriteCipher::FileKeyAes256` uses the 32-byte file key directly for
+    /// every object, with no per-object Algorithm-1 derivation and no
+    /// `/ID[0]` dependency (unlike V=4's `WriteCipher::PerObject`; see
+    /// `WriteCipher`'s own doc) — so this proves the linearized writer's
+    /// generic dispatch on `EncryptParams::method` actually reaches that
+    /// path, not just that V=4 works.
+    ///
+    /// Assertion style mirrors two existing precedents: the on-disk
+    /// `/Encrypt` dict shape check follows
+    /// `linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`
+    /// (locate the reserved object, inspect its raw bytes); the correctness
+    /// gate follows `crate::writer::tests::v5_r6_encrypt_round_trips_string_and_stream_via_reader`
+    /// — V=5's random salts + FEK give no byte-identical determinism to
+    /// assert, so password round-trip decryption is the real proof.
+    #[test]
+    fn linearize_with_v5_r6_aes256_encrypts_and_round_trips() {
+        let content_marker: &[u8] = b"BT /F1 12 Tf (flpdf v5r6 linearize content marker) Tj ET\n";
+        let producer_marker: &[u8] = b"flpdf v5r6 linearize producer marker";
+        let src = tiny_pdf_with_content_and_producer(content_marker, producer_marker);
+
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let expected_encrypt_num = renumber.hint_stream_slot();
+
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        // Premise (verified for this same fixture shape by the V=4 sibling
+        // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`,
+        // which asserts the marker DOES appear verbatim in unencrypted
+        // output under the same `stream_data = Uncompress`): these negative
+        // checks are supplementary, not load-bearing — the round-trip
+        // decrypt below is the actual correctness proof.
+        assert!(
+            !out.windows(content_marker.len())
+                .any(|w| w == content_marker),
+            "content stream plaintext leaked into V=5 R=6 encrypted linearized output"
+        );
+        assert!(
+            !out.windows(producer_marker.len())
+                .any(|w| w == producer_marker),
+            "/Info /Producer plaintext leaked into V=5 R=6 encrypted linearized output"
+        );
+
+        let encrypt_object_bytes = find_object_bytes(&out, expected_encrypt_num);
+        for needle in [
+            b"/V 5".as_slice(),
+            b"/R 6".as_slice(),
+            b"/CFM /AESV3".as_slice(),
+        ] {
+            assert!(
+                encrypt_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=6 /Encrypt dict must contain {needle:?}"
+            );
+        }
+
+        // V=5 R=6 floors the Adobe developer extension level to 8 at
+        // `/Extensions /ADBE /ExtensionLevel` on the CATALOG (qpdf
+        // QPDFWriter.cc L806-808's `setMinimumPDFVersion("1.7", 8)`,
+        // L1355-1450's `addDeveloperExtension` — verified byte-identical
+        // against real qpdf 11.9.0's `--linearize --encrypt "" owner 256
+        // --static-id --static-aes-iv --` output for this exact fixture
+        // shape). This was flpdf-txag's Task 11 review-found gap:
+        // `write_linearized` wired the header-version half
+        // (`effective_pdf_version`) but never the Catalog-injection half
+        // that `crate::writer::write_pdf_full_rewrite_inner` already had
+        // (writer.rs:3154-3238).
+        let catalog_new_ref = renumber
+            .new_for_original(plan.root_ref.expect("plan has root_ref"))
+            .expect("catalog must be in the renumber map");
+        let catalog_object_bytes = find_object_bytes(&out, catalog_new_ref.number);
+        for needle in [
+            b"/Extensions".as_slice(),
+            b"/ADBE".as_slice(),
+            b"/BaseVersion /1.7".as_slice(),
+            b"/ExtensionLevel 8".as_slice(),
+        ] {
+            assert!(
+                catalog_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=6 Catalog must contain {needle:?}"
+            );
+        }
+
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("V=5 R=6 encrypted linearized output must pass the linearization checker");
+
+        for pw in [b"".as_slice(), b"owner".as_slice()] {
+            let mut reopened = Pdf::open_with_options(
+                Cursor::new(out.clone()),
+                crate::PdfOpenOptions {
+                    password: pw.to_vec(),
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| {
+                // cov:ignore-start: only reached if the reopen fails — the
+                // property under test is that it always succeeds for a
+                // correctly encrypted V=5 R=6 output.
+                panic!("re-open of V=5 R=6 linearized output with password {pw:?} failed: {e}")
+                // cov:ignore-end
+            });
+            let (producer, content) = resolve_producer_and_content(&mut reopened);
+            assert_eq!(
+                producer, producer_marker,
+                "V=5 R=6 /Info /Producer must decrypt back to its original plaintext"
+            );
+            assert_eq!(
+                content, content_marker,
+                "V=5 R=6 content stream must decrypt back to its original plaintext"
+            );
+        }
+    }
+
+    /// As [`linearize_with_v5_r6_aes256_encrypts_and_round_trips`], but for
+    /// V=5 R=5 (deprecated pre-ISO 32000-2 AES-256, `EncryptParams::v5_r5`,
+    /// selected by `--force-R5`). R=5 shares V=5's `WriteCipher::
+    /// FileKeyAes256` code path with R=6 (only the password-hash algorithm
+    /// and the `/R` value differ — see `build_v5_r5_encrypt_dict`'s doc), so
+    /// this is not a redundant re-run of the R=6 case: it is R=5's own
+    /// weak-crypto reader gate (`revision == 5`,
+    /// `PdfOpenOptions::allow_weak_crypto`) that needs its own coverage,
+    /// mirroring `crate::writer::tests::v5_r5_encrypt_round_trips_string_and_stream_via_reader`.
+    /// `check_linearization_bytes` opens with the reader's default options
+    /// (weak crypto disallowed), so the linearization-checker step here opens
+    /// its own `Pdf` with `allow_weak_crypto: true` and calls
+    /// `check_linearization` directly instead.
+    #[test]
+    fn linearize_with_v5_r5_aes256_encrypts_and_round_trips() {
+        let content_marker: &[u8] = b"BT /F1 12 Tf (flpdf v5r5 linearize content marker) Tj ET\n";
+        let producer_marker: &[u8] = b"flpdf v5r5 linearize producer marker";
+        let src = tiny_pdf_with_content_and_producer(content_marker, producer_marker);
+
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let expected_encrypt_num = renumber.hint_stream_slot();
+
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v5_r5(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        // See the R=6 sibling test's identical comment: the premise (marker
+        // appears verbatim under stream_data = Uncompress with no
+        // encryption) is verified by
+        // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
+        // on the same fixture shape; these negative checks are
+        // supplementary, the round-trip decrypt below is load-bearing.
+        assert!(
+            !out.windows(content_marker.len())
+                .any(|w| w == content_marker),
+            "content stream plaintext leaked into V=5 R=5 encrypted linearized output"
+        );
+        assert!(
+            !out.windows(producer_marker.len())
+                .any(|w| w == producer_marker),
+            "/Info /Producer plaintext leaked into V=5 R=5 encrypted linearized output"
+        );
+
+        let encrypt_object_bytes = find_object_bytes(&out, expected_encrypt_num);
+        for needle in [
+            b"/V 5".as_slice(),
+            b"/R 5".as_slice(),
+            b"/CFM /AESV3".as_slice(),
+        ] {
+            assert!(
+                encrypt_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=5 /Encrypt dict must contain {needle:?}"
+            );
+        }
+
+        // V=5 R=5 floors the Adobe developer extension level to 3 (qpdf
+        // QPDFWriter.cc L806-808's `setMinimumPDFVersion("1.7", 3)`) — see
+        // the R=6 sibling test's identical comment for the full citation and
+        // the real-qpdf byte-identical verification this mirrors.
+        let catalog_new_ref = renumber
+            .new_for_original(plan.root_ref.expect("plan has root_ref"))
+            .expect("catalog must be in the renumber map");
+        let catalog_object_bytes = find_object_bytes(&out, catalog_new_ref.number);
+        for needle in [
+            b"/Extensions".as_slice(),
+            b"/ADBE".as_slice(),
+            b"/BaseVersion /1.7".as_slice(),
+            b"/ExtensionLevel 3".as_slice(),
+        ] {
+            assert!(
+                catalog_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=5 Catalog must contain {needle:?}"
+            );
+        }
+
+        let mut checker_pdf = Pdf::open_with_options(
+            Cursor::new(out.clone()),
+            crate::PdfOpenOptions {
+                allow_weak_crypto: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("re-open with the empty user password + allow_weak_crypto for the checker");
+        crate::linearization::check_linearization(&mut checker_pdf, &out)
+            .expect("V=5 R=5 encrypted linearized output must pass the linearization checker");
+
+        for pw in [b"".as_slice(), b"owner".as_slice()] {
+            let mut reopened = Pdf::open_with_options(
+                Cursor::new(out.clone()),
+                crate::PdfOpenOptions {
+                    password: pw.to_vec(),
+                    allow_weak_crypto: true,
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| {
+                // cov:ignore-start: only reached if the reopen fails — the
+                // property under test is that it always succeeds for a
+                // correctly encrypted V=5 R=5 output.
+                panic!("re-open of V=5 R=5 linearized output with password {pw:?} failed: {e}")
+                // cov:ignore-end
+            });
+            let (producer, content) = resolve_producer_and_content(&mut reopened);
+            assert_eq!(
+                producer, producer_marker,
+                "V=5 R=5 /Info /Producer must decrypt back to its original plaintext"
+            );
+            assert_eq!(
+                content, content_marker,
+                "V=5 R=5 content stream must decrypt back to its original plaintext"
+            );
+        }
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as an
+    /// INDIRECT reference (object 4) to `<< /ADBE << /BaseVersion /1.6
+    /// /ExtensionLevel 2 >> >>` — the scope-out case
+    /// [`resolve_catalog_adbe_status`] rejects (top-level `/Extensions`
+    /// indirection).
+    fn tiny_pdf_with_indirect_extensions_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /ADBE << /BaseVersion /1.6 /ExtensionLevel 2 >> >>\nendobj\n",
+        );
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Task 11 review fix: a source Catalog `/Extensions` stored as an
+    /// indirect reference must be rejected loudly, not silently inlined —
+    /// see [`CatalogAdbeStatus::orphans_indirect_object`]'s doc for why
+    /// (this function's `plan`/`renumber` are already frozen from a
+    /// separate `Pdf` handle by the time this runs, unlike
+    /// `crate::writer::write_pdf_full_rewrite_inner`, which mutates the
+    /// Catalog before its OWN renumbering). V=5 R=6 encryption's ext-8
+    /// floor (`eff_ext > 0`) is what makes this fixture actually need to
+    /// touch `/Extensions` at all — a non-encrypting linearize of the same
+    /// fixture takes neither the inject nor the reject branch, since its
+    /// own ext(2)-vs-source(2) pairwise result never changes.
+    #[test]
+    fn linearize_encrypt_v5_rejects_indirect_source_extensions() {
+        let src = tiny_pdf_with_indirect_extensions_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as a
+    /// DIRECT dictionary, but whose `/ADBE` entry WITHIN that dictionary is
+    /// itself an INDIRECT reference (object 4) to `<< /BaseVersion /1.6
+    /// /ExtensionLevel 2 >>` — the nested-indirection scope-out case
+    /// [`resolve_catalog_adbe_status`] rejects. Unlike
+    /// [`tiny_pdf_with_indirect_extensions_bytes`], `/Extensions` itself
+    /// never moves; only its `/ADBE` entry does.
+    fn tiny_pdf_with_indirect_adbe_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE 4 0 R >> >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n<< /BaseVersion /1.6 /ExtensionLevel 2 >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Code-quality review follow-up to the previous fix: the top-level
+    /// indirect-`/Extensions` guard alone missed a case one level deeper.
+    /// `inject_adbe_extension`/`strip_adbe_extension` both unconditionally
+    /// overwrite (`extensions.insert("ADBE", ..)`) or remove
+    /// (`extensions.remove("ADBE")`) the `/ADBE` entry without ever
+    /// resolving the OLD value first — so a DIRECT `/Extensions` dict whose
+    /// `/ADBE` entry is itself an indirect reference orphans that object
+    /// exactly the same way a top-level indirect `/Extensions` does, even
+    /// though `/Extensions` itself never moves. Before the fix this
+    /// combination silently succeeded, injecting the correct new
+    /// `/Extensions` while ALSO leaving a dangling orphaned body object
+    /// behind — a genuine byte/structural divergence from real qpdf, which
+    /// never enqueues that object in the first place (mutate-then-renumber
+    /// on one handle). Mirrors
+    /// [`linearize_encrypt_v5_rejects_indirect_source_extensions`], with
+    /// the nested fixture in place of the top-level one.
+    #[test]
+    fn linearize_encrypt_v5_rejects_nested_indirect_adbe() {
+        let src = tiny_pdf_with_indirect_adbe_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as an
+    /// INDIRECT reference (object 4) to a value that is NOT a dictionary at
+    /// all — a bare integer. Regression fixture: a top-level indirect
+    /// `/Extensions` must be rejected purely because it is indirect,
+    /// regardless of what it resolves to. `resolve_catalog_adbe_status`
+    /// decides this via `collect_direct_refs` on the UNRESOLVED
+    /// `/Extensions` value (which pushes the reference itself before ever
+    /// resolving it), so a non-Dictionary target is caught exactly like a
+    /// well-formed one — unlike an earlier, now-corrected version of the
+    /// check that resolved first and only flagged the reference when the
+    /// resolved target happened to be a Dictionary.
+    fn tiny_pdf_with_indirect_extensions_to_non_dict_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n42\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Code-quality review follow-up: `resolve_catalog_adbe_status` must
+    /// keep rejecting an indirect `/Extensions` even when the resolved
+    /// target isn't a Dictionary — a prior revision of the check resolved
+    /// the indirect `/Extensions` first and only flagged the orphan risk
+    /// when the resolved value was itself `Some(Dictionary)`, so a
+    /// non-Dictionary target silently fell through as "safe" (worse than
+    /// the ORIGINAL top-level-only check this crate started with, which was
+    /// type-agnostic and rejected on `Object::Reference` alone without
+    /// caring what it resolved to). See
+    /// [`linearize_encrypt_v5_rejects_indirect_source_extensions`] for the
+    /// well-formed sibling of this fixture.
+    #[test]
+    fn linearize_encrypt_v5_rejects_indirect_source_extensions_to_non_dict() {
+        let src = tiny_pdf_with_indirect_extensions_to_non_dict_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as a DIRECT
+    /// dictionary with a DIRECT `/ADBE` dictionary, but whose `/ADBE`
+    /// dictionary carries an `/ExtensionLevel` value that is itself an
+    /// INDIRECT reference (object 4) to `2` — one level deeper than
+    /// [`tiny_pdf_with_indirect_adbe_bytes`], where `/ADBE` itself is the
+    /// indirect entry. Here neither `/Extensions` nor `/ADBE` ever moves;
+    /// only a value nested inside `/ADBE` is indirect.
+    fn tiny_pdf_with_indirect_extension_level_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE \
+              << /BaseVersion /1.6 /ExtensionLevel 4 0 R >> >> >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n2\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Code-quality review follow-up: the top-level-`/Extensions` and
+    /// direct-`/Extensions`-with-indirect-`/ADBE` guards alone still missed
+    /// a case one level deeper still — a fully direct `/Extensions` and
+    /// `/ADBE`, but an indirect VALUE nested inside `/ADBE` (here
+    /// `/ExtensionLevel`). `inject_adbe_extension` replaces the entire
+    /// `/ADBE` dictionary wholesale (`adbe.insert("ExtensionLevel", ..)` on
+    /// a FRESH `Dictionary`, discarding the old one), so this reference is
+    /// orphaned exactly like the shallower cases even though `/Extensions`
+    /// and `/ADBE` both stay direct. `resolve_catalog_adbe_status` now
+    /// catches this — and any further nesting depth — via a single
+    /// shape-independent [`collect_direct_refs`] walk over the whole
+    /// `/Extensions` subtree, rather than a growing list of enumerated
+    /// shapes. Mirrors
+    /// [`linearize_encrypt_v5_rejects_nested_indirect_adbe`], one level
+    /// deeper.
+    #[test]
+    fn linearize_encrypt_v5_rejects_indirect_extension_level() {
+        let src = tiny_pdf_with_indirect_extension_level_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as a DIRECT
+    /// Array (not a Dictionary at all — non-conformant per ISO 32000, which
+    /// defines `/Extensions` as a dictionary) with one element being an
+    /// INDIRECT reference (object 4). Regression fixture for
+    /// `resolve_catalog_adbe_status`'s catch-all match arm (`/Extensions`
+    /// present but neither `Object::Dictionary` nor `Object::Reference`):
+    /// `has_adbe` is unconditionally `false` there (there is no dict to
+    /// look `/ADBE` up in), but `collect_direct_refs` still walks the array
+    /// element and must still flag the nested reference.
+    fn tiny_pdf_with_array_extensions_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions [4 0 R] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n<< /BaseVersion /1.6 /ExtensionLevel 2 >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Code-quality review follow-up: exercises `resolve_catalog_adbe_status`'s
+    /// catch-all match arm (`/Extensions` present but neither `Dictionary`
+    /// nor `Reference`) with a committed fixture, which is what lets the
+    /// coverage-exclusion marker this arm previously carried be dropped. An
+    /// Array-shaped `/Extensions` is non-conformant per ISO 32000
+    /// (`/Extensions` is defined as a dictionary), so real qpdf never has to
+    /// handle this shape from a conforming file; flpdf still rejects the
+    /// indirect reference inside it defensively rather than mis-handling
+    /// untrusted input, which is a flpdf scope limitation, not a parity
+    /// requirement.
+    #[test]
+    fn linearize_encrypt_v5_rejects_array_extensions_with_indirect_element() {
+        let src = tiny_pdf_with_array_extensions_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries a DIRECT `/Extensions`
+    /// dict with a malformed `/ADBE` entry (no `/ExtensionLevel` key at
+    /// all) — qpdf removes `/ADBE` based on key existence, not
+    /// `/ExtensionLevel` validity (QPDFWriter.cc L1387), so this must be
+    /// stripped whenever the effective extension level is 0, even without
+    /// any version race.
+    fn tiny_pdf_with_malformed_direct_extensions_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << >> >> >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Task 11 review fix, the STRIP arm: a non-encrypting linearize (no
+    /// `--min-extension-level`, so the effective extension level is 0) of a
+    /// source whose Catalog already carries a stale/malformed direct
+    /// `/Extensions /ADBE` must have that key removed from the output —
+    /// mirrors `crate::writer::strip_adbe_extension`'s doc and its
+    /// full-rewrite byte-parity precedent, now wired through
+    /// `write_linearized` too.
+    #[test]
+    fn linearize_strips_malformed_direct_source_extensions_when_no_ext_requested() {
+        let src = tiny_pdf_with_malformed_direct_extensions_bytes();
+        let out = linearize_with(&src, |_o| {});
+        let needle: &[u8] = b"/Extensions";
+        assert!(
+            !out.windows(needle.len()).any(|w| w == needle),
+            "stale /Extensions /ADBE (no /ExtensionLevel) must be stripped when no \
+             effective extension level is requested"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output with stripped /Extensions must still pass the linearization checker");
+    }
+
+    /// Build a linearizable single-page PDF whose Catalog carries a
+    /// `/Metadata` XMP stream (raw `metadata_xml` bytes, no `/Filter`) in
+    /// addition to a page content stream (raw `content` bytes) and an
+    /// `/Info /Producer` string — three distinct body values with three
+    /// distinct expected encryption outcomes under `--cleartext-metadata`
+    /// (`encrypt_metadata: false`): the metadata stream must be exempted,
+    /// the content stream and the producer string must not be.
+    fn tiny_pdf_with_metadata_content_and_producer(
+        metadata_xml: &[u8],
+        content: &[u8],
+        producer: &[u8],
+    ) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"5 0 obj\n<< /Producer (");
+        pdf.extend_from_slice(producer);
+        pdf.extend_from_slice(b") >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
+                metadata_xml.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(metadata_xml);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Task 8 follow-up: `--cleartext-metadata` (`encrypt_metadata: false`)
+    /// must exempt ONLY the `/Catalog /Metadata` XMP stream from encryption
+    /// (leaving it in the clear with `/Crypt /Identity` prepended, mirroring
+    /// `crate::writer::write_pdf_full_rewrite`'s `Object::Stream` branch,
+    /// `writer.rs` around line 3826) — every OTHER body string/stream must
+    /// still be encrypted normally. A same-fixture A/B check: the metadata
+    /// marker stays readable, the content-stream marker and the `/Info
+    /// /Producer` string do not.
+    #[test]
+    fn linearize_with_encrypt_cleartext_metadata_exempts_only_metadata_stream() {
+        let metadata_marker: &[u8] = b"<?xpacket flpdf-cleartext-metadata-xml-marker?>";
+        let content_marker: &[u8] =
+            b"BT /F1 12 Tf (flpdf cleartext-metadata content marker) Tj ET\n";
+        let producer_marker: &[u8] = b"flpdf cleartext-metadata producer marker";
+        let src = tiny_pdf_with_metadata_content_and_producer(
+            metadata_marker,
+            content_marker,
+            producer_marker,
+        );
+
+        // Empty user password (qpdf's `--encrypt "" "" 128` convention) so
+        // both `check_linearization_bytes` (no-password open) and the
+        // explicit reopen below can decrypt transparently.
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams {
+                encrypt_metadata: false,
+                ..crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
+            });
+        });
+
+        // (a) The exempted /Metadata stream's marker is readable in the raw
+        // output — never ran through the cipher.
+        assert!(
+            out.windows(metadata_marker.len())
+                .any(|w| w == metadata_marker),
+            "cleartext-metadata: the /Metadata XMP stream must stay plaintext, \
+             got {:?}",
+            String::from_utf8_lossy(&out) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // (b) Its dict carries /Crypt /Identity (the exact form
+        // prepend_crypt_filter_to_stream_dict produces for a source with no
+        // prior /Filter: a singleton /Filter /Crypt plus a
+        // /DecodeParms << /Type /CryptFilterDecodeParms /Name /Identity >>),
+        // so a reader knows not to attempt decryption.
+        let crypt_needle: &[u8] = b"/Filter /Crypt";
+        assert!(
+            out.windows(crypt_needle.len()).any(|w| w == crypt_needle),
+            "cleartext-metadata: /Metadata dict must carry /Filter /Crypt"
+        );
+        let identity_needle: &[u8] = b"/Name /Identity";
+        assert!(
+            out.windows(identity_needle.len())
+                .any(|w| w == identity_needle),
+            "cleartext-metadata: /Metadata dict must carry /Name /Identity in /DecodeParms"
+        );
+
+        // (c) Every OTHER body value is still properly encrypted — the
+        // exemption is scoped to metadata_ref alone, not blanket-applied.
+        assert!(
+            !out.windows(content_marker.len())
+                .any(|w| w == content_marker),
+            "cleartext-metadata must not exempt the page content stream"
+        );
+        assert!(
+            !out.windows(producer_marker.len())
+                .any(|w| w == producer_marker),
+            "cleartext-metadata must not exempt the /Info /Producer string"
+        );
+
+        crate::linearization::check_linearization_bytes(&out).expect(
+            "cleartext-metadata linearized output must still pass the linearization checker",
+        );
+
+        // Reader round-trip: the content stream and /Info /Producer decrypt
+        // back to their originals (proving they really were encrypted, not
+        // merely absent-by-coincidence), and the /Metadata stream resolves
+        // to its ORIGINAL bytes too — via the /Crypt /Identity passthrough,
+        // not via decryption (there is nothing to decrypt).
+        let mut reopened =
+            Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
+                .expect(
+                    "re-open of cleartext-metadata linearized output with the empty user password",
+                );
+        let (decrypted_producer, decrypted_content) = resolve_producer_and_content(&mut reopened);
+        assert_eq!(
+            decrypted_producer, producer_marker,
+            "/Info /Producer must decrypt back to its original plaintext"
+        );
+        assert_eq!(
+            decrypted_content, content_marker,
+            "content stream must decrypt back to its original plaintext"
+        );
+
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get_ref("Metadata") {
+                Some(r) => r,
+                None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+        };
+        let metadata_bytes = match reopened.resolve(metadata_ref).expect("resolve /Metadata") {
+            Object::Stream(s) => s.data,
+            other => panic!("/Metadata must be a stream, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+        };
+        assert_eq!(
+            metadata_bytes, metadata_marker,
+            "/Metadata stream must resolve to its original plaintext via /Crypt /Identity"
+        );
+    }
+
+    /// Locate object `number`'s raw byte range in `out` — from its `\n{number}
+    /// 0 obj` header (inclusive) to just before the next `endobj` (exclusive).
+    /// Every object header in this writer is preceded by a newline
+    /// (`append_object`/`append_body_object` emit `\nendobj\n` for the prior
+    /// object, or a trailer/xref section ends in `\n`), so search for
+    /// `\n{number} 0 obj` rather than `{number} 0 obj` alone — an unprefixed
+    /// search for e.g. "4 0 obj" would also match inside "14 0 obj" for
+    /// larger fixtures.
+    fn find_object_bytes(out: &[u8], number: u32) -> &[u8] {
+        let header = format!("\n{number} 0 obj");
+        let header_pos = out
+            .windows(header.len())
+            .position(|w| w == header.as_bytes())
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if a caller's own assertion
+                // would already fail — every well-formed fixture in this
+                // test module produces a findable header for its own refs.
+                panic!("expected \"{header}\" (object {number}'s header) in output")
+                // cov:ignore-end
+            })
+            + 1;
+        let body = &out[header_pos..];
+        let body_end = body
+            .windows(b"endobj".len())
+            .position(|w| w == b"endobj")
+            .unwrap_or(body.len());
+        &body[..body_end]
+    }
+
+    /// Locate object `number`'s start byte OFFSET in `out` (the position of
+    /// its `{number} 0 obj` header). Sibling of [`find_object_bytes`], which
+    /// returns the object's body slice instead of its offset.
+    fn find_object_offset(out: &[u8], number: u32) -> usize {
+        let header = format!("\n{number} 0 obj");
+        out.windows(header.len())
+            .position(|w| w == header.as_bytes())
+            .unwrap_or_else(|| panic!("expected \"{header}\" (object {number}'s header) in output"))
+            + 1
+    }
+
+    /// Code-quality follow-up to Task 8: `--cleartext-metadata` interacts
+    /// with the crate-wide default `CompressStreams::Yes` re-filtering
+    /// policy. `append_body_object` computes `refiltered` — the flag
+    /// deciding whether `/Filter` may collapse to a bare `/FlateDecode` —
+    /// from `s.dict.get("Filter")` AFTER `prepend_crypt_filter_to_stream_dict`
+    /// has already mutated it. For a `/Metadata` source with no `/Filter`,
+    /// the default policy re-encodes it to a bare `/Filter /FlateDecode`
+    /// (`apply_stream_compress_policy`'s `CompressStreams::Yes` arm) BEFORE
+    /// the exemption prepends `/Crypt`, turning `/Filter` into the array
+    /// `[/Crypt /FlateDecode]`; `is_lone_flate` then correctly reads that as
+    /// NOT a lone `/FlateDecode`, so `refiltered` is `false` and the real
+    /// `/Crypt`-bearing chain survives instead of being collapsed to a bare
+    /// `/Filter /FlateDecode` (which would tell a reader to inflate bytes
+    /// that were never run through the normal encryption cipher). Both
+    /// other cleartext-metadata tests force `StreamDataMode::Uncompress`,
+    /// which bypasses re-encoding entirely and never reaches this
+    /// interaction — this test uses the default `CompressStreams::Yes`
+    /// policy specifically to exercise it.
+    #[test]
+    fn linearize_with_encrypt_cleartext_metadata_keeps_crypt_filter_after_refilter() {
+        let metadata_marker: &[u8] = b"<?xpacket flpdf-refilter-metadata-marker?>";
+        let src = tiny_pdf_with_metadata_content_and_producer(
+            metadata_marker,
+            b"BT /F1 12 Tf (flpdf refilter content marker) Tj ET\n",
+            b"flpdf refilter producer marker",
+        );
+
+        // Default compression policy (CompressStreams::Yes; StreamDataMode
+        // set explicitly to Compress rather than left at the default None,
+        // so the intent is self-evident here without relying on
+        // WriteOptions::default()'s fallback chain). The /Metadata stream's
+        // source has no /Filter, so it gets decoded (a no-op) and
+        // RE-ENCODED to a bare /Filter /FlateDecode inside
+        // reencode_stream_for_compress, BEFORE the cleartext-metadata
+        // exemption mutates that same dict.
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Compress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams {
+                encrypt_metadata: false,
+                ..crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
+            });
+        });
+
+        crate::linearization::check_linearization_bytes(&out).expect(
+            "cleartext-metadata + default compress policy must still pass the linearization checker",
+        );
+
+        let mut reopened =
+            Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
+                .expect("re-open with the empty user password");
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get_ref("Metadata") {
+                Some(r) => r,
+                None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+        };
+
+        let object_bytes = find_object_bytes(&out, metadata_ref.number);
+
+        // The re-filtered stream's dict must keep /Crypt ahead of
+        // /FlateDecode: prepend_crypt_filter_to_stream_dict's
+        // Object::Name(n) branch, given a source /Filter /FlateDecode with
+        // no /DecodeParms (apply_stream_compress_policy's
+        // CompressStreams::Yes arm never sets /DecodeParms), produces
+        // exactly this array shape (Object::Array::write_pdf's
+        // "[ elem elem ]" form, confirmed by reading both functions).
+        let filter_needle: &[u8] = b"/Filter [ /Crypt /FlateDecode ]";
+        assert!(
+            object_bytes
+                .windows(filter_needle.len())
+                .any(|w| w == filter_needle),
+            "re-filtered /Metadata stream must keep /Crypt ahead of /FlateDecode in \
+             its /Filter array, got {:?}",
+            String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Negative check: the reviewed concern in concrete terms — the
+        // stream must not have collapsed to append_body_object's
+        // refiltered-stream shortcut (a bare `/Filter /FlateDecode`), which
+        // would silently drop the /Crypt tag and tell a reader to run
+        // FlateDecode directly over bytes that were never processed by the
+        // normal encryption cipher.
+        let bare_flate_needle: &[u8] = b"/Filter /FlateDecode";
+        assert!(
+            !object_bytes
+                .windows(bare_flate_needle.len())
+                .any(|w| w == bare_flate_needle),
+            "re-filtered /Metadata stream must not collapse to a bare /Filter /FlateDecode, \
+             got {:?}",
+            String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Reader round-trip. `decrypt_resolved_object` (reader.rs) has its
+        // OWN `/Type /Metadata` + `!encrypt_metadata` fast path
+        // (`is_metadata_stream`) that returns the stream entirely untouched
+        // for ANY metadata stream once the /Encrypt dict declares
+        // `/EncryptMetadata false` — it never even inspects the /Crypt tag,
+        // so `apply_explicit_crypt_filters`'s /Crypt-stripping never runs
+        // here and `s.dict`'s /Filter stays the raw on-disk
+        // `[/Crypt /FlateDecode]`. Confirm that object-model shape
+        // independently of the byte-scan above, then strip /Crypt ourselves
+        // (mirroring what `apply_explicit_crypt_filters` does for a
+        // non-metadata /Crypt-tagged stream) before decoding the surviving
+        // /FlateDecode filter, proving the payload really is readable
+        // end to end — not merely missing the plaintext marker by
+        // coincidence.
+        let resolved = reopened
+            .resolve(metadata_ref)
+            .expect("resolve /Metadata (reader's metadata fast path leaves it untouched)");
+        let Object::Stream(s) = resolved else {
+            // cov:ignore-start: only reached if the assertion below would
+            // already fail — /Metadata always resolves to a stream for this
+            // fixture's well-formed structure.
+            panic!("/Metadata must resolve to a stream, got {resolved:?}");
+            // cov:ignore-end
+        };
+        assert_eq!(
+            s.dict.get("Filter"),
+            Some(&Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ])),
+            "resolved /Metadata dict must still carry the raw on-disk \
+             [/Crypt /FlateDecode] chain (the reader's metadata fast path \
+             skips /Crypt stripping entirely)"
+        );
+        let mut decode_dict = Dictionary::new();
+        decode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let inflated = crate::filters::decode_stream_data(&decode_dict, &s.data)
+            .expect("the surviving /FlateDecode filter must still decode");
+        assert_eq!(
+            inflated, metadata_marker,
+            "/Metadata stream must decode back to its original plaintext through \
+             /FlateDecode once /Crypt has been stripped"
+        );
+    }
+
+    /// Task 8: the hint stream is encrypted like any other stream payload —
+    /// qpdf's `writeHintStream` calls `setDataKey(hint_id)` before writing
+    /// the dict/payload (QPDFWriter.cc:2297), unlike the xref table/stream
+    /// and the `/Encrypt` dict, which stay plaintext unconditionally.
+    /// Constructs an `EncryptionContext` directly (mirroring
+    /// `crate::writer::tests::rc4_stream_encryption_preserves_payload_allocation`)
+    /// to exercise `append_hint_stream_object` in isolation.
+    #[test]
+    fn append_hint_stream_object_encrypts_payload_when_ctx_present() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        let payload = b"page offset hint table + shared object hint table payload".to_vec();
+        let object_ref = ObjectRef::new(9, 0);
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encrypt_ref: ObjectRef::new(2, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        // Independently compute the ciphertext encrypt_stream_payload_for_writer
+        // produces for this object ref + key material — the oracle for what
+        // append_hint_stream_object must embed.
+        let mut expected_stream = crate::Stream::new(Dictionary::new(), payload.clone());
+        crate::writer::encrypt_stream_payload_for_writer(object_ref, &mut expected_stream, &ctx)
+            .expect("compute expected ciphertext");
+        let expected_ciphertext = expected_stream.data;
+
+        let mut bytes = Vec::new();
+        let offset = append_hint_stream_object(
+            &mut bytes,
+            object_ref,
+            &payload,
+            46,
+            None,
+            false,
+            Some(&ctx),
+            crate::pipeline::aes::static_initialization_vector(),
+        )
+        .expect("emit with encrypt_ctx");
+        assert_eq!(offset, 0);
+
+        assert!(
+            !bytes
+                .windows(payload.len())
+                .any(|w| w == payload.as_slice()),
+            "hint stream payload must not appear in plaintext when encrypt_ctx is Some"
+        );
+        assert!(
+            bytes
+                .windows(expected_ciphertext.len())
+                .any(|w| w == expected_ciphertext.as_slice()),
+            "hint stream must embed the same ciphertext encrypt_stream_payload_for_writer \
+             produces for this object ref + key material"
+        );
+
+        let length_marker = format!("/Length {}", expected_ciphertext.len());
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(&length_marker),
+            "/Length must reflect the encrypted (not plaintext) byte count"
+        );
+    }
+
+    /// Proves the mechanism the PR-review-flagged bug depends on: encrypting
+    /// the SAME plaintext hint-stream payload with two DIFFERENT AES IVs can
+    /// produce hint-stream *objects* of different total byte length, because
+    /// [`append_hint_stream_object`]'s newline-before-`endstream` decision
+    /// (qpdf, QPDFWriter.cc:2327) is data-dependent on the CIPHERTEXT's last
+    /// byte, and AES-CBC ciphertext is a function of the IV as well as the
+    /// plaintext (each ciphertext block chains through the previous one,
+    /// starting from the IV).
+    ///
+    /// `IV_NO_NEWLINE` / `IV_WITH_NEWLINE` were found by brute-forcing 16-byte
+    /// IVs against this exact payload + key until one landed on each side of
+    /// the boundary (`stream.data.last() == Some(&b'\n')`); they are not
+    /// otherwise meaningful values. This is the premise half of the fix's
+    /// proof — see [`hint_stream_length_is_stable_across_a_forced_iv_change`]
+    /// (this file) for why the length difference this test demonstrates does
+    /// NOT translate into a corrupted hint table, and
+    /// `append_hint_stream_object`'s own doc for the invariant that makes
+    /// that true.
+    #[test]
+    fn identical_plaintext_different_iv_can_change_hint_stream_object_length() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        const IV_NO_NEWLINE: [u8; 16] = [0u8; 16];
+        const IV_WITH_NEWLINE: [u8; 16] = [146, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let payload = b"page offset hint table + shared object hint table payload".to_vec();
+        let object_ref = ObjectRef::new(9, 0);
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encrypt_ref: ObjectRef::new(2, 0),
+            id0: Vec::new(),
+            static_aes_iv: false, // irrelevant here: the IV is passed explicitly
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        let emit = |iv: [u8; 16]| -> Vec<u8> {
+            let mut bytes = Vec::new();
+            append_hint_stream_object(
+                &mut bytes,
+                object_ref,
+                &payload,
+                46,
+                None,
+                false,
+                Some(&ctx),
+                iv,
+            )
+            .expect("emit with encrypt_ctx");
+            bytes
+        };
+
+        let with_no_newline_iv = emit(IV_NO_NEWLINE);
+        let with_newline_iv = emit(IV_WITH_NEWLINE);
+
+        // Sanity: confirm the brute-forced IVs actually land on opposite
+        // sides of the ciphertext-last-byte boundary, independently of the
+        // object-length assertion below (a passing length assertion for the
+        // wrong reason would be worse than no test).
+        let payload_len_from = |ctx: &EncryptionContext, iv: [u8; 16]| -> usize {
+            let mut stream = crate::Stream::new(Dictionary::new(), payload.clone());
+            crate::writer::encrypt_stream_payload_with_iv(object_ref, &mut stream, ctx, iv)
+                .unwrap();
+            let ends_in_newline = stream.data.last() == Some(&b'\n');
+            stream.data.len() + usize::from(!ends_in_newline)
+        };
+        assert_ne!(
+            payload_len_from(&ctx, IV_NO_NEWLINE),
+            payload_len_from(&ctx, IV_WITH_NEWLINE),
+            "test premise: the two brute-forced IVs must land on opposite \
+             sides of the newline-before-endstream boundary for this payload"
+        );
+
+        assert_ne!(
+            with_no_newline_iv.len(),
+            with_newline_iv.len(),
+            "identical plaintext through two different IVs must be able to \
+             produce hint-stream OBJECTS of different total byte length \
+             (this is the exact premise the reviewer-flagged bug depends on)"
+        );
+    }
+
+    /// Proves the fix actually closes the gap `identical_plaintext_different_iv_can_change_hint_stream_object_length`
+    /// opens: even though the hint stream's OWN emitted length can differ
+    /// between two IVs for the same plaintext, every downstream hint-table
+    /// field this writer derives from a probed pass stays IDENTICAL when
+    /// [`build_outline_hint_table`] (real production code, unmodified for
+    /// this test) is fed two scenarios that model "probe pass used
+    /// `hint_stream_obj_total_len = L`, the pass that actually ships the
+    /// bytes used `L + delta`" — the exact cross-pass situation the old
+    /// (fresh-IV-per-call) code could produce and the fix now prevents from
+    /// ever occurring in the first place.
+    ///
+    /// The mechanism: every object physically AFTER the hint stream shifts by
+    /// the same `delta` the hint stream's own length changed by (nothing else
+    /// in the file depends on the hint stream's length), so a probed offset
+    /// for such an object is always `hint_stream_offset + L + gap` for a
+    /// pass-invariant `gap`. Subtracting that same pass's `L` cancels it,
+    /// leaving `hint_stream_offset + gap` — independent of `L` entirely. This
+    /// is the invariant `append_hint_stream_object`'s doc names explicitly.
+    #[test]
+    fn hint_stream_length_is_stable_across_a_forced_iv_change() {
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 2,
+        };
+        let byte_lengths = BTreeMap::from([(3u32, 60usize), (4u32, 70usize)]);
+
+        // Scenario A: "probe pass" measured hint_stream_obj_total_len = 144,
+        // and object 3 (the first outline unit) physically landed at offset
+        // 500 in THAT pass's bytes (500 = hint_stream_offset + 144 + gap for
+        // some fixed hint_stream_offset/gap).
+        let table_a = build_outline_hint_table(
+            &info,
+            &BTreeMap::from([(3u32, 500usize)]),
+            &byte_lengths,
+            144,
+        )
+        .unwrap();
+
+        // Scenario B: same physical document, but the hint stream's OWN
+        // ciphertext was one byte longer this time (delta = +1, e.g. a
+        // different IV flipped the newline-before-endstream decision) — every
+        // object after it, including object 3, shifts by that same delta.
+        let delta: usize = 1;
+        let table_b = build_outline_hint_table(
+            &info,
+            &BTreeMap::from([(3u32, 500usize + delta)]),
+            &byte_lengths,
+            144 + delta,
+        )
+        .unwrap();
+
+        assert_eq!(
+            table_a.first_object_offset, table_b.first_object_offset,
+            "the stored (adjusted) offset must be independent of which \
+             pass's hint-stream length measured it, as long as every \
+             object after the hint stream shifted by the same delta"
+        );
+        // Negative control: this is not vacuously true for every field —
+        // group_length is an ABSOLUTE sum of other objects' own byte
+        // lengths (not an offset the hint stream's length was ever
+        // subtracted from), so it stays unaffected by delta and unequal
+        // scenarios would show up here instead if the byte_lengths differed.
+        assert_eq!(table_a.group_length, table_b.group_length);
+    }
+
+    /// Read a `"{key}: "`-prefixed decimal field out of a
+    /// [`crate::linearization::show_linearization_bytes`] dump — the same
+    /// text format qpdf's `--show-linearization` produces. Exact line-prefix
+    /// match (not substring search), so e.g. `"first_object: "` never matches
+    /// the unrelated `"first_page_object: "` line.
+    fn parse_dump_field(dump: &str, key: &str) -> u64 {
+        let needle = format!("{key}: ");
+        for line in dump.lines() {
+            if let Some(rest) = line.strip_prefix(&needle) {
+                // cov:ignore-start: defensive — show_linearization_bytes's
+                // dump_* helpers always write these fields as plain decimal
+                // via `{}` on a numeric value, so `rest` is always parseable
+                // for a well-formed dump; this only guards a future format
+                // change in show.rs from failing silently instead of loudly.
+                return rest
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|e| panic!("field {key:?} = {rest:?} is not decimal: {e}"));
+                // cov:ignore-end
+            }
+        }
+        panic!("dump has no \"{needle}\" line:\n{dump}"); // cov:ignore: defensive — every dump this test module produces contains every field it queries; only guards a future show.rs field-name rename from failing silently.
+    }
+
+    /// End-to-end proof (task item 5): a real linearized + AES-128-encrypted
+    /// document carrying BOTH an Outlines Hint Table entry and a Part-8
+    /// (`part4_other_pages_shared`) Shared Objects Hint Table entry — the two
+    /// concrete tables the PR review named — has internally self-consistent
+    /// hint tables under the fix, run repeatedly with genuinely random
+    /// (non-`--static-aes-iv`) per-invocation IVs.
+    ///
+    /// For each run: decode the hint stream via
+    /// [`crate::linearization::show_linearization_bytes`] (the same decoder
+    /// that reconstructs qpdf's `adjusted_offset`, i.e. `stored_value +
+    /// /H[1]`) and independently locate the REAL physical byte offset of the
+    /// referenced object by scanning the actually-shipped bytes — then assert
+    /// they agree. `check_linearization_bytes` alone would not catch a
+    /// regression here: per its own doc table it validates the linearization
+    /// PARAMETER DICT (`/L /N /O /H /E /T`), not the hint stream's internal
+    /// Page/Shared/Outline tables — this test's `show_linearization_bytes` +
+    /// manual offset reconstruction is the actual oracle for those (see task
+    /// item 6 in the commit/PR description for this gap in the checker).
+    #[test]
+    fn linearized_encrypted_outline_and_part8_shared_hint_tables_stay_consistent_across_many_random_iv_runs(
+    ) {
+        let src = outlines_and_part8_shared_pdf_bytes();
+        let mut observed_hint_lengths: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        let mut observed_outputs: std::collections::BTreeSet<Vec<u8>> =
+            std::collections::BTreeSet::new();
+
+        // 3000 trials keeps the (informational, not asserted — see below)
+        // probability of never observing the newline-before-endstream
+        // boundary below 1e-5: each trial independently has a ~1/256 chance
+        // of the hint-stream ciphertext's last byte landing on `\n`, so
+        // P(never in N trials) = (255/256)^N ≈ e^(-N/256); N=3000 gives
+        // e^-11.7 ≈ 8e-6.
+        const TRIALS: usize = 3000;
+        for _ in 0..TRIALS {
+            let out = linearize_with(&src, |o| {
+                // Empty user password so `check_linearization_bytes` and
+                // `show_linearization_bytes` below (both open with no
+                // password) can decrypt transparently — the same convention
+                // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
+                // uses. `static_aes_iv` stays at its default `false`: this
+                // test's whole point is genuinely random per-invocation IVs.
+                o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                    Vec::new(),
+                    b"owner".to_vec(),
+                ));
+            });
+
+            crate::linearization::check_linearization_bytes(&out)
+                .expect("encrypted linearized output must pass the linearization checker");
+
+            let dump = crate::linearization::show_linearization_bytes(&out, "test")
+                .expect("hint stream must decode (decryption + bit-unpacking)");
+
+            // Shared Objects Hint Table: `first_shared_offset` (already
+            // adjusted_offset()-reconstructed by the dump) must equal the
+            // REAL physical offset of the renumbered first Part-8 object.
+            let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
+            let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
+            let real_shared_offset = find_object_offset(&out, first_shared_obj);
+            assert_eq!(
+                first_shared_offset, real_shared_offset,
+                "Shared Objects Hint Table's first_shared_offset must match the \
+                 real physical offset of object {first_shared_obj} (dump:\n{dump})"
+            );
+
+            // Outlines Hint Table: same check for `first_object_offset`.
+            assert!(
+                dump.contains("Outlines Hint Table"),
+                "test premise: fixture's /Outlines must produce an Outlines Hint \
+                 Table section (dump:\n{dump})"
+            );
+            let first_object = parse_dump_field(&dump, "first_object") as u32;
+            let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
+            let real_object_offset = find_object_offset(&out, first_object);
+            assert_eq!(
+                first_object_offset, real_object_offset,
+                "Outlines Hint Table's first_object_offset must match the real \
+                 physical offset of object {first_object} (dump:\n{dump})"
+            );
+
+            let h_length = parse_dump_field(&dump, "H_length") as usize;
+            observed_hint_lengths.insert(h_length);
+            observed_outputs.insert(out);
+        }
+
+        // Randomness sanity check: confirm the fix pins the IV only WITHIN
+        // one `write_linearized` call, not accidentally across every call —
+        // every one of these `TRIALS` invocations still draws its own fresh
+        // IV, so the shipped bytes vary from run to run. This assertion is
+        // effectively certain to hold regardless of the newline-before-
+        // endstream boundary: every OTHER encrypted string/stream in the
+        // fixture also draws its own fresh per-invocation IV, so the output
+        // bytes differ across runs even on trials where the hint stream's
+        // own length happens to match.
+        assert!(
+            observed_outputs.len() > 1,
+            "{TRIALS} independent encrypted runs produced byte-identical output \
+             — the per-invocation IV draw appears to have been hardcoded away"
+        );
+        // NOT asserted (deliberately): whether this run's `TRIALS` draws ever
+        // landed on the opposite side of the hint stream's newline-before-
+        // endstream boundary is a low-probability (~1/256 per trial) event.
+        // `TRIALS` is sized so missing it entirely is rare (≈8e-6), but "rare"
+        // is not "never" — turning this into a hard assertion would make the
+        // test flaky under CI's normal run-to-run variance. When it DOES
+        // fire, it is a second, independent confirmation (beyond the offset
+        // assertions above, which run unconditionally on every trial) that a
+        // real hint-stream length difference occurred and self-consistency
+        // still held for it.
+        eprintln!(
+            "observed {} distinct H_length value(s) across {TRIALS} trials \
+             (>1 means the newline-before-endstream boundary was hit and \
+             self-consistency held across it too)",
+            observed_hint_lengths.len()
+        );
+    }
+
+    /// Extract just the hint stream object's stream *payload* (the bytes
+    /// between its `stream\n` marker and the following `endstream`),
+    /// locating the object by its pre-computed reserved number. Companion to
+    /// [`find_object_bytes`] — needed because the hint dict prefix (`/S`,
+    /// `/O`, `/Length`) legitimately differs in decimal width between an
+    /// unencrypted and an encrypted run even before considering the payload
+    /// itself, so diffing whole `find_object_bytes` output would conflate
+    /// that dict-width noise with the payload comparison this helper's
+    /// caller actually wants.
+    fn hint_stream_payload_bytes(out: &[u8], hint_num: u32) -> &[u8] {
+        let object_bytes = find_object_bytes(out, hint_num);
+        let stream_marker: &[u8] = b"stream\n";
+        let payload_start = object_bytes
+            .windows(stream_marker.len())
+            .position(|w| w == stream_marker)
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the hint stream object
+                // has no "stream\n" marker — every well-formed fixture in
+                // this test module reaches the assertion under test instead.
+                panic!("hint stream object {hint_num} must contain a \"stream\\n\" marker")
+                // cov:ignore-end
+            })
+            + stream_marker.len();
+        let after_stream = &object_bytes[payload_start..];
+        let end_marker: &[u8] = b"endstream";
+        let payload_end = after_stream
+            .windows(end_marker.len())
+            .position(|w| w == end_marker)
+            .unwrap_or(after_stream.len());
+        &after_stream[..payload_end]
+    }
+
+    /// Locate the classic (stream-free) `xref\n<start> <count>\n` subsection
+    /// header nearest the start of `out` and confirm every one of its
+    /// `count` fixed-width entries is qpdf's plaintext ASCII
+    /// `%010d %05d %s \n` form (`write_part1_xref_and_trailer` /
+    /// `patch_part1_xref`'s `CLASSIC_XREF_ENTRY_WIDTH`-byte row) — parseable
+    /// by a reader without deriving the file key first, unlike every other
+    /// body object and the hint stream.
+    fn assert_classic_xref_section_entries_are_ascii_plaintext(out: &[u8]) {
+        let marker: &[u8] = b"\nxref\n";
+        let marker_pos = out
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the classic layout has
+                // no xref section at all — the state under test always has
+                // one (the Part-1 first-page subsection).
+                panic!("expected a classic \"xref\\n\" section header in output")
+                // cov:ignore-end
+            });
+        let header_start = marker_pos + marker.len();
+        let header_len = out[header_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the header line never
+                // terminates — never true for a well-formed classic layout.
+                panic!("xref subsection header must end in a newline")
+                // cov:ignore-end
+            });
+        let header = std::str::from_utf8(&out[header_start..header_start + header_len])
+            .expect("xref subsection header bytes are ASCII digits/spaces by construction");
+        let mut parts = header.split(' ');
+        let _start_num: u32 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("xref subsection header's first field must be a decimal object number");
+        let count: u32 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("xref subsection header's second field must be a decimal entry count");
+        assert!(
+            count > 0,
+            "xref subsection must cover at least one entry, got header {header:?} \
+             (a zero count would make every ASCII assertion below vacuous)"
+        );
+
+        let entries_start = header_start + header_len + 1;
+        for i in 0..count as usize {
+            let start = entries_start + i * CLASSIC_XREF_ENTRY_WIDTH;
+            let entry = std::str::from_utf8(&out[start..start + CLASSIC_XREF_ENTRY_WIDTH])
+                .unwrap_or_else(|_| {
+                    // cov:ignore-start: only reached if a classic xref entry
+                    // is not valid ASCII — the property under test.
+                    panic!("xref entry {i} must be ASCII, got non-UTF8 bytes")
+                    // cov:ignore-end
+                });
+            let fields: Vec<&str> = entry.trim_end_matches('\n').split(' ').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "xref entry must be \"%010d %05d %s \" (trailing space before \
+                 the newline this loop already stripped), got {entry:?}"
+            );
+            assert!(
+                fields[0].len() == 10 && fields[0].bytes().all(|b| b.is_ascii_digit()),
+                "xref offset field must be 10 ASCII digits, got {entry:?}"
+            );
+            assert!(
+                fields[1].len() == 5 && fields[1].bytes().all(|b| b.is_ascii_digit()),
+                "xref generation field must be 5 ASCII digits, got {entry:?}"
+            );
+            assert!(
+                fields[2] == "n" || fields[2] == "f",
+                "xref type field must be 'n' or 'f', got {entry:?}"
+            );
+        }
+    }
+
+    /// Task 11 qualitative check (`bd show flpdf-txag` acceptance criteria
+    /// item 6): confirms the hint stream is genuinely ciphertext THROUGH THE
+    /// FULL `linearize_with` pipeline — renumbering, plan, and the
+    /// probe/convergence loop all included — not merely at the level of
+    /// `append_hint_stream_object` called in isolation with a hand-built
+    /// `EncryptionContext`, which
+    /// [`append_hint_stream_object_encrypts_payload_when_ctx_present`]
+    /// already proves against an independently computed oracle. That
+    /// existing test does not go through `linearize_with` at all, so it
+    /// cannot catch a bug where the full pipeline fails to *wire* an
+    /// `encrypt_ctx` into the hint-stream call even though the function
+    /// itself encrypts correctly when given one.
+    ///
+    /// The discriminator is deliberately NOT "the raw payload bytes differ
+    /// from an unencrypted control": with `--encrypt`,
+    /// `reserve_encrypt_dict_slot` inserts one extra object and every
+    /// encrypted body object grows (a 16-byte IV + CBC padding), so the
+    /// PLAINTEXT hint table itself already differs between the two runs
+    /// regardless of whether the hint stream is encrypted — a plain
+    /// raw-byte inequality would still pass even if the `encrypt_ctx`
+    /// wiring into the hint-stream call site were silently dropped
+    /// (verified empirically: temporarily changing that one call site to
+    /// pass `None` left a raw-inequality version of this test green).
+    /// Instead this exploits that with default options the hint stream is
+    /// `/Filter /FlateDecode` (`structural_streams_filtered`,
+    /// `CompressStreams::Yes`): a genuinely unencrypted FlateDecode payload
+    /// MUST decode as zlib, while ciphertext (AES-CBC over already-
+    /// compressed bytes) essentially never does. That flips sign exactly on
+    /// "was the payload actually run through the cipher", independent of
+    /// any layout/offset drift between the two runs.
+    ///
+    /// Companion check, same output: the classic Part-1 xref subsection
+    /// stays in qpdf's plaintext ASCII `%010d %05d %s \n` form even though
+    /// the document is encrypted — qpdf's `writeTrailer` never calls
+    /// `setDataKey` for the xref table (`m->cur_data_key.clear()` in the
+    /// `xref_stream` branch), unlike the hint stream, because a reader must
+    /// be able to locate every object before it can even derive the file
+    /// key.
+    #[test]
+    fn linearize_with_encrypt_hint_stream_is_ciphertext_xref_stays_ascii_plaintext() {
+        let src = tiny_pdf_bytes();
+
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let unencrypted_hint_num = renumber.hint_stream_slot();
+        // reserve_encrypt_dict_slot inserts the /Encrypt slot at the OLD
+        // hint_stream_slot and shifts the hint stream itself to old+1 (see
+        // its own doc).
+        let encrypted_hint_num = unencrypted_hint_num + 1;
+
+        let unencrypted = linearize_with(&src, |_o| {});
+        let encrypted = linearize_with(&src, |o| {
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        // Sanity: both located objects really are the hint stream (carry
+        // the `/S ` shared-section-offset key `hint_stream_dict_prefix`
+        // always emits) — guards against the `+1` shift assumption silently
+        // landing on some other object if the layout ever changes.
+        for (label, object_bytes) in [
+            (
+                "unencrypted control",
+                find_object_bytes(&unencrypted, unencrypted_hint_num),
+            ),
+            (
+                "encrypted output",
+                find_object_bytes(&encrypted, encrypted_hint_num),
+            ),
+        ] {
+            assert!(
+                object_bytes.windows(3).any(|w| w == b"/S "),
+                "{label}: object at the computed hint-stream number must carry \
+                 the hint stream's /S key"
+            );
+        }
+
+        let unencrypted_payload = hint_stream_payload_bytes(&unencrypted, unencrypted_hint_num);
+        let encrypted_payload = hint_stream_payload_bytes(&encrypted, encrypted_hint_num);
+
+        // Coarse signal only — see the doc comment above for why this alone
+        // does not prove the payload was run through the cipher.
+        assert_ne!(
+            unencrypted_payload, encrypted_payload,
+            "hint stream payload must differ between the unencrypted control \
+             and the encrypted output at their respective structural positions"
+        );
+
+        // The real, falsifiable discriminator: a bare /FlateDecode dict
+        // decodes the unencrypted control's payload (real zlib) but must
+        // NOT decode the encrypted output's payload (AES-CBC ciphertext).
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        crate::filters::decode_stream_data(&flate_dict, unencrypted_payload).expect(
+            "premise: the unencrypted control's hint stream payload must be valid \
+             zlib (structural_streams_filtered is true under default options)",
+        );
+        assert!(
+            crate::filters::decode_stream_data(&flate_dict, encrypted_payload).is_err(),
+            "encrypted output's hint stream payload must NOT decode as zlib — \
+             if it does, the hint stream was never actually run through the cipher"
+        );
+
+        assert_classic_xref_section_entries_are_ascii_plaintext(&encrypted);
+    }
+
+    /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
+    /// source-side ObjStm: object 4 (`/Info`) exists ONLY inside object 5's
+    /// ObjStm — there is no plain indirect object 4 in the file. Used to
+    /// exercise `ObjectStreamMode::Preserve` (the default), which reuses the
+    /// *source's* ObjStm membership rather than repacking, as opposed to
+    /// `Generate`, which always builds fresh containers regardless of source
+    /// form.
+    fn objstm_bearing_pdf_bytes() -> Vec<u8> {
+        fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_be_bytes()[1..]);
+        }
+        fn append_xref_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
+            entries.push(entry_type);
+            append_u24_be(entries, field1);
+            entries.push(field2);
+        }
+
+        let objstm_num: u32 = 5;
+        let xref_num: u32 = 6;
+        let total_size: u32 = xref_num + 1;
+
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        let catalog_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        let pages_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        let page_offset = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        // Object 4 (/Info) lives ONLY inside the ObjStm (object 5) — no plain
+        // indirect object 4 exists in the file.
+        let header: &[u8] = b"4 0 ";
+        let info_bytes: &[u8] = b"<< /Title (x) >>";
+        let first = header.len();
+        let mut stream_data = Vec::new();
+        stream_data.extend_from_slice(header);
+        stream_data.extend_from_slice(info_bytes);
+
+        let objstm_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "{objstm_num} 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+                stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = bytes.len();
+        let mut xref_entries: Vec<u8> = Vec::new();
+        append_xref_entry(&mut xref_entries, 0, 0, 0); // 0: free
+        append_xref_entry(&mut xref_entries, 1, catalog_offset as u32, 0); // 1: Catalog
+        append_xref_entry(&mut xref_entries, 1, pages_offset as u32, 0); // 2: Pages
+        append_xref_entry(&mut xref_entries, 1, page_offset as u32, 0); // 3: Page
+        append_xref_entry(&mut xref_entries, 2, objstm_num, 0); // 4: Info, compressed
+        append_xref_entry(&mut xref_entries, 1, objstm_offset as u32, 0); // 5: ObjStm
+        append_xref_entry(&mut xref_entries, 1, xref_offset as u32, 0); // 6: XRef
+
+        bytes.extend_from_slice(
+            format!(
+                "{xref_num} 0 obj\n<< /Type /XRef /Size {total_size} /Root 1 0 R /Info 4 0 R \
+                 /W [1 3 1] /Index [0 {total_size}] /Length {} >>\nstream\n",
+                xref_entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        bytes
+    }
+
+    /// As [`objstm_encrypt_linearize_combination_is_unsupported`], but for
+    /// `ObjectStreamMode::Preserve` (the default) on a source that already
+    /// carries an ObjStm — the path Task 2's code review specifically flagged
+    /// as a way to reach a non-empty batch plan *without*
+    /// `ObjectStreamMode::Generate`. Confirms the guard is keyed on the
+    /// resolved batch plan (which reflects the source's real membership under
+    /// Preserve), not on the write-mode enum variant.
+    #[test]
+    fn preserve_objstm_encrypt_linearize_combination_is_unsupported() {
+        let mut pdf = Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf_with_object_stream_mode(
+            &mut pdf,
+            crate::writer::ObjectStreamMode::Preserve,
+        )
+        .expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            object_streams: crate::writer::ObjectStreamMode::Preserve,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                b"user".to_vec(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        // Precondition: the source's ObjStm membership actually survives
+        // planning under Preserve, so this test exercises the relocation
+        // path rather than being vacuously true on an empty batch plan.
+        let mut precheck_pdf =
+            Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
+        let resolved = ObjStmLayout::resolve_batches(&plan, &mut precheck_pdf, &opts)
+            .expect("resolve_batches");
+        assert!(
+            !resolved.open_document_batches.is_empty()
+                || !resolved.part3_batches.is_empty()
+                || !resolved.part4_batches.is_empty(),
+            "test precondition: Preserve on an ObjStm-bearing source must \
+             yield a non-empty batch plan"
+        );
+        let mut pdf2 = Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m)
+                if m.contains("does not yet support object streams")),
+            "got {err:?}"
+        );
+    }
+
     /// The primary hint-stream object must serialize its filtered dict in
     /// qpdf's key order `/Filter /S /Length` (so `/S` precedes `/Length`), with
     /// framing byte-identical to the generic object serializer. Asserts the
@@ -5548,8 +8638,17 @@ mod tests {
     fn append_hint_stream_object_emits_qpdf_key_order() {
         let payload = vec![0u8; 53];
         let mut bytes = Vec::new();
-        let offset =
-            append_hint_stream_object(&mut bytes, ObjectRef::new(9, 0), &payload, 46, None, true);
+        let offset = append_hint_stream_object(
+            &mut bytes,
+            ObjectRef::new(9, 0),
+            &payload,
+            46,
+            None,
+            true,
+            None,
+            [0u8; 16], // unused: no encrypt_ctx
+        )
+        .expect("no encrypt_ctx: emission cannot fail");
         assert_eq!(offset, 0, "emitter returns its start offset");
 
         let mut expected = Vec::new();
@@ -5573,7 +8672,10 @@ mod tests {
             46,
             Some(51),
             false,
-        );
+            None,
+            [0u8; 16], // unused: no encrypt_ctx
+        )
+        .expect("no encrypt_ctx: emission cannot fail");
 
         assert_eq!(
             bytes,

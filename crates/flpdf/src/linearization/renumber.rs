@@ -429,6 +429,51 @@ impl RenumberMap {
     }
 
     // -----------------------------------------------------------------------
+    // /Encrypt dictionary slot reservation
+    // -----------------------------------------------------------------------
+
+    /// Reserve a new sentinel slot for the `/Encrypt` dictionary object,
+    /// inserted immediately before the hint-stream slot — matching qpdf's
+    /// object-number sequence for linearized+encrypted output
+    /// (`QPDFWriter.cc:2563-2624`): `... part4 uncompressed objects ->
+    /// encryption dictionary -> hint stream -> part6 uncompressed objects
+    /// ...`. Every already-assigned slot at or after the old hint-stream
+    /// position shifts up by one; `param_dict_slot` is always allocated
+    /// strictly before `hint_stream_slot` in [`from_plan`](Self::from_plan)
+    /// (the param-dict sentinel push happens before the hint-stream sentinel
+    /// push, regardless of whether the catalog / open-document-plain
+    /// sections in between are empty), so it never shifts.
+    ///
+    /// Mutually exclusive with
+    /// [`place_objstm_members_per_half`](Self::place_objstm_members_per_half):
+    /// encrypted ObjStm-relocated linearized output is out of scope, so a
+    /// caller must use at most one of the two. Calling this method first
+    /// would not be a safe substitute sequencing —
+    /// `place_objstm_members_per_half` treats any `by_new_number` slot that
+    /// is not `old_param_slot`/`old_hint_slot` and holds a sentinel
+    /// (`original.number == 0`) as an "unexpected sentinel" and silently
+    /// drops it, which would discard this reservation rather than preserve
+    /// it.
+    ///
+    /// Returns the newly reserved [`ObjectRef`] (generation 0) for the writer
+    /// to use as the `/Encrypt` object number.
+    pub(crate) fn reserve_encrypt_dict_slot(&mut self) -> ObjectRef {
+        let insert_at = self.hint_stream_slot as usize;
+        debug_assert!(
+            (self.param_dict_slot as usize) < insert_at,
+            "param_dict_slot must precede hint_stream_slot (from_plan invariant)"
+        );
+        self.by_new_number.insert(insert_at, SENTINEL);
+        for new_ref in self.by_original.values_mut() {
+            if new_ref.number as usize >= insert_at {
+                new_ref.number += 1;
+            }
+        }
+        self.hint_stream_slot += 1;
+        ObjectRef::new(insert_at as u32, 0)
+    }
+
+    // -----------------------------------------------------------------------
     // ObjStm per-half compressed-last placement
     // -----------------------------------------------------------------------
 
@@ -1571,6 +1616,120 @@ mod tests {
         assert_eq!(
             helper, mapped,
             "renumber_assigned_refs must equal from_plan's by_original key set"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reserve_encrypt_dict_slot
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reserve_encrypt_dict_slot_inserts_before_hint_and_shifts_it() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        let old_hint = rn.hint_stream_slot();
+
+        let encrypt_ref = rn.reserve_encrypt_dict_slot();
+
+        assert_eq!(encrypt_ref, ObjectRef::new(old_hint, 0));
+        assert_eq!(rn.hint_stream_slot(), old_hint + 1);
+    }
+
+    #[test]
+    fn reserve_encrypt_dict_slot_shifts_every_object_at_or_after_old_hint_slot() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        // Snapshot every mapping before the reservation.
+        let before: Vec<(ObjectRef, ObjectRef)> = rn.iter_in_layout_order().collect();
+        let old_hint = rn.hint_stream_slot();
+
+        rn.reserve_encrypt_dict_slot();
+
+        for (old_new_ref, original) in before {
+            let expected = if old_new_ref.number >= old_hint {
+                ObjectRef::new(old_new_ref.number + 1, 0)
+            } else {
+                old_new_ref
+            };
+            assert_eq!(
+                rn.new_for_original(original),
+                Some(expected),
+                "original {original:?} did not shift correctly"
+            );
+        }
+    }
+
+    #[test]
+    fn reserve_encrypt_dict_slot_leaves_param_dict_slot_untouched() {
+        // param_dict_slot is always allocated before hint_stream_slot in
+        // from_plan, so inserting immediately before the hint slot must never
+        // shift the param dict slot.
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        let old_param = rn.param_dict_ref();
+
+        rn.reserve_encrypt_dict_slot();
+
+        assert_eq!(rn.param_dict_ref(), old_param);
+    }
+
+    #[test]
+    fn reserve_encrypt_dict_slot_is_reserved_not_original_for_new() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        let encrypt_ref = rn.reserve_encrypt_dict_slot();
+
+        // The slot has no original object, same as param dict / hint stream.
+        assert_eq!(rn.original_for_new(encrypt_ref), None);
+    }
+
+    #[test]
+    fn reserve_encrypt_dict_slot_len_increases_by_one() {
+        let plan = two_page_plan();
+        let mut rn = RenumberMap::from_plan(&plan);
+        let before_len = rn.len();
+
+        rn.reserve_encrypt_dict_slot();
+
+        assert_eq!(rn.len(), before_len + 1);
+    }
+
+    /// `two_page_plan()` has an empty `part4_open_document_plain`, so in it
+    /// the hint-stream slot sits immediately after the catalog: "insert
+    /// before hint" and "insert right after the catalog" land on the same
+    /// number and the two checks are indistinguishable. qpdf's actual
+    /// sequence (`QPDFWriter.cc:2563-2624`) is `part4_first_obj ->
+    /// after_part4 -> encryption_dict_objid -> hint_id`, where qpdf's local
+    /// `part4` is flpdf's catalog + `part4_open_document_plain` — so the
+    /// load-bearing behavior is that the encrypt slot lands after the LAST
+    /// open-document-plain object, not merely after the catalog. Pin that
+    /// with a plan shaped like `two_page_plan()` plus one OD-plain object.
+    #[test]
+    fn reserve_encrypt_dict_slot_lands_after_open_document_plain_objects() {
+        let od_plain = ObjectRef::new(9, 0);
+        let plan = LinearizationPlan {
+            part2_objects: vec![ObjectRef::new(3, 0), ObjectRef::new(6, 0)],
+            part3_objects: vec![ObjectRef::new(5, 0), ObjectRef::new(8, 0)],
+            part4_other_pages_private: vec![ObjectRef::new(4, 0), ObjectRef::new(7, 0)],
+            part4_rest: vec![ObjectRef::new(1, 0), ObjectRef::new(2, 0)],
+            part4_open_document_plain: vec![od_plain],
+            total_object_count: 9,
+            root_ref: Some(ObjectRef::new(1, 0)),
+            ..Default::default()
+        };
+        let mut rn = RenumberMap::from_plan(&plan);
+        let od_plain_number = rn.new_for_original(od_plain).unwrap().number;
+
+        let encrypt_ref = rn.reserve_encrypt_dict_slot();
+
+        // The encrypt slot lands directly after the OD-plain object and
+        // directly before the (now-shifted) hint slot.
+        assert_eq!(encrypt_ref.number, od_plain_number + 1);
+        assert_eq!(encrypt_ref.number, rn.hint_stream_slot() - 1);
+        // The OD-plain object's own number is unaffected by the reservation.
+        assert_eq!(
+            rn.new_for_original(od_plain).unwrap().number,
+            od_plain_number
         );
     }
 }

@@ -711,15 +711,19 @@ pub fn effective_pdf_version_and_ext<'a>(
 /// - [`crate::Error::Missing`] if the input has no `/Root` in its trailer.
 /// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
-fn inject_adbe_extension<R: Read + Seek>(
+pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: &str,
     extension_level: i64,
 ) -> Result<()> {
-    // cov:ignore-start: defensive /Root guard. inject_adbe_extension is only
-    // called from write_pdf_full_rewrite AFTER its own root_ref check has
-    // already returned Missing("/Root"), so this branch is unreachable in the
-    // normal pipeline.
+    // cov:ignore-start: defensive /Root guard. Called from
+    // write_pdf_full_rewrite (AFTER its own root_ref check has already
+    // returned Missing("/Root")) and from
+    // crate::linearization::writer::write_linearized (whose own
+    // resolve_catalog_adbe_status pre-check treats a missing root as
+    // `has_adbe: false, orphans_indirect_object: false` rather than
+    // erroring, so this is that caller's actual root check) -- unreachable
+    // in every fixture in either test module.
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
@@ -731,7 +735,8 @@ fn inject_adbe_extension<R: Read + Seek>(
     // silently mutate nothing.
     let catalog_obj = pdf.resolve(root_ref)?;
     // cov:ignore-start: defensive non-Dict Catalog guard. Every downstream
-    // write path rejects a non-dict Catalog before reaching this helper.
+    // write path (both callers) rejects a non-dict Catalog before reaching
+    // this helper.
     let Some(mut catalog) = catalog_obj.into_dict() else {
         return Err(crate::Error::Unsupported(
             "Catalog is not a dictionary".to_string(),
@@ -779,18 +784,18 @@ fn inject_adbe_extension<R: Read + Seek>(
 ///
 /// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
-fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
-    // cov:ignore-start: defensive /Root guard. strip_adbe_extension is only
-    // reached after write_pdf_full_rewrite passes its own root_ref check on
-    // the same Pdf.
+pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+    // cov:ignore-start: defensive /Root guard, mirroring
+    // inject_adbe_extension's identical comment (same two callers:
+    // write_pdf_full_rewrite and crate::linearization::writer::write_linearized).
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(());
     };
     // cov:ignore-end
     let catalog_obj = pdf.resolve(root_ref)?;
     // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
-    // inject_adbe_extension. Every downstream write path rejects a non-dict
-    // Catalog before reaching this helper.
+    // inject_adbe_extension. Every downstream write path (both callers)
+    // rejects a non-dict Catalog before reaching this helper.
     let Some(mut catalog) = catalog_obj.into_dict() else {
         return Ok(());
     };
@@ -2224,17 +2229,13 @@ mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above 
 
 // ── Encryption context (flpdf-9hc.4.9) ───────────────────────────────────────
 
-/// Per-write encryption state used by the full-rewrite path when
-/// [`WriteOptions::encrypt`] is set. Built once at the top of
-/// [`write_pdf_full_rewrite`] via [`build_encryption_context`] and consumed
-/// by the per-object emission loop + the trailer-build step.
 /// How the writer derives per-object string/stream encryption key material.
 ///
 /// Mirrors the reader's per-object dispatch (`EncryptionMode`): V<5 handlers
 /// derive a per-object key via Algorithm 1, while V=5 uses the 32-byte file
 /// key directly with AES-256 (no per-object derivation).
 #[derive(Debug, Clone, Copy)]
-enum WriteCipher {
+pub(crate) enum WriteCipher {
     /// V=1/V=2/V=4: per-object key via Algorithm 1, then RC4 or AES-128
     /// (the [`ObjectKeyAlg`](crate::security::standard::ObjectKeyAlg) selects
     /// the `sAlT` salt and the resulting cipher).
@@ -2244,44 +2245,54 @@ enum WriteCipher {
     FileKeyAes256,
 }
 
-struct EncryptionContext {
+/// Per-write encryption state used when [`WriteOptions::encrypt`] or
+/// [`WriteOptions::copy_encryption`] is set. Built once via
+/// [`build_encryption_context`] or [`build_copy_encryption_context`] — at the
+/// top of [`write_pdf_full_rewrite`] for the full-rewrite path, or inside
+/// [`crate::linearization::writer::write_linearized`] for linearized output
+/// (`--encrypt` only; `--copy-encryption-from` is not yet supported there) —
+/// and consumed by the per-object emission loop + the trailer-build step.
+pub(crate) struct EncryptionContext {
     /// Built `/Encrypt` dictionary (from a 4.1/4.2/4.3 builder).
-    encrypt_dict: Dictionary,
+    pub(crate) encrypt_dict: Dictionary,
     /// File encryption key derived from passwords + `/ID[0]` (Algorithm 2),
     /// or — for V=5 — the random 32-byte file key (FEK).
-    file_key: Vec<u8>,
+    pub(crate) file_key: Vec<u8>,
     /// How per-object string/stream key material is derived (V<5 per-object
     /// vs V=5 file-key-direct).
-    cipher: WriteCipher,
+    pub(crate) cipher: WriteCipher,
     /// Indirect reference of the freshly-allocated `/Encrypt` object. The
     /// emission loop skips this ref so the `/Encrypt` dict itself stays
     /// plaintext (PDF 1.7 §7.6.1).
-    encrypt_ref: ObjectRef,
+    pub(crate) encrypt_ref: ObjectRef,
     /// The 16-byte `/ID[0]` bytes that were fed into the file-key derivation.
     /// The output trailer's `/ID` array MUST start with these same bytes —
     /// readers re-derive the file key from `/ID[0]` to validate the password.
-    id0: Vec<u8>,
+    pub(crate) id0: Vec<u8>,
     /// When `true`, all AES CBC IVs are forced to `[0u8; 16]` instead of
     /// being drawn from the OS CSPRNG.  Testing only — mirrors
     /// [`WriteOptions::static_aes_iv`].
-    static_aes_iv: bool,
+    pub(crate) static_aes_iv: bool,
     /// Whether the `/Metadata` stream is encrypted alongside the rest of the
     /// document (mirrors [`crate::EncryptParams::encrypt_metadata`]). When `false`
     /// (qpdf `--cleartext-metadata`, V=4/V=5 only), the `/Metadata` stream in
     /// [`metadata_ref`](Self::metadata_ref) is left in the clear and tagged
     /// with `/Crypt /Identity` instead of being run through the cipher.
-    encrypt_metadata: bool,
+    pub(crate) encrypt_metadata: bool,
     /// Indirect reference of the document `/Catalog`'s `/Metadata` stream, when
     /// one exists AND `encrypt_metadata` is `false`. Used by the emission loop
     /// to exempt exactly that object from encryption. `None` whenever metadata
     /// is encrypted (the common case) or the document has no `/Metadata`.
-    metadata_ref: Option<ObjectRef>,
+    pub(crate) metadata_ref: Option<ObjectRef>,
 }
 
 /// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
 /// Used to exempt the XMP metadata stream from encryption under
 /// `--cleartext-metadata`.
-fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
+///
+/// `pub(crate)`: also used by [`crate::linearization::writer::write_linearized`],
+/// which needs the same `--cleartext-metadata` exemption for linearized output.
+pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
     match pdf.resolve_borrowed(root).ok()? {
         Object::Dictionary(dict) => dict.get_ref("Metadata"),
@@ -2289,12 +2300,25 @@ fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<Objec
     }
 }
 
-fn build_encryption_context<R: Read + Seek>(
-    pdf: &Pdf<R>,
+/// `id0` is the `/ID[0]` bytes the file encryption key is derived from
+/// (PDF 1.7 §7.6.3.3 Algorithm 2); the caller must have already decided this
+/// value — typically via [`resolve_id0_for_encryption`] — and must write the
+/// SAME bytes into the output trailer's `/ID[0]`, since a reader re-derives
+/// the file key from `/ID[0]` to validate the password. Taking it as a
+/// parameter (rather than resolving it internally from `pdf`) lets a caller
+/// that already finalized `/ID` elsewhere (the linearized writer, which must
+/// settle `/ID`'s final width before its two-pass probe loop runs) feed that
+/// SAME value in, instead of this function re-deriving an independent one —
+/// mirrors qpdf's own `generateID()`-is-idempotent contract: `/ID` is
+/// computed once, and encryption setup consumes that single value
+/// (`QPDFWriter::setEncryptionParameters` calls `generateID()` itself before
+/// deriving `/O`/`/U`, and `writeTrailer`'s later call is a no-op).
+pub(crate) fn build_encryption_context(
     options: &WriteOptions,
     params: &crate::encrypt_setup::EncryptParams,
     existing_max: u32,
     metadata_ref: Option<ObjectRef>,
+    id0: &[u8],
 ) -> Result<EncryptionContext> {
     use crate::encrypt_setup::EncryptMethod;
     use crate::security::standard::{
@@ -2302,10 +2326,7 @@ fn build_encryption_context<R: Read + Seek>(
         V4CryptMethod, V4EncryptParams,
     };
 
-    // Resolve /ID[0] BEFORE deriving the file key. Algorithm 2 uses /ID[0]
-    // as a salt; the trailer must carry the same bytes so the reader can
-    // re-derive the file key from the password.
-    let id0 = resolve_id0_for_encryption(pdf, options);
+    let id0 = id0.to_vec();
 
     let (encrypt_dict, file_key, cipher) = match params.method {
         EncryptMethod::V4Aes128 => {
@@ -2452,7 +2473,7 @@ fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
 /// decrypted with the donor's original user or owner password because all the
 /// ingredients of Algorithm 2 (key-length, `/O`, `/P`, `/ID[0]`) are
 /// reproduced exactly.
-fn build_copy_encryption_context(
+pub(crate) fn build_copy_encryption_context(
     src: &crate::encrypt_setup::CopyEncryptionSource,
     options: &WriteOptions,
     existing_max: u32,
@@ -2739,7 +2760,7 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
 /// a per-object key derived via Algorithm 1 and the cipher implied by
 /// `ctx.object_key_alg`. The `/Encrypt` dict itself is skipped by the
 /// caller (this function is not called on `ctx.encrypt_ref`).
-fn encrypt_strings_in_object_for_writer(
+pub(crate) fn encrypt_strings_in_object_for_writer(
     object_ref: ObjectRef,
     object: &mut Object,
     ctx: &EncryptionContext,
@@ -2815,26 +2836,45 @@ fn encrypt_strings_in_object_for_writer(
     }
 }
 
+/// Whether `cipher` needs an AES CBC initialization vector: `true` for both
+/// AES variants (V=4 AESV2 `PerObject(Aes)` and V=5 AESV3 `FileKeyAes256`),
+/// `false` for RC4 (a stream cipher with no IV concept).
+///
+/// Shared by [`encrypt_stream_payload_for_writer`] (which draws its own IV
+/// only when this is `true`) and
+/// `crate::linearization::writer::write_linearized` (which draws the hint
+/// stream's single per-invocation IV under the same condition).
+pub(crate) fn cipher_needs_aes_iv(cipher: WriteCipher) -> bool {
+    use crate::security::standard::ObjectKeyAlg;
+    matches!(
+        cipher,
+        WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
+    )
+}
+
 /// Encrypt a stream's payload bytes in place (after filter re-encoding) and
 /// update its `/Length` entry. AES grows the buffer by 16 bytes (IV prefix)
 /// plus up to one full block of PKCS#7 padding.
-fn encrypt_stream_payload_for_writer(
+///
+/// Draws a fresh AES IV internally on every call (or the fixed test vector
+/// under `ctx.static_aes_iv`) and delegates to
+/// [`encrypt_stream_payload_with_iv`] for the actual encryption. This is the
+/// right behavior for every caller except one: `crate::linearization::writer`
+/// re-invokes the hint-stream emitter once per convergence-loop pass, so a
+/// fresh-per-call IV here would mean the hint stream's own ciphertext framing
+/// could vary pass-to-pass for the same plaintext — that caller uses
+/// [`encrypt_stream_payload_with_iv`] directly with a single IV drawn once
+/// per `write_linearized` invocation instead (see
+/// `crate::linearization::writer::append_hint_stream_object`'s doc).
+pub(crate) fn encrypt_stream_payload_for_writer(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     ctx: &EncryptionContext,
 ) -> Result<()> {
-    use crate::pipeline::rc4::PlRc4;
-    use crate::security::standard::{
-        encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
-    };
-
     // AES (V=4 AESV2 or V=5 AESV3) prefixes a random 16-byte CBC IV; RC4 does
     // not. Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
     // entropy in a chroot at boot) as `Unsupported` instead of panicking.
-    let needs_aes_iv = matches!(
-        ctx.cipher,
-        WriteCipher::PerObject(ObjectKeyAlg::Aes) | WriteCipher::FileKeyAes256
-    );
+    let needs_aes_iv = cipher_needs_aes_iv(ctx.cipher);
     let mut iv = if ctx.static_aes_iv {
         crate::pipeline::aes::static_initialization_vector()
     } else {
@@ -2847,6 +2887,33 @@ fn encrypt_stream_payload_for_writer(
             ))
         })?;
     }
+
+    encrypt_stream_payload_with_iv(object_ref, stream, ctx, iv)
+}
+
+/// Core of [`encrypt_stream_payload_for_writer`]: encrypt `stream.data` in
+/// place with an explicit IV and update `/Length` to the on-disk (encrypted)
+/// byte count. `iv` is used verbatim for AES ciphers; RC4 has no IV concept
+/// and ignores it.
+///
+/// Exposed as a separate primitive so a caller that needs the *same*
+/// ciphertext across repeated calls (the linearized writer's hint stream,
+/// re-emitted once per convergence-loop pass) can supply one IV instead of
+/// getting a fresh random draw every call. Every other caller goes through
+/// [`encrypt_stream_payload_for_writer`], which draws the IV itself
+/// (once per call, as before this split) and forwards here — this function
+/// has no IV-selection policy of its own, so extracting it changes no
+/// caller's behavior.
+pub(crate) fn encrypt_stream_payload_with_iv(
+    object_ref: ObjectRef,
+    stream: &mut crate::Stream,
+    ctx: &EncryptionContext,
+    iv: [u8; 16],
+) -> Result<()> {
+    use crate::pipeline::rc4::PlRc4;
+    use crate::security::standard::{
+        encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
+    };
 
     match ctx.cipher {
         WriteCipher::PerObject(alg) => {
@@ -3445,12 +3512,16 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
             )
         })?;
+        // Resolve /ID[0] here (rather than inside `build_encryption_context`) so
+        // this is the single place that decides it — matching qpdf's own
+        // `generateID()`-is-idempotent contract (see that function's doc).
+        let id0 = resolve_id0_for_encryption(pdf, options);
         Some(build_encryption_context(
-            pdf,
             options,
             params,
             base_for_encrypt,
             metadata_ref,
+            &id0,
         )?)
     } else if let Some(ref src) = options.copy_encryption {
         Some(build_copy_encryption_context(src, options, existing_max)?)
