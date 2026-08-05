@@ -35,7 +35,7 @@
 | `crates/flpdf/src/json/schema.rs` | correspondence | JSON.cc schema validation responsibilities |
 | `crates/flpdf/src/json/value.rs` | correspondence | JSON.cc shared value model and mutation and accessor responsibilities |
 | `crates/flpdf/src/json/writer.rs` | correspondence | JSON.cc incremental serialization and blob Base64 responsibilities |
-| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDF_json.cc writeJSON serialization and side-file lifecycle, and QPDFObjectHandle::getJSON object serialization responsibilities |
+| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDFObjectHandle::getJSON and QPDFObjectHandle::writeJSON object serialization, and QPDF_Stream::writeStreamJSON payload and dictionary normalization |
 | `crates/flpdf/src/lib.rs` | correspondence | crate root aggregating multiple qpdf library components and flpdf-only APIs |
 | `crates/flpdf/src/linearization/back_patch.rs` | correspondence | QPDFWriter.cc linearization back-patching split from the writer |
 | `crates/flpdf/src/linearization/check.rs` | correspondence | QPDF_linearization.cc structural validation represented as a standalone checker |
@@ -111,6 +111,7 @@
 | `crates/flpdf/src/pipeline/string.rs` | correspondence | Pl_String.cc accumulation, optional pass-through, and finish forwarding |
 | `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
+| `crates/flpdf/src/qpdf_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |

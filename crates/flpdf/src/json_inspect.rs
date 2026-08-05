@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDF_json.cc writeJSON serialization and side-file lifecycle, and QPDFObjectHandle::getJSON object serialization responsibilities.
+//! qpdf correspondence: QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDFObjectHandle::getJSON and QPDFObjectHandle::writeJSON object serialization, and QPDF_Stream::writeStreamJSON payload and dictionary normalization.
 //! qpdf JSON v2 inspection builders and command-boundary output coordinator.
 //!
 //! Provides the structural frame for qpdf `--json` output.  Each builder
@@ -9,6 +9,12 @@
 //! explicitly finishes `PlOStream`, a top-level file relies on buffered
 //! close/drop without finishing `PlStdioFile`, and each side file explicitly
 //! finishes `PlStdioFile` before close/drop.
+//!
+//! The `qpdf` top-level key is not built here: qpdf serializes it in
+//! `QPDF_json.cc`, and [`crate::qpdf_json`] holds that boundary. The object
+//! and stream serialization primitives this module still owns —
+//! `QPDFObjectHandle::writeJSON` and `QPDF_Stream::writeStreamJSON` in qpdf —
+//! are shared with that module.
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::json::Json;
@@ -18,10 +24,16 @@ use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PipelineError, PlOStream, PlStdioFile};
 use crate::reader::Pdf;
 use std::borrow::Cow;
-use std::fs::File;
 use std::io::{Read, Seek, Write};
 
 pub(crate) use crate::pdf_string::{decode_pdf_text_string, lossy_utf16_to_utf8};
+
+/// The qpdf JSON version these builders emit.
+///
+/// qpdf selects the version from `--json=N`; flpdf accepts only version 2, so
+/// the value is fixed here and passed on to the writers that qpdf also
+/// parameterizes by version.
+pub(crate) const QPDF_JSON_VERSION: i32 = 2;
 
 // ── ConvertError ──────────────────────────────────────────────────────────────
 
@@ -71,6 +83,9 @@ pub enum JsonOutputError {
         #[source]
         source: std::io::Error,
     },
+    /// A qpdf JSON version other than 2 was requested.
+    #[error("QPDF::writeJSON: only version 2 is supported")]
+    UnsupportedVersion,
 }
 
 /// Ordinary output handle supplied at the qpdf JSON command boundary.
@@ -81,7 +96,7 @@ pub enum JsonOutput<'a> {
     File(&'a mut dyn Write),
 }
 
-fn side_file_io_error(
+pub(crate) fn side_file_io_error(
     operation: &'static str,
     path: &str,
     source: std::io::Error,
@@ -288,13 +303,13 @@ fn qpdf_dict_to_json<R: Read + Seek>(
 /// qpdf 11.9.0 dispatches every PDF object to its type-specific `writeJSON`
 /// implementation through one shared `JSON::Writer`. That writer's start,
 /// next, and end methods also define observable pipeline-write boundaries.
-enum OrderedPdfJson {
+pub(crate) enum OrderedPdfJson {
     Scalar(RawPdfJsonScalar),
     Array(Vec<OrderedPdfJson>),
     Dictionary(Vec<(RawPdfJsonKey, OrderedPdfJson)>),
 }
 
-enum RawPdfJsonScalar {
+pub(crate) enum RawPdfJsonScalar {
     Null,
     Boolean(bool),
     Integer(i64),
@@ -304,17 +319,17 @@ enum RawPdfJsonScalar {
     Reference(Vec<u8>),
 }
 
-enum RawPdfJsonKey {
+pub(crate) enum RawPdfJsonKey {
     PdfName(RawPdfName),
     Literal(Vec<u8>),
 }
 
-struct RawPdfName {
+pub(crate) struct RawPdfName {
     non_utf8: bool,
     encoded: Vec<u8>,
 }
 
-struct RawPdfString {
+pub(crate) struct RawPdfString {
     unicode: bool,
     encoded: Vec<u8>,
 }
@@ -505,13 +520,17 @@ impl<'a> RawPdfJsonWriter<'a> {
 }
 
 impl OrderedPdfJson {
-    fn write(&self, out: &mut dyn Pipeline, depth: usize) -> Result<(), JsonOutputError> {
+    pub(crate) fn write(
+        &self,
+        out: &mut dyn Pipeline,
+        depth: usize,
+    ) -> Result<(), JsonOutputError> {
         RawPdfJsonWriter::new(out, depth).write_value(self)?;
         Ok(())
     }
 }
 
-fn ordered_qpdf_dict<R: Read + Seek>(
+pub(crate) fn ordered_qpdf_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &Dictionary,
 ) -> Result<OrderedPdfJson, ConvertError> {
@@ -528,7 +547,7 @@ fn ordered_qpdf_dict<R: Read + Seek>(
     Ok(OrderedPdfJson::Dictionary(entries))
 }
 
-fn ordered_qpdf_object<R: Read + Seek>(
+pub(crate) fn ordered_qpdf_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     object: &Object,
 ) -> Result<OrderedPdfJson, ConvertError> {
@@ -611,7 +630,7 @@ fn qpdf_pdf_object_to_json<R: Read + Seek>(
     }
 }
 
-fn qpdf_resolve_top_level_object<R: Read + Seek>(
+pub(crate) fn qpdf_resolve_top_level_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
 ) -> Result<Object, ConvertError> {
@@ -921,15 +940,6 @@ pub enum StreamDataMode {
     File { prefix: String },
 }
 
-/// Format the side-file path for a `File`-mode stream entry.
-///
-/// qpdf 11.9.0 names side files `<prefix>-<obj_num>` — the bare object
-/// number with no zero-padding. Centralized here so the JSON `datafile`
-/// value and incremental JSON side-file writer always produce the same name.
-pub fn format_json_side_file_path(prefix: &str, obj_num: u32) -> String {
-    format!("{prefix}-{obj_num}")
-}
-
 // ── build_qpdf_key ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1069,7 +1079,8 @@ fn build_qpdf_object_entry<R: Read + Seek>(
                     let payload = stream_payload_with_decode_status(stream, decode_level);
                     let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
                     let dict_json = qpdf_dict_to_json(pdf, &dict)?;
-                    let datafile = format_json_side_file_path(prefix, object_ref.number);
+                    let datafile =
+                        crate::qpdf_json::format_json_side_file_path(prefix, object_ref.number);
                     let stream_inner = json_dictionary([
                         ("datafile".to_string(), Json::make_string(datafile)),
                         ("dict".to_string(), dict_json),
@@ -1092,7 +1103,10 @@ fn build_qpdf_object_entry<R: Read + Seek>(
     }
 }
 
-fn normalized_emitted_stream_dict(stream: &Stream, decode_succeeded: bool) -> Dictionary {
+pub(crate) fn normalized_emitted_stream_dict(
+    stream: &Stream,
+    decode_succeeded: bool,
+) -> Dictionary {
     // qpdf 11.9.0 QPDF_Stream.cc:272-292 normalizes only dictionaries whose
     // payload is emitted; dict-only mode keeps the original stream dictionary.
     let mut dict = stream.dict.clone();
@@ -1164,12 +1178,12 @@ pub fn stream_payload_for_decode_level(
     stream_payload_with_decode_status(stream, decode_level).bytes
 }
 
-struct StreamPayload<'a> {
-    bytes: Cow<'a, [u8]>,
-    decode_succeeded: bool,
+pub(crate) struct StreamPayload<'a> {
+    pub(crate) bytes: Cow<'a, [u8]>,
+    pub(crate) decode_succeeded: bool,
 }
 
-fn stream_payload_with_decode_status(
+pub(crate) fn stream_payload_with_decode_status(
     stream: &Stream,
     decode_level: DecodeLevel,
 ) -> StreamPayload<'_> {
@@ -2824,265 +2838,6 @@ fn emit_section(
     Ok(())
 }
 
-fn object_selected(selectors: &[JsonObjectSelector], object_ref: ObjectRef) -> bool {
-    selectors.is_empty()
-        || selectors.iter().any(|selector| {
-            matches!(
-                selector,
-                JsonObjectSelector::Object { number, generation }
-                    if *number == object_ref.number
-                        && *generation == object_ref.generation
-            )
-        })
-}
-
-fn trailer_selected(selectors: &[JsonObjectSelector]) -> bool {
-    selectors.is_empty()
-        || selectors
-            .iter()
-            .any(|selector| matches!(selector, JsonObjectSelector::Trailer))
-}
-
-fn write_qpdf_section<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    decode_level: DecodeLevel,
-    stream_mode: &StreamDataMode,
-    objects: &[JsonObjectSelector],
-    out: &mut dyn Pipeline,
-    top_first: &mut bool,
-) -> Result<(), JsonOutputError> {
-    Json::write_dictionary_key(out, top_first, b"qpdf", 1)?;
-    let mut qpdf_first = true;
-    Json::write_array_open(out, &mut qpdf_first, 1)?;
-    Json::write_next(out, &mut qpdf_first, 2)?;
-    let mut metadata_first = true;
-    Json::write_dictionary_open(out, &mut metadata_first, 2)?;
-    Json::write_dictionary_item(
-        out,
-        &mut metadata_first,
-        b"jsonversion",
-        &Json::make_int(2),
-        3,
-    )?;
-    Json::write_dictionary_item(
-        out,
-        &mut metadata_first,
-        b"pdfversion",
-        &Json::make_string(pdf.version()),
-        3,
-    )?;
-    Json::write_dictionary_item(
-        out,
-        &mut metadata_first,
-        b"pushedinheritedpageresources",
-        &Json::make_bool(false),
-        3,
-    )?;
-    Json::write_dictionary_item(
-        out,
-        &mut metadata_first,
-        b"calledgetallpages",
-        &Json::make_bool(pdf.ever_called_get_all_pages()),
-        3,
-    )?;
-    Json::write_dictionary_key(out, &mut metadata_first, b"maxobjectid", 3)?;
-    let prepared = pdf
-        .prepare_qpdf_json_objects()
-        .map_err(ConvertError::from)?;
-    Json::make_int(i64::from(prepared.max_object_id)).write(out, 3)?;
-    Json::write_dictionary_close(out, metadata_first, 2)?;
-
-    Json::write_next(out, &mut qpdf_first, 2)?;
-    let mut objects_first = true;
-    Json::write_dictionary_open(out, &mut objects_first, 2)?;
-    for object_ref in prepared.refs {
-        if !object_selected(objects, object_ref) {
-            continue;
-        }
-        let result = match stream_mode {
-            StreamDataMode::None => write_non_file_mode_object_entry(
-                pdf,
-                object_ref,
-                decode_level,
-                NonFileStreamDataMode::None,
-                out,
-                &mut objects_first,
-            ),
-            StreamDataMode::Inline => write_non_file_mode_object_entry(
-                pdf,
-                object_ref,
-                decode_level,
-                NonFileStreamDataMode::Inline,
-                out,
-                &mut objects_first,
-            ),
-            StreamDataMode::File { prefix } => write_file_mode_object_entry(
-                pdf,
-                object_ref,
-                decode_level,
-                prefix,
-                out,
-                &mut objects_first,
-            ),
-        };
-        result?;
-    }
-
-    if trailer_selected(objects) {
-        let trailer = ordered_qpdf_dict(pdf, &pdf.trailer().clone())?;
-        Json::write_dictionary_key(out, &mut objects_first, b"trailer", 3)?;
-        let mut trailer_first = true;
-        Json::write_dictionary_open(out, &mut trailer_first, 3)?;
-        Json::write_dictionary_key(out, &mut trailer_first, b"value", 4)?;
-        trailer.write(out, 4)?;
-        Json::write_dictionary_close(out, trailer_first, 3)?;
-    }
-    // qpdf keeps the raw object map expanded even when selectors match
-    // neither an object nor the trailer: `{\n    }`, not compact `{}`.
-    Json::write_dictionary_close(out, false, 2)?;
-    Json::write_array_close(out, qpdf_first, 1)?;
-    Ok(())
-}
-
-enum NonFileStreamDataMode {
-    None,
-    Inline,
-}
-
-fn write_non_file_mode_object_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
-    decode_level: DecodeLevel,
-    stream_mode: NonFileStreamDataMode,
-    out: &mut dyn Pipeline,
-    objects_first: &mut bool,
-) -> Result<(), JsonOutputError> {
-    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
-    let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
-
-    match object {
-        Object::Stream(stream) => {
-            let (data, dict) = match stream_mode {
-                NonFileStreamDataMode::None => (None, ordered_qpdf_dict(pdf, &stream.dict)?),
-                NonFileStreamDataMode::Inline => {
-                    let payload = stream_payload_with_decode_status(&stream, decode_level);
-                    let dict = normalized_emitted_stream_dict(&stream, payload.decode_succeeded);
-                    let ordered = ordered_qpdf_dict(pdf, &dict)?;
-                    let bytes = payload.bytes.into_owned();
-                    (
-                        Some(Json::make_blob(move |sink| sink.write(&bytes))),
-                        ordered,
-                    )
-                }
-            };
-
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
-            let mut stream_first = true;
-            Json::write_dictionary_open(out, &mut stream_first, 4)?;
-            if let Some(data) = data {
-                Json::write_dictionary_item(out, &mut stream_first, b"data", &data, 5)?;
-            }
-            Json::write_dictionary_key(out, &mut stream_first, b"dict", 5)?;
-            dict.write(out, 5)?;
-            Json::write_dictionary_close(out, stream_first, 4)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
-        other => {
-            let value = ordered_qpdf_object(pdf, &other)?;
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
-            value.write(out, 4)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_file_mode_object_entry<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object_ref: ObjectRef,
-    decode_level: DecodeLevel,
-    prefix: &str,
-    out: &mut dyn Pipeline,
-    objects_first: &mut bool,
-) -> Result<(), JsonOutputError> {
-    let object = qpdf_resolve_top_level_object(pdf, object_ref)?;
-    let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
-
-    match object {
-        Object::Stream(stream) => {
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"stream", 4)?;
-
-            let side_path = format_json_side_file_path(prefix, object_ref.number);
-            let mut side_file = File::create(&side_path)
-                .map_err(|source| side_file_io_error("open", &side_path, source))?;
-            write_file_mode_side_file(pdf, &stream, decode_level, &side_path, &mut side_file, out)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
-        other => {
-            let value = ordered_qpdf_object(pdf, &other)?;
-            Json::write_dictionary_key(out, objects_first, key.as_bytes(), 3)?;
-            let mut object_first = true;
-            Json::write_dictionary_open(out, &mut object_first, 3)?;
-            Json::write_dictionary_key(out, &mut object_first, b"value", 4)?;
-            value.write(out, 4)?;
-            Json::write_dictionary_close(out, object_first, 3)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_file_mode_side_file<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    stream: &Stream,
-    decode_level: DecodeLevel,
-    side_path: &str,
-    side_file: &mut dyn Write,
-    out: &mut dyn Pipeline,
-) -> Result<(), JsonOutputError> {
-    let mut buffered = StdioBuffer::new(side_file);
-    let mut terminal = PlStdioFile::new("stream data", &mut buffered);
-    write_file_mode_stream_value(pdf, stream, decode_level, side_path, &mut terminal, out)?;
-    terminal.finish()?;
-    Ok(())
-}
-
-fn write_file_mode_stream_value<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    stream: &Stream,
-    decode_level: DecodeLevel,
-    side_path: &str,
-    side_file: &mut dyn Pipeline,
-    out: &mut dyn Pipeline,
-) -> Result<(), JsonOutputError> {
-    let payload = stream_payload_with_decode_status(stream, decode_level);
-    let mut stream_first = true;
-    Json::write_dictionary_open(out, &mut stream_first, 4)?;
-    Json::write_dictionary_item(
-        out,
-        &mut stream_first,
-        b"datafile",
-        &Json::make_string(side_path),
-        5,
-    )?;
-    side_file.write(payload.bytes.as_ref())?;
-
-    let dict = normalized_emitted_stream_dict(stream, payload.decode_succeeded);
-    let dict_json = ordered_qpdf_dict(pdf, &dict)?;
-    Json::write_dictionary_key(out, &mut stream_first, b"dict", 5)?;
-    dict_json.write(out, 5)?;
-    Json::write_dictionary_close(out, stream_first, 4)?;
-    Ok(())
-}
-
 /// Incrementally write a selected qpdf JSON v2 document.
 ///
 /// The envelope and selected sections are emitted in qpdf's fixed order.
@@ -3114,7 +2869,13 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
 ) -> Result<(), JsonOutputError> {
     let mut first = true;
     Json::write_dictionary_open(out, &mut first, 0)?;
-    Json::write_dictionary_item(out, &mut first, b"version", &Json::make_int(2), 1)?;
+    Json::write_dictionary_item(
+        out,
+        &mut first,
+        b"version",
+        &Json::make_int(i64::from(QPDF_JSON_VERSION)),
+        1,
+    )?;
     Json::write_dictionary_item(
         out,
         &mut first,
@@ -3161,7 +2922,19 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         || build_outlines_section(pdf),
     )?;
     if json_section_selected(keys, JsonKey::Qpdf) {
-        write_qpdf_section(pdf, decode_level, stream_mode, objects, out, &mut first)?;
+        // qpdf's doJSONObjects delegates the whole "qpdf" key to
+        // QPDF::writeJSON with complete=false, letting it continue the
+        // dictionary this function opened.
+        crate::qpdf_json::write_json_key(
+            pdf,
+            QPDF_JSON_VERSION,
+            out,
+            false,
+            &mut first,
+            decode_level,
+            stream_mode,
+            objects,
+        )?;
     }
     Json::write_dictionary_close(out, first, 0)?;
     out.write(b"\n")?;
@@ -3220,6 +2993,7 @@ mod tests {
     use super::*;
     use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
+    use crate::qpdf_json::{format_json_side_file_path, write_json_stream_file};
     use std::rc::Rc;
 
     fn number(value: impl ToString) -> serde_json::Value {
@@ -4900,7 +4674,7 @@ mod tests {
         let mut out = Vec::new();
         let result = {
             let mut output = PlString::new("file-mode main output", None, &mut out);
-            write_file_mode_side_file(
+            write_json_stream_file(
                 &mut pdf,
                 &stream,
                 DecodeLevel::None,
@@ -4942,7 +4716,7 @@ mod tests {
         let trace = shared_trace();
         let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
-        write_file_mode_side_file(
+        write_json_stream_file(
             &mut pdf,
             &stream,
             DecodeLevel::None,
@@ -4981,7 +4755,7 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut output = PlString::new("file-mode main output", None, &mut out);
-            write_file_mode_side_file(
+            write_json_stream_file(
                 &mut pdf,
                 &stream,
                 DecodeLevel::None,
@@ -5005,7 +4779,7 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut output = PlString::new("file-mode main output", None, &mut out);
-            write_file_mode_side_file(
+            write_json_stream_file(
                 &mut pdf,
                 &stream,
                 DecodeLevel::None,
@@ -5028,7 +4802,7 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut output = PlString::new("file-mode main output", None, &mut out);
-            write_file_mode_side_file(
+            write_json_stream_file(
                 &mut pdf,
                 &stream,
                 DecodeLevel::None,
@@ -5055,7 +4829,7 @@ mod tests {
         let trace = shared_trace();
         let mut out = RecordingSink::with_trace(trace.clone(), &[], &[]);
 
-        let error = write_file_mode_side_file(
+        let error = write_json_stream_file(
             &mut pdf,
             &stream,
             DecodeLevel::None,

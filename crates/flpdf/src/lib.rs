@@ -146,6 +146,7 @@ pub mod pdf_version;
 pub mod permissions;
 pub mod pipeline;
 pub mod qdf_fix;
+pub mod qpdf_json;
 pub(crate) mod qpdf_null;
 pub mod reader;
 #[cfg(not(feature = "qtest-driver"))]
