@@ -711,7 +711,7 @@ pub fn effective_pdf_version_and_ext<'a>(
 /// - [`crate::Error::Missing`] if the input has no `/Root` in its trailer.
 /// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
-fn inject_adbe_extension<R: Read + Seek>(
+pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     version: &str,
     extension_level: i64,
@@ -779,7 +779,7 @@ fn inject_adbe_extension<R: Read + Seek>(
 ///
 /// - Propagates [`Pdf::resolve`] errors when materialising the Catalog or an
 ///   indirect `/Extensions` value.
-fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
+pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
     // cov:ignore-start: defensive /Root guard. strip_adbe_extension is only
     // reached after write_pdf_full_rewrite passes its own root_ref check on
     // the same Pdf.
@@ -836,7 +836,7 @@ fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<()> {
 ///
 /// - Propagates [`Pdf::resolve_borrowed`] errors when materialising the Catalog
 ///   or an indirect `/Extensions` value.
-fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+pub(crate) fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
     // cov:ignore-start: defensive /Root guard. catalog_has_extensions_adbe is
     // only reached after write_pdf_full_rewrite passes its own root_ref check
     // on the same Pdf.

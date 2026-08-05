@@ -73,9 +73,10 @@ use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
 use crate::writer::{
-    effective_pdf_version, effective_stream_policy, is_lone_flate, reencode_stream_for_compress,
+    catalog_has_extensions_adbe, effective_pdf_version_and_ext, effective_stream_policy,
+    inject_adbe_extension, is_lone_flate, reencode_stream_for_compress,
     serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order, serialize::xref_stream,
-    CompressStreams, NewlineBeforeEndstream, WriteOptions, QPDF_STATIC_ID,
+    strip_adbe_extension, CompressStreams, NewlineBeforeEndstream, WriteOptions, QPDF_STATIC_ID,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -2743,6 +2744,45 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     Ok(())
 }
 
+/// Whether the destination Catalog's `/Extensions` entry (if present) is
+/// stored as an indirect reference, rather than a direct dictionary or
+/// absent.
+///
+/// [`inject_adbe_extension`]/[`strip_adbe_extension`] only ever rewrite
+/// content already inside the Catalog object itself (an `/Extensions` dict
+/// they create or update is always a *direct* nested value — see
+/// `inject_adbe_extension`'s own doc), so calling them never changes how
+/// many indirect objects exist... UNLESS the source `/Extensions` was
+/// *already* indirect, in which case inlining it drops that indirect
+/// object's reachability from the Catalog.
+///
+/// `crate::writer::write_pdf_full_rewrite_inner` can absorb that safely: it
+/// mutates the Catalog and THEN builds its `CatalogFirstRenumber` from the
+/// SAME (now-mutated) handle (`writer.rs:3154-3238`), so the dropped object
+/// simply never gets a slot. [`write_linearized`] cannot: its
+/// `plan`/`renumber` are built by the CALLER from a SEPARATE `Pdf` handle
+/// BEFORE this function ever runs (see the doc above the
+/// `Optimization::prepare_for_linearized_write` call below), so an indirect
+/// source `/Extensions` object is already counted in that frozen `plan`
+/// and would still be walked and emitted — with its STALE, now-orphaned,
+/// pre-inline content — a genuine byte divergence from qpdf, not a
+/// cosmetic one. [`write_linearized`] checks this so that combination can
+/// be rejected loudly (`Unsupported`) instead of silently producing wrong
+/// bytes.
+fn catalog_extensions_is_indirect<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    let Some(root_ref) = pdf.root_ref() else {
+        return Ok(false);
+    };
+    let catalog = pdf.resolve_borrowed(root_ref)?;
+    let Some(catalog_dict) = catalog.as_dict() else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        catalog_dict.get("Extensions"),
+        Some(Object::Reference(_))
+    ))
+}
+
 /// Write a complete linearized PDF to an in-memory buffer.
 ///
 /// Given a [`LinearizationPlan`] (which partitions all objects into the four
@@ -2797,6 +2837,17 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
 /// is set. This is a temporary flpdf scope limitation, not a qpdf
 /// restriction: qpdf itself supports linearize+copy-encryption together.
 /// [`WriteOptions::encrypt`] is not affected by this restriction.
+///
+/// Returns [`crate::Error::Unsupported`] when the effective Adobe developer
+/// extension level (`/Extensions /ADBE /ExtensionLevel` — contributed by
+/// [`WriteOptions::encrypt`]'s method, [`WriteOptions::min_extension_level`],
+/// or the source document itself) would change AND the source Catalog's
+/// `/Extensions` entry is stored as an indirect reference. This is a
+/// temporary flpdf scope limitation, not a qpdf restriction: inlining an
+/// indirect `/Extensions` here would orphan its already-numbered object slot
+/// (this function's object numbering is fixed by its `plan`/`renumber`
+/// parameters before it runs). A source `/Extensions` that is absent, or
+/// already a direct dictionary, is always handled correctly.
 ///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
@@ -3230,7 +3281,45 @@ pub fn write_linearized<R: Read + Seek>(
     // container (qpdf raises the minimum on real emission, not on mode). When
     // all batch lists are empty the placement early-returned and no container
     // is written, so the non-ObjStm linearized goldens stay at the 1.2 floor.
-    let eff_version = effective_pdf_version(pdf.version(), options, true, emits_object_streams);
+    //
+    // Adobe developer-extension propagation (qpdf QPDFWriter.cc L1355-1450
+    // `addDeveloperExtension`, and the pairwise `setMinimumPDFVersion`
+    // contributions at L806-815 that give V=5 R=6/R=5 `--encrypt` their
+    // `/Extensions /ADBE /ExtensionLevel` 8/3 floor) — mirrors
+    // `crate::writer::write_pdf_full_rewrite_inner`'s handling
+    // (writer.rs:3154-3238), reusing the SAME pairwise-combine function so
+    // the injected `/BaseVersion` always agrees with the header version
+    // computed from the identical `(eff_version, eff_ext)` pair. `source_ver`
+    // is cloned to an owned `String` first so the borrow-checker sees no
+    // conflict between the immutable `pdf.version()` read and the `&mut self`
+    // `pdf.adobe_extension_level()` call just below it (mirrors the flat
+    // writer's own `source_ver`/`source_ext` locals).
+    let source_ver = pdf.version().to_string();
+    let source_ext = pdf.adobe_extension_level().unwrap_or(0);
+    let (eff_version, eff_ext) =
+        effective_pdf_version_and_ext(&source_ver, source_ext, options, true, emits_object_streams);
+    if eff_ext > 0 || catalog_has_extensions_adbe(pdf)? {
+        // See `catalog_extensions_is_indirect`'s doc for why an indirect
+        // source `/Extensions` is rejected here rather than inlined: unlike
+        // the flat writer, this function's `plan`/`renumber` were already
+        // frozen by the caller from a separate `Pdf` handle before this
+        // point, so inlining an indirect `/Extensions` here would orphan its
+        // already-counted slot while still emitting it with stale content.
+        if catalog_extensions_is_indirect(pdf)? {
+            return Err(crate::Error::Unsupported(
+                "linearize: a source Catalog /Extensions stored as an \
+                 indirect reference is not yet supported when the effective \
+                 Adobe extension level changes; inline /Extensions in the \
+                 source or file a follow-up if you need this combination"
+                    .to_string(),
+            ));
+        }
+        if eff_ext > 0 {
+            inject_adbe_extension(pdf, eff_version, eff_ext)?;
+        } else {
+            strip_adbe_extension(pdf)?;
+        }
+    }
     let part1 = Part1Bytes::build(plan, renumber, eff_version);
     let part1_placeholders = part1.placeholders.clone();
     let part1_dict_region = part1.dict_writable_region.clone();
@@ -6577,6 +6666,35 @@ mod tests {
             );
         }
 
+        // V=5 R=6 floors the Adobe developer extension level to 8 at
+        // `/Extensions /ADBE /ExtensionLevel` on the CATALOG (qpdf
+        // QPDFWriter.cc L806-808's `setMinimumPDFVersion("1.7", 8)`,
+        // L1355-1450's `addDeveloperExtension` — verified byte-identical
+        // against real qpdf 11.9.0's `--linearize --encrypt "" owner 256
+        // --static-id --static-aes-iv --` output for this exact fixture
+        // shape). This was flpdf-txag's Task 11 review-found gap:
+        // `write_linearized` wired the header-version half
+        // (`effective_pdf_version`) but never the Catalog-injection half
+        // that `crate::writer::write_pdf_full_rewrite_inner` already had
+        // (writer.rs:3154-3238).
+        let catalog_new_ref = renumber
+            .new_for_original(plan.root_ref.expect("plan has root_ref"))
+            .expect("catalog must be in the renumber map");
+        let catalog_object_bytes = find_object_bytes(&out, catalog_new_ref.number);
+        for needle in [
+            b"/Extensions".as_slice(),
+            b"/ADBE".as_slice(),
+            b"/BaseVersion /1.7".as_slice(),
+            b"/ExtensionLevel 8".as_slice(),
+        ] {
+            assert!(
+                catalog_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=6 Catalog must contain {needle:?}"
+            );
+        }
+
         crate::linearization::check_linearization_bytes(&out)
             .expect("V=5 R=6 encrypted linearized output must pass the linearization checker");
 
@@ -6671,6 +6789,28 @@ mod tests {
             );
         }
 
+        // V=5 R=5 floors the Adobe developer extension level to 3 (qpdf
+        // QPDFWriter.cc L806-808's `setMinimumPDFVersion("1.7", 3)`) — see
+        // the R=6 sibling test's identical comment for the full citation and
+        // the real-qpdf byte-identical verification this mirrors.
+        let catalog_new_ref = renumber
+            .new_for_original(plan.root_ref.expect("plan has root_ref"))
+            .expect("catalog must be in the renumber map");
+        let catalog_object_bytes = find_object_bytes(&out, catalog_new_ref.number);
+        for needle in [
+            b"/Extensions".as_slice(),
+            b"/ADBE".as_slice(),
+            b"/BaseVersion /1.7".as_slice(),
+            b"/ExtensionLevel 3".as_slice(),
+        ] {
+            assert!(
+                catalog_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=5 Catalog must contain {needle:?}"
+            );
+        }
+
         let mut checker_pdf = Pdf::open_with_options(
             Cursor::new(out.clone()),
             crate::PdfOpenOptions {
@@ -6708,6 +6848,136 @@ mod tests {
                 "V=5 R=5 content stream must decrypt back to its original plaintext"
             );
         }
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as an
+    /// INDIRECT reference (object 4) to `<< /ADBE << /BaseVersion /1.6
+    /// /ExtensionLevel 2 >> >>` — the scope-out case
+    /// [`catalog_extensions_is_indirect`] rejects.
+    fn tiny_pdf_with_indirect_extensions_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /ADBE << /BaseVersion /1.6 /ExtensionLevel 2 >> >>\nendobj\n",
+        );
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Task 11 review fix: a source Catalog `/Extensions` stored as an
+    /// indirect reference must be rejected loudly, not silently inlined —
+    /// see [`catalog_extensions_is_indirect`]'s doc for why (this function's
+    /// `plan`/`renumber` are already frozen from a separate `Pdf` handle by
+    /// the time this runs, unlike `crate::writer::write_pdf_full_rewrite_inner`,
+    /// which mutates the Catalog before its OWN renumbering). V=5 R=6
+    /// encryption's ext-8 floor (`eff_ext > 0`) is what makes this fixture
+    /// actually need to touch `/Extensions` at all — a non-encrypting
+    /// linearize of the same fixture takes neither the inject nor the
+    /// reject branch, since its own ext(2)-vs-source(2) pairwise result
+    /// never changes.
+    #[test]
+    fn linearize_encrypt_v5_rejects_indirect_source_extensions() {
+        let src = tiny_pdf_with_indirect_extensions_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries a DIRECT `/Extensions`
+    /// dict with a malformed `/ADBE` entry (no `/ExtensionLevel` key at
+    /// all) — qpdf removes `/ADBE` based on key existence, not
+    /// `/ExtensionLevel` validity (QPDFWriter.cc L1387), so this must be
+    /// stripped whenever the effective extension level is 0, even without
+    /// any version race.
+    fn tiny_pdf_with_malformed_direct_extensions_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE << >> >> >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Task 11 review fix, the STRIP arm: a non-encrypting linearize (no
+    /// `--min-extension-level`, so the effective extension level is 0) of a
+    /// source whose Catalog already carries a stale/malformed direct
+    /// `/Extensions /ADBE` must have that key removed from the output —
+    /// mirrors `crate::writer::strip_adbe_extension`'s doc and its
+    /// full-rewrite byte-parity precedent, now wired through
+    /// `write_linearized` too.
+    #[test]
+    fn linearize_strips_malformed_direct_source_extensions_when_no_ext_requested() {
+        let src = tiny_pdf_with_malformed_direct_extensions_bytes();
+        let out = linearize_with(&src, |_o| {});
+        let needle: &[u8] = b"/Extensions";
+        assert!(
+            !out.windows(needle.len()).any(|w| w == needle),
+            "stale /Extensions /ADBE (no /ExtensionLevel) must be stripped when no \
+             effective extension level is requested"
+        );
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("output with stripped /Extensions must still pass the linearization checker");
     }
 
     /// Build a linearizable single-page PDF whose Catalog carries a
