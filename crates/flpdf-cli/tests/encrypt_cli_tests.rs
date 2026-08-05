@@ -13,6 +13,8 @@ use std::process::Command as ShellCommand;
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
+const TWO_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/two-page.pdf";
+const THREE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
 
 fn fixture(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
@@ -2192,4 +2194,133 @@ fn rewrite_linearize_encrypt_object_streams_generate_is_rejected_with_actionable
         !output.exists(),
         "rejected linearize+encrypt+object-streams=generate must not leave a partial output behind"
     );
+}
+
+/// Whole-document byte parity for linearized AES-128 (V=4/AESV2) encrypted
+/// output against real qpdf.
+///
+/// Same rationale as `encrypted_document_is_byte_identical_to_qpdf` above
+/// (V=4/AESV2 only, `qpdf-zlib-compat`-gated for the DEFLATE backend), plus
+/// `--linearize`: qpdf's linearized+encrypted object-number sequence
+/// (`QPDFWriter.cc:2563-2624`) places the `/Encrypt` dictionary right before
+/// the hint stream, writes `/Encrypt <ref> 0 R` only in the first-half
+/// trailer, and encrypts the hint stream's payload but not the classic xref
+/// table or the `/Encrypt` dictionary object itself. This test is the
+/// end-to-end proof that all of that lines up byte-for-byte with qpdf 11.9.0,
+/// not just "looks right" per the unit-level assertions that pinned each of
+/// those pieces individually.
+///
+/// Uses one/two/three-page fixtures, not just `ONE_PAGE_FIXTURE`:
+/// `RenumberMap::reserve_encrypt_dict_slot`'s object-number shift and the
+/// hint stream's shared-object table are close to degenerate on a single
+/// page (almost nothing sits after the hint-stream slot to shift, and the
+/// shared-object table is trivially small), so a one-page-only comparison
+/// would barely exercise the object-renumbering and hint-table machinery
+/// this feature actually added.
+///
+/// Covers both flpdf write surfaces — the top-level `--linearize` alias and
+/// the `rewrite --linearize` subcommand — against the *same* qpdf oracle
+/// output per fixture. They build `WriteOptions` independently (see
+/// `fix(cli): allow --linearize with --encrypt / --copy-encryption-from`,
+/// which fixed a real bug where the top-level alias silently dropped
+/// `--encrypt`), so comparing only one surface would leave the other
+/// unverified.
+///
+/// 256-bit (V=5/AESV3) is excluded for the same reason as the non-linearized
+/// test: its random salt bytes are not seeded by `--static-id`/
+/// `--static-aes-iv`, so even two qpdf runs of the same invocation diverge.
+#[cfg(feature = "qpdf-zlib-compat")]
+#[test]
+fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+
+    let qpdf_args = [
+        "--linearize",
+        "--static-id",
+        "--static-aes-iv",
+        "--encrypt",
+        "",
+        "",
+        "128",
+        "--use-aes=y",
+        "--",
+    ];
+
+    for (case, fixture_path) in [
+        ("one-page", ONE_PAGE_FIXTURE),
+        ("two-page", TWO_PAGE_FIXTURE),
+        ("three-page", THREE_PAGE_FIXTURE),
+    ] {
+        let input = fixture(fixture_path);
+
+        let theirs = tmp.path().join(format!("{case}-qpdf.pdf"));
+        let qpdf = std::process::Command::new("qpdf")
+            .args(qpdf_args)
+            .arg(&input)
+            .arg(&theirs)
+            .output()
+            .unwrap();
+        assert!(
+            qpdf.status.success(),
+            "{case}: qpdf reference run failed: {}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        let reference = std::fs::read(&theirs).unwrap();
+
+        // Surface 1: the top-level `--linearize` alias.
+        let top_level = tmp.path().join(format!("{case}-flpdf-top-level.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(qpdf_args)
+            .arg(&input)
+            .arg(&top_level)
+            .assert()
+            .success();
+        let top_level_bytes = std::fs::read(&top_level).unwrap();
+        assert_eq!(
+            top_level_bytes, reference,
+            "{case}: top-level `flpdf --linearize --encrypt` (AES-128) must be \
+             byte-identical to qpdf 11.9.0"
+        );
+
+        // Surface 2: the `rewrite --linearize` subcommand.
+        let rewrite = tmp.path().join(format!("{case}-flpdf-rewrite.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .arg("rewrite")
+            .args(qpdf_args)
+            .arg(&input)
+            .arg(&rewrite)
+            .assert()
+            .success();
+        let rewrite_bytes = std::fs::read(&rewrite).unwrap();
+        assert_eq!(
+            rewrite_bytes, reference,
+            "{case}: `flpdf rewrite --linearize --encrypt` (AES-128) must be \
+             byte-identical to qpdf 11.9.0"
+        );
+
+        // Determinism check: a second top-level run of the identical
+        // invocation must also be byte-identical, proving --static-id
+        // --static-aes-iv genuinely eliminate every source of
+        // nondeterminism on this path (not just that this one run happened
+        // to match this one qpdf sample).
+        let top_level_again = tmp.path().join(format!("{case}-flpdf-top-level-again.pdf"));
+        Command::cargo_bin("flpdf")
+            .unwrap()
+            .args(qpdf_args)
+            .arg(&input)
+            .arg(&top_level_again)
+            .assert()
+            .success();
+        let top_level_again_bytes = std::fs::read(&top_level_again).unwrap();
+        assert_eq!(
+            top_level_bytes, top_level_again_bytes,
+            "{case}: two flpdf runs of the same --static-id --static-aes-iv \
+             invocation must be byte-identical to each other"
+        );
+    }
 }
