@@ -922,16 +922,42 @@ mod live_input_tests {
             .spawn(move || {
                 let mut input = CountingInput::new(leaked);
                 let mut resolver = NullResolver;
-                parse_live_file_object(&mut input, &mut resolver)
-                    .expect("500 nested containers must parse")
-                    .value
-                    .is_null()
+                // qpdf's parser owns a heap `std::vector<StackFrame>`
+                // (`QPDFParser.hh:75`), while `QPDF_Array` keeps its normal
+                // shared-ownership destructor (`QPDF_Array.hh:19`). Keep this
+                // small-stack test scoped to the former: qpdf itself exits
+                // 139 after parsing and then destroying this tree with a
+                // 256 KiB process stack.
+                let parsed = std::mem::ManuallyDrop::new(
+                    parse_live_file_object(&mut input, &mut resolver)
+                        .expect("500 nested containers must parse"),
+                );
+                parsed.value.is_null()
             })
             .expect("spawn small-stack parser thread")
             .join()
             .expect("live parser must not overflow the caller stack");
 
         assert!(!outcome, "a valid 500-level array must not recover to null");
+    }
+
+    #[test]
+    fn live_file_parser_drops_qpdfs_500_container_limit_on_a_normal_stack() {
+        let mut bytes = vec![b'['; MAX_PARSE_DEPTH];
+        bytes.extend(std::iter::repeat_n(b']', MAX_PARSE_DEPTH));
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut input = CountingInput::new(leaked);
+        let mut resolver = NullResolver;
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver)
+            .expect("500 nested containers must parse");
+
+        assert!(
+            !parsed.value.is_null(),
+            "a valid 500-level array must not recover to null"
+        );
+        // Normal scope exit destroys the parsed object tree, as qpdf does
+        // outside the intentionally constrained parser-stack probe above.
     }
 
     #[test]
