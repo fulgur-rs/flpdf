@@ -311,6 +311,66 @@ mod tests {
     }
 
     #[test]
+    fn callback_string_writer_reaches_stream_object_in_compact_and_qdf() {
+        let mut dict = Dictionary::new();
+        dict.insert("Label", Object::String(b"stream".to_vec()));
+        dict.insert("Length", Object::Integer(4));
+        let object = Object::Stream(Stream {
+            dict,
+            data: b"data".to_vec(),
+        });
+
+        let mut compact = Vec::new();
+        let mut compact_seen = Vec::new();
+        let mut compact_writer = hex_recording_writer(&mut compact_seen);
+        object
+            .try_write_pdf_with_string_writer(&mut compact, &mut compact_writer)
+            .expect("compact stream-object callback serialization");
+        assert_eq!(
+            compact,
+            b"<< /Label <73747265616d> /Length 4 >>\nstream\ndata\nendstream"
+        );
+        drop(compact_writer);
+        assert_eq!(compact_seen, [b"stream".to_vec()]);
+
+        let mut qdf = Vec::new();
+        let mut qdf_seen = Vec::new();
+        let mut qdf_writer = hex_recording_writer(&mut qdf_seen);
+        object
+            .try_write_pdf_qdf_with_string_writer(&mut qdf, 0, &mut qdf_writer)
+            .expect("QDF stream-object callback serialization");
+        assert_eq!(
+            qdf,
+            b"<<\n  /Label <73747265616d>\n  /Length 4\n>>\nstream\ndata\nendstream"
+        );
+        drop(qdf_writer);
+        assert_eq!(qdf_seen, [b"stream".to_vec()]);
+    }
+
+    #[test]
+    fn stream_dictionary_length_callback_errors_propagate_in_compact_and_qdf() {
+        let mut dict = Dictionary::new();
+        dict.insert("Length", Object::String(b"invalid".to_vec()));
+
+        for qdf in [false, true] {
+            let mut out = Vec::new();
+            let mut writer = |_out: &mut Vec<u8>, value: &[u8]| {
+                assert_eq!(value, b"invalid");
+                Err(crate::Error::Internal("length writer failed".to_string()))
+            };
+            let result = if qdf {
+                dict.try_write_pdf_stream_qdf_with_string_writer(&mut out, 0, &mut writer)
+            } else {
+                dict.try_write_pdf_stream_with_string_writer(&mut out, false, &mut writer)
+            };
+            assert!(matches!(
+                result,
+                Err(crate::Error::Internal(message)) if message == "length writer failed"
+            ));
+        }
+    }
+
+    #[test]
     fn callback_string_writer_propagates_error() {
         let mut out = Vec::new();
         let mut writer = |_out: &mut Vec<u8>, _value: &[u8]| {

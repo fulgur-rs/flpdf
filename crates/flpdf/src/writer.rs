@@ -3529,6 +3529,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
         } else {
+            // cov:ignore-start: contiguous object and batch counts cannot approach u32::MAX in a supported process.
             let containers_len = u32::try_from(plan.batches.len()).map_err(|_| {
                 crate::Error::Unsupported(
                     "full-rewrite encrypt: ObjStm batch count overflows u32".to_string(),
@@ -3539,6 +3540,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
                 )
             })?
+            // cov:ignore-end
         };
         // Resolve /ID[0] here (rather than inside `build_encryption_context`) so
         // this is the single place that decides it — matching qpdf's own
@@ -3550,7 +3552,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             base_for_encrypt,
             metadata_ref,
             &id0,
-        )?)
+        )?) // cov:ignore: validated parameters leave only a non-injectable OS CSPRNG failure
     } else if let Some(ref src) = options.copy_encryption {
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
@@ -3561,7 +3563,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             src,
             options,
             base_for_encrypt,
-        )?)
+        )?) // cov:ignore: contiguous emission numbering cannot overflow u32 here
     } else {
         None
     };
@@ -3892,7 +3894,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                         options.newline_before_endstream,
                         encrypted_strings.as_mut(),
                         emit_ref,
-                    )?;
+                    )?; // cov:ignore: validated encryption state leaves only non-injectable CSPRNG failure
                 } else {
                     // cov:ignore-start: unreachable — this arm is inside the
                     // stream branch and reencode_stream_for_compress always
@@ -3910,7 +3912,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     options,
                     encrypted_strings.as_mut(),
                     emit_ref,
-                )?;
+                )?; // cov:ignore: validated encryption state leaves only non-injectable CSPRNG failure
             }
         } else if let Some(emitter) = encrypted_strings.as_mut() {
             emitter.write_object(&mut bytes, emit_ref, None, &object, options.qdf)?;
@@ -3975,7 +3977,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     Ok(())
                 }
             },
-        )?;
+        )?; // cov:ignore: validated ObjStm members and encryption state make callback propagation unreachable
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
@@ -6507,6 +6509,83 @@ mod tests {
             .as_bytes(),
         );
         bytes
+    }
+
+    /// The library supports copy-encryption in QDF mode even though the CLI
+    /// deliberately rejects that flag combination. QDF inserts an indirect
+    /// `/Length` holder after each stream, so `/Encrypt` must be allocated
+    /// after the final interleaved holder rather than after the last source
+    /// object. Re-opening the result exercises that non-colliding allocation.
+    #[test]
+    fn qdf_copy_encryption_allocates_encrypt_after_length_holders() {
+        use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
+        use crate::security::standard::ObjectKeyAlg;
+        use crate::PdfOpenOptions;
+        use std::io::Cursor;
+
+        let derivation_options = WriteOptions {
+            static_aes_iv: true,
+            ..WriteOptions::default()
+        };
+        let params = EncryptParams::v4_aes128(b"user-pw".to_vec(), b"owner-pw".to_vec());
+        let donor =
+            build_encryption_context(&derivation_options, &params, 4, None, &QPDF_STATIC_ID)
+                .expect("derive deterministic donor encryption state");
+        let source = CopyEncryptionSource {
+            encrypt_dict: donor.encrypt_dict,
+            file_key: donor.file_key,
+            id0: donor.id0,
+            object_key_alg: ObjectKeyAlg::Aes,
+        };
+
+        let fixture = build_string_and_stream_fixture();
+        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            qdf: true,
+            compress_streams: CompressStreams::No,
+            static_aes_iv: true,
+            copy_encryption: Some(source),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options)
+            .expect("QDF copy-encryption write must succeed");
+        assert!(out.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0"));
+
+        let mut reopened = Pdf::open_with_options(
+            Cursor::new(out),
+            PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("QDF copy-encryption output must reopen with donor password");
+        let encrypt_ref = reopened
+            .trailer()
+            .get_ref("Encrypt")
+            .expect("trailer must reference /Encrypt");
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(dict) => dict
+                .get_ref("Metadata")
+                .expect("Catalog must reference /Metadata"),
+            other => panic!("/Root must be a dictionary, got {other:?}"),
+        };
+        let length_ref = match reopened.resolve(metadata_ref).expect("resolve /Metadata") {
+            Object::Stream(stream) => stream
+                .dict
+                .get_ref("Length")
+                .expect("QDF stream must use an indirect /Length holder"),
+            other => panic!("/Metadata must be a stream, got {other:?}"),
+        };
+        assert_ne!(
+            encrypt_ref, length_ref,
+            "/Encrypt must not collide with QDF's interleaved /Length holder"
+        );
+        let (title, stream) = resolve_title_and_stream(&mut reopened);
+        assert_eq!(title, b"TopSecretTitle");
+        assert_eq!(stream, b"hello");
     }
 
     /// Resolve the `/Title` string and the content-stream payload from a

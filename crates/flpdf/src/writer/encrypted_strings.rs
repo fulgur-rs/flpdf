@@ -1,5 +1,4 @@
-//! qpdf correspondence: QPDFWriter.cc:1567-1599 and 1761-1796 encrypted string emission;
-//! QPDFWriter.cc:2244-2256 `/Encrypt` dictionary emission.
+//! qpdf correspondence: QPDFWriter.cc:1567-1599 string-unparse, QPDFWriter.cc:1761-1796 object data-key lifecycle, and QPDFWriter.cc:2244-2256 encryption-dictionary emission responsibilities.
 
 use crate::object::{write_hex_string, write_name_escaped, write_string_value};
 use crate::security::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
@@ -112,11 +111,13 @@ fn encrypt_string(
         [0; 16]
     };
     if crate::writer::cipher_needs_aes_iv(cipher) && !static_aes_iv {
+        // cov:ignore-start: the OS CSPRNG failure is not injectable in the local test harness.
         getrandom::getrandom(&mut iv).map_err(|error| {
             crate::Error::Unsupported(format!(
                 "OS CSPRNG (getrandom) unavailable for AES IV generation: {error}"
             ))
         })?;
+        // cov:ignore-end
     }
     match cipher {
         WriteCipher::PerObject(ObjectKeyAlg::Rc4) => {
@@ -450,6 +451,30 @@ mod tests {
             error,
             crate::Error::Unsupported(message)
                 if message == "V=5 AES-256 data key is not 32 bytes"
+        ));
+        assert_eq!(emitter.current_data_key_for_test(), None);
+    }
+
+    #[test]
+    fn invalid_aes128_data_key_error_clears_the_current_data_key() {
+        let context = fixed_context(Vec::new(), WriteCipher::PerObject(ObjectKeyAlg::Aes), 4, 4);
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let mut out = Vec::new();
+
+        let error = emitter
+            .write_object(
+                &mut out,
+                ObjectRef::new(44, 0),
+                None,
+                &Object::String(b"plaintext".to_vec()),
+                false,
+            )
+            .expect_err("short AES-128 data key must fail in the string callback");
+
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(message)
+                if message == "V=4 AES-128 data key is not 16 bytes"
         ));
         assert_eq!(emitter.current_data_key_for_test(), None);
     }

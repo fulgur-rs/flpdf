@@ -649,9 +649,11 @@ where
 
     for (member_index, (object_ref, object)) in members.iter().enumerate() {
         offsets.push(objects_section.len());
+        // cov:ignore-start: a Vec cannot hold more than u32::MAX members in supported targets.
         let member_index = u32::try_from(member_index).map_err(|_| {
             crate::Error::Unsupported("ObjStm member index overflows u32".to_string())
         })?;
+        // cov:ignore-end
         write_member(&mut objects_section, member_index, *object_ref, object)?;
         // Append exactly one newline after each object body (write_pdf has no trailing LF).
         objects_section.push(b'\n');
