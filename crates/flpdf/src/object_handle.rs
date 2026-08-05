@@ -80,6 +80,22 @@ mod parse_tests {
     }
 
     #[test]
+    fn parse_without_context_rejects_the_501st_nested_container() {
+        // qpdf's heap-owned parser stack accepts 500 containers, then warns
+        // for the 501st. With no QPDF context, `QPDFParser::warn` throws that
+        // warning instead of recording it on the document.
+        let input = vec![b'['; 501];
+        let error =
+            ObjectHandle::parse(&input).expect_err("depth warning must fail explicit parse");
+
+        assert!(matches!(
+            error,
+            crate::Error::Parse { ref message, .. }
+                if message == "ignoring excessively deeply nested data structure"
+        ));
+    }
+
+    #[test]
     fn parse_without_context_keeps_the_first_warning_ahead_of_later_references() {
         // `QPDFParser::warn` throws immediately when `context == nullptr`.
         // The later `1 0 R` must not replace the earlier brace warning with

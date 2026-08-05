@@ -281,7 +281,6 @@ fn parse_live_file_object_with_context<I: LiveInput>(
         resolver,
         buffered: VecDeque::new(),
         diagnostics: Vec::new(),
-        depth: 0,
         good_count: 0,
         bad_count: 0,
         give_up: false,
@@ -295,13 +294,29 @@ struct LiveFileParser<'tokens, 'input, I: LiveInput> {
     resolver: &'tokens mut dyn HandleResolver,
     buffered: VecDeque<Token>,
     diagnostics: Vec<ParserDiagnostic>,
-    depth: usize,
     /// qpdf's `good_count` / `bad_count` recovery guard. These counters apply
     /// after the outer container has entered `parseRemainder`.
     good_count: usize,
     bad_count: usize,
     give_up: bool,
     has_context: bool,
+}
+
+/// qpdf's `QPDFParser::StackFrame` keeps incomplete containers on the heap,
+/// letting `parseRemainder` advance through nested arrays and dictionaries
+/// without growing the caller's native stack (`libqpdf/qpdf/QPDFParser.hh:33-48`).
+enum LiveFrame {
+    Array {
+        values: Vec<ObjectHandle>,
+        start: usize,
+    },
+    Dictionary {
+        values: std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+        orphan_values: Vec<ObjectHandle>,
+        pending_key: Option<Vec<u8>>,
+        start: usize,
+        frame_offset: usize,
+    },
 }
 
 impl<I: LiveInput> LiveFileParser<'_, '_, I> {
@@ -323,7 +338,14 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
             });
         }
 
-        let value = self.parse_from_token(token, start_offset, true)?;
+        let value = match token.token_type {
+            TokenType::ArrayOpen | TokenType::DictOpen => {
+                let mut frames = Vec::new();
+                self.push_frame(&mut frames, token)?;
+                self.parse_remainder(&mut frames)?
+            }
+            _ => self.parse_scalar_token(token, start_offset, true)?,
+        };
         let parsed_offset = value.get_parsed_offset();
         Ok(LiveParsedObject {
             value,
@@ -333,23 +355,181 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
         })
     }
 
-    fn parse_from_token(
+    /// Mirrors qpdf's iterative `QPDFParser::parseRemainder`: each token
+    /// updates the top heap-owned frame, while a completed frame is popped and
+    /// supplied to its parent rather than returned through recursive calls.
+    fn parse_remainder(&mut self, frames: &mut Vec<LiveFrame>) -> Result<ObjectHandle> {
+        loop {
+            let token = self.next_token()?;
+            self.good_count += 1;
+
+            match token.token_type {
+                TokenType::ArrayOpen | TokenType::DictOpen => {
+                    if !self.push_frame(frames, token)? {
+                        return Ok(ObjectHandle::null());
+                    }
+                }
+                TokenType::ArrayClose if matches!(frames.last(), Some(LiveFrame::Array { .. })) => {
+                    let frame = frames.pop().expect("array frame is present");
+                    let value = Self::finish_array(frame);
+                    if frames.is_empty() {
+                        return Ok(value);
+                    }
+                    self.add_to_top_frame(frames, value)?;
+                }
+                TokenType::DictClose
+                    if matches!(frames.last(), Some(LiveFrame::Dictionary { .. })) =>
+                {
+                    let frame = frames.pop().expect("dictionary frame is present");
+                    let value = self.finish_dictionary(frame)?;
+                    if frames.is_empty() {
+                        return Ok(value);
+                    }
+                    self.add_to_top_frame(frames, value)?;
+                }
+                TokenType::Eof => {
+                    self.warn(token.start, "parse error while reading object")?;
+                    self.warn(token.start, "unexpected EOF")?;
+                    return Ok(ObjectHandle::null());
+                }
+                TokenType::Name => {
+                    if let Some(LiveFrame::Dictionary { pending_key, .. }) = frames.last_mut() {
+                        if pending_key.is_none() {
+                            *pending_key = Some(token.value[1..].to_vec());
+                            continue;
+                        }
+                    }
+                    let value =
+                        self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    self.add_to_top_frame(frames, value)?;
+                }
+                _ => {
+                    let value =
+                        self.parse_scalar_token(token.clone(), token.start as i64, false)?;
+                    self.add_to_top_frame(frames, value)?;
+                }
+            }
+
+            if self.give_up {
+                return Ok(ObjectHandle::null());
+            }
+        }
+    }
+
+    fn push_frame(&mut self, frames: &mut Vec<LiveFrame>, token: Token) -> Result<bool> {
+        // qpdf checks its existing `stack` before it emplaces a new frame:
+        // exactly 500 containers are accepted and the 501st recovers as null.
+        if frames.len() >= MAX_PARSE_DEPTH {
+            let warning = "ignoring excessively deeply nested data structure";
+            self.warn(token.start, warning)?;
+            self.give_up = true;
+            return Ok(false);
+        }
+
+        match token.token_type {
+            TokenType::ArrayOpen => frames.push(LiveFrame::Array {
+                values: Vec::new(),
+                start: token.start,
+            }),
+            TokenType::DictOpen => frames.push(LiveFrame::Dictionary {
+                values: std::collections::BTreeMap::new(),
+                orphan_values: Vec::new(),
+                pending_key: None,
+                start: token.start,
+                frame_offset: token.end,
+            }),
+            _ => unreachable!("only container tokens create live parser frames"), // cov:ignore: callers dispatch only opening container tokens
+        }
+        Ok(true)
+    }
+
+    fn add_to_top_frame(&mut self, frames: &mut [LiveFrame], value: ObjectHandle) -> Result<()> {
+        let frame = frames.last_mut().expect("live parser has an open frame");
+        self.add_to_frame(frame, value)
+    }
+
+    fn add_to_frame(&mut self, frame: &mut LiveFrame, value: ObjectHandle) -> Result<()> {
+        match frame {
+            LiveFrame::Array { values, .. } => values.push(value),
+            LiveFrame::Dictionary {
+                values,
+                orphan_values,
+                pending_key,
+                frame_offset,
+                ..
+            } => {
+                if let Some(key) = pending_key.take() {
+                    Self::insert_dictionary_value(values, key, value, *frame_offset, self)?;
+                } else {
+                    orphan_values.push(value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_array(frame: LiveFrame) -> ObjectHandle {
+        let LiveFrame::Array { values, start } = frame else {
+            unreachable!("array close can only complete an array frame"); // cov:ignore: close dispatch checked the frame variant
+        };
+        Self::direct(ObjectValue::Array(values), start)
+    }
+
+    fn finish_dictionary(&mut self, frame: LiveFrame) -> Result<ObjectHandle> {
+        let LiveFrame::Dictionary {
+            mut values,
+            orphan_values,
+            pending_key,
+            start,
+            frame_offset,
+        } = frame
+        else {
+            unreachable!("dictionary frame required"); // cov:ignore: close dispatch checked the frame variant
+        };
+
+        if let Some(key) = pending_key {
+            self.warn(
+                frame_offset,
+                "dictionary ended prematurely; using null as value for last key",
+            )?;
+            // qpdf assigns this recovery value directly instead of routing it
+            // through `add`, so a duplicate final key has no duplicate warning.
+            values.insert(key, ObjectHandle::null());
+        }
+
+        let orphan_names: std::collections::BTreeSet<Vec<u8>> = orphan_values
+            .iter()
+            .filter_map(ObjectHandle::as_name)
+            .collect();
+        let mut fake = 1;
+        for value in orphan_values {
+            let key = loop {
+                let candidate = format!("QPDFFake{fake}").into_bytes();
+                fake += 1;
+                if !values.contains_key(&candidate) && !orphan_names.contains(&candidate) {
+                    break candidate;
+                }
+            };
+            self.warn(
+                frame_offset,
+                format!(
+                    "expected dictionary key but found non-name object; inserting key /{}",
+                    String::from_utf8_lossy(&key)
+                ),
+            )?;
+            values.insert(key, value);
+        }
+
+        Ok(Self::direct(ObjectValue::Dictionary(values), start))
+    }
+
+    fn parse_scalar_token(
         &mut self,
         token: Token,
         scalar_offset: i64,
         top_level: bool,
     ) -> Result<ObjectHandle> {
         match token.token_type {
-            // qpdf keeps its parser frames on an explicit vector. The Rust
-            // direct implementation recurses, so give every container entry
-            // the same stack-growth guard as the legacy parser before the
-            // 500-level qpdf limit can exhaust a small caller thread stack.
-            TokenType::DictOpen => stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || {
-                self.dictionary(token.start, token.end)
-            }),
-            TokenType::ArrayOpen => stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || {
-                self.array(token.start)
-            }),
             TokenType::Name => Ok(Self::direct_at(
                 ObjectValue::Name(token.value[1..].to_vec()),
                 scalar_offset,
@@ -410,106 +590,8 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                 self.too_many_bad_tokens(token.start)?;
                 Ok(ObjectHandle::null())
             } // cov:ignore-end
+            TokenType::DictOpen | TokenType::ArrayOpen => unreachable!("frame loop"), // cov:ignore: frame loop dispatches container tokens
         }
-    }
-
-    fn array(&mut self, start: usize) -> Result<ObjectHandle> {
-        if !self.enter_container(start)? {
-            return Ok(ObjectHandle::null());
-        }
-        let mut values = Vec::new();
-        let result = loop {
-            let token = self.next_token()?;
-            self.good_count += 1;
-            if token.token_type == TokenType::ArrayClose {
-                break Ok(Self::direct(
-                    ObjectValue::Array(values),
-                    token.start.min(start),
-                ));
-            }
-            if token.token_type == TokenType::Eof {
-                self.warn(token.start, "parse error while reading object")?;
-                self.warn(token.start, "unexpected EOF")?;
-                break Ok(ObjectHandle::null());
-            }
-            let value = self.parse_from_token(token.clone(), token.start as i64, false)?;
-            values.push(value);
-            if self.give_up {
-                break Ok(ObjectHandle::null());
-            }
-        };
-        self.depth -= 1;
-        result
-    }
-
-    fn dictionary(&mut self, start: usize, frame_offset: usize) -> Result<ObjectHandle> {
-        if !self.enter_container(start)? {
-            return Ok(ObjectHandle::null());
-        }
-        let mut values = std::collections::BTreeMap::new();
-        let mut orphan_values = Vec::new();
-        let mut pending_key: Option<Vec<u8>> = None;
-        let result = loop {
-            let token = self.next_token()?;
-            self.good_count += 1;
-            if token.token_type == TokenType::DictClose {
-                if let Some(key) = pending_key.take() {
-                    self.warn(
-                        frame_offset,
-                        "dictionary ended prematurely; using null as value for last key",
-                    )?;
-                    // qpdf assigns this recovery null directly rather than
-                    // routing it through `add`, so even a duplicate final
-                    // key gets only the premature-end warning.
-                    values.insert(key, ObjectHandle::null());
-                }
-                let orphan_names: std::collections::BTreeSet<Vec<u8>> = orphan_values
-                    .iter()
-                    .filter_map(ObjectHandle::as_name)
-                    .collect();
-                let mut fake = 1;
-                for value in orphan_values {
-                    let key = loop {
-                        let candidate = format!("QPDFFake{fake}").into_bytes();
-                        fake += 1;
-                        if !values.contains_key(&candidate) && !orphan_names.contains(&candidate) {
-                            break candidate;
-                        }
-                    };
-                    self.warn(
-                        frame_offset,
-                        format!(
-                            "expected dictionary key but found non-name object; inserting key /{}",
-                            String::from_utf8_lossy(&key)
-                        ),
-                    )?;
-                    values.insert(key, value);
-                }
-                break Ok(Self::direct(ObjectValue::Dictionary(values), start));
-            }
-            if token.token_type == TokenType::Eof {
-                self.warn(token.start, "parse error while reading object")?;
-                self.warn(token.start, "unexpected EOF")?;
-                break Ok(ObjectHandle::null());
-            }
-
-            if pending_key.is_none() && token.token_type == TokenType::Name {
-                pending_key = Some(token.value[1..].to_vec());
-                continue;
-            }
-
-            let value = self.parse_from_token(token.clone(), token.start as i64, false)?;
-            if let Some(key) = pending_key.take() {
-                Self::insert_dictionary_value(&mut values, key, value, frame_offset, self)?;
-            } else {
-                orphan_values.push(value);
-            }
-            if self.give_up {
-                break Ok(ObjectHandle::null());
-            }
-        };
-        self.depth -= 1;
-        result
     }
 
     fn insert_dictionary_value(
@@ -592,18 +674,6 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
         let handle = ObjectHandle::from_value(value);
         handle.set_parsed_offset_if_unset(offset);
         handle
-    }
-
-    fn enter_container(&mut self, offset: usize) -> Result<bool> {
-        // qpdf checks the already-open stack before adding a new frame: 500
-        // containers are accepted and the 501st recovers as a null object.
-        if self.depth >= MAX_PARSE_DEPTH {
-            self.warn(offset, "ignoring excessively deeply nested data structure")?;
-            self.give_up = true;
-            return Ok(false);
-        }
-        self.depth += 1;
-        Ok(true)
     }
 
     fn next_token(&mut self) -> Result<Token> {

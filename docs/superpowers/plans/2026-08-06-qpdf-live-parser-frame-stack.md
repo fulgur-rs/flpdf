@@ -54,7 +54,7 @@ assert!(!outcome.expect("500 nested containers must parse").value.is_null());
 
 - [ ] **Step 3: Run the focused regression**
 
-Run: `cargo test -p flpdf --lib live_file_parser_accepts_qpdfs_500_container_limit_on_a_small_stack -- --exact`
+Run: `cargo test -p flpdf --lib parser::live_input_tests::live_file_parser_accepts_qpdfs_500_container_limit_on_a_small_stack -- --exact`
 
 Expected before Task 2: CI remains the authoritative RED result on the three
 failing targets; after Task 2 this command passes locally and the same test
