@@ -12,6 +12,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # qpdf behavior is an oracle for compatibility tests. Keep this in sync with
+  # scripts/fetch-qpdf-source.sh and the pinned source in the module docs.
+  QPDF_VERSION: 11.9.0
 
 jobs:
   quality:
@@ -89,27 +92,85 @@ jobs:
           shared-key: ${{ matrix.cache-key }}
 
       # qpdf is an external oracle for the cross-check suites (cli_linearize_qpdf,
-      # cli_qdf*, cli_object_streams_qpdf_parity, writer_tests, ...). Install it
-      # on every runner so those suites hard-fail when qpdf is missing rather
-      # than silently skipping (skip_if_qpdf_missing).
-      #
-      # qpdf 12.x (choco on Windows, Homebrew on macOS) aborts `qpdf --check`
-      # on a zero-page PDF with an upstream `std::vector::at()` crash
-      # (`ERROR: vector...`); the apt qpdf 11.x on Linux does not. The few
-      # tests that `qpdf --check` a zero-page fixture detect that crash by its
-      # stderr signature and skip just that gate (flpdf-d4k) — so qpdf can be
-      # installed on all runners without the upstream bug breaking CI.
-      - name: Install qpdf (Linux)
+      # cli_qdf*, cli_object_streams_qpdf_parity, writer_tests, ...). It must
+      # be 11.9.0, matching scripts/fetch-qpdf-source.sh, rather than whichever
+      # version happens to be current in Homebrew or Chocolatey.
+      - name: Install qpdf 11.9.0 (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y qpdf
 
-      - name: Install qpdf (macOS)
+      # qpdf 11.9.0 has no macOS release binary. Build the verified upstream
+      # source archive with the same OpenSSL-backed crypto configuration that
+      # its distributed binaries use.
+      - name: Install qpdf 11.9.0 (macOS)
         if: runner.os == 'macOS'
-        run: brew install qpdf
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Install qpdf (Windows)
+          release_url="https://github.com/qpdf/qpdf/releases/download/v${QPDF_VERSION}"
+          archive="${RUNNER_TEMP}/qpdf-${QPDF_VERSION}.tar.gz"
+          checksums="${RUNNER_TEMP}/qpdf-${QPDF_VERSION}.sha256"
+          source_dir="${RUNNER_TEMP}/qpdf-${QPDF_VERSION}"
+          build_dir="${RUNNER_TEMP}/qpdf-${QPDF_VERSION}-build"
+          install_dir="${RUNNER_TEMP}/qpdf-${QPDF_VERSION}-install"
+
+          curl --fail --location --retry 3 --output "${archive}" \
+            "${release_url}/qpdf-${QPDF_VERSION}.tar.gz"
+          curl --fail --location --retry 3 --output "${checksums}" \
+            "${release_url}/qpdf-${QPDF_VERSION}.sha256"
+          expected="$(awk -v archive="qpdf-${QPDF_VERSION}.tar.gz" '$2 == archive { print $1; exit }' "${checksums}")"
+          actual="$(shasum -a 256 "${archive}" | awk '{ print $1 }')"
+          test -n "${expected}"
+          test "${actual}" = "${expected}"
+
+          brew install cmake jpeg-turbo openssl@3 pkg-config zlib
+          tar -xzf "${archive}" -C "${RUNNER_TEMP}"
+          export PKG_CONFIG_PATH="$(brew --prefix jpeg-turbo)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix zlib)/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+          cmake -S "${source_dir}" -B "${build_dir}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${install_dir}" \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix jpeg-turbo);$(brew --prefix openssl@3);$(brew --prefix zlib)" \
+            -DREQUIRE_CRYPTO_OPENSSL=ON
+          cmake --build "${build_dir}" --parallel 2
+          cmake --install "${build_dir}"
+          printf '%s\n' "${install_dir}/bin" >> "${GITHUB_PATH}"
+
+      - name: Install qpdf 11.9.0 (Windows)
         if: runner.os == 'Windows'
-        run: choco install qpdf -y --no-progress
+        shell: pwsh
+        run: |
+          $releaseUrl = "https://github.com/qpdf/qpdf/releases/download/v$env:QPDF_VERSION"
+          $archive = Join-Path $env:RUNNER_TEMP "qpdf-$env:QPDF_VERSION-mingw64.zip"
+          $checksums = Join-Path $env:RUNNER_TEMP "qpdf-$env:QPDF_VERSION.sha256"
+          $installDir = Join-Path $env:RUNNER_TEMP "qpdf-$env:QPDF_VERSION"
+
+          Invoke-WebRequest -Uri "$releaseUrl/qpdf-$env:QPDF_VERSION-mingw64.zip" -OutFile $archive
+          Invoke-WebRequest -Uri "$releaseUrl/qpdf-$env:QPDF_VERSION.sha256" -OutFile $checksums
+          $checksumLine = @(Select-String -Path $checksums -Pattern ([regex]::Escape("qpdf-$env:QPDF_VERSION-mingw64.zip") + '$'))
+          if ($checksumLine.Count -ne 1) {
+            throw "unable to locate the qpdf 11.9.0 Windows archive checksum"
+          }
+          $expected = ($checksumLine.Line -split '\s+')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash
+          if ($actual -ne $expected) {
+            throw "qpdf 11.9.0 Windows archive checksum mismatch"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath $installDir
+          $qpdf = @(Get-ChildItem -Path $installDir -Filter qpdf.exe -File -Recurse)
+          if ($qpdf.Count -ne 1) {
+            throw "expected exactly one qpdf.exe in the qpdf 11.9.0 archive"
+          }
+          $qpdf[0].DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Verify qpdf 11.9.0 oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          qpdf --version
+          test "$(qpdf --version | sed -n '1p')" = "qpdf version ${QPDF_VERSION}"
 
       - name: Run tests in required order
         shell: bash
