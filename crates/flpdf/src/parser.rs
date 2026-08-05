@@ -57,10 +57,11 @@ impl LiveInput for SliceLiveInput<'_> {
     }
 
     fn seek(&mut self, offset: u64) -> Result<()> {
-        let position = usize::try_from(offset).map_err(|_| {
-            Error::Internal("slice live-input offset does not fit usize".into())
-            // cov:ignore: u64 exceeds usize only on 32-bit targets; coverage runs on 64-bit.
-        })?;
+        #[cfg(target_pointer_width = "64")]
+        let position = offset as usize;
+        #[cfg(not(target_pointer_width = "64"))]
+        let position = usize::try_from(offset)
+            .map_err(|_| Error::Internal("slice live-input offset does not fit usize".into()))?;
         if position > self.bytes.len() {
             return Err(Error::parse(position, "seek past end of parser input"));
         }
