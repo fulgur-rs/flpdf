@@ -222,6 +222,108 @@ mod tests {
         );
         assert_eq!(Object::Null.as_inline_image(), None);
     }
+
+    fn nested_string_object() -> Object {
+        let mut nested = Dictionary::new();
+        nested.insert("Nested", Object::String(b"second".to_vec()));
+
+        let mut outer = Dictionary::new();
+        outer.insert(
+            "Values",
+            Object::Array(vec![
+                Object::String(b"first".to_vec()),
+                Object::Dictionary(nested),
+            ]),
+        );
+        Object::Dictionary(outer)
+    }
+
+    fn hex_recording_writer<'a>(
+        seen: &'a mut Vec<Vec<u8>>,
+    ) -> impl FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()> + 'a {
+        move |out, value| {
+            seen.push(value.to_vec());
+            write_hex_string(out, value);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn callback_string_writer_reaches_nested_compact_values() {
+        let object = nested_string_object();
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        let mut writer = hex_recording_writer(&mut seen);
+
+        object
+            .try_write_pdf_with_string_writer(&mut out, &mut writer)
+            .expect("callback serialization should succeed");
+
+        assert_eq!(
+            out,
+            b"<< /Values [ <6669727374> << /Nested <7365636f6e64> >> ] >>"
+        );
+        drop(writer);
+        assert_eq!(seen, [b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[test]
+    fn callback_string_writer_reaches_nested_qdf_and_stream_dictionary_values() {
+        let object = nested_string_object();
+        let mut qdf = Vec::new();
+        let mut seen = Vec::new();
+        let mut writer = hex_recording_writer(&mut seen);
+
+        object
+            .try_write_pdf_qdf_with_string_writer(&mut qdf, 0, &mut writer)
+            .expect("QDF callback serialization should succeed");
+
+        assert_eq!(
+            qdf,
+            b"<<\n  /Values [\n    <6669727374>\n    <<\n      /Nested <7365636f6e64>\n    >>\n  ]\n>>"
+        );
+        drop(writer);
+        assert_eq!(seen, [b"first".to_vec(), b"second".to_vec()]);
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Label", Object::String(b"stream".to_vec()));
+        stream_dict.insert("Length", Object::Integer(7));
+
+        let mut compact = Vec::new();
+        let mut compact_seen = Vec::new();
+        let mut compact_writer = hex_recording_writer(&mut compact_seen);
+        stream_dict
+            .try_write_pdf_stream_with_string_writer(&mut compact, false, &mut compact_writer)
+            .expect("compact stream dictionary callback should succeed");
+        assert_eq!(compact, b"<< /Label <73747265616d> /Length 7 >>");
+        drop(compact_writer);
+        assert_eq!(compact_seen, [b"stream".to_vec()]);
+
+        let mut qdf_stream = Vec::new();
+        let mut qdf_stream_seen = Vec::new();
+        let mut qdf_stream_writer = hex_recording_writer(&mut qdf_stream_seen);
+        stream_dict
+            .try_write_pdf_stream_qdf_with_string_writer(&mut qdf_stream, 0, &mut qdf_stream_writer)
+            .expect("QDF stream dictionary callback should succeed");
+        assert_eq!(qdf_stream, b"<<\n  /Label <73747265616d>\n  /Length 7\n>>");
+        drop(qdf_stream_writer);
+        assert_eq!(qdf_stream_seen, [b"stream".to_vec()]);
+    }
+
+    #[test]
+    fn callback_string_writer_propagates_error() {
+        let mut out = Vec::new();
+        let mut writer = |_out: &mut Vec<u8>, _value: &[u8]| {
+            Err(crate::Error::Internal("string writer failed".to_string()))
+        };
+
+        let result = nested_string_object().try_write_pdf_with_string_writer(&mut out, &mut writer);
+
+        assert!(matches!(
+            result,
+            Err(crate::Error::Internal(message)) if message == "string writer failed"
+        ));
+    }
 }
 
 pub(crate) fn collect_qpdf_object_references(
@@ -500,6 +602,43 @@ impl Object {
         self.write_pdf_with_string_mode(out, true);
     }
 
+    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
+    pub(crate) fn try_write_pdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        write_string: &mut F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    {
+        match self {
+            Object::String(value) => write_string(out, value),
+            Object::Array(values) => {
+                out.push(b'[');
+                for value in values {
+                    out.push(b' ');
+                    value.try_write_pdf_with_string_writer(out, write_string)?;
+                }
+                out.extend_from_slice(b" ]");
+                Ok(())
+            }
+            Object::Dictionary(dict) => dict.try_write_pdf_with_string_writer(out, write_string),
+            Object::Stream(stream) => {
+                stream
+                    .dict
+                    .try_write_pdf_with_string_writer(out, write_string)?;
+                out.extend_from_slice(b"\nstream\n");
+                out.extend_from_slice(&stream.data);
+                out.extend_from_slice(b"\nendstream");
+                Ok(())
+            }
+            _ => {
+                self.write_pdf(out);
+                Ok(())
+            }
+        }
+    }
+
     fn write_pdf_with_string_mode(&self, out: &mut Vec<u8>, force_hex_strings: bool) {
         match self {
             Object::Null => out.extend_from_slice(b"null"),
@@ -603,6 +742,49 @@ impl Object {
             // Scalars, names, strings, numbers, references, null, booleans:
             // reuse the existing compact serialization verbatim.
             _ => self.write_pdf(out),
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
+    pub(crate) fn try_write_pdf_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    {
+        match self {
+            Object::String(value) => write_string(out, value),
+            Object::Array(values) => {
+                out.push(b'[');
+                out.push(b'\n');
+                for value in values {
+                    push_spaces(out, indent + 2);
+                    value.try_write_pdf_qdf_with_string_writer(out, indent + 2, write_string)?;
+                    out.push(b'\n');
+                }
+                push_spaces(out, indent);
+                out.push(b']');
+                Ok(())
+            }
+            Object::Dictionary(dict) => {
+                dict.try_write_pdf_qdf_with_string_writer(out, indent, write_string)
+            }
+            Object::Stream(stream) => {
+                stream
+                    .dict
+                    .try_write_pdf_qdf_with_string_writer(out, indent, write_string)?;
+                out.extend_from_slice(b"\nstream\n");
+                out.extend_from_slice(&stream.data);
+                out.extend_from_slice(b"\nendstream");
+                Ok(())
+            }
+            _ => {
+                self.write_pdf(out);
+                Ok(())
+            }
         }
     }
 }
@@ -861,6 +1043,26 @@ impl Dictionary {
         self.write_pdf_with_string_mode(out, false);
     }
 
+    #[allow(dead_code)] // Reached through the callback serializer above.
+    fn try_write_pdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        write_string: &mut F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    {
+        out.extend_from_slice(b"<<");
+        for (key, value) in self.iter() {
+            out.extend_from_slice(b" /");
+            write_name_escaped(out, key);
+            out.push(b' ');
+            value.try_write_pdf_with_string_writer(out, write_string)?;
+        }
+        out.extend_from_slice(b" >>");
+        Ok(())
+    }
+
     fn write_pdf_with_string_mode(&self, out: &mut Vec<u8>, force_hex_strings: bool) {
         out.extend_from_slice(b"<<");
         for (key, value) in self.iter() {
@@ -945,6 +1147,42 @@ impl Dictionary {
         refiltered: bool,
     ) {
         self.write_pdf_stream_with_string_mode(out, refiltered, true);
+    }
+
+    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
+    pub(crate) fn try_write_pdf_stream_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        write_string: &mut F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    {
+        out.extend_from_slice(b"<<");
+        let mut length_value: Option<&Object> = None;
+        for (key, value) in self.iter() {
+            if key == b"Length" {
+                length_value = Some(value);
+                continue;
+            }
+            if refiltered && (key == b"Filter" || key == b"DecodeParms") {
+                continue;
+            }
+            out.extend_from_slice(b" /");
+            write_name_escaped(out, key);
+            out.push(b' ');
+            value.try_write_pdf_with_string_writer(out, write_string)?;
+        }
+        if let Some(length) = length_value {
+            out.extend_from_slice(b" /Length ");
+            length.try_write_pdf_with_string_writer(out, write_string)?;
+        }
+        if refiltered {
+            out.extend_from_slice(b" /Filter /FlateDecode");
+        }
+        out.extend_from_slice(b" >>");
+        Ok(())
     }
 
     fn write_pdf_stream_with_string_mode(
@@ -1069,6 +1307,30 @@ impl Dictionary {
         out.extend_from_slice(b">>");
     }
 
+    #[allow(dead_code)] // Reached through the callback serializer above.
+    fn try_write_pdf_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    {
+        out.extend_from_slice(b"<<\n");
+        for (key, value) in self.iter() {
+            push_spaces(out, indent + 2);
+            out.push(b'/');
+            write_name_escaped(out, key);
+            out.push(b' ');
+            value.try_write_pdf_qdf_with_string_writer(out, indent + 2, write_string)?;
+            out.push(b'\n');
+        }
+        push_spaces(out, indent);
+        out.extend_from_slice(b">>");
+        Ok(())
+    }
+
     /// Serialize this stream dictionary in qpdf `--qdf` layout (see
     /// [`write_pdf_qdf`](Self::write_pdf_qdf)), but with `/Length` pulled to the
     /// end so it appears immediately before `>>`. Mirrors qpdf's non-QDF
@@ -1098,6 +1360,41 @@ impl Dictionary {
         }
         push_spaces(out, indent);
         out.extend_from_slice(b">>");
+    }
+
+    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
+    pub(crate) fn try_write_pdf_stream_qdf_with_string_writer<F>(
+        &self,
+        out: &mut Vec<u8>,
+        indent: usize,
+        write_string: &mut F,
+    ) -> crate::Result<()>
+    where
+        F: FnMut(&mut Vec<u8>, &[u8]) -> crate::Result<()>,
+    {
+        out.extend_from_slice(b"<<\n");
+        let mut length_value: Option<&Object> = None;
+        for (key, value) in self.iter() {
+            if key == b"Length" {
+                length_value = Some(value);
+                continue;
+            }
+            push_spaces(out, indent + 2);
+            out.push(b'/');
+            write_name_escaped(out, key);
+            out.push(b' ');
+            value.try_write_pdf_qdf_with_string_writer(out, indent + 2, write_string)?;
+            out.push(b'\n');
+        }
+        if let Some(length) = length_value {
+            push_spaces(out, indent + 2);
+            out.extend_from_slice(b"/Length ");
+            length.try_write_pdf_qdf_with_string_writer(out, indent + 2, write_string)?;
+            out.push(b'\n');
+        }
+        push_spaces(out, indent);
+        out.extend_from_slice(b">>");
+        Ok(())
     }
 }
 
