@@ -2839,15 +2839,23 @@ pub(crate) fn encrypt_strings_in_object_for_writer(
 /// Encrypt a stream's payload bytes in place (after filter re-encoding) and
 /// update its `/Length` entry. AES grows the buffer by 16 bytes (IV prefix)
 /// plus up to one full block of PKCS#7 padding.
+///
+/// Draws a fresh AES IV internally on every call (or the fixed test vector
+/// under `ctx.static_aes_iv`) and delegates to
+/// [`encrypt_stream_payload_with_iv`] for the actual encryption. This is the
+/// right behavior for every caller except one: `crate::linearization::writer`
+/// re-invokes the hint-stream emitter once per convergence-loop pass, so a
+/// fresh-per-call IV here would mean the hint stream's own ciphertext framing
+/// could vary pass-to-pass for the same plaintext — that caller uses
+/// [`encrypt_stream_payload_with_iv`] directly with a single IV drawn once
+/// per `write_linearized` invocation instead (see
+/// `crate::linearization::writer::append_hint_stream_object`'s doc).
 pub(crate) fn encrypt_stream_payload_for_writer(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
     ctx: &EncryptionContext,
 ) -> Result<()> {
-    use crate::pipeline::rc4::PlRc4;
-    use crate::security::standard::{
-        encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
-    };
+    use crate::security::standard::ObjectKeyAlg;
 
     // AES (V=4 AESV2 or V=5 AESV3) prefixes a random 16-byte CBC IV; RC4 does
     // not. Propagate OS-RNG failures (e.g. restricted WASM sandbox, exhausted
@@ -2868,6 +2876,33 @@ pub(crate) fn encrypt_stream_payload_for_writer(
             ))
         })?;
     }
+
+    encrypt_stream_payload_with_iv(object_ref, stream, ctx, iv)
+}
+
+/// Core of [`encrypt_stream_payload_for_writer`]: encrypt `stream.data` in
+/// place with an explicit IV and update `/Length` to the on-disk (encrypted)
+/// byte count. `iv` is used verbatim for AES ciphers; RC4 has no IV concept
+/// and ignores it.
+///
+/// Exposed as a separate primitive so a caller that needs the *same*
+/// ciphertext across repeated calls (the linearized writer's hint stream,
+/// re-emitted once per convergence-loop pass) can supply one IV instead of
+/// getting a fresh random draw every call. Every other caller goes through
+/// [`encrypt_stream_payload_for_writer`], which draws the IV itself
+/// (once per call, as before this split) and forwards here — this function
+/// has no IV-selection policy of its own, so extracting it changes no
+/// caller's behavior.
+pub(crate) fn encrypt_stream_payload_with_iv(
+    object_ref: ObjectRef,
+    stream: &mut crate::Stream,
+    ctx: &EncryptionContext,
+    iv: [u8; 16],
+) -> Result<()> {
+    use crate::pipeline::rc4::PlRc4;
+    use crate::security::standard::{
+        encrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringEncryptCipher,
+    };
 
     match ctx.cipher {
         WriteCipher::PerObject(alg) => {

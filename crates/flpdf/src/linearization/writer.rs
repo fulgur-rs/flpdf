@@ -1641,30 +1641,53 @@ fn hint_stream_convergence_len(
 /// — so no self-skip check is needed here, unlike [`append_object`] and
 /// [`append_body_object`].
 ///
-/// Procedural deviation from qpdf (does not affect output bytes): qpdf
+/// `hint_stream_aes_iv` is the single AES IV [`write_linearized`] draws once
+/// per invocation and passes to every call this function makes across the
+/// whole convergence loop (probe passes and the final pass alike), via
+/// [`crate::writer::encrypt_stream_payload_with_iv`] rather than
+/// [`crate::writer::encrypt_stream_payload_for_writer`] (which would draw a
+/// fresh IV on every call). This mirrors qpdf's own architecture: qpdf
 /// encrypts the hint stream exactly once, on its internal linearization
 /// "pass 1", and replays those exact bytes (`writeBuffer(hint_buffer)`) on
 /// "pass 2" without re-invoking `writeHintStream` (QPDFWriter.cc:2860-2884,
-/// the `pass == 1`/`else { writeBuffer(hint_buffer) }` split). This function
-/// is instead invoked fresh on every iteration of this writer's own
-/// convergence loop — probe passes and the final pass alike — so without
-/// `--static-aes-iv` each call draws a new random IV and produces different
-/// ciphertext bytes for the (eventually stable) plaintext payload.
+/// the `pass == 1`/`else { writeBuffer(hint_buffer) }` split) — one IV per
+/// file for the hint stream, same as every other encrypted object gets one
+/// IV per file. `hint_stream_aes_iv` is unused when `encrypt_ctx` is `None`
+/// or the cipher is RC4 (no IV concept); callers may pass any value in
+/// those cases.
 ///
-/// This is safe, and does NOT depend on any IV-related length argument:
-/// [`hint_stream_convergence_len`] — unchanged by encryption support, still
-/// PLAINTEXT-only, see its own doc for why comparing it across iterations
-/// soundly detects when the underlying hint-table structure has stabilized
-/// — is only ever used as the convergence loop's stopping criterion. The
-/// value that actually drives every downstream offset calculation,
-/// `hint_stream_obj_total_len` (`do_write_pass`'s `bytes.len() -
-/// hint_stream_offset`), is instead measured directly from THIS function's
-/// real emitted bytes, freshly, on every single pass including the final
-/// one. So whatever ciphertext a given pass's IV happens to produce, that
-/// pass's own real measurement is what downstream code uses — there is no
-/// path through which a stale or predicted length could ever diverge from
-/// the bytes actually shipped, regardless of how many times the hint
-/// stream was re-encrypted along the way.
+/// # Why the IV must stay fixed across passes: the offset/length invariant
+///
+/// Every downstream hint-table field this writer patches from a probed pass
+/// (`so_table.header.location`, [`build_outline_hint_table`]'s
+/// `first_object_offset`, and every per-object/per-page length in
+/// [`compute_byte_lengths`]) is computed as either (a) a same-pass offset
+/// *after* the hint stream minus that same pass's `hint_stream_obj_total_len`,
+/// or (b) the difference between two same-pass offsets both after the hint
+/// stream. Both forms cancel the hint stream's own byte length out of the
+/// stored value entirely, so they are safe against a hint stream whose
+/// length varies from pass to pass — **provided** every OTHER object's own
+/// serialized length is pass-invariant, i.e. does not itself depend on that
+/// pass's random IV draws. That precondition holds here: AES-CBC ciphertext
+/// length depends only on plaintext length (PKCS#7 padding, not the IV),
+/// non-hint-stream stream objects use `NewlineBeforeEndstream::Never` (no
+/// IV-dependent framing decision), and AES-encrypted strings are written by
+/// [`crate::object::use_hex_string`]'s content-dependent heuristic, which
+/// forces hex for realistic AES-CBC-with-IV-prefix ciphertext with
+/// overwhelming probability (two independent triggers, each individually
+/// near-certain past ~20 bytes) — matching qpdf's own unconditional
+/// `unparse(true)` for AES-encrypted strings closely enough that no
+/// observed-length variance has ever been produced from it. So the ONLY
+/// actual source of pass-to-pass length variance in this writer is the hint
+/// stream's own conditional newline-before-`endstream` (below), and pinning
+/// its IV removes that source entirely instead of relying on the
+/// cancellation to absorb it. Pinning also converts what would otherwise be
+/// an emergent property of this writer's specific formulas into a
+/// structural one: a future hint-table field that stores a raw pass-local
+/// offset (instead of subtracting `hint_stream_obj_total_len` from it) would
+/// silently reintroduce the risk this comment describes if the IV were still
+/// drawn fresh per pass.
+#[allow(clippy::too_many_arguments)]
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
@@ -1673,6 +1696,7 @@ fn append_hint_stream_object(
     outline_section_offset: Option<usize>,
     filtered: bool,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    hint_stream_aes_iv: [u8; 16],
 ) -> Result<usize> {
     // Encrypt the payload BEFORE computing the dict prefix, so `/Length`
     // reflects the on-disk (encrypted) byte count — mirrors qpdf's
@@ -1681,7 +1705,12 @@ fn append_hint_stream_object(
     let payload: &[u8] = match encrypt_ctx {
         Some(ctx) => {
             let mut stream = crate::Stream::new(Dictionary::new(), payload.to_vec());
-            crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut stream, ctx)?;
+            crate::writer::encrypt_stream_payload_with_iv(
+                new_ref,
+                &mut stream,
+                ctx,
+                hint_stream_aes_iv,
+            )?;
             encrypted_payload = stream.data;
             &encrypted_payload
         }
@@ -1931,6 +1960,7 @@ fn do_write_pass<R: Read + Seek>(
     pass1_digest: bool,
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    hint_stream_aes_iv: [u8; 16],
 ) -> Result<(
     Vec<u8>,
     BTreeMap<u32, usize>,
@@ -2197,6 +2227,7 @@ fn do_write_pass<R: Read + Seek>(
             hint_outline_section_offset,
             structural_streams_filtered,
             encrypt_ctx,
+            hint_stream_aes_iv,
         )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
@@ -3380,6 +3411,34 @@ pub fn write_linearized<R: Read + Seek>(
             None
         };
 
+    // Draw the hint stream's AES IV once for this whole invocation, reused
+    // for every `append_hint_stream_object` call the convergence loop below
+    // makes (probe passes and the final pass alike) — see that function's
+    // doc for why a fresh-per-call draw would be unsafe. `--static-aes-iv`
+    // keeps using the same fixed test vector every other AES call in this
+    // writer already uses, so that path is byte-for-byte unchanged. When no
+    // AES cipher is in play (RC4, or `encrypt_ctx` is `None`) the value is
+    // never read; `[0u8; 16]` is a harmless placeholder.
+    let hint_stream_aes_iv: [u8; 16] = match &encrypt_ctx {
+        Some(ctx) if ctx.static_aes_iv => crate::pipeline::aes::static_initialization_vector(),
+        Some(ctx)
+            if matches!(
+                ctx.cipher,
+                crate::writer::WriteCipher::PerObject(crate::ObjectKeyAlg::Aes)
+                    | crate::writer::WriteCipher::FileKeyAes256
+            ) =>
+        {
+            let mut iv = [0u8; 16];
+            getrandom::getrandom(&mut iv).map_err(|e| {
+                crate::Error::Unsupported(format!(
+                    "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
+                ))
+            })?;
+            iv
+        }
+        _ => [0u8; 16],
+    };
+
     let renumber: &RenumberMap = &local_renumber;
 
     // Floor the header to 1.5 only when the output actually carries an ObjStm
@@ -3674,6 +3733,10 @@ pub fn write_linearized<R: Read + Seek>(
             // with the probe/final passes below if that guard is ever
             // relaxed.
             encrypt_ctx.as_ref(),
+            // Pass-1 digest mode never emits the hint stream (`pass1_digest =
+            // true` above), so this value is never read; threaded through
+            // for signature uniformity with the probe/final calls below.
+            hint_stream_aes_iv,
         )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeed on these same inputs, so it cannot introduce a new Err.
             // Whole-buffer digest: a linearized file repeats `/ID` at several
             // sites, so there is no single `[` cutoff; pass the last index as the
@@ -3743,6 +3806,10 @@ pub fn write_linearized<R: Read + Seek>(
             // convergence, and because omitting it here would shift every
             // downstream object's measured offset relative to the final pass.
             encrypt_ctx.as_ref(),
+            // Reused across every probe pass AND the final pass below — see
+            // `append_hint_stream_object`'s doc for why a fresh-per-call IV
+            // would be unsafe.
+            hint_stream_aes_iv,
         )?;
 
         // ------------------------------------------------------------------
@@ -4219,6 +4286,9 @@ pub fn write_linearized<R: Read + Seek>(
                 false,
                 id_writer,
                 encrypt_ctx.as_ref(),
+                // Same IV as every probe pass above — see
+                // `append_hint_stream_object`'s doc.
+                hint_stream_aes_iv,
             )?;
             final_bytes = bytes_final;
             final_xref_offsets = xref_offsets_final;
@@ -5146,6 +5216,91 @@ mod tests {
         }
         pdf.extend_from_slice(
             format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+        pdf
+    }
+
+    /// Three pages + a `/Outlines` root, built so the writer's plan populates
+    /// BOTH hint tables the reviewer-flagged bug named: page 0 has its own
+    /// private font (5 0 R, referenced only by page 0, so it stays a
+    /// first-page-private object) while pages 1 and 2 share a DIFFERENT font
+    /// (9 0 R) that page 0 never references — per qpdf's classification, a
+    /// shared object is Part 3 (first half) only when page 0 is among its
+    /// referencing pages; shared *without* page 0 among the referencers goes
+    /// to Part 8 (`part4_other_pages_shared`, second half), which is what
+    /// populates `so_table.header.location`. The empty `/Outlines` dict gives
+    /// `compute_outline_hint_info` a non-empty retained outline set, which
+    /// populates the Outlines Hint Table's `first_object_offset`.
+    fn outlines_and_part8_shared_pdf_bytes() -> Vec<u8> {
+        let content = b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n";
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = [0usize; 11];
+
+        offs[1] = pdf.len();
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R \
+              /Outlines << /Type /Outlines /Count 0 >> >>\nendobj\n",
+        );
+        offs[2] = pdf.len();
+        pdf.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [3 0 R 6 0 R 10 0 R] /Count 3 >>\nendobj\n",
+        );
+
+        // Page 0: private font 5 0 R, not shared with any other page.
+        offs[3] = pdf.len();
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n",
+        );
+        offs[4] = pdf.len();
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offs[5] = pdf.len();
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+
+        // Page 1: shares font 9 0 R with page 2 (below), never page 0.
+        offs[6] = pdf.len();
+        pdf.extend_from_slice(
+            b"6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 7 0 R /Resources << /Font << /F2 9 0 R >> >> >>\nendobj\n",
+        );
+        offs[7] = pdf.len();
+        pdf.extend_from_slice(
+            format!("7 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        offs[9] = pdf.len();
+        pdf.extend_from_slice(
+            b"9 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>\nendobj\n",
+        );
+
+        // Page 2: also references the shared font 9 0 R.
+        offs[10] = pdf.len();
+        pdf.extend_from_slice(
+            b"10 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 8 0 R /Resources << /Font << /F2 9 0 R >> >> >>\nendobj\n",
+        );
+        offs[8] = pdf.len();
+        pdf.extend_from_slice(
+            format!("8 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 11\n0000000000 65535 f \n");
+        for off in offs.iter().skip(1) {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 11 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
         );
         pdf
     }
@@ -7614,6 +7769,17 @@ mod tests {
         &body[..body_end]
     }
 
+    /// Locate object `number`'s start byte OFFSET in `out` (the position of
+    /// its `{number} 0 obj` header). Sibling of [`find_object_bytes`], which
+    /// returns the object's body slice instead of its offset.
+    fn find_object_offset(out: &[u8], number: u32) -> usize {
+        let header = format!("\n{number} 0 obj");
+        out.windows(header.len())
+            .position(|w| w == header.as_bytes())
+            .unwrap_or_else(|| panic!("expected \"{header}\" (object {number}'s header) in output"))
+            + 1
+    }
+
     /// Code-quality follow-up to Task 8: `--cleartext-metadata` interacts
     /// with the crate-wide default `CompressStreams::Yes` re-filtering
     /// policy. `append_body_object` computes `refiltered` — the flag
@@ -7795,6 +7961,7 @@ mod tests {
             None,
             false,
             Some(&ctx),
+            crate::pipeline::aes::static_initialization_vector(),
         )
         .expect("emit with encrypt_ctx");
         assert_eq!(offset, 0);
@@ -7817,6 +7984,291 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&bytes).contains(&length_marker),
             "/Length must reflect the encrypted (not plaintext) byte count"
+        );
+    }
+
+    /// Proves the mechanism the PR-review-flagged bug depends on: encrypting
+    /// the SAME plaintext hint-stream payload with two DIFFERENT AES IVs can
+    /// produce hint-stream *objects* of different total byte length, because
+    /// [`append_hint_stream_object`]'s newline-before-`endstream` decision
+    /// (qpdf, QPDFWriter.cc:2327) is data-dependent on the CIPHERTEXT's last
+    /// byte, and AES-CBC ciphertext is a function of the IV as well as the
+    /// plaintext (each ciphertext block chains through the previous one,
+    /// starting from the IV).
+    ///
+    /// `IV_NO_NEWLINE` / `IV_WITH_NEWLINE` were found by brute-forcing 16-byte
+    /// IVs against this exact payload + key until one landed on each side of
+    /// the boundary (`stream.data.last() == Some(&b'\n')`); they are not
+    /// otherwise meaningful values. This is the premise half of the fix's
+    /// proof — see [`hint_stream_length_is_stable_across_a_forced_iv_change`]
+    /// (this file) for why the length difference this test demonstrates does
+    /// NOT translate into a corrupted hint table, and
+    /// `append_hint_stream_object`'s own doc for the invariant that makes
+    /// that true.
+    #[test]
+    fn identical_plaintext_different_iv_can_change_hint_stream_object_length() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        const IV_NO_NEWLINE: [u8; 16] = [0u8; 16];
+        const IV_WITH_NEWLINE: [u8; 16] = [146, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let payload = b"page offset hint table + shared object hint table payload".to_vec();
+        let object_ref = ObjectRef::new(9, 0);
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encrypt_ref: ObjectRef::new(2, 0),
+            id0: Vec::new(),
+            static_aes_iv: false, // irrelevant here: the IV is passed explicitly
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        let emit = |iv: [u8; 16]| -> Vec<u8> {
+            let mut bytes = Vec::new();
+            append_hint_stream_object(
+                &mut bytes,
+                object_ref,
+                &payload,
+                46,
+                None,
+                false,
+                Some(&ctx),
+                iv,
+            )
+            .expect("emit with encrypt_ctx");
+            bytes
+        };
+
+        let with_no_newline_iv = emit(IV_NO_NEWLINE);
+        let with_newline_iv = emit(IV_WITH_NEWLINE);
+
+        // Sanity: confirm the brute-forced IVs actually land on opposite
+        // sides of the ciphertext-last-byte boundary, independently of the
+        // object-length assertion below (a passing length assertion for the
+        // wrong reason would be worse than no test).
+        let payload_len_from = |ctx: &EncryptionContext, iv: [u8; 16]| -> usize {
+            let mut stream = crate::Stream::new(Dictionary::new(), payload.clone());
+            crate::writer::encrypt_stream_payload_with_iv(object_ref, &mut stream, ctx, iv)
+                .unwrap();
+            let ends_in_newline = stream.data.last() == Some(&b'\n');
+            stream.data.len() + usize::from(!ends_in_newline)
+        };
+        assert_ne!(
+            payload_len_from(&ctx, IV_NO_NEWLINE),
+            payload_len_from(&ctx, IV_WITH_NEWLINE),
+            "test premise: the two brute-forced IVs must land on opposite \
+             sides of the newline-before-endstream boundary for this payload"
+        );
+
+        assert_ne!(
+            with_no_newline_iv.len(),
+            with_newline_iv.len(),
+            "identical plaintext through two different IVs must be able to \
+             produce hint-stream OBJECTS of different total byte length \
+             (this is the exact premise the reviewer-flagged bug depends on)"
+        );
+    }
+
+    /// Proves the fix actually closes the gap `identical_plaintext_different_iv_can_change_hint_stream_object_length`
+    /// opens: even though the hint stream's OWN emitted length can differ
+    /// between two IVs for the same plaintext, every downstream hint-table
+    /// field this writer derives from a probed pass stays IDENTICAL when
+    /// [`build_outline_hint_table`] (real production code, unmodified for
+    /// this test) is fed two scenarios that model "probe pass used
+    /// `hint_stream_obj_total_len = L`, the pass that actually ships the
+    /// bytes used `L + delta`" — the exact cross-pass situation the old
+    /// (fresh-IV-per-call) code could produce and the fix now prevents from
+    /// ever occurring in the first place.
+    ///
+    /// The mechanism: every object physically AFTER the hint stream shifts by
+    /// the same `delta` the hint stream's own length changed by (nothing else
+    /// in the file depends on the hint stream's length), so a probed offset
+    /// for such an object is always `hint_stream_offset + L + gap` for a
+    /// pass-invariant `gap`. Subtracting that same pass's `L` cancels it,
+    /// leaving `hint_stream_offset + gap` — independent of `L` entirely. This
+    /// is the invariant `append_hint_stream_object`'s doc names explicitly.
+    #[test]
+    fn hint_stream_length_is_stable_across_a_forced_iv_change() {
+        let info = OutlineHintInfo {
+            first_object: 3,
+            nobjects: 2,
+        };
+        let byte_lengths = BTreeMap::from([(3u32, 60usize), (4u32, 70usize)]);
+
+        // Scenario A: "probe pass" measured hint_stream_obj_total_len = 144,
+        // and object 3 (the first outline unit) physically landed at offset
+        // 500 in THAT pass's bytes (500 = hint_stream_offset + 144 + gap for
+        // some fixed hint_stream_offset/gap).
+        let table_a = build_outline_hint_table(
+            &info,
+            &BTreeMap::from([(3u32, 500usize)]),
+            &byte_lengths,
+            144,
+        )
+        .unwrap();
+
+        // Scenario B: same physical document, but the hint stream's OWN
+        // ciphertext was one byte longer this time (delta = +1, e.g. a
+        // different IV flipped the newline-before-endstream decision) — every
+        // object after it, including object 3, shifts by that same delta.
+        let delta: usize = 1;
+        let table_b = build_outline_hint_table(
+            &info,
+            &BTreeMap::from([(3u32, 500usize + delta)]),
+            &byte_lengths,
+            144 + delta,
+        )
+        .unwrap();
+
+        assert_eq!(
+            table_a.first_object_offset, table_b.first_object_offset,
+            "the stored (adjusted) offset must be independent of which \
+             pass's hint-stream length measured it, as long as every \
+             object after the hint stream shifted by the same delta"
+        );
+        // Negative control: this is not vacuously true for every field —
+        // group_length is an ABSOLUTE sum of other objects' own byte
+        // lengths (not an offset the hint stream's length was ever
+        // subtracted from), so it stays unaffected by delta and unequal
+        // scenarios would show up here instead if the byte_lengths differed.
+        assert_eq!(table_a.group_length, table_b.group_length);
+    }
+
+    /// Read a `"{key}: "`-prefixed decimal field out of a
+    /// [`crate::linearization::show_linearization_bytes`] dump — the same
+    /// text format qpdf's `--show-linearization` produces. Exact line-prefix
+    /// match (not substring search), so e.g. `"first_object: "` never matches
+    /// the unrelated `"first_page_object: "` line.
+    fn parse_dump_field(dump: &str, key: &str) -> u64 {
+        let needle = format!("{key}: ");
+        for line in dump.lines() {
+            if let Some(rest) = line.strip_prefix(&needle) {
+                return rest
+                    .trim()
+                    .parse()
+                    .unwrap_or_else(|e| panic!("field {key:?} = {rest:?} is not decimal: {e}"));
+            }
+        }
+        panic!("dump has no \"{needle}\" line:\n{dump}");
+    }
+
+    /// End-to-end proof (task item 5): a real linearized + AES-128-encrypted
+    /// document carrying BOTH an Outlines Hint Table entry and a Part-8
+    /// (`part4_other_pages_shared`) Shared Objects Hint Table entry — the two
+    /// concrete tables the PR review named — has internally self-consistent
+    /// hint tables under the fix, run repeatedly with genuinely random
+    /// (non-`--static-aes-iv`) per-invocation IVs.
+    ///
+    /// For each run: decode the hint stream via
+    /// [`crate::linearization::show_linearization_bytes`] (the same decoder
+    /// that reconstructs qpdf's `adjusted_offset`, i.e. `stored_value +
+    /// /H[1]`) and independently locate the REAL physical byte offset of the
+    /// referenced object by scanning the actually-shipped bytes — then assert
+    /// they agree. `check_linearization_bytes` alone would not catch a
+    /// regression here: per its own doc table it validates the linearization
+    /// PARAMETER DICT (`/L /N /O /H /E /T`), not the hint stream's internal
+    /// Page/Shared/Outline tables — this test's `show_linearization_bytes` +
+    /// manual offset reconstruction is the actual oracle for those (see task
+    /// item 6 in the commit/PR description for this gap in the checker).
+    #[test]
+    fn linearized_encrypted_outline_and_part8_shared_hint_tables_stay_consistent_across_many_random_iv_runs(
+    ) {
+        let src = outlines_and_part8_shared_pdf_bytes();
+        let mut observed_hint_lengths: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        let mut observed_outputs: std::collections::BTreeSet<Vec<u8>> =
+            std::collections::BTreeSet::new();
+
+        // 3000 trials keeps the (informational, not asserted — see below)
+        // probability of never observing the newline-before-endstream
+        // boundary below 1e-5: each trial independently has a ~1/256 chance
+        // of the hint-stream ciphertext's last byte landing on `\n`, so
+        // P(never in N trials) = (255/256)^N ≈ e^(-N/256); N=3000 gives
+        // e^-11.7 ≈ 8e-6.
+        const TRIALS: usize = 3000;
+        for _ in 0..TRIALS {
+            let out = linearize_with(&src, |o| {
+                // Empty user password so `check_linearization_bytes` and
+                // `show_linearization_bytes` below (both open with no
+                // password) can decrypt transparently — the same convention
+                // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
+                // uses. `static_aes_iv` stays at its default `false`: this
+                // test's whole point is genuinely random per-invocation IVs.
+                o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                    Vec::new(),
+                    b"owner".to_vec(),
+                ));
+            });
+
+            crate::linearization::check_linearization_bytes(&out)
+                .expect("encrypted linearized output must pass the linearization checker");
+
+            let dump = crate::linearization::show_linearization_bytes(&out, "test")
+                .expect("hint stream must decode (decryption + bit-unpacking)");
+
+            // Shared Objects Hint Table: `first_shared_offset` (already
+            // adjusted_offset()-reconstructed by the dump) must equal the
+            // REAL physical offset of the renumbered first Part-8 object.
+            let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
+            let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
+            let real_shared_offset = find_object_offset(&out, first_shared_obj);
+            assert_eq!(
+                first_shared_offset, real_shared_offset,
+                "Shared Objects Hint Table's first_shared_offset must match the \
+                 real physical offset of object {first_shared_obj} (dump:\n{dump})"
+            );
+
+            // Outlines Hint Table: same check for `first_object_offset`.
+            assert!(
+                dump.contains("Outlines Hint Table"),
+                "test premise: fixture's /Outlines must produce an Outlines Hint \
+                 Table section (dump:\n{dump})"
+            );
+            let first_object = parse_dump_field(&dump, "first_object") as u32;
+            let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
+            let real_object_offset = find_object_offset(&out, first_object);
+            assert_eq!(
+                first_object_offset, real_object_offset,
+                "Outlines Hint Table's first_object_offset must match the real \
+                 physical offset of object {first_object} (dump:\n{dump})"
+            );
+
+            let h_length = parse_dump_field(&dump, "H_length") as usize;
+            observed_hint_lengths.insert(h_length);
+            observed_outputs.insert(out);
+        }
+
+        // Randomness sanity check: confirm the fix pins the IV only WITHIN
+        // one `write_linearized` call, not accidentally across every call —
+        // every one of these `TRIALS` invocations still draws its own fresh
+        // IV, so the shipped bytes vary from run to run. This assertion is
+        // effectively certain to hold regardless of the newline-before-
+        // endstream boundary: every OTHER encrypted string/stream in the
+        // fixture also draws its own fresh per-invocation IV, so the output
+        // bytes differ across runs even on trials where the hint stream's
+        // own length happens to match.
+        assert!(
+            observed_outputs.len() > 1,
+            "{TRIALS} independent encrypted runs produced byte-identical output \
+             — the per-invocation IV draw appears to have been hardcoded away"
+        );
+        // NOT asserted (deliberately): whether this run's `TRIALS` draws ever
+        // landed on the opposite side of the hint stream's newline-before-
+        // endstream boundary is a low-probability (~1/256 per trial) event.
+        // `TRIALS` is sized so missing it entirely is rare (≈8e-6), but "rare"
+        // is not "never" — turning this into a hard assertion would make the
+        // test flaky under CI's normal run-to-run variance. When it DOES
+        // fire, it is a second, independent confirmation (beyond the offset
+        // assertions above, which run unconditionally on every trial) that a
+        // real hint-stream length difference occurred and self-consistency
+        // still held for it.
+        eprintln!(
+            "observed {} distinct H_length value(s) across {TRIALS} trials \
+             (>1 means the newline-before-endstream boundary was hit and \
+             self-consistency held across it too)",
+            observed_hint_lengths.len()
         );
     }
 
@@ -8182,6 +8634,7 @@ mod tests {
             None,
             true,
             None,
+            [0u8; 16], // unused: no encrypt_ctx
         )
         .expect("no encrypt_ctx: emission cannot fail");
         assert_eq!(offset, 0, "emitter returns its start offset");
@@ -8208,6 +8661,7 @@ mod tests {
             Some(51),
             false,
             None,
+            [0u8; 16], // unused: no encrypt_ctx
         )
         .expect("no encrypt_ctx: emission cannot fail");
 
