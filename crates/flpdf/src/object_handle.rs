@@ -677,10 +677,13 @@ impl ObjectHandle {
             return Ok(false);
         };
         for index in 0..count {
-            if let Some(item) = self.try_array_item(index)? {
-                if item.try_is_name_and_equals(name)? {
-                    return Ok(true);
-                }
+            if self
+                .try_array_item(index)?
+                .map(|item| item.try_is_name_and_equals(name))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -3746,6 +3749,13 @@ pub(crate) mod identity_tests {
         )]);
         let non_name = ObjectHandle::dictionary(vec![(b"Type".to_vec(), ObjectHandle::integer(1))]);
         let missing = ObjectHandle::dictionary(Vec::new());
+        let wrong_subtype = ObjectHandle::dictionary(vec![
+            (
+                b"Type".to_vec(),
+                ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+            ),
+            (b"Subtype".to_vec(), ObjectHandle::name(b"Other".to_vec())),
+        ]);
 
         assert!(!wrong
             .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
@@ -3755,6 +3765,9 @@ pub(crate) mod identity_tests {
             .unwrap());
         assert!(!missing
             .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!wrong_subtype
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
             .unwrap());
         assert!(!ObjectHandle::integer(1)
             .try_is_dictionary_of_type(b"", b"")
