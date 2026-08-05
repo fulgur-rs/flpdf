@@ -107,7 +107,17 @@ impl SharedObjectHintEntry {
 /// Walks arrays, dictionaries, and stream dictionaries (but NOT stream data
 /// bytes). A `Reference(r)` is pushed to `out` as-is.  The caller is
 /// responsible for cycle detection and transitive expansion.
-fn collect_direct_refs(obj: &Object, depth: usize, out: &mut Vec<ObjectRef>) -> Result<()> {
+///
+/// `pub(crate)`: also reused by
+/// `crate::linearization::writer::resolve_catalog_adbe_status` to answer a
+/// shape-independent "does this subtree contain any indirect reference
+/// anywhere" question for the Catalog's `/Extensions` value, rather than
+/// hand-rolling a second traversal for that unrelated purpose.
+pub(crate) fn collect_direct_refs(
+    obj: &Object,
+    depth: usize,
+    out: &mut Vec<ObjectRef>,
+) -> Result<()> {
     if depth > MAX_INLINE_DEPTH {
         return Err(crate::Error::Unsupported(format!(
             "linearization plan: inline object nesting exceeds maximum of {MAX_INLINE_DEPTH}"
