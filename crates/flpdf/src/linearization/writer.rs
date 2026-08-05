@@ -2207,17 +2207,22 @@ fn do_write_pass<R: Read + Seek>(
     // `writeEncryptionDictionary` unconditionally on `m->encrypted`, on
     // every pass, so this is not gated on `pass1_digest`. The dict itself is
     // never encrypted (PDF 1.7 §7.6.1 — a reader must parse it before it can
-    // derive the file key needed to decrypt anything else), so this reuses
-    // the same [`append_object`] every other body object in this function
-    // uses; its `new_ref == ctx.encrypt_ref` self-skip is exactly what keeps
-    // no data key from ever being applied to these bytes.
+    // derive the file key needed to decrypt anything else). Its five binary
+    // security-handler strings use the dedicated compact hexadecimal form.
     if let Some(ctx) = encrypt_ctx {
-        let offset = append_object(
+        let offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "{} {} obj\n",
+                ctx.encrypt_ref.number, ctx.encrypt_ref.generation
+            )
+            .as_bytes(),
+        );
+        crate::writer::encrypted_strings::write_encryption_dictionary(
             &mut bytes,
-            ctx.encrypt_ref,
-            Object::Dictionary(ctx.encrypt_dict.clone()),
-            encrypt_ctx,
-        )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
+            &ctx.encrypt_dict,
+        );
+        bytes.extend_from_slice(b"\nendobj\n");
         xref_offsets.insert(ctx.encrypt_ref.number, offset);
     }
 

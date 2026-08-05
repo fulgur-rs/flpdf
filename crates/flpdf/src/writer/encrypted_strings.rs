@@ -1,6 +1,7 @@
-//! qpdf correspondence: QPDFWriter.cc:1567-1599 and 1761-1796 encrypted string emission.
+//! qpdf correspondence: QPDFWriter.cc:1567-1599 and 1761-1796 encrypted string emission;
+//! QPDFWriter.cc:2244-2256 `/Encrypt` dictionary emission.
 
-use crate::object::{write_hex_string, write_string_value};
+use crate::object::{write_hex_string, write_name_escaped, write_string_value};
 use crate::security::standard::{encrypt_cipher_bytes, ObjectKeyAlg, StringEncryptCipher};
 use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::{EncryptionContext, WriteCipher};
@@ -150,9 +151,32 @@ pub(crate) fn serialize_encrypted_string(out: &mut Vec<u8>, ciphertext: &[u8], u
     }
 }
 
+/// Serialize the `/Encrypt` dictionary with qpdf's compact direct layout.
+///
+/// The five binary security-handler fields are hexadecimal even when their
+/// bytes are printable. This policy deliberately applies only to direct
+/// dictionary entries: nested values retain ordinary object serialization.
+pub(crate) fn write_encryption_dictionary(out: &mut Vec<u8>, dict: &Dictionary) {
+    const HEX_ENCRYPT_KEYS: [&[u8]; 5] = [b"O", b"U", b"OE", b"UE", b"Perms"];
+
+    out.extend_from_slice(b"<<");
+    for (key, value) in dict.iter() {
+        out.extend_from_slice(b" /");
+        write_name_escaped(out, key);
+        out.push(b' ');
+        match value {
+            Object::String(bytes) if HEX_ENCRYPT_KEYS.contains(&key) => {
+                write_hex_string(out, bytes);
+            }
+            _ => value.write_pdf(out),
+        }
+    }
+    out.extend_from_slice(b" >>");
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{serialize_encrypted_string, EncryptedStringEmitter};
+    use super::{serialize_encrypted_string, write_encryption_dictionary, EncryptedStringEmitter};
     use crate::encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
     use crate::security::standard::{
         decrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringCipher,
@@ -257,6 +281,38 @@ mod tests {
         let mut rc4 = Vec::new();
         serialize_encrypted_string(&mut rc4, b"printable", false);
         assert_eq!(rc4, b"(printable)");
+    }
+
+    #[test]
+    fn encryption_dictionary_hex_encodes_only_the_five_direct_binary_keys() {
+        let mut nested = Dictionary::new();
+        nested.insert("O", Object::String(b"nested".to_vec()));
+
+        let mut dict = Dictionary::new();
+        for key in ["O", "U", "OE", "UE", "Perms"] {
+            dict.insert(key, Object::String(b"printable".to_vec()));
+        }
+        dict.insert("Custom", Object::String(b"custom".to_vec()));
+        dict.insert("Nested", Object::Dictionary(nested));
+
+        let mut wire = Vec::new();
+        write_encryption_dictionary(&mut wire, &dict);
+
+        for key in [b"O".as_slice(), b"U", b"OE", b"UE", b"Perms"] {
+            let expected = [key, b" <7072696e7461626c65>"].concat();
+            assert!(
+                wire.windows(expected.len()).any(|part| part == expected),
+                "direct /{} must be hexadecimal: {}",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(&wire),
+            );
+        }
+        assert!(wire
+            .windows(b"/Custom (custom)".len())
+            .any(|part| part == b"/Custom (custom)"));
+        assert!(wire
+            .windows(b"/Nested << /O (nested) >>".len())
+            .any(|part| part == b"/Nested << /O (nested) >>"));
     }
 
     #[test]

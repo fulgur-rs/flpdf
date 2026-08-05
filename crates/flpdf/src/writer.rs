@@ -4085,7 +4085,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     if let Some(ctx) = &encrypt_ctx {
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", ctx.encrypt_ref.number).as_bytes());
-        Object::Dictionary(ctx.encrypt_dict.clone()).write_pdf(&mut bytes);
+        encrypted_strings::write_encryption_dictionary(&mut bytes, &ctx.encrypt_dict);
         bytes.extend_from_slice(b"\nendobj\n");
         offsets.insert(ctx.encrypt_ref.number, (0, emit_offset));
     }
