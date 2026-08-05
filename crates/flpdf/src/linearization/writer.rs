@@ -1710,7 +1710,7 @@ fn append_hint_stream_object(
                 &mut stream,
                 ctx,
                 hint_stream_aes_iv,
-            )?;
+            )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass with encrypt_ctx present.
             encrypted_payload = stream.data;
             &encrypted_payload
         }
@@ -3423,11 +3423,16 @@ pub fn write_linearized<R: Read + Seek>(
         Some(ctx) if ctx.static_aes_iv => crate::pipeline::aes::static_initialization_vector(),
         Some(ctx) if crate::writer::cipher_needs_aes_iv(ctx.cipher) => {
             let mut iv = [0u8; 16];
+            // cov:ignore-start: defensive — the OS CSPRNG does not fail on
+            // any platform this crate's test suite runs on; mirrors the
+            // same untested-in-practice getrandom failure arm in
+            // `crate::writer::encrypt_stream_payload_for_writer`.
             getrandom::getrandom(&mut iv).map_err(|e| {
                 crate::Error::Unsupported(format!(
                     "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
                 ))
             })?;
+            // cov:ignore-end
             iv
         }
         _ => [0u8; 16],
