@@ -71,6 +71,7 @@ use crate::linearization::plan::{
 };
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
 use crate::object::MAX_INLINE_DEPTH;
+use crate::writer::encrypted_strings::EncryptedStringEmitter;
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
@@ -545,29 +546,22 @@ fn renumber_object_with_removed<R: Read + Seek>(
 /// Append `N G obj\n<object>\nendobj\n` to `bytes` and return the offset of the
 /// `N G obj` header (i.e. the start of the object).
 ///
-/// When `encrypt_ctx` is `Some` and `new_ref` is not the `/Encrypt` dict's own
-/// ref, every string in `object`'s graph is encrypted in place first (mirrors
-/// `crate::writer`'s per-object emission loop, which calls
-/// `encrypt_strings_in_object_for_writer` before serializing). The `new_ref ==
-/// ctx.encrypt_ref` self-skip is what keeps the `/Encrypt` dict itself
-/// plaintext (PDF 1.7 §7.6.1) when this same function is reused for its
-/// emission.
+/// When `encrypted_string_emitter` is `Some`, strings are encrypted from the
+/// writer's per-object emission state without mutating `object`. The
+/// `/Encrypt` dictionary never reaches this helper: [`do_write_pass`] emits it
+/// directly through
+/// [`write_encryption_dictionary`](crate::writer::encrypted_strings::write_encryption_dictionary)
+/// so it remains plaintext.
 fn append_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
-    mut object: Object,
-    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    object: Object,
+    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
 ) -> Result<usize> {
-    let object_encryption = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-    let force_hex_strings = object_encryption
-        .is_some_and(crate::writer::EncryptionContext::encrypted_strings_require_hex);
-    if let Some(ctx) = object_encryption {
-        crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut object, ctx)?;
-    }
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
-    if force_hex_strings {
-        object.write_pdf_with_forced_hex_strings(bytes);
+    if let Some(emitter) = encrypted_string_emitter {
+        emitter.write_object(bytes, new_ref, None, &object, false)?;
     } else {
         object.write_pdf(bytes);
     }
@@ -599,17 +593,13 @@ fn append_object(
 /// and the `newline_before_endstream` policy is honoured so the framing matches
 /// the option the caller passed.
 ///
-/// Non-stream objects are delegated to [`append_object`] unchanged (which
-/// applies string encryption itself).
+/// Non-stream objects are delegated to [`append_object`] unchanged, which uses
+/// `encrypted_string_emitter` for scalar emission when encryption is active.
 ///
-/// When `encrypt_ctx` is `Some` and `new_ref` is not the `/Encrypt` dict's own
-/// ref, a stream object's dictionary strings are encrypted BEFORE re-encoding
-/// and its payload is encrypted AFTER re-encoding — mirroring
-/// `crate::writer`'s per-object emission loop, which calls
-/// `encrypt_strings_in_object_for_writer` on the whole resolved object first,
-/// then `encrypt_stream_payload_for_writer` on the stream's payload once
-/// `reencode_stream_for_compress` has produced the final on-disk bytes (so
-/// `/Length` is set from the ciphertext, not the plaintext, byte count).
+/// When encryption is active, `encrypted_string_emitter` encrypts stream
+/// dictionary strings during final serialization while `encrypt_ctx` retains
+/// ownership of stream-payload encryption after re-encoding (so `/Length` is
+/// set from the ciphertext, not the plaintext, byte count).
 ///
 /// `original_ref` is the object's PRE-renumber ref (matching `crate::writer`'s
 /// `old_ref`), used only to check it against `ctx.metadata_ref` (also an
@@ -617,6 +607,7 @@ fn append_object(
 /// `--cleartext-metadata` exemption below. `new_ref` must not be substituted
 /// here: `metadata_ref` is populated before renumbering, so comparing against
 /// the renumbered ref would never match.
+#[allow(clippy::too_many_arguments)]
 fn append_body_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
@@ -625,28 +616,11 @@ fn append_body_object(
     options: &WriteOptions,
     recovered_stream_eol: Option<&[u8]>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
 ) -> Result<usize> {
     let Object::Stream(stream) = object else {
-        return append_object(bytes, new_ref, object, encrypt_ctx);
+        return append_object(bytes, new_ref, object, encrypted_string_emitter);
     };
-
-    // Encrypt any strings inside the stream's dictionary before re-encoding —
-    // same ordering as crate::writer's loop (string encryption runs on the
-    // whole resolved object before the compress-policy reencode).
-    let mut wrapped = Object::Stream(stream);
-    let object_encryption = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
-    let force_hex_strings = object_encryption
-        .is_some_and(crate::writer::EncryptionContext::encrypted_strings_require_hex);
-    if let Some(ctx) = object_encryption {
-        crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut wrapped, ctx)?;
-    }
-    // cov:ignore-start: unreachable — `wrapped` was just constructed as
-    // Object::Stream above, and encrypt_strings_in_object_for_writer never
-    // changes an object's variant.
-    let Object::Stream(stream) = wrapped else {
-        unreachable!("wrapped is always Object::Stream")
-    };
-    // cov:ignore-end
 
     let policy = effective_stream_policy(options);
     let (reencoded, source_filter_is_lone_flate) =
@@ -702,13 +676,16 @@ fn append_body_object(
     // route to `Never`); force `Never` so the framing matches qpdf.  The
     // primary hint stream keeps its newline via the separate
     // `append_hint_stream_object`, matching qpdf's hint-stream framing.
-    write_stream_to_buf_qpdf_order(
-        bytes,
-        &s,
-        NewlineBeforeEndstream::Never,
-        refiltered,
-        force_hex_strings,
-    );
+    if let Some(emitter) = encrypted_string_emitter {
+        emitter.write_stream_dict(bytes, new_ref, None, &s.dict, false, refiltered)?;
+        crate::writer::serialize::write_stream_payload(
+            bytes,
+            &s.data,
+            NewlineBeforeEndstream::Never,
+        );
+    } else {
+        write_stream_to_buf_qpdf_order(bytes, &s, NewlineBeforeEndstream::Never, refiltered);
+    }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
 }
@@ -1973,6 +1950,7 @@ fn do_write_pass<R: Read + Seek>(
     pass1_digest: bool,
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
+    mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
     hint_stream_aes_iv: [u8; 16],
 ) -> Result<(
     Vec<u8>,
@@ -2140,6 +2118,7 @@ fn do_write_pass<R: Read + Seek>(
             options,
             recovered_eol,
             encrypt_ctx,
+            encrypted_string_emitter.as_deref_mut(),
         )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
@@ -2176,6 +2155,7 @@ fn do_write_pass<R: Read + Seek>(
             options,
             recovered_eol,
             encrypt_ctx,
+            encrypted_string_emitter.as_deref_mut(),
         )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2286,6 +2266,7 @@ fn do_write_pass<R: Read + Seek>(
             options,
             recovered_eol,
             encrypt_ctx,
+            encrypted_string_emitter.as_deref_mut(),
         )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2325,6 +2306,7 @@ fn do_write_pass<R: Read + Seek>(
             options,
             recovered_eol,
             encrypt_ctx,
+            encrypted_string_emitter.as_deref_mut(),
         )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2374,6 +2356,7 @@ fn do_write_pass<R: Read + Seek>(
             options,
             recovered_eol,
             encrypt_ctx,
+            encrypted_string_emitter.as_deref_mut(),
         )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
         xref_offsets.insert(new_ref.number, offset);
     }
@@ -2448,6 +2431,7 @@ fn do_write_pass<R: Read + Seek>(
                     options,
                     recovered_eol,
                     encrypt_ctx,
+                    encrypted_string_emitter.as_deref_mut(),
                 )?; // cov:ignore: llvm-cov region artifact on this bare closing line (Err never taken); the call itself executes every pass.
                 xref_offsets.insert(new_ref.number, offset);
             }
@@ -3428,6 +3412,9 @@ pub fn write_linearized<R: Read + Seek>(
         } else {
             None
         };
+    let mut encrypted_string_emitter = encrypt_ctx
+        .as_ref()
+        .map(EncryptedStringEmitter::from_context);
 
     // Draw the hint stream's AES IV once for this whole invocation, reused
     // for every `append_hint_stream_object` call the convergence loop below
@@ -3750,6 +3737,7 @@ pub fn write_linearized<R: Read + Seek>(
             // with the probe/final passes below if that guard is ever
             // relaxed.
             encrypt_ctx.as_ref(),
+            encrypted_string_emitter.as_mut(),
             // Pass-1 digest mode never emits the hint stream (`pass1_digest =
             // true` above), so this value is never read; threaded through
             // for signature uniformity with the probe/final calls below.
@@ -3823,6 +3811,7 @@ pub fn write_linearized<R: Read + Seek>(
             // convergence, and because omitting it here would shift every
             // downstream object's measured offset relative to the final pass.
             encrypt_ctx.as_ref(),
+            encrypted_string_emitter.as_mut(),
             // Reused across every probe pass AND the final pass below — see
             // `append_hint_stream_object`'s doc for why a fresh-per-call IV
             // would be unsafe.
@@ -4303,6 +4292,7 @@ pub fn write_linearized<R: Read + Seek>(
                 false,
                 id_writer,
                 encrypt_ctx.as_ref(),
+                encrypted_string_emitter.as_mut(),
                 // Same IV as every probe pass above — see
                 // `append_hint_stream_object`'s doc.
                 hint_stream_aes_iv,
@@ -6710,8 +6700,9 @@ mod tests {
 
     /// Build a linearizable single-page PDF with a page content stream (raw
     /// `content` bytes, no `/Filter`) and an `/Info` dictionary carrying a
-    /// `/Producer` string — the two distinct kinds of body data Task 8 must
-    /// encrypt: a stream payload and a dictionary string.
+    /// `/Producer` string plus nested printable strings — the distinct kinds
+    /// of body data the encrypted writer must handle: a stream payload and
+    /// scalar strings at every container depth.
     fn tiny_pdf_with_content_and_producer(content: &[u8], producer: &[u8]) -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -6737,7 +6728,10 @@ mod tests {
         pdf.extend_from_slice(b"\nendstream\nendobj\n");
 
         offs.push(pdf.len() as u64);
-        pdf.extend_from_slice(b"5 0 obj\n<< /Producer (");
+        pdf.extend_from_slice(
+            b"5 0 obj\n<< /Nested [(array-printable) << /Inner (inner-printable) >>] \
+              /Producer (",
+        );
         pdf.extend_from_slice(producer);
         pdf.extend_from_slice(b") >>\nendobj\n");
 
@@ -6753,6 +6747,66 @@ mod tests {
         );
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    /// Assert the three strings in
+    /// [`tiny_pdf_with_content_and_producer`]'s `/Info` object use raw hex
+    /// string tokens after AES encryption. The source values are all printable
+    /// and nested at scalar/array/dictionary positions, so literal `(...)`
+    /// syntax anywhere in this object is a regression to generic emission.
+    fn assert_encrypted_body_strings_are_hex(out: &[u8]) {
+        let reopened = Pdf::open(Cursor::new(out.to_vec()))
+            .expect("encrypted output must reopen with the empty user password");
+        let info_ref = match reopened.trailer().get("Info") {
+            Some(Object::Reference(r)) => *r,
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: fixture invariant
+        };
+        let info_bytes = find_object_bytes(out, info_ref.number);
+
+        assert!(
+            info_bytes
+                .windows(b"/Nested [ <".len())
+                .any(|part| part == b"/Nested [ <"),
+            "nested array string must start with a hex token: {:?}",
+            String::from_utf8_lossy(info_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+        assert!(
+            info_bytes
+                .windows(b"/Inner <".len())
+                .any(|part| part == b"/Inner <"),
+            "nested dictionary string must start with a hex token: {:?}",
+            String::from_utf8_lossy(info_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+        assert!(
+            info_bytes
+                .windows(b"/Producer <".len())
+                .any(|part| part == b"/Producer <"),
+            "/Producer string must start with a hex token: {:?}",
+            String::from_utf8_lossy(info_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+
+        let literal_tokens = info_bytes.iter().filter(|&&byte| byte == b'(').count();
+        let hex_tokens = info_bytes
+            .iter()
+            .enumerate()
+            .filter(|&(index, byte)| {
+                *byte == b'<'
+                    && (index == 0 || info_bytes[index - 1] != b'<')
+                    && info_bytes.get(index + 1) != Some(&b'<')
+            })
+            .count();
+        assert_eq!(
+            literal_tokens,
+            0,
+            "AES-encrypted /Info must contain no literal string token: {:?}",
+            String::from_utf8_lossy(info_bytes) // cov:ignore: only evaluated on assertion failure
+        );
+        assert_eq!(
+            hex_tokens,
+            3,
+            "all three AES-encrypted /Info strings must use hex tokens: {:?}",
+            String::from_utf8_lossy(info_bytes) // cov:ignore: only evaluated on assertion failure
+        );
     }
 
     /// Resolve `/Info /Producer` and the (single) page's `/Contents` stream
@@ -6884,6 +6938,25 @@ mod tests {
             decrypted_content, marker,
             "content stream must decrypt back to its original plaintext"
         );
+    }
+
+    #[test]
+    fn linearized_aes_strings_use_hex() {
+        let src = tiny_pdf_with_content_and_producer(
+            b"BT (linearized AES string syntax) Tj ET\n",
+            b"producer-printable",
+        );
+        let out = linearize_with(&src, |options| {
+            options.static_aes_iv = true;
+            options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        assert_encrypted_body_strings_are_hex(&out);
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("AES-encrypted output must pass linearization checks");
     }
 
     /// Task 11: every prior test in this module (Tasks 6-10) only exercised

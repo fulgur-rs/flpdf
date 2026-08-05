@@ -2293,20 +2293,6 @@ pub(crate) struct EncryptionContext {
     pub(crate) metadata_ref: Option<ObjectRef>,
 }
 
-impl EncryptionContext {
-    /// Whether qpdf serializes strings for this encryption method with
-    /// `QPDF_String::unparse(true)`. AES uses forced hexadecimal output after
-    /// encryption; RC4 retains `QPDF_String::unparse()`'s heuristic
-    /// (`QPDFWriter.cc:1567-1592`).
-    pub(crate) fn encrypted_strings_require_hex(&self) -> bool {
-        matches!(
-            self.cipher,
-            WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Aes)
-                | WriteCipher::FileKeyAes256
-        )
-    }
-}
-
 /// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
 /// Used to exempt the XMP metadata stream from encryption under
 /// `--cleartext-metadata`.
@@ -2789,86 +2775,6 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
             apply_static_id(trailer);
         } else {
             apply_random_id(trailer);
-        }
-    }
-}
-
-/// Encrypt every `Object::String` value in `object`'s graph in place, using
-/// a per-object key derived via Algorithm 1 and the cipher implied by
-/// `ctx.object_key_alg`. The `/Encrypt` dict itself is skipped by the
-/// caller (this function is not called on `ctx.encrypt_ref`).
-pub(crate) fn encrypt_strings_in_object_for_writer(
-    object_ref: ObjectRef,
-    object: &mut Object,
-    ctx: &EncryptionContext,
-) -> Result<()> {
-    use crate::security::standard::{
-        encrypt_strings_in_object, per_object_key, ObjectKeyAlg, StringEncryptCipher,
-    };
-
-    let mut iv_gen = || {
-        if ctx.static_aes_iv {
-            crate::pipeline::aes::static_initialization_vector()
-        } else {
-            let mut iv = [0u8; 16];
-            getrandom::getrandom(&mut iv)
-                .expect("OS CSPRNG (getrandom) must be available for AES IV generation");
-            iv
-        }
-    };
-
-    match ctx.cipher {
-        WriteCipher::PerObject(alg) => {
-            let per_obj_key = per_object_key(
-                &ctx.file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                alg,
-            );
-            match alg {
-                ObjectKeyAlg::Aes => {
-                    // V=4 AES per-object key is 16 bytes (min(n + 5, 16) with n=16 → 16).
-                    let key_bytes: [u8; 16] = per_obj_key
-                        .as_slice()
-                        .try_into()
-                        .expect("V=4 AES per-object key is exactly 16 bytes");
-                    let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
-                    encrypt_strings_in_object(
-                        object_ref,
-                        object,
-                        cipher,
-                        Some(ctx.encrypt_ref),
-                        &mut iv_gen,
-                    )
-                }
-                ObjectKeyAlg::Rc4 => {
-                    let cipher = StringEncryptCipher::Rc4 {
-                        key: per_obj_key.as_slice(),
-                    };
-                    encrypt_strings_in_object(
-                        object_ref,
-                        object,
-                        cipher,
-                        Some(ctx.encrypt_ref),
-                        &mut iv_gen,
-                    )
-                }
-            }
-        }
-        WriteCipher::FileKeyAes256 => {
-            // V=5: the 32-byte file key is the object key directly (no
-            // Algorithm-1 derivation), used with AES-256-CBC.
-            let key_bytes: [u8; 32] = ctx.file_key.as_slice().try_into().map_err(|_| {
-                crate::Error::Unsupported("V=5 AES-256 file key is not 32 bytes".to_string())
-            })?;
-            let cipher = StringEncryptCipher::Aes256 { key: &key_bytes };
-            encrypt_strings_in_object(
-                object_ref,
-                object,
-                cipher,
-                Some(ctx.encrypt_ref),
-                &mut iv_gen,
-            )
         }
     }
 }

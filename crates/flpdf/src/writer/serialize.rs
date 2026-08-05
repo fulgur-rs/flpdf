@@ -47,15 +47,8 @@ pub(crate) fn write_qpdf_stream(
     stream: &crate::Stream,
     policy: NewlineBeforeEndstream,
     refiltered: bool,
-    force_hex_strings: bool,
 ) {
-    if force_hex_strings {
-        stream
-            .dict
-            .write_pdf_stream_with_forced_hex_strings(out, refiltered);
-    } else {
-        stream.dict.write_pdf_stream(out, refiltered);
-    }
+    stream.dict.write_pdf_stream(out, refiltered);
     write_stream_payload(out, &stream.data, policy);
 }
 
