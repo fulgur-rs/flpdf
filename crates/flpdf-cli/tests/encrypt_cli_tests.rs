@@ -13,7 +13,11 @@ use std::process::Command as ShellCommand;
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
+// Only referenced by the qpdf-zlib-compat-gated byte-identical oracle test
+// below; under default features they'd otherwise be dead code.
+#[cfg(feature = "qpdf-zlib-compat")]
 const TWO_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/two-page.pdf";
+#[cfg(feature = "qpdf-zlib-compat")]
 const THREE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/three-page.pdf";
 
 fn fixture(rel: &str) -> PathBuf {
