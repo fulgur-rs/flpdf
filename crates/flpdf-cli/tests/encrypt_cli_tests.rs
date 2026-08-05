@@ -2233,6 +2233,13 @@ fn rewrite_linearize_encrypt_object_streams_generate_is_rejected_with_actionable
 /// 256-bit (V=5/AESV3) is excluded for the same reason as the non-linearized
 /// test: its random salt bytes are not seeded by `--static-id`/
 /// `--static-aes-iv`, so even two qpdf runs of the same invocation diverge.
+///
+/// The determinism re-run below repeats BOTH surfaces (not just the
+/// top-level one) — the two surfaces build `WriteOptions` independently
+/// (see the byte-parity check above), so a nondeterminism bug specific to
+/// one surface's own option-construction path (e.g. IV-seeding order)
+/// could otherwise slip past a determinism check that only re-ran the
+/// other.
 #[cfg(feature = "qpdf-zlib-compat")]
 #[test]
 fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
@@ -2252,6 +2259,19 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
         "--use-aes=y",
         "--",
     ];
+
+    // Runs `flpdf [rewrite] <qpdf_args> input output` and returns the
+    // output bytes. `subcommand` is `Some("rewrite")` for the `rewrite
+    // --linearize` surface, `None` for the top-level `--linearize` alias.
+    let run_flpdf = |subcommand: Option<&str>, input: &Path, tag: &str| -> Vec<u8> {
+        let out = tmp.path().join(format!("{tag}.pdf"));
+        let mut cmd = Command::cargo_bin("flpdf").unwrap();
+        if let Some(sub) = subcommand {
+            cmd.arg(sub);
+        }
+        cmd.args(qpdf_args).arg(input).arg(&out).assert().success();
+        std::fs::read(&out).unwrap()
+    };
 
     for (case, fixture_path) in [
         ("one-page", ONE_PAGE_FIXTURE),
@@ -2275,15 +2295,7 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
         let reference = std::fs::read(&theirs).unwrap();
 
         // Surface 1: the top-level `--linearize` alias.
-        let top_level = tmp.path().join(format!("{case}-flpdf-top-level.pdf"));
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .args(qpdf_args)
-            .arg(&input)
-            .arg(&top_level)
-            .assert()
-            .success();
-        let top_level_bytes = std::fs::read(&top_level).unwrap();
+        let top_level_bytes = run_flpdf(None, &input, &format!("{case}-flpdf-top-level"));
         assert_eq!(
             top_level_bytes, reference,
             "{case}: top-level `flpdf --linearize --encrypt` (AES-128) must be \
@@ -2291,40 +2303,33 @@ fn cli_linearize_encrypt_aes128_byte_identical_to_qpdf() {
         );
 
         // Surface 2: the `rewrite --linearize` subcommand.
-        let rewrite = tmp.path().join(format!("{case}-flpdf-rewrite.pdf"));
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .arg("rewrite")
-            .args(qpdf_args)
-            .arg(&input)
-            .arg(&rewrite)
-            .assert()
-            .success();
-        let rewrite_bytes = std::fs::read(&rewrite).unwrap();
+        let rewrite_bytes = run_flpdf(Some("rewrite"), &input, &format!("{case}-flpdf-rewrite"));
         assert_eq!(
             rewrite_bytes, reference,
             "{case}: `flpdf rewrite --linearize --encrypt` (AES-128) must be \
              byte-identical to qpdf 11.9.0"
         );
 
-        // Determinism check: a second top-level run of the identical
+        // Determinism check: a second run of each surface's identical
         // invocation must also be byte-identical, proving --static-id
         // --static-aes-iv genuinely eliminate every source of
-        // nondeterminism on this path (not just that this one run happened
-        // to match this one qpdf sample).
-        let top_level_again = tmp.path().join(format!("{case}-flpdf-top-level-again.pdf"));
-        Command::cargo_bin("flpdf")
-            .unwrap()
-            .args(qpdf_args)
-            .arg(&input)
-            .arg(&top_level_again)
-            .assert()
-            .success();
-        let top_level_again_bytes = std::fs::read(&top_level_again).unwrap();
+        // nondeterminism on BOTH paths (not just that this one run
+        // happened to match this one qpdf sample).
+        let top_level_again = run_flpdf(None, &input, &format!("{case}-flpdf-top-level-again"));
         assert_eq!(
-            top_level_bytes, top_level_again_bytes,
-            "{case}: two flpdf runs of the same --static-id --static-aes-iv \
-             invocation must be byte-identical to each other"
+            top_level_bytes, top_level_again,
+            "{case}: two flpdf top-level runs of the same --static-id \
+             --static-aes-iv invocation must be byte-identical to each other"
+        );
+        let rewrite_again = run_flpdf(
+            Some("rewrite"),
+            &input,
+            &format!("{case}-flpdf-rewrite-again"),
+        );
+        assert_eq!(
+            rewrite_bytes, rewrite_again,
+            "{case}: two `flpdf rewrite` runs of the same --static-id \
+             --static-aes-iv invocation must be byte-identical to each other"
         );
     }
 }
