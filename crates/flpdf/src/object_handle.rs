@@ -3,6 +3,11 @@
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
 //!
+//! `QPDFObjectHandle.cc:456-466,759-785,1027-1039` supplies the
+//! name/dictionary/array inspection mirrored by `try_is_name_and_equals`,
+//! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
+//! `try_is_or_has_name`.
+//!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
 //! (`libqpdf/qpdf/QPDFValue.hh`).
@@ -11,6 +16,13 @@
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
 // internal structure only and does not affect output bytes (see
 // docs/qpdf-correspondence.md).
+//
+// Deviation: qpdf's canonical name strings include a leading slash and its
+// array access borrows QPDF_Array, while ObjectValue stores decoded name bytes
+// without the slash and Vec<ObjectHandle>. Inspection compares the same decoded
+// bytes and clones only one Rc-backed child per valid array access. It emits no
+// bytes or diagnostics; invalid array access (where qpdf warns) is outside the
+// try_array_item contract. See docs/qpdf-correspondence.md.
 
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
@@ -634,6 +646,84 @@ impl ObjectHandle {
         Ok(self.as_name())
     }
 
+    /// True when this handle lazily resolves to the requested decoded name.
+    ///
+    /// Ports `QPDFObjectHandle::isNameAndEquals`
+    /// (`libqpdf/QPDFObjectHandle.cc:456-459`). qpdf's canonical name string
+    /// includes its leading slash; [`ObjectValue::Name`] follows this crate's
+    /// existing representation and stores the same decoded bytes without it.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_is_name_and_equals(&self, name: &[u8]) -> Result<bool> {
+        self.try_dereference()?;
+        Ok(self.with_value(
+            |value| matches!(value, Some(ObjectValue::Name(actual)) if actual.as_slice() == name),
+        ))
+    }
+
+    /// True when this handle is the requested decoded name or an array with a
+    /// matching name item.
+    ///
+    /// Ports `QPDFObjectHandle::isOrHasName` in its exact short-circuit order:
+    /// inspect the holder as a name first, then inspect array items one at a
+    /// time (`libqpdf/QPDFObjectHandle.cc:1027-1039`). Each array borrow ends
+    /// before the selected child is resolved.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_is_or_has_name(&self, name: &[u8]) -> Result<bool> {
+        if self.try_is_name_and_equals(name)? {
+            return Ok(true);
+        }
+        let Some(count) = self.try_array_len()? else {
+            return Ok(false);
+        };
+        for index in 0..count {
+            if self
+                .try_array_item(index)?
+                .map(|item| item.try_is_name_and_equals(name))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// True when this handle lazily resolves to a dictionary whose optional
+    /// `/Type` and `/Subtype` names equal the requested decoded bytes.
+    ///
+    /// Ports `QPDFObjectHandle::isDictionaryOfType` and its left-to-right
+    /// short-circuiting (`libqpdf/QPDFObjectHandle.cc:461-466`). flpdf keys and
+    /// names omit qpdf's canonical leading slash, so the lookups use `Type`
+    /// and `Subtype` and callers pass values such as `CryptFilterDecodeParms`.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_is_dictionary_of_type(
+        &self,
+        type_name: &[u8],
+        subtype_name: &[u8],
+    ) -> Result<bool> {
+        self.try_dereference()?;
+        let is_dictionary =
+            self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_))));
+        if !is_dictionary {
+            return Ok(false);
+        }
+        if !type_name.is_empty()
+            && !self
+                .try_get_key(b"Type")?
+                .try_is_name_and_equals(type_name)?
+        {
+            return Ok(false);
+        }
+        if !subtype_name.is_empty()
+            && !self
+                .try_get_key(b"Subtype")?
+                .try_is_name_and_equals(subtype_name)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// qpdf-compatible array inspection with lazy dereference. Only the array
     /// itself is resolved; each returned child keeps its own identity.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
@@ -672,6 +762,26 @@ impl ObjectHandle {
         self.try_dereference()?;
         Ok(self.with_value(|value| match value {
             Some(ObjectValue::Array(children)) => Some(children.len()),
+            _ => None,
+        }))
+    }
+
+    /// Return one live child handle from a lazily resolved array.
+    ///
+    /// This is the valid-index portion of `QPDFObjectHandle::getArrayItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:770-775`). qpdf borrows its `QPDF_Array`
+    /// and copies one `QPDFObjectHandle`; this port briefly borrows the backing
+    /// `Vec` and clones one `Rc`-backed handle. The child is not resolved.
+    ///
+    /// qpdf warns and returns a special null for a non-array or out-of-bounds
+    /// index (`:776-785`). This prerequisite's consumer only calls after both
+    /// arrays have equal, known lengths, so invalid-domain diagnostics remain
+    /// outside this method and are represented as `None` rather than guessed.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_array_item(&self, index: usize) -> Result<Option<ObjectHandle>> {
+        self.try_dereference()?;
+        Ok(self.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => children.get(index).cloned(),
             _ => None,
         }))
     }
@@ -3488,6 +3598,238 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn try_is_name_and_equals_compares_direct_decoded_name_bytes() {
+        let name = ObjectHandle::name(b"Crypt".to_vec());
+
+        assert!(name.try_is_name_and_equals(b"Crypt").unwrap());
+        assert!(!name.try_is_name_and_equals(b"FlateDecode").unwrap());
+        assert!(!ObjectHandle::integer(1)
+            .try_is_name_and_equals(b"Crypt")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_name_and_equals_resolves_an_indirect_name() {
+        let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Name(b"Crypt".to_vec()));
+
+        assert!(!handle.is_resolved());
+        assert!(handle.try_is_name_and_equals(b"Crypt").unwrap());
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_is_name_and_equals_propagates_resolver_errors() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(22, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        assert_eq!(
+            handle
+                .try_is_name_and_equals(b"Crypt")
+                .unwrap_err()
+                .to_string(),
+            "resolver failed"
+        );
+    }
+
+    #[test]
+    fn try_is_name_and_equals_reports_a_dropped_document() {
+        let (handle, resolver) = resolver_bearing_handle(ObjectValue::Name(b"Crypt".to_vec()));
+        drop(resolver);
+
+        assert_eq!(
+            handle
+                .try_is_name_and_equals(b"Crypt")
+                .unwrap_err()
+                .to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
+    }
+
+    #[test]
+    fn try_is_or_has_name_matches_a_direct_name_or_array_item() {
+        assert!(ObjectHandle::name(b"Crypt".to_vec())
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+        assert!(ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"Crypt".to_vec()),
+        ])
+        .try_is_or_has_name(b"Crypt")
+        .unwrap());
+    }
+
+    #[test]
+    fn try_is_or_has_name_returns_false_for_other_shapes_and_names() {
+        assert!(!ObjectHandle::name(b"FlateDecode".to_vec())
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+        assert!(!ObjectHandle::integer(1)
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+        assert!(!ObjectHandle::array(vec![ObjectHandle::integer(1)])
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_or_has_name_stops_before_a_later_erroring_child() {
+        let (erroring, _resolver) = error_resolving_handle(ObjectRef::new(24, 0));
+        let array = ObjectHandle::array(vec![ObjectHandle::name(b"Crypt".to_vec()), erroring]);
+
+        assert!(array.try_is_or_has_name(b"Crypt").unwrap());
+    }
+
+    #[test]
+    fn try_is_or_has_name_resolves_indirect_holder_and_child() {
+        let (child, _child_resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"Crypt".to_vec()));
+        let (array, _array_resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![child.clone()]));
+
+        assert!(array.try_is_or_has_name(b"Crypt").unwrap());
+        assert!(array.is_resolved());
+        assert!(child.is_resolved());
+    }
+
+    #[test]
+    fn try_is_or_has_name_propagates_child_resolution_errors() {
+        let (erroring, _resolver) = error_resolving_handle(ObjectRef::new(25, 0));
+        let array = ObjectHandle::array(vec![erroring]);
+
+        assert_eq!(
+            array.try_is_or_has_name(b"Crypt").unwrap_err().to_string(),
+            "resolver failed"
+        );
+    }
+
+    #[test]
+    fn try_is_or_has_name_reports_a_dropped_document() {
+        let (array, resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::null()]));
+        drop(resolver);
+
+        assert_eq!(
+            array.try_is_or_has_name(b"Crypt").unwrap_err().to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_matches_type_subtype_and_empty_constraints() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Type".to_vec(),
+                ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+            ),
+            (
+                b"Subtype".to_vec(),
+                ObjectHandle::name(b"Identity".to_vec()),
+            ),
+        ]);
+
+        assert!(dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .unwrap());
+        assert!(dict.try_is_dictionary_of_type(b"", b"").unwrap());
+        assert!(dict.try_is_dictionary_of_type(b"", b"Identity").unwrap());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_rejects_wrong_missing_or_non_name_entries() {
+        let wrong = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"Metadata".to_vec()),
+        )]);
+        let non_name = ObjectHandle::dictionary(vec![(b"Type".to_vec(), ObjectHandle::integer(1))]);
+        let missing = ObjectHandle::dictionary(Vec::new());
+        let wrong_subtype = ObjectHandle::dictionary(vec![
+            (
+                b"Type".to_vec(),
+                ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+            ),
+            (b"Subtype".to_vec(), ObjectHandle::name(b"Other".to_vec())),
+        ]);
+
+        assert!(!wrong
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!non_name
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!missing
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!wrong_subtype
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .unwrap());
+        assert!(!ObjectHandle::integer(1)
+            .try_is_dictionary_of_type(b"", b"")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_resolves_indirect_holder_and_type_child() {
+        let (type_name, _type_resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"CryptFilterDecodeParms".to_vec()));
+        let (dict, _dict_resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+                (b"Type".to_vec(), type_name.clone()),
+            ])));
+
+        assert!(dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(dict.is_resolved());
+        assert!(type_name.is_resolved());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_stops_before_subtype_after_wrong_type() {
+        let (erroring_subtype, _resolver) = error_resolving_handle(ObjectRef::new(26, 0));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Metadata".to_vec())),
+            (b"Subtype".to_vec(), erroring_subtype),
+        ]);
+
+        assert!(!dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_propagates_child_resolution_errors() {
+        let (erroring_type, _resolver) = error_resolving_handle(ObjectRef::new(27, 0));
+        let dict = ObjectHandle::dictionary(vec![(b"Type".to_vec(), erroring_type)]);
+
+        assert_eq!(
+            dict.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+                .unwrap_err()
+                .to_string(),
+            "resolver failed"
+        );
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_reports_a_dropped_document() {
+        let (dict, resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+        drop(resolver);
+
+        assert_eq!(
+            dict.try_is_dictionary_of_type(b"", b"")
+                .unwrap_err()
+                .to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
+    }
+
+    #[test]
     fn try_as_integer_resolves_an_indirect_integer_through_its_document() {
         let (handle, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
 
@@ -3571,6 +3913,54 @@ pub(crate) mod identity_tests {
 
         assert_eq!(handle.try_array_len().unwrap(), Some(1));
         assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_array_item_returns_live_first_middle_and_last_handles() {
+        let first = ObjectHandle::integer(1);
+        let middle = ObjectHandle::integer(2);
+        let last = ObjectHandle::integer(3);
+        let array = ObjectHandle::array(vec![first.clone(), middle.clone(), last.clone()]);
+
+        assert!(array.try_array_item(0).unwrap().unwrap().ptr_eq(&first));
+        assert!(array.try_array_item(1).unwrap().unwrap().ptr_eq(&middle));
+        assert!(array.try_array_item(2).unwrap().unwrap().ptr_eq(&last));
+    }
+
+    #[test]
+    fn try_array_item_returns_none_outside_the_valid_array_domain() {
+        let array = ObjectHandle::array(vec![ObjectHandle::null()]);
+
+        assert!(array.try_array_item(1).unwrap().is_none());
+        assert!(ObjectHandle::integer(1)
+            .try_array_item(0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn try_array_item_resolves_an_indirect_holder_once_without_resolving_the_child() {
+        let (child, _child_resolver) = error_resolving_handle(ObjectRef::new(23, 0));
+        let (array, _resolver, calls) =
+            logged_resolver_bearing_handle(ObjectValue::Array(vec![child.clone()]));
+
+        let fetched = array.try_array_item(0).unwrap().unwrap();
+
+        assert!(fetched.ptr_eq(&child));
+        assert!(!fetched.is_resolved());
+        assert_eq!(calls.borrow().as_slice(), &[ObjectRef::new(20, 0)]);
+    }
+
+    #[test]
+    fn try_array_item_reports_a_dropped_document() {
+        let (array, resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::null()]));
+        drop(resolver);
+
+        assert_eq!(
+            array.try_array_item(0).unwrap_err().to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
     }
 
     #[test]
