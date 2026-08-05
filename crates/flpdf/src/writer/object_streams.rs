@@ -601,6 +601,29 @@ pub(crate) struct ObjStmBody {
 pub(crate) fn emit_objstm_body_from_resolved(
     members: &[(ObjectRef, Object)],
 ) -> crate::Result<ObjStmBody> {
+    emit_objstm_body_from_resolved_with_writer(
+        members,
+        &mut |out, _member_index, _object_ref, object| {
+            object.write_pdf(out);
+            Ok(())
+        },
+    )
+}
+
+/// Serialize pre-resolved ObjStm members while delegating each complete member
+/// body to `write_member`.
+///
+/// `member_index` is the member's zero-based index in the object stream. The
+/// encrypted full-rewrite writer passes it to `EncryptedStringEmitter` so the
+/// callback serializer runs without installing an individual object data key;
+/// the enclosing ObjStm stream remains the sole encryption boundary.
+pub(crate) fn emit_objstm_body_from_resolved_with_writer<F>(
+    members: &[(ObjectRef, Object)],
+    write_member: &mut F,
+) -> crate::Result<ObjStmBody>
+where
+    F: FnMut(&mut Vec<u8>, u32, ObjectRef, &Object) -> crate::Result<()>,
+{
     if members.is_empty() {
         return Ok(ObjStmBody {
             bytes: vec![],
@@ -624,9 +647,14 @@ pub(crate) fn emit_objstm_body_from_resolved(
     let mut objects_section: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::with_capacity(members.len());
 
-    for (_, obj) in members {
+    for (member_index, (object_ref, object)) in members.iter().enumerate() {
         offsets.push(objects_section.len());
-        obj.write_pdf(&mut objects_section);
+        // cov:ignore-start: a Vec cannot hold more than u32::MAX members in supported targets.
+        let member_index = u32::try_from(member_index).map_err(|_| {
+            crate::Error::Unsupported("ObjStm member index overflows u32".to_string())
+        })?;
+        // cov:ignore-end
+        write_member(&mut objects_section, member_index, *object_ref, object)?;
         // Append exactly one newline after each object body (write_pdf has no trailing LF).
         objects_section.push(b'\n');
     }

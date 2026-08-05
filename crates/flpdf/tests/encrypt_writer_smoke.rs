@@ -10,13 +10,19 @@
 //! original — proving the per-object key derivation, AES IV/padding, and
 //! `/Length` updates all line up with what the reader path expects.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Cursor;
+use std::process::Command;
 
 use flpdf::{
-    write_pdf_with_options, EncryptParams, Object, Pdf, PdfOpenOptions, StreamDataMode,
-    WriteOptions,
+    load_xref_and_trailer, write_pdf_with_options, CopyEncryptionSource, Dictionary, EncryptMethod,
+    EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, Pdf,
+    PdfOpenOptions, StreamDataMode, WriteOptions, XrefEntry,
 };
+
+const INFO_PLAINTEXT: &[u8] = b"Task4NestedPrintable";
+const STREAM_DICT_PLAINTEXT: &[u8] = b"Task4StreamPrintable";
 
 fn fixture(rel: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -44,6 +50,346 @@ fn open_encrypted(bytes: &[u8], password: &[u8]) -> Pdf<Cursor<Vec<u8>>> {
         },
     )
     .expect("open encrypted output with password")
+}
+
+/// A one-page PDF whose trailer `/Info` dictionary contains a nested printable
+/// string and whose Catalog-reachable stream dictionary contains another one.
+/// The stream keeps the QDF indirect `/Length` holder route observable while
+/// the nested `/Info` value is eligible for generated ObjStm membership.
+///
+/// The page intentionally has no `/Resources`. qpdf 11.9.0 preserves that
+/// omission in standard, QDF, and generated-ObjStm writes: only the linearized
+/// writer calls `QPDF::optimize()`, and inherited-attribute pushing copies an
+/// ancestor value rather than synthesizing an empty resource dictionary.
+fn nested_string_fixture(info_value: &[u8]) -> Vec<u8> {
+    let mut info_hex = String::with_capacity(info_value.len() * 2);
+    for byte in info_value {
+        use std::fmt::Write as _;
+        write!(&mut info_hex, "{byte:02x}").expect("write to String");
+    }
+
+    let objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>".to_vec(),
+        format!("<< /Nested << /Marker <{info_hex}> >> >>").into_bytes(),
+        [
+            format!(
+                "<< /Type /Metadata /Subtype /XML /Label ({}) /Length 5 >>\nstream\n",
+                String::from_utf8_lossy(STREAM_DICT_PLAINTEXT)
+            )
+            .into_bytes(),
+            b"hello\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+    fixture_from_objects(&objects, 4)
+}
+
+fn rc4_printable_ciphertext_fixture() -> Vec<u8> {
+    let mut candidates = String::new();
+    for byte in 0u8..=u8::MAX {
+        use std::fmt::Write as _;
+        write!(&mut candidates, " /C{byte:02x} <{byte:02x}>").expect("write to String");
+    }
+    let objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>".to_vec(),
+        format!("<< /Nested <<{candidates} >> >>").into_bytes(),
+    ];
+    fixture_from_objects(&objects, 4)
+}
+
+fn fixture_from_objects(objects: &[Vec<u8>], info_number: u32) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        bytes.extend_from_slice(object);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info {info_number} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1,
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn encrypted_options() -> WriteOptions {
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.static_id = true;
+    options.static_aes_iv = true;
+    options.encrypt = Some(EncryptParams::v4_aes128(Vec::new(), Vec::new()));
+    options
+}
+
+fn rewrite_fixture(input: &[u8], options: &WriteOptions) -> Vec<u8> {
+    let mut pdf = Pdf::open(Cursor::new(input.to_vec())).expect("open nested string fixture");
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, options).expect("encrypted full rewrite");
+    output
+}
+
+fn assert_named_string_token_is_hex(bytes: &[u8], key: &[u8]) {
+    let key_offset = bytes
+        .windows(key.len())
+        .position(|part| part == key)
+        .unwrap_or_else(|| panic!("missing {} in output", String::from_utf8_lossy(key)));
+    let mut token_offset = key_offset + key.len();
+    while bytes
+        .get(token_offset)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        token_offset += 1;
+    }
+    assert_eq!(
+        bytes.get(token_offset),
+        Some(&b'<'),
+        "{} string token must use hexadecimal syntax",
+        String::from_utf8_lossy(key)
+    );
+    let token_end = bytes[token_offset + 1..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map(|relative| token_offset + 1 + relative)
+        .expect("hexadecimal string token must close");
+    assert!(
+        bytes[token_offset + 1..token_end]
+            .iter()
+            .all(u8::is_ascii_hexdigit),
+        "{} hexadecimal token contains a non-hex byte",
+        String::from_utf8_lossy(key)
+    );
+}
+
+fn run_qpdf_check(bytes: &[u8]) -> Option<std::process::Output> {
+    if Command::new("qpdf").arg("--version").output().is_err() {
+        return None;
+    }
+
+    let dir = tempfile::tempdir().expect("create qpdf check directory");
+    let path = dir.path().join("encrypted.pdf");
+    fs::write(&path, bytes).expect("write qpdf check input");
+    Some(
+        Command::new("qpdf")
+            .arg("--password=")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .expect("run qpdf --check"),
+    )
+}
+
+fn qpdf_check_result_is_acceptable(exit_code: Option<i32>, stderr: &[u8]) -> bool {
+    if exit_code == Some(0) {
+        return true;
+    }
+    if exit_code != Some(3) {
+        return false;
+    }
+
+    // qpdf 12.x added this page validation after the pinned 11.9.0 oracle.
+    // Permit only that version-skew warning. Other repair warnings still fail
+    // the test so damaged xrefs, syntax, and stream data cannot be hidden.
+    let Ok(stderr) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    let mut saw_resources_warning = false;
+    let mut saw_warning_summary = false;
+    for line in stderr.lines().map(|line| line.trim_end_matches('\r')) {
+        if line.is_empty() {
+            continue;
+        }
+        if line == "qpdf: operation succeeded with warnings" {
+            if saw_warning_summary {
+                return false;
+            }
+            saw_warning_summary = true;
+        } else if line.starts_with("WARNING: ")
+            && line.ends_with(" Resources is missing or invalid; repairing")
+        {
+            saw_resources_warning = true;
+        } else {
+            return false;
+        }
+    }
+    saw_resources_warning && saw_warning_summary
+}
+
+fn assert_qpdf_check(bytes: &[u8]) {
+    let Some(output) = run_qpdf_check(bytes) else {
+        eprintln!("qpdf not available; skipping qpdf --check verification");
+        return;
+    };
+    assert!(
+        qpdf_check_result_is_acceptable(output.status.code(), &output.stderr),
+        "qpdf --check failed:\nstdout:\n{}\nstderr:\n{}\nPDF:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(bytes)
+    );
+}
+
+#[test]
+fn qpdf_check_helper_rejects_recoverable_xref_warnings_and_errors() {
+    let mut warning_only = nested_string_fixture(INFO_PLAINTEXT);
+    let marker = b"\nstartxref\n";
+    let marker_offset = warning_only
+        .windows(marker.len())
+        .rposition(|part| part == marker)
+        .expect("fixture has startxref");
+    let value_start = marker_offset + marker.len();
+    let value_end = value_start
+        + warning_only[value_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .expect("startxref value is newline terminated");
+    warning_only.splice(value_start..value_end, *b"0");
+
+    let Some(warning_output) = run_qpdf_check(&warning_only) else {
+        eprintln!("qpdf not available; skipping qpdf --check verification");
+        return;
+    };
+    assert!(
+        !warning_output.status.success(),
+        "qpdf repair warnings must remain distinguishable from clean output: {}",
+        String::from_utf8_lossy(&warning_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&warning_output.stderr).contains("WARNING"),
+        "damaged startxref must exercise qpdf's warning-only path"
+    );
+
+    let error_output = run_qpdf_check(b"not a PDF file").expect("qpdf remains available");
+    assert!(
+        !error_output.status.success(),
+        "--warning-exit-0 must not hide qpdf errors"
+    );
+}
+
+#[test]
+fn qpdf_check_acceptance_allows_only_qpdf_12_missing_resources_warning() {
+    let resource_warning = b"WARNING: /tmp/output.pdf object stream 6, object 5 0 at offset 116: kid 0 (from 0) Resources is missing or invalid; repairing\nqpdf: operation succeeded with warnings\n";
+    assert!(qpdf_check_result_is_acceptable(Some(3), resource_warning));
+
+    let xref_warning = b"WARNING: /tmp/output.pdf: file is damaged\nWARNING: /tmp/output.pdf: can't find startxref\nWARNING: /tmp/output.pdf: Attempting to reconstruct cross-reference table\nqpdf: operation succeeded with warnings\n";
+    assert!(!qpdf_check_result_is_acceptable(Some(3), xref_warning));
+    assert!(!qpdf_check_result_is_acceptable(
+        Some(3),
+        b"WARNING: /tmp/output.pdf: stream data is damaged; repairing\nqpdf: operation succeeded with warnings\n",
+    ));
+    assert!(!qpdf_check_result_is_acceptable(Some(2), resource_warning));
+}
+
+#[test]
+fn encrypted_standard_writes_preserve_missing_page_resources_like_qpdf_11_9() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    for (qdf, object_streams) in [
+        (false, ObjectStreamMode::Disable),
+        (true, ObjectStreamMode::Disable),
+        (false, ObjectStreamMode::Generate),
+    ] {
+        let mut options = encrypted_options();
+        options.qdf = qdf;
+        options.object_streams = object_streams;
+        let bytes = rewrite_fixture(&input, &options);
+        let mut reopened = open_encrypted(&bytes, b"");
+        let pages = PageDocumentHelper::new(&mut reopened)
+            .get_all_pages()
+            .expect("enumerate rewritten pages");
+        assert_eq!(pages.len(), 1);
+        let page = reopened.resolve(pages[0]).expect("resolve rewritten page");
+        assert!(
+            page.as_dict().is_some_and(|dict| dict.get("Resources").is_none()),
+            "qdf={qdf}, object_streams={object_streams:?}: qpdf 11.9 standard writes do not synthesize /Resources"
+        );
+    }
+}
+
+fn resolve_nested_info_marker(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
+    let info_ref = match pdf.trailer().get("Info") {
+        Some(Object::Reference(reference)) => *reference,
+        other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
+    };
+    let info = pdf.resolve(info_ref).expect("resolve /Info");
+    let nested = info
+        .as_dict()
+        .and_then(|dict| dict.get("Nested"))
+        .and_then(Object::as_dict)
+        .expect("/Info /Nested dictionary");
+    match nested.get("Marker") {
+        Some(Object::String(value)) => value.clone(),
+        other => panic!("/Info /Nested /Marker must be a string, got {other:?}"),
+    }
+}
+
+fn resolve_metadata_label(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
+    let root_ref = pdf.root_ref().expect("encrypted output has /Root");
+    let metadata_ref = match pdf
+        .resolve(root_ref)
+        .expect("resolve Catalog")
+        .as_dict()
+        .and_then(|dict| dict.get("Metadata"))
+    {
+        Some(Object::Reference(reference)) => *reference,
+        other => panic!("Catalog /Metadata must be an indirect reference, got {other:?}"),
+    };
+    match pdf
+        .resolve(metadata_ref)
+        .expect("resolve Metadata stream")
+        .as_stream()
+        .and_then(|stream| stream.dict.get("Label"))
+    {
+        Some(Object::String(value)) => value.clone(),
+        other => panic!("Metadata /Label must be a string, got {other:?}"),
+    }
+}
+
+fn object_number_before_marker(bytes: &[u8], marker: &[u8]) -> u32 {
+    let marker_offset = bytes
+        .windows(marker.len())
+        .position(|part| part == marker)
+        .expect("object marker must be present");
+    let object_suffix = b" 0 obj\n";
+    let suffix_offset = bytes[..marker_offset]
+        .windows(object_suffix.len())
+        .rposition(|part| part == object_suffix)
+        .expect("marker must follow an indirect object header");
+    let mut number_start = suffix_offset;
+    while number_start > 0 && bytes[number_start - 1].is_ascii_digit() {
+        number_start -= 1;
+    }
+    std::str::from_utf8(&bytes[number_start..suffix_offset])
+        .expect("object number is ASCII")
+        .parse()
+        .expect("object number is decimal")
+}
+
+fn indirect_object_numbers(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let mut words = line.split(|byte| *byte == b' ');
+            let number = words.next()?;
+            if words.next()? != b"0" || words.next()? != b"obj" || words.next().is_some() {
+                return None;
+            }
+            std::str::from_utf8(number).ok()?.parse().ok()
+        })
+        .collect()
 }
 
 /// Encrypting `minimal.pdf` (no strings / no streams) must still produce
@@ -165,26 +511,239 @@ fn v4_aes128_round_trip_on_one_page_resolves_to_same_root() {
     );
 }
 
-/// `--qdf` + `--encrypt` is an unsupported combination for the walking
-/// skeleton (qdf emits plaintext for human inspection; encryption
-/// destroys that purpose). Verify the writer rejects with a clear
-/// `Unsupported` error rather than silently producing a corrupt file.
+/// AES string syntax is selected at scalar emission time on both compact and
+/// QDF full rewrites. The nested `/Info` value and stream-dictionary label must
+/// both be encrypted, forced to hexadecimal syntax, accepted by qpdf, and
+/// recoverable through flpdf's public reader.
 #[test]
-fn v4_aes128_rejects_qdf_combination() {
-    let input = fixture("tests/fixtures/minimal.pdf");
-    let mut pdf = Pdf::open(Cursor::new(input)).unwrap();
-    let mut out = Vec::new();
+fn aes_encrypted_strings_use_hex_in_compact_and_qdf() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    for qdf in [false, true] {
+        let mut options = encrypted_options();
+        options.qdf = qdf;
+        let bytes = rewrite_fixture(&input, &options);
+
+        for plaintext in [INFO_PLAINTEXT, STREAM_DICT_PLAINTEXT] {
+            assert!(
+                !bytes.windows(plaintext.len()).any(|part| part == plaintext),
+                "{plaintext:?} leaked from the {qdf:?} encrypted output"
+            );
+        }
+        assert_named_string_token_is_hex(&bytes, b"/Marker");
+        assert_named_string_token_is_hex(&bytes, b"/Label");
+        if qdf {
+            let object_numbers = indirect_object_numbers(&bytes);
+            let unique: BTreeSet<_> = object_numbers.iter().copied().collect();
+            assert_eq!(
+                object_numbers.len(),
+                unique.len(),
+                "QDF object and /Length-holder numbers must be unique: {object_numbers:?}"
+            );
+            assert!(
+                bytes
+                    .windows(b"\nendobj\n\nxref\n".len())
+                    .any(|part| part == b"\nendobj\n\nxref\n"),
+                "QDF /Encrypt object must keep the blank line before xref"
+            );
+        }
+        assert_qpdf_check(&bytes);
+
+        let mut reopened = open_encrypted(&bytes, b"");
+        assert!(reopened.is_encrypted());
+        assert!(reopened.user_password_matched());
+        let encrypt_ref = match reopened.trailer().get("Encrypt") {
+            Some(Object::Reference(reference)) => *reference,
+            other => panic!("trailer /Encrypt must be an indirect reference, got {other:?}"),
+        };
+        let encrypt_dict = reopened
+            .resolve(encrypt_ref)
+            .expect("resolve dedicated /Encrypt object");
+        assert_eq!(
+            encrypt_dict.as_dict().and_then(|dict| dict.get("Filter")),
+            Some(&Object::Name(b"Standard".to_vec())),
+            "trailer /Encrypt must reference the dedicated encryption dictionary"
+        );
+        assert_eq!(resolve_nested_info_marker(&mut reopened), INFO_PLAINTEXT);
+        assert_eq!(resolve_metadata_label(&mut reopened), STREAM_DICT_PLAINTEXT);
+    }
+}
+
+/// Generated ObjStm members do not receive an individual string data key. The
+/// enclosing ObjStm stream remains payload-encrypted, while its decrypted and
+/// decoded member body retains the original plaintext marker.
+#[test]
+fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    let mut options = encrypted_options();
+    options.object_streams = ObjectStreamMode::Generate;
+    let bytes = rewrite_fixture(&input, &options);
+
+    assert!(
+        bytes
+            .windows(b"/Type /ObjStm".len())
+            .any(|part| part == b"/Type /ObjStm"),
+        "generate mode must emit an ObjStm container"
+    );
+    assert!(
+        !bytes
+            .windows(INFO_PLAINTEXT.len())
+            .any(|part| part == INFO_PLAINTEXT),
+        "the ObjStm container payload must be encrypted"
+    );
+    assert_qpdf_check(&bytes);
+
+    let mut reopened = open_encrypted(&bytes, b"");
+    let info_ref = match reopened.trailer().get("Info") {
+        Some(Object::Reference(reference)) => *reference,
+        other => panic!("trailer /Info must be an indirect reference, got {other:?}"),
+    };
+    let object_header = format!("\n{} 0 obj\n", info_ref.number);
+    assert!(
+        !bytes
+            .windows(object_header.len())
+            .any(|part| part == object_header.as_bytes()),
+        "/Info must be stored as an ObjStm member, not a plain indirect object"
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes.as_slice()))
+        .expect("load encrypted output xref");
+    let (container_number, member_index) = match loaded.entries.get(&info_ref) {
+        Some(XrefEntry::Compressed { stream, index }) => (*stream, *index),
+        other => panic!("/Info must have a type-2 xref entry, got {other:?}"),
+    };
+    assert_eq!(
+        container_number,
+        object_number_before_marker(&bytes, b"/Type /ObjStm"),
+        "/Info type-2 xref entry must name the emitted ObjStm container"
+    );
+    let container = reopened
+        .resolve(ObjectRef::new(container_number, 0))
+        .expect("resolve and decrypt ObjStm container");
+    let stream = container.as_stream().expect("ObjStm object is a stream");
+    let decoded = flpdf::filters::decode_stream_data(&stream.dict, &stream.data)
+        .expect("decode decrypted ObjStm payload");
+    let first = match stream.dict.get("First") {
+        Some(Object::Integer(value)) => usize::try_from(*value).expect("non-negative /First"),
+        other => panic!("ObjStm /First must be an integer, got {other:?}"),
+    };
+    let member_count = match stream.dict.get("N") {
+        Some(Object::Integer(value)) => u32::try_from(*value).expect("non-negative /N"),
+        other => panic!("ObjStm /N must be an integer, got {other:?}"),
+    };
+    assert!(
+        member_index < member_count,
+        "type-2 index must be within /N"
+    );
+    let header_fields: Vec<usize> = std::str::from_utf8(&decoded[..first])
+        .expect("ObjStm header is ASCII")
+        .split_ascii_whitespace()
+        .map(|field| field.parse().expect("ObjStm header field is decimal"))
+        .collect();
+    let member_pair = usize::try_from(member_index).expect("member index fits usize") * 2;
+    assert_eq!(
+        header_fields.get(member_pair).copied(),
+        Some(usize::try_from(info_ref.number).expect("object number fits usize")),
+        "type-2 index must select the /Info member header"
+    );
+    let member_start = first
+        + header_fields
+            .get(member_pair + 1)
+            .copied()
+            .expect("member offset follows object number");
+    let member_end = if member_index + 1 < member_count {
+        first
+            + header_fields
+                .get(member_pair + 3)
+                .copied()
+                .expect("next member offset follows next object number")
+    } else {
+        decoded.len()
+    };
+    assert!(
+        decoded[member_start..member_end]
+            .windows(INFO_PLAINTEXT.len())
+            .any(|part| part == INFO_PLAINTEXT),
+        "ObjStm member string must stay plaintext inside the encrypted container"
+    );
+}
+
+#[test]
+fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+
+    for qdf in [false, true] {
+        let mut pdf = Pdf::open(Cursor::new(input.clone())).expect("open copy-encryption fixture");
+        let mut output = Vec::new();
+        let mut options = WriteOptions::default();
+        options.full_rewrite = true;
+        options.qdf = qdf;
+        options.static_id = true;
+        options.static_aes_iv = true;
+        options.copy_encryption = Some(CopyEncryptionSource {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x31; 15],
+            id0: b"0123456789abcdef".to_vec(),
+            object_key_alg: ObjectKeyAlg::Aes,
+        });
+
+        let error = write_pdf_with_options(&mut pdf, &mut output, &options)
+            .expect_err("short public copy-encryption key must be rejected");
+        assert!(matches!(
+            error,
+            flpdf::Error::Unsupported(message)
+                if message
+                    == "copy-encryption V=4 AES-128 file key must be 16 bytes; got 15"
+        ));
+        assert!(
+            output.is_empty(),
+            "{qdf:?} copy-encryption validation must precede output emission"
+        );
+    }
+}
+
+/// RC4-128 keeps qpdf's normal content heuristic after encryption. Cover every
+/// possible one-byte plaintext under one deterministic object key: RC4's XOR
+/// mapping is a permutation, so at least one resulting ciphertext byte is
+/// printable and must therefore use literal-string syntax rather than a
+/// cipher-wide hexadecimal override.
+#[test]
+fn rc4_128_printable_ciphertext_uses_literal_string_syntax() {
+    let input = rc4_printable_ciphertext_fixture();
     let mut options = WriteOptions::default();
     options.full_rewrite = true;
-    options.qdf = true;
-    options.encrypt = Some(EncryptParams::v4_aes128(b"u".to_vec(), b"o".to_vec()));
-    let err = write_pdf_with_options(&mut pdf, &mut out, &options)
-        .expect_err("--encrypt + --qdf must be rejected");
-    let display = format!("{err:?}");
+    options.static_id = true;
+    options.encrypt = Some(EncryptParams::rc4(
+        EncryptMethod::V4Rc4128,
+        Vec::new(),
+        Vec::new(),
+    ));
+
+    let bytes = rewrite_fixture(&input, &options);
+    let repeated = rewrite_fixture(&input, &options);
+    assert_eq!(bytes, repeated, "RC4 + static ID must be deterministic");
+
+    let literal_candidate = (0u8..=u8::MAX).find(|byte| {
+        let needle = format!("/C{byte:02x} (");
+        bytes
+            .windows(needle.len())
+            .any(|part| part == needle.as_bytes())
+    });
     assert!(
-        display.contains("Unsupported"),
-        "expected Unsupported error, got: {display}"
+        literal_candidate.is_some(),
+        "at least one printable RC4 ciphertext must use literal syntax"
     );
+
+    let reopened = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            password: Vec::new(),
+            allow_weak_crypto: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("reopen RC4-128 output");
+    assert!(reopened.is_encrypted());
+    assert!(reopened.user_password_matched());
 }
 
 /// Resolve the JavaScript stream (catalog `/OpenAction` -> action `/JS`) in the

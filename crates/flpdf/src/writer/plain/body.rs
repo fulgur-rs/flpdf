@@ -58,7 +58,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                             &reencoded,
                             source_filter_is_lone_flate,
                             options,
-                        );
+                            None,
+                            *output,
+                        )?; // cov:ignore: no emitter means this validated stream serializer is infallible
                     }
                     other => other.write_pdf(&mut bytes),
                 }

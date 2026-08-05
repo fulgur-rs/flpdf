@@ -203,6 +203,8 @@ pub struct CopyEncryptionSource {
     /// [`crate::Pdf::encryption_file_key`]).  The writer uses it directly
     /// instead of re-deriving a key from a password, so that encrypted strings
     /// and streams are consistent with the copied `/O` / `/U` / `/P` entries.
+    /// It must be exactly 16 bytes for the supported V=4 AES-128 source;
+    /// shorter or longer public inputs are rejected before output emission.
     pub file_key: Vec<u8>,
     /// The donor's `/ID[0]` bytes.  Copied into the output trailer's `/ID[0]`
     /// position; Algorithm 2 key derivation is pinned to this value.

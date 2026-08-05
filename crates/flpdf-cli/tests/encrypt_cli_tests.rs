@@ -8,11 +8,17 @@
 //! so user-visible diagnostics remain stable.
 
 use assert_cmd::Command;
+use flpdf::{Pdf, PdfOpenOptions};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command as ShellCommand;
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
 const ONE_PAGE_FIXTURE: &str = "../../tests/fixtures/compat/one-page.pdf";
+// Exercise actual page/content traversal in qpdf's QDF + encryption oracle.
+// `minimal.pdf` has an empty page tree; qpdf 12.3.0--12.3.2 crashes on it
+// during `--check` (qpdf#1674) before reaching the QDF/AES properties.
+const QDF_ENCRYPTION_FIXTURE: &str = ONE_PAGE_FIXTURE;
 // Only referenced by the qpdf-zlib-compat-gated byte-identical oracle test
 // below; under default features they'd otherwise be dead code.
 #[cfg(feature = "qpdf-zlib-compat")]
@@ -38,6 +44,88 @@ fn ensure_qpdf_or_skip() -> bool {
     }
     eprintln!("skipping: qpdf not available");
     false
+}
+
+fn assert_qdf_encrypted_output(output: &Path, password: &str) {
+    let bytes = std::fs::read(output).expect("read encrypted QDF output");
+    assert!(
+        bytes.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0"),
+        "encrypted QDF output must carry the QDF marker"
+    );
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "encrypted QDF output must carry /Encrypt"
+    );
+    let trailer_marker = b"\ntrailer <<\n";
+    let trailer_start = bytes
+        .windows(trailer_marker.len())
+        .rposition(|window| window == trailer_marker)
+        .expect("encrypted QDF output has a classic trailer")
+        + trailer_marker.len();
+    let trailer = &bytes[trailer_start..];
+    let id_offset = trailer
+        .windows(b"  /ID ".len())
+        .position(|window| window == b"  /ID ")
+        .expect("encrypted QDF trailer has /ID");
+    let encrypt_offset = trailer
+        .windows(b" /Encrypt ".len())
+        .position(|window| window == b" /Encrypt ")
+        .expect("encrypted QDF trailer has /Encrypt");
+    let encrypt_line_end = trailer[encrypt_offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| encrypt_offset + offset)
+        .expect("encrypted QDF trailer /Encrypt line is terminated");
+    let encrypt_fields: Vec<&[u8]> = trailer[encrypt_offset..encrypt_line_end]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    assert!(
+        id_offset < encrypt_offset
+            && !trailer[id_offset..encrypt_offset].contains(&b'\n')
+            && encrypt_fields.len() == 4
+            && encrypt_fields[0] == b"/Encrypt"
+            && !encrypt_fields[1].is_empty()
+            && encrypt_fields[1].iter().all(|byte| byte.is_ascii_digit())
+            && encrypt_fields[2] == b"0"
+            && encrypt_fields[3] == b"R"
+            && trailer[encrypt_line_end..].starts_with(b"\n>>\n"),
+        "qpdf writes /ID then a final /Encrypt N 0 R on the same QDF trailer line: {}",
+        String::from_utf8_lossy(trailer)
+    );
+
+    let check = ShellCommand::new("qpdf")
+        .arg(format!("--password={password}"))
+        .arg("--check")
+        .arg(output)
+        .output()
+        .expect("run qpdf --check on encrypted QDF output");
+    assert!(
+        check.status.success(),
+        "qpdf --check failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let mut reopened = Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            password: password.as_bytes().to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect("flpdf must reopen and authenticate encrypted QDF output");
+    assert!(
+        reopened
+            .encryption_info()
+            .expect("read encryption information")
+            .is_some(),
+        "reopened QDF output must remain encrypted"
+    );
+    let root_ref = reopened.root_ref().expect("encrypted QDF output has /Root");
+    reopened
+        .resolve(root_ref)
+        .expect("authenticated reader resolves the QDF root");
 }
 
 /// Top-level alias: `flpdf --encrypt USER OWNER 128 --use-aes=y -- IN OUT`
@@ -139,6 +227,40 @@ fn rewrite_subcommand_encrypt_v4_aes_128_round_trips_via_qpdf() {
         stdout.contains("R = 4") && stdout.contains("Supplied password is user password"),
         "qpdf must report R=4 + user-password match: {stdout}"
     );
+}
+
+#[test]
+fn qdf_direct_encryption_works_on_top_level_and_rewrite_surfaces() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+
+    for (surface, rewrite) in [("top-level", false), ("rewrite", true)] {
+        let output = tmp.path().join(format!("{surface}-direct-qdf.pdf"));
+        let mut command = Command::cargo_bin("flpdf").unwrap();
+        if rewrite {
+            command.arg("rewrite");
+        }
+        command
+            .args([
+                "--qdf",
+                "--static-id",
+                "--static-aes-iv",
+                "--encrypt",
+                "qdf-user",
+                "qdf-owner",
+                "128",
+                "--use-aes=y",
+                "--",
+            ])
+            .arg(fixture(QDF_ENCRYPTION_FIXTURE))
+            .arg(&output)
+            .assert()
+            .success();
+
+        assert_qdf_encrypted_output(&output, "qdf-user");
+    }
 }
 
 /// `flpdf --encrypt USER OWNER 256 -- IN OUT` produces a V=5 R=6 AES-256
@@ -1228,6 +1350,34 @@ fn make_donor_pdf(tmp: &tempfile::TempDir, user_pw: &str, owner_pw: &str) -> Pat
         .assert()
         .success();
     donor
+}
+
+#[test]
+fn qdf_copy_encryption_works_on_top_level_and_rewrite_surfaces() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "donor-user", "donor-owner");
+
+    for (surface, rewrite) in [("top-level", false), ("rewrite", true)] {
+        let output = tmp.path().join(format!("{surface}-copied-qdf.pdf"));
+        let mut command = Command::cargo_bin("flpdf").unwrap();
+        if rewrite {
+            command.arg("rewrite");
+        }
+        command
+            .args(["--qdf", "--static-id", "--static-aes-iv"])
+            .arg("--copy-encryption-from")
+            .arg(&donor)
+            .args(["--encryption-file-password", "donor-user"])
+            .arg(fixture(QDF_ENCRYPTION_FIXTURE))
+            .arg(&output)
+            .assert()
+            .success();
+
+        assert_qdf_encrypted_output(&output, "donor-user");
+    }
 }
 
 /// `--copy-encryption-from` produces an output that carries /Encrypt and that

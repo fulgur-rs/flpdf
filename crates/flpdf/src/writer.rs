@@ -1,4 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc responsibilities shared with writer submodules and linearization.
+#[path = "writer/encrypted_strings.rs"]
+pub(crate) mod encrypted_strings;
 #[path = "writer/encryption_state.rs"]
 pub(crate) mod encryption_state;
 #[path = "writer/object_streams.rs"]
@@ -10,8 +12,7 @@ pub(crate) mod serialize;
 pub use object_streams::ObjectStreamMode;
 pub use serialize::write_stream_to_buf;
 use serialize::{
-    framing_adds_newline as stream_framing_adds_newline,
-    write_qpdf_stream as write_stream_to_buf_qpdf_order, write_stream_payload,
+    framing_adds_newline as stream_framing_adds_newline, write_stream_payload,
     write_stream_with_id_writer as write_stream_to_buf_with_id_writer,
 };
 
@@ -432,8 +433,8 @@ pub struct WriteOptions {
     ///
     /// - `full_rewrite` is implicitly forced to `true` (the incremental
     ///   path cannot rewrite source object bytes).
-    /// - `qdf` must be `false` (QDF mode emits plaintext for human
-    ///   inspection; the combination is rejected with `Unsupported`).
+    /// - `qdf` may be enabled; encrypted strings and stream dictionaries retain
+    ///   QDF layout while their encrypted bytes remain ciphertext.
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
 
     /// Copy the `/Encrypt` dictionary verbatim from a donor PDF and re-use its
@@ -931,9 +932,9 @@ pub fn write_pdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 ///
 /// - [`crate::Error::Missing`] if the input has no `/Root`.
 /// - [`crate::Error::Unsupported`] when `options.encrypt` and
-///   `options.copy_encryption` are both set (mutually exclusive), when
-///   encryption is combined with `options.qdf`, or when the OS CSPRNG
-///   (`getrandom`) is unavailable while deriving encryption keys or an AES IV.
+///   `options.copy_encryption` are both set (mutually exclusive), or when the
+///   OS CSPRNG (`getrandom`) is unavailable while deriving encryption keys or
+///   an AES IV.
 /// - [`crate::Error::Encrypted`] when `options.encrypt` or
 ///   `options.copy_encryption` is set but the requested encryption parameters
 ///   cannot be realized (an unsupported handler combination or malformed donor
@@ -2263,6 +2264,10 @@ pub(crate) struct EncryptionContext {
     /// How per-object string/stream key material is derived (V<5 per-object
     /// vs V=5 file-key-direct).
     pub(crate) cipher: WriteCipher,
+    /// Standard handler algorithm version (`/V`) used to derive writer data keys.
+    pub(crate) encryption_v: i32,
+    /// Standard handler revision (`/R`) retained with the writer encryption state.
+    pub(crate) encryption_r: i32,
     /// Indirect reference of the freshly-allocated `/Encrypt` object. The
     /// emission loop skips this ref so the `/Encrypt` dict itself stays
     /// plaintext (PDF 1.7 §7.6.1).
@@ -2330,7 +2335,7 @@ pub(crate) fn build_encryption_context(
 
     let id0 = id0.to_vec();
 
-    let (encrypt_dict, file_key, cipher) = match params.method {
+    let (encrypt_dict, file_key, cipher, encryption_v, encryption_r) = match params.method {
         EncryptMethod::V4Aes128 => {
             let v4 = V4EncryptParams {
                 method: V4CryptMethod::Aes,
@@ -2341,7 +2346,7 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let (dict, key) = build_v4_encrypt_dict(&v4)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Aes))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Aes), 4, 4)
         }
         EncryptMethod::V5R6Aes256 => {
             use crate::security::standard::{build_v5_r6_encrypt_dict, V5R6EncryptParams};
@@ -2357,7 +2362,13 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let dict = build_v5_r6_encrypt_dict(&v5, &secrets);
-            (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
+            (
+                dict,
+                secrets.file_key.to_vec(),
+                WriteCipher::FileKeyAes256,
+                5,
+                6,
+            )
         }
         EncryptMethod::V5R5Aes256 => {
             use crate::security::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
@@ -2369,7 +2380,13 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let dict = build_v5_r5_encrypt_dict(&v5, &secrets);
-            (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
+            (
+                dict,
+                secrets.file_key.to_vec(),
+                WriteCipher::FileKeyAes256,
+                5,
+                5,
+            )
         }
         EncryptMethod::V1Rc440 => {
             // V=1 R=2 RC4-40. /EncryptMetadata is a V>=4 concept, so it is not
@@ -2384,7 +2401,7 @@ pub(crate) fn build_encryption_context(
                 id0: &id0,
             };
             let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4), 1, 2)
         }
         EncryptMethod::V2Rc4128 => {
             // V=2 R=3 RC4-128 (qpdf's default for `--encrypt … 128`).
@@ -2398,7 +2415,7 @@ pub(crate) fn build_encryption_context(
                 id0: &id0,
             };
             let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4), 2, 3)
         }
         EncryptMethod::V4Rc4128 => {
             // V=4 R=4 with /CFM V2 (RC4-128 crypt filter), e.g. `--force-V4`.
@@ -2411,7 +2428,7 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let (dict, key) = build_v4_encrypt_dict(&v4)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4), 4, 4)
         }
     };
 
@@ -2428,6 +2445,8 @@ pub(crate) fn build_encryption_context(
         encrypt_dict,
         file_key,
         cipher,
+        encryption_v,
+        encryption_r,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0,
         static_aes_iv: options.static_aes_iv,
@@ -2480,6 +2499,13 @@ pub(crate) fn build_copy_encryption_context(
     options: &WriteOptions,
     existing_max: u32,
 ) -> Result<EncryptionContext> {
+    if src.file_key.len() != 16 {
+        return Err(crate::Error::Unsupported(format!(
+            "copy-encryption V=4 AES-128 file key must be 16 bytes; got {}",
+            src.file_key.len()
+        )));
+    }
+
     let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
         crate::Error::Unsupported(
             "full-rewrite copy-encryption: /Encrypt object number overflows u32".to_string(),
@@ -2492,6 +2518,8 @@ pub(crate) fn build_copy_encryption_context(
         // --copy-encryption-from only supports V=4 AES-128 donors today, so the
         // donor's per-object key alg maps straight onto the per-object cipher.
         cipher: WriteCipher::PerObject(src.object_key_alg),
+        encryption_v: 4,
+        encryption_r: 4,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
@@ -2758,86 +2786,6 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
     }
 }
 
-/// Encrypt every `Object::String` value in `object`'s graph in place, using
-/// a per-object key derived via Algorithm 1 and the cipher implied by
-/// `ctx.object_key_alg`. The `/Encrypt` dict itself is skipped by the
-/// caller (this function is not called on `ctx.encrypt_ref`).
-pub(crate) fn encrypt_strings_in_object_for_writer(
-    object_ref: ObjectRef,
-    object: &mut Object,
-    ctx: &EncryptionContext,
-) -> Result<()> {
-    use crate::security::standard::{
-        encrypt_strings_in_object, per_object_key, ObjectKeyAlg, StringEncryptCipher,
-    };
-
-    let mut iv_gen = || {
-        if ctx.static_aes_iv {
-            crate::pipeline::aes::static_initialization_vector()
-        } else {
-            let mut iv = [0u8; 16];
-            getrandom::getrandom(&mut iv)
-                .expect("OS CSPRNG (getrandom) must be available for AES IV generation");
-            iv
-        }
-    };
-
-    match ctx.cipher {
-        WriteCipher::PerObject(alg) => {
-            let per_obj_key = per_object_key(
-                &ctx.file_key,
-                object_ref.number,
-                u32::from(object_ref.generation),
-                alg,
-            );
-            match alg {
-                ObjectKeyAlg::Aes => {
-                    // V=4 AES per-object key is 16 bytes (min(n + 5, 16) with n=16 → 16).
-                    let key_bytes: [u8; 16] = per_obj_key
-                        .as_slice()
-                        .try_into()
-                        .expect("V=4 AES per-object key is exactly 16 bytes");
-                    let cipher = StringEncryptCipher::Aes128 { key: &key_bytes };
-                    encrypt_strings_in_object(
-                        object_ref,
-                        object,
-                        cipher,
-                        Some(ctx.encrypt_ref),
-                        &mut iv_gen,
-                    )
-                }
-                ObjectKeyAlg::Rc4 => {
-                    let cipher = StringEncryptCipher::Rc4 {
-                        key: per_obj_key.as_slice(),
-                    };
-                    encrypt_strings_in_object(
-                        object_ref,
-                        object,
-                        cipher,
-                        Some(ctx.encrypt_ref),
-                        &mut iv_gen,
-                    )
-                }
-            }
-        }
-        WriteCipher::FileKeyAes256 => {
-            // V=5: the 32-byte file key is the object key directly (no
-            // Algorithm-1 derivation), used with AES-256-CBC.
-            let key_bytes: [u8; 32] = ctx.file_key.as_slice().try_into().map_err(|_| {
-                crate::Error::Unsupported("V=5 AES-256 file key is not 32 bytes".to_string())
-            })?;
-            let cipher = StringEncryptCipher::Aes256 { key: &key_bytes };
-            encrypt_strings_in_object(
-                object_ref,
-                object,
-                cipher,
-                Some(ctx.encrypt_ref),
-                &mut iv_gen,
-            )
-        }
-    }
-}
-
 /// Whether `cipher` needs an AES CBC initialization vector: `true` for both
 /// AES variants (V=4 AESV2 `PerObject(Aes)` and V=5 AESV3 `FileKeyAes256`),
 /// `false` for RC4 (a stream cipher with no IV concept).
@@ -3063,19 +3011,33 @@ fn write_reencoded_object(
     reencoded: &Object,
     source_filter_is_lone_flate: bool,
     options: &WriteOptions,
-) {
+    encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
+    emitted_ref: ObjectRef,
+) -> Result<()> {
     match reencoded {
         Object::Stream(s) => {
             let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
                 && !source_filter_is_lone_flate
                 && is_lone_flate(s.dict.get("Filter"));
-            write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
+            if let Some(emitter) = encrypted_strings {
+                emitter.write_stream_dict(bytes, emitted_ref, None, &s.dict, false, refiltered)?;
+                write_stream_payload(bytes, &s.data, options.newline_before_endstream);
+            } else {
+                s.dict.write_pdf_stream(bytes, refiltered);
+                write_stream_payload(bytes, &s.data, options.newline_before_endstream);
+            }
         }
         // cov:ignore-start: unreachable — callers only pass stream objects and
         // reencode_stream_for_compress always returns Object::Stream.
-        other => other.write_pdf(bytes),
-        // cov:ignore-end
+        other => {
+            if let Some(emitter) = encrypted_strings {
+                emitter.write_object(bytes, emitted_ref, None, other, false)?;
+            } else {
+                other.write_pdf(bytes);
+            }
+        } // cov:ignore-end
     }
+    Ok(())
 }
 
 fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
@@ -3198,12 +3160,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             "the deterministic-id option is incompatible with encrypted output files".to_string(),
         ));
     }
-    if encrypting && options.qdf {
-        return Err(crate::Error::Unsupported(
-            "--encrypt / --copy-encryption-from cannot be combined with --qdf".to_string(),
-        ));
-    }
-
     // flpdf-9hc.16.8: propagate the Adobe extension level into the destination
     // Catalog BEFORE any downstream dispatch, so every full-rewrite route sees
     // the injected Catalog.
@@ -3487,12 +3443,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         }
     }
 
-    // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
-    // Built ONCE up front so /ID[0] is decided before any object is encrypted.
-    // For --encrypt: /Encrypt is allocated above existing objects AND any ObjStm
-    // container numbers (existing_max+1..existing_max+N), so base_for_encrypt+1
-    // is the safe slot (flpdf-9hc.4.16).
-    // For --copy-encryption-from: ObjStm is forced off, so existing_max+1 is safe.
     // Resolve /Metadata stream ref up front for --cleartext-metadata support.
     let metadata_ref = if options
         .encrypt
@@ -3503,34 +3453,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     } else {
         None
     };
-    let encrypt_ctx: Option<EncryptionContext> = if let Some(ref params) = options.encrypt {
-        let containers_len = u32::try_from(plan.batches.len()).map_err(|_| {
-            crate::Error::Unsupported(
-                "full-rewrite encrypt: ObjStm batch count overflows u32".to_string(),
-            )
-        })?;
-        let base_for_encrypt = existing_max.checked_add(containers_len).ok_or_else(|| {
-            crate::Error::Unsupported(
-                "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
-            )
-        })?;
-        // Resolve /ID[0] here (rather than inside `build_encryption_context`) so
-        // this is the single place that decides it — matching qpdf's own
-        // `generateID()`-is-idempotent contract (see that function's doc).
-        let id0 = resolve_id0_for_encryption(pdf, options);
-        Some(build_encryption_context(
-            options,
-            params,
-            base_for_encrypt,
-            metadata_ref,
-            &id0,
-        )?)
-    } else if let Some(ref src) = options.copy_encryption {
-        Some(build_copy_encryption_context(src, options, existing_max)?)
-    } else {
-        None
-    };
-
     // ── QDF emission pre-scan ─────────────────────────────────────────────────
     // qpdf --qdf emits each stream's /Length holder IMMEDIATELY after that
     // stream object (numbered in emission order), so file positions are strictly
@@ -3550,13 +3472,11 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
 
     let mut qdf_emission_renumber: HashMap<ObjectRef, ObjectRef> = HashMap::new();
     let mut qdf_holder_map: HashMap<u32, u32> = HashMap::new();
+    let mut qdf_max_emission: u32 = 0;
 
     if options.qdf {
         let mut next_emission: u32 = 0;
         for (cf_ref, old_ref) in &renumbered {
-            if Some(*old_ref) == pdf.encryption_ref() {
-                continue; // cov:ignore: QDF + encryption not covered by existing tests
-            }
             if old_ref.number == 0 || skip_refs.contains(old_ref) {
                 continue; // cov:ignore: free/deleted refs don't appear in renumbered
             }
@@ -3602,7 +3522,54 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 qdf_holder_map.insert(emission_num, next_emission);
             }
         }
+        qdf_max_emission = next_emission;
     }
+
+    // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
+    // Built ONCE up front so /ID[0] is decided before any object is encrypted.
+    // Compact /Encrypt follows existing objects and generated ObjStm containers.
+    // QDF /Encrypt follows the final interleaved /Length holder from the pre-scan.
+    let encrypt_ctx: Option<EncryptionContext> = if let Some(ref params) = options.encrypt {
+        let base_for_encrypt = if options.qdf {
+            qdf_max_emission
+        } else {
+            // cov:ignore-start: contiguous object and batch counts cannot approach u32::MAX in a supported process.
+            let containers_len = u32::try_from(plan.batches.len()).map_err(|_| {
+                crate::Error::Unsupported(
+                    "full-rewrite encrypt: ObjStm batch count overflows u32".to_string(),
+                )
+            })?;
+            existing_max.checked_add(containers_len).ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "full-rewrite encrypt: /Encrypt object number overflows u32".to_string(),
+                )
+            })?
+            // cov:ignore-end
+        };
+        // Resolve /ID[0] here (rather than inside `build_encryption_context`) so
+        // this is the single place that decides it — matching qpdf's own
+        // `generateID()`-is-idempotent contract (see that function's doc).
+        let id0 = resolve_id0_for_encryption(pdf, options);
+        let context =
+            build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
+        Some(context?)
+    } else if let Some(ref src) = options.copy_encryption {
+        let base_for_encrypt = if options.qdf {
+            qdf_max_emission
+        } else {
+            existing_max
+        };
+        Some(build_copy_encryption_context(
+            src,
+            options,
+            base_for_encrypt,
+        )?)
+    } else {
+        None
+    };
+    let mut encrypted_strings = encrypt_ctx
+        .as_ref()
+        .map(encrypted_strings::EncryptedStringEmitter::from_context);
 
     // ── QDF page/contents marker pre-scan ─────────────────────────────────────
     // qpdf --qdf emits two page-context comments to help human readers:
@@ -3717,14 +3684,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 
     for (new_ref, old_ref) in &renumbered {
-        // `pdf.encryption_ref()`, `skip_refs` (deleted_object_refs), and
-        // `member_to_batch` are all keyed on ORIGINAL refs, so compare with
-        // `old_ref`. (Object 0 / deleted refs are unreachable from /Root and
-        // never appear in `renumbered`, but the guards stay for parity.)
-        if Some(*old_ref) == pdf.encryption_ref() {
-            continue;
-        }
-
         // Never emit object 0 or any free/deleted entry as a body object (qpdf
         // parity, all modes). The xref free-list head and any free rows are
         // still written into the regenerated `xref` table below.
@@ -3764,19 +3723,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
         } else {
             crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
-        }
-
-        // flpdf-9hc.4.9: encrypt every string inside this object's resolved
-        // graph. Stream PAYLOAD encryption happens later (after the compress
-        // policy reencode), and the /Encrypt dict object itself is exempt per
-        // PDF 1.7 §7.6.1 ("strings and streams inside the encryption
-        // dictionary are not encrypted").
-        // The encryption key derives from the emitted object number (`emit_ref`),
-        // which is what the file header records for this object.
-        if let Some(ctx) = &encrypt_ctx {
-            if emit_ref != ctx.encrypt_ref {
-                encrypt_strings_in_object_for_writer(emit_ref, &mut object, ctx)?;
-            }
         }
 
         // Skip xref-stream container objects — we'll rebuild the xref from
@@ -3934,11 +3880,14 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     holder_stream
                         .dict
                         .insert("Length", Object::Reference(ObjectRef::new(holder_num, 0)));
-                    write_stream_to_buf_qdf(
+                    let written = write_stream_to_buf_qdf(
                         &mut bytes,
                         &holder_stream,
                         options.newline_before_endstream,
+                        encrypted_strings.as_mut(),
+                        emit_ref,
                     );
+                    written?;
                 } else {
                     // cov:ignore-start: unreachable — this arm is inside the
                     // stream branch and reencode_stream_for_compress always
@@ -3949,13 +3898,18 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             } else {
                 // Non-qdf: shared choke point — qpdf's re-filtered key order for
                 // re-encoded streams, lexicographic order otherwise.
-                write_reencoded_object(
+                let written = write_reencoded_object(
                     &mut bytes,
                     &reencoded,
                     source_filter_is_lone_flate,
                     options,
+                    encrypted_strings.as_mut(),
+                    emit_ref,
                 );
+                written?;
             }
+        } else if let Some(emitter) = encrypted_strings.as_mut() {
+            emitter.write_object(&mut bytes, emit_ref, None, &object, options.qdf)?;
         } else if options.qdf {
             object.write_pdf_qdf(&mut bytes, 0);
         } else {
@@ -4007,7 +3961,18 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             })?;
             resolved.push((new, obj));
         }
-        let body = object_streams::emit_objstm_body_from_resolved(&resolved)?;
+        let emitted = object_streams::emit_objstm_body_from_resolved_with_writer(
+            &resolved,
+            &mut |out, member_index, member_ref, object| {
+                if let Some(emitter) = encrypted_strings.as_mut() {
+                    emitter.write_object(out, member_ref, Some(member_index), object, false)
+                } else {
+                    object.write_pdf(out);
+                    Ok(())
+                }
+            },
+        );
+        let body = emitted?;
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
@@ -4035,8 +4000,11 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     if let Some(ctx) = &encrypt_ctx {
         let emit_offset = bytes.len();
         bytes.extend_from_slice(format!("{} 0 obj\n", ctx.encrypt_ref.number).as_bytes());
-        Object::Dictionary(ctx.encrypt_dict.clone()).write_pdf(&mut bytes);
+        encrypted_strings::write_encryption_dictionary(&mut bytes, &ctx.encrypt_dict);
         bytes.extend_from_slice(b"\nendobj\n");
+        if options.qdf {
+            bytes.push(b'\n');
+        }
         offsets.insert(ctx.encrypt_ref.number, (0, emit_offset));
     }
 
@@ -4095,9 +4063,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             if options.qdf {
                 // qpdf --qdf trailer: "trailer <<" on one line, then one
                 // "  /Key value" entry per line with the keys alphabetically
-                // sorted but /ID forced LAST (verified empirically against
-                // qpdf 11.9.0: minimal => /Root /Size /ID; three-page =>
-                // /Info /Root /Size /ID). Values use the EXISTING compact
+                // sorted but /ID and /Encrypt forced last in that order
+                // (verified against qpdf 11.9.0: minimal => /Root /Size /ID;
+                // encrypted => /Info /Root /Size /ID /Encrypt, with the final
+                // two entries on one line). Values use the EXISTING compact
                 // serializer, which keeps the /ID array inline
                 // ("[<hex><hex>]") — do NOT route the trailer through the qdf
                 // dict serializer. Closing ">>" then startxref directly (no
@@ -4503,14 +4472,21 @@ fn write_stream_to_buf_qdf(
     buf: &mut Vec<u8>,
     stream: &crate::Stream,
     policy: NewlineBeforeEndstream,
-) {
+    encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
+    emitted_ref: ObjectRef,
+) -> Result<()> {
     // qpdf --qdf pulls /Length past every other (alphabetically-sorted) key so
     // the length indirect reference sits immediately before `>>`; use the
     // /Length-last QDF serializer here (mirrors non-QDF write_pdf_stream).
-    stream.dict.write_pdf_stream_qdf(buf, 0);
+    if let Some(emitter) = encrypted_strings {
+        emitter.write_stream_dict(buf, emitted_ref, None, &stream.dict, true, false)?;
+    } else {
+        stream.dict.write_pdf_stream_qdf(buf, 0);
+    }
     // Stream framing + newline-before-endstream policy is identical to the
     // compact path; only the dict serialization differs in qdf mode.
     write_stream_payload(buf, &stream.data, policy);
+    Ok(())
 }
 
 /// Emit the rebuilt full-rewrite trailer in qpdf `--qdf` formatting:
@@ -4522,13 +4498,14 @@ fn write_stream_to_buf_qdf(
 /// >>
 /// ```
 ///
-/// Keys are emitted alphabetically by raw name, **except `/ID` which is forced
-/// last** — this matches qpdf 11.9.0 exactly (minimal.pdf: `/Root /Size /ID`;
-/// three-page.pdf: `/Info /Root /Size /ID`). Each value is written with the
-/// EXISTING compact [`Object::write_pdf`] serializer, so array values such as
-/// `/ID [<hex><hex>]` stay inline (qpdf formats the trailer specially). The
-/// closing `>>` is followed by a newline; the caller appends `startxref`
-/// directly afterwards.
+/// Keys are emitted alphabetically by raw name, **except `/ID` and `/Encrypt`,
+/// which are forced last in that order** — this matches qpdf 11.9.0's
+/// `QPDFWriter::writeTrailer` (`QPDFWriter.cc:1160-1236`). In QDF mode qpdf
+/// writes `/Encrypt` on the same line immediately after `/ID`. Each value is
+/// written with the EXISTING compact [`Object::write_pdf`] serializer, so array
+/// values such as `/ID [<hex><hex>]` stay inline (qpdf formats the trailer
+/// specially). The closing `>>` is followed by a newline; the caller appends
+/// `startxref` directly afterwards.
 ///
 /// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
 /// (the `  /ID ` key token is still emitted) instead of serializing the
@@ -4545,11 +4522,17 @@ fn write_qdf_trailer(
     bytes.extend_from_slice(b"trailer <<\n");
 
     // `Dictionary::iter()` already yields keys in lexicographic (BTreeMap)
-    // order; split out /ID so it can be appended last.
+    // order; split out /ID and /Encrypt so they can be appended last in
+    // qpdf's writer-state order.
     let mut id_value: Option<&Object> = None;
+    let mut encrypt_value: Option<&Object> = None;
     for (key, value) in trailer.iter() {
         if key == b"ID" {
             id_value = Some(value);
+            continue;
+        }
+        if key == b"Encrypt" {
+            encrypt_value = Some(value);
             continue;
         }
         bytes.extend_from_slice(b"  /");
@@ -4564,6 +4547,14 @@ fn write_qdf_trailer(
             Some(write_id) => write_id(bytes),
             None => crate::object::write_id_style_value(bytes, value),
         }
+    }
+    if let Some(value) = encrypt_value {
+        // Encrypted writes always materialize /ID before this serializer;
+        // qpdf appends /Encrypt to that same QDF trailer line.
+        bytes.extend_from_slice(b" /Encrypt ");
+        value.write_pdf(bytes);
+    }
+    if id_value.is_some() || encrypt_value.is_some() {
         bytes.push(b'\n');
     }
 
@@ -5723,6 +5714,40 @@ mod tests {
     }
 
     #[test]
+    fn qdf_encrypted_trailer_puts_encrypt_after_id_on_the_same_final_line() {
+        let mut trailer = Dictionary::new();
+        trailer.insert("Encrypt", Object::Reference(ObjectRef::new(9, 0)));
+        trailer.insert("Info", Object::Reference(ObjectRef::new(7, 0)));
+        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
+        trailer.insert("Size", Object::Integer(10));
+        trailer.insert(
+            "ID",
+            Object::Array(vec![Object::String(vec![1]), Object::String(vec![2])]),
+        );
+
+        let mut out = Vec::new();
+        write_qdf_trailer(&mut out, &trailer, None);
+
+        assert_eq!(
+            out,
+            b"trailer <<\n  /Info 7 0 R\n  /Root 1 0 R\n  /Size 10\n  /ID [<01><02>] /Encrypt 9 0 R\n>>\n",
+            "qpdf writes normal keys first, followed by /ID and /Encrypt on the final line"
+        );
+    }
+
+    #[test]
+    fn qdf_trailer_without_id_or_encrypt_closes_after_sorted_keys() {
+        let mut trailer = Dictionary::new();
+        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
+        trailer.insert("Size", Object::Integer(2));
+
+        let mut out = Vec::new();
+        write_qdf_trailer(&mut out, &trailer, None);
+
+        assert_eq!(out, b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\n");
+    }
+
+    #[test]
     fn deterministic_id_xref_stream_is_self_stable() {
         // xref-stream form: qpdf does not produce byte-parity here, but the
         // content-derived /ID must still be deterministic (self-stable) and the
@@ -6531,6 +6556,80 @@ mod tests {
         bytes
     }
 
+    /// Copy-encryption is supported in QDF mode through both the library and
+    /// CLI. QDF inserts an indirect
+    /// `/Length` holder after each stream, so `/Encrypt` must be allocated
+    /// after the final interleaved holder rather than after the last source
+    /// object. Re-opening the result exercises that non-colliding allocation.
+    #[test]
+    fn qdf_copy_encryption_allocates_encrypt_after_length_holders() {
+        use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
+        use crate::security::standard::ObjectKeyAlg;
+        use crate::PdfOpenOptions;
+        use std::io::Cursor;
+
+        let derivation_options = WriteOptions {
+            static_aes_iv: true,
+            ..WriteOptions::default()
+        };
+        let params = EncryptParams::v4_aes128(b"user-pw".to_vec(), b"owner-pw".to_vec());
+        let donor =
+            build_encryption_context(&derivation_options, &params, 4, None, &QPDF_STATIC_ID)
+                .expect("derive deterministic donor encryption state");
+        let source = CopyEncryptionSource {
+            encrypt_dict: donor.encrypt_dict,
+            file_key: donor.file_key,
+            id0: donor.id0,
+            object_key_alg: ObjectKeyAlg::Aes,
+        };
+
+        let fixture = build_string_and_stream_fixture();
+        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            qdf: true,
+            compress_streams: CompressStreams::No,
+            static_aes_iv: true,
+            copy_encryption: Some(source),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options)
+            .expect("QDF copy-encryption write must succeed");
+        assert!(out.windows(b"%QDF-1.0".len()).any(|w| w == b"%QDF-1.0"));
+
+        let mut reopened = Pdf::open_with_options(
+            Cursor::new(out),
+            PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("QDF copy-encryption output must reopen with donor password");
+        let encrypt_ref = reopened
+            .trailer()
+            .get_ref("Encrypt")
+            .expect("trailer must reference /Encrypt");
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let root = reopened.resolve(root_ref).expect("resolve /Root");
+        let metadata_ref = root
+            .as_dict()
+            .and_then(|dict| dict.get_ref("Metadata"))
+            .expect("Catalog must reference /Metadata");
+        let metadata = reopened.resolve(metadata_ref).expect("resolve /Metadata");
+        let length_ref = metadata
+            .as_stream()
+            .and_then(|stream| stream.dict.get_ref("Length"))
+            .expect("QDF stream must use an indirect /Length holder");
+        assert_ne!(
+            encrypt_ref, length_ref,
+            "/Encrypt must not collide with QDF's interleaved /Length holder"
+        );
+        let (title, stream) = resolve_title_and_stream(&mut reopened);
+        assert_eq!(title, b"TopSecretTitle");
+        assert_eq!(stream, b"hello");
+    }
+
     /// Resolve the `/Title` string and the content-stream payload from a
     /// re-opened encrypted output of [`build_string_and_stream_fixture`].
     ///
@@ -6684,6 +6783,8 @@ mod tests {
             encrypt_dict: Dictionary::new(),
             file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
             cipher: WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4),
+            encryption_v: 1,
+            encryption_r: 2,
             encrypt_ref: ObjectRef::new(99, 0),
             id0: Vec::new(),
             static_aes_iv: false,
