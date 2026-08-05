@@ -1,4 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc responsibilities shared with writer submodules and linearization.
+#[path = "writer/encrypted_strings.rs"]
+pub(crate) mod encrypted_strings;
 #[path = "writer/encryption_state.rs"]
 pub(crate) mod encryption_state;
 #[path = "writer/object_streams.rs"]
@@ -2263,6 +2265,10 @@ pub(crate) struct EncryptionContext {
     /// How per-object string/stream key material is derived (V<5 per-object
     /// vs V=5 file-key-direct).
     pub(crate) cipher: WriteCipher,
+    /// Standard handler algorithm version (`/V`) used to derive writer data keys.
+    pub(crate) encryption_v: i32,
+    /// Standard handler revision (`/R`) retained with the writer encryption state.
+    pub(crate) encryption_r: i32,
     /// Indirect reference of the freshly-allocated `/Encrypt` object. The
     /// emission loop skips this ref so the `/Encrypt` dict itself stays
     /// plaintext (PDF 1.7 §7.6.1).
@@ -2344,7 +2350,7 @@ pub(crate) fn build_encryption_context(
 
     let id0 = id0.to_vec();
 
-    let (encrypt_dict, file_key, cipher) = match params.method {
+    let (encrypt_dict, file_key, cipher, encryption_v, encryption_r) = match params.method {
         EncryptMethod::V4Aes128 => {
             let v4 = V4EncryptParams {
                 method: V4CryptMethod::Aes,
@@ -2355,7 +2361,7 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let (dict, key) = build_v4_encrypt_dict(&v4)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Aes))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Aes), 4, 4)
         }
         EncryptMethod::V5R6Aes256 => {
             use crate::security::standard::{build_v5_r6_encrypt_dict, V5R6EncryptParams};
@@ -2371,7 +2377,13 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let dict = build_v5_r6_encrypt_dict(&v5, &secrets);
-            (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
+            (
+                dict,
+                secrets.file_key.to_vec(),
+                WriteCipher::FileKeyAes256,
+                5,
+                6,
+            )
         }
         EncryptMethod::V5R5Aes256 => {
             use crate::security::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
@@ -2383,7 +2395,13 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let dict = build_v5_r5_encrypt_dict(&v5, &secrets);
-            (dict, secrets.file_key.to_vec(), WriteCipher::FileKeyAes256)
+            (
+                dict,
+                secrets.file_key.to_vec(),
+                WriteCipher::FileKeyAes256,
+                5,
+                5,
+            )
         }
         EncryptMethod::V1Rc440 => {
             // V=1 R=2 RC4-40. /EncryptMetadata is a V>=4 concept, so it is not
@@ -2398,7 +2416,7 @@ pub(crate) fn build_encryption_context(
                 id0: &id0,
             };
             let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4), 1, 2)
         }
         EncryptMethod::V2Rc4128 => {
             // V=2 R=3 RC4-128 (qpdf's default for `--encrypt … 128`).
@@ -2412,7 +2430,7 @@ pub(crate) fn build_encryption_context(
                 id0: &id0,
             };
             let (dict, key) = build_v1_v2_encrypt_dict(&v12)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4), 2, 3)
         }
         EncryptMethod::V4Rc4128 => {
             // V=4 R=4 with /CFM V2 (RC4-128 crypt filter), e.g. `--force-V4`.
@@ -2425,7 +2443,7 @@ pub(crate) fn build_encryption_context(
                 encrypt_metadata: params.encrypt_metadata,
             };
             let (dict, key) = build_v4_encrypt_dict(&v4)?;
-            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4))
+            (dict, key, WriteCipher::PerObject(ObjectKeyAlg::Rc4), 4, 4)
         }
     };
 
@@ -2442,6 +2460,8 @@ pub(crate) fn build_encryption_context(
         encrypt_dict,
         file_key,
         cipher,
+        encryption_v,
+        encryption_r,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0,
         static_aes_iv: options.static_aes_iv,
@@ -2506,6 +2526,8 @@ pub(crate) fn build_copy_encryption_context(
         // --copy-encryption-from only supports V=4 AES-128 donors today, so the
         // donor's per-object key alg maps straight onto the per-object cipher.
         cipher: WriteCipher::PerObject(src.object_key_alg),
+        encryption_v: 4,
+        encryption_r: 4,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
@@ -6712,6 +6734,8 @@ mod tests {
             encrypt_dict: Dictionary::new(),
             file_key: vec![0x11, 0x22, 0x33, 0x44, 0x55],
             cipher: WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4),
+            encryption_v: 1,
+            encryption_r: 2,
             encrypt_ref: ObjectRef::new(99, 0),
             id0: Vec::new(),
             static_aes_iv: false,

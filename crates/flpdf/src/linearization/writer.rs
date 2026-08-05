@@ -7949,6 +7949,8 @@ mod tests {
             encrypt_dict: Dictionary::new(),
             file_key: vec![0x11; 16],
             cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encryption_v: 4,
+            encryption_r: 4,
             encrypt_ref: ObjectRef::new(2, 0),
             id0: Vec::new(),
             static_aes_iv: true,
@@ -8030,6 +8032,8 @@ mod tests {
             encrypt_dict: Dictionary::new(),
             file_key: vec![0x11; 16],
             cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encryption_v: 4,
+            encryption_r: 4,
             encrypt_ref: ObjectRef::new(2, 0),
             id0: Vec::new(),
             static_aes_iv: false, // irrelevant here: the IV is passed explicitly
