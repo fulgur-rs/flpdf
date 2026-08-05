@@ -690,6 +690,26 @@ impl ObjectHandle {
         }))
     }
 
+    /// Return one live child handle from a lazily resolved array.
+    ///
+    /// This is the valid-index portion of `QPDFObjectHandle::getArrayItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:770-775`). qpdf borrows its `QPDF_Array`
+    /// and copies one `QPDFObjectHandle`; this port briefly borrows the backing
+    /// `Vec` and clones one `Rc`-backed handle. The child is not resolved.
+    ///
+    /// qpdf warns and returns a special null for a non-array or out-of-bounds
+    /// index (`:776-785`). This prerequisite's consumer only calls after both
+    /// arrays have equal, known lengths, so invalid-domain diagnostics remain
+    /// outside this method and are represented as `None` rather than guessed.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_array_item(&self, index: usize) -> Result<Option<ObjectHandle>> {
+        self.try_dereference()?;
+        Ok(self.with_value(|value| match value {
+            Some(ObjectValue::Array(children)) => children.get(index).cloned(),
+            _ => None,
+        }))
+    }
+
     /// qpdf-compatible integer inspection with lazy dereference.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_integer(&self) -> Result<Option<i64>> {
@@ -3636,6 +3656,54 @@ pub(crate) mod identity_tests {
 
         assert_eq!(handle.try_array_len().unwrap(), Some(1));
         assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn try_array_item_returns_live_first_middle_and_last_handles() {
+        let first = ObjectHandle::integer(1);
+        let middle = ObjectHandle::integer(2);
+        let last = ObjectHandle::integer(3);
+        let array = ObjectHandle::array(vec![first.clone(), middle.clone(), last.clone()]);
+
+        assert!(array.try_array_item(0).unwrap().unwrap().ptr_eq(&first));
+        assert!(array.try_array_item(1).unwrap().unwrap().ptr_eq(&middle));
+        assert!(array.try_array_item(2).unwrap().unwrap().ptr_eq(&last));
+    }
+
+    #[test]
+    fn try_array_item_returns_none_outside_the_valid_array_domain() {
+        let array = ObjectHandle::array(vec![ObjectHandle::null()]);
+
+        assert!(array.try_array_item(1).unwrap().is_none());
+        assert!(ObjectHandle::integer(1)
+            .try_array_item(0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn try_array_item_resolves_an_indirect_holder_once_without_resolving_the_child() {
+        let (child, _child_resolver) = error_resolving_handle(ObjectRef::new(23, 0));
+        let (array, _resolver, calls) =
+            logged_resolver_bearing_handle(ObjectValue::Array(vec![child.clone()]));
+
+        let fetched = array.try_array_item(0).unwrap().unwrap();
+
+        assert!(fetched.ptr_eq(&child));
+        assert!(!fetched.is_resolved());
+        assert_eq!(calls.borrow().as_slice(), &[ObjectRef::new(20, 0)]);
+    }
+
+    #[test]
+    fn try_array_item_reports_a_dropped_document() {
+        let (array, resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::null()]));
+        drop(resolver);
+
+        assert_eq!(
+            array.try_array_item(0).unwrap_err().to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
     }
 
     #[test]
