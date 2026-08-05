@@ -96,6 +96,7 @@ pub mod content_normalizer;
 pub mod content_stream;
 pub mod default_appearance;
 pub mod diagnostics;
+pub mod document_json;
 pub mod embedded_files;
 pub mod encrypt_setup;
 pub mod error;

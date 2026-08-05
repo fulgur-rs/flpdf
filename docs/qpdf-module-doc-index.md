@@ -18,6 +18,7 @@
 | `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
+| `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
@@ -35,7 +36,7 @@
 | `crates/flpdf/src/json/schema.rs` | correspondence | JSON.cc schema validation responsibilities |
 | `crates/flpdf/src/json/value.rs` | correspondence | JSON.cc shared value model and mutation and accessor responsibilities |
 | `crates/flpdf/src/json/writer.rs` | correspondence | JSON.cc incremental serialization and blob Base64 responsibilities |
-| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDF_json.cc writeJSON serialization and side-file lifecycle, and QPDFObjectHandle::getJSON object serialization responsibilities |
+| `crates/flpdf/src/json_inspect.rs` | correspondence | QPDFJob.cc JSON v2 doJSON* section builders (doJSONPages, doJSONPageLabels, doJSONOutlines, doJSONAcroform, doJSONEncrypt, doJSONAttachments, doJSON; the v1-only doJSONObjects v1 branch and doJSONObjectinfo have no counterpart here), QPDFObjectHandle::getJSON and QPDFObjectHandle::writeJSON object serialization, and QPDF_Stream::writeStreamJSON payload and dictionary normalization |
 | `crates/flpdf/src/lib.rs` | correspondence | crate root aggregating multiple qpdf library components and flpdf-only APIs |
 | `crates/flpdf/src/linearization/back_patch.rs` | correspondence | QPDFWriter.cc linearization back-patching split from the writer |
 | `crates/flpdf/src/linearization/check.rs` | correspondence | QPDF_linearization.cc structural validation represented as a standalone checker |
