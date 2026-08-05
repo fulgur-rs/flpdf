@@ -9,14 +9,12 @@ use crate::{Dictionary, Object, ObjectRef};
 
 /// Writer-owned adapter that encrypts strings while an emitted object's data
 /// key is active, without changing the source [`Object`] tree.
-#[allow(dead_code)] // Wired into the full and linearized production loops in later tasks.
 pub(crate) struct EncryptedStringEmitter {
     state: WriterEncryptionState,
     cipher: WriteCipher,
     static_aes_iv: bool,
 }
 
-#[allow(dead_code)] // Wired into the full and linearized production loops in later tasks.
 impl EncryptedStringEmitter {
     pub(crate) fn from_context(ctx: &EncryptionContext) -> Self {
         Self {
@@ -142,7 +140,6 @@ fn encrypt_string(
 
 /// Serialize encrypted bytes using qpdf's cipher-specific representation:
 /// AES ciphertext is always hexadecimal; RC4 retains normal string heuristics.
-#[allow(dead_code)] // Wired into the full and linearized production loops in later tasks.
 pub(crate) fn serialize_encrypted_string(out: &mut Vec<u8>, ciphertext: &[u8], use_aes: bool) {
     if use_aes {
         write_hex_string(out, ciphertext);

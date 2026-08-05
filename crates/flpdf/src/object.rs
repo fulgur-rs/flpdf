@@ -602,7 +602,6 @@ impl Object {
         self.write_pdf_with_string_mode(out, true);
     }
 
-    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
     pub(crate) fn try_write_pdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -745,7 +744,6 @@ impl Object {
         }
     }
 
-    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
     pub(crate) fn try_write_pdf_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1043,7 +1041,6 @@ impl Dictionary {
         self.write_pdf_with_string_mode(out, false);
     }
 
-    #[allow(dead_code)] // Reached through the callback serializer above.
     fn try_write_pdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1149,7 +1146,6 @@ impl Dictionary {
         self.write_pdf_stream_with_string_mode(out, refiltered, true);
     }
 
-    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
     pub(crate) fn try_write_pdf_stream_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1307,7 +1303,6 @@ impl Dictionary {
         out.extend_from_slice(b">>");
     }
 
-    #[allow(dead_code)] // Reached through the callback serializer above.
     fn try_write_pdf_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
@@ -1362,7 +1357,6 @@ impl Dictionary {
         out.extend_from_slice(b">>");
     }
 
-    #[allow(dead_code)] // Consumed by the writer migration in subsequent tasks.
     pub(crate) fn try_write_pdf_stream_qdf_with_string_writer<F>(
         &self,
         out: &mut Vec<u8>,
