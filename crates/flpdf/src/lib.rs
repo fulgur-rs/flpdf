@@ -96,6 +96,7 @@ pub mod content_normalizer;
 pub mod content_stream;
 pub mod default_appearance;
 pub mod diagnostics;
+pub mod document_json;
 pub mod embedded_files;
 pub mod encrypt_setup;
 pub mod error;
@@ -146,7 +147,6 @@ pub mod pdf_version;
 pub mod permissions;
 pub mod pipeline;
 pub mod qdf_fix;
-pub mod qpdf_json;
 pub(crate) mod qpdf_null;
 pub mod reader;
 #[cfg(not(feature = "qtest-driver"))]

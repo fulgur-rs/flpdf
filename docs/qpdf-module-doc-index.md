@@ -18,6 +18,7 @@
 | `crates/flpdf/src/content_stream.rs` | correspondence | QPDFParser.cc content callbacks |
 | `crates/flpdf/src/default_appearance.rs` | correspondence | QPDFFormFieldObjectHelper.cc default-appearance parsing split from the form-field helper |
 | `crates/flpdf/src/diagnostics.rs` | correspondence | QPDFLogger.cc diagnostic routing represented as Rust values |
+| `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
@@ -111,7 +112,6 @@
 | `crates/flpdf/src/pipeline/string.rs` | correspondence | Pl_String.cc accumulation, optional pass-through, and finish forwarding |
 | `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
-| `crates/flpdf/src/qpdf_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |

@@ -11,7 +11,7 @@
 //! finishes `PlStdioFile` before close/drop.
 //!
 //! The `qpdf` top-level key is not built here: qpdf serializes it in
-//! `QPDF_json.cc`, and [`crate::qpdf_json`] holds that boundary. The object
+//! `QPDF_json.cc`, and [`crate::document_json`] holds that boundary. The object
 //! and stream serialization primitives this module still owns —
 //! `QPDFObjectHandle::writeJSON` and `QPDF_Stream::writeStreamJSON` in qpdf —
 //! are shared with that module.
@@ -2705,7 +2705,7 @@ pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(
         // qpdf's doJSONObjects delegates the whole "qpdf" key to
         // QPDF::writeJSON with complete=false, letting it continue the
         // dictionary this function opened.
-        crate::qpdf_json::write_json_key(
+        crate::document_json::write_json_key(
             pdf,
             QPDF_JSON_VERSION,
             out,
@@ -2771,9 +2771,9 @@ pub fn write_qpdf_json_v2_selected_objects_to_output_with_options<R: Read + Seek
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document_json::{format_json_side_file_path, write_json_stream_file};
     use crate::pipeline::test_support::{shared_trace, RecordingSink, TraceCall};
     use crate::pipeline::{Pipeline, PipelineError, PipelineResult, PlString};
-    use crate::qpdf_json::{format_json_side_file_path, write_json_stream_file};
     use std::rc::Rc;
 
     fn number(value: impl ToString) -> serde_json::Value {
@@ -3031,7 +3031,7 @@ mod tests {
         let mut bytes = Vec::new();
         {
             let mut out = PlString::new("qpdf key", None, &mut bytes);
-            crate::qpdf_json::write_json(pdf, 2, &mut out, decode_level, stream_mode, &[])
+            crate::document_json::write_json(pdf, 2, &mut out, decode_level, stream_mode, &[])
                 .expect("the qpdf key must be written");
         }
         let document: serde_json::Value =

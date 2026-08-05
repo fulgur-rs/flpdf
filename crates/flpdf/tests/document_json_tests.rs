@@ -6,12 +6,12 @@
 //! writes are exactly those of `QPDF::writeJSON` with `complete=true`, so the
 //! command output is a usable oracle for the library call.
 
+use flpdf::document_json::write_json;
 use flpdf::json_inspect::{
     write_qpdf_json_v2_selected_objects_with_options, DecodeLevel, JsonKey, JsonOutputError,
     StreamDataMode,
 };
 use flpdf::pipeline::PlString;
-use flpdf::qpdf_json::write_json;
 use flpdf::Pdf;
 use std::fs::File;
 use std::io::BufReader;
