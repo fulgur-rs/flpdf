@@ -2071,20 +2071,132 @@ fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+// Detects the sibling condition `QPDFWriter::unparseObject`'s dictionary
+// branch checks per key before special-casing `/Contents`
+// (`QPDFWriter.cc:1497-1498`: `object.isDictionaryOfType("/Sig") &&
+// object.hasKey("/ByteRange")`) -- `object` there is the dict *being
+// written* (this function's own `entries`), not the `/Contents` value
+// itself. Checked in qpdf's own short-circuit order: `/Type` first, then
+// `/ByteRange` only if `/Type` was `/Sig` -- `isDictionaryOfType`
+// (`QPDFObjectHandle.cc:461-466`) resolves `/Type`'s own value through
+// `getKey("/Type").isNameAndEquals("/Sig")` (`isNameAndEquals` calls
+// `isName()`, which dereferences), so an indirect `/Type` value is
+// force-resolved here too, matching that (the suppression predicate above,
+// `visible_dict_entries`, already accepts this same "no-hidden-I/O
+// constraint" tradeoff for the identical writer-internal reason -- see its
+// own doc).
+//
+// `hasKey` is **not** pure map-containment despite its name:
+// `QPDFObjectHandle::hasKey` (`QPDFObjectHandle.cc:965-976`) delegates to
+// `QPDF_Dictionary::hasKey` (`QPDF_Dictionary.cc:98-101`), which is
+// `items.count(key) > 0 && !items[key].isNull()` -- `isNull()`
+// (`QPDFObjectHandle.cc:353-356`) dereferences too, so a `/ByteRange` key
+// whose value resolves to null (directly or indirectly) counts as *absent*,
+// the same null-suppression rule `visible_dict_entries` already applies to
+// dict entries generally. `/ByteRange`'s own value is therefore
+// force-resolved here as well -- but only after `/Type` was already
+// confirmed `/Sig`, matching qpdf's `&&` short-circuit: a dict whose
+// `/Type` is not `/Sig` never touches `/ByteRange`'s resolver at all.
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -> Result<bool> {
+    let Some((_, type_value)) = entries.iter().find(|entry| entry.0.as_slice() == b"Type") else {
+        return Ok(false);
+    };
+    type_value.try_dereference()?;
+    let is_sig = type_value.with_value(
+        |value| matches!(value, Some(ObjectValue::Name(name)) if name.as_slice() == b"Sig"),
+    );
+    if !is_sig {
+        return Ok(false);
+    }
+    let Some((_, byte_range_value)) = entries
+        .iter()
+        .find(|entry| entry.0.as_slice() == b"ByteRange")
+    else {
+        return Ok(false);
+    };
+    Ok(!byte_range_value.try_is_null()?)
+}
+
+// Applies qpdf's `/Contents`-in-a-signature-dictionary hex-string special
+// case (`QPDFWriter.cc:1490-1504`) to a single dict-value child in place of
+// the ordinary `write_child`/`write_child_qdf` call, when `force_hex_string`
+// is set (every call site below passes `dict_is_sig_with_byte_range(entries)?
+// && key.as_slice() == b"Contents"`, matching the `key == "/Contents" &&
+// object.isDictionaryOfType(...) && object.hasKey(...)` guard at the same
+// source lines). Returns `Ok(true)` when it wrote the value itself -- the
+// caller must not also call the ordinary child-writer in that case -- or
+// `Ok(false)` when the ordinary path should run instead.
+//
+// Matches `unparseChild`'s own indirect-first short-circuit
+// (`QPDFWriter.cc:1149-1156`): an indirect child still writes as its own
+// `"N G R"` reference form regardless of the flag -- real qpdf's flags are
+// consulted only inside `unparseObject`, which `unparseChild` never reaches
+// for an indirect child at all -- so this only ever has an effect on a
+// *direct* child. Even then, it only affects a child whose resolved value is
+// itself a String: qpdf's own `f_hex_string` handling lives inside
+// `unparseObject`'s `ot_string` arm alone (`QPDFWriter.cc:1567,1594-1595`);
+// every other resolved type's arm never inspects the flag, so a non-String
+// direct child (unusual for `/Contents` in practice, but not structurally
+// ruled out) falls through to the ordinary child-writer unaffected, matching
+// that.
+//
+// Deliberately does not implement `f_no_encryption` (`QPDFWriter.cc:1501`)
+// -- qpdf's `ot_string` arm consults it only inside its own `m->encrypted`
+// branch (`:1569-1593`), routing this one child's bytes through a
+// non-encrypting sub-pipeline while the rest of the document is encrypted.
+// This crate's `ObjectHandle` writer-emission primitives carry no
+// pipeline/encryption context at all -- every one of them is a plain
+// `(&self, out: &mut Vec<u8>, ...) -> Result<()>` -- so there is no
+// encryption state to route around in the first place here; wiring an
+// actual encryption pipeline around these bytes is a future
+// consumer-migration/encryption-integration concern this primitive does not
+// implement, matching the scope limits `unparse_stream_body`/
+// `unparse_trailer` already document for their own out-of-scope qpdf steps
+// (e.g. the `t_lin_second` branch, the `/Crypt`-filter stripping logic).
+#[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
+fn try_write_sig_contents_hex_string(
+    handle: &ObjectHandle,
+    force_hex_string: bool,
+    out: &mut Vec<u8>,
+) -> Result<bool> {
+    if !force_hex_string || handle.object_ref().is_some() {
+        return Ok(false);
+    }
+    handle.try_dereference()?;
+    Ok(handle.with_value(|value| {
+        if let Some(ObjectValue::String(bytes)) = value {
+            crate::object::write_hex_string(out, bytes);
+            true
+        } else {
+            false
+        }
+    }))
+}
+
 // Writes `<< /K1 v1 /K2 v2 >>` with qpdf's suppression rule applied
 // (`QPDFWriter.cc:1488-1527`, non-stream case: no `/Length` tail). Matches
 // `Dictionary::write_pdf`'s own key-writing shape (`object.rs:839-848`): a
 // leading space, then `/` + the escaped key, pushed separately since
-// `write_name_escaped` does not write the leading slash itself.
+// `write_name_escaped` does not write the leading slash itself. Also applies
+// the `/Contents`-in-a-`/Sig`-dictionary hex-string special case that same
+// qpdf loop applies unconditionally (`QPDFWriter.cc:1490-1504`) -- see
+// `dict_is_sig_with_byte_range`/`try_write_sig_contents_hex_string`'s own
+// docs for the detection/writing split (Codex Review on PR #644,
+// crates/flpdf/src/object_handle.rs:2087).
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) -> Result<()> {
+    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     out.extend_from_slice(b"<<");
     for (key, value) in visible_dict_entries(entries)? {
         out.push(b' ');
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        write_child(value, out)?;
+        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child(value, out)?;
+        }
     }
     out.extend_from_slice(b" >>");
     Ok(())
@@ -2223,20 +2335,26 @@ fn unparse_object_value_qdf(value: &ObjectValue, indent: usize, out: &mut Vec<u8
 // shape (`<<\n<indent spaces>>>`) when every entry is absent or suppressed.
 // Suppression itself is `visible_dict_entries`, unchanged from the plain
 // path -- QDF mode does not alter *which* entries survive, only how the
-// survivors are laid out.
+// survivors are laid out. Applies the same `/Contents`-in-a-`/Sig`-dictionary
+// hex-string special case `unparse_dict_entries` applies -- real qpdf's own
+// guard (`QPDFWriter.cc:1497-1503`) is unconditional across `m->qdf_mode`.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_dict_entries_qdf(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     out.extend_from_slice(b"<<\n");
     for (key, value) in visible_dict_entries(entries)? {
         push_spaces(out, indent + 2);
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        write_child_qdf(value, indent + 2, out)?;
+        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_qdf(value, indent + 2, out)?;
+        }
         out.push(b'\n');
     }
     push_spaces(out, indent);
@@ -2413,13 +2531,46 @@ impl ObjectHandle {
 // `/DecodeParms` are dropped from that pass and a fresh `/Filter
 // /FlateDecode` is appended after `/Length` instead -- both spellings
 // verified byte-for-byte against `write_pdf_stream` (`object.rs`) before
-// this primitive's tests were written.
+// this primitive's tests were written. Also applies the same
+// `/Contents`-in-a-`/Sig`-dictionary hex-string special case
+// `unparse_dict_entries` applies -- real qpdf's own guard
+// (`QPDFWriter.cc:1497-1503`) has no `f_stream` gate, so in principle it
+// covers a stream object whose dict happens to be `/Type /Sig` with
+// `/ByteRange` too (unusual -- signature dictionaries aren't normally
+// streams -- but not structurally ruled out by qpdf's own code).
+//
+// When `refiltered`, `/Filter` and `/DecodeParms` are excluded from the
+// entries `visible_dict_entries` ever sees, rather than left in and skipped
+// later during the write loop: real qpdf removes those two keys from a
+// shallow copy of the dict entirely BEFORE its null-suppression loop even
+// starts (`object.removeKey("/Filter")`/`object.removeKey("/DecodeParms")`
+// at `QPDFWriter.cc:1454-1455`, both ahead of the shared loop at
+// `:1488-1491`) -- it never calls `isNull()` on a key it is about to
+// discard anyway. This primitive previously did the opposite order (compute
+// suppression over every entry, including `/Filter`/`/DecodeParms`, and
+// only skip those two keys afterward inside the write loop), which could
+// force-resolve -- and needlessly fail on -- a stale or unsupported
+// indirect `/Filter`/`/DecodeParms` reference that is guaranteed to be
+// irrelevant to the refiltered output (Codex Review on PR #644,
+// crates/flpdf/src/object_handle.rs:2425).
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_stream_dict_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
     refiltered: bool,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
+    let excluded_entries;
+    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
+        excluded_entries = entries
+            .iter()
+            .filter(|entry| entry.0.as_slice() != b"Filter" && entry.0.as_slice() != b"DecodeParms")
+            .cloned()
+            .collect::<Vec<_>>();
+        &excluded_entries
+    } else {
+        entries
+    };
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
@@ -2427,14 +2578,14 @@ fn unparse_stream_dict_entries(
             length_value = Some(value);
             continue;
         }
-        if refiltered && (key.as_slice() == b"Filter" || key.as_slice() == b"DecodeParms") {
-            continue;
-        }
         out.push(b' ');
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        write_child(value, out)?;
+        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child(value, out)?;
+        }
     }
     if let Some(length) = length_value {
         out.extend_from_slice(b" /Length ");
@@ -2458,13 +2609,20 @@ fn unparse_stream_dict_entries(
 // dimension exists here, matching `write_pdf_stream_qdf`'s own signature
 // (see `unparse_stream_body_qdf`'s own doc for why). Verified byte-for-byte
 // against `write_pdf_stream_qdf` (`object.rs`) before this primitive's
-// tests were written.
+// tests were written. Applies the same `/Contents`-in-a-`/Sig`-dictionary
+// hex-string special case `unparse_stream_dict_entries` applies, for the
+// same reason (see that function's own doc); this function has no
+// `refiltered` parameter to begin with, so the Finding-2
+// remove-then-suppress reordering that primitive also needed does not apply
+// here -- there is no `/Filter`/`/DecodeParms` drop in this function for
+// that reordering to fix.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_stream_dict_entries_qdf(
     entries: &[(Vec<u8>, ObjectHandle)],
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
+    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
@@ -2476,7 +2634,10 @@ fn unparse_stream_dict_entries_qdf(
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        write_child_qdf(value, indent + 2, out)?;
+        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_qdf(value, indent + 2, out)?;
+        }
         out.push(b'\n');
     }
     if let Some(length) = length_value {
@@ -2594,7 +2755,13 @@ impl ObjectHandle {
 // is the one dictionary-shaped writer-emission primitive in this family
 // that does not suppress null-valued keys, matching `writeTrailer`'s own
 // key loop (`QPDFWriter.cc:1174-1192`), which has no `isNull` check
-// anywhere in it.
+// anywhere in it. Also has no `/Contents`-in-a-`/Sig`-dictionary hex-string
+// special case, deliberately: that guard lives in `unparseObject`'s
+// dictionary branch alone (`QPDFWriter.cc:1490-1504`), a different loop
+// `writeTrailer`'s own key loop never calls into -- `writeTrailer` calls
+// `unparseChild(trailer.getKey(key), 1, 0)` directly for every non-`/Size`
+// key (`:1188`), and a trailer is never itself a signature dictionary in
+// any case.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_trailer_entries(
     entries: &[(Vec<u8>, ObjectHandle)],
@@ -3074,6 +3241,25 @@ pub(crate) mod identity_tests {
         ) -> crate::Result<()> {
             Err(Error::System("resolver failed".to_string()))
         }
+    }
+
+    /// An unresolved indirect handle whose resolver always errors, mirroring
+    /// [`resolver_bearing_handle`]'s own doc but for a position that must
+    /// never be resolved at all rather than one that resolves to a
+    /// particular value -- a test asserting some code path does not resolve
+    /// a value it does not need can build one of these and assert success:
+    /// actually resolving it here would surface as an error instead.
+    ///
+    /// `pub(crate)` for the same reason as [`resolver_bearing_handle`]: a
+    /// harness other test modules in this file need, not just this one.
+    /// Same "keep the resolver alive" rule applies -- see that function's
+    /// own doc.
+    pub(crate) fn error_resolving_handle(
+        object_ref: ObjectRef,
+    ) -> (ObjectHandle, Rc<dyn DocumentResolver>) {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(object_ref, Rc::downgrade(&resolver));
+        (handle, resolver)
     }
 
     #[test]
@@ -4607,7 +4793,7 @@ mod unparse_tests {
 
 #[cfg(test)]
 mod unparse_object_tests {
-    use super::identity_tests::resolver_bearing_handle;
+    use super::identity_tests::{error_resolving_handle, resolver_bearing_handle};
     use super::*;
 
     #[test]
@@ -4635,6 +4821,232 @@ mod unparse_object_tests {
         drop(resolver);
         let entries: Vec<(Vec<u8>, ObjectHandle)> = vec![(b"RefNull".to_vec(), indirect_null)];
         assert!(visible_dict_entries(&entries).is_err());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_true_when_both_present() {
+        let entries = vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+        ];
+        assert!(dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_false_when_byte_range_is_a_direct_null() {
+        // `QPDF_Dictionary::hasKey` (QPDF_Dictionary.cc:98-101) is
+        // `items.count(key) > 0 && !items[key].isNull()` -- a null
+        // `/ByteRange` value counts as *absent*, the same way a null-valued
+        // entry is excluded from `visible_dict_entries`'s own output.
+        let entries = vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::null()),
+        ];
+        assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_false_when_byte_range_resolves_to_an_indirect_null() {
+        // Same null-exclusion rule as the direct case above, but through
+        // `isNull()`'s own dereference (QPDFObjectHandle.cc:353-356) --
+        // `hasKey` resolves an indirect `/ByteRange` to decide this too.
+        let (indirect_null, _resolver) = resolver_bearing_handle(ObjectValue::Null);
+        let entries = vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), indirect_null),
+        ];
+        assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_propagates_a_dropped_document_error_from_byte_range() {
+        // `/Type` is a direct `/Sig`, so the short-circuit passes it and
+        // reaches `/ByteRange`'s own forced resolution, which must
+        // propagate a dropped-document error the same way `/Type`'s own
+        // resolution does.
+        let (indirect_byte_range, resolver) = error_resolving_handle(ObjectRef::new(32, 0));
+        drop(resolver);
+        let entries = vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), indirect_byte_range),
+        ];
+        assert!(dict_is_sig_with_byte_range(&entries).is_err());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_false_without_byte_range_key() {
+        let entries = vec![(b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec()))];
+        assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_false_without_type_key() {
+        let entries = vec![(b"ByteRange".to_vec(), ObjectHandle::array(vec![]))];
+        assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_false_when_type_is_not_sig() {
+        let entries = vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+        ];
+        assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_resolves_an_indirect_type_that_is_sig() {
+        // Mirrors qpdf's own `getKey("/Type").isNameAndEquals("/Sig")`,
+        // which dereferences through `isName()` -- an indirect `/Type` must
+        // be force-resolved to decide this, not conservatively treated as
+        // "not Sig".
+        let (indirect_type, _resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"Sig".to_vec()));
+        let entries = vec![
+            (b"Type".to_vec(), indirect_type),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+        ];
+        assert!(dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_propagates_a_dropped_document_error_from_type() {
+        let (indirect_type, resolver) = error_resolving_handle(ObjectRef::new(30, 0));
+        drop(resolver);
+        let entries = vec![
+            (b"Type".to_vec(), indirect_type),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+        ];
+        assert!(dict_is_sig_with_byte_range(&entries).is_err());
+    }
+
+    #[test]
+    fn dict_is_sig_with_byte_range_does_not_resolve_byte_range_when_type_is_not_sig() {
+        // Mirrors qpdf's own `&&` short-circuit
+        // (`isDictionaryOfType("/Sig") && hasKey("/ByteRange")`,
+        // QPDFWriter.cc:1497-1498): `/ByteRange`'s resolver must never run
+        // at all once `/Type` is confirmed not `/Sig` -- an indirect
+        // `/ByteRange` whose resolver would error must not surface that
+        // error here.
+        let (indirect_byte_range, _resolver) = error_resolving_handle(ObjectRef::new(31, 0));
+        let entries = vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"ByteRange".to_vec(), indirect_byte_range),
+        ];
+        assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
+    }
+
+    #[test]
+    fn unparse_object_writes_sig_contents_as_a_hex_string() {
+        // `/Contents` is a printable-ASCII direct String, which the ordinary
+        // `write_string_value` path (via `use_hex_string`) would write as a
+        // literal string `(hi)` -- confirms the Sig+ByteRange special case
+        // overrides that choice with `write_hex_string`'s own byte shape
+        // (`<` + one lowercase hex pair per byte + `>`: `h` = 0x68, `i` =
+        // 0x69).
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< /ByteRange [ ] /Contents <6869> /Type /Sig >>");
+    }
+
+    #[test]
+    fn unparse_object_leaves_contents_literal_without_sig_type() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< /ByteRange [ ] /Contents (hi) /Type /Page >>");
+    }
+
+    #[test]
+    fn unparse_object_leaves_contents_literal_without_byte_range() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< /Contents (hi) /Type /Sig >>");
+    }
+
+    #[test]
+    fn unparse_object_writes_an_indirect_sig_contents_as_reference_form_not_hex() {
+        // Mirrors `unparseChild`'s own indirect-first short-circuit
+        // (QPDFWriter.cc:1149-1156): an indirect `/Contents` value writes
+        // as its own "N G R" reference form regardless of the Sig+ByteRange
+        // condition -- qpdf's flags are only consulted inside
+        // `unparseObject`, which an indirect child never reaches.
+        let (indirect_contents, _resolver) =
+            resolver_bearing_handle(ObjectValue::String(b"hi".to_vec()));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), indirect_contents),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< /ByteRange [ ] /Contents 20 0 R /Type /Sig >>");
+    }
+
+    #[test]
+    fn unparse_object_leaves_a_non_string_sig_contents_unaffected() {
+        // The Sig+ByteRange special case only affects a child whose
+        // resolved value is itself a String (QPDFWriter.cc's `f_hex_string`
+        // handling lives inside the `ot_string` arm alone) -- a non-String
+        // direct `/Contents` (unusual in practice, but not structurally
+        // ruled out) falls through to the ordinary child-writer unaffected.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::integer(7)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_object(&mut out).unwrap();
+        assert_eq!(out, b"<< /ByteRange [ ] /Contents 7 /Type /Sig >>");
+    }
+
+    #[test]
+    fn unparse_object_qdf_writes_sig_contents_as_a_hex_string() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_object_qdf(&mut out, 0).unwrap();
+        assert_eq!(
+            out,
+            b"<<\n  /ByteRange [\n  ]\n  /Contents <6869>\n  /Type /Sig\n>>"
+        );
+    }
+
+    #[test]
+    fn unparse_stream_body_writes_sig_contents_as_a_hex_string() {
+        // The Sig+ByteRange special case has no `f_stream` guard in real
+        // qpdf either (QPDFWriter.cc:1490-1504 is the same shared loop the
+        // stream-dictionary branch falls into) -- a stream whose dict
+        // happens to be `/Type /Sig` with `/ByteRange` is unusual but not
+        // structurally ruled out.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+            (b"Length".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body(&mut out, false).unwrap();
+        assert_eq!(
+            out,
+            b"<< /ByteRange [ ] /Contents <6869> /Type /Sig /Length 2 >>"
+        );
     }
 
     #[test]
@@ -5023,6 +5435,58 @@ mod unparse_object_tests {
     }
 
     #[test]
+    fn unparse_stream_body_refiltered_does_not_resolve_a_would_error_indirect_filter_or_decodeparms(
+    ) {
+        // Codex Review on PR #644 (crates/flpdf/src/object_handle.rs:2425):
+        // `visible_dict_entries` previously ran over every entry --
+        // including `/Filter`/`/DecodeParms` -- before the `refiltered`
+        // skip in the write loop below ever got a chance to drop them,
+        // force-resolving (and potentially failing on) a value guaranteed
+        // to be discarded from the refiltered output. Real qpdf removes
+        // both keys from a shallow copy of the dict entirely BEFORE its
+        // null-suppression loop runs (`QPDFWriter.cc:1454-1455`, ahead of
+        // `:1488-1491`) -- it never calls `isNull()` on a key it is about
+        // to discard anyway.
+        //
+        // An indirect `/Filter`/`/DecodeParms` whose resolver would error,
+        // with `refiltered == true`, must now succeed without ever calling
+        // that resolver -- proving the values are excluded before
+        // suppression ever inspects them, not merely skipped during the
+        // write loop after being resolved (which would have propagated
+        // `ErrorResolver`'s error through `visible_dict_entries`'s
+        // `try_is_null()` call before this fix).
+        let (filter, _filter_resolver) = error_resolving_handle(ObjectRef::new(40, 0));
+        let (decode_parms, _decode_parms_resolver) = error_resolving_handle(ObjectRef::new(41, 0));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), filter),
+            (b"DecodeParms".to_vec(), decode_parms),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body(&mut out, true).unwrap();
+        assert_eq!(out, b"<< /Length 3 /Filter /FlateDecode >>");
+    }
+
+    #[test]
+    fn unparse_stream_body_not_refiltered_still_propagates_an_indirect_filter_error() {
+        // Contrast with the test above: when `refiltered` is false,
+        // `/Filter` is a surviving key that must actually be written, so an
+        // indirect value whose resolver errors must still surface that
+        // error -- proving the fix scopes "skip resolution" to the
+        // refiltered case alone, rather than exempting
+        // `/Filter`/`/DecodeParms` from resolution unconditionally (which
+        // would silently corrupt a non-refiltered stream's real `/Filter`
+        // value).
+        let (filter, _resolver) = error_resolving_handle(ObjectRef::new(42, 0));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), filter),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let mut out = Vec::new();
+        assert!(dict.unparse_stream_body(&mut out, false).is_err());
+    }
+
+    #[test]
     fn unparse_stream_body_suppresses_a_null_valued_key() {
         let dict = ObjectHandle::dictionary(vec![
             (b"Length".to_vec(), ObjectHandle::integer(3)),
@@ -5193,6 +5657,27 @@ mod unparse_object_tests {
         assert_eq!(
             out,
             b"<<\n  /DecodeParms <<\n  >>\n  /Filter /FlateDecode\n  /Width 100\n  /Length 3\n>>"
+        );
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_writes_sig_contents_as_a_hex_string() {
+        // QDF sibling of `unparse_stream_body_writes_sig_contents_as_a_hex_string`
+        // above -- `unparse_stream_dict_entries_qdf` applies the same
+        // Sig+ByteRange special case its compact sibling does (see that
+        // function's own doc). `/Length` is pulled out and written last, at
+        // `indent + 2`, same as the non-Sig QDF stream shape above.
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+            (b"Length".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let mut out = Vec::new();
+        dict.unparse_stream_body_qdf(&mut out, 0).unwrap();
+        assert_eq!(
+            out,
+            b"<<\n  /ByteRange [\n  ]\n  /Contents <6869>\n  /Type /Sig\n  /Length 2\n>>"
         );
     }
 
