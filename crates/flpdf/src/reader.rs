@@ -4111,18 +4111,11 @@ fn required_version(encrypt: &Dictionary) -> Result<i64> {
     required_integer(encrypt, "V")
 }
 
-/// qpdf `QPDF::interpretCF` (`libqpdf/QPDF_encryption.cc:700-716`).
-///
-/// The branch order is load-bearing: the `/CF` lookup runs **before** the
-/// built-in `/Identity`, so a document that defines a crypt filter actually
-/// named `/Identity` shadows the built-in and gets that filter's method. A
-/// selector that is not a name at all is qpdf's "Default: /Identity" and
-/// yields `e_none`.
-fn interpret_cf(
+fn interpret_cf_name(
     crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
-    cf: Option<&Object>,
+    filter: Option<&[u8]>,
 ) -> EncryptionMode {
-    let Some(filter) = cf.and_then(Object::as_name) else {
+    let Some(filter) = filter else {
         return EncryptionMode::Identity;
     };
     if let Some(mode) = crypt_filters.get(filter) {
@@ -4132,6 +4125,37 @@ fn interpret_cf(
         return EncryptionMode::Identity;
     }
     EncryptionMode::Unknown
+}
+
+/// qpdf `QPDF::interpretCF` (`libqpdf/QPDF_encryption.cc:700-716`).
+///
+/// The branch order is load-bearing: the `/CF` lookup runs **before** the
+/// built-in `/Identity`, so a document that defines a crypt filter actually
+/// named `/Identity` shadows the built-in and gets that filter's method. A
+/// selector that is not a name at all is qpdf's "Default: /Identity" and
+/// yields `e_none`.
+///
+/// This materialized adapter retains the existing `Object` caller boundary.
+fn interpret_cf(
+    crypt_filters: &BTreeMap<Vec<u8>, EncryptionMode>,
+    cf: Option<&Object>,
+) -> EncryptionMode {
+    interpret_cf_name(crypt_filters, cf.and_then(Object::as_name))
+}
+
+/// qpdf `QPDF::interpretCF`'s ObjectHandle boundary
+/// (`include/qpdf/QPDF.hh:1122-1127`,
+/// `libqpdf/QPDF_encryption.cc:700-716`).
+#[allow(dead_code)] // production consumer cutover belongs to flpdf-25kg.3.12
+pub(in crate::reader) fn interpret_cf_from_handle(
+    encryption: &EncryptionState,
+    cf: &ObjectHandle,
+) -> Result<EncryptionMode> {
+    let filter = cf.try_as_name()?;
+    Ok(interpret_cf_name(
+        &encryption.crypt_filters,
+        filter.as_deref(),
+    ))
 }
 
 /// qpdf's `/CF` loop inside `QPDF::initializeEncryption`
@@ -4640,6 +4664,96 @@ mod tests {
             EncryptionMode::Identity
         );
         assert_eq!(interpret_cf(&modes, None), EncryptionMode::Identity);
+    }
+
+    #[test]
+    fn interpret_cf_from_handle_matches_the_materialized_selector_and_qpdf_order() {
+        let mut encryption = explicit_rc4_encryption_state();
+        encryption
+            .crypt_filters
+            .insert(b"Identity".to_vec(), EncryptionMode::Aes128);
+
+        let cases = [
+            (
+                Object::Name(b"StdCF".to_vec()),
+                ObjectHandle::name(b"StdCF".to_vec()),
+                EncryptionMode::Rc4,
+            ),
+            (
+                Object::Name(b"Identity".to_vec()),
+                ObjectHandle::name(b"Identity".to_vec()),
+                EncryptionMode::Aes128,
+            ),
+            (
+                Object::Name(b"NoSuchCF".to_vec()),
+                ObjectHandle::name(b"NoSuchCF".to_vec()),
+                EncryptionMode::Unknown,
+            ),
+            (
+                Object::Integer(7),
+                ObjectHandle::integer(7),
+                EncryptionMode::Identity,
+            ),
+            (Object::Null, ObjectHandle::null(), EncryptionMode::Identity),
+        ];
+
+        for (object, handle, expected) in cases {
+            assert_eq!(
+                interpret_cf(&encryption.crypt_filters, Some(&object)),
+                expected
+            );
+            assert_eq!(
+                interpret_cf_from_handle(&encryption, &handle).unwrap(),
+                expected
+            );
+        }
+
+        let builtin_identity = explicit_rc4_encryption_state();
+        assert_eq!(
+            interpret_cf_from_handle(&builtin_identity, &ObjectHandle::name(b"Identity".to_vec()),)
+                .unwrap(),
+            EncryptionMode::Identity
+        );
+    }
+
+    #[test]
+    fn interpret_cf_from_handle_lazily_resolves_an_indirect_name() {
+        let encryption = explicit_rc4_encryption_state();
+        let (handle, _resolver) = crate::object_handle::identity_tests::resolver_bearing_handle(
+            ObjectValue::Name(b"StdCF".to_vec()),
+        );
+
+        assert!(!handle.is_resolved());
+        assert_eq!(
+            interpret_cf_from_handle(&encryption, &handle).unwrap(),
+            EncryptionMode::Rc4
+        );
+        assert!(handle.is_resolved());
+    }
+
+    #[test]
+    fn interpret_cf_from_handle_propagates_resolution_failures() {
+        let encryption = explicit_rc4_encryption_state();
+
+        let (dropped, resolver) = crate::object_handle::identity_tests::resolver_bearing_handle(
+            ObjectValue::Name(b"StdCF".to_vec()),
+        );
+        drop(resolver);
+        assert_eq!(
+            interpret_cf_from_handle(&encryption, &dropped)
+                .unwrap_err()
+                .to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
+
+        let (failing, _resolver) =
+            crate::object_handle::identity_tests::error_resolving_handle(ObjectRef::new(21, 0));
+        assert_eq!(
+            interpret_cf_from_handle(&encryption, &failing)
+                .unwrap_err()
+                .to_string(),
+            "resolver failed"
+        );
     }
 
     /// qpdf enters the crypt-filter switch only for `/V >= 4` (`:982-983`,
