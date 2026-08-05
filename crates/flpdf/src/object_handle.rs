@@ -648,6 +648,67 @@ impl ObjectHandle {
         ))
     }
 
+    /// True when this handle is the requested decoded name or an array with a
+    /// matching name item.
+    ///
+    /// Ports `QPDFObjectHandle::isOrHasName` in its exact short-circuit order:
+    /// inspect the holder as a name first, then inspect array items one at a
+    /// time (`libqpdf/QPDFObjectHandle.cc:1027-1039`). Each array borrow ends
+    /// before the selected child is resolved.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_is_or_has_name(&self, name: &[u8]) -> Result<bool> {
+        if self.try_is_name_and_equals(name)? {
+            return Ok(true);
+        }
+        let Some(count) = self.try_array_len()? else {
+            return Ok(false);
+        };
+        for index in 0..count {
+            if let Some(item) = self.try_array_item(index)? {
+                if item.try_is_name_and_equals(name)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// True when this handle lazily resolves to a dictionary whose optional
+    /// `/Type` and `/Subtype` names equal the requested decoded bytes.
+    ///
+    /// Ports `QPDFObjectHandle::isDictionaryOfType` and its left-to-right
+    /// short-circuiting (`libqpdf/QPDFObjectHandle.cc:461-466`). flpdf keys and
+    /// names omit qpdf's canonical leading slash, so the lookups use `Type`
+    /// and `Subtype` and callers pass values such as `CryptFilterDecodeParms`.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
+    pub(crate) fn try_is_dictionary_of_type(
+        &self,
+        type_name: &[u8],
+        subtype_name: &[u8],
+    ) -> Result<bool> {
+        self.try_dereference()?;
+        let is_dictionary =
+            self.with_value(|value| matches!(value, Some(ObjectValue::Dictionary(_))));
+        if !is_dictionary {
+            return Ok(false);
+        }
+        if !type_name.is_empty()
+            && !self
+                .try_get_key(b"Type")?
+                .try_is_name_and_equals(type_name)?
+        {
+            return Ok(false);
+        }
+        if !subtype_name.is_empty()
+            && !self
+                .try_get_key(b"Subtype")?
+                .try_is_name_and_equals(subtype_name)?
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// qpdf-compatible array inspection with lazy dereference. Only the array
     /// itself is resolved; each returned child keeps its own identity.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
@@ -3566,6 +3627,177 @@ pub(crate) mod identity_tests {
         assert_eq!(
             handle
                 .try_is_name_and_equals(b"Crypt")
+                .unwrap_err()
+                .to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
+    }
+
+    #[test]
+    fn try_is_or_has_name_matches_a_direct_name_or_array_item() {
+        assert!(ObjectHandle::name(b"Crypt".to_vec())
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+        assert!(ObjectHandle::array(vec![
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+            ObjectHandle::name(b"Crypt".to_vec()),
+        ])
+        .try_is_or_has_name(b"Crypt")
+        .unwrap());
+    }
+
+    #[test]
+    fn try_is_or_has_name_returns_false_for_other_shapes_and_names() {
+        assert!(!ObjectHandle::name(b"FlateDecode".to_vec())
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+        assert!(!ObjectHandle::integer(1)
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+        assert!(!ObjectHandle::array(vec![ObjectHandle::integer(1)])
+            .try_is_or_has_name(b"Crypt")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_or_has_name_stops_before_a_later_erroring_child() {
+        let (erroring, _resolver) = error_resolving_handle(ObjectRef::new(24, 0));
+        let array = ObjectHandle::array(vec![ObjectHandle::name(b"Crypt".to_vec()), erroring]);
+
+        assert!(array.try_is_or_has_name(b"Crypt").unwrap());
+    }
+
+    #[test]
+    fn try_is_or_has_name_resolves_indirect_holder_and_child() {
+        let (child, _child_resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"Crypt".to_vec()));
+        let (array, _array_resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![child.clone()]));
+
+        assert!(array.try_is_or_has_name(b"Crypt").unwrap());
+        assert!(array.is_resolved());
+        assert!(child.is_resolved());
+    }
+
+    #[test]
+    fn try_is_or_has_name_propagates_child_resolution_errors() {
+        let (erroring, _resolver) = error_resolving_handle(ObjectRef::new(25, 0));
+        let array = ObjectHandle::array(vec![erroring]);
+
+        assert_eq!(
+            array.try_is_or_has_name(b"Crypt").unwrap_err().to_string(),
+            "resolver failed"
+        );
+    }
+
+    #[test]
+    fn try_is_or_has_name_reports_a_dropped_document() {
+        let (array, resolver) =
+            resolver_bearing_handle(ObjectValue::Array(vec![ObjectHandle::null()]));
+        drop(resolver);
+
+        assert_eq!(
+            array.try_is_or_has_name(b"Crypt").unwrap_err().to_string(),
+            "object 20 0 belongs to a dropped PDF"
+        );
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_matches_type_subtype_and_empty_constraints() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Type".to_vec(),
+                ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+            ),
+            (
+                b"Subtype".to_vec(),
+                ObjectHandle::name(b"Identity".to_vec()),
+            ),
+        ]);
+
+        assert!(dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .unwrap());
+        assert!(dict.try_is_dictionary_of_type(b"", b"").unwrap());
+        assert!(dict.try_is_dictionary_of_type(b"", b"Identity").unwrap());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_rejects_wrong_missing_or_non_name_entries() {
+        let wrong = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"Metadata".to_vec()),
+        )]);
+        let non_name = ObjectHandle::dictionary(vec![(b"Type".to_vec(), ObjectHandle::integer(1))]);
+        let missing = ObjectHandle::dictionary(Vec::new());
+
+        assert!(!wrong
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!non_name
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!missing
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(!ObjectHandle::integer(1)
+            .try_is_dictionary_of_type(b"", b"")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_resolves_indirect_holder_and_type_child() {
+        let (type_name, _type_resolver) =
+            resolver_bearing_handle(ObjectValue::Name(b"CryptFilterDecodeParms".to_vec()));
+        let (dict, _dict_resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+                (b"Type".to_vec(), type_name.clone()),
+            ])));
+
+        assert!(dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+            .unwrap());
+        assert!(dict.is_resolved());
+        assert!(type_name.is_resolved());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_stops_before_subtype_after_wrong_type() {
+        let (erroring_subtype, _resolver) = error_resolving_handle(ObjectRef::new(26, 0));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Metadata".to_vec())),
+            (b"Subtype".to_vec(), erroring_subtype),
+        ]);
+
+        assert!(!dict
+            .try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"Identity")
+            .unwrap());
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_propagates_child_resolution_errors() {
+        let (erroring_type, _resolver) = error_resolving_handle(ObjectRef::new(27, 0));
+        let dict = ObjectHandle::dictionary(vec![(b"Type".to_vec(), erroring_type)]);
+
+        assert_eq!(
+            dict.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")
+                .unwrap_err()
+                .to_string(),
+            "resolver failed"
+        );
+    }
+
+    #[test]
+    fn try_is_dictionary_of_type_reports_a_dropped_document() {
+        let (dict, resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+        drop(resolver);
+
+        assert_eq!(
+            dict.try_is_dictionary_of_type(b"", b"")
                 .unwrap_err()
                 .to_string(),
             "object 20 0 belongs to a dropped PDF"
