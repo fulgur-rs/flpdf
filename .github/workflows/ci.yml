@@ -131,6 +131,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="${install_dir}" \
             -DCMAKE_PREFIX_PATH="$(brew --prefix jpeg-turbo);$(brew --prefix openssl@3);$(brew --prefix zlib)" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_STATIC_LIBS=ON \
             -DREQUIRE_CRYPTO_OPENSSL=ON
           cmake --build "${build_dir}" --parallel 2
           cmake --install "${build_dir}"
