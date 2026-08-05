@@ -6546,6 +6546,12 @@ mod tests {
             ));
         });
 
+        // Premise (verified for this same fixture shape by the V=4 sibling
+        // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`,
+        // which asserts the marker DOES appear verbatim in unencrypted
+        // output under the same `stream_data = Uncompress`): these negative
+        // checks are supplementary, not load-bearing — the round-trip
+        // decrypt below is the actual correctness proof.
         assert!(
             !out.windows(content_marker.len())
                 .any(|w| w == content_marker),
@@ -6634,6 +6640,12 @@ mod tests {
             ));
         });
 
+        // See the R=6 sibling test's identical comment: the premise (marker
+        // appears verbatim under stream_data = Uncompress with no
+        // encryption) is verified by
+        // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
+        // on the same fixture shape; these negative checks are
+        // supplementary, the round-trip decrypt below is load-bearing.
         assert!(
             !out.windows(content_marker.len())
                 .any(|w| w == content_marker),
