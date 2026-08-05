@@ -73,10 +73,10 @@ use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
 };
 use crate::writer::{
-    catalog_has_extensions_adbe, effective_pdf_version_and_ext, effective_stream_policy,
-    inject_adbe_extension, is_lone_flate, reencode_stream_for_compress,
-    serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order, serialize::xref_stream,
-    strip_adbe_extension, CompressStreams, NewlineBeforeEndstream, WriteOptions, QPDF_STATIC_ID,
+    effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension, is_lone_flate,
+    reencode_stream_for_compress, serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order,
+    serialize::xref_stream, strip_adbe_extension, CompressStreams, NewlineBeforeEndstream,
+    WriteOptions, QPDF_STATIC_ID,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -2744,56 +2744,115 @@ fn reject_multiple_generations(plan: &LinearizationPlan) -> Result<()> {
     Ok(())
 }
 
-/// Whether the destination Catalog's `/Extensions` entry (if present) is
-/// stored as an indirect reference, rather than a direct dictionary or
-/// absent.
-///
-/// [`inject_adbe_extension`]/[`strip_adbe_extension`] only ever rewrite
-/// content already inside the Catalog object itself (an `/Extensions` dict
-/// they create or update is always a *direct* nested value — see
-/// `inject_adbe_extension`'s own doc), so calling them never changes how
-/// many indirect objects exist... UNLESS the source `/Extensions` was
-/// *already* indirect, in which case inlining it drops that indirect
-/// object's reachability from the Catalog.
-///
-/// `crate::writer::write_pdf_full_rewrite_inner` can absorb that safely: it
-/// mutates the Catalog and THEN builds its `CatalogFirstRenumber` from the
-/// SAME (now-mutated) handle (`writer.rs:3154-3238`), so the dropped object
-/// simply never gets a slot. [`write_linearized`] cannot: its
-/// `plan`/`renumber` are built by the CALLER from a SEPARATE `Pdf` handle
-/// BEFORE this function ever runs (see the doc above the
-/// `Optimization::prepare_for_linearized_write` call below), so an indirect
-/// source `/Extensions` object is already counted in that frozen `plan`
-/// and would still be walked and emitted — with its STALE, now-orphaned,
-/// pre-inline content — a genuine byte divergence from qpdf, not a
-/// cosmetic one. [`write_linearized`] checks this so that combination can
-/// be rejected loudly (`Unsupported`) instead of silently producing wrong
-/// bytes.
-fn catalog_extensions_is_indirect<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    // cov:ignore-start: defensive /Root guard, mirroring
-    // `catalog_has_extensions_adbe`. `write_linearized`'s only caller
-    // context reaches this point with a `plan` whose `root_ref` is
+/// Resolved state of the destination Catalog's `/Extensions /ADBE` entry —
+/// gathered in a single Catalog/`/Extensions` resolve pass, replacing two
+/// separate walks (a former `catalog_extensions_is_indirect`, which only
+/// checked whether `/Extensions` itself was indirect, plus a call to
+/// `crate::writer::catalog_has_extensions_adbe`) that independently
+/// re-resolved the same Catalog and `/Extensions` value.
+struct CatalogAdbeStatus {
+    /// Whether an `/ADBE` key exists under `/Extensions`, in ANY form —
+    /// Dictionary or Reference. Matches qpdf's key-existence-based removal
+    /// trigger (QPDFWriter.cc L1387: `keys.count("/ADBE") > 0`), not
+    /// `/ExtensionLevel` validity.
+    has_adbe: bool,
+    /// Whether [`inject_adbe_extension`]/[`strip_adbe_extension`] mutating
+    /// the Catalog in place would silently drop an indirect object's only
+    /// edge. Both helpers unconditionally overwrite (`inject`,
+    /// `extensions.insert("ADBE", ..)`) or remove (`strip`,
+    /// `extensions.remove("ADBE")`) the `/ADBE` entry, and replace
+    /// `/Extensions` itself with either a fresh direct dict or nothing —
+    /// NEVER resolving or preserving whatever indirect value was
+    /// previously there. True when EITHER:
+    /// - `/Extensions` itself is an indirect reference (inlining it always
+    ///   drops that reference, regardless of what `/ADBE` holds), OR
+    /// - `/Extensions` is a direct dictionary whose OWN `/ADBE` entry is an
+    ///   indirect reference — the nested case, `/Extensions << /ADBE 4 0 R
+    ///   >>` — which `extensions.insert`/`extensions.remove` drops just as
+    ///   silently even though `/Extensions` itself never moves.
+    ///
+    /// `crate::writer::write_pdf_full_rewrite_inner` can absorb either case
+    /// safely: it mutates the Catalog and THEN builds its
+    /// `CatalogFirstRenumber` from the SAME (now-mutated) handle
+    /// (`writer.rs:3154-3238`), so a dropped object simply never gets a
+    /// slot. [`write_linearized`] cannot: its `plan`/`renumber` are built
+    /// by the CALLER from a SEPARATE `Pdf` handle BEFORE this function ever
+    /// runs (see the doc above the `Optimization::prepare_for_linearized_write`
+    /// call below), so an object dropped either way is already counted in
+    /// that frozen `plan` and would still be walked and emitted — with its
+    /// STALE, now-orphaned, pre-mutation content — a genuine byte
+    /// divergence from qpdf, not a cosmetic one. [`write_linearized`]
+    /// checks this so either combination can be rejected loudly
+    /// (`Unsupported`) instead of silently producing wrong bytes.
+    orphans_indirect_object: bool,
+}
+
+/// Resolve [`CatalogAdbeStatus`] for `pdf`'s destination Catalog.
+fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<CatalogAdbeStatus> {
+    const NONE: CatalogAdbeStatus = CatalogAdbeStatus {
+        has_adbe: false,
+        orphans_indirect_object: false,
+    };
+
+    // cov:ignore-start: defensive /Root guard. `write_linearized`'s only
+    // caller context reaches this point with a `plan` whose `root_ref` is
     // `Some` (`plan.root_ref.ok_or_else(Unsupported)` below, on the SAME
     // source bytes as `pdf`), so `pdf.root_ref()` is `None` here only for a
     // caller that deliberately passes a `plan`/`pdf` pair built from
     // different sources — not exercised by any fixture in this test module.
     let Some(root_ref) = pdf.root_ref() else {
-        return Ok(false);
+        return Ok(NONE);
     };
     // cov:ignore-end
-    let catalog = pdf.resolve_borrowed(root_ref)?;
-    // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
-    // `catalog_has_extensions_adbe`. Every well-formed fixture that reaches
-    // this point (a linearizable document with a resolved `plan.root_ref`)
-    // has a dictionary Catalog.
-    let Some(catalog_dict) = catalog.as_dict() else {
-        return Ok(false);
+
+    let extensions_ref = {
+        let catalog = pdf.resolve_borrowed(root_ref)?;
+        // cov:ignore-start: defensive non-Dict Catalog guard. Every
+        // well-formed fixture that reaches this point (a linearizable
+        // document with a resolved `plan.root_ref`) has a dictionary
+        // Catalog.
+        let Some(catalog_dict) = catalog.as_dict() else {
+            return Ok(NONE);
+        };
+        // cov:ignore-end
+        match catalog_dict.get("Extensions") {
+            // Direct /Extensions: the nested case lives entirely inside
+            // this already-resolved dict, so both fields are decided right
+            // here without a second resolve.
+            Some(Object::Dictionary(d)) => {
+                let adbe = d.get("ADBE");
+                return Ok(CatalogAdbeStatus {
+                    has_adbe: adbe.is_some(),
+                    orphans_indirect_object: matches!(adbe, Some(Object::Reference(_))),
+                });
+            }
+            Some(Object::Reference(r)) => *r,
+            None => return Ok(NONE),
+            // cov:ignore-start: /Extensions present but neither Dict nor Ref
+            // is structurally malformed input; no test-fixture path
+            // produces it.
+            Some(_) => return Ok(NONE),
+            // cov:ignore-end
+        }
+    };
+
+    // /Extensions itself is indirect: mutating the Catalog in place — the
+    // ONLY way inject_adbe_extension/strip_adbe_extension operate — always
+    // replaces it with either a fresh direct dict or nothing, so touching
+    // it ALWAYS orphans this reference regardless of what /ADBE (if
+    // anything) holds inside it.
+    let extensions = pdf.resolve_borrowed(extensions_ref)?;
+    // cov:ignore-start: defensive non-Dict indirect-/Extensions guard,
+    // mirroring the Catalog guard above; no test-fixture path produces a
+    // malformed indirect /Extensions target.
+    let Some(extensions_dict) = extensions.as_dict() else {
+        return Ok(NONE);
     };
     // cov:ignore-end
-    Ok(matches!(
-        catalog_dict.get("Extensions"),
-        Some(Object::Reference(_))
-    ))
+    Ok(CatalogAdbeStatus {
+        has_adbe: extensions_dict.get("ADBE").is_some(),
+        orphans_indirect_object: true,
+    })
 }
 
 /// Write a complete linearized PDF to an in-memory buffer.
@@ -2854,13 +2913,16 @@ fn catalog_extensions_is_indirect<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bo
 /// Returns [`crate::Error::Unsupported`] when the effective Adobe developer
 /// extension level (`/Extensions /ADBE /ExtensionLevel` — contributed by
 /// [`WriteOptions::encrypt`]'s method, [`WriteOptions::min_extension_level`],
-/// or the source document itself) would change AND the source Catalog's
-/// `/Extensions` entry is stored as an indirect reference. This is a
-/// temporary flpdf scope limitation, not a qpdf restriction: inlining an
-/// indirect `/Extensions` here would orphan its already-numbered object slot
-/// (this function's object numbering is fixed by its `plan`/`renumber`
-/// parameters before it runs). A source `/Extensions` that is absent, or
-/// already a direct dictionary, is always handled correctly.
+/// or the source document itself) would change AND applying that change
+/// would orphan an indirect object: either the source Catalog's
+/// `/Extensions` entry itself is an indirect reference, or `/Extensions` is
+/// a direct dictionary whose own `/ADBE` entry is an indirect reference.
+/// This is a temporary flpdf scope limitation, not a qpdf restriction:
+/// dropping either reference here would orphan its already-numbered object
+/// slot (this function's object numbering is fixed by its `plan`/`renumber`
+/// parameters before it runs). A source `/Extensions` that is absent, or a
+/// direct dictionary whose own `/ADBE` entry (if any) is also direct, is
+/// always handled correctly.
 ///
 /// Returns [`crate::Error::Unsupported`] when the plan and renumber map are
 /// inconsistent or a layout value does not fit its slot — for example an
@@ -3311,19 +3373,22 @@ pub fn write_linearized<R: Read + Seek>(
     let source_ext = pdf.adobe_extension_level().unwrap_or(0);
     let (eff_version, eff_ext) =
         effective_pdf_version_and_ext(&source_ver, source_ext, options, true, emits_object_streams);
-    if eff_ext > 0 || catalog_has_extensions_adbe(pdf)? {
-        // See `catalog_extensions_is_indirect`'s doc for why an indirect
-        // source `/Extensions` is rejected here rather than inlined: unlike
-        // the flat writer, this function's `plan`/`renumber` were already
+    let adbe_status = resolve_catalog_adbe_status(pdf)?;
+    if eff_ext > 0 || adbe_status.has_adbe {
+        // See `CatalogAdbeStatus::orphans_indirect_object`'s doc for why an
+        // indirect `/Extensions` OR a direct `/Extensions` with an indirect
+        // `/ADBE` entry is rejected here rather than inlined: unlike the
+        // flat writer, this function's `plan`/`renumber` were already
         // frozen by the caller from a separate `Pdf` handle before this
-        // point, so inlining an indirect `/Extensions` here would orphan its
+        // point, so dropping either reference here would orphan its
         // already-counted slot while still emitting it with stale content.
-        if catalog_extensions_is_indirect(pdf)? {
+        if adbe_status.orphans_indirect_object {
             return Err(crate::Error::Unsupported(
-                "linearize: a source Catalog /Extensions stored as an \
-                 indirect reference is not yet supported when the effective \
-                 Adobe extension level changes; inline /Extensions in the \
-                 source or file a follow-up if you need this combination"
+                "linearize: a source Catalog /Extensions (or its /ADBE \
+                 entry) stored as an indirect reference is not yet \
+                 supported when the effective Adobe extension level \
+                 changes; inline /Extensions/ADBE in the source or file a \
+                 follow-up if you need this combination"
                     .to_string(),
             ));
         }
@@ -6866,7 +6931,8 @@ mod tests {
     /// Minimal one-page PDF whose Catalog carries `/Extensions` as an
     /// INDIRECT reference (object 4) to `<< /ADBE << /BaseVersion /1.6
     /// /ExtensionLevel 2 >> >>` — the scope-out case
-    /// [`catalog_extensions_is_indirect`] rejects.
+    /// [`resolve_catalog_adbe_status`] rejects (top-level `/Extensions`
+    /// indirection).
     fn tiny_pdf_with_indirect_extensions_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -6905,18 +6971,96 @@ mod tests {
 
     /// Task 11 review fix: a source Catalog `/Extensions` stored as an
     /// indirect reference must be rejected loudly, not silently inlined —
-    /// see [`catalog_extensions_is_indirect`]'s doc for why (this function's
-    /// `plan`/`renumber` are already frozen from a separate `Pdf` handle by
-    /// the time this runs, unlike `crate::writer::write_pdf_full_rewrite_inner`,
-    /// which mutates the Catalog before its OWN renumbering). V=5 R=6
-    /// encryption's ext-8 floor (`eff_ext > 0`) is what makes this fixture
-    /// actually need to touch `/Extensions` at all — a non-encrypting
-    /// linearize of the same fixture takes neither the inject nor the
-    /// reject branch, since its own ext(2)-vs-source(2) pairwise result
-    /// never changes.
+    /// see [`CatalogAdbeStatus::orphans_indirect_object`]'s doc for why
+    /// (this function's `plan`/`renumber` are already frozen from a
+    /// separate `Pdf` handle by the time this runs, unlike
+    /// `crate::writer::write_pdf_full_rewrite_inner`, which mutates the
+    /// Catalog before its OWN renumbering). V=5 R=6 encryption's ext-8
+    /// floor (`eff_ext > 0`) is what makes this fixture actually need to
+    /// touch `/Extensions` at all — a non-encrypting linearize of the same
+    /// fixture takes neither the inject nor the reject branch, since its
+    /// own ext(2)-vs-source(2) pairwise result never changes.
     #[test]
     fn linearize_encrypt_v5_rejects_indirect_source_extensions() {
         let src = tiny_pdf_with_indirect_extensions_bytes();
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let opts = WriteOptions {
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
+        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(ref m) if m.contains("indirect reference")),
+            "got {err:?}"
+        );
+    }
+
+    /// Minimal one-page PDF whose Catalog carries `/Extensions` as a
+    /// DIRECT dictionary, but whose `/ADBE` entry WITHIN that dictionary is
+    /// itself an INDIRECT reference (object 4) to `<< /BaseVersion /1.6
+    /// /ExtensionLevel 2 >>` — the nested-indirection scope-out case
+    /// [`resolve_catalog_adbe_status`] rejects. Unlike
+    /// [`tiny_pdf_with_indirect_extensions_bytes`], `/Extensions` itself
+    /// never moves; only its `/ADBE` entry does.
+    fn tiny_pdf_with_indirect_adbe_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Extensions << /ADBE 4 0 R >> >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"4 0 obj\n<< /BaseVersion /1.6 /ExtensionLevel 2 >>\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Code-quality review follow-up to the previous fix: the top-level
+    /// indirect-`/Extensions` guard alone missed a case one level deeper.
+    /// `inject_adbe_extension`/`strip_adbe_extension` both unconditionally
+    /// overwrite (`extensions.insert("ADBE", ..)`) or remove
+    /// (`extensions.remove("ADBE")`) the `/ADBE` entry without ever
+    /// resolving the OLD value first — so a DIRECT `/Extensions` dict whose
+    /// `/ADBE` entry is itself an indirect reference orphans that object
+    /// exactly the same way a top-level indirect `/Extensions` does, even
+    /// though `/Extensions` itself never moves. Before the fix this
+    /// combination silently succeeded, injecting the correct new
+    /// `/Extensions` while ALSO leaving a dangling orphaned body object
+    /// behind — a genuine byte/structural divergence from real qpdf, which
+    /// never enqueues that object in the first place (mutate-then-renumber
+    /// on one handle). Mirrors
+    /// [`linearize_encrypt_v5_rejects_indirect_source_extensions`], with
+    /// the nested fixture in place of the top-level one.
+    #[test]
+    fn linearize_encrypt_v5_rejects_nested_indirect_adbe() {
+        let src = tiny_pdf_with_indirect_adbe_bytes();
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);

@@ -720,9 +720,10 @@ pub(crate) fn inject_adbe_extension<R: Read + Seek>(
     // write_pdf_full_rewrite (AFTER its own root_ref check has already
     // returned Missing("/Root")) and from
     // crate::linearization::writer::write_linearized (whose own
-    // catalog_extensions_is_indirect pre-check treats a missing root as
-    // `false` rather than erroring, so this is that caller's actual root
-    // check) -- unreachable in every fixture in either test module.
+    // resolve_catalog_adbe_status pre-check treats a missing root as
+    // `has_adbe: false, orphans_indirect_object: false` rather than
+    // erroring, so this is that caller's actual root check) -- unreachable
+    // in every fixture in either test module.
     let Some(root_ref) = pdf.root_ref() else {
         return Err(crate::Error::Missing("/Root"));
     };
@@ -840,10 +841,10 @@ pub(crate) fn strip_adbe_extension<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<(
 ///
 /// - Propagates [`Pdf::resolve_borrowed`] errors when materialising the Catalog
 ///   or an indirect `/Extensions` value.
-pub(crate) fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
-    // cov:ignore-start: defensive /Root guard, mirroring
-    // inject_adbe_extension's identical comment (same two callers:
-    // write_pdf_full_rewrite and crate::linearization::writer::write_linearized).
+fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<bool> {
+    // cov:ignore-start: defensive /Root guard. catalog_has_extensions_adbe is
+    // only reached after write_pdf_full_rewrite passes its own root_ref check
+    // on the same Pdf.
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(false);
     };
@@ -851,8 +852,8 @@ pub(crate) fn catalog_has_extensions_adbe<R: Read + Seek>(pdf: &mut Pdf<R>) -> R
     let extensions_ref = {
         let catalog = pdf.resolve_borrowed(root_ref)?;
         // cov:ignore-start: defensive non-Dict Catalog guard, mirroring
-        // strip_adbe_extension. Every downstream write path (both callers)
-        // rejects a non-dict Catalog before reaching this helper.
+        // strip_adbe_extension. Every downstream write path rejects a non-dict
+        // Catalog before reaching this helper.
         let Some(catalog_dict) = catalog.as_dict() else {
             return Ok(false);
         };
