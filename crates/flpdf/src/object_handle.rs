@@ -2121,12 +2121,45 @@ fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -> Result<bo
 // Applies qpdf's `/Contents`-in-a-signature-dictionary hex-string special
 // case (`QPDFWriter.cc:1490-1504`) to a single dict-value child in place of
 // the ordinary `write_child`/`write_child_qdf` call, when `force_hex_string`
-// is set (every call site below passes `dict_is_sig_with_byte_range(entries)?
-// && key.as_slice() == b"Contents"`, matching the `key == "/Contents" &&
+// is set (every call site below passes `key.as_slice() == b"Contents" &&
+// dict_is_sig_with_byte_range(entries)?`, matching the `key == "/Contents" &&
 // object.isDictionaryOfType(...) && object.hasKey(...)` guard at the same
 // source lines). Returns `Ok(true)` when it wrote the value itself -- the
 // caller must not also call the ordinary child-writer in that case -- or
 // `Ok(false)` when the ordinary path should run instead.
+//
+// The key check must come *first* in that `&&`, not merely for a byte-for-byte
+// mirror of qpdf's own operand order: qpdf's guard sits inside the *same*
+// per-item loop that already visits every key for null-suppression
+// (`:1488-1491`), so `isDictionaryOfType`/`hasKey`'s own resolution of
+// `/Type`/`/ByteRange` only ever runs when that loop's *current* item is
+// literally `/Contents` -- a dict with no `/Contents` key never reaches it at
+// all. Every call site below evaluates `dict_is_sig_with_byte_range(entries)?`
+// on that same short-circuited, per-key-gated basis -- once, lazily, only if
+// and when the loop below actually reaches a surviving `/Contents` key --
+// rather than once, unconditionally, before the loop starts.
+//
+// Note what this ordering fix does *not* claim: unlike Finding 2's
+// `refiltered`-key exclusion (see `unparse_stream_dict_entries`'s own doc),
+// this is not a "never touched at all" guarantee for `/Type`/`/ByteRange`.
+// Both remain ordinary surviving dict keys -- unlike `/Filter`/`/DecodeParms`
+// under `refiltered`, they are never removed from `entries` -- so
+// `visible_dict_entries`'s own generic per-item null check
+// (`:1488`/`isNull()`, mirrored here) force-resolves them anyway whenever
+// they are present, independent of whether `/Contents` exists at all. What
+// hoisting this call above the loop (as this function previously did)
+// actually changes is *ordering*: it force-resolves `/Type` (and,
+// conditionally, `/ByteRange`) *before* the null-suppression pass runs at
+// all, so a dict whose surviving keys straddle `/Type` in the dict's own
+// (`BTreeMap`) alphabetical order surfaces `/Type`'s own resolution error
+// ahead of an earlier-sorting key's error that qpdf's single-pass loop would
+// have reached first. Gating the call on the loop's *current* key, as fixed
+// here, keeps that resolution order aligned with qpdf's own single pass
+// (code-quality review of commit 6cae41fd; see
+// `unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached`
+// below, which pins this ordering against a dict with no `/Contents` key at
+// all -- and documents, in its own comment, why a plain success-vs-error
+// assertion cannot observe this fix at all).
 //
 // Matches `unparseChild`'s own indirect-first short-circuit
 // (`QPDFWriter.cc:1149-1156`): an indirect child still writes as its own
@@ -2186,14 +2219,14 @@ fn try_write_sig_contents_hex_string(
 // crates/flpdf/src/object_handle.rs:2087).
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) -> Result<()> {
-    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     out.extend_from_slice(b"<<");
     for (key, value) in visible_dict_entries(entries)? {
         out.push(b' ');
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        let force_hex_string =
+            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child(value, out)?;
         }
@@ -2344,14 +2377,14 @@ fn unparse_dict_entries_qdf(
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     out.extend_from_slice(b"<<\n");
     for (key, value) in visible_dict_entries(entries)? {
         push_spaces(out, indent + 2);
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        let force_hex_string =
+            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
@@ -2559,7 +2592,6 @@ fn unparse_stream_dict_entries(
     refiltered: bool,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     let excluded_entries;
     let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
         excluded_entries = entries
@@ -2582,7 +2614,8 @@ fn unparse_stream_dict_entries(
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        let force_hex_string =
+            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child(value, out)?;
         }
@@ -2622,7 +2655,6 @@ fn unparse_stream_dict_entries_qdf(
     indent: usize,
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    let sig_with_byte_range = dict_is_sig_with_byte_range(entries)?;
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
@@ -2634,7 +2666,8 @@ fn unparse_stream_dict_entries_qdf(
         out.push(b'/');
         crate::object::write_name_escaped(out, key);
         out.push(b' ');
-        let force_hex_string = sig_with_byte_range && key.as_slice() == b"Contents";
+        let force_hex_string =
+            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
@@ -5014,6 +5047,60 @@ mod unparse_object_tests {
     }
 
     #[test]
+    fn unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached() {
+        // Code-quality review of commit 6cae41fd: `dict_is_sig_with_byte_range`
+        // was hoisted to run once, unconditionally, before the per-entry loop
+        // even started -- rather than lazily, only when the loop's own
+        // iteration actually reaches a surviving `/Contents` key -- for the
+        // Sig+ByteRange hex-string special case that same commit added. This
+        // reintroduced the identical unnecessary-force-resolution bug class
+        // Finding 2's `refiltered`-key exclusion fix (see
+        // `unparse_stream_dict_entries`'s own doc) already fixed for
+        // `/Filter`/`/DecodeParms`: `/Type` (and, conditionally,
+        // `/ByteRange`) now gets force-resolved even for a dict with no
+        // `/Contents` key at all to apply the special case to -- see
+        // `try_write_sig_contents_hex_string`'s own doc for why the operand
+        // order matters, not just the call site's existence.
+        //
+        // This dict has no `/Contents` key, so a correctly lazy
+        // implementation never even calls `dict_is_sig_with_byte_range` --
+        // `/Type`'s own resolution must be driven solely by
+        // `visible_dict_entries`'s ordinary per-key null-suppression pass,
+        // which runs in the dict's own (`BTreeMap`) alphabetical key order.
+        // `/AAA` sorts before `/Type`; both are dropped-document handles at
+        // distinct object refs, so the surfaced error text -- which embeds
+        // the failing ref, see
+        // `try_dereference_reports_a_dropped_document_without_reconnecting`
+        // -- pins exactly which one was actually touched first: with the
+        // eager bug, `/Type` (object 30) is resolved before the
+        // null-suppression loop even starts, so its error surfaces even
+        // though `/AAA` (object 99) sorts first in qpdf's own single-pass
+        // loop order; with the fix, `/AAA`'s error surfaces instead, and
+        // `/Type`'s handle is never dereferenced at all. (A plain
+        // success-vs-error assertion cannot discriminate this bug on its
+        // own: `visible_dict_entries` itself already force-resolves every
+        // surviving entry -- including `/Type`/`/ByteRange` whenever they
+        // are present as dict keys -- for the ordinary null-suppression
+        // check, matching qpdf's own `isNull()` call inside the identical
+        // per-item loop, `QPDFWriter.cc:1488-1491`; a dict with a genuinely
+        // erroring `/Type` errors either way. The bug is about *which*
+        // resolution happens first among several, not whether the overall
+        // call succeeds.)
+        let (aaa, aaa_resolver) = error_resolving_handle(ObjectRef::new(99, 0));
+        drop(aaa_resolver);
+        let (sig_type, type_resolver) = error_resolving_handle(ObjectRef::new(30, 0));
+        drop(type_resolver);
+        let dict = ObjectHandle::dictionary(vec![
+            (b"AAA".to_vec(), aaa),
+            (b"Type".to_vec(), sig_type),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+        ]);
+        let mut out = Vec::new();
+        let error = dict.unparse_object(&mut out).unwrap_err();
+        assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
+    }
+
+    #[test]
     fn unparse_object_qdf_writes_sig_contents_as_a_hex_string() {
         let dict = ObjectHandle::dictionary(vec![
             (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
@@ -5026,6 +5113,28 @@ mod unparse_object_tests {
             out,
             b"<<\n  /ByteRange [\n  ]\n  /Contents <6869>\n  /Type /Sig\n>>"
         );
+    }
+
+    #[test]
+    fn unparse_object_qdf_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached() {
+        // QDF sibling of
+        // `unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached`
+        // above -- `unparse_dict_entries_qdf` needed the identical fix at
+        // its own call site. See that test's own doc for the full
+        // eager-vs-lazy rationale and why a plain success-vs-error
+        // assertion cannot discriminate this bug.
+        let (aaa, aaa_resolver) = error_resolving_handle(ObjectRef::new(99, 0));
+        drop(aaa_resolver);
+        let (sig_type, type_resolver) = error_resolving_handle(ObjectRef::new(30, 0));
+        drop(type_resolver);
+        let dict = ObjectHandle::dictionary(vec![
+            (b"AAA".to_vec(), aaa),
+            (b"Type".to_vec(), sig_type),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+        ]);
+        let mut out = Vec::new();
+        let error = dict.unparse_object_qdf(&mut out, 0).unwrap_err();
+        assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
     #[test]
@@ -5047,6 +5156,31 @@ mod unparse_object_tests {
             out,
             b"<< /ByteRange [ ] /Contents <6869> /Type /Sig /Length 2 >>"
         );
+    }
+
+    #[test]
+    fn unparse_stream_body_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached() {
+        // Stream sibling of
+        // `unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached`
+        // above -- `unparse_stream_dict_entries` needed the identical fix at
+        // its own call site. See that test's own doc for the full
+        // eager-vs-lazy rationale and why a plain success-vs-error
+        // assertion cannot discriminate this bug. `/Length` is a harmless
+        // direct value here -- this test is not about the `refiltered`
+        // dimension Finding 2 already fixed, so `refiltered == false`.
+        let (aaa, aaa_resolver) = error_resolving_handle(ObjectRef::new(99, 0));
+        drop(aaa_resolver);
+        let (sig_type, type_resolver) = error_resolving_handle(ObjectRef::new(30, 0));
+        drop(type_resolver);
+        let dict = ObjectHandle::dictionary(vec![
+            (b"AAA".to_vec(), aaa),
+            (b"Type".to_vec(), sig_type),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Length".to_vec(), ObjectHandle::integer(0)),
+        ]);
+        let mut out = Vec::new();
+        let error = dict.unparse_stream_body(&mut out, false).unwrap_err();
+        assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
     #[test]
@@ -5679,6 +5813,30 @@ mod unparse_object_tests {
             out,
             b"<<\n  /ByteRange [\n  ]\n  /Contents <6869>\n  /Type /Sig\n  /Length 2\n>>"
         );
+    }
+
+    #[test]
+    fn unparse_stream_body_qdf_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached(
+    ) {
+        // QDF-stream sibling of
+        // `unparse_object_defers_type_and_byte_range_resolution_until_a_contents_key_is_reached`
+        // above -- `unparse_stream_dict_entries_qdf` needed the identical
+        // fix at its own call site. See that test's own doc for the full
+        // eager-vs-lazy rationale and why a plain success-vs-error
+        // assertion cannot discriminate this bug.
+        let (aaa, aaa_resolver) = error_resolving_handle(ObjectRef::new(99, 0));
+        drop(aaa_resolver);
+        let (sig_type, type_resolver) = error_resolving_handle(ObjectRef::new(30, 0));
+        drop(type_resolver);
+        let dict = ObjectHandle::dictionary(vec![
+            (b"AAA".to_vec(), aaa),
+            (b"Type".to_vec(), sig_type),
+            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"Length".to_vec(), ObjectHandle::integer(0)),
+        ]);
+        let mut out = Vec::new();
+        let error = dict.unparse_stream_body_qdf(&mut out, 0).unwrap_err();
+        assert_eq!(error.to_string(), "object 99 0 belongs to a dropped PDF");
     }
 
     #[test]
