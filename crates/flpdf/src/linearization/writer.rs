@@ -6546,6 +6546,17 @@ mod tests {
             ));
         });
 
+        assert!(
+            !out.windows(content_marker.len())
+                .any(|w| w == content_marker),
+            "content stream plaintext leaked into V=5 R=6 encrypted linearized output"
+        );
+        assert!(
+            !out.windows(producer_marker.len())
+                .any(|w| w == producer_marker),
+            "/Info /Producer plaintext leaked into V=5 R=6 encrypted linearized output"
+        );
+
         let encrypt_object_bytes = find_object_bytes(&out, expected_encrypt_num);
         for needle in [
             b"/V 5".as_slice(),
@@ -6622,6 +6633,17 @@ mod tests {
                 b"owner".to_vec(),
             ));
         });
+
+        assert!(
+            !out.windows(content_marker.len())
+                .any(|w| w == content_marker),
+            "content stream plaintext leaked into V=5 R=5 encrypted linearized output"
+        );
+        assert!(
+            !out.windows(producer_marker.len())
+                .any(|w| w == producer_marker),
+            "/Info /Producer plaintext leaked into V=5 R=5 encrypted linearized output"
+        );
 
         let encrypt_object_bytes = find_object_bytes(&out, expected_encrypt_num);
         for needle in [
@@ -7164,6 +7186,11 @@ mod tests {
             .next()
             .and_then(|s| s.parse().ok())
             .expect("xref subsection header's second field must be a decimal entry count");
+        assert!(
+            count > 0,
+            "xref subsection must cover at least one entry, got header {header:?} \
+             (a zero count would make every ASCII assertion below vacuous)"
+        );
 
         let entries_start = header_start + header_len + 1;
         for i in 0..count as usize {
@@ -7210,13 +7237,23 @@ mod tests {
     /// `encrypt_ctx` into the hint-stream call even though the function
     /// itself encrypts correctly when given one.
     ///
-    /// This is a same-fixture A/B instead: the SAME source produces a hint
-    /// stream at the analogous structural position (object number shifted by
-    /// exactly one slot — see [`reserve_encrypt_dict_slot`](RenumberMap::reserve_encrypt_dict_slot)'s
-    /// own doc and
-    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`])
-    /// whether or not `--encrypt` is requested; their raw payload bytes must
-    /// differ.
+    /// The discriminator is deliberately NOT "the raw payload bytes differ
+    /// from an unencrypted control": with `--encrypt`,
+    /// `reserve_encrypt_dict_slot` inserts one extra object and every
+    /// encrypted body object grows (a 16-byte IV + CBC padding), so the
+    /// PLAINTEXT hint table itself already differs between the two runs
+    /// regardless of whether the hint stream is encrypted — a plain
+    /// raw-byte inequality would still pass even if the `encrypt_ctx`
+    /// wiring into the hint-stream call site were silently dropped
+    /// (verified empirically: temporarily changing that one call site to
+    /// pass `None` left a raw-inequality version of this test green).
+    /// Instead this exploits that with default options the hint stream is
+    /// `/Filter /FlateDecode` (`structural_streams_filtered`,
+    /// `CompressStreams::Yes`): a genuinely unencrypted FlateDecode payload
+    /// MUST decode as zlib, while ciphertext (AES-CBC over already-
+    /// compressed bytes) essentially never does. That flips sign exactly on
+    /// "was the payload actually run through the cipher", independent of
+    /// any layout/offset drift between the two runs.
     ///
     /// Companion check, same output: the classic Part-1 xref subsection
     /// stays in qpdf's plaintext ASCII `%010d %05d %s \n` form even though
@@ -7226,7 +7263,7 @@ mod tests {
     /// be able to locate every object before it can even derive the file
     /// key.
     #[test]
-    fn linearize_with_encrypt_hint_stream_differs_from_control_xref_stays_ascii_plaintext() {
+    fn linearize_with_encrypt_hint_stream_is_ciphertext_xref_stays_ascii_plaintext() {
         let src = tiny_pdf_bytes();
 
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
@@ -7247,12 +7284,51 @@ mod tests {
             ));
         });
 
+        // Sanity: both located objects really are the hint stream (carry
+        // the `/S ` shared-section-offset key `hint_stream_dict_prefix`
+        // always emits) — guards against the `+1` shift assumption silently
+        // landing on some other object if the layout ever changes.
+        for (label, object_bytes) in [
+            (
+                "unencrypted control",
+                find_object_bytes(&unencrypted, unencrypted_hint_num),
+            ),
+            (
+                "encrypted output",
+                find_object_bytes(&encrypted, encrypted_hint_num),
+            ),
+        ] {
+            assert!(
+                object_bytes.windows(3).any(|w| w == b"/S "),
+                "{label}: object at the computed hint-stream number must carry \
+                 the hint stream's /S key"
+            );
+        }
+
         let unencrypted_payload = hint_stream_payload_bytes(&unencrypted, unencrypted_hint_num);
         let encrypted_payload = hint_stream_payload_bytes(&encrypted, encrypted_hint_num);
+
+        // Coarse signal only — see the doc comment above for why this alone
+        // does not prove the payload was run through the cipher.
         assert_ne!(
             unencrypted_payload, encrypted_payload,
             "hint stream payload must differ between the unencrypted control \
              and the encrypted output at their respective structural positions"
+        );
+
+        // The real, falsifiable discriminator: a bare /FlateDecode dict
+        // decodes the unencrypted control's payload (real zlib) but must
+        // NOT decode the encrypted output's payload (AES-CBC ciphertext).
+        let mut flate_dict = Dictionary::new();
+        flate_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        crate::filters::decode_stream_data(&flate_dict, unencrypted_payload).expect(
+            "premise: the unencrypted control's hint stream payload must be valid \
+             zlib (structural_streams_filtered is true under default options)",
+        );
+        assert!(
+            crate::filters::decode_stream_data(&flate_dict, encrypted_payload).is_err(),
+            "encrypted output's hint stream payload must NOT decode as zlib — \
+             if it does, the hint stream was never actually run through the cipher"
         );
 
         assert_classic_xref_section_entries_are_ascii_plaintext(&encrypted);
