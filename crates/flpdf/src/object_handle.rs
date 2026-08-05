@@ -1,7 +1,13 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
+//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue`
+//! identity and payload ownership; `QPDFObjectHandle.cc:456-466,759-785,1027-1039`
+//! name/dictionary/array inspection (`try_is_name_and_equals`,
+//! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
+//! `try_is_or_has_name`); plus `QPDFWriter.cc` `unparseObject`/`writeTrailer`
+//! writer-emission primitives (`unparse_object`/`unparse_object_qdf`/
+//! `unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
@@ -11,6 +17,13 @@
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
 // internal structure only and does not affect output bytes (see
 // docs/qpdf-correspondence.md).
+//
+// Deviation: qpdf's canonical name strings include a leading slash and its
+// array access borrows QPDF_Array, while ObjectValue stores decoded name bytes
+// without the slash and Vec<ObjectHandle>. Inspection compares the same decoded
+// bytes and clones only one Rc-backed child per valid array access. It emits no
+// bytes or diagnostics; invalid array access (where qpdf warns) is outside the
+// try_array_item contract. See docs/qpdf-correspondence.md.
 
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
