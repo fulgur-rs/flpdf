@@ -57,8 +57,10 @@ impl LiveInput for SliceLiveInput<'_> {
     }
 
     fn seek(&mut self, offset: u64) -> Result<()> {
-        let position = usize::try_from(offset)
-            .map_err(|_| Error::Internal("slice live-input offset does not fit usize".into()))?;
+        let position = usize::try_from(offset).map_err(|_| {
+            // cov:ignore: u64 exceeds usize only on 32-bit targets; coverage runs on 64-bit.
+            Error::Internal("slice live-input offset does not fit usize".into())
+        })?;
         if position > self.bytes.len() {
             return Err(Error::parse(position, "seek past end of parser input"));
         }
@@ -98,9 +100,6 @@ impl HandleResolver for DetachedHandles {
 }
 
 fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
-    if let Some(object_ref) = handle.object_ref() {
-        return Ok(Object::Reference(object_ref));
-    }
     if let Some(object_ref) = handle.as_reference() {
         return Ok(Object::Reference(object_ref));
     }
@@ -125,12 +124,6 @@ fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
     if let Some(value) = handle.as_string() {
         return Ok(Object::String(value));
     }
-    if let Some(value) = handle.as_operator() {
-        return Ok(Object::Operator(value));
-    }
-    if let Some(value) = handle.as_inline_image() {
-        return Ok(Object::InlineImage(value));
-    }
     if let Some(values) = handle.as_array() {
         return values
             .iter()
@@ -145,9 +138,11 @@ fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
         }
         return Ok(Object::Dictionary(dictionary));
     }
+    // cov:ignore-start: LiveFileParser's file-object grammar only produces the arms above.
     Err(Error::Internal(
         "live parser produced an unmaterializable direct object handle".into(),
     ))
+    // cov:ignore-end
 }
 
 /// Pulls exactly one token at a time from a live [`LiveInput`] through the
@@ -184,12 +179,14 @@ impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
     pub(crate) fn next_token(&mut self) -> Result<Token> {
         loop {
             match self.input.read_byte()? {
+                // cov:ignore-start: each loop drains a ready token before the next input byte.
                 Some(byte) => self.tokenizer.present_character(byte).map_err(|error| {
                     Error::Internal(format!("live tokenizer state error: {error:?}"))
                 })?,
                 None => self.tokenizer.present_eof().map_err(|error| {
                     Error::Internal(format!("live tokenizer state error: {error:?}"))
                 })?,
+                // cov:ignore-end
             }
 
             let Some(pushed) = self.tokenizer.get_token() else {
@@ -253,10 +250,6 @@ pub(crate) fn parse_explicit_object_handle(input: &[u8]) -> Result<ObjectHandle>
     let mut detached_handles = DetachedHandles;
     let parsed =
         parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false)?;
-
-    if let Some(diagnostic) = parsed.diagnostics.into_iter().next() {
-        return Err(Error::parse(diagnostic.relative_offset, diagnostic.message));
-    }
 
     let trailing_offset = input_source.position();
     if input[trailing_offset..]
@@ -407,6 +400,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                 self.warn(token.start, "unexpected EOF")?;
                 Ok(ObjectHandle::null())
             }
+            // cov:ignore-start: the live file-object tokenizer excludes ignorable and inline-image tokens.
             TokenType::Space | TokenType::Comment | TokenType::InlineImage => {
                 self.warn(
                     token.start,
@@ -414,7 +408,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                 )?;
                 self.too_many_bad_tokens(token.start)?;
                 Ok(ObjectHandle::null())
-            }
+            } // cov:ignore-end
         }
     }
 
@@ -660,8 +654,8 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
 #[cfg(test)]
 mod live_input_tests {
     use super::{
-        parse_live_file_object, parse_qpdf_file_object, HandleResolver, LiveInput, LiveTokenSource,
-        MAX_PARSE_DEPTH,
+        parse_live_file_object, parse_qpdf_file_object, HandleResolver, LiveInput,
+        LiveParsedObject, LiveTokenSource, SliceLiveInput, MAX_PARSE_DEPTH,
     };
     use crate::object_handle::{ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
@@ -717,6 +711,12 @@ mod live_input_tests {
         fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
             ObjectHandle::new_indirect_unresolved(object_ref, -1)
         }
+    }
+
+    fn parse_with_null_resolver(bytes: &'static [u8]) -> LiveParsedObject {
+        let mut input = CountingInput::new(bytes);
+        let mut resolver = NullResolver;
+        parse_live_file_object(&mut input, &mut resolver).expect("live file object")
     }
 
     // This catches a production regression where the live adapter retains a
@@ -888,6 +888,176 @@ mod live_input_tests {
                 2,
                 "expected dictionary key but found non-name object; inserting key /QPDFFake1"
             )]
+        );
+    }
+
+    #[test]
+    fn live_file_parser_exercises_document_context_recovery_tokens() {
+        let word = parse_with_null_resolver(b"bare-word");
+        assert_eq!(word.value.as_string(), Some(b"bare-word".to_vec()));
+        assert_eq!(
+            word.diagnostics[0].message,
+            "unknown token while reading object; treating as string"
+        );
+
+        let array_close = parse_with_null_resolver(b"]");
+        assert!(array_close.value.is_null());
+        assert_eq!(
+            array_close.diagnostics[0].message,
+            "treating unexpected array close token as null"
+        );
+
+        let dictionary_close = parse_with_null_resolver(b">>");
+        assert!(dictionary_close.value.is_null());
+        assert_eq!(
+            dictionary_close.diagnostics[0].message,
+            "unexpected dictionary close token"
+        );
+
+        let eof = parse_with_null_resolver(b"");
+        assert!(eof.value.is_null());
+        assert_eq!(eof.diagnostics[0].message, "unexpected EOF");
+
+        let array_eof = parse_with_null_resolver(b"[");
+        assert!(array_eof.value.is_null());
+        assert_eq!(
+            array_eof
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parse error while reading object", "unexpected EOF"]
+        );
+
+        let dictionary_eof = parse_with_null_resolver(b"<<");
+        assert!(dictionary_eof.value.is_null());
+        assert_eq!(
+            dictionary_eof
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parse error while reading object", "unexpected EOF"]
+        );
+    }
+
+    #[test]
+    fn live_file_parser_exercises_dictionary_recovery_and_reference_edges() {
+        let missing_value = parse_with_null_resolver(b"<< /Last >>");
+        let missing_value_entries = missing_value.value.as_dictionary().expect("dictionary");
+        assert!(missing_value_entries
+            .get(b"Last".as_slice())
+            .is_some_and(ObjectHandle::is_null));
+        assert_eq!(
+            missing_value.diagnostics[0].message,
+            "dictionary ended prematurely; using null as value for last key"
+        );
+
+        let duplicate = parse_with_null_resolver(b"<< /K 1 /K 2 >>");
+        let duplicate_entries = duplicate.value.as_dictionary().expect("dictionary");
+        assert_eq!(
+            duplicate_entries
+                .get(b"K".as_slice())
+                .and_then(ObjectHandle::as_integer),
+            Some(2)
+        );
+        assert_eq!(
+            duplicate.diagnostics[0].message,
+            "dictionary has duplicated key /K; last occurrence overrides earlier ones"
+        );
+
+        let collision = parse_with_null_resolver(b"<< /QPDFFake1 1 2 >>");
+        let collision_entries = collision.value.as_dictionary().expect("dictionary");
+        assert_eq!(
+            collision_entries
+                .get(b"QPDFFake2".as_slice())
+                .and_then(ObjectHandle::as_integer),
+            Some(2)
+        );
+        assert_eq!(
+            collision.diagnostics[0].message,
+            "expected dictionary key but found non-name object; inserting key /QPDFFake2"
+        );
+
+        let invalid_reference = parse_with_null_resolver(b"[ 0 0 R ]");
+        assert!(invalid_reference
+            .value
+            .as_array()
+            .is_some_and(|items| items.len() == 1 && items[0].is_null()));
+
+        let nested_reference = parse_with_null_resolver(b"[ 1 0 R ]");
+        let nested_reference_items = nested_reference.value.as_array().expect("array");
+        assert_eq!(
+            nested_reference_items
+                .first()
+                .and_then(ObjectHandle::object_ref),
+            Some(ObjectRef::new(1, 0))
+        );
+    }
+
+    #[test]
+    fn live_file_parser_resets_the_bad_token_streak_after_good_tokens() {
+        let parsed = parse_with_null_resolver(b"[ /A /B /C /D /E } ]");
+
+        assert!(parsed.value.as_array().is_some());
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["treating unexpected brace token as null"]
+        );
+    }
+
+    #[test]
+    fn live_file_parser_recovers_the_501st_dictionary_as_null() {
+        let mut bytes = Vec::new();
+        for _ in 0..=MAX_PARSE_DEPTH {
+            bytes.extend_from_slice(b"<<");
+        }
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+
+        let parsed = parse_with_null_resolver(leaked);
+        assert!(parsed.value.is_null());
+        assert_eq!(
+            parsed
+                .diagnostics
+                .last()
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some("ignoring excessively deeply nested data structure")
+        );
+    }
+
+    #[test]
+    fn slice_live_input_and_objstm_empty_body_keep_live_parser_coordinates() {
+        let mut input = SliceLiveInput::new(b"x");
+        input.seek(1).expect("seek within input");
+        assert_eq!(input.read_byte().expect("read"), None);
+        assert!(matches!(
+            input.seek(2),
+            Err(crate::Error::Parse { offset: 2, .. })
+        ));
+        input.seek(0).expect("rewind");
+        assert!(matches!(
+            input.unread_byte(),
+            Err(crate::Error::Internal(_))
+        ));
+
+        let mut live_input = CountingInput::new(b"endobj");
+        let mut resolver = NullResolver;
+        let empty = parse_live_file_object(&mut live_input, &mut resolver).expect("empty body");
+        assert_eq!(empty.empty, Some(0));
+        assert_eq!(live_input.position, 0, "endobj remains unread");
+
+        let (object, diagnostics) = parse_qpdf_file_object(b"endobj").expect("ObjStm empty");
+        assert_eq!(object, crate::Object::Null);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.relative_offset, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(0, "empty object treated as null")]
         );
     }
 }

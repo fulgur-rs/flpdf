@@ -3304,15 +3304,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn live_object_header_and_fast_unread_fail_at_qpdfs_boundary() {
+        let bad_keyword = resolver_over(b"1 0 nope".to_vec());
+        assert!(matches!(
+            bad_keyword.read_object_at_offset(0, ObjectRef::new(1, 0)),
+            Err(Error::Parse { offset: 4, ref message }) if message == "expected obj"
+        ));
+
+        let bad_number = resolver_over(b"/N 0 obj".to_vec());
+        assert!(matches!(
+            bad_number.read_object_at_offset(0, ObjectRef::new(1, 0)),
+            Err(Error::Parse { offset: 0, ref message }) if message == "expected integer"
+        ));
+
+        let resolver = resolver_over(b"x".to_vec());
+        let mut input = resolver.live_input();
+        crate::parser::LiveInput::seek(&mut input, 1).expect("seek after the byte");
+        crate::parser::LiveInput::unread_byte(&mut input).expect("unread from an empty buffer");
+        assert_eq!(
+            crate::parser::LiveInput::tell(&mut input).expect("position"),
+            0
+        );
+        assert!(matches!(
+            crate::parser::LiveInput::unread_byte(&mut input),
+            Err(Error::Parse { offset: 0, ref message }) if message == "cannot unread before the start of input"
+        ));
+    }
+
     /// Differential check against the pinned qpdf binary. `--json-object=2`
     /// forces qpdf to parse the damaged object rather than relying on generic
     /// document traversal to reach it.
     #[test]
     fn live_dictionary_recovery_matches_pinned_qpdf_warning_text() {
+        // cov:ignore-start: CI has pinned qpdf; this fallback exists only for developer hosts without it.
         if Command::new("qpdf").arg("--version").output().is_err() {
             eprintln!("qpdf not available; skipping live parser differential");
             return;
         }
+        // cov:ignore-end
 
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
