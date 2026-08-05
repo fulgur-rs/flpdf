@@ -1959,3 +1959,237 @@ fn encrypt_preserves_xref_stream_form_when_objstm_disabled() {
         String::from_utf8_lossy(&check_result.stderr)
     );
 }
+
+// ── --linearize + --encrypt / --copy-encryption-from (flpdf-txag) ──────────
+//
+// qpdf itself supports `--linearize --encrypt ... --` (verified empirically:
+// `qpdf --linearize --encrypt "" "" 128 --use-aes=y -- IN OUT` produces a
+// valid, `qpdf --check`-clean linearized+encrypted file), so the CLI must not
+// reject the combination at the clap layer. `--copy-encryption-from
+// --linearize` is different: the library (`write_linearized`) currently
+// returns `Error::Unsupported` for that specific pairing (a still-open
+// implementation gap, tracked separately), so the CLI test below pins that
+// the clean library diagnostic surfaces instead of a clap parse error.
+
+/// `rewrite --linearize --encrypt ... --` succeeds end-to-end and produces a
+/// file `qpdf --check` accepts as both valid and linearized.
+#[test]
+fn rewrite_linearize_encrypt_produces_valid_linearized_encrypted_pdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("lin-enc.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--encrypt",
+            "",
+            "",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "output must carry /Encrypt"
+    );
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --check failed on linearized+encrypted output: stdout={} stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("File is linearized"),
+        "qpdf --check must report the output as linearized: {stdout}"
+    );
+    // `check.status.success()` above is qpdf's own pass/fail signal (a
+    // successful --check exits 0 even though its trailing summary line always
+    // contains the substring "errors", e.g. "No syntax or stream encoding
+    // errors found"), so no separate stdout text scan for "error" is needed
+    // or would be reliable.
+}
+
+/// The top-level `--linearize` alias (not the `rewrite` subcommand) must also
+/// thread `--encrypt` through to `write_linearized`. This exercises the
+/// top-level dispatch branch separately, since it builds its own
+/// `WriteOptions` rather than sharing the `rewrite` subcommand's.
+#[test]
+fn top_level_linearize_encrypt_produces_valid_linearized_encrypted_pdf() {
+    if !ensure_qpdf_or_skip() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("lin-enc-top.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--linearize",
+            "--encrypt",
+            "user-pw",
+            "owner-pw",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .success();
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "output must carry /Encrypt"
+    );
+
+    let check = ShellCommand::new("qpdf")
+        .arg("--password=user-pw")
+        .arg("--check")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --check failed on top-level linearized+encrypted output: stdout={} stderr={}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        stdout.contains("File is linearized"),
+        "qpdf --check must report the output as linearized: {stdout}"
+    );
+    assert!(
+        stdout.contains("Supplied password is user password"),
+        "qpdf must authenticate the user password on the top-level path: {stdout}"
+    );
+}
+
+/// `--linearize --copy-encryption-from` is no longer rejected by clap, but the
+/// linearized writer itself still returns a clean `Unsupported` diagnostic
+/// for this specific pairing (donor `/ID[0]` direction vs. the linearized
+/// writer's early `/ID` computation is a separate, larger piece of work).
+/// Pin that the library error surfaces cleanly (exit 2, actionable message)
+/// rather than reverting to the pre-existing clap "cannot be used with"
+/// rejection. Covers both the `rewrite` subcommand and the top-level
+/// `--linearize` alias, since `apply_encryption_options` (which calls
+/// `build_copy_encryption_source` and can itself `exit(2)` on a donor-open
+/// failure) is invoked separately on each of the two dispatch paths.
+#[test]
+fn linearize_copy_encryption_from_is_rejected_with_actionable_library_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let donor = make_donor_pdf(&tmp, "donor-user", "donor-owner");
+
+    // ONE_PAGE_FIXTURE (not UNENCRYPTED_FIXTURE / minimal.pdf, which has no
+    // pages): linearization requires at least one page to plan, and this test
+    // wants to reach the copy-encryption `Unsupported` guard rather than an
+    // earlier, unrelated "no pages found" error.
+    let output = tmp.path().join("lin-copy-enc.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "donor-user",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "linearize+copy-encryption-from is not yet supported",
+        ));
+    assert!(
+        !output.exists(),
+        "rejected linearize+copy-encryption-from must not leave a partial output behind"
+    );
+
+    let output_top = tmp.path().join("lin-copy-enc-top.pdf");
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "--linearize",
+            "--copy-encryption-from",
+            donor.to_str().unwrap(),
+            "--encryption-file-password",
+            "donor-user",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output_top)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "linearize+copy-encryption-from is not yet supported",
+        ));
+    assert!(
+        !output_top.exists(),
+        "rejected top-level linearize+copy-encryption-from must not leave a partial output behind"
+    );
+}
+
+/// `rewrite --linearize --object-streams=generate --encrypt ...` is newly
+/// reachable now that `--linearize` no longer clap-conflicts with
+/// `--encrypt`: previously clap blocked the combination outright, so the
+/// library's Task-3 ObjStm+encrypt+linearize `Unsupported` guard
+/// (`crates/flpdf/src/linearization/writer.rs`) was reachable only from
+/// library-level tests, never through the CLI. Pin that it still surfaces
+/// as a clean diagnostic here too (exit 2, actionable message, no partial
+/// output) rather than a panic or a silently-wrong file. (Top-level
+/// `--linearize` does not accept `--object-streams` at all, so this
+/// combination only exists on the `rewrite` subcommand.)
+#[test]
+fn rewrite_linearize_encrypt_object_streams_generate_is_rejected_with_actionable_library_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = tmp.path().join("lin-objstm-enc.pdf");
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            "rewrite",
+            "--linearize",
+            "--object-streams=generate",
+            "--encrypt",
+            "",
+            "",
+            "128",
+            "--use-aes=y",
+            "--",
+        ])
+        .arg(fixture(ONE_PAGE_FIXTURE))
+        .arg(&output)
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "linearize+encrypt does not yet support object streams",
+        ));
+
+    assert!(
+        !output.exists(),
+        "rejected linearize+encrypt+object-streams=generate must not leave a partial output behind"
+    );
+}
