@@ -6572,7 +6572,11 @@ mod tests {
                 },
             )
             .unwrap_or_else(|e| {
+                // cov:ignore-start: only reached if the reopen fails — the
+                // property under test is that it always succeeds for a
+                // correctly encrypted V=5 R=6 output.
                 panic!("re-open of V=5 R=6 linearized output with password {pw:?} failed: {e}")
+                // cov:ignore-end
             });
             let (producer, content) = resolve_producer_and_content(&mut reopened);
             assert_eq!(
@@ -6654,7 +6658,11 @@ mod tests {
                 },
             )
             .unwrap_or_else(|e| {
+                // cov:ignore-start: only reached if the reopen fails — the
+                // property under test is that it always succeeds for a
+                // correctly encrypted V=5 R=5 output.
                 panic!("re-open of V=5 R=5 linearized output with password {pw:?} failed: {e}")
+                // cov:ignore-end
             });
             let (producer, content) = resolve_producer_and_content(&mut reopened);
             assert_eq!(
