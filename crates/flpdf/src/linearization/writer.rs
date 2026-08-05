@@ -600,9 +600,17 @@ fn append_object(
 /// then `encrypt_stream_payload_for_writer` on the stream's payload once
 /// `reencode_stream_for_compress` has produced the final on-disk bytes (so
 /// `/Length` is set from the ciphertext, not the plaintext, byte count).
+///
+/// `original_ref` is the object's PRE-renumber ref (matching `crate::writer`'s
+/// `old_ref`), used only to check it against `ctx.metadata_ref` (also an
+/// original ref — see [`crate::writer::resolve_metadata_stream_ref`]) for the
+/// `--cleartext-metadata` exemption below. `new_ref` must not be substituted
+/// here: `metadata_ref` is populated before renumbering, so comparing against
+/// the renumbered ref would never match.
 fn append_body_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
+    original_ref: ObjectRef,
     object: Object,
     options: &WriteOptions,
     recovered_stream_eol: Option<&[u8]>,
@@ -643,8 +651,23 @@ fn append_body_object(
     // Encrypt the stream payload AFTER re-encoding, so the encryption operates
     // on the on-disk bytes; updates /Length to the encrypted byte count (AES
     // adds a 16-byte IV prefix plus PKCS#7 padding).
+    //
+    // `--cleartext-metadata` exemption (mirrors crate::writer's
+    // write_pdf_full_rewrite loop, writer.rs's Object::Stream branch): when
+    // `ctx.metadata_ref` is this object's original ref, leave the payload in
+    // the clear and prepend /Crypt /Identity so a reader knows not to decrypt
+    // it, instead of running it through the cipher. /Length stays the
+    // un-encrypted byte count. Every OTHER stream (metadata_ref is None, or
+    // this isn't it) takes the normal encrypt_stream_payload_for_writer path.
     if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
-        crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut s, ctx)?;
+        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(original_ref) {
+            crate::security::standard::prepend_crypt_filter_to_stream_dict(
+                &mut s.dict,
+                b"Identity",
+            );
+        } else {
+            crate::writer::encrypt_stream_payload_for_writer(new_ref, &mut s, ctx)?;
+        }
     }
 
     let offset = bytes.len();
@@ -1614,6 +1637,23 @@ fn hint_stream_convergence_len(
 /// slot and shifting the latter by one (`RenumberMap::reserve_encrypt_dict_slot`)
 /// — so no self-skip check is needed here, unlike [`append_object`] and
 /// [`append_body_object`].
+///
+/// Procedural deviation from qpdf (does not affect output bytes): qpdf
+/// encrypts the hint stream exactly once, on its internal linearization
+/// "pass 1", and replays those exact bytes (`writeBuffer(hint_buffer)`) on
+/// "pass 2" without re-invoking `writeHintStream` (QPDFWriter.cc:2860-2884,
+/// the `pass == 1`/`else { writeBuffer(hint_buffer) }` split). This function
+/// is instead invoked fresh on every iteration of this writer's own
+/// convergence loop — probe passes and the final pass alike — so without
+/// `--static-aes-iv` each call draws a new random IV and produces different
+/// ciphertext bytes for the (eventually stable) plaintext payload. This is
+/// safe: AES-CBC ciphertext length is IV-invariant, so every pass agrees on
+/// the hint stream's on-disk byte length regardless of which IV was drawn
+/// (the length used by [`hint_stream_convergence_len`] and by
+/// `hint_stream_obj_total_len` in `do_write_pass` is unaffected), and only
+/// the FINAL pass's bytes are ever kept — there is no mismatch between the
+/// offsets baked into the shipped file and the ciphertext that ships with
+/// it.
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
@@ -2041,6 +2081,7 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             catalog_new_ref,
+            catalog_orig,
             renumbered,
             options,
             recovered_eol,
@@ -2076,6 +2117,7 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             new_ref,
+            *original_ref,
             renumbered,
             options,
             recovered_eol,
@@ -2179,6 +2221,7 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             new_ref,
+            *original_ref,
             renumbered,
             options,
             recovered_eol,
@@ -2217,6 +2260,7 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             new_ref,
+            *original_ref,
             renumbered,
             options,
             recovered_eol,
@@ -2265,6 +2309,7 @@ fn do_write_pass<R: Read + Seek>(
         let offset = append_body_object(
             &mut bytes,
             new_ref,
+            *original_ref,
             renumbered,
             options,
             recovered_eol,
@@ -2338,6 +2383,7 @@ fn do_write_pass<R: Read + Seek>(
                 let offset = append_body_object(
                     &mut bytes,
                     new_ref,
+                    *original_ref,
                     renumbered,
                     options,
                     recovered_eol,
@@ -6006,10 +6052,12 @@ mod tests {
     /// succeeds (same as
     /// [`non_deterministic_encrypt_linearize_no_longer_rejected_by_guard`],
     /// now that the `/Encrypt` object is actually emitted — see
-    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`]);
-    /// it does NOT pin the `Some(metadata_ref)` exemption path's actual
-    /// effect (which needs a `/Metadata`-bearing fixture, and matters once
-    /// per-object encryption is implemented and can act on it).
+    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`]).
+    /// The `Some(metadata_ref)` exemption path's actual effect (leaving the
+    /// `/Metadata` stream in the clear while every other body value is still
+    /// encrypted) is pinned by
+    /// [`linearize_with_encrypt_cleartext_metadata_exempts_only_metadata_stream`],
+    /// which uses a `/Metadata`-bearing fixture.
     #[test]
     fn non_deterministic_encrypt_linearize_cleartext_metadata_option_reaches_same_point() {
         let mut pdf = open_tiny_pdf();
@@ -6450,6 +6498,187 @@ mod tests {
         assert_eq!(
             decrypted_content, marker,
             "content stream must decrypt back to its original plaintext"
+        );
+    }
+
+    /// Build a linearizable single-page PDF whose Catalog carries a
+    /// `/Metadata` XMP stream (raw `metadata_xml` bytes, no `/Filter`) in
+    /// addition to a page content stream (raw `content` bytes) and an
+    /// `/Info /Producer` string — three distinct body values with three
+    /// distinct expected encryption outcomes under `--cleartext-metadata`
+    /// (`encrypt_metadata: false`): the metadata stream must be exempted,
+    /// the content stream and the producer string must not be.
+    fn tiny_pdf_with_metadata_content_and_producer(
+        metadata_xml: &[u8],
+        content: &[u8],
+        producer: &[u8],
+    ) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let mut offs = Vec::new();
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Contents 4 0 R >>\nendobj\n",
+        );
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(content);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(b"5 0 obj\n<< /Producer (");
+        pdf.extend_from_slice(producer);
+        pdf.extend_from_slice(b") >>\nendobj\n");
+
+        offs.push(pdf.len() as u64);
+        pdf.extend_from_slice(
+            format!(
+                "6 0 obj\n<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n",
+                metadata_xml.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(metadata_xml);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let size = offs.len() + 1;
+        let xref_start = pdf.len() as u64;
+        let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+        for off in &offs {
+            xref.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /Info 5 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        );
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    /// Task 8 follow-up: `--cleartext-metadata` (`encrypt_metadata: false`)
+    /// must exempt ONLY the `/Catalog /Metadata` XMP stream from encryption
+    /// (leaving it in the clear with `/Crypt /Identity` prepended, mirroring
+    /// `crate::writer::write_pdf_full_rewrite`'s `Object::Stream` branch,
+    /// `writer.rs` around line 3826) — every OTHER body string/stream must
+    /// still be encrypted normally. A same-fixture A/B check: the metadata
+    /// marker stays readable, the content-stream marker and the `/Info
+    /// /Producer` string do not.
+    #[test]
+    fn linearize_with_encrypt_cleartext_metadata_exempts_only_metadata_stream() {
+        let metadata_marker: &[u8] = b"<?xpacket flpdf-cleartext-metadata-xml-marker?>";
+        let content_marker: &[u8] =
+            b"BT /F1 12 Tf (flpdf cleartext-metadata content marker) Tj ET\n";
+        let producer_marker: &[u8] = b"flpdf cleartext-metadata producer marker";
+        let src = tiny_pdf_with_metadata_content_and_producer(
+            metadata_marker,
+            content_marker,
+            producer_marker,
+        );
+
+        // Empty user password (qpdf's `--encrypt "" "" 128` convention) so
+        // both `check_linearization_bytes` (no-password open) and the
+        // explicit reopen below can decrypt transparently.
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams {
+                encrypt_metadata: false,
+                ..crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
+            });
+        });
+
+        // (a) The exempted /Metadata stream's marker is readable in the raw
+        // output — never ran through the cipher.
+        assert!(
+            out.windows(metadata_marker.len())
+                .any(|w| w == metadata_marker),
+            "cleartext-metadata: the /Metadata XMP stream must stay plaintext, \
+             got {:?}",
+            String::from_utf8_lossy(&out) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // (b) Its dict carries /Crypt /Identity (the exact form
+        // prepend_crypt_filter_to_stream_dict produces for a source with no
+        // prior /Filter: a singleton /Filter /Crypt plus a
+        // /DecodeParms << /Type /CryptFilterDecodeParms /Name /Identity >>),
+        // so a reader knows not to attempt decryption.
+        let crypt_needle: &[u8] = b"/Filter /Crypt";
+        assert!(
+            out.windows(crypt_needle.len()).any(|w| w == crypt_needle),
+            "cleartext-metadata: /Metadata dict must carry /Filter /Crypt"
+        );
+        let identity_needle: &[u8] = b"/Name /Identity";
+        assert!(
+            out.windows(identity_needle.len())
+                .any(|w| w == identity_needle),
+            "cleartext-metadata: /Metadata dict must carry /Name /Identity in /DecodeParms"
+        );
+
+        // (c) Every OTHER body value is still properly encrypted — the
+        // exemption is scoped to metadata_ref alone, not blanket-applied.
+        assert!(
+            !out.windows(content_marker.len())
+                .any(|w| w == content_marker),
+            "cleartext-metadata must not exempt the page content stream"
+        );
+        assert!(
+            !out.windows(producer_marker.len())
+                .any(|w| w == producer_marker),
+            "cleartext-metadata must not exempt the /Info /Producer string"
+        );
+
+        crate::linearization::check_linearization_bytes(&out).expect(
+            "cleartext-metadata linearized output must still pass the linearization checker",
+        );
+
+        // Reader round-trip: the content stream and /Info /Producer decrypt
+        // back to their originals (proving they really were encrypted, not
+        // merely absent-by-coincidence), and the /Metadata stream resolves
+        // to its ORIGINAL bytes too — via the /Crypt /Identity passthrough,
+        // not via decryption (there is nothing to decrypt).
+        let mut reopened =
+            Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
+                .expect(
+                    "re-open of cleartext-metadata linearized output with the empty user password",
+                );
+        let (decrypted_producer, decrypted_content) = resolve_producer_and_content(&mut reopened);
+        assert_eq!(
+            decrypted_producer, producer_marker,
+            "/Info /Producer must decrypt back to its original plaintext"
+        );
+        assert_eq!(
+            decrypted_content, content_marker,
+            "content stream must decrypt back to its original plaintext"
+        );
+
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get_ref("Metadata") {
+                Some(r) => r,
+                None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+        };
+        let metadata_bytes = match reopened.resolve(metadata_ref).expect("resolve /Metadata") {
+            Object::Stream(s) => s.data,
+            other => panic!("/Metadata must be a stream, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+        };
+        assert_eq!(
+            metadata_bytes, metadata_marker,
+            "/Metadata stream must resolve to its original plaintext via /Crypt /Identity"
         );
     }
 
