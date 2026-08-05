@@ -17,8 +17,8 @@ use std::process::Command;
 
 use flpdf::{
     load_xref_and_trailer, write_pdf_with_options, CopyEncryptionSource, Dictionary, EncryptMethod,
-    EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions,
-    StreamDataMode, WriteOptions, XrefEntry,
+    EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, Pdf,
+    PdfOpenOptions, StreamDataMode, WriteOptions, XrefEntry,
 };
 
 const INFO_PLAINTEXT: &[u8] = b"Task4NestedPrintable";
@@ -56,6 +56,11 @@ fn open_encrypted(bytes: &[u8], password: &[u8]) -> Pdf<Cursor<Vec<u8>>> {
 /// string and whose Catalog-reachable stream dictionary contains another one.
 /// The stream keeps the QDF indirect `/Length` holder route observable while
 /// the nested `/Info` value is eligible for generated ObjStm membership.
+///
+/// The page intentionally has no `/Resources`. qpdf 11.9.0 preserves that
+/// omission in standard, QDF, and generated-ObjStm writes: only the linearized
+/// writer calls `QPDF::optimize()`, and inherited-attribute pushing copies an
+/// ancestor value rather than synthesizing an empty resource dictionary.
 fn nested_string_fixture(info_value: &[u8]) -> Vec<u8> {
     let mut info_hex = String::with_capacity(info_value.len() * 2);
     for byte in info_value {
@@ -170,28 +175,148 @@ fn assert_named_string_token_is_hex(bytes: &[u8], key: &[u8]) {
     );
 }
 
-fn assert_qpdf_check(bytes: &[u8]) {
+fn run_qpdf_check(bytes: &[u8]) -> Option<std::process::Output> {
     if Command::new("qpdf").arg("--version").output().is_err() {
-        eprintln!("qpdf not available; skipping qpdf --check verification");
-        return;
+        return None;
     }
 
     let dir = tempfile::tempdir().expect("create qpdf check directory");
     let path = dir.path().join("encrypted.pdf");
     fs::write(&path, bytes).expect("write qpdf check input");
-    let output = Command::new("qpdf")
-        .arg("--password=")
-        .arg("--check")
-        .arg(&path)
-        .output()
-        .expect("run qpdf --check");
+    Some(
+        Command::new("qpdf")
+            .arg("--password=")
+            .arg("--check")
+            .arg(&path)
+            .output()
+            .expect("run qpdf --check"),
+    )
+}
+
+fn qpdf_check_result_is_acceptable(exit_code: Option<i32>, stderr: &[u8]) -> bool {
+    if exit_code == Some(0) {
+        return true;
+    }
+    if exit_code != Some(3) {
+        return false;
+    }
+
+    // qpdf 12.x added this page validation after the pinned 11.9.0 oracle.
+    // Permit only that version-skew warning. Other repair warnings still fail
+    // the test so damaged xrefs, syntax, and stream data cannot be hidden.
+    let Ok(stderr) = std::str::from_utf8(stderr) else {
+        return false;
+    };
+    let mut saw_resources_warning = false;
+    let mut saw_warning_summary = false;
+    for line in stderr.lines().map(|line| line.trim_end_matches('\r')) {
+        if line.is_empty() {
+            continue;
+        }
+        if line == "qpdf: operation succeeded with warnings" {
+            if saw_warning_summary {
+                return false;
+            }
+            saw_warning_summary = true;
+        } else if line.starts_with("WARNING: ")
+            && line.ends_with(" Resources is missing or invalid; repairing")
+        {
+            saw_resources_warning = true;
+        } else {
+            return false;
+        }
+    }
+    saw_resources_warning && saw_warning_summary
+}
+
+fn assert_qpdf_check(bytes: &[u8]) {
+    let Some(output) = run_qpdf_check(bytes) else {
+        eprintln!("qpdf not available; skipping qpdf --check verification");
+        return;
+    };
     assert!(
-        output.status.success(),
+        qpdf_check_result_is_acceptable(output.status.code(), &output.stderr),
         "qpdf --check failed:\nstdout:\n{}\nstderr:\n{}\nPDF:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(bytes)
     );
+}
+
+#[test]
+fn qpdf_check_helper_rejects_recoverable_xref_warnings_and_errors() {
+    let mut warning_only = nested_string_fixture(INFO_PLAINTEXT);
+    let marker = b"\nstartxref\n";
+    let marker_offset = warning_only
+        .windows(marker.len())
+        .rposition(|part| part == marker)
+        .expect("fixture has startxref");
+    let value_start = marker_offset + marker.len();
+    let value_end = value_start
+        + warning_only[value_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .expect("startxref value is newline terminated");
+    warning_only.splice(value_start..value_end, *b"0");
+
+    let Some(warning_output) = run_qpdf_check(&warning_only) else {
+        eprintln!("qpdf not available; skipping qpdf --check verification");
+        return;
+    };
+    assert!(
+        !warning_output.status.success(),
+        "qpdf repair warnings must remain distinguishable from clean output: {}",
+        String::from_utf8_lossy(&warning_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&warning_output.stderr).contains("WARNING"),
+        "damaged startxref must exercise qpdf's warning-only path"
+    );
+
+    let error_output = run_qpdf_check(b"not a PDF file").expect("qpdf remains available");
+    assert!(
+        !error_output.status.success(),
+        "--warning-exit-0 must not hide qpdf errors"
+    );
+}
+
+#[test]
+fn qpdf_check_acceptance_allows_only_qpdf_12_missing_resources_warning() {
+    let resource_warning = b"WARNING: /tmp/output.pdf object stream 6, object 5 0 at offset 116: kid 0 (from 0) Resources is missing or invalid; repairing\nqpdf: operation succeeded with warnings\n";
+    assert!(qpdf_check_result_is_acceptable(Some(3), resource_warning));
+
+    let xref_warning = b"WARNING: /tmp/output.pdf: file is damaged\nWARNING: /tmp/output.pdf: can't find startxref\nWARNING: /tmp/output.pdf: Attempting to reconstruct cross-reference table\nqpdf: operation succeeded with warnings\n";
+    assert!(!qpdf_check_result_is_acceptable(Some(3), xref_warning));
+    assert!(!qpdf_check_result_is_acceptable(
+        Some(3),
+        b"WARNING: /tmp/output.pdf: stream data is damaged; repairing\nqpdf: operation succeeded with warnings\n",
+    ));
+    assert!(!qpdf_check_result_is_acceptable(Some(2), resource_warning));
+}
+
+#[test]
+fn encrypted_standard_writes_preserve_missing_page_resources_like_qpdf_11_9() {
+    let input = nested_string_fixture(INFO_PLAINTEXT);
+    for (qdf, object_streams) in [
+        (false, ObjectStreamMode::Disable),
+        (true, ObjectStreamMode::Disable),
+        (false, ObjectStreamMode::Generate),
+    ] {
+        let mut options = encrypted_options();
+        options.qdf = qdf;
+        options.object_streams = object_streams;
+        let bytes = rewrite_fixture(&input, &options);
+        let mut reopened = open_encrypted(&bytes, b"");
+        let pages = PageDocumentHelper::new(&mut reopened)
+            .get_all_pages()
+            .expect("enumerate rewritten pages");
+        assert_eq!(pages.len(), 1);
+        let page = reopened.resolve(pages[0]).expect("resolve rewritten page");
+        assert!(
+            page.as_dict().is_some_and(|dict| dict.get("Resources").is_none()),
+            "qdf={qdf}, object_streams={object_streams:?}: qpdf 11.9 standard writes do not synthesize /Resources"
+        );
+    }
 }
 
 fn resolve_nested_info_marker(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> Vec<u8> {
