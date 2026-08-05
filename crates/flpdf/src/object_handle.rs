@@ -97,6 +97,34 @@ mod parse_tests {
     }
 
     #[test]
+    fn parse_without_context_propagates_each_late_recovery_warning() {
+        for (input, expected) in [
+            (
+                b"bare-word".as_slice(),
+                "unknown token while reading object; treating as string",
+            ),
+            (
+                b"<< /Last >>".as_slice(),
+                "dictionary ended prematurely; using null as value for last key",
+            ),
+            (
+                b"<< /QPDFFake1 1 2 >>".as_slice(),
+                "expected dictionary key but found non-name object; inserting key /QPDFFake2",
+            ),
+            (
+                b"<< /K 1 /K 2 >>".as_slice(),
+                "dictionary has duplicated key /K; last occurrence overrides earlier ones",
+            ),
+        ] {
+            let error = ObjectHandle::parse(input).expect_err("qpdf warning must fail parse");
+            assert!(matches!(
+                error,
+                crate::Error::Parse { ref message, .. } if message == expected
+            ));
+        }
+    }
+
+    #[test]
     fn parse_without_context_allows_only_c_whitespace_after_the_object() {
         let parsed = ObjectHandle::parse(b"1 \t\r\n").expect("C whitespace is allowed");
         assert_eq!(parsed.as_integer(), Some(1));

@@ -58,8 +58,8 @@ impl LiveInput for SliceLiveInput<'_> {
 
     fn seek(&mut self, offset: u64) -> Result<()> {
         let position = usize::try_from(offset).map_err(|_| {
-            // cov:ignore: u64 exceeds usize only on 32-bit targets; coverage runs on 64-bit.
             Error::Internal("slice live-input offset does not fit usize".into())
+            // cov:ignore: u64 exceeds usize only on 32-bit targets; coverage runs on 64-bit.
         })?;
         if position > self.bytes.len() {
             return Err(Error::parse(position, "seek past end of parser input"));
@@ -137,8 +137,8 @@ fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
             dictionary.insert(key, materialize_live_handle(&value)?);
         }
         return Ok(Object::Dictionary(dictionary));
-    }
-    // cov:ignore-start: LiveFileParser's file-object grammar only produces the arms above.
+    } // cov:ignore: LLVM attributes the exercised dictionary return to its closing delimiter.
+      // cov:ignore-start: LiveFileParser's file-object grammar only produces the arms above.
     Err(Error::Internal(
         "live parser produced an unmaterializable direct object handle".into(),
     ))
@@ -981,6 +981,12 @@ mod live_input_tests {
 
         let invalid_reference = parse_with_null_resolver(b"[ 0 0 R ]");
         assert!(invalid_reference
+            .value
+            .as_array()
+            .is_some_and(|items| items.len() == 1 && items[0].is_null()));
+
+        let overflowing_reference = parse_with_null_resolver(b"[ 4294967296 0 R ]");
+        assert!(overflowing_reference
             .value
             .as_array()
             .is_some_and(|items| items.len() == 1 && items[0].is_null()));
