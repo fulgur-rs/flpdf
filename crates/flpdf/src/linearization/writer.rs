@@ -6509,6 +6509,165 @@ mod tests {
         );
     }
 
+    /// Task 11: every prior test in this module (Tasks 6-10) only exercised
+    /// `EncryptMethod::V4Aes128`. V=5 R=6 AES-256 takes a genuinely
+    /// different code path through `crate::writer::build_encryption_context`
+    /// — `WriteCipher::FileKeyAes256` uses the 32-byte file key directly for
+    /// every object, with no per-object Algorithm-1 derivation and no
+    /// `/ID[0]` dependency (unlike V=4's `WriteCipher::PerObject`; see
+    /// `WriteCipher`'s own doc) — so this proves the linearized writer's
+    /// generic dispatch on `EncryptParams::method` actually reaches that
+    /// path, not just that V=4 works.
+    ///
+    /// Assertion style mirrors two existing precedents: the on-disk
+    /// `/Encrypt` dict shape check follows
+    /// `linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`
+    /// (locate the reserved object, inspect its raw bytes); the correctness
+    /// gate follows `crate::writer::tests::v5_r6_encrypt_round_trips_string_and_stream_via_reader`
+    /// — V=5's random salts + FEK give no byte-identical determinism to
+    /// assert, so password round-trip decryption is the real proof.
+    #[test]
+    fn linearize_with_v5_r6_aes256_encrypts_and_round_trips() {
+        let content_marker: &[u8] = b"BT /F1 12 Tf (flpdf v5r6 linearize content marker) Tj ET\n";
+        let producer_marker: &[u8] = b"flpdf v5r6 linearize producer marker";
+        let src = tiny_pdf_with_content_and_producer(content_marker, producer_marker);
+
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let expected_encrypt_num = renumber.hint_stream_slot();
+
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v5_r6(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        let encrypt_object_bytes = find_object_bytes(&out, expected_encrypt_num);
+        for needle in [
+            b"/V 5".as_slice(),
+            b"/R 6".as_slice(),
+            b"/CFM /AESV3".as_slice(),
+        ] {
+            assert!(
+                encrypt_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=6 /Encrypt dict must contain {needle:?}"
+            );
+        }
+
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("V=5 R=6 encrypted linearized output must pass the linearization checker");
+
+        for pw in [b"".as_slice(), b"owner".as_slice()] {
+            let mut reopened = Pdf::open_with_options(
+                Cursor::new(out.clone()),
+                crate::PdfOpenOptions {
+                    password: pw.to_vec(),
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("re-open of V=5 R=6 linearized output with password {pw:?} failed: {e}")
+            });
+            let (producer, content) = resolve_producer_and_content(&mut reopened);
+            assert_eq!(
+                producer, producer_marker,
+                "V=5 R=6 /Info /Producer must decrypt back to its original plaintext"
+            );
+            assert_eq!(
+                content, content_marker,
+                "V=5 R=6 content stream must decrypt back to its original plaintext"
+            );
+        }
+    }
+
+    /// As [`linearize_with_v5_r6_aes256_encrypts_and_round_trips`], but for
+    /// V=5 R=5 (deprecated pre-ISO 32000-2 AES-256, `EncryptParams::v5_r5`,
+    /// selected by `--force-R5`). R=5 shares V=5's `WriteCipher::
+    /// FileKeyAes256` code path with R=6 (only the password-hash algorithm
+    /// and the `/R` value differ — see `build_v5_r5_encrypt_dict`'s doc), so
+    /// this is not a redundant re-run of the R=6 case: it is R=5's own
+    /// weak-crypto reader gate (`revision == 5`,
+    /// `PdfOpenOptions::allow_weak_crypto`) that needs its own coverage,
+    /// mirroring `crate::writer::tests::v5_r5_encrypt_round_trips_string_and_stream_via_reader`.
+    /// `check_linearization_bytes` opens with the reader's default options
+    /// (weak crypto disallowed), so the linearization-checker step here opens
+    /// its own `Pdf` with `allow_weak_crypto: true` and calls
+    /// `check_linearization` directly instead.
+    #[test]
+    fn linearize_with_v5_r5_aes256_encrypts_and_round_trips() {
+        let content_marker: &[u8] = b"BT /F1 12 Tf (flpdf v5r5 linearize content marker) Tj ET\n";
+        let producer_marker: &[u8] = b"flpdf v5r5 linearize producer marker";
+        let src = tiny_pdf_with_content_and_producer(content_marker, producer_marker);
+
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let expected_encrypt_num = renumber.hint_stream_slot();
+
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Uncompress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v5_r5(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        let encrypt_object_bytes = find_object_bytes(&out, expected_encrypt_num);
+        for needle in [
+            b"/V 5".as_slice(),
+            b"/R 5".as_slice(),
+            b"/CFM /AESV3".as_slice(),
+        ] {
+            assert!(
+                encrypt_object_bytes
+                    .windows(needle.len())
+                    .any(|w| w == needle),
+                "V=5 R=5 /Encrypt dict must contain {needle:?}"
+            );
+        }
+
+        let mut checker_pdf = Pdf::open_with_options(
+            Cursor::new(out.clone()),
+            crate::PdfOpenOptions {
+                allow_weak_crypto: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("re-open with the empty user password + allow_weak_crypto for the checker");
+        crate::linearization::check_linearization(&mut checker_pdf, &out)
+            .expect("V=5 R=5 encrypted linearized output must pass the linearization checker");
+
+        for pw in [b"".as_slice(), b"owner".as_slice()] {
+            let mut reopened = Pdf::open_with_options(
+                Cursor::new(out.clone()),
+                crate::PdfOpenOptions {
+                    password: pw.to_vec(),
+                    allow_weak_crypto: true,
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("re-open of V=5 R=5 linearized output with password {pw:?} failed: {e}")
+            });
+            let (producer, content) = resolve_producer_and_content(&mut reopened);
+            assert_eq!(
+                producer, producer_marker,
+                "V=5 R=5 /Info /Producer must decrypt back to its original plaintext"
+            );
+            assert_eq!(
+                content, content_marker,
+                "V=5 R=5 content stream must decrypt back to its original plaintext"
+            );
+        }
+    }
+
     /// Build a linearizable single-page PDF whose Catalog carries a
     /// `/Metadata` XMP stream (raw `metadata_xml` bytes, no `/Filter`) in
     /// addition to a page content stream (raw `content` bytes) and an
@@ -6923,6 +7082,172 @@ mod tests {
             String::from_utf8_lossy(&bytes).contains(&length_marker),
             "/Length must reflect the encrypted (not plaintext) byte count"
         );
+    }
+
+    /// Extract just the hint stream object's stream *payload* (the bytes
+    /// between its `stream\n` marker and the following `endstream`),
+    /// locating the object by its pre-computed reserved number. Companion to
+    /// [`find_object_bytes`] — needed because the hint dict prefix (`/S`,
+    /// `/O`, `/Length`) legitimately differs in decimal width between an
+    /// unencrypted and an encrypted run even before considering the payload
+    /// itself, so diffing whole `find_object_bytes` output would conflate
+    /// that dict-width noise with the payload comparison this helper's
+    /// caller actually wants.
+    fn hint_stream_payload_bytes(out: &[u8], hint_num: u32) -> &[u8] {
+        let object_bytes = find_object_bytes(out, hint_num);
+        let stream_marker: &[u8] = b"stream\n";
+        let payload_start = object_bytes
+            .windows(stream_marker.len())
+            .position(|w| w == stream_marker)
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the hint stream object
+                // has no "stream\n" marker — every well-formed fixture in
+                // this test module reaches the assertion under test instead.
+                panic!("hint stream object {hint_num} must contain a \"stream\\n\" marker")
+                // cov:ignore-end
+            })
+            + stream_marker.len();
+        let after_stream = &object_bytes[payload_start..];
+        let end_marker: &[u8] = b"endstream";
+        let payload_end = after_stream
+            .windows(end_marker.len())
+            .position(|w| w == end_marker)
+            .unwrap_or(after_stream.len());
+        &after_stream[..payload_end]
+    }
+
+    /// Locate the classic (stream-free) `xref\n<start> <count>\n` subsection
+    /// header nearest the start of `out` and confirm every one of its
+    /// `count` fixed-width entries is qpdf's plaintext ASCII
+    /// `%010d %05d %s \n` form (`write_part1_xref_and_trailer` /
+    /// `patch_part1_xref`'s `CLASSIC_XREF_ENTRY_WIDTH`-byte row) — parseable
+    /// by a reader without deriving the file key first, unlike every other
+    /// body object and the hint stream.
+    fn assert_classic_xref_section_entries_are_ascii_plaintext(out: &[u8]) {
+        let marker: &[u8] = b"\nxref\n";
+        let marker_pos = out
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the classic layout has
+                // no xref section at all — the state under test always has
+                // one (the Part-1 first-page subsection).
+                panic!("expected a classic \"xref\\n\" section header in output")
+                // cov:ignore-end
+            });
+        let header_start = marker_pos + marker.len();
+        let header_len = out[header_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if the header line never
+                // terminates — never true for a well-formed classic layout.
+                panic!("xref subsection header must end in a newline")
+                // cov:ignore-end
+            });
+        let header = std::str::from_utf8(&out[header_start..header_start + header_len])
+            .expect("xref subsection header bytes are ASCII digits/spaces by construction");
+        let mut parts = header.split(' ');
+        let _start_num: u32 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("xref subsection header's first field must be a decimal object number");
+        let count: u32 = parts
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("xref subsection header's second field must be a decimal entry count");
+
+        let entries_start = header_start + header_len + 1;
+        for i in 0..count as usize {
+            let start = entries_start + i * CLASSIC_XREF_ENTRY_WIDTH;
+            let entry = std::str::from_utf8(&out[start..start + CLASSIC_XREF_ENTRY_WIDTH])
+                .unwrap_or_else(|_| {
+                    // cov:ignore-start: only reached if a classic xref entry
+                    // is not valid ASCII — the property under test.
+                    panic!("xref entry {i} must be ASCII, got non-UTF8 bytes")
+                    // cov:ignore-end
+                });
+            let fields: Vec<&str> = entry.trim_end_matches('\n').split(' ').collect();
+            assert_eq!(
+                fields.len(),
+                4,
+                "xref entry must be \"%010d %05d %s \" (trailing space before \
+                 the newline this loop already stripped), got {entry:?}"
+            );
+            assert!(
+                fields[0].len() == 10 && fields[0].bytes().all(|b| b.is_ascii_digit()),
+                "xref offset field must be 10 ASCII digits, got {entry:?}"
+            );
+            assert!(
+                fields[1].len() == 5 && fields[1].bytes().all(|b| b.is_ascii_digit()),
+                "xref generation field must be 5 ASCII digits, got {entry:?}"
+            );
+            assert!(
+                fields[2] == "n" || fields[2] == "f",
+                "xref type field must be 'n' or 'f', got {entry:?}"
+            );
+        }
+    }
+
+    /// Task 11 qualitative check (`bd show flpdf-txag` acceptance criteria
+    /// item 6): confirms the hint stream is genuinely ciphertext THROUGH THE
+    /// FULL `linearize_with` pipeline — renumbering, plan, and the
+    /// probe/convergence loop all included — not merely at the level of
+    /// `append_hint_stream_object` called in isolation with a hand-built
+    /// `EncryptionContext`, which
+    /// [`append_hint_stream_object_encrypts_payload_when_ctx_present`]
+    /// already proves against an independently computed oracle. That
+    /// existing test does not go through `linearize_with` at all, so it
+    /// cannot catch a bug where the full pipeline fails to *wire* an
+    /// `encrypt_ctx` into the hint-stream call even though the function
+    /// itself encrypts correctly when given one.
+    ///
+    /// This is a same-fixture A/B instead: the SAME source produces a hint
+    /// stream at the analogous structural position (object number shifted by
+    /// exactly one slot — see [`reserve_encrypt_dict_slot`](RenumberMap::reserve_encrypt_dict_slot)'s
+    /// own doc and
+    /// [`linearize_with_encrypt_emits_encrypt_dict_at_reserved_object_number`])
+    /// whether or not `--encrypt` is requested; their raw payload bytes must
+    /// differ.
+    ///
+    /// Companion check, same output: the classic Part-1 xref subsection
+    /// stays in qpdf's plaintext ASCII `%010d %05d %s \n` form even though
+    /// the document is encrypted — qpdf's `writeTrailer` never calls
+    /// `setDataKey` for the xref table (`m->cur_data_key.clear()` in the
+    /// `xref_stream` branch), unlike the hint stream, because a reader must
+    /// be able to locate every object before it can even derive the file
+    /// key.
+    #[test]
+    fn linearize_with_encrypt_hint_stream_differs_from_control_xref_stays_ascii_plaintext() {
+        let src = tiny_pdf_bytes();
+
+        let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let unencrypted_hint_num = renumber.hint_stream_slot();
+        // reserve_encrypt_dict_slot inserts the /Encrypt slot at the OLD
+        // hint_stream_slot and shifts the hint stream itself to old+1 (see
+        // its own doc).
+        let encrypted_hint_num = unencrypted_hint_num + 1;
+
+        let unencrypted = linearize_with(&src, |_o| {});
+        let encrypted = linearize_with(&src, |o| {
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+
+        let unencrypted_payload = hint_stream_payload_bytes(&unencrypted, unencrypted_hint_num);
+        let encrypted_payload = hint_stream_payload_bytes(&encrypted, encrypted_hint_num);
+        assert_ne!(
+            unencrypted_payload, encrypted_payload,
+            "hint stream payload must differ between the unencrypted control \
+             and the encrypted output at their respective structural positions"
+        );
+
+        assert_classic_xref_section_entries_are_ascii_plaintext(&encrypted);
     }
 
     /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
