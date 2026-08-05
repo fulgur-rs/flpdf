@@ -1695,12 +1695,13 @@ fn append_hint_stream_object(
     let payload: &[u8] = match encrypt_ctx {
         Some(ctx) => {
             let mut stream = crate::Stream::new(Dictionary::new(), payload.to_vec());
-            crate::writer::encrypt_stream_payload_with_iv(
+            let encryption = crate::writer::encrypt_stream_payload_with_iv(
                 new_ref,
                 &mut stream,
                 ctx,
                 hint_stream_aes_iv,
-            )?;
+            );
+            encryption?;
             encrypted_payload = stream.data;
             &encrypted_payload
         }
@@ -2110,7 +2111,7 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(catalog_orig);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(
+        let appended = append_body_object(
             &mut bytes,
             catalog_new_ref,
             catalog_orig,
@@ -2119,7 +2120,8 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?;
+        );
+        let offset = appended?;
         xref_offsets.insert(catalog_new_ref.number, offset);
         catalog_emitted_early = true;
     }
@@ -2147,7 +2149,7 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(
+        let appended = append_body_object(
             &mut bytes,
             new_ref,
             *original_ref,
@@ -2156,7 +2158,8 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?;
+        );
+        let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2217,7 +2220,7 @@ fn do_write_pass<R: Read + Seek>(
     let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
     let hint_stream_offset = bytes.len();
     if !pass1_digest {
-        let emitted_offset = append_hint_stream_object(
+        let appended = append_hint_stream_object(
             &mut bytes,
             hint_new_ref,
             hint_payload,
@@ -2226,7 +2229,8 @@ fn do_write_pass<R: Read + Seek>(
             structural_streams_filtered,
             encrypt_ctx,
             hint_stream_aes_iv,
-        )?;
+        );
+        let emitted_offset = appended?;
         debug_assert_eq!(emitted_offset, hint_stream_offset);
         xref_offsets.insert(hint_stream_new_num, emitted_offset);
     }
@@ -2258,7 +2262,7 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(
+        let appended = append_body_object(
             &mut bytes,
             new_ref,
             *original_ref,
@@ -2267,7 +2271,8 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?;
+        );
+        let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2298,7 +2303,7 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(
+        let appended = append_body_object(
             &mut bytes,
             new_ref,
             *original_ref,
@@ -2307,7 +2312,8 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?;
+        );
+        let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2348,7 +2354,7 @@ fn do_write_pass<R: Read + Seek>(
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-        let offset = append_body_object(
+        let appended = append_body_object(
             &mut bytes,
             new_ref,
             *original_ref,
@@ -2357,7 +2363,8 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
-        )?;
+        );
+        let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
     }
 
@@ -2423,7 +2430,7 @@ fn do_write_pass<R: Read + Seek>(
                 let recovered_eol = pdf.recovered_stream_eol(*original_ref);
                 let renumbered =
                     renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
-                let offset = append_body_object(
+                let appended = append_body_object(
                     &mut bytes,
                     new_ref,
                     *original_ref,
@@ -2432,7 +2439,8 @@ fn do_write_pass<R: Read + Seek>(
                     recovered_eol,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
-                )?;
+                );
+                let offset = appended?;
                 xref_offsets.insert(new_ref.number, offset);
             }
             Part4Emit::Container(container) => {

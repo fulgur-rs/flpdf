@@ -3477,9 +3477,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     if options.qdf {
         let mut next_emission: u32 = 0;
         for (cf_ref, old_ref) in &renumbered {
-            if Some(*old_ref) == pdf.encryption_ref() {
-                continue;
-            }
             if old_ref.number == 0 || skip_refs.contains(old_ref) {
                 continue; // cov:ignore: free/deleted refs don't appear in renumbered
             }
@@ -3553,13 +3550,9 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         // this is the single place that decides it — matching qpdf's own
         // `generateID()`-is-idempotent contract (see that function's doc).
         let id0 = resolve_id0_for_encryption(pdf, options);
-        Some(build_encryption_context(
-            options,
-            params,
-            base_for_encrypt,
-            metadata_ref,
-            &id0,
-        )?)
+        let context =
+            build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
+        Some(context?)
     } else if let Some(ref src) = options.copy_encryption {
         let base_for_encrypt = if options.qdf {
             qdf_max_emission
@@ -3691,14 +3684,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
 
     for (new_ref, old_ref) in &renumbered {
-        // `pdf.encryption_ref()`, `skip_refs` (deleted_object_refs), and
-        // `member_to_batch` are all keyed on ORIGINAL refs, so compare with
-        // `old_ref`. (Object 0 / deleted refs are unreachable from /Root and
-        // never appear in `renumbered`, but the guards stay for parity.)
-        if Some(*old_ref) == pdf.encryption_ref() {
-            continue;
-        }
-
         // Never emit object 0 or any free/deleted entry as a body object (qpdf
         // parity, all modes). The xref free-list head and any free rows are
         // still written into the regenerated `xref` table below.
@@ -3895,13 +3880,14 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     holder_stream
                         .dict
                         .insert("Length", Object::Reference(ObjectRef::new(holder_num, 0)));
-                    write_stream_to_buf_qdf(
+                    let written = write_stream_to_buf_qdf(
                         &mut bytes,
                         &holder_stream,
                         options.newline_before_endstream,
                         encrypted_strings.as_mut(),
                         emit_ref,
-                    )?;
+                    );
+                    written?;
                 } else {
                     // cov:ignore-start: unreachable — this arm is inside the
                     // stream branch and reencode_stream_for_compress always
@@ -3912,14 +3898,15 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             } else {
                 // Non-qdf: shared choke point — qpdf's re-filtered key order for
                 // re-encoded streams, lexicographic order otherwise.
-                write_reencoded_object(
+                let written = write_reencoded_object(
                     &mut bytes,
                     &reencoded,
                     source_filter_is_lone_flate,
                     options,
                     encrypted_strings.as_mut(),
                     emit_ref,
-                )?;
+                );
+                written?;
             }
         } else if let Some(emitter) = encrypted_strings.as_mut() {
             emitter.write_object(&mut bytes, emit_ref, None, &object, options.qdf)?;
@@ -3974,7 +3961,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             })?;
             resolved.push((new, obj));
         }
-        let body = object_streams::emit_objstm_body_from_resolved_with_writer(
+        let emitted = object_streams::emit_objstm_body_from_resolved_with_writer(
             &resolved,
             &mut |out, member_index, member_ref, object| {
                 if let Some(emitter) = encrypted_strings.as_mut() {
@@ -3984,7 +3971,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     Ok(())
                 }
             },
-        )?;
+        );
+        let body = emitted?;
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
@@ -6518,8 +6506,8 @@ mod tests {
         bytes
     }
 
-    /// The library supports copy-encryption in QDF mode even though the CLI
-    /// deliberately rejects that flag combination. QDF inserts an indirect
+    /// Copy-encryption is supported in QDF mode through both the library and
+    /// CLI. QDF inserts an indirect
     /// `/Length` holder after each stream, so `/Encrypt` must be allocated
     /// after the final interleaved holder rather than after the last source
     /// object. Re-opening the result exercises that non-colliding allocation.

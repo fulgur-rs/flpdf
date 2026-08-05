@@ -6,7 +6,7 @@ use crate::writer::encryption_state::WriterEncryptionState;
 use crate::writer::{EncryptionContext, WriteCipher};
 use crate::{Dictionary, Object, ObjectRef};
 
-type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> crate::Result<()>;
+type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
 
 /// Writer-owned adapter that encrypts strings while an emitted object's data
 /// key is active, without changing the source [`Object`] tree.
@@ -19,7 +19,7 @@ pub(crate) struct EncryptedStringEmitter {
 
 impl EncryptedStringEmitter {
     pub(crate) fn from_context(ctx: &EncryptionContext) -> Self {
-        Self::from_context_with_boxed_iv_generator(ctx, Box::new(fill_aes_iv_from_os))
+        Self::from_context_with_boxed_iv_generator(ctx, Box::new(|iv| getrandom::getrandom(iv)))
     }
 
     fn from_context_with_boxed_iv_generator(
@@ -43,7 +43,7 @@ impl EncryptedStringEmitter {
     #[cfg(test)]
     fn from_context_with_iv_generator(
         ctx: &EncryptionContext,
-        aes_iv_generator: impl FnMut(&mut [u8; 16]) -> crate::Result<()> + 'static,
+        aes_iv_generator: impl FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error> + 'static,
     ) -> Self {
         Self::from_context_with_boxed_iv_generator(ctx, Box::new(aes_iv_generator))
     }
@@ -148,7 +148,7 @@ fn encrypt_string(
         [0; 16]
     };
     if crate::writer::cipher_needs_aes_iv(cipher) && !static_aes_iv {
-        aes_iv_generator(&mut iv)?;
+        fill_aes_iv(aes_iv_generator, &mut iv)?;
     }
     match cipher {
         WriteCipher::PerObject(ObjectKeyAlg::Rc4) => {
@@ -170,8 +170,8 @@ fn encrypt_string(
     Ok(bytes)
 }
 
-fn fill_aes_iv_from_os(iv: &mut [u8; 16]) -> crate::Result<()> {
-    getrandom::getrandom(iv).map_err(|error| {
+fn fill_aes_iv(aes_iv_generator: &mut AesIvGenerator, iv: &mut [u8; 16]) -> crate::Result<()> {
+    aes_iv_generator(iv).map_err(|error| {
         crate::Error::Unsupported(format!(
             "OS CSPRNG (getrandom) unavailable for AES IV generation: {error}"
         ))
@@ -341,9 +341,7 @@ mod tests {
             let expected = [key, b" <7072696e7461626c65>"].concat();
             assert!(
                 wire.windows(expected.len()).any(|part| part == expected),
-                "direct /{} must be hexadecimal: {}",
-                String::from_utf8_lossy(key),
-                String::from_utf8_lossy(&wire),
+                "direct binary encryption-dictionary key must be hexadecimal",
             );
         }
         assert!(wire
@@ -515,9 +513,7 @@ mod tests {
                 let call = observed_calls.get();
                 observed_calls.set(call + 1);
                 if call == 0 {
-                    return Err(crate::Error::Unsupported(
-                        "injected AES IV RNG failure".to_string(),
-                    ));
+                    return Err(getrandom::Error::UNSUPPORTED);
                 }
                 *iv = crate::pipeline::aes::static_initialization_vector();
                 Ok(())
@@ -535,7 +531,12 @@ mod tests {
             .expect_err("injected IV RNG failure must propagate");
         assert!(matches!(
             error,
-            crate::Error::Unsupported(message) if message == "injected AES IV RNG failure"
+            crate::Error::Unsupported(message)
+                if message
+                    == format!(
+                        "OS CSPRNG (getrandom) unavailable for AES IV generation: {}",
+                        getrandom::Error::UNSUPPORTED
+                    )
         ));
         assert!(
             failed_output.is_empty(),
