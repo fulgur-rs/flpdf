@@ -1,4 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc responsibilities shared with writer submodules and linearization.
+#[path = "writer/encryption_state.rs"]
+pub(crate) mod encryption_state;
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
 #[path = "writer/plain/mod.rs"]

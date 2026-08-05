@@ -136,6 +136,7 @@
 | `crates/flpdf/src/token_filter.rs` | correspondence | QPDFObjectHandle::TokenFilter callback boundary |
 | `crates/flpdf/src/tokenizer.rs` | mirror | libqpdf/QPDFTokenizer.cc |
 | `crates/flpdf/src/writer.rs` | correspondence | QPDFWriter.cc responsibilities shared with writer submodules and linearization |
+| `crates/flpdf/src/writer/encryption_state.rs` | correspondence | QPDFWriter.hh:641-663 and QPDFWriter.cc:842-847 current data-key state |
 | `crates/flpdf/src/writer/object_streams.rs` | correspondence | QPDF.cc getCompressibleObjGens plus QPDFWriter.cc object-stream planning and emission |
 | `crates/flpdf/src/writer/plain/body.rs` | correspondence | QPDFWriter.cc plain object-body emission split from planning and xref output |
 | `crates/flpdf/src/writer/plain/mod.rs` | correspondence | QPDFWriter.cc standard write pipeline split across plain writer modules |
