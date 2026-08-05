@@ -465,13 +465,13 @@ Run: `python3 scripts/qpdf-module-docs.py`
 
 Run: `python3 scripts/qpdf-module-docs.py --check`
 
-Expected: `writer/encrypted_strings.rs` appears as `QPDFWriter.cc` string-unparse and encryption-dictionary emission responsibility; the check exits zero.
+Expected: `writer/encrypted_strings.rs` appears as `QPDFWriter.cc:785-803` encryption-dictionary binary-key hex selection plus string-unparse, data-key lifecycle, and encryption-dictionary emission responsibility; the check exits zero.
 
 - [x] **Step 3: Run formatting, clippy, and workspace tests**
 
 Run: `cargo fmt -- --check`
 
-Run: `cargo clippy --workspace --all-targets -- -D warnings`
+Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 
 Run: `cargo test -p flpdf`
 
