@@ -2288,6 +2288,20 @@ pub(crate) struct EncryptionContext {
     pub(crate) metadata_ref: Option<ObjectRef>,
 }
 
+impl EncryptionContext {
+    /// Whether qpdf serializes strings for this encryption method with
+    /// `QPDF_String::unparse(true)`. AES uses forced hexadecimal output after
+    /// encryption; RC4 retains `QPDF_String::unparse()`'s heuristic
+    /// (`QPDFWriter.cc:1567-1592`).
+    pub(crate) fn encrypted_strings_require_hex(&self) -> bool {
+        matches!(
+            self.cipher,
+            WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Aes)
+                | WriteCipher::FileKeyAes256
+        )
+    }
+}
+
 /// Resolve the document `/Catalog`'s `/Metadata` indirect reference, if any.
 /// Used to exempt the XMP metadata stream from encryption under
 /// `--cleartext-metadata`.
@@ -3063,16 +3077,24 @@ fn write_reencoded_object(
     reencoded: &Object,
     source_filter_is_lone_flate: bool,
     options: &WriteOptions,
+    force_hex_strings: bool,
 ) {
     match reencoded {
         Object::Stream(s) => {
             let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
                 && !source_filter_is_lone_flate
                 && is_lone_flate(s.dict.get("Filter"));
-            write_stream_to_buf_qpdf_order(bytes, s, options.newline_before_endstream, refiltered);
+            write_stream_to_buf_qpdf_order(
+                bytes,
+                s,
+                options.newline_before_endstream,
+                refiltered,
+                force_hex_strings,
+            );
         }
         // cov:ignore-start: unreachable — callers only pass stream objects and
         // reencode_stream_for_compress always returns Object::Stream.
+        other if force_hex_strings => other.write_pdf_with_forced_hex_strings(bytes),
         other => other.write_pdf(bytes),
         // cov:ignore-end
     }
@@ -3778,6 +3800,9 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 encrypt_strings_in_object_for_writer(emit_ref, &mut object, ctx)?;
             }
         }
+        let force_hex_strings = encrypt_ctx
+            .as_ref()
+            .is_some_and(|ctx| emit_ref != ctx.encrypt_ref && ctx.encrypted_strings_require_hex());
 
         // Skip xref-stream container objects — we'll rebuild the xref from
         // scratch below.  Skip ObjStm container objects — their members have
@@ -3954,10 +3979,13 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     &reencoded,
                     source_filter_is_lone_flate,
                     options,
+                    force_hex_strings,
                 );
             }
         } else if options.qdf {
             object.write_pdf_qdf(&mut bytes, 0);
+        } else if force_hex_strings {
+            object.write_pdf_with_forced_hex_strings(&mut bytes);
         } else {
             object.write_pdf(&mut bytes);
         }

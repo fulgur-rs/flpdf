@@ -486,6 +486,21 @@ impl Object {
     /// );
     /// ```
     pub fn write_pdf(&self, out: &mut Vec<u8>) {
+        self.write_pdf_with_string_mode(out, false);
+    }
+
+    /// Serialize this object for an AES-encrypted writer object.
+    ///
+    /// qpdf's `QPDFWriter::unparseObject` serializes every AES-encrypted
+    /// string through `QPDF_String::unparse(true)`
+    /// (`libqpdf/QPDFWriter.cc:1567-1583`). The mode is local to an emission:
+    /// it does not change the stored [`Object::String`] value or the default
+    /// public serializer.
+    pub(crate) fn write_pdf_with_forced_hex_strings(&self, out: &mut Vec<u8>) {
+        self.write_pdf_with_string_mode(out, true);
+    }
+
+    fn write_pdf_with_string_mode(&self, out: &mut Vec<u8>, force_hex_strings: bool) {
         match self {
             Object::Null => out.extend_from_slice(b"null"),
             Object::Boolean(value) => {
@@ -511,7 +526,7 @@ impl Object {
                 write_name_escaped(out, name);
             }
             Object::String(value) => {
-                write_string_value(out, value);
+                write_string_value_with_mode(out, value, force_hex_strings);
             }
             Object::Operator(value) | Object::InlineImage(value) => {
                 out.extend_from_slice(value);
@@ -530,13 +545,15 @@ impl Object {
                 out.push(b'[');
                 for value in values.iter() {
                     out.push(b' ');
-                    value.write_pdf(out);
+                    value.write_pdf_with_string_mode(out, force_hex_strings);
                 }
                 out.extend_from_slice(b" ]");
             }
-            Object::Dictionary(dict) => dict.write_pdf(out),
+            Object::Dictionary(dict) => dict.write_pdf_with_string_mode(out, force_hex_strings),
             Object::Stream(stream) => {
-                stream.dict.write_pdf(out);
+                stream
+                    .dict
+                    .write_pdf_with_string_mode(out, force_hex_strings);
                 out.extend_from_slice(b"\nstream\n");
                 out.extend_from_slice(&stream.data);
                 out.extend_from_slice(b"\nendstream");
@@ -754,7 +771,11 @@ pub(crate) fn write_literal_string(out: &mut Vec<u8>, value: &[u8]) {
 }
 
 pub(crate) fn write_string_value(out: &mut Vec<u8>, value: &[u8]) {
-    if use_hex_string(value) {
+    write_string_value_with_mode(out, value, false);
+}
+
+fn write_string_value_with_mode(out: &mut Vec<u8>, value: &[u8], force_hex: bool) {
+    if force_hex || use_hex_string(value) {
         write_hex_string(out, value);
     } else {
         write_literal_string(out, value);
@@ -837,12 +858,16 @@ impl Dictionary {
     }
 
     pub(crate) fn write_pdf(&self, out: &mut Vec<u8>) {
+        self.write_pdf_with_string_mode(out, false);
+    }
+
+    fn write_pdf_with_string_mode(&self, out: &mut Vec<u8>, force_hex_strings: bool) {
         out.extend_from_slice(b"<<");
         for (key, value) in self.iter() {
             out.extend_from_slice(b" /");
             write_name_escaped(out, key);
             out.push(b' ');
-            value.write_pdf(out);
+            value.write_pdf_with_string_mode(out, force_hex_strings);
         }
         out.extend_from_slice(b" >>");
     }
@@ -911,6 +936,23 @@ impl Dictionary {
     /// this dictionary (the writer stores the on-disk byte count before
     /// serialization); if `/Length` is absent it is simply omitted.
     pub(crate) fn write_pdf_stream(&self, out: &mut Vec<u8>, refiltered: bool) {
+        self.write_pdf_stream_with_string_mode(out, refiltered, false);
+    }
+
+    pub(crate) fn write_pdf_stream_with_forced_hex_strings(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+    ) {
+        self.write_pdf_stream_with_string_mode(out, refiltered, true);
+    }
+
+    fn write_pdf_stream_with_string_mode(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        force_hex_strings: bool,
+    ) {
         out.extend_from_slice(b"<<");
         // Capture /Length during the single iteration (it is appended after the
         // other keys) instead of looking it up again afterwards.
@@ -926,11 +968,11 @@ impl Dictionary {
             out.extend_from_slice(b" /");
             write_name_escaped(out, key);
             out.push(b' ');
-            value.write_pdf(out);
+            value.write_pdf_with_string_mode(out, force_hex_strings);
         }
         if let Some(length) = length_value {
             out.extend_from_slice(b" /Length ");
-            length.write_pdf(out);
+            length.write_pdf_with_string_mode(out, force_hex_strings);
         }
         if refiltered {
             out.extend_from_slice(b" /Filter /FlateDecode");
@@ -1155,6 +1197,39 @@ mod compact_key_escape_tests {
         let mut out = Vec::new();
         dictionary.write_pdf_trailer(&mut out, None);
         assert_eq!(out, [b"<< /", ESCAPED_KEY, b" 1 /Size 5 >>"].concat());
+    }
+}
+
+#[cfg(test)]
+mod aes_encrypted_string_serialization_tests {
+    use super::*;
+
+    /// qpdf's AES branch calls `QPDF_String::unparse(true)` after encrypting
+    /// each string (`QPDFWriter.cc:1567-1592`), so even ciphertext that looks
+    /// like a literal PDF string must remain hex encoded. The writer passes
+    /// this mode for AES-encrypted object emission; RC4 and unencrypted
+    /// serialization keep the normal `use_hex_string` heuristic.
+    #[test]
+    fn forced_hex_string_mode_reaches_nested_object_values() {
+        let mut nested = Dictionary::new();
+        nested.insert("Nested", Object::String(b"still-printable".to_vec()));
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Label", Object::String(b"stream-printable".to_vec()));
+
+        let object = Object::Array(vec![
+            Object::String(b"top-printable".to_vec()),
+            Object::Dictionary(nested),
+            Object::Stream(Stream::new(stream_dict, b"payload".to_vec())),
+        ]);
+
+        let mut out = Vec::new();
+        object.write_pdf_with_forced_hex_strings(&mut out);
+
+        assert_eq!(
+            out,
+            b"[ <746f702d7072696e7461626c65> << /Nested <7374696c6c2d7072696e7461626c65> >> << /Label <73747265616d2d7072696e7461626c65> >>\nstream\npayload\nendstream ]"
+        );
     }
 }
 

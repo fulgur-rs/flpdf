@@ -558,12 +558,19 @@ fn append_object(
     mut object: Object,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<usize> {
-    if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
+    let object_encryption = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
+    let force_hex_strings = object_encryption
+        .is_some_and(crate::writer::EncryptionContext::encrypted_strings_require_hex);
+    if let Some(ctx) = object_encryption {
         crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut object, ctx)?;
     }
     let offset = bytes.len();
     bytes.extend_from_slice(format!("{} {} obj\n", new_ref.number, new_ref.generation).as_bytes());
-    object.write_pdf(bytes);
+    if force_hex_strings {
+        object.write_pdf_with_forced_hex_strings(bytes);
+    } else {
+        object.write_pdf(bytes);
+    }
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
 }
@@ -627,7 +634,10 @@ fn append_body_object(
     // same ordering as crate::writer's loop (string encryption runs on the
     // whole resolved object before the compress-policy reencode).
     let mut wrapped = Object::Stream(stream);
-    if let Some(ctx) = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref) {
+    let object_encryption = encrypt_ctx.filter(|ctx| new_ref != ctx.encrypt_ref);
+    let force_hex_strings = object_encryption
+        .is_some_and(crate::writer::EncryptionContext::encrypted_strings_require_hex);
+    if let Some(ctx) = object_encryption {
         crate::writer::encrypt_strings_in_object_for_writer(new_ref, &mut wrapped, ctx)?;
     }
     // cov:ignore-start: unreachable — `wrapped` was just constructed as
@@ -692,7 +702,13 @@ fn append_body_object(
     // route to `Never`); force `Never` so the framing matches qpdf.  The
     // primary hint stream keeps its newline via the separate
     // `append_hint_stream_object`, matching qpdf's hint-stream framing.
-    write_stream_to_buf_qpdf_order(bytes, &s, NewlineBeforeEndstream::Never, refiltered);
+    write_stream_to_buf_qpdf_order(
+        bytes,
+        &s,
+        NewlineBeforeEndstream::Never,
+        refiltered,
+        force_hex_strings,
+    );
     bytes.extend_from_slice(b"\nendobj\n");
     Ok(offset)
 }
@@ -1671,20 +1687,10 @@ fn hint_stream_convergence_len(
 /// pass's random IV draws. That precondition holds here: AES-CBC ciphertext
 /// length depends only on plaintext length (PKCS#7 padding, not the IV),
 /// non-hint-stream stream objects use `NewlineBeforeEndstream::Never` (no
-/// IV-dependent framing decision), and AES-encrypted strings are written by
-/// [`crate::object::use_hex_string`]'s content-dependent heuristic, which
-/// forces hex for realistic AES-CBC-with-IV-prefix ciphertext with
-/// overwhelming empirical probability (zero counterexamples in 2,000,000
-/// brute-forced IV trials against a minimal ciphertext) — but this is a
-/// *probabilistic* observation, not a proven guarantee: unlike qpdf, which
-/// unconditionally forces hex for every AES-encrypted string
-/// (`QPDF_String::unparse(true)`, `QPDFWriter.cc:1567-1599`), flpdf's
-/// `use_hex_string` is a content-dependent heuristic applied identically
-/// regardless of encryption method. That gap (tracked separately as
-/// flpdf-a32l, not fixed by this pinning) is the reason the "every OTHER
-/// object has pass-invariant length" precondition above is stated
-/// probabilistically rather than proven. Pinning the hint stream's own IV
-/// removes the ONE source of
+/// IV-dependent framing decision), and every AES-encrypted string is
+/// unconditionally hex encoded like qpdf's `QPDF_String::unparse(true)`
+/// (`QPDFWriter.cc:1567-1599`). Pinning the hint stream's own IV removes the
+/// ONE source of
 /// pass-to-pass variance this writer's algebraic cancellation does NOT
 /// already absorb regardless of that gap — the hint stream's own conditional
 /// newline-before-`endstream` — and matches qpdf's own "encrypt once, reuse

@@ -58,6 +58,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                             &reencoded,
                             source_filter_is_lone_flate,
                             options,
+                            false,
                         );
                     }
                     other => other.write_pdf(&mut bytes),
