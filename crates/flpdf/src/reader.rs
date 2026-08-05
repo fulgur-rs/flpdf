@@ -8115,14 +8115,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_compressed_member_still_rejects_nesting_past_max_parse_depth() {
-        // Unlike the MAX_INLINE_DEPTH/MAX_PARSE_DEPTH gap above, nesting past
-        // MAX_PARSE_DEPTH itself is genuinely unparseable — the underlying
-        // `parse_object_stream_chain_entry` call inside `resolve_to_cache`
-        // already rejects it before `resolve_object_handle` ever reaches the
-        // `lift_bounded` call, so `MAX_PARSE_DEPTH` remains a real ceiling
-        // for the Compressed (ObjStm-member) case too, not just for
-        // Uncompressed objects.
+    fn resolve_object_handle_compressed_member_recovers_qpdfs_excessive_nesting() {
+        // `QPDFParser` does not make deep ObjStm data a hard parse failure:
+        // its context-owned recovery warns and returns null when it encounters
+        // the 501st container. The former slice parser was strict here, so
+        // this regression pins the live parser's shared ObjStm behavior.
         let depth = crate::parser::MAX_PARSE_DEPTH + 5;
         let mut member_value = Vec::new();
         member_value.extend(std::iter::repeat_n(b'[', depth));
@@ -8164,10 +8161,18 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
-        let err = pdf
-            .resolve_object_handle(&handle)
-            .expect_err("a compressed member's nesting beyond MAX_PARSE_DEPTH must be rejected");
-        assert!(matches!(err, Error::Parse { .. }));
+        pdf.resolve_object_handle(&handle)
+            .expect("qpdf-style excessive nesting recovery");
+        assert!(handle.is_null());
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .filter(|message| message.contains("excessively deeply nested"))
+                .collect::<Vec<_>>(),
+            vec!["object stream 4 (object 7 0, offset 504): ignoring excessively deeply nested data structure"]
+        );
     }
 
     #[test]

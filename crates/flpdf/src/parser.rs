@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDFParser.cc object parsing with tokenizer responsibilities still shared elsewhere.
+//! qpdf correspondence: QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries.
 use std::collections::VecDeque;
 
 use crate::object_handle::{ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
@@ -15,6 +15,881 @@ use crate::{Dictionary, Error, Object, ObjectRef, Result};
 /// delegating to its own inherent `get_object_handle` method.
 pub(crate) trait HandleResolver {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle;
+}
+
+/// The narrow live-input surface that qpdf's `InputSource` gives
+/// `QPDFTokenizer`: observe the current position, consume one byte, and give
+/// back the one delimiter byte that terminated a token.
+///
+/// qpdf correspondence: `InputSource::tell`/`read`/`unreadCh`
+/// (`include/qpdf/InputSource.hh:69-85`) as consumed by
+/// `QPDFTokenizer::nextToken` (`libqpdf/QPDFTokenizer.cc:912-964`).
+pub(crate) trait LiveInput {
+    fn tell(&mut self) -> Result<u64>;
+    fn seek(&mut self, offset: u64) -> Result<()>;
+    fn read_byte(&mut self) -> Result<Option<u8>>;
+    fn unread_byte(&mut self) -> Result<()>;
+}
+
+/// A decoded object-stream member is still consumed by qpdf's same
+/// `QPDFParser`; only its coordinate system changes from file-relative to
+/// decoded-stream-relative.  Keep the in-memory input adapter here rather
+/// than falling back to `Parser`'s strict slice path, so file objects and
+/// ObjStm members make exactly the same token/recovery decisions.
+struct SliceLiveInput<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> SliceLiveInput<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn position(&self) -> usize {
+        self.position
+    }
+}
+
+impl LiveInput for SliceLiveInput<'_> {
+    fn tell(&mut self) -> Result<u64> {
+        Ok(self.position as u64)
+    }
+
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        let position = usize::try_from(offset)
+            .map_err(|_| Error::Internal("slice live-input offset does not fit usize".into()))?;
+        if position > self.bytes.len() {
+            return Err(Error::parse(position, "seek past end of parser input"));
+        }
+        self.position = position;
+        Ok(())
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>> {
+        let byte = self.bytes.get(self.position).copied();
+        if byte.is_some() {
+            self.position += 1;
+        }
+        Ok(byte)
+    }
+
+    fn unread_byte(&mut self) -> Result<()> {
+        self.position = self
+            .position
+            .checked_sub(1)
+            .ok_or_else(|| Error::Internal("live tokenizer unread before input start".into()))?;
+        Ok(())
+    }
+}
+
+/// ObjStm parsing has a qpdf document context, but it only returns a legacy
+/// [`Object`].  Keep nested references as direct `ObjectValue::Reference`
+/// values while sharing the live parser, then convert the finished tree back
+/// to `Object::Reference`. This resolver is deliberately local: object
+/// streams do not mint document-cache entries until their owning compressed-
+/// object resolver consumes the result.
+struct DetachedHandles;
+
+impl HandleResolver for DetachedHandles {
+    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        ObjectHandle::from_value(ObjectValue::Reference(object_ref))
+    }
+}
+
+fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
+    if let Some(object_ref) = handle.object_ref() {
+        return Ok(Object::Reference(object_ref));
+    }
+    if let Some(object_ref) = handle.as_reference() {
+        return Ok(Object::Reference(object_ref));
+    }
+    if handle.is_null() {
+        return Ok(Object::Null);
+    }
+    if let Some(value) = handle.as_boolean() {
+        return Ok(Object::Boolean(value));
+    }
+    if let Some(value) = handle.as_integer() {
+        return Ok(Object::Integer(value));
+    }
+    if let Some((value, literal)) = handle.as_real_literal() {
+        return Ok(Object::RealLiteral { value, literal });
+    }
+    if let Some(value) = handle.as_real() {
+        return Ok(Object::Real(value));
+    }
+    if let Some(value) = handle.as_name() {
+        return Ok(Object::Name(value));
+    }
+    if let Some(value) = handle.as_string() {
+        return Ok(Object::String(value));
+    }
+    if let Some(value) = handle.as_operator() {
+        return Ok(Object::Operator(value));
+    }
+    if let Some(value) = handle.as_inline_image() {
+        return Ok(Object::InlineImage(value));
+    }
+    if let Some(values) = handle.as_array() {
+        return values
+            .iter()
+            .map(materialize_live_handle)
+            .collect::<Result<Vec<_>>>()
+            .map(Object::Array);
+    }
+    if let Some(values) = handle.as_dictionary() {
+        let mut dictionary = Dictionary::new();
+        for (key, value) in values {
+            dictionary.insert(key, materialize_live_handle(&value)?);
+        }
+        return Ok(Object::Dictionary(dictionary));
+    }
+    Err(Error::Internal(
+        "live parser produced an unmaterializable direct object handle".into(),
+    ))
+}
+
+/// Pulls exactly one token at a time from a live [`LiveInput`] through the
+/// existing qpdf-shaped push tokenizer.
+///
+/// A token's terminating delimiter is the only byte this adapter replays:
+/// `Tokenizer::get_token` reports that delimiter and qpdf calls
+/// `InputSource::fastUnread(true)` before exposing the token. Completed token
+/// bytes are never buffered or reparsed.
+pub(crate) struct LiveTokenSource<'input, I: LiveInput> {
+    input: &'input mut I,
+    tokenizer: Tokenizer<'static>,
+}
+
+impl<'input, I: LiveInput> LiveTokenSource<'input, I> {
+    pub(crate) fn new(input: &'input mut I) -> Self {
+        let mut tokenizer = Tokenizer::push();
+        // qpdf's document-owned tokenizer enables EOF before all parser
+        // consumers use it (`QPDF.cc:208`). Push EOF is already a token in
+        // flpdf too; retain the policy here so this adapter remains the live
+        // equivalent of that shared tokenizer.
+        tokenizer.allow_eof();
+        Self { input, tokenizer }
+    }
+
+    pub(crate) fn tell(&mut self) -> Result<u64> {
+        self.input.tell()
+    }
+
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        self.input.seek(offset)
+    }
+
+    pub(crate) fn next_token(&mut self) -> Result<Token> {
+        loop {
+            match self.input.read_byte()? {
+                Some(byte) => self.tokenizer.present_character(byte).map_err(|error| {
+                    Error::Internal(format!("live tokenizer state error: {error:?}"))
+                })?,
+                None => self.tokenizer.present_eof().map_err(|error| {
+                    Error::Internal(format!("live tokenizer state error: {error:?}"))
+                })?,
+            }
+
+            let Some(pushed) = self.tokenizer.get_token() else {
+                continue;
+            };
+
+            if pushed.unread.is_some() {
+                self.input.unread_byte()?;
+            }
+            let end = self.input.tell()?;
+            let start = end.saturating_sub(pushed.token.raw.len() as u64);
+            let start = usize::try_from(start).unwrap_or(usize::MAX);
+            let end = usize::try_from(end).unwrap_or(usize::MAX);
+            let mut token = pushed.token;
+            token.start = start;
+            token.error_offset = start;
+            token.end = end;
+            return Ok(token);
+        }
+    }
+}
+
+/// The direct value and parser side effects qpdf produces while reading one
+/// file object body. The caller owns stream/endobj framing, just as
+/// `QPDF::readObject` calls `QPDFParser::parse` before it reads the next
+/// token (`libqpdf/QPDF.cc:1329-1355`).
+#[derive(Debug)]
+pub(crate) struct LiveParsedObject {
+    pub(crate) value: ObjectHandle,
+    pub(crate) parsed_offset: i64,
+    /// `Some(endobj_offset)` when qpdf recovered an empty indirect-object
+    /// body. It leaves that `endobj` unread and reports its offset in the
+    /// enclosing `empty object treated as null` warning.
+    pub(crate) empty: Option<u64>,
+    pub(crate) diagnostics: Vec<ParserDiagnostic>,
+}
+
+/// Parse one file-object value from a live source. This is deliberately
+/// handle-producing: nested indirect references go through `resolver` as
+/// they are encountered and are not resolved or materialized during parsing.
+pub(crate) fn parse_live_file_object<I: LiveInput>(
+    input: &mut I,
+    resolver: &mut dyn HandleResolver,
+) -> Result<LiveParsedObject> {
+    parse_live_file_object_with_context(input, resolver, true)
+}
+
+/// Parse one standalone object string through qpdf's parser entry point with
+/// no owning document context, matching `QPDFObjectHandle::parse(string)`.
+///
+/// qpdf makes the absence of a `QPDF*` observable: a nested `N G R` is a
+/// logic error instead of a detached reference, and a recoverable parser
+/// warning terminates the explicit parse. It also accepts only C `isspace`
+/// trailing bytes, not PDF comments.
+///
+/// qpdf correspondence: `QPDFObjectHandle::parse`
+/// (`libqpdf/QPDFObjectHandle.cc:1672-1698`) and `QPDFParser::parseRemainder`
+/// (`libqpdf/QPDFParser.cc:135-176`).
+pub(crate) fn parse_explicit_object_handle(input: &[u8]) -> Result<ObjectHandle> {
+    let mut input_source = SliceLiveInput::new(input);
+    let mut detached_handles = DetachedHandles;
+    let parsed =
+        parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false)?;
+
+    if let Some(diagnostic) = parsed.diagnostics.into_iter().next() {
+        return Err(Error::parse(diagnostic.relative_offset, diagnostic.message));
+    }
+
+    let trailing_offset = input_source.position();
+    if input[trailing_offset..]
+        .iter()
+        .any(|byte| !is_c_whitespace(*byte))
+    {
+        return Err(Error::parse(
+            trailing_offset,
+            "trailing data found parsing object from string",
+        ));
+    }
+
+    Ok(parsed.value)
+}
+
+fn is_c_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+fn parse_live_file_object_with_context<I: LiveInput>(
+    input: &mut I,
+    resolver: &mut dyn HandleResolver,
+    has_context: bool,
+) -> Result<LiveParsedObject> {
+    let mut tokens = LiveTokenSource::new(input);
+    let mut parser = LiveFileParser {
+        tokens: &mut tokens,
+        resolver,
+        buffered: VecDeque::new(),
+        diagnostics: Vec::new(),
+        depth: 0,
+        good_count: 0,
+        bad_count: 0,
+        give_up: false,
+        has_context,
+    };
+    parser.parse()
+}
+
+struct LiveFileParser<'tokens, 'input, I: LiveInput> {
+    tokens: &'tokens mut LiveTokenSource<'input, I>,
+    resolver: &'tokens mut dyn HandleResolver,
+    buffered: VecDeque<Token>,
+    diagnostics: Vec<ParserDiagnostic>,
+    depth: usize,
+    /// qpdf's `good_count` / `bad_count` recovery guard. These counters apply
+    /// after the outer container has entered `parseRemainder`.
+    good_count: usize,
+    bad_count: usize,
+    give_up: bool,
+    has_context: bool,
+}
+
+impl<I: LiveInput> LiveFileParser<'_, '_, I> {
+    fn parse(&mut self) -> Result<LiveParsedObject> {
+        // QPDFParser records `input->tell()` before reading its first token,
+        // deliberately including leading whitespace in a top-level scalar's
+        // parsed offset (`QPDFParser.cc:32-36,413-421`).
+        let start = self.tokens.tell()?;
+        let start_offset = i64::try_from(start).unwrap_or(i64::MAX);
+        let token = self.next_token()?;
+
+        if token.is_word_value(b"endobj") {
+            self.tokens.seek(token.start as u64)?;
+            return Ok(LiveParsedObject {
+                value: ObjectHandle::null(),
+                parsed_offset: NO_PARSED_OFFSET,
+                empty: Some(token.start as u64),
+                diagnostics: std::mem::take(&mut self.diagnostics),
+            });
+        }
+
+        let value = self.parse_from_token(token, start_offset, true)?;
+        let parsed_offset = value.get_parsed_offset();
+        Ok(LiveParsedObject {
+            value,
+            parsed_offset,
+            empty: None,
+            diagnostics: std::mem::take(&mut self.diagnostics),
+        })
+    }
+
+    fn parse_from_token(
+        &mut self,
+        token: Token,
+        scalar_offset: i64,
+        top_level: bool,
+    ) -> Result<ObjectHandle> {
+        match token.token_type {
+            // qpdf keeps its parser frames on an explicit vector. The Rust
+            // direct implementation recurses, so give every container entry
+            // the same stack-growth guard as the legacy parser before the
+            // 500-level qpdf limit can exhaust a small caller thread stack.
+            TokenType::DictOpen => stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || {
+                self.dictionary(token.start, token.end)
+            }),
+            TokenType::ArrayOpen => stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || {
+                self.array(token.start)
+            }),
+            TokenType::Name => Ok(Self::direct_at(
+                ObjectValue::Name(token.value[1..].to_vec()),
+                scalar_offset,
+            )),
+            TokenType::String => Ok(Self::direct_at(
+                ObjectValue::String(token.value),
+                scalar_offset,
+            )),
+            TokenType::Bool => Ok(Self::direct_at(
+                ObjectValue::Boolean(token.value == b"true"),
+                scalar_offset,
+            )),
+            // qpdf gives parsed null no description, so its parsed offset is
+            // always -1 (`QPDFParser.cc:81-82,308-310`).
+            TokenType::Null => Ok(ObjectHandle::null()),
+            TokenType::Integer => self.integer_or_ref(token, scalar_offset, top_level),
+            TokenType::Real => self.real(token, scalar_offset),
+            TokenType::Word => {
+                self.warn(
+                    token.start,
+                    "unknown token while reading object; treating as string",
+                )?;
+                self.too_many_bad_tokens(token.start)?;
+                Ok(Self::direct_at(
+                    ObjectValue::String(token.value),
+                    scalar_offset,
+                ))
+            }
+            TokenType::Bad => {
+                self.too_many_bad_tokens(token.start)?;
+                Ok(ObjectHandle::null())
+            }
+            TokenType::BraceOpen | TokenType::BraceClose => {
+                self.warn(token.start, "treating unexpected brace token as null")?;
+                self.too_many_bad_tokens(token.start)?;
+                Ok(ObjectHandle::null())
+            }
+            TokenType::ArrayClose => {
+                self.warn(token.start, "treating unexpected array close token as null")?;
+                self.too_many_bad_tokens(token.start)?;
+                Ok(ObjectHandle::null())
+            }
+            TokenType::DictClose => {
+                self.warn(token.start, "unexpected dictionary close token")?;
+                self.too_many_bad_tokens(token.start)?;
+                Ok(ObjectHandle::null())
+            }
+            TokenType::Eof => {
+                self.warn(token.start, "unexpected EOF")?;
+                Ok(ObjectHandle::null())
+            }
+            TokenType::Space | TokenType::Comment | TokenType::InlineImage => {
+                self.warn(
+                    token.start,
+                    "treating unknown token type as null while reading object",
+                )?;
+                self.too_many_bad_tokens(token.start)?;
+                Ok(ObjectHandle::null())
+            }
+        }
+    }
+
+    fn array(&mut self, start: usize) -> Result<ObjectHandle> {
+        if !self.enter_container(start)? {
+            return Ok(ObjectHandle::null());
+        }
+        let mut values = Vec::new();
+        let result = loop {
+            let token = self.next_token()?;
+            self.good_count += 1;
+            if token.token_type == TokenType::ArrayClose {
+                break Ok(Self::direct(
+                    ObjectValue::Array(values),
+                    token.start.min(start),
+                ));
+            }
+            if token.token_type == TokenType::Eof {
+                self.warn(token.start, "parse error while reading object")?;
+                self.warn(token.start, "unexpected EOF")?;
+                break Ok(ObjectHandle::null());
+            }
+            let value = self.parse_from_token(token.clone(), token.start as i64, false)?;
+            values.push(value);
+            if self.give_up {
+                break Ok(ObjectHandle::null());
+            }
+        };
+        self.depth -= 1;
+        result
+    }
+
+    fn dictionary(&mut self, start: usize, frame_offset: usize) -> Result<ObjectHandle> {
+        if !self.enter_container(start)? {
+            return Ok(ObjectHandle::null());
+        }
+        let mut values = std::collections::BTreeMap::new();
+        let mut orphan_values = Vec::new();
+        let mut pending_key: Option<Vec<u8>> = None;
+        let result = loop {
+            let token = self.next_token()?;
+            self.good_count += 1;
+            if token.token_type == TokenType::DictClose {
+                if let Some(key) = pending_key.take() {
+                    self.warn(
+                        frame_offset,
+                        "dictionary ended prematurely; using null as value for last key",
+                    )?;
+                    // qpdf assigns this recovery null directly rather than
+                    // routing it through `add`, so even a duplicate final
+                    // key gets only the premature-end warning.
+                    values.insert(key, ObjectHandle::null());
+                }
+                let orphan_names: std::collections::BTreeSet<Vec<u8>> = orphan_values
+                    .iter()
+                    .filter_map(ObjectHandle::as_name)
+                    .collect();
+                let mut fake = 1;
+                for value in orphan_values {
+                    let key = loop {
+                        let candidate = format!("QPDFFake{fake}").into_bytes();
+                        fake += 1;
+                        if !values.contains_key(&candidate) && !orphan_names.contains(&candidate) {
+                            break candidate;
+                        }
+                    };
+                    self.warn(
+                        frame_offset,
+                        format!(
+                            "expected dictionary key but found non-name object; inserting key /{}",
+                            String::from_utf8_lossy(&key)
+                        ),
+                    )?;
+                    values.insert(key, value);
+                }
+                break Ok(Self::direct(ObjectValue::Dictionary(values), start));
+            }
+            if token.token_type == TokenType::Eof {
+                self.warn(token.start, "parse error while reading object")?;
+                self.warn(token.start, "unexpected EOF")?;
+                break Ok(ObjectHandle::null());
+            }
+
+            if pending_key.is_none() && token.token_type == TokenType::Name {
+                pending_key = Some(token.value[1..].to_vec());
+                continue;
+            }
+
+            let value = self.parse_from_token(token.clone(), token.start as i64, false)?;
+            if let Some(key) = pending_key.take() {
+                Self::insert_dictionary_value(&mut values, key, value, frame_offset, self)?;
+            } else {
+                orphan_values.push(value);
+            }
+            if self.give_up {
+                break Ok(ObjectHandle::null());
+            }
+        };
+        self.depth -= 1;
+        result
+    }
+
+    fn insert_dictionary_value(
+        values: &mut std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
+        key: Vec<u8>,
+        value: ObjectHandle,
+        offset: usize,
+        parser: &mut Self,
+    ) -> Result<()> {
+        if values.insert(key.clone(), value).is_some() {
+            parser.warn(
+                offset,
+                format!(
+                    "dictionary has duplicated key /{}; last occurrence overrides earlier ones",
+                    String::from_utf8_lossy(&key)
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn integer_or_ref(
+        &mut self,
+        token: Token,
+        offset: i64,
+        top_level: bool,
+    ) -> Result<ObjectHandle> {
+        let first = parse_integer_token(&token)?;
+        if top_level {
+            return Ok(Self::direct_at(ObjectValue::Integer(first), offset));
+        }
+
+        let second_token = self.next_token()?;
+        if second_token.token_type != TokenType::Integer {
+            self.unread_token(second_token);
+            return Ok(Self::direct_at(ObjectValue::Integer(first), offset));
+        }
+        let second = parse_integer_token(&second_token)?;
+        let third = self.next_token()?;
+        if third.is_word_value(b"R") {
+            // The two lookahead tokens are consumed only for a complete
+            // indirect reference; otherwise they are replayed through the
+            // outer parser loop, which will count them there.
+            if !self.has_context {
+                return Err(Error::Internal(
+                    "QPDFParser::parse called without context on an object with indirect references"
+                        .into(),
+                ));
+            }
+            self.good_count += 2;
+            if let (Ok(number), Ok(generation)) = (u32::try_from(first), u16::try_from(second)) {
+                if number >= 1 && generation < 65535 {
+                    return Ok(self
+                        .resolver
+                        .indirect_handle(ObjectRef::new(number, generation)));
+                }
+            }
+            return Ok(ObjectHandle::null());
+        }
+        self.unread_token(third);
+        self.unread_token(second_token);
+        Ok(Self::direct_at(ObjectValue::Integer(first), offset))
+    }
+
+    fn real(&self, token: Token, offset: i64) -> Result<ObjectHandle> {
+        let value = match classify_real(token)? {
+            RealClassification::Canonical(value) => ObjectValue::Real(value),
+            RealClassification::Literal { value, literal } => {
+                ObjectValue::RealLiteral { value, literal }
+            }
+        };
+        Ok(Self::direct_at(value, offset))
+    }
+
+    fn direct(value: ObjectValue, offset: usize) -> ObjectHandle {
+        Self::direct_at(value, i64::try_from(offset).unwrap_or(i64::MAX))
+    }
+
+    fn direct_at(value: ObjectValue, offset: i64) -> ObjectHandle {
+        let handle = ObjectHandle::from_value(value);
+        handle.set_parsed_offset_if_unset(offset);
+        handle
+    }
+
+    fn enter_container(&mut self, offset: usize) -> Result<bool> {
+        // qpdf checks the already-open stack before adding a new frame: 500
+        // containers are accepted and the 501st recovers as a null object.
+        if self.depth >= MAX_PARSE_DEPTH {
+            self.warn(offset, "ignoring excessively deeply nested data structure")?;
+            self.give_up = true;
+            return Ok(false);
+        }
+        self.depth += 1;
+        Ok(true)
+    }
+
+    fn next_token(&mut self) -> Result<Token> {
+        let token = if let Some(token) = self.buffered.pop_front() {
+            token
+        } else {
+            self.tokens.next_token()?
+        };
+        if let Some(message) = token.error_message.as_deref() {
+            self.warn(token.start, String::from_utf8_lossy(message))?;
+        }
+        Ok(token)
+    }
+
+    fn unread_token(&mut self, token: Token) {
+        self.buffered.push_front(token);
+    }
+
+    /// `QPDFParser::tooManyBadTokens` (`QPDFParser.cc:456-469`). The caller
+    /// has already emitted the token-specific warning; this may emit qpdf's
+    /// final give-up warning and asks all enclosing frames to return null.
+    fn too_many_bad_tokens(&mut self, offset: usize) -> Result<()> {
+        if self.good_count <= 4 {
+            self.bad_count += 1;
+            if self.bad_count > 5 {
+                self.warn(offset, "too many errors; giving up on reading object")?;
+                self.give_up = true;
+            }
+        } else {
+            self.bad_count = 1;
+        }
+        self.good_count = 0;
+        Ok(())
+    }
+
+    fn warn(&mut self, offset: usize, message: impl Into<String>) -> Result<()> {
+        let message = message.into();
+        if !self.has_context {
+            return Err(Error::parse(offset, message));
+        }
+        self.diagnostics.push(ParserDiagnostic {
+            relative_offset: offset,
+            message,
+        });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_input_tests {
+    use super::{
+        parse_live_file_object, parse_qpdf_file_object, HandleResolver, LiveInput, LiveTokenSource,
+        MAX_PARSE_DEPTH,
+    };
+    use crate::object_handle::{ObjectHandle, ObjectValue};
+    use crate::tokenizer::TokenType;
+    use crate::{ObjectRef, Result};
+
+    struct CountingInput {
+        bytes: &'static [u8],
+        position: usize,
+        reads: Vec<usize>,
+    }
+
+    impl CountingInput {
+        fn new(bytes: &'static [u8]) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                reads: vec![0; bytes.len()],
+            }
+        }
+    }
+
+    impl LiveInput for CountingInput {
+        fn tell(&mut self) -> Result<u64> {
+            Ok(self.position as u64)
+        }
+
+        fn seek(&mut self, offset: u64) -> Result<()> {
+            self.position = usize::try_from(offset).expect("test offsets fit usize");
+            Ok(())
+        }
+
+        fn read_byte(&mut self) -> Result<Option<u8>> {
+            let Some(&byte) = self.bytes.get(self.position) else {
+                return Ok(None);
+            };
+            self.reads[self.position] += 1;
+            self.position += 1;
+            Ok(Some(byte))
+        }
+
+        fn unread_byte(&mut self) -> Result<()> {
+            self.position = self
+                .position
+                .checked_sub(1)
+                .expect("only unread a byte just read");
+            Ok(())
+        }
+    }
+
+    struct NullResolver;
+
+    impl HandleResolver for NullResolver {
+        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::new_indirect_unresolved(object_ref, -1)
+        }
+    }
+
+    // This catches a production regression where the live adapter retains a
+    // completed token or replays the object prefix after a delimiter. The
+    // expected positions are derived from `QPDFTokenizer::nextToken`: the
+    // delimiter is read once to terminate `12`, then unread and re-read as
+    // ignorable input for `/A`; completed-token bytes are read only once.
+    #[test]
+    fn live_token_source_unreads_only_the_delimiter_between_completed_tokens() {
+        let mut input = CountingInput::new(b"12 /A");
+        let mut tokens = LiveTokenSource::new(&mut input);
+
+        let first = tokens.next_token().expect("first token");
+        assert_eq!(first.token_type, TokenType::Integer);
+        assert_eq!(first.value, b"12");
+        assert_eq!(first.start, 0);
+        assert_eq!(tokens.tell().unwrap(), 2);
+
+        let second = tokens.next_token().expect("second token");
+        assert_eq!(second.token_type, TokenType::Name);
+        assert_eq!(second.value, b"/A");
+        assert_eq!(second.start, 3);
+        assert_eq!(tokens.tell().unwrap(), 5);
+
+        drop(tokens);
+        assert_eq!(input.reads, vec![1, 1, 2, 1, 1]);
+    }
+
+    // This catches the production regression where file-object parsing falls
+    // back to a growing slice and restarts at its first byte. The real parser
+    // must return after `]`, retain qpdf's opening-delimiter offset, and have
+    // replayed only delimiters that become the next token (the integer's
+    // whitespace and the name's closing-array delimiter).
+    #[test]
+    fn live_file_object_parser_consumes_one_object_without_replaying_its_prefix() {
+        let mut input = CountingInput::new(b" \n[12 /A] tail");
+        let mut resolver = NullResolver;
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("array object");
+
+        assert!(parsed.empty.is_none());
+        assert_eq!(parsed.parsed_offset, 2);
+        assert!(matches!(
+            parsed.value.into_direct_value(),
+            Some((ObjectValue::Array(values), 2))
+                if matches!(values.as_slice(), [first, second]
+                    if first.as_integer() == Some(12) && second.as_name() == Some(b"A".to_vec()))
+        ));
+        assert_eq!(input.position, 9);
+        assert_eq!(input.reads, vec![1, 1, 1, 1, 1, 2, 1, 1, 2, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn live_file_parser_uses_qpdfs_top_level_and_nested_offsets() {
+        let mut scalar_input = CountingInput::new(b"  /Top");
+        let mut resolver = NullResolver;
+        let scalar = parse_live_file_object(&mut scalar_input, &mut resolver).expect("name");
+        assert_eq!(scalar.parsed_offset, 0, "leading whitespace is included");
+
+        let mut nested_input = CountingInput::new(b" \n[/Nested]");
+        let nested = parse_live_file_object(&mut nested_input, &mut resolver).expect("array");
+        assert_eq!(
+            nested.parsed_offset, 2,
+            "the array owns its opening delimiter"
+        );
+        assert_eq!(
+            nested
+                .value
+                .as_array()
+                .expect("array value")
+                .first()
+                .expect("name item")
+                .get_parsed_offset(),
+            3,
+            "nested scalar offsets start at their own token"
+        );
+    }
+
+    #[test]
+    fn live_file_parser_stops_after_qpdfs_sixth_bad_token() {
+        let mut input = CountingInput::new(b"[ } } } } } } 1 ]");
+        let mut resolver = NullResolver;
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("recovered null");
+
+        assert!(parsed.value.is_null());
+        assert_eq!(
+            parsed
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "treating unexpected brace token as null",
+                "treating unexpected brace token as null",
+                "treating unexpected brace token as null",
+                "treating unexpected brace token as null",
+                "treating unexpected brace token as null",
+                "treating unexpected brace token as null",
+                "too many errors; giving up on reading object",
+            ]
+        );
+        assert_eq!(input.position, 13, "tokens after the give-up remain unread");
+    }
+
+    #[test]
+    fn live_file_parser_recovers_the_501st_nested_container_as_null() {
+        let input = vec![b'['; MAX_PARSE_DEPTH + 1];
+        let leaked: &'static [u8] = Box::leak(input.into_boxed_slice());
+        let mut input = CountingInput::new(leaked);
+        let mut resolver = NullResolver;
+
+        let parsed = parse_live_file_object(&mut input, &mut resolver).expect("recovered null");
+
+        assert!(parsed.value.is_null());
+        assert_eq!(
+            parsed
+                .diagnostics
+                .last()
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some("ignoring excessively deeply nested data structure")
+        );
+    }
+
+    #[test]
+    fn live_file_parser_accepts_qpdfs_500_container_limit_on_a_small_stack() {
+        let mut bytes = vec![b'['; MAX_PARSE_DEPTH];
+        bytes.extend(std::iter::repeat_n(b']', MAX_PARSE_DEPTH));
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let outcome = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut input = CountingInput::new(leaked);
+                let mut resolver = NullResolver;
+                parse_live_file_object(&mut input, &mut resolver)
+                    .expect("500 nested containers must parse")
+                    .value
+                    .is_null()
+            })
+            .expect("spawn small-stack parser thread")
+            .join()
+            .expect("live parser must not overflow the caller stack");
+
+        assert!(!outcome, "a valid 500-level array must not recover to null");
+    }
+
+    #[test]
+    fn objstm_member_uses_the_live_file_recovery_and_decoded_stream_offsets() {
+        // `parse_qpdf_file_object` is consumed by `parse_object_stream_entry`.
+        // This is deliberately malformed: qpdf keeps the scalar under a fake
+        // key and warns at qpdf's dictionary-frame offset (just after `<<`),
+        // rather than taking the legacy strict-parser error branch.
+        let (object, diagnostics) =
+            parse_qpdf_file_object(b"<< 12 >> next-member").expect("recovered ObjStm member");
+
+        assert_eq!(
+            object
+                .as_dict()
+                .and_then(|dict| dict.get("QPDFFake1"))
+                .cloned(),
+            Some(crate::Object::Integer(12))
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.relative_offset, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                2,
+                "expected dictionary key but found non-name object; inserting key /QPDFFake1"
+            )]
+        );
+    }
 }
 
 /// Parse a single PDF object from `input`, which must contain nothing but
@@ -68,11 +943,18 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 /// Object-stream members use this mode without any `endobj` check because an
 /// ObjStm body contains only adjacent direct-object representations.
 pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
-    let mut tokenizer = Tokenizer::new(input);
-    let mut parser = Parser::with_tokenizer(&mut tokenizer);
-    parser.top_level_no_reference = true;
-    let object = parser.object()?;
-    Ok((object, parser.diagnostics))
+    let mut input = SliceLiveInput::new(input);
+    let mut handles = DetachedHandles;
+    let parsed = parse_live_file_object(&mut input, &mut handles)?;
+    let object = materialize_live_handle(&parsed.value)?;
+    let mut diagnostics = parsed.diagnostics;
+    if let Some(empty_offset) = parsed.empty {
+        diagnostics.push(ParserDiagnostic {
+            relative_offset: usize::try_from(empty_offset).unwrap_or(usize::MAX),
+            message: "empty object treated as null".to_string(),
+        });
+    }
+    Ok((object, diagnostics))
 }
 
 #[derive(Debug, PartialEq)]
@@ -150,78 +1032,19 @@ pub(crate) fn parse_qpdf_direct_object_handle(
     base_offset: i64,
     resolver: &mut dyn HandleResolver,
 ) -> Result<(ObjectValue, i64)> {
-    let parsed = parse_qpdf_direct_object_handle_with_end(input, base_offset, resolver)?;
-    Ok((parsed.value, parsed.parsed_offset))
-}
-
-/// What [`parse_qpdf_direct_object_handle_with_end`] reports, mirroring
-/// [`ParsedDirectObject`]'s shape for the handle-producing path.
-#[derive(Debug)]
-pub(crate) struct ParsedHandleObject {
-    /// The parsed value.
-    pub(crate) value: ObjectValue,
-    /// Its qpdf `getParsedOffset`, already shifted by `base_offset`.
-    pub(crate) parsed_offset: i64,
-    /// The position in `input` immediately after the value consumed.
-    pub(crate) end: usize,
-    /// Every recoverable diagnostic the parse raised, in the order raised.
-    pub(crate) diagnostics: Vec<ParserDiagnostic>,
-}
-
-/// [`parse_qpdf_direct_object_handle`], additionally reporting the position in
-/// `input` immediately after the value it consumed, and the diagnostics the
-/// parse raised.
-///
-/// qpdf never needs the position: `QPDFParser::parse` consumes `m->file`
-/// directly, so the input source is *already* positioned after the object when
-/// it returns and `QPDF::readObject` can just call `readToken(m->file)` again
-/// (`libqpdf/QPDF.cc:1346`). flpdf's parser runs over a slice, so the caller
-/// has to be told how far it got in order to put its own input source in the
-/// same place. `reader/resolver.rs` is the caller that needs it; the
-/// two-value form above is what every existing caller keeps using.
-///
-/// The diagnostics are reported for the same reason qpdf's are not: qpdf's
-/// parser warns through the document as it goes — `QPDFParser::parse`
-/// (`libqpdf/QPDFParser.cc:38-40`) and `QPDFParser::parseRemainder` (`:141-143`)
-/// each call `warn(tokenizer.getErrorMessage())`, and `QPDFParser::warn`
-/// (`:488`) forwards to `context->warn` (`:494`), the enclosing `QPDF`. flpdf's
-/// parser has no document to warn through, so it accumulates instead and the
-/// caller decides when to raise them — which for `reader/resolver.rs` matters,
-/// because its `scan_forward` runs this parse more than once per object.
-///
-/// For the recovered-empty-object case the reported position is the start of
-/// the `endobj` token, not past it: `peek_token` does not consume, matching
-/// qpdf, whose `QPDFParser` likewise leaves `endobj` for its caller to read.
-pub(crate) fn parse_qpdf_direct_object_handle_with_end(
-    input: &[u8],
-    base_offset: i64,
-    resolver: &mut dyn HandleResolver,
-) -> Result<ParsedHandleObject> {
     let mut tokenizer = Tokenizer::new(input);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.top_level_no_reference = true;
     let token = parser.peek_token()?;
     if token.is_word_value(b"endobj") {
-        return Ok(ParsedHandleObject {
-            value: ObjectValue::Null,
-            parsed_offset: NO_PARSED_OFFSET,
-            end: parser.position(),
-            diagnostics: parser.diagnostics,
-        });
+        return Ok((ObjectValue::Null, NO_PARSED_OFFSET));
     }
 
     let handle = parser.object_handle(base_offset, resolver)?;
-    let end = parser.position();
-    let (value, parsed_offset) = handle.into_direct_value().expect(
+    Ok(handle.into_direct_value().expect(
         "top_level_no_reference forces the outermost integer_or_ref decision to Integer, \
          so the top-level handle this function just built is always direct",
-    );
-    Ok(ParsedHandleObject {
-        value,
-        parsed_offset,
-        end,
-        diagnostics: parser.diagnostics,
-    })
+    ))
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
