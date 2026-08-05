@@ -4063,9 +4063,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             if options.qdf {
                 // qpdf --qdf trailer: "trailer <<" on one line, then one
                 // "  /Key value" entry per line with the keys alphabetically
-                // sorted but /ID forced LAST (verified empirically against
-                // qpdf 11.9.0: minimal => /Root /Size /ID; three-page =>
-                // /Info /Root /Size /ID). Values use the EXISTING compact
+                // sorted but /ID and /Encrypt forced last in that order
+                // (verified against qpdf 11.9.0: minimal => /Root /Size /ID;
+                // encrypted => /Info /Root /Size /ID /Encrypt, with the final
+                // two entries on one line). Values use the EXISTING compact
                 // serializer, which keeps the /ID array inline
                 // ("[<hex><hex>]") — do NOT route the trailer through the qdf
                 // dict serializer. Closing ">>" then startxref directly (no
@@ -4497,13 +4498,14 @@ fn write_stream_to_buf_qdf(
 /// >>
 /// ```
 ///
-/// Keys are emitted alphabetically by raw name, **except `/ID` which is forced
-/// last** — this matches qpdf 11.9.0 exactly (minimal.pdf: `/Root /Size /ID`;
-/// three-page.pdf: `/Info /Root /Size /ID`). Each value is written with the
-/// EXISTING compact [`Object::write_pdf`] serializer, so array values such as
-/// `/ID [<hex><hex>]` stay inline (qpdf formats the trailer specially). The
-/// closing `>>` is followed by a newline; the caller appends `startxref`
-/// directly afterwards.
+/// Keys are emitted alphabetically by raw name, **except `/ID` and `/Encrypt`,
+/// which are forced last in that order** — this matches qpdf 11.9.0's
+/// `QPDFWriter::writeTrailer` (`QPDFWriter.cc:1160-1236`). In QDF mode qpdf
+/// writes `/Encrypt` on the same line immediately after `/ID`. Each value is
+/// written with the EXISTING compact [`Object::write_pdf`] serializer, so array
+/// values such as `/ID [<hex><hex>]` stay inline (qpdf formats the trailer
+/// specially). The closing `>>` is followed by a newline; the caller appends
+/// `startxref` directly afterwards.
 ///
 /// When `id_writer` is `Some`, the `/ID` *value* is produced by that closure
 /// (the `  /ID ` key token is still emitted) instead of serializing the
@@ -4520,11 +4522,17 @@ fn write_qdf_trailer(
     bytes.extend_from_slice(b"trailer <<\n");
 
     // `Dictionary::iter()` already yields keys in lexicographic (BTreeMap)
-    // order; split out /ID so it can be appended last.
+    // order; split out /ID and /Encrypt so they can be appended last in
+    // qpdf's writer-state order.
     let mut id_value: Option<&Object> = None;
+    let mut encrypt_value: Option<&Object> = None;
     for (key, value) in trailer.iter() {
         if key == b"ID" {
             id_value = Some(value);
+            continue;
+        }
+        if key == b"Encrypt" {
+            encrypt_value = Some(value);
             continue;
         }
         bytes.extend_from_slice(b"  /");
@@ -4539,6 +4547,14 @@ fn write_qdf_trailer(
             Some(write_id) => write_id(bytes),
             None => crate::object::write_id_style_value(bytes, value),
         }
+    }
+    if let Some(value) = encrypt_value {
+        // Encrypted writes always materialize /ID before this serializer;
+        // qpdf appends /Encrypt to that same QDF trailer line.
+        bytes.extend_from_slice(b" /Encrypt ");
+        value.write_pdf(bytes);
+    }
+    if id_value.is_some() || encrypt_value.is_some() {
         bytes.push(b'\n');
     }
 
@@ -5695,6 +5711,40 @@ mod tests {
             &QPDF_STATIC_ID[..],
             "stored /ID[1] (qpdf static constant) must be serialized verbatim"
         );
+    }
+
+    #[test]
+    fn qdf_encrypted_trailer_puts_encrypt_after_id_on_the_same_final_line() {
+        let mut trailer = Dictionary::new();
+        trailer.insert("Encrypt", Object::Reference(ObjectRef::new(9, 0)));
+        trailer.insert("Info", Object::Reference(ObjectRef::new(7, 0)));
+        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
+        trailer.insert("Size", Object::Integer(10));
+        trailer.insert(
+            "ID",
+            Object::Array(vec![Object::String(vec![1]), Object::String(vec![2])]),
+        );
+
+        let mut out = Vec::new();
+        write_qdf_trailer(&mut out, &trailer, None);
+
+        assert_eq!(
+            out,
+            b"trailer <<\n  /Info 7 0 R\n  /Root 1 0 R\n  /Size 10\n  /ID [<01><02>] /Encrypt 9 0 R\n>>\n",
+            "qpdf writes normal keys first, followed by /ID and /Encrypt on the final line"
+        );
+    }
+
+    #[test]
+    fn qdf_trailer_without_id_or_encrypt_closes_after_sorted_keys() {
+        let mut trailer = Dictionary::new();
+        trailer.insert("Root", Object::Reference(ObjectRef::new(1, 0)));
+        trailer.insert("Size", Object::Integer(2));
+
+        let mut out = Vec::new();
+        write_qdf_trailer(&mut out, &trailer, None);
+
+        assert_eq!(out, b"trailer <<\n  /Root 1 0 R\n  /Size 2\n>>\n");
     }
 
     #[test]

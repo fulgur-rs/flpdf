@@ -56,6 +56,43 @@ fn assert_qdf_encrypted_output(output: &Path, password: &str) {
         bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
         "encrypted QDF output must carry /Encrypt"
     );
+    let trailer_marker = b"\ntrailer <<\n";
+    let trailer_start = bytes
+        .windows(trailer_marker.len())
+        .rposition(|window| window == trailer_marker)
+        .expect("encrypted QDF output has a classic trailer")
+        + trailer_marker.len();
+    let trailer = &bytes[trailer_start..];
+    let id_offset = trailer
+        .windows(b"  /ID ".len())
+        .position(|window| window == b"  /ID ")
+        .expect("encrypted QDF trailer has /ID");
+    let encrypt_offset = trailer
+        .windows(b" /Encrypt ".len())
+        .position(|window| window == b" /Encrypt ")
+        .expect("encrypted QDF trailer has /Encrypt");
+    let encrypt_line_end = trailer[encrypt_offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|offset| encrypt_offset + offset)
+        .expect("encrypted QDF trailer /Encrypt line is terminated");
+    let encrypt_fields: Vec<&[u8]> = trailer[encrypt_offset..encrypt_line_end]
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty())
+        .collect();
+    assert!(
+        id_offset < encrypt_offset
+            && !trailer[id_offset..encrypt_offset].contains(&b'\n')
+            && encrypt_fields.len() == 4
+            && encrypt_fields[0] == b"/Encrypt"
+            && !encrypt_fields[1].is_empty()
+            && encrypt_fields[1].iter().all(|byte| byte.is_ascii_digit())
+            && encrypt_fields[2] == b"0"
+            && encrypt_fields[3] == b"R"
+            && trailer[encrypt_line_end..].starts_with(b"\n>>\n"),
+        "qpdf writes /ID then a final /Encrypt N 0 R on the same QDF trailer line: {}",
+        String::from_utf8_lossy(trailer)
+    );
 
     let check = ShellCommand::new("qpdf")
         .arg(format!("--password={password}"))
