@@ -6130,9 +6130,16 @@ mod tests {
     }
 
     /// `--deterministic-id` combined with encryption is rejected up front:
-    /// the linearized writer emits plaintext only, and a content-derived `/ID`
-    /// cannot be computed once the bytes are encrypted. Mirrors the flat
-    /// (`write_pdf_full_rewrite`) guard, including its wording.
+    /// a content-derived `/ID` cannot be computed once the bytes are
+    /// encrypted, and the file encryption key itself derives from `/ID[0]`
+    /// (PDF Algorithm 2) — the same restriction qpdf enforces (verified
+    /// empirically: `qpdf --deterministic-id --linearize --encrypt ...`
+    /// fails with qpdf's own `QPDFWriter::generateID` internal error). This
+    /// guard does not mean linearize+encrypt is unsupported in general —
+    /// non-deterministic (default) and `--static-id` `/ID`s combine with
+    /// encryption just fine; see [`write_linearized`]'s `# Errors` section.
+    /// Mirrors the flat (`write_pdf_full_rewrite`) guard, including its
+    /// wording.
     #[test]
     fn deterministic_id_linearized_rejects_encrypt() {
         let mut pdf = open_tiny_pdf();
