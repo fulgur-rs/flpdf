@@ -1646,14 +1646,22 @@ fn hint_stream_convergence_len(
 /// is instead invoked fresh on every iteration of this writer's own
 /// convergence loop — probe passes and the final pass alike — so without
 /// `--static-aes-iv` each call draws a new random IV and produces different
-/// ciphertext bytes for the (eventually stable) plaintext payload. This is
-/// safe: AES-CBC ciphertext length is IV-invariant, so every pass agrees on
-/// the hint stream's on-disk byte length regardless of which IV was drawn
-/// (the length used by [`hint_stream_convergence_len`] and by
-/// `hint_stream_obj_total_len` in `do_write_pass` is unaffected), and only
-/// the FINAL pass's bytes are ever kept — there is no mismatch between the
-/// offsets baked into the shipped file and the ciphertext that ships with
-/// it.
+/// ciphertext bytes for the (eventually stable) plaintext payload.
+///
+/// This is safe, and does NOT depend on any IV-related length argument:
+/// [`hint_stream_convergence_len`] — unchanged by encryption support, still
+/// PLAINTEXT-only, see its own doc for why comparing it across iterations
+/// soundly detects when the underlying hint-table structure has stabilized
+/// — is only ever used as the convergence loop's stopping criterion. The
+/// value that actually drives every downstream offset calculation,
+/// `hint_stream_obj_total_len` (`do_write_pass`'s `bytes.len() -
+/// hint_stream_offset`), is instead measured directly from THIS function's
+/// real emitted bytes, freshly, on every single pass including the final
+/// one. So whatever ciphertext a given pass's IV happens to produce, that
+/// pass's own real measurement is what downstream code uses — there is no
+/// path through which a stale or predicted length could ever diverge from
+/// the bytes actually shipped, regardless of how many times the hint
+/// stream was re-encrypted along the way.
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
     new_ref: ObjectRef,
@@ -6377,44 +6385,44 @@ mod tests {
     fn resolve_producer_and_content<R: Read + Seek>(rt: &mut Pdf<R>) -> (Vec<u8>, Vec<u8>) {
         let info_ref = match rt.trailer().get("Info") {
             Some(Object::Reference(r)) => *r,
-            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
         let producer = match rt.resolve(info_ref).expect("resolve /Info") {
             Object::Dictionary(d) => match d.get("Producer") {
                 Some(Object::String(s)) => s.clone(),
-                other => panic!("/Producer must be a string, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+                other => panic!("/Producer must be a string, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
-            other => panic!("/Info must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+            other => panic!("/Info must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
 
         let root_ref = rt.root_ref().expect("root_ref");
         let pages_ref = match rt.resolve(root_ref).expect("resolve /Root") {
             Object::Dictionary(d) => match d.get("Pages") {
                 Some(Object::Reference(r)) => *r,
-                other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+                other => panic!("/Pages must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
-            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
         let page_ref = match rt.resolve(pages_ref).expect("resolve /Pages") {
             Object::Dictionary(d) => match d.get("Kids") {
                 Some(Object::Array(kids)) => match kids.first() {
                     Some(Object::Reference(r)) => *r,
-                    other => panic!("Kids[0] must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+                    other => panic!("Kids[0] must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
                 },
-                other => panic!("/Kids must be an array, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+                other => panic!("/Kids must be an array, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
-            other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+            other => panic!("/Pages must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
         let contents_ref = match rt.resolve(page_ref).expect("resolve page") {
             Object::Dictionary(d) => match d.get("Contents") {
                 Some(Object::Reference(r)) => *r,
-                other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+                other => panic!("/Contents must be a reference, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
             },
-            other => panic!("page must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+            other => panic!("page must be a dictionary, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
         let content = match rt.resolve(contents_ref).expect("resolve /Contents") {
             Object::Stream(s) => s.data,
-            other => panic!("/Contents must be a stream, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for tiny_pdf_with_content_and_producer's well-formed structure
+            other => panic!("/Contents must be a stream, got {other:?}"), // cov:ignore: defensive fallback arm — never hit for either fixture's well-formed structure
         };
         (producer, content)
     }
@@ -6679,6 +6687,175 @@ mod tests {
         assert_eq!(
             metadata_bytes, metadata_marker,
             "/Metadata stream must resolve to its original plaintext via /Crypt /Identity"
+        );
+    }
+
+    /// Locate object `number`'s raw byte range in `out` — from its `\n{number}
+    /// 0 obj` header (inclusive) to just before the next `endobj` (exclusive).
+    /// Every object header in this writer is preceded by a newline
+    /// (`append_object`/`append_body_object` emit `\nendobj\n` for the prior
+    /// object, or a trailer/xref section ends in `\n`), so search for
+    /// `\n{number} 0 obj` rather than `{number} 0 obj` alone — an unprefixed
+    /// search for e.g. "4 0 obj" would also match inside "14 0 obj" for
+    /// larger fixtures.
+    fn find_object_bytes(out: &[u8], number: u32) -> &[u8] {
+        let header = format!("\n{number} 0 obj");
+        let header_pos = out
+            .windows(header.len())
+            .position(|w| w == header.as_bytes())
+            .unwrap_or_else(|| {
+                // cov:ignore-start: only reached if a caller's own assertion
+                // would already fail — every well-formed fixture in this
+                // test module produces a findable header for its own refs.
+                panic!("expected \"{header}\" (object {number}'s header) in output")
+                // cov:ignore-end
+            })
+            + 1;
+        let body = &out[header_pos..];
+        let body_end = body
+            .windows(b"endobj".len())
+            .position(|w| w == b"endobj")
+            .unwrap_or(body.len());
+        &body[..body_end]
+    }
+
+    /// Code-quality follow-up to Task 8: `--cleartext-metadata` interacts
+    /// with the crate-wide default `CompressStreams::Yes` re-filtering
+    /// policy. `append_body_object` computes `refiltered` — the flag
+    /// deciding whether `/Filter` may collapse to a bare `/FlateDecode` —
+    /// from `s.dict.get("Filter")` AFTER `prepend_crypt_filter_to_stream_dict`
+    /// has already mutated it. For a `/Metadata` source with no `/Filter`,
+    /// the default policy re-encodes it to a bare `/Filter /FlateDecode`
+    /// (`apply_stream_compress_policy`'s `CompressStreams::Yes` arm) BEFORE
+    /// the exemption prepends `/Crypt`, turning `/Filter` into the array
+    /// `[/Crypt /FlateDecode]`; `is_lone_flate` then correctly reads that as
+    /// NOT a lone `/FlateDecode`, so `refiltered` is `false` and the real
+    /// `/Crypt`-bearing chain survives instead of being collapsed to a bare
+    /// `/Filter /FlateDecode` (which would tell a reader to inflate bytes
+    /// that were never run through the normal encryption cipher). Both
+    /// other cleartext-metadata tests force `StreamDataMode::Uncompress`,
+    /// which bypasses re-encoding entirely and never reaches this
+    /// interaction — this test uses the default `CompressStreams::Yes`
+    /// policy specifically to exercise it.
+    #[test]
+    fn linearize_with_encrypt_cleartext_metadata_keeps_crypt_filter_after_refilter() {
+        let metadata_marker: &[u8] = b"<?xpacket flpdf-refilter-metadata-marker?>";
+        let src = tiny_pdf_with_metadata_content_and_producer(
+            metadata_marker,
+            b"BT /F1 12 Tf (flpdf refilter content marker) Tj ET\n",
+            b"flpdf refilter producer marker",
+        );
+
+        // Default compression policy (CompressStreams::Yes; StreamDataMode
+        // set explicitly to Compress rather than left at the default None,
+        // so the intent is self-evident here without relying on
+        // WriteOptions::default()'s fallback chain). The /Metadata stream's
+        // source has no /Filter, so it gets decoded (a no-op) and
+        // RE-ENCODED to a bare /Filter /FlateDecode inside
+        // reencode_stream_for_compress, BEFORE the cleartext-metadata
+        // exemption mutates that same dict.
+        let out = linearize_with(&src, |o| {
+            o.stream_data = Some(crate::writer::StreamDataMode::Compress);
+            o.static_aes_iv = true;
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams {
+                encrypt_metadata: false,
+                ..crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec())
+            });
+        });
+
+        crate::linearization::check_linearization_bytes(&out).expect(
+            "cleartext-metadata + default compress policy must still pass the linearization checker",
+        );
+
+        let mut reopened =
+            Pdf::open_with_options(Cursor::new(out.clone()), crate::PdfOpenOptions::default())
+                .expect("re-open with the empty user password");
+        let root_ref = reopened.root_ref().expect("root_ref");
+        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
+            Object::Dictionary(d) => match d.get_ref("Metadata") {
+                Some(r) => r,
+                None => panic!("/Root must carry /Metadata"), // cov:ignore: only evaluated when the assertion above fails.
+            },
+            other => panic!("/Root must be a dictionary, got {other:?}"), // cov:ignore: only evaluated when the assertion above fails.
+        };
+
+        let object_bytes = find_object_bytes(&out, metadata_ref.number);
+
+        // The re-filtered stream's dict must keep /Crypt ahead of
+        // /FlateDecode: prepend_crypt_filter_to_stream_dict's
+        // Object::Name(n) branch, given a source /Filter /FlateDecode with
+        // no /DecodeParms (apply_stream_compress_policy's
+        // CompressStreams::Yes arm never sets /DecodeParms), produces
+        // exactly this array shape (Object::Array::write_pdf's
+        // "[ elem elem ]" form, confirmed by reading both functions).
+        let filter_needle: &[u8] = b"/Filter [ /Crypt /FlateDecode ]";
+        assert!(
+            object_bytes
+                .windows(filter_needle.len())
+                .any(|w| w == filter_needle),
+            "re-filtered /Metadata stream must keep /Crypt ahead of /FlateDecode in \
+             its /Filter array, got {:?}",
+            String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Negative check: the reviewed concern in concrete terms — the
+        // stream must not have collapsed to append_body_object's
+        // refiltered-stream shortcut (a bare `/Filter /FlateDecode`), which
+        // would silently drop the /Crypt tag and tell a reader to run
+        // FlateDecode directly over bytes that were never processed by the
+        // normal encryption cipher.
+        let bare_flate_needle: &[u8] = b"/Filter /FlateDecode";
+        assert!(
+            !object_bytes
+                .windows(bare_flate_needle.len())
+                .any(|w| w == bare_flate_needle),
+            "re-filtered /Metadata stream must not collapse to a bare /Filter /FlateDecode, \
+             got {:?}",
+            String::from_utf8_lossy(object_bytes) // cov:ignore: only evaluated when the assertion above fails.
+        );
+
+        // Reader round-trip. `decrypt_resolved_object` (reader.rs) has its
+        // OWN `/Type /Metadata` + `!encrypt_metadata` fast path
+        // (`is_metadata_stream`) that returns the stream entirely untouched
+        // for ANY metadata stream once the /Encrypt dict declares
+        // `/EncryptMetadata false` — it never even inspects the /Crypt tag,
+        // so `apply_explicit_crypt_filters`'s /Crypt-stripping never runs
+        // here and `s.dict`'s /Filter stays the raw on-disk
+        // `[/Crypt /FlateDecode]`. Confirm that object-model shape
+        // independently of the byte-scan above, then strip /Crypt ourselves
+        // (mirroring what `apply_explicit_crypt_filters` does for a
+        // non-metadata /Crypt-tagged stream) before decoding the surviving
+        // /FlateDecode filter, proving the payload really is readable
+        // end to end — not merely missing the plaintext marker by
+        // coincidence.
+        let resolved = reopened
+            .resolve(metadata_ref)
+            .expect("resolve /Metadata (reader's metadata fast path leaves it untouched)");
+        let Object::Stream(s) = resolved else {
+            // cov:ignore-start: only reached if the assertion below would
+            // already fail — /Metadata always resolves to a stream for this
+            // fixture's well-formed structure.
+            panic!("/Metadata must resolve to a stream, got {resolved:?}");
+            // cov:ignore-end
+        };
+        assert_eq!(
+            s.dict.get("Filter"),
+            Some(&Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ])),
+            "resolved /Metadata dict must still carry the raw on-disk \
+             [/Crypt /FlateDecode] chain (the reader's metadata fast path \
+             skips /Crypt stripping entirely)"
+        );
+        let mut decode_dict = Dictionary::new();
+        decode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let inflated = crate::filters::decode_stream_data(&decode_dict, &s.data)
+            .expect("the surviving /FlateDecode filter must still decode");
+        assert_eq!(
+            inflated, metadata_marker,
+            "/Metadata stream must decode back to its original plaintext through \
+             /FlateDecode once /Crypt has been stripped"
         );
     }
 
