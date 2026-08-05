@@ -6566,19 +6566,16 @@ mod tests {
             .get_ref("Encrypt")
             .expect("trailer must reference /Encrypt");
         let root_ref = reopened.root_ref().expect("root_ref");
-        let metadata_ref = match reopened.resolve(root_ref).expect("resolve /Root") {
-            Object::Dictionary(dict) => dict
-                .get_ref("Metadata")
-                .expect("Catalog must reference /Metadata"),
-            other => panic!("/Root must be a dictionary, got {other:?}"),
-        };
-        let length_ref = match reopened.resolve(metadata_ref).expect("resolve /Metadata") {
-            Object::Stream(stream) => stream
-                .dict
-                .get_ref("Length")
-                .expect("QDF stream must use an indirect /Length holder"),
-            other => panic!("/Metadata must be a stream, got {other:?}"),
-        };
+        let root = reopened.resolve(root_ref).expect("resolve /Root");
+        let metadata_ref = root
+            .as_dict()
+            .and_then(|dict| dict.get_ref("Metadata"))
+            .expect("Catalog must reference /Metadata");
+        let metadata = reopened.resolve(metadata_ref).expect("resolve /Metadata");
+        let length_ref = metadata
+            .as_stream()
+            .and_then(|stream| stream.dict.get_ref("Length"))
+            .expect("QDF stream must use an indirect /Length holder");
         assert_ne!(
             encrypt_ref, length_ref,
             "/Encrypt must not collide with QDF's interleaved /Length holder"

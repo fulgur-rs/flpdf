@@ -1228,7 +1228,7 @@ impl Dictionary {
         if let Some(length) = length_value {
             out.extend_from_slice(b" /Length ");
             length.try_write_pdf_with_string_writer(out, write_string)?;
-        }
+        } // cov:ignore: llvm maps Result cleanup for the tested callback error edge to this closing brace
         if refiltered {
             out.extend_from_slice(b" /Filter /FlateDecode");
         }
@@ -1407,7 +1407,7 @@ impl Dictionary {
             out.extend_from_slice(b"/Length ");
             length.try_write_pdf_qdf_with_string_writer(out, indent + 2, write_string)?;
             out.push(b'\n');
-        }
+        } // cov:ignore: llvm maps Result cleanup for the tested callback error edge to this closing brace
         push_spaces(out, indent);
         out.extend_from_slice(b">>");
         Ok(())

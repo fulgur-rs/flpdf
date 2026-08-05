@@ -206,20 +206,22 @@ mod tests {
     }
 
     fn parse_string(bytes: &[u8]) -> Vec<u8> {
-        match crate::parse_object(bytes).expect("emitted string syntax must parse") {
-            Object::String(value) => value,
-            other => panic!("expected emitted string, got {other:?}"),
-        }
+        crate::parse_object(bytes)
+            .expect("emitted string syntax must parse")
+            .as_string()
+            .expect("emitted object must be a string")
+            .to_vec()
     }
 
     fn parse_dict_string(bytes: &[u8], key: &str) -> Vec<u8> {
-        match crate::parse_object(bytes).expect("emitted dictionary syntax must parse") {
-            Object::Dictionary(dict) => match dict.get(key) {
-                Some(Object::String(value)) => value.clone(),
-                other => panic!("expected /{key} string, got {other:?}"),
-            },
-            other => panic!("expected emitted dictionary, got {other:?}"),
-        }
+        let object = crate::parse_object(bytes).expect("emitted dictionary syntax must parse");
+        object
+            .as_dict()
+            .expect("emitted object must be a dictionary")
+            .get(key)
+            .and_then(Object::as_string)
+            .expect("requested encryption dictionary key must be a string")
+            .to_vec()
     }
 
     fn decrypt_emitted_string(
@@ -298,11 +300,13 @@ mod tests {
 
         for key in [b"O".as_slice(), b"U", b"OE", b"UE", b"Perms"] {
             let expected = [key, b" <7072696e7461626c65>"].concat();
+            let key_display = String::from_utf8_lossy(key);
+            let wire_display = String::from_utf8_lossy(&wire);
             assert!(
                 wire.windows(expected.len()).any(|part| part == expected),
                 "direct /{} must be hexadecimal: {}",
-                String::from_utf8_lossy(key),
-                String::from_utf8_lossy(&wire),
+                key_display,
+                wire_display,
             );
         }
         assert!(wire
