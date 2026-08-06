@@ -99,6 +99,7 @@ pub mod diagnostics;
 pub mod document_json;
 pub mod embedded_files;
 pub mod encrypt_setup;
+pub mod engine;
 pub mod error;
 pub mod filespec_helper;
 pub mod filters;
