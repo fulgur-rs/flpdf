@@ -1193,6 +1193,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
             (found, parsed, trailing)
         };
 
+        if found.is_some_and(|object_ref| object_ref.number == 0) {
+            return Err(Error::parse(offset as usize, "object with ID 0"));
+        }
+
         if found != Some(expected) {
             return Err(Error::parse(
                 offset as usize,
@@ -3330,6 +3334,16 @@ mod tests {
             crate::parser::LiveInput::unread_byte(&mut input),
             Err(Error::Parse { offset: 0, ref message }) if message == "cannot unread before the start of input"
         ));
+    }
+
+    #[test]
+    fn live_object_header_rejects_qpdfs_object_zero() {
+        let resolver = resolver_over(b"0 0 obj\n42\nendobj\n".to_vec());
+
+        let error = resolver
+            .read_object_at_offset(0, ObjectRef::new(0, 0))
+            .expect_err("qpdf rejects object ID zero");
+        assert_eq!(error.to_string(), "parse error at byte 0: object with ID 0");
     }
 
     /// Differential check against the pinned qpdf binary. `--json-object=2`

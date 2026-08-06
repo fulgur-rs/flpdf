@@ -197,7 +197,7 @@ jobs:
           set -euo pipefail
 
           qpdf --version
-          test "$(qpdf --version | sed -n '1p')" = "qpdf version ${QPDF_VERSION}"
+          test "$(qpdf --version | sed -n '1p' | tr -d '\r')" = "qpdf version ${QPDF_VERSION}"
 
       - name: Run tests in required order
         shell: bash
