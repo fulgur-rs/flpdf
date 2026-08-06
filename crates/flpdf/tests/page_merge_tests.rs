@@ -162,6 +162,26 @@ fn merge_single_input_copies_selected_pages_with_shared_dedup() {
     assert_eq!(count_font_objects(&mut doc, b"Courier"), 0); // unselected page's font absent
 }
 
+/// The merged document is built the same way qpdf's library-level
+/// `QPDF::emptyPDF()` + `QPDFPageDocumentHelper::addPage()` pattern would:
+/// neither call touches the document's PDF version, so the result carries
+/// `emptyPDF()`'s own header version (1.3) regardless of any input's version.
+/// (Propagating an input's version, as `qpdf --pages` does, is `QPDFJob`
+/// orchestration behavior — a separate responsibility, not this function's.)
+#[test]
+fn merged_document_version_is_the_empty_pdf_baseline_not_an_input_version() {
+    let bytes = three_page_shared_font_pdf(); // source header is 1.4
+    let mut src = Pdf::open_mem_owned(bytes).unwrap();
+    let mut inputs = [MergeInput {
+        source: &mut src,
+        pages: vec![0],
+    }];
+
+    let doc = merge_documents(&mut inputs).unwrap();
+
+    assert_eq!(doc.version(), "1.3");
+}
+
 // The merged document round-trips: writing then re-opening yields a valid PDF
 // with the same page count.
 #[test]

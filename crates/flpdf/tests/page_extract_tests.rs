@@ -150,6 +150,22 @@ fn extracts_single_page_with_count_one() {
     }
 }
 
+/// The extracted document is built the same way qpdf's library-level
+/// `QPDF::emptyPDF()` + `QPDFPageDocumentHelper::addPage()` pattern would:
+/// neither call touches the document's PDF version, so the result carries
+/// `emptyPDF()`'s own header version (1.3) regardless of `source`'s version.
+/// (Propagating `source`'s version, as `qpdf --pages` does, is `QPDFJob`
+/// CLI-orchestration behavior — a different qpdf class not mirrored here.)
+#[test]
+fn extracted_document_version_is_the_empty_pdf_baseline_not_the_source_version() {
+    let src = two_page_pdf(); // source header is 1.4
+    let mut source = Pdf::open_mem_owned(src).unwrap();
+
+    let out = extract_page(&mut source, 0).unwrap();
+
+    assert_eq!(out.version(), "1.3");
+}
+
 /// Parent /Pages carries /MediaBox, /Resources (font), and /Rotate; the leaf
 /// page (obj 3) inherits all three.
 fn inherited_attrs_pdf() -> Vec<u8> {

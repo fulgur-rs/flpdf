@@ -19,14 +19,23 @@
 //! catalog-level `/Names /Dests`, legacy `/Dests`, or `/Outlines`.
 //! Consequently no named-destination "collision" between inputs is possible
 //! here (there is nothing from a secondary input to collide with).
+//!
+//! The target document is built via [`Pdf::empty`] (qpdf's
+//! `QPDF::emptyPDF()`) plus the same page-copy primitives
+//! [`crate::page_extract`] uses for `QPDFPageDocumentHelper::addPage()`.
+//! Neither of those calls touches PDF version, so the returned document
+//! keeps `emptyPDF()`'s own header version (`"1.3"`) rather than any input's
+//! version. Propagating an input's version, as the `qpdf` CLI's `--pages`
+//! does, is `QPDFJob` orchestration layered on top of these library
+//! primitives — a distinct responsibility this function does not implement.
 
 use crate::acroform_document_helper::{collect_refs_in_object, remap_refs_in_object};
 use crate::acroform_field_prune::DEFAULT_MAX_ACROFORM_DEPTH;
 use crate::object_copy::copy_objects;
 use crate::page_closure::{extend_object_closure, extend_page_object_closure};
 use crate::page_extract::{
-    append_selection_kids, materialize_leaf, minimal_target_bytes, null_copied_removed_pages,
-    resolve_dict, target_pages_root, InheritedAttrs,
+    append_selection_kids, materialize_leaf, null_copied_removed_pages, resolve_dict,
+    target_pages_root, InheritedAttrs,
 };
 use crate::page_label_document_helper::{merge_adjacent_ranges, LabelRange};
 use crate::pages::{page_refs, DEFAULT_MAX_PAGE_TREE_DEPTH};
@@ -823,7 +832,7 @@ pub fn merge_documents<R: Read + Seek>(
         ));
     }
 
-    let mut target = Pdf::open_mem_owned(minimal_target_bytes())?;
+    let mut target = Pdf::empty()?;
     let pages_root_ref = target_pages_root(&mut target)?;
 
     // Output `/Kids`, accumulated across inputs in input/selection order.

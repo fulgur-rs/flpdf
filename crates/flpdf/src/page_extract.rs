@@ -1,15 +1,23 @@
-//! qpdf correspondence: QPDFPageDocumentHelper.cc emptyPDF/addPage operations plus QPDFJob.cc page extraction.
+//! qpdf correspondence: QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only.
 //! Page extraction into a fresh minimal document.
 //!
-//! [`extract_pages`] builds a brand-new minimal [`Pdf`] containing the
-//! selected pages from `source` plus their transitive object closure, copied
-//! across documents; [`extract_page`] is the single-page convenience form.
-//! This mirrors qpdf's `emptyPDF()` + `QPDFPageDocumentHelper::addPage()`
-//! extraction pattern: a **new** document object is constructed and populated
-//! here, then written by a separate writer (`write_pdf` /
-//! `write_pdf_with_options`). It is deliberately distinct from
-//! [`crate::PageDocumentHelper`], whose `add_page` mutates an already-open
-//! document, and from [`crate::pages`], which owns page-tree traversal.
+//! [`extract_pages`] builds a brand-new minimal [`Pdf`] (via [`Pdf::empty`])
+//! containing the selected pages from `source` plus their transitive object
+//! closure, copied across documents; [`extract_page`] is the single-page
+//! convenience form. This mirrors the qpdf *library* pattern of
+//! `QPDF::emptyPDF()` followed by `QPDFPageDocumentHelper::addPage()`: a
+//! **new** document object is constructed and populated here, then written
+//! by a separate writer (`write_pdf` / `write_pdf_with_options`). It is
+//! deliberately distinct from [`crate::PageDocumentHelper`], whose
+//! `add_page` mutates an already-open document, and from [`crate::pages`],
+//! which owns page-tree traversal.
+//!
+//! Neither `QPDF::emptyPDF()` nor `QPDFPageDocumentHelper::addPage()`
+//! touches the document's PDF version, so the returned document keeps
+//! `emptyPDF()`'s own header version (`"1.3"`) regardless of `source`'s
+//! version. Propagating an input's version into the output, as the `qpdf`
+//! CLI's `--pages` does, is `QPDFJob` orchestration — a distinct
+//! responsibility this module does not implement.
 //!
 //! `source` is left unmodified. Inherited page attributes (`/Resources`,
 //! `/MediaBox`, `/CropBox`, `/Rotate`) are materialized onto each extracted
@@ -179,7 +187,7 @@ pub fn extract_pages<R: Read + Seek>(
     for &page_ref in &unique {
         extend_page_object_closure(source, page_ref, &mut closure)?;
     }
-    let mut target = Pdf::open_mem_owned(minimal_target_bytes())?;
+    let mut target = Pdf::empty()?;
     let map = copy_objects(source, &mut target, &closure)?;
     null_copied_removed_pages(&mut target, &all_pages, &seen, &map);
     let pages_root_ref = target_pages_root(&mut target)?;
@@ -380,25 +388,6 @@ pub(crate) fn append_selection_kids(
         kids.push(kid);
     }
     Ok(())
-}
-
-/// Minimal valid target: Catalog(1) + empty Pages(2). No placeholder page (so
-/// there is no orphan to delete after copying).
-pub(crate) fn minimal_target_bytes() -> Vec<u8> {
-    let mut out: Vec<u8> = b"%PDF-1.7\n".to_vec();
-    let off1 = out.len() as u64;
-    out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-    let off2 = out.len() as u64;
-    out.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [] /Count 0 >>\nendobj\n");
-    let xref_start = out.len() as u64;
-    out.extend_from_slice(
-        format!("xref\n0 3\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n")
-            .as_bytes(),
-    );
-    out.extend_from_slice(
-        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
-    );
-    out
 }
 
 /// Resolve the target catalog's `/Pages` root ref.
