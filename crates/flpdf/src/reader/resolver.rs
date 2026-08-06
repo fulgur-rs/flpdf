@@ -84,10 +84,13 @@
 //! released its input adapter, so each source token contributes at most one
 //! document warning.
 
+use super::{interpret_cf_from_handle, EncryptionMode, EncryptionState};
 use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
 use crate::parser::{
     parse_live_file_object_with_decrypter, LiveInput, LiveTokenSource, StringDecrypter,
 };
+use crate::pipeline::aes::PlAesPdf;
+use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
@@ -807,19 +810,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// keeps no copy of them, so its `pipeStreamData` reads them here from
     /// `parsed_offset` and `length` (`libqpdf/QPDF_Stream.cc:608-620`).
     ///
-    /// Returns whether the bytes were delivered, mirroring qpdf's `bool`:
-    /// a damaged source is a warning and a `false`, not an error for the
-    /// caller to propagate.
+    /// The inner bool reports whether the bytes were delivered, mirroring
+    /// qpdf's `bool`: a damaged source inside `pipeStreamData`'s `try` is a
+    /// warning and `false`. Errors preparing `decryptStream` are outside that
+    /// catch boundary (`QPDF.cc:2487-2494`) and therefore remain `Err`.
     ///
     /// qpdf allocates `length` and reads it in one operation (`:2497-2501`).
     /// That is deliberate here even though parsing deliberately does *not*
     /// pre-allocate a declared `/Length`: by pipe time the offset and length
     /// have already been validated by the framing scan.
     ///
-    /// **The decryption stage is not inserted yet.** qpdf prepends one when
-    /// the document is encrypted (`:2490-2492`, `QPDF::decryptStream`); until
-    /// that lands, an encrypted document pipes ciphertext. No test asserts
-    /// that as correct.
+    /// qpdf prepends a decryption stage before it touches the input source
+    /// (`:2490-2492`, `QPDF::decryptStream`). The legacy `/V < 4` form has no
+    /// crypt-filter lookup: it always uses RC4 (`QPDF_encryption.cc:1062-1064`,
+    /// `:1146-1151`). Later branches below extend that same pipe-time seam for
+    /// `/V >= 4` crypt filters.
     //
     // The parameter list is qpdf's (`QPDF.cc:2542-2550` passes seven beyond
     // the receiver); bundling them would be a shape this port does not have a
@@ -832,7 +837,136 @@ impl<R: Read + Seek> ResolverHandle<R> {
         object_ref: ObjectRef,
         offset: i64,
         length: usize,
-        _stream_dict: &ObjectHandle,
+        stream_dict: &ObjectHandle,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        // qpdf only calls `decryptStream` for encrypted input
+        // (`QPDF.cc:2487-2492`). Snapshot the shared state before inspecting
+        // the dictionary: an ObjectHandle operation can lazily re-enter this
+        // resolver, so the encryption-cell borrow must not span it.
+        let encryption_parameters = self.encryption_parameters();
+        let encryption_snapshot = encryption_parameters.borrow().as_ref().cloned();
+        let Some(encryption_snapshot) = encryption_snapshot else {
+            return Ok(self.pipe_stream_data_to_pipeline(
+                object_ref,
+                offset,
+                length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            ));
+        };
+
+        // `decryptStream` rejects cross-reference streams before looking at
+        // encryption version or crypt filters (`QPDF_encryption.cc:1055-1061`).
+        let inspection = inspect_stream_encryption(&encryption_snapshot, stream_dict)?;
+        if inspection.is_xref {
+            return Ok(self.pipe_stream_data_to_pipeline(
+                object_ref,
+                offset,
+                length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            ));
+        }
+
+        // `decryptStream` constructs the stage before `pipeStreamData` enters
+        // its read/write `try` (`QPDF.cc:2487-2494`). Derive and copy the key
+        // while holding the short encryption-cell borrow, then release it
+        // before touching the source or the downstream pipeline.
+        let decryption = {
+            let mut encryption = encryption_parameters.borrow_mut();
+            match encryption.as_mut() {
+                None => None,
+                Some(encryption) => {
+                    let (use_aes, warn_unknown) = encryption.stream_method(inspection.method);
+                    let stage = match use_aes {
+                        None => StreamDecryption::None,
+                        Some(false) => StreamDecryption::Rc4(
+                            encryption.key_for_object(object_ref, false).to_vec(),
+                        ),
+                        Some(true) => StreamDecryption::Aes(
+                            encryption.key_for_object(object_ref, true).to_vec(),
+                        ),
+                    };
+                    Some((stage, warn_unknown))
+                }
+            }
+        };
+        let Some((decryption, warn_unknown)) = decryption else {
+            return Ok(self.pipe_stream_data_to_pipeline(
+                object_ref,
+                offset,
+                length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            ));
+        };
+        if warn_unknown {
+            self.warn_unknown_stream_filter(inspection.method_source);
+        }
+
+        match decryption {
+            StreamDecryption::None => Ok(self.pipe_stream_data_to_pipeline(
+                object_ref,
+                offset,
+                length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            )),
+            StreamDecryption::Rc4(key) => {
+                let mut decrypt = PlRc4::new("RC4 stream decryption", pipeline, &key)?;
+                Ok(self.pipe_stream_data_to_pipeline(
+                    object_ref,
+                    offset,
+                    length,
+                    &mut decrypt,
+                    suppress_warnings,
+                    will_retry,
+                ))
+            }
+            StreamDecryption::Aes(key) => {
+                let mut decrypt = PlAesPdf::new_decrypt("AES stream decryption", pipeline, &key)?;
+                Ok(self.pipe_stream_data_to_pipeline(
+                    object_ref,
+                    offset,
+                    length,
+                    &mut decrypt,
+                    suppress_warnings,
+                    will_retry,
+                ))
+            }
+        }
+    }
+
+    /// qpdf's unknown-stream-filter warning from `decryptStream`'s default
+    /// arm (`libqpdf/QPDF_encryption.cc:1121-1129`). It happens before the
+    /// source read, so `getLastOffset()` is sampled here rather than in the
+    /// pipe-time catch path below.
+    fn warn_unknown_stream_filter(&self, method_source: &str) {
+        self.push_warning_at(
+            self.last_offset(),
+            format!(
+                "unknown encryption filter for streams (check {method_source}); \
+                 streams may be decrypted improperly"
+            ),
+        );
+    }
+
+    /// qpdf's `pipeStreamData` read/write `try`, catches, and shared finish
+    /// tail (`libqpdf/QPDF.cc:2494-2538`). `pipeline` is either the caller's
+    /// sink or a decryption stage prepended by [`Self::pipe_stream_data`].
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_stream_data_to_pipeline(
+        &self,
+        object_ref: ObjectRef,
+        offset: i64,
+        length: usize,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
@@ -849,6 +983,27 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return true;
         };
 
+        self.finish_pipe_failure_with_attempt(
+            object_ref,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+            failure,
+            attempted_finish,
+        )
+    }
+
+    /// qpdf's `catch` arms and common finish tail (`QPDF.cc:2505-2538`).
+    #[allow(clippy::too_many_arguments)]
+    fn finish_pipe_failure_with_attempt(
+        &self,
+        object_ref: ObjectRef,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+        failure: PipeFailure,
+        attempted_finish: bool,
+    ) -> bool {
         if !suppress_warnings {
             match failure {
                 // qpdf `:2498-2500` throws `damagedPDF(file, "", offset +
@@ -1493,6 +1648,106 @@ enum PipeFailure {
     Decoding { at: u64, detail: String },
 }
 
+/// The replacement value of qpdf's local `Pipeline*` after `decryptStream`.
+/// The key is owned because the encryption-state borrow must end before this
+/// stage reads the source or calls a downstream pipeline.
+enum StreamDecryption {
+    /// qpdf's `e_none` early return; retain the caller's pipeline unchanged.
+    None,
+    /// qpdf's `Pl_RC4` branch (`QPDF_encryption.cc:1146-1151`).
+    Rc4(Vec<u8>),
+    /// qpdf's shared `Pl_AES_PDF` branch for `e_aes` and `e_aesv3`
+    /// (`QPDF_encryption.cc:1136-1145`).
+    Aes(Vec<u8>),
+}
+
+/// The stream-dictionary half of qpdf's `decryptStream` method choice
+/// (`libqpdf/QPDF_encryption.cc:1055-1103`). `method: None` means that qpdf
+/// reached its `/StmF` fallback; a concrete `Identity` is instead the
+/// deliberate no-op selected by `/Crypt` or cleartext metadata.
+struct StreamEncryptionInspection {
+    is_xref: bool,
+    method: Option<EncryptionMode>,
+    method_source: &'static str,
+}
+
+fn inspect_stream_encryption(
+    encryption: &EncryptionState,
+    stream_dict: &ObjectHandle,
+) -> Result<StreamEncryptionInspection> {
+    let stream_type = stream_dict.try_get_key(b"Type")?.try_as_name()?;
+    let is_xref = stream_type.as_deref() == Some(b"XRef");
+    let is_metadata = stream_type.as_deref() == Some(b"Metadata");
+    let default_source = "/StmF from /Encrypt dictionary";
+
+    // qpdf's `/Type /XRef` return is outside this gate, but all subsequent
+    // stream-local Crypt inspection is strictly `/V >= 4` (`:1057-1064`).
+    if is_xref || encryption.encryption_v < 4 {
+        return Ok(StreamEncryptionInspection {
+            is_xref,
+            method: None,
+            method_source: default_source,
+        });
+    }
+
+    let filter = stream_dict.try_get_key(b"Filter")?;
+    let mut method = None;
+    let mut method_source = default_source;
+    if filter.try_is_or_has_name(b"Crypt")? {
+        let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+        // qpdf's `if (isDictionary()) { if (isDictionaryOfType()) ... }
+        // else if (isArray() && filter.isArray()) ...` shape matters: a
+        // dictionary of the wrong type never falls through to array pairing.
+        if decode_params.try_is_dictionary_of_type(b"", b"")? {
+            if decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")? {
+                let name = decode_params.try_get_key(b"Name")?;
+                method = Some(interpret_cf_from_handle(encryption, &name)?);
+                method_source = "stream's Crypt decode parameters";
+            } // cov:ignore: llvm maps the covered typed-dictionary branch to its closing brace
+        } else if let (Some(filter_len), Some(decode_len)) =
+            (filter.try_array_len()?, decode_params.try_array_len()?)
+        {
+            if filter_len == decode_len {
+                for index in 0..filter_len {
+                    let (Some(filter_item), Some(crypt_params)) = (
+                        filter.try_array_item(index)?,
+                        decode_params.try_array_item(index)?,
+                    ) else {
+                        continue; // cov:ignore: equal-length in-range array indexes always exist
+                    };
+                    let is_crypt = filter_item.try_is_name_and_equals(b"Crypt")?;
+                    let has_dictionary_params = crypt_params.try_is_dictionary_of_type(b"", b"")?;
+                    if !is_crypt || !has_dictionary_params {
+                        continue;
+                    }
+                    let name = crypt_params.try_get_key(b"Name")?;
+                    if name.try_as_name()?.is_some() {
+                        method = Some(interpret_cf_from_handle(encryption, &name)?);
+                        method_source = "stream's Crypt decode parameters (array)";
+                    } // cov:ignore: llvm maps the covered assignment branch to its closing brace
+                }
+            } // cov:ignore: llvm maps the covered equal-length branch to its closing brace
+        } // cov:ignore: llvm maps the covered Crypt-filter branch exit to this closing brace
+    }
+    // qpdf begins with `e_unknown`, so both a missing stream-local method and
+    // a selected unknown name take this fallback. The source remains local
+    // when an explicit `/Crypt` lookup produced that unknown method, which is
+    // observable in the eventual warning text.
+    if matches!(method, None | Some(EncryptionMode::Unknown)) {
+        method = if !encryption.encrypt_metadata && is_metadata {
+            Some(EncryptionMode::Identity)
+        } else {
+            None
+        };
+    }
+
+    Ok(StreamEncryptionInspection {
+        is_xref,
+        method,
+        method_source,
+    })
+}
+
 /// Bytes pulled per iteration by [`ResolverHandle::read_to_owned`].
 ///
 /// Larger than [`INPUT_CHUNK`] because its callers are the legacy tenants,
@@ -1615,7 +1870,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         suppress_warnings: bool,
         will_retry: bool,
     ) -> Result<bool> {
-        Ok(ResolverHandle::pipe_stream_data(
+        ResolverHandle::pipe_stream_data(
             self,
             object_ref,
             offset,
@@ -1624,7 +1879,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
             pipeline,
             suppress_warnings,
             will_retry,
-        ))
+        )
     }
 
     /// Resolve `object_ref`'s slot in place.
@@ -1833,7 +2088,8 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 mod tests {
     use super::ResolveMark;
     use super::ResolverHandle;
-    use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
+    use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+    use crate::reader::{EncryptionMode, EncryptionState};
     use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
     use std::collections::BTreeMap;
     use std::fs;
@@ -1939,6 +2195,109 @@ mod tests {
         )
     }
 
+    fn authenticated_v2_rc4_encryption() -> EncryptionState {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v2-rc4-128-r3.pdf"
+        );
+        let fixture = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v2-rc4-128-r3.pdf");
+        let pdf = Pdf::open_mem_owned_with_options(
+            fixture,
+            crate::PdfOpenOptions {
+                password: b"user-v2".to_vec(),
+                allow_weak_crypto: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open RC4 fixture");
+        pdf.resolver
+            .encryption_parameters()
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("RC4 fixture must authenticate")
+    }
+
+    fn authenticated_v5_aes256_encryption() -> EncryptionState {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/tests/fixtures/encrypted/v5-aes-256-r6.pdf"
+        );
+        let fixture = std::fs::read(path)
+            .expect("encrypted fixture missing: tests/fixtures/encrypted/v5-aes-256-r6.pdf");
+        let pdf = Pdf::open_mem_owned_with_options(
+            fixture,
+            crate::PdfOpenOptions {
+                password: b"user-v5-r6".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open AES-256 fixture");
+        pdf.resolver
+            .encryption_parameters()
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("AES-256 fixture must authenticate")
+    }
+
+    fn rc4_stream_ciphertext(
+        object_ref: ObjectRef,
+        plaintext: &[u8],
+        encryption: &EncryptionState,
+    ) -> Vec<u8> {
+        let mut key_derivation = encryption.clone();
+        let key = key_derivation.key_for_object(object_ref, false).to_vec();
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::rc4::Rc4::new(&key)
+            .expect("authenticated RC4 key is non-empty")
+            .process_in_place(&mut ciphertext);
+        ciphertext
+    }
+
+    fn v4_encryption(cf_stream: EncryptionMode) -> EncryptionState {
+        let mut encryption = authenticated_v2_rc4_encryption();
+        encryption.encryption_v = 4;
+        encryption.cf_stream = cf_stream;
+        encryption
+    }
+
+    fn crypt_filter_decode_params(name: &[u8]) -> crate::ObjectHandle {
+        crate::ObjectHandle::dictionary(vec![
+            (
+                b"Type".to_vec(),
+                crate::ObjectHandle::name(b"CryptFilterDecodeParms".to_vec()),
+            ),
+            (b"Name".to_vec(), crate::ObjectHandle::name(name.to_vec())),
+        ])
+    }
+
+    fn crypt_params(name: &[u8]) -> crate::ObjectHandle {
+        crate::ObjectHandle::dictionary(vec![(
+            b"Name".to_vec(),
+            crate::ObjectHandle::name(name.to_vec()),
+        )])
+    }
+
+    struct EncryptionClearingResolver {
+        target: std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>>,
+    }
+
+    impl DocumentResolver for EncryptionClearingResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &crate::ObjectHandle,
+        ) -> crate::Result<()> {
+            *self.target.encryption_parameters().borrow_mut() = None;
+            handle.set_resolved(ObjectValue::Name(b"Metadata".to_vec()));
+            Ok(())
+        }
+    }
+
     /// `QPDF::pipeStreamData` seeks to the parsed offset, reads exactly
     /// `length` bytes, writes them to the pipeline and finishes it
     /// (`libqpdf/QPDF.cc:2496-2504`). It reads the declared length and nothing
@@ -1954,18 +2313,816 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok = resolver.pipe_stream_data(
-            ObjectRef::new(4, 0),
-            offset,
-            b"payload bytes".len(),
-            &dict,
-            &mut sink,
-            false,
-            false,
-        );
+        let ok = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                offset,
+                b"payload bytes".len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation");
 
         assert!(ok, "an in-bounds read succeeds");
         assert_eq!(sink.take_buffer().expect("buffer"), b"payload bytes");
+    }
+
+    // Removing the pipe-side decrypt stage leaves this ciphertext at the sink.
+    #[test]
+    fn piping_an_encrypted_v2_rc4_stream_delivers_plaintext_to_the_sink() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = authenticated_v2_rc4_encryption();
+        let plaintext = b"pipe-time RC4 plaintext";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    #[test]
+    fn pipe_releases_the_encryption_borrow_while_stream_dict_values_resolve() {
+        let object_ref = ObjectRef::new(4, 0);
+        let source = b"reentrant dictionary inspection".to_vec();
+        let resolver = resolver_over(source.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(v4_encryption(EncryptionMode::Rc4));
+        let clearing: std::rc::Rc<dyn DocumentResolver> =
+            std::rc::Rc::new(EncryptionClearingResolver {
+                target: resolver.clone(),
+            });
+        let stream_type = crate::ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            std::rc::Rc::downgrade(&clearing),
+        );
+        let dict = crate::ObjectHandle::dictionary(vec![(b"Type".to_vec(), stream_type)]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(object_ref, 0, source.len(), &dict, &mut sink, false, false,)
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), source);
+        assert!(resolver.encryption_parameters().borrow().is_none());
+    }
+
+    #[test]
+    fn a_stream_dictionary_resolution_error_propagates_before_the_pipe_try() {
+        let resolver = resolver_over(b"ciphertext".to_vec());
+        *resolver.encryption_parameters().borrow_mut() =
+            Some(v4_encryption(EncryptionMode::Identity));
+        let (stream_type, stream_type_resolver) =
+            crate::object_handle::identity_tests::resolver_bearing_handle(ObjectValue::Name(
+                b"Metadata".to_vec(),
+            ));
+        drop(stream_type_resolver);
+        let dict = crate::ObjectHandle::dictionary(vec![(b"Type".to_vec(), stream_type)]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
+
+        let error = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                0,
+                b"ciphertext".len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect_err("decryptStream preparation errors propagate");
+        assert!(error
+            .to_string()
+            .contains("object 20 0 belongs to a dropped PDF"));
+        assert!(trace.borrow().calls.is_empty(), "the sink is untouched");
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn an_invalid_aes_object_key_propagates_before_the_pipe_try() {
+        let mut encryption = v4_encryption(EncryptionMode::Aes128);
+        encryption.file_key.clear();
+        encryption.cached_object_encryption_key.clear();
+        encryption.cached_key_og = None;
+        let resolver = resolver_over(b"ciphertext".to_vec());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
+
+        let error = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                0,
+                b"ciphertext".len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect_err("decryptStream stage-construction errors propagate");
+        assert!(error
+            .to_string()
+            .contains("Pl_AES_PDF: key must be 16 or 32 bytes"));
+        assert!(trace.borrow().calls.is_empty(), "the sink is untouched");
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn an_empty_v5_rc4_object_key_propagates_before_the_pipe_try() {
+        let mut encryption = authenticated_v5_aes256_encryption();
+        encryption.cf_stream = EncryptionMode::Rc4;
+        encryption.file_key.clear();
+        encryption.cached_object_encryption_key.clear();
+        encryption.cached_key_og = None;
+        let resolver = resolver_over(b"ciphertext".to_vec());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
+
+        let error = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                0,
+                b"ciphertext".len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect_err("decryptStream stage-construction errors propagate");
+        assert!(error.to_string().contains("invalid key/IV length"));
+        assert!(trace.borrow().calls.is_empty(), "the sink is untouched");
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    /// qpdf returns before the `/V` gate for an encrypted cross-reference
+    /// stream (`QPDF_encryption.cc:1057-1061`), leaving its payload untouched.
+    #[test]
+    fn piping_an_encrypted_xref_stream_leaves_its_ciphertext_untouched() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = authenticated_v2_rc4_encryption();
+        let plaintext = b"xref bytes are never decrypted";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            crate::ObjectHandle::name(b"XRef".to_vec()),
+        )]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), ciphertext);
+    }
+
+    /// With `/V >= 4`, qpdf falls back to `/StmF` only after finding no
+    /// stream-local `/Crypt` filter (`QPDF_encryption.cc:1063-1103`).
+    #[test]
+    fn piping_an_encrypted_v4_rc4_default_stream_delivers_plaintext() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = authenticated_v2_rc4_encryption();
+        encryption.encryption_v = 4;
+        encryption.cf_stream = EncryptionMode::Rc4;
+        let plaintext = b"V4 /StmF RC4 plaintext";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    #[test]
+    fn piping_an_encrypted_v4_aes_default_stream_delivers_plaintext() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = authenticated_v2_rc4_encryption();
+        encryption.encryption_v = 4;
+        encryption.cf_stream = EncryptionMode::Aes128;
+        let mut key_derivation = encryption.clone();
+        let key: [u8; 16] = key_derivation
+            .key_for_object(object_ref, true)
+            .try_into()
+            .expect("V4 AES object key");
+        let plaintext = b"V4 /StmF AES plaintext";
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext");
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    #[test]
+    fn piping_an_encrypted_v5_aes256_default_stream_delivers_plaintext() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = authenticated_v5_aes256_encryption();
+        let mut key_derivation = encryption.clone();
+        let key: [u8; 32] = key_derivation
+            .key_for_object(object_ref, true)
+            .try_into()
+            .expect("V5 AES object key");
+        let plaintext = b"V5 /StmF AES-256 plaintext";
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes256 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES-256 ciphertext");
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    /// qpdf's object-key cache is shared by `decryptString` and
+    /// `decryptStream`, and is keyed by object/generation without `use_aes`
+    /// (`QPDF_encryption.cc:955-974,1008,1135`). A string encountered first
+    /// therefore makes an AES stream on the same object use the string's
+    /// unsalted RC4 key.
+    #[test]
+    fn string_then_stream_share_qpdfs_object_key_cache() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = v4_encryption(EncryptionMode::Aes128);
+        encryption.cf_string = EncryptionMode::Rc4;
+
+        let mut oracle_key_state = encryption.clone();
+        let cached_string_key = oracle_key_state.key_for_object(object_ref, false).to_vec();
+        let plaintext = b"AES stream with the string's cached key";
+        let key: [u8; 16] = cached_string_key.clone().try_into().expect("V4 object key");
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext with qpdf's cached key");
+
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let mut encrypted_string = b"string first".to_vec();
+        crate::security::rc4::Rc4::new(&cached_string_key)
+            .expect("RC4 object key")
+            .process_in_place(&mut encrypted_string);
+        resolver
+            .encryption_parameters()
+            .borrow_mut()
+            .as_mut()
+            .expect("encryption state")
+            .decrypt_object_string(object_ref, &mut encrypted_string)
+            .expect("decrypt string");
+        assert_eq!(encrypted_string, b"string first");
+
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    /// The same qpdf cache rule is order-sensitive in the other direction:
+    /// an AES stream encountered first makes an RC4 string on the same object
+    /// use the stream's salted key.
+    #[test]
+    fn stream_then_string_share_qpdfs_object_key_cache() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = v4_encryption(EncryptionMode::Aes128);
+        encryption.cf_string = EncryptionMode::Rc4;
+
+        let mut oracle_key_state = encryption.clone();
+        let cached_stream_key = oracle_key_state.key_for_object(object_ref, true).to_vec();
+        let key: [u8; 16] = cached_stream_key
+            .clone()
+            .try_into()
+            .expect("V4 AES object key");
+        let stream_plaintext = b"stream first";
+        let mut stream_ciphertext = stream_plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut stream_ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext");
+
+        let resolver = resolver_over(stream_ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                stream_ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), stream_plaintext);
+
+        let string_plaintext = b"RC4 string with the stream's cached key";
+        let mut string_ciphertext = string_plaintext.to_vec();
+        crate::security::rc4::Rc4::new(&cached_stream_key)
+            .expect("cached object key")
+            .process_in_place(&mut string_ciphertext);
+        resolver
+            .encryption_parameters()
+            .borrow_mut()
+            .as_mut()
+            .expect("encryption state")
+            .decrypt_object_string(object_ref, &mut string_ciphertext)
+            .expect("decrypt string");
+        assert_eq!(string_ciphertext, string_plaintext);
+    }
+
+    /// qpdf warns at the source's last offset, switches the shared `/StmF`
+    /// state to AES, and consequently emits that warning only once
+    /// (`QPDF_encryption.cc:1121-1133`).
+    #[test]
+    fn an_unknown_v4_default_stream_filter_warns_once_then_decrypts_as_aes() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = authenticated_v2_rc4_encryption();
+        encryption.encryption_v = 4;
+        encryption.cf_stream = EncryptionMode::Unknown;
+        let mut key_derivation = encryption.clone();
+        let key: [u8; 16] = key_derivation
+            .key_for_object(object_ref, true)
+            .try_into()
+            .expect("V4 AES object key");
+        let plaintext = b"unknown /StmF defaults to AES";
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext");
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+
+        for _ in 0..2 {
+            let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+            assert!(resolver
+                .pipe_stream_data(
+                    object_ref,
+                    0,
+                    ciphertext.len(),
+                    &dict,
+                    &mut sink,
+                    false,
+                    false,
+                )
+                .expect("decryptStream preparation"));
+            assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+        }
+
+        let diagnostics = resolver.repair_diagnostics();
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| (diagnostic.message.as_str(), diagnostic.offset))
+                .collect::<Vec<_>>(),
+            vec![(
+                "unknown encryption filter for streams (check /StmF from /Encrypt dictionary); \
+                 streams may be decrypted improperly",
+                Some(0),
+            )]
+        );
+        assert_eq!(
+            resolver
+                .encryption_parameters()
+                .borrow()
+                .as_ref()
+                .expect("encryption retained")
+                .cf_stream,
+            EncryptionMode::Aes128
+        );
+    }
+
+    /// A bare `/Crypt` only overrides `/StmF` when its dictionary has qpdf's
+    /// required `/Type /CryptFilterDecodeParms` marker
+    /// (`QPDF_encryption.cc:1067-1074`).
+    #[test]
+    fn a_typed_bare_crypt_filter_can_select_identity_over_an_rc4_stmf() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = v4_encryption(EncryptionMode::Rc4);
+        let plaintext = b"bare Crypt selects Identity";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::name(b"Crypt".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                crypt_filter_decode_params(b"Identity"),
+            ),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), ciphertext);
+    }
+
+    /// qpdf walks equally-sized `/Filter` and `/DecodeParms` arrays in order;
+    /// every `/Crypt` match overwrites the local method, so the last matching
+    /// index supplies the one prepended pipeline stage (`:1077-1094`).
+    #[test]
+    fn a_paired_crypt_filter_array_selects_its_last_crypt_method() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = v4_encryption(EncryptionMode::Identity);
+        encryption
+            .crypt_filters
+            .insert(b"TestRc4".to_vec(), EncryptionMode::Rc4);
+        let plaintext = b"array Crypt selects RC4";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::array(vec![
+                    crate::ObjectHandle::name(b"FlateDecode".to_vec()),
+                    crate::ObjectHandle::name(b"Crypt".to_vec()),
+                    crate::ObjectHandle::name(b"Crypt".to_vec()),
+                ]),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                crate::ObjectHandle::array(vec![
+                    crate::ObjectHandle::null(),
+                    crypt_filter_decode_params(b"Identity"),
+                    crypt_params(b"TestRc4"),
+                ]),
+            ),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    #[test]
+    fn an_untyped_bare_crypt_decode_params_dict_does_not_override_stmf() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = v4_encryption(EncryptionMode::Rc4);
+        let plaintext = b"untyped bare Crypt falls back to /StmF";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::name(b"Crypt".to_vec()),
+            ),
+            (b"DecodeParms".to_vec(), crypt_params(b"Identity")),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    #[test]
+    fn unequal_crypt_filter_arrays_fall_back_to_stmf() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = v4_encryption(EncryptionMode::Identity);
+        let plaintext = b"unequal Crypt arrays remain /StmF identity";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::array(vec![crate::ObjectHandle::name(b"Crypt".to_vec())]),
+            ),
+            (b"DecodeParms".to_vec(), crate::ObjectHandle::array(vec![])),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), ciphertext);
+    }
+
+    #[test]
+    fn a_v2_crypt_filter_does_not_bypass_the_pre_v4_rc4_gate() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = authenticated_v2_rc4_encryption();
+        let plaintext = b"V2 always uses RC4";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::name(b"Crypt".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                crypt_filter_decode_params(b"Identity"),
+            ),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    #[test]
+    fn an_unknown_bare_crypt_filter_uses_its_own_warning_source() {
+        let object_ref = ObjectRef::new(4, 0);
+        let encryption = v4_encryption(EncryptionMode::Unknown);
+        let mut key_derivation = encryption.clone();
+        let key: [u8; 16] = key_derivation
+            .key_for_object(object_ref, true)
+            .try_into()
+            .expect("V4 AES object key");
+        let plaintext = b"unknown Crypt falls through to unknown /StmF";
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext");
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::name(b"Crypt".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                crypt_filter_decode_params(b"NoSuchCF"),
+            ),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+        let diagnostics = resolver.repair_diagnostics();
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| (diagnostic.message.as_str(), diagnostic.offset))
+                .collect::<Vec<_>>(),
+            vec![(
+                "unknown encryption filter for streams (check stream's Crypt decode parameters); \
+                 streams may be decrypted improperly",
+                Some(0),
+            )]
+        );
+    }
+
+    #[test]
+    fn cleartext_metadata_without_crypt_skips_the_stmf_stage() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = v4_encryption(EncryptionMode::Rc4);
+        encryption.encrypt_metadata = false;
+        let plaintext = b"cleartext metadata";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext.clone());
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            crate::ObjectHandle::name(b"Metadata".to_vec()),
+        )]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                ciphertext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), ciphertext);
+    }
+
+    /// `EncryptMetadata true` disables qpdf's cleartext-Metadata exception,
+    /// so a Metadata stream without a local `/Crypt` uses `/StmF`
+    /// (`QPDF_encryption.cc:1096-1102`).
+    #[test]
+    fn metadata_with_encrypt_metadata_true_uses_stmf() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = v4_encryption(EncryptionMode::Rc4);
+        encryption.encrypt_metadata = true;
+        let plaintext = b"encrypted metadata";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            crate::ObjectHandle::name(b"Metadata".to_vec()),
+        )]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
+    }
+
+    /// qpdf checks `/Crypt` before applying the cleartext-Metadata fallback.
+    /// A local RC4 filter therefore wins over `EncryptMetadata false`
+    /// (`QPDF_encryption.cc:1067-1103`).
+    #[test]
+    fn a_crypt_filter_on_cleartext_metadata_still_decrypts() {
+        let object_ref = ObjectRef::new(4, 0);
+        let mut encryption = v4_encryption(EncryptionMode::Identity);
+        encryption.encrypt_metadata = false;
+        encryption
+            .crypt_filters
+            .insert(b"TestRc4".to_vec(), EncryptionMode::Rc4);
+        let plaintext = b"Crypt metadata is not cleartext";
+        let ciphertext = rc4_stream_ciphertext(object_ref, plaintext, &encryption);
+        let resolver = resolver_over(ciphertext);
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let dict = crate::ObjectHandle::dictionary(vec![
+            (
+                b"Type".to_vec(),
+                crate::ObjectHandle::name(b"Metadata".to_vec()),
+            ),
+            (
+                b"Filter".to_vec(),
+                crate::ObjectHandle::name(b"Crypt".to_vec()),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                crypt_filter_decode_params(b"TestRc4"),
+            ),
+        ]);
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+
+        assert!(resolver
+            .pipe_stream_data(
+                object_ref,
+                0,
+                plaintext.len(),
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation"));
+        assert_eq!(sink.take_buffer().expect("buffer"), plaintext);
     }
 
     /// qpdf throws `damagedPDF(file, "", offset + read, "unexpected EOF
@@ -1982,15 +3139,17 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok = resolver.pipe_stream_data(
-            ObjectRef::new(4, 0),
-            offset,
-            available + 100,
-            &dict,
-            &mut sink,
-            false,
-            false,
-        );
+        let ok = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                offset,
+                available + 100,
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation");
 
         assert!(!ok, "a truncated read fails");
         let diagnostics = resolver.repair_diagnostics();
@@ -2018,15 +3177,17 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok = resolver.pipe_stream_data(
-            ObjectRef::new(4, 0),
-            9,
-            1_000,
-            &dict,
-            &mut sink,
-            true,
-            false,
-        );
+        let ok = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                9,
+                1_000,
+                &dict,
+                &mut sink,
+                true,
+                false,
+            )
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         assert!(resolver.repair_diagnostics().entries().is_empty());
@@ -2046,8 +3207,9 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
 
-        let ok =
-            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, false);
+        let ok = resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, false)
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let diagnostics = resolver.repair_diagnostics();
@@ -2076,8 +3238,9 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
 
-        let ok =
-            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, true);
+        let ok = resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, true)
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let diagnostics = resolver.repair_diagnostics();
@@ -2110,8 +3273,9 @@ mod tests {
         let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[1]);
         let trace = sink.trace();
 
-        let ok =
-            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
+        let ok = resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false)
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let finishes = finish_count(&trace);
@@ -2128,8 +3292,9 @@ mod tests {
         let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[1]);
         let trace = sink.trace();
 
-        let ok =
-            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false);
+        let ok = resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, true, false)
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let finishes = finish_count(&trace);
@@ -2150,15 +3315,17 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok = resolver.pipe_stream_data(
-            ObjectRef::new(4, 0),
-            past_end,
-            7,
-            &dict,
-            &mut sink,
-            false,
-            false,
-        );
+        let ok = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                past_end,
+                7,
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let diagnostics = resolver.repair_diagnostics();
@@ -2190,8 +3357,9 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok =
-            resolver.pipe_stream_data(ObjectRef::new(4, 0), -1, 7, &dict, &mut sink, false, false);
+        let ok = resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), -1, 7, &dict, &mut sink, false, false)
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let messages: Vec<_> = resolver
@@ -2216,8 +3384,9 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok =
-            resolver.pipe_stream_data(ObjectRef::new(4, 0), 9, 0, &dict, &mut sink, false, false);
+        let ok = resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), 9, 0, &dict, &mut sink, false, false)
+            .expect("decryptStream preparation");
 
         assert!(ok);
         assert!(sink.take_buffer().expect("buffer").is_empty());
@@ -2268,15 +3437,9 @@ mod tests {
             let dict = crate::ObjectHandle::dictionary(vec![]);
             let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-            let ok = resolver.pipe_stream_data(
-                ObjectRef::new(4, 0),
-                9,
-                7,
-                &dict,
-                &mut sink,
-                false,
-                false,
-            );
+            let ok = resolver
+                .pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, false)
+                .expect("decryptStream preparation");
 
             assert!(!ok, "seeks={fail_seeks}");
             let messages: Vec<_> = resolver
@@ -2308,15 +3471,17 @@ mod tests {
             let mut sink = crate::pipeline::test_support::RecordingSink::new(&[], &[]);
             let trace = sink.trace();
 
-            let ok = resolver.pipe_stream_data(
-                ObjectRef::new(4, 0),
-                offset,
-                length,
-                &dict,
-                &mut sink,
-                true,
-                false,
-            );
+            let ok = resolver
+                .pipe_stream_data(
+                    ObjectRef::new(4, 0),
+                    offset,
+                    length,
+                    &dict,
+                    &mut sink,
+                    true,
+                    false,
+                )
+                .expect("decryptStream preparation");
 
             assert!(!ok, "offset={offset} length={length}");
             let finishes = finish_count(&trace);
@@ -2365,27 +3530,23 @@ mod tests {
 
         // One good pipe, so the last read is at offset 9.
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
-        assert!(resolver.pipe_stream_data(
-            ObjectRef::new(4, 0),
-            9,
-            7,
-            &dict,
-            &mut sink,
-            false,
-            false
-        ));
+        assert!(resolver
+            .pipe_stream_data(ObjectRef::new(4, 0), 9, 7, &dict, &mut sink, false, false)
+            .expect("decryptStream preparation"));
 
         resolver.with_reader_mut(|reader| reader.fail_seeks = true);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
-        assert!(!resolver.pipe_stream_data(
-            ObjectRef::new(5, 0),
-            1_000,
-            7,
-            &dict,
-            &mut sink,
-            false,
-            false
-        ));
+        assert!(!resolver
+            .pipe_stream_data(
+                ObjectRef::new(5, 0),
+                1_000,
+                7,
+                &dict,
+                &mut sink,
+                false,
+                false
+            )
+            .expect("decryptStream preparation"));
 
         let offsets: Vec<_> = resolver
             .repair_diagnostics()
@@ -2406,15 +3567,17 @@ mod tests {
         let dict = crate::ObjectHandle::dictionary(vec![]);
         let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
 
-        let ok = resolver.pipe_stream_data(
-            ObjectRef::new(4, 0),
-            9,
-            usize::MAX,
-            &dict,
-            &mut sink,
-            false,
-            false,
-        );
+        let ok = resolver
+            .pipe_stream_data(
+                ObjectRef::new(4, 0),
+                9,
+                usize::MAX,
+                &dict,
+                &mut sink,
+                false,
+                false,
+            )
+            .expect("decryptStream preparation");
 
         assert!(!ok);
         let messages: Vec<_> = resolver
@@ -2641,6 +3804,147 @@ mod tests {
         )
         .expect("encrypted write");
         encrypted
+    }
+
+    fn encrypted_stream_fixture(
+        encrypt: crate::encrypt_setup::EncryptParams,
+    ) -> (Vec<u8>, &'static [u8]) {
+        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+
+        const PAYLOAD: &[u8] = b"qpdf 11.9.0 decryptStream differential payload";
+        let mut stream = format!("3 0 obj\n<< /Length {} >>\nstream\n", PAYLOAD.len()).into_bytes();
+        stream.extend_from_slice(PAYLOAD);
+        stream.extend_from_slice(b"\nendstream\nendobj\n");
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Probe 3 0 R >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n".to_vec(),
+            stream,
+        ]);
+
+        let mut plaintext = Pdf::open(Cursor::new(bytes)).expect("open plaintext stream fixture");
+        let mut encrypted = Vec::new();
+        write_pdf_with_options(
+            &mut plaintext,
+            &mut encrypted,
+            &WriteOptions {
+                full_rewrite: true,
+                compress_streams: CompressStreams::No,
+                encrypt: Some(encrypt),
+                ..WriteOptions::default()
+            },
+        )
+        .expect("encrypted stream write");
+        (encrypted, PAYLOAD)
+    }
+
+    /// Exact `/usr/bin/qpdf` 11.9.0 differential for the real encrypted-file
+    /// path. Each writer-produced RC4/AES stream is independently decrypted
+    /// by qpdf's `--raw-stream-data` and by this pipe-time primitive from the
+    /// original source offset; both byte sequences must equal the plaintext.
+    #[test]
+    fn pipe_time_rc4_and_aes_streams_match_pinned_qpdf_11_9_0() {
+        let version = match Command::new("/usr/bin/qpdf").arg("--version").output() {
+            Ok(version) => version,
+            // cov:ignore-start: CI provides the pinned qpdf binary; this is a developer-host skip
+            Err(error) => {
+                eprintln!(
+                    "/usr/bin/qpdf unavailable; skipping decryptStream differential: {error}"
+                );
+                return;
+            } // cov:ignore-end
+        };
+        let first_line = String::from_utf8_lossy(&version.stdout)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if first_line != "qpdf version 11.9.0" {
+            // cov:ignore-start: CI provides exactly qpdf 11.9.0; this is a developer-host skip
+            eprintln!(
+                "expected /usr/bin/qpdf 11.9.0; skipping decryptStream differential: {first_line}"
+            );
+            return;
+            // cov:ignore-end
+        }
+
+        for (name, encrypt, allow_weak_crypto) in [
+            (
+                "rc4-v2",
+                crate::encrypt_setup::EncryptParams::rc4(
+                    crate::encrypt_setup::EncryptMethod::V2Rc4128,
+                    b"user-pw",
+                    b"owner-pw",
+                ),
+                true,
+            ),
+            (
+                "aes128-v4",
+                crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+                false,
+            ),
+            (
+                "aes256-v5",
+                crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw", b"owner-pw"),
+                false,
+            ),
+        ] {
+            let (encrypted, plaintext) = encrypted_stream_fixture(encrypt);
+            let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+            let path = directory.path().join(format!("{name}.pdf"));
+            fs::write(&path, &encrypted).expect("write encrypted stream fixture");
+
+            let qpdf = Command::new("/usr/bin/qpdf")
+                .arg("--password=user-pw")
+                .arg("--show-object=3")
+                .arg("--raw-stream-data")
+                .arg(&path)
+                .output()
+                .expect("run pinned qpdf stream probe");
+            if !qpdf.status.success() {
+                // cov:ignore-start: failure-only qpdf diagnostic
+                panic!(
+                    "{name}: qpdf stream probe failed:\n{}",
+                    String::from_utf8_lossy(&qpdf.stderr)
+                );
+                // cov:ignore-end
+            }
+            assert_eq!(qpdf.stdout, plaintext, "{name}: qpdf oracle bytes");
+
+            let mut pdf = Pdf::open_with_options(
+                Cursor::new(encrypted),
+                crate::PdfOpenOptions {
+                    password: b"user-pw".to_vec(),
+                    allow_weak_crypto,
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .expect("open encrypted stream fixture");
+            let object_ref = ObjectRef::new(3, 0);
+            let stream = pdf.get_object_handle(object_ref);
+            stream
+                .try_dereference()
+                .expect("resolve encrypted stream handle");
+            let offset = stream.get_parsed_offset();
+            let dict = stream.as_stream_dict().expect("stream dictionary");
+            let length = usize::try_from(
+                dict.try_get_key(b"Length")
+                    .expect("resolve /Length")
+                    .try_as_integer()
+                    .expect("inspect /Length")
+                    .expect("integer /Length"),
+            )
+            .expect("non-negative stream length");
+            let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+            assert!(pdf
+                .resolver
+                .pipe_stream_data(object_ref, offset, length, &dict, &mut sink, false, false,)
+                .expect("decryptStream preparation"));
+            assert_eq!(
+                sink.take_buffer().expect("flpdf stream bytes"),
+                qpdf.stdout,
+                "{name}: flpdf and qpdf decrypted bytes"
+            );
+        }
     }
 
     fn canonical_info_dictionary(
