@@ -7429,11 +7429,11 @@ mod mutation_tests {
         owner.set_resolved(value);
 
         let Repr::Indirect(slot) = &owner.0 else {
-            panic!("test owner must remain indirect");
+            panic!("test owner must remain indirect"); // cov:ignore: test constructor guarantees this variant
         };
         let slot = slot.borrow();
         let IndirectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
-            panic!("test owner must resolve to the supplied dictionary");
+            panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries
             .keys()
@@ -7447,7 +7447,7 @@ mod mutation_tests {
     fn expired_direct_parent_edges_are_pruned_on_attach_and_query() {
         fn parent_count(handle: &ObjectHandle) -> usize {
             let Repr::Direct(slot) = &handle.0 else {
-                panic!("test child must be direct");
+                panic!("test child must be direct"); // cov:ignore: test factory guarantees this variant
             };
             slot.borrow().containment_parents.len()
         }
@@ -7478,21 +7478,23 @@ mod mutation_tests {
             .env("FLPDF_DEEP_CONTAINMENT_PROBE", "1")
             .output()
             .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
 
         assert!(
             output.status.success(),
             "deep-containment probe failed: status={} stderr={}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
+            stderr
         );
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
     fn deep_containment_traversals_probe() {
-        if std::env::var_os("FLPDF_DEEP_CONTAINMENT_PROBE").is_none() {
-            return;
-        }
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_CONTAINMENT_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
 
         let owner_ref = ObjectRef::new(7, 0);
         let owner = ObjectHandle::new_indirect_unresolved_with_identity(
