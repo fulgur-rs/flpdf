@@ -6897,7 +6897,26 @@ mod tests {
         assert!(!pdf.is_dirty(owner_ref));
         let mut out = Vec::new();
         write_pdf(&mut pdf, &mut out).expect("incremental write");
-        assert_eq!(out, bytes);
+        assert!(out.starts_with(&bytes));
+        assert_eq!(
+            out.windows(b"1 0 obj\n".len())
+                .filter(|window| *window == b"1 0 obj\n")
+                .count(),
+            1,
+            "the detached child's former owner must not be appended again"
+        );
+
+        let mut reopened = Pdf::open_mem_owned(out).expect("reopen incremental output");
+        let reopened_owner = reopened.get_object_handle(owner_ref);
+        reopened.resolve_object_handle(&reopened_owner).unwrap();
+        assert_eq!(
+            reopened_owner
+                .get_key(b"Child")
+                .get_key(b"Value")
+                .as_integer(),
+            Some(1),
+            "a detached child mutation must not change the former owner on disk"
+        );
     }
 
     #[test]
