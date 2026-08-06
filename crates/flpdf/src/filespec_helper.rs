@@ -258,7 +258,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         // projections: a stream dictionary is always a dictionary and comes
         // from the same stream value that owns the payload.
         let dictionary = stream_dict
-            .materialize()
+            .materialize()?
             .into_dict()
             .expect("stream dictionary handle must materialize as a dictionary");
         let data = stream
@@ -550,7 +550,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             return Ok(None);
         };
         let dict = dictionary
-            .materialize()
+            .materialize()?
             .into_dict()
             .expect("dictionary handle must materialize as a dictionary");
         Ok(Some(dict))

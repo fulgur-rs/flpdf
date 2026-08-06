@@ -208,7 +208,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         owner_ref: ObjectRef,
         updated: Object,
     ) -> Result<()> {
-        if target.materialize() == updated {
+        if target.materialize()? == updated {
             return Ok(());
         }
         let updated = self.pdf.lift_object_to_handle(&updated)?;
@@ -227,8 +227,8 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         // cov:ignore-end
         for (key, value) in entries {
             let value = match existing.get(&key) {
-                Some(current) if Self::same_handle_value(current, &value) => current.clone(),
-                Some(current) => Self::merge_updated_root_entry(&key, current, value),
+                Some(current) if Self::same_handle_value(current, &value)? => current.clone(),
+                Some(current) => Self::merge_updated_root_entry(&key, current, value)?,
                 None => value,
             };
             target.replace_key(&key, value);
@@ -237,47 +237,47 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         Ok(())
     }
 
-    fn same_handle_value(left: &ObjectHandle, right: &ObjectHandle) -> bool {
-        match (left.object_ref(), right.object_ref()) {
+    fn same_handle_value(left: &ObjectHandle, right: &ObjectHandle) -> Result<bool> {
+        Ok(match (left.object_ref(), right.object_ref()) {
             (Some(left_ref), Some(right_ref)) => left_ref == right_ref,
-            (None, None) => left.materialize() == right.materialize(),
+            (None, None) => left.materialize()? == right.materialize()?,
             _ => false,
-        }
+        })
     }
 
     fn merge_updated_root_entry(
         key: &[u8],
         current: &ObjectHandle,
         updated: ObjectHandle,
-    ) -> ObjectHandle {
+    ) -> Result<ObjectHandle> {
         let (Some(current_items), Some(updated_items)) = (current.as_array(), updated.as_array())
         else {
-            return updated;
+            return Ok(updated);
         };
-        let merged =
-            if key == b"Names" && current_items.len() % 2 == 0 && updated_items.len() % 2 == 0 {
-                Self::merge_name_pairs(current_items, updated_items)
-            } else {
-                updated_items
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, item)| {
-                        current_items
-                            .get(index)
-                            .filter(|current| Self::same_handle_value(current, &item))
-                            .cloned()
-                            .unwrap_or(item)
-                    })
-                    .collect()
-            };
+        let merged = if key == b"Names"
+            && current_items.len() % 2 == 0
+            && updated_items.len() % 2 == 0
+        {
+            Self::merge_name_pairs(current_items, updated_items)?
+        } else {
+            let mut merged = Vec::with_capacity(updated_items.len());
+            for (index, item) in updated_items.into_iter().enumerate() {
+                let item = match current_items.get(index) {
+                    Some(current) if Self::same_handle_value(current, &item)? => current.clone(),
+                    _ => item,
+                };
+                merged.push(item);
+            }
+            merged
+        };
         current.replace_array_items(merged);
-        current.clone()
+        Ok(current.clone())
     }
 
     fn merge_name_pairs(
         current_items: Vec<ObjectHandle>,
         updated_items: Vec<ObjectHandle>,
-    ) -> Vec<ObjectHandle> {
+    ) -> Result<Vec<ObjectHandle>> {
         let mut current_pairs = BTreeMap::new();
         for pair in current_items.chunks_exact(2) {
             current_pairs.entry(pair[0].unparse()).or_insert(pair);
@@ -288,7 +288,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             match current_pair {
                 Some(pair) => {
                     merged.push(pair[0].clone());
-                    merged.push(if Self::same_handle_value(&pair[1], &updated_pair[1]) {
+                    merged.push(if Self::same_handle_value(&pair[1], &updated_pair[1])? {
                         pair[1].clone()
                     } else {
                         updated_pair[1].clone()
@@ -297,7 +297,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 None => merged.extend(updated_pair.iter().cloned()),
             }
         }
-        merged
+        Ok(merged)
     }
 
     fn live_embedded_file(
@@ -499,7 +499,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             }
         };
         if let Some((root, owner_ref)) = direct_root {
-            let mut tree = crate::NameTree::new(root.materialize(), true);
+            let mut tree = crate::NameTree::new(root.materialize()?, true);
             let inserted = tree.insert(self.pdf, key, value);
             self.update_direct_embedded_files_root(&root, owner_ref, tree.into_root())?;
             inserted?;
@@ -512,8 +512,8 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     fn replace_direct_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
         // cov:ignore-start: exercised identity is identical to the indirect Filespec path; public construction of a PDF-owned direct Filespec is covered by the slot-identity regression
         if let Some((root, owner_ref)) = self.direct_embedded_files_root_handle()? {
-            let mut tree = crate::NameTree::new(root.materialize(), true);
-            let inserted = tree.insert(self.pdf, key, filespec.materialize());
+            let mut tree = crate::NameTree::new(root.materialize()?, true);
+            let inserted = tree.insert(self.pdf, key, filespec.materialize()?);
             let position = inserted
                 .as_ref()
                 .ok()
@@ -532,7 +532,8 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             return Ok(());
         }
         // cov:ignore-end
-        insert_embedded_file_value(self.pdf, key, filespec.materialize())?;
+        let filespec_value = filespec.materialize()?; // cov:ignore: FileSpec construction above guarantees a direct dictionary
+        insert_embedded_file_value(self.pdf, key, filespec_value)?; // cov:ignore: this direct-root fallback preserves the already-covered indirect insertion path
         let Some(mut tree) = self.name_tree()? else {
             return Ok(()); // cov:ignore: insertion above creates the tree
         };
@@ -559,7 +560,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     pub fn remove_embedded_file(&mut self, key: &[u8]) -> Result<bool> {
         let direct_root = self.direct_embedded_files_root_handle()?;
         if let Some((root, owner_ref)) = direct_root {
-            let mut tree = crate::NameTree::new(root.materialize(), true);
+            let mut tree = crate::NameTree::new(root.materialize()?, true);
             let found = tree.find_object(self.pdf, key);
             match found {
                 Err(error) => {
@@ -1358,7 +1359,8 @@ mod tests {
 
         let equal_direct = ObjectHandle::integer(1);
         let equal_direct_copy = ObjectHandle::integer(1);
-        assert!(Helper::same_handle_value(&equal_direct, &equal_direct_copy));
+        assert!(Helper::same_handle_value(&equal_direct, &equal_direct_copy)
+            .expect("direct values materialize"));
 
         let mut pdf = open_minimal();
         let first_ref = ObjectRef::new(90, 0);
@@ -1368,16 +1370,20 @@ mod tests {
         let first = pdf.get_object_handle(first_ref);
         let first_again = pdf.get_object_handle(first_ref);
         let second = pdf.get_object_handle(second_ref);
-        assert!(Helper::same_handle_value(&first, &first_again));
-        assert!(!Helper::same_handle_value(&first, &second));
-        assert!(!Helper::same_handle_value(&equal_direct, &first));
+        assert!(
+            Helper::same_handle_value(&first, &first_again).expect("indirect values materialize")
+        );
+        assert!(!Helper::same_handle_value(&first, &second).expect("indirect values materialize"));
+        assert!(!Helper::same_handle_value(&equal_direct, &first)
+            .expect("direct and indirect values materialize"));
 
         let replacement = ObjectHandle::integer(2);
         let merged = Helper::merge_updated_root_entry(
             b"Other",
             &ObjectHandle::integer(1),
             replacement.clone(),
-        );
+        )
+        .expect("root entry merges");
         assert!(merged.is_same_object_as(&replacement));
 
         let retained_item = ObjectHandle::integer(3);
@@ -1385,7 +1391,8 @@ mod tests {
             b"Other",
             &ObjectHandle::array(vec![retained_item.clone()]),
             ObjectHandle::array(vec![ObjectHandle::integer(3), ObjectHandle::integer(4)]),
-        );
+        )
+        .expect("root entry merges");
         let items = merged.as_array().expect("merged array");
         assert!(items[0].is_same_object_as(&retained_item));
         assert_eq!(items[1].as_integer(), Some(4));
@@ -1400,7 +1407,8 @@ mod tests {
                 ObjectHandle::string(b"b".to_vec()),
                 ObjectHandle::integer(7),
             ],
-        );
+        )
+        .expect("name pairs merge");
         assert!(pairs[0].is_same_object_as(&retained_key));
         assert_eq!(pairs[1].as_integer(), Some(6));
         assert_eq!(pairs[3].as_integer(), Some(7));
