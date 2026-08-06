@@ -348,12 +348,15 @@ impl EncryptionState {
     /// handed (`libqpdf/Pl_AES_PDF.cc:12-34`), and `compute_data_key` makes
     /// that buffer 32 bytes exactly when `/V >= 5`.
     fn with_object_cipher<T>(
-        &self,
+        &mut self,
         og: ObjectRef,
         use_aes: bool,
         apply: impl FnOnce(StringCipher<'_>) -> Result<T>,
     ) -> Result<T> {
-        let key = self.compute_data_key(og, use_aes);
+        // qpdf's string and stream paths both enter through
+        // `getKeyForObject`; copying releases the mutable cache borrow before
+        // handing a key-backed cipher to the recursive object walk.
+        let key = self.key_for_object(og, use_aes).to_vec();
         if !use_aes {
             return apply(StringCipher::Rc4 { key: &key });
         }
@@ -376,11 +379,6 @@ impl EncryptionState {
     /// counterpart: an `EncryptionState` only exists for an encrypted
     /// document.
     //
-    // Not yet wired to a production caller. `QPDF::decryptStream`'s port
-    // (the pipe-time decryption stage) is what will call it; until then the
-    // legacy resolve-time route keeps deriving keys per call through
-    // `security::standard::per_object_key`.
-    #[allow(dead_code)]
     fn key_for_object(&mut self, og: ObjectRef, use_aes: bool) -> &[u8] {
         if self.cached_key_og != Some(og) {
             let key = self.compute_data_key(og, use_aes);
@@ -3148,10 +3146,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         // qpdf `QPDF::decryptString` (`libqpdf/QPDF_encryption.cc:977-1039`).
-        let (string_use_aes, warn_unknown_string) = encryption.string_method();
-        if let Some(use_aes) = string_use_aes {
-            decrypt_object_strings(object_ref, &mut object, use_aes, encryption)?;
-        }
+        let warn_unknown_string = decrypt_object_strings(object_ref, &mut object, encryption)?;
 
         let mut stream_payload_transformed = false;
         let mut warn_unknown_stream = false;
@@ -3524,13 +3519,57 @@ fn resolve_object_value<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Opti
 fn decrypt_object_strings(
     object_ref: ObjectRef,
     object: &mut Object,
-    use_aes: bool,
-    encryption: &EncryptionState,
-) -> Result<()> {
+    encryption: &mut EncryptionState,
+) -> Result<bool> {
     let encrypt_ref = encryption.encrypt_ref;
+    if Some(object_ref) == encrypt_ref || !object_contains_string(object, 0)? {
+        return Ok(false);
+    }
+    let (use_aes, warn) = encryption.string_method();
+    let Some(use_aes) = use_aes else {
+        return Ok(warn);
+    };
     encryption.with_object_cipher(object_ref, use_aes, |cipher| {
         decrypt_strings_in_object(object_ref, object, cipher, encrypt_ref)
-    })
+    })?;
+    Ok(warn)
+}
+
+/// Whether qpdf's parser would encounter a string token while reading this
+/// already-materialized legacy object. The scan is deliberately key-free:
+/// `decryptString` and therefore `getKeyForObject` run only at an actual
+/// string token (`QPDFParser.cc:114-121`).
+fn object_contains_string(object: &Object, depth: usize) -> Result<bool> {
+    if depth > crate::object::MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "decrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH // cov:ignore-start: llvm maps the covered recursive error and String arm to trailing syntax
+        )));
+    }
+    let values: Option<Box<dyn Iterator<Item = &Object> + '_>> = match object {
+        Object::String(_) => return Ok(true),
+        // cov:ignore-end
+        Object::Array(values) => Some(Box::new(values.iter())),
+        Object::Dictionary(dict) => Some(Box::new(dict.iter().map(|(_, value)| value))),
+        Object::Stream(stream) => Some(Box::new(stream.dict.iter().map(|(_, value)| value))),
+        Object::Null
+        | Object::Boolean(_)
+        | Object::Integer(_)
+        | Object::Real(_)
+        | Object::RealLiteral { .. }
+        | Object::Name(_)
+        | Object::Reference(_)
+        | Object::Operator(_)
+        | Object::InlineImage(_) => None,
+    };
+    if let Some(values) = values {
+        for value in values {
+            if object_contains_string(value, depth + 1)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 // Mirrors `decrypt_object_strings`'s mode dispatch exactly (same key
@@ -3555,6 +3594,9 @@ fn decrypt_object_value_strings(
     if Some(object_ref) == encryption.encrypt_ref {
         return Ok(false);
     }
+    if !object_value_contains_string(value)? {
+        return Ok(false);
+    }
     let (use_aes, warn) = encryption.string_method();
     let Some(use_aes) = use_aes else {
         return Ok(warn);
@@ -3563,6 +3605,69 @@ fn decrypt_object_value_strings(
         decrypt_strings_in_object_value(value, cipher)
     })?;
     Ok(warn)
+}
+
+fn object_value_contains_string(value: &ObjectValue) -> Result<bool> {
+    match value {
+        ObjectValue::String(_) => Ok(true),
+        ObjectValue::Array(items) => handles_contain_string(items.iter(), 1),
+        ObjectValue::Dictionary(entries) => handles_contain_string(entries.values(), 1),
+        ObjectValue::Stream { stream_dict, .. } => {
+            let entries = stream_dict
+                .as_dictionary()
+                .expect("a stream's own dictionary handle is always a direct Dictionary value");
+            handles_contain_string(entries.values(), 1)
+        }
+        ObjectValue::Null
+        | ObjectValue::Boolean(_)
+        | ObjectValue::Integer(_)
+        | ObjectValue::Real(_)
+        | ObjectValue::RealLiteral { .. }
+        | ObjectValue::Name(_)
+        | ObjectValue::Reference(_)
+        | ObjectValue::Operator(_)
+        | ObjectValue::InlineImage(_) => Ok(false),
+    }
+}
+
+fn handles_contain_string<'a>(
+    handles: impl Iterator<Item = &'a ObjectHandle>,
+    depth: usize,
+) -> Result<bool> {
+    for handle in handles {
+        if handle_contains_string(handle, depth)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn handle_contains_string(handle: &ObjectHandle, depth: usize) -> Result<bool> {
+    if handle.is_indirect() {
+        return Ok(false);
+    }
+    if depth > crate::object::MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "decrypt: inline object nesting exceeds maximum of {}",
+            crate::object::MAX_INLINE_DEPTH
+        )));
+    }
+    if handle.as_string().is_some() {
+        return Ok(true);
+    }
+    if let Some(items) = handle.as_array() {
+        return handles_contain_string(items.iter(), depth + 1);
+    }
+    if let Some(entries) = handle.as_dictionary() {
+        return handles_contain_string(entries.values(), depth + 1);
+    }
+    if let Some(dict) = handle.as_stream_dict() {
+        let entries = dict
+            .as_dictionary()
+            .expect("a stream's own dictionary handle is always a direct Dictionary value");
+        return handles_contain_string(entries.values(), depth + 1);
+    }
+    Ok(false)
 }
 
 // The top-level value itself: a bare `ObjectValue::String` is mutated
@@ -3687,10 +3792,10 @@ fn decrypt_stream_bytes(
     object_ref: ObjectRef,
     bytes: &mut Vec<u8>,
     use_aes: bool,
-    encryption: &EncryptionState,
+    encryption: &mut EncryptionState,
 ) -> Result<()> {
     if !use_aes {
-        let key = encryption.compute_data_key(object_ref, false);
+        let key = encryption.key_for_object(object_ref, false).to_vec();
         return PlRc4::transform_in_place("RC4 stream decryption", bytes, &key).map_err(Into::into);
     }
     encryption.with_object_cipher(object_ref, true, |cipher| {
@@ -4165,7 +4270,6 @@ fn interpret_cf(
 /// qpdf `QPDF::interpretCF`'s ObjectHandle boundary
 /// (`include/qpdf/QPDF.hh:1122-1127`,
 /// `libqpdf/QPDF_encryption.cc:700-716`).
-#[allow(dead_code)] // production consumer cutover belongs to flpdf-25kg.3.12
 pub(in crate::reader) fn interpret_cf_from_handle(
     encryption: &EncryptionState,
     cf: &ObjectHandle,
@@ -4925,8 +5029,9 @@ mod tests {
         plaintext: &[u8],
         encryption: &EncryptionState,
     ) -> Vec<u8> {
+        let mut encryption = encryption.clone();
         let mut ciphertext = plaintext.to_vec();
-        decrypt_stream_bytes(object_ref, &mut ciphertext, false, encryption)
+        decrypt_stream_bytes(object_ref, &mut ciphertext, false, &mut encryption)
             .expect("RC4 encryption");
         ciphertext
     }
@@ -4934,21 +5039,104 @@ mod tests {
     #[test]
     fn rc4_stream_decryption_preserves_payload_allocation() {
         let object_ref = ObjectRef::new(7, 0);
-        let encryption = explicit_rc4_encryption_state();
+        let mut encryption = explicit_rc4_encryption_state();
         let plaintext = vec![0x42; crate::pipeline::rc4::DEFAULT_OUT_BUFFER_SIZE + 17];
         let mut bytes = plaintext.clone();
         let original_ptr = bytes.as_ptr();
         let original_capacity = bytes.capacity();
 
-        decrypt_stream_bytes(object_ref, &mut bytes, false, &encryption).expect("RC4 transform");
+        decrypt_stream_bytes(object_ref, &mut bytes, false, &mut encryption)
+            .expect("RC4 transform");
         assert_eq!(bytes.as_ptr(), original_ptr);
         assert_eq!(bytes.capacity(), original_capacity);
         assert_ne!(bytes, plaintext);
 
-        decrypt_stream_bytes(object_ref, &mut bytes, false, &encryption)
+        decrypt_stream_bytes(object_ref, &mut bytes, false, &mut encryption)
             .expect("RC4 inverse transform");
         assert_eq!(bytes.as_ptr(), original_ptr);
         assert_eq!(bytes, plaintext);
+    }
+
+    #[test]
+    fn a_string_free_legacy_object_does_not_prime_qpdfs_key_cache() {
+        let object_ref = ObjectRef::new(7, 0);
+        let mut encryption = explicit_rc4_string_encryption_state();
+        encryption.file_key = (0..16).collect();
+        encryption.cf_stream = EncryptionMode::Aes128;
+        let mut oracle_state = encryption.clone();
+        let key: [u8; 16] = oracle_state
+            .key_for_object(object_ref, true)
+            .try_into()
+            .expect("V4 AES object key");
+        let plaintext = b"string-free stream uses its own method first";
+        let mut ciphertext = plaintext.to_vec();
+        crate::security::standard::encrypt_cipher_bytes(
+            &mut ciphertext,
+            crate::security::standard::StringEncryptCipher::Aes128 { key: &key },
+            &[0x5a; 16],
+        )
+        .expect("build AES ciphertext");
+        let mut object = Object::Stream(Stream::new(Dictionary::new(), Vec::new()));
+
+        decrypt_object_strings(object_ref, &mut object, &mut encryption)
+            .expect("walk string-free stream dictionary");
+
+        assert_eq!(encryption.cached_key_og, None);
+        assert!(encryption.cached_object_encryption_key.is_empty());
+        decrypt_stream_bytes(object_ref, &mut ciphertext, true, &mut encryption)
+            .expect("stream method primes and uses qpdf's cache");
+        assert_eq!(ciphertext, plaintext);
+    }
+
+    #[test]
+    fn a_string_free_object_value_does_not_prime_qpdfs_key_cache() {
+        let object_ref = ObjectRef::new(7, 0); // cov:ignore: llvm test-prologue mapping artifact; the test body runs
+        let mut encryption = explicit_rc4_string_encryption_state();
+        encryption.cf_stream = EncryptionMode::Aes128;
+        let mut value = ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_length: 0,
+        };
+
+        decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
+            .expect("walk string-free stream dictionary");
+
+        assert_eq!(encryption.cached_key_og, None);
+        assert!(encryption.cached_object_encryption_key.is_empty());
+    }
+
+    #[test]
+    fn legacy_identity_string_does_not_prime_qpdfs_key_cache() {
+        let object_ref = ObjectRef::new(7, 0);
+        let mut encryption = explicit_rc4_string_encryption_state();
+        encryption.cf_string = EncryptionMode::Identity;
+        let mut object = Object::String(b"identity string".to_vec());
+
+        let warn = decrypt_object_strings(object_ref, &mut object, &mut encryption)
+            .expect("Identity is a no-op");
+
+        assert!(!warn);
+        assert_eq!(object.as_string(), Some(b"identity string".as_slice()));
+        assert_eq!(encryption.cached_key_og, None);
+    }
+
+    #[test]
+    fn legacy_string_scan_rejects_excess_inline_nesting() {
+        let object_ref = ObjectRef::new(7, 0);
+        let mut encryption = explicit_rc4_string_encryption_state();
+        let mut object = Object::String(b"leaf".to_vec());
+        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+            object = Object::Array(vec![object]);
+        }
+
+        let error = decrypt_object_strings(object_ref, &mut object, &mut encryption)
+            .expect_err("excess inline nesting must error before key derivation");
+        assert!(
+            matches!(error, Error::Unsupported(ref message) if message.contains("inline object nesting exceeds maximum")), // cov:ignore: llvm maps this executed matches predicate as zero
+            "got {error:?}"
+        );
+        assert_eq!(encryption.cached_key_og, None);
     }
 
     fn explicit_rc4_string_encryption_state() -> EncryptionState {
