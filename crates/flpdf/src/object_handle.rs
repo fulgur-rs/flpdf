@@ -2163,9 +2163,13 @@ impl ObjectHandle {
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if let Repr::Direct(slot) = &self.0 {
-            let old_value = std::mem::replace(&mut slot.borrow_mut().value, value.clone());
+            let new_children = Self::direct_children(&value);
+            let old_value = std::mem::replace(&mut slot.borrow_mut().value, value);
             self.detach_value_children(&old_value);
-            self.attach_value_children(&value);
+            let parent = self.containment_parent();
+            for child in new_children {
+                Self::attach_child_to_parent(&child, &parent);
+            }
         }
     }
 
@@ -5302,6 +5306,31 @@ mod materialize_tests {
 
         assert_eq!(handle.as_integer(), Some(2));
         assert_eq!(handle.get_parsed_offset(), 100);
+    }
+
+    #[test]
+    fn replace_direct_value_moves_dictionary_storage_without_cloning_it() {
+        let handle = ObjectHandle::integer(1);
+        let key = vec![b'K'; 4_096];
+        let original_key_allocation = key.as_ptr();
+        let value =
+            ObjectValue::Dictionary([(key, ObjectHandle::integer(2))].into_iter().collect());
+
+        handle.replace_direct_value(value);
+
+        let Repr::Direct(slot) = &handle.0 else {
+            panic!("test handle must remain direct"); // cov:ignore: test constructor guarantees this variant
+        };
+        let slot = slot.borrow();
+        let ObjectValue::Dictionary(entries) = &slot.value else {
+            panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
+        };
+        let replaced_key_allocation = entries
+            .keys()
+            .next()
+            .expect("replacement dictionary retains its key")
+            .as_ptr();
+        assert_eq!(replaced_key_allocation, original_key_allocation);
     }
 
     #[test]
