@@ -4459,6 +4459,7 @@ fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::pages::page_refs;
+    use crate::write_pdf;
     use crate::Stream;
     // `SeekFrom` left `reader.rs`'s own imports along with the input source;
     // the fault-injecting cursor below still implements `Seek`.
@@ -6874,6 +6875,29 @@ mod tests {
 
         pdf.mark_object_handle_dirty(&inner).unwrap();
         assert!(pdf.is_dirty(object_ref));
+    }
+
+    #[test]
+    fn detached_direct_child_neither_dirties_nor_emits_its_former_owner() {
+        let owner_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Child << /Value 1 >> >>\nendobj\n"],
+            owner_ref,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
+        let owner = pdf.get_object_handle(owner_ref);
+        pdf.resolve_object_handle(&owner).unwrap();
+        let child = owner.get_key(b"Child");
+
+        owner.remove_key(b"Child");
+        pdf.clear_dirty(owner_ref);
+        child.replace_key(b"Value", ObjectHandle::integer(2));
+        pdf.mark_object_handle_dirty(&child).unwrap();
+
+        assert!(!pdf.is_dirty(owner_ref));
+        let mut out = Vec::new();
+        write_pdf(&mut pdf, &mut out).expect("incremental write");
+        assert_eq!(out, bytes);
     }
 
     #[test]

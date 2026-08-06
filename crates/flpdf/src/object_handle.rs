@@ -7187,6 +7187,94 @@ mod mutation_tests {
     }
 
     #[test]
+    fn dictionary_detach_removes_only_the_removed_live_path() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let child = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"A".to_vec(), child.clone()),
+                (b"B".to_vec(), child.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        owner.remove_key(b"A");
+        assert_eq!(child.containing_object_refs(), vec![owner_ref]);
+        owner.remove_key(b"B");
+        assert!(child.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn replacing_a_nested_dictionary_path_detaches_the_old_subtree() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let leaf = ObjectHandle::integer(1);
+        let nested = ObjectHandle::dictionary(vec![(b"Leaf".to_vec(), leaf.clone())]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Nested".to_vec(), nested.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        owner.replace_key(b"Nested", ObjectHandle::dictionary(vec![]));
+
+        assert!(nested.containing_object_refs().is_empty());
+        assert!(leaf.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn shared_subtree_loses_only_the_detached_indirect_root() {
+        let first_ref = ObjectRef::new(7, 0);
+        let second_ref = ObjectRef::new(9, 0);
+        let first = ObjectHandle::new_indirect_unresolved(first_ref, -1);
+        let second = ObjectHandle::new_indirect_unresolved(second_ref, -1);
+        let shared = ObjectHandle::dictionary(vec![]);
+        first.set_resolved(ObjectValue::Dictionary(
+            [(b"Shared".to_vec(), shared.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        second.set_resolved(ObjectValue::Dictionary(
+            [(b"Shared".to_vec(), shared.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        first.remove_key(b"Shared");
+
+        assert_eq!(shared.containing_object_refs(), vec![second_ref]);
+    }
+
+    #[test]
+    fn array_and_direct_value_replacement_detach_old_children() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let first = ObjectHandle::integer(1);
+        let second = ObjectHandle::integer(2);
+        let array = ObjectHandle::array(vec![first.clone(), first.clone()]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Array".to_vec(), array.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        assert!(array.replace_array_item(0, second.clone()));
+        assert_eq!(first.containing_object_refs(), vec![owner_ref]);
+        assert_eq!(second.containing_object_refs(), vec![owner_ref]);
+        assert!(array.replace_array_items(vec![]));
+        assert!(first.containing_object_refs().is_empty());
+        assert!(second.containing_object_refs().is_empty());
+
+        let replacement = ObjectHandle::integer(3);
+        array.replace_direct_value(ObjectValue::Array(vec![replacement.clone()]));
+        assert_eq!(replacement.containing_object_refs(), vec![owner_ref]);
+        array.replace_direct_value(ObjectValue::Array(vec![]));
+        assert!(replacement.containing_object_refs().is_empty());
+    }
+
+    #[test]
     fn shallow_copy_is_always_direct_even_from_an_indirect_source() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
