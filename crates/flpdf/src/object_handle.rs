@@ -341,8 +341,9 @@ pub(crate) enum IndirectState {
     /// The owning document has been dropped and this slot's value has been
     /// severed (see [`ObjectHandle::disconnect`]). Distinct from `Missing`
     /// (a reference absent from the source) so a future diagnostic can still
-    /// tell the two apart; presents the same externally-observable `Null`
-    /// value as both other terminal states.
+    /// tell the two apart. It is also distinct from null: [`ObjectHandle::is_null`]
+    /// reports `false`, while value accessors without an error channel retain
+    /// their null fallback.
     Destroyed,
 }
 
@@ -690,8 +691,8 @@ impl ObjectHandle {
     ///
     /// Also resets the parsed offset to the no-offset sentinel, mirroring
     /// [`Self::set_missing`]'s own reset and the same Parsed-Offset Contract
-    /// clause it cites: a surviving handle that now presents as null must
-    /// not keep reporting the destroyed value's former source position.
+    /// clause it cites: a surviving destroyed handle must not keep reporting
+    /// the destroyed value's former source position.
     pub(crate) fn disconnect(&self) {
         if let Repr::Indirect(slot) = &self.0 {
             let mut slot = slot.borrow_mut();
@@ -1139,9 +1140,16 @@ impl ObjectHandle {
     /// never performs resolution itself, so an unresolved handle is not
     /// assumed to be null. Once resolved, this reflects the real value:
     /// `true` both for a genuinely parsed `null` object and for a reference
-    /// that turned out to be missing from the source.
+    /// that turned out to be missing from the source. A handle disconnected
+    /// when its owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
-        self.with_value(|value| matches!(value, Some(ObjectValue::Null)))
+        match &self.0 {
+            Repr::Direct(slot) => matches!(&slot.borrow().value, ObjectValue::Null),
+            Repr::Indirect(slot) => matches!(
+                &slot.borrow().state,
+                IndirectState::Resolved(ObjectValue::Null) | IndirectState::Missing
+            ),
+        }
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -1723,10 +1731,10 @@ impl ObjectHandle {
 
     // `None` for an indirect handle that has not yet been resolved — value
     // access on an unresolved handle must not perform hidden I/O (design,
-    // `Pdf` section). A resolved indirect handle exposes its real value;
-    // `Missing` (see [`IndirectState`]) presents as `ObjectValue::Null`,
-    // matching the externally-observable behavior of a resolved literal
-    // `null` object.
+    // `Pdf` section). A resolved indirect handle exposes its real value.
+    // Missing and Destroyed retain the null fallback for value accessors that
+    // use this helper; state-aware accessors such as `is_null` inspect their
+    // slot directly instead.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
         match &self.0 {
             Repr::Direct(slot) => f(Some(&slot.borrow().value)),
@@ -1843,9 +1851,9 @@ impl ObjectHandle {
     ///   handle's value severed): qpdf's `QPDF_Destroyed::unparse()`
     ///   (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`; this
     ///   method has no exception channel to mirror that with (`Vec<u8>`
-    ///   return, no `Result`) and instead presents the same `null` fallback
-    ///   this file's other value accessors (e.g. [`Self::is_null`]) already
-    ///   give a destroyed handle, rather than panicking.
+    ///   return, no `Result`) and instead retains its null fallback rather
+    ///   than panicking. [`Self::is_null`] intentionally remains false for a
+    ///   destroyed handle.
     pub fn unparse_resolved(&self) -> Vec<u8> {
         // Bridges through a null-omission-aware materialization walk
         // (`unparse_materialize`, distinct from the general `materialize`/
@@ -4611,14 +4619,15 @@ mod resolution_state_tests {
     }
 
     #[test]
-    fn disconnect_replaces_a_resolved_value_and_presents_as_null() {
+    fn disconnect_replaces_a_resolved_value_with_destroyed_state() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
 
         handle.disconnect();
 
         assert!(handle.is_resolved());
-        assert!(handle.is_null());
+        assert!(!handle.is_null());
+        assert_eq!(handle.type_code(), 14);
         assert_eq!(handle.as_integer(), None);
     }
 
@@ -5240,8 +5249,7 @@ mod unparse_tests {
         // (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`
         // once it gets there. This method has no exception channel to
         // mirror that with, so -- as documented on `unparse_resolved`
-        // itself -- it presents the same `null` fallback this file's other
-        // value accessors give a destroyed handle, rather than panicking.
+        // itself -- it retains a null fallback rather than panicking.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
         handle.disconnect();

@@ -2947,15 +2947,14 @@ mod tests {
 
     /// Attaching a resolver must not disturb `Pdf::drop`'s teardown.
     ///
-    /// A handle that outlives its document reads as null and does *not*
-    /// error, because `Pdf::drop` disconnects every registry entry into
+    /// A handle that outlives its document is destroyed and does *not* error,
+    /// because `Pdf::drop` disconnects every registry entry into
     /// `IndirectState::Destroyed` before the `Rc<ResolverHandle>` drops, and
     /// `try_dereference` short-circuits on any non-`NotYetResolved` state
-    /// without consulting the resolver. That "reads as null" outcome is
-    /// `flpdf-nrp3`'s recorded divergence from qpdf; this slice must leave it
-    /// exactly as it found it, so this test pins it rather than endorsing it.
+    /// without consulting the resolver. qpdf's `isNull()` accepts `ot_null`,
+    /// not `ot_destroyed` (`libqpdf/QPDFObjectHandle.cc:352-356`).
     #[test]
-    fn a_handle_outliving_its_document_still_reads_as_null_instead_of_erroring() {
+    fn a_handle_outliving_its_document_is_destroyed_not_null() {
         let handle = {
             let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
             pdf.get_object_handle(ObjectRef::new(1, 0))
@@ -2964,7 +2963,8 @@ mod tests {
         handle
             .try_dereference()
             .expect("a destroyed slot is terminal, not an error");
-        assert!(handle.is_null());
+        assert_eq!(handle.type_code(), 14, "qpdf ot_destroyed");
+        assert!(!handle.is_null());
     }
 
     /// The resolver cannot outlive the document that owns it, observed through

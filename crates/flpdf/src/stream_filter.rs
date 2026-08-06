@@ -3089,7 +3089,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn handle_reader_reads_a_filter_disconnected_by_pdf_teardown_as_absent() {
+    fn handle_reader_rejects_a_filter_disconnected_by_pdf_teardown() {
         // Production teardown, not a synthetic resolver: `Pdf::drop`
         // (`reader.rs`, mirroring `QPDF::~QPDF`, `libqpdf/QPDF.cc:215-236`)
         // calls `ObjectHandle::disconnect` on every registry entry, leaving
@@ -3097,18 +3097,12 @@ pub(crate) mod tests {
         // than `NotYetResolved` as terminal, so a surviving handle does *not*
         // raise `Error::Internal("... belongs to a dropped PDF")` — that error
         // belongs to the other path, a still-`NotYetResolved` handle whose
-        // resolver `Weak` has expired. `Destroyed` presents as null instead,
-        // and this reader takes a null `/Filter` as absent.
+        // resolver `Weak` has expired.
         //
-        // **This pins flpdf behavior, not qpdf parity — beads `flpdf-nrp3`
-        // (P2).** qpdf's `isNull()` is `dereference() && getTypeCode() ==
-        // ::ot_null` (`libqpdf/QPDFObjectHandle.cc:353-356`) and a destroyed
-        // object is `::ot_destroyed`, so qpdf answers false where flpdf
-        // answers true and would not read this stream as unfiltered. Do not
-        // cite this test as evidence the two agree. The divergence is
-        // `is_null` alone: `as_name`/`as_array`/`as_integer`/`as_dictionary`
-        // all fall through to `None` for `Destroyed`, which is what qpdf does
-        // for `::ot_destroyed` too.
+        // qpdf's `isNull()` accepts only `ot_null`
+        // (`libqpdf/QPDFObjectHandle.cc:352-356`), so an `ot_destroyed`
+        // `/Filter` falls through `isName()`/`isArray()` and is rejected by
+        // `QPDF_Stream::filterable` (`libqpdf/QPDF_Stream.cc:391-413`).
         let mut pdf = Pdf::open(Cursor::new(pdf_with_a_filter_name_object())).expect("open");
         let filter = pdf.get_object_handle(ObjectRef::new(2, 0));
         pdf.resolve_object_handle(&filter).expect("resolve /Filter");
@@ -3123,10 +3117,13 @@ pub(crate) mod tests {
         drop(pdf);
 
         assert!(filter.is_resolved(), "disconnect leaves a terminal state");
-        assert!(
-            decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None)
-                .expect("a disconnected /Filter is terminal, not an error")
-                .is_empty()
+        assert_eq!(filter.type_code(), 14, "qpdf ot_destroyed");
+        assert!(!filter.is_null());
+        let error = decode_filter_specs_from_handle(&filter, &ObjectHandle::null(), None)
+            .expect_err("a destroyed /Filter is not absent");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter type is not name or array"
         );
     }
 
