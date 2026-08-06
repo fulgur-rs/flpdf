@@ -3542,11 +3542,18 @@ fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) {
 }
 
 fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
-    handle.with_value_mut(|v| {
+    let child = item.clone();
+    let appended = handle.with_value_mut(|v| {
         if let Some(ObjectValue::Array(items)) = v {
             items.push(item);
+            true
+        } else {
+            false // cov:ignore: merge_resource_array only calls after confirming this_val is an array
         }
     });
+    if appended {
+        ObjectHandle::attach_child_to_parent(&child, &handle.containment_parent());
+    }
 }
 
 // Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:450-453`): bool,
@@ -7900,6 +7907,36 @@ mod mutation_tests {
         let items = dest.get_key(b"ProcSet").as_array().unwrap();
         let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
         assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
+    }
+
+    #[test]
+    fn merge_resources_array_union_records_the_destination_owner() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner =
+            ObjectHandle::new_indirect_unresolved_with_identity(owner_ref, -1, Some(41), None);
+        let dest = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Resources".to_vec(), dest.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        let retained = ObjectHandle::name(b"Text".to_vec());
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![retained.clone()]),
+        )]);
+
+        dest.merge_resources(&other, None);
+
+        let merged = dest
+            .get_key(b"ProcSet")
+            .as_array()
+            .expect("merged ProcSet remains an array");
+        assert!(merged[1].is_same_object_as(&retained));
+        assert_eq!(retained.containing_object_refs_for_pdf(41), vec![owner_ref]);
     }
 
     #[test]
