@@ -2584,6 +2584,238 @@ mod tests {
         );
     }
 
+    fn encrypted_info_fixture(
+        info_body: &[u8],
+        encrypt: crate::encrypt_setup::EncryptParams,
+    ) -> Vec<u8> {
+        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries: Vec<(u16, usize)> = Vec::new();
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"3 0 obj\n");
+        bytes.extend_from_slice(info_body);
+        bytes.extend_from_slice(b"\nendobj\n");
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let mut plaintext = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
+        let mut encrypted = Vec::new();
+        write_pdf_with_options(
+            &mut plaintext,
+            &mut encrypted,
+            &WriteOptions {
+                full_rewrite: true,
+                compress_streams: CompressStreams::No,
+                encrypt: Some(encrypt),
+                ..WriteOptions::default()
+            },
+        )
+        .expect("encrypted write");
+        encrypted
+    }
+
+    fn canonical_info_dictionary(
+        bytes: Vec<u8>,
+        allow_weak_crypto: bool,
+    ) -> (
+        ObjectRef,
+        std::collections::BTreeMap<Vec<u8>, crate::ObjectHandle>,
+    ) {
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            crate::PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                allow_weak_crypto,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open encrypted fixture");
+        let info_ref = match pdf.trailer().get("Info") {
+            Some(crate::Object::Reference(object_ref)) => *object_ref,
+            other => panic!("trailer /Info must be a reference, got {other:?}"),
+        };
+        let info = pdf.get_object_handle(info_ref);
+        info.try_dereference()
+            .expect("canonical resolver must resolve /Info");
+        (
+            info_ref,
+            info.as_dictionary().expect("/Info must be a dictionary"),
+        )
+    }
+
+    fn qpdf_show_object(path: &std::path::Path, object_ref: ObjectRef) -> String {
+        let qpdf = Command::new("qpdf")
+            .arg("--password=user-pw")
+            .arg(format!(
+                "--show-object={},{}",
+                object_ref.number, object_ref.generation
+            ))
+            .arg(path)
+            .output()
+            .expect("run pinned qpdf");
+        assert!(
+            qpdf.status.success(),
+            "qpdf --show-object failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&qpdf.stdout),
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        String::from_utf8(qpdf.stdout).expect("qpdf object display is text")
+    }
+
+    fn qpdf_contents_hex(object: &str) -> Vec<u8> {
+        let (_, after_contents) = object
+            .split_once("/Contents <")
+            .expect("qpdf must display binary signature contents as hex");
+        let (hex, _) = after_contents
+            .split_once('>')
+            .expect("qpdf contents hex must terminate");
+        assert_eq!(hex.len() % 2, 0, "qpdf emitted an even-length hex string");
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("qpdf hex is ASCII"), 16)
+                    .expect("qpdf contents must be hexadecimal")
+            })
+            .collect()
+    }
+
+    // This catches a production regression where a cipher-mode dispatch
+    // selects the wrong object key or bypasses nested parser tokens. The
+    // qpdf command independently parses the exact encrypted object that the
+    // canonical resolver dereferences; disabling the callback makes flpdf's
+    // plaintext assertions fail while qpdf continues to show the literals.
+    #[test]
+    fn canonical_resolver_string_ciphers_match_pinned_qpdf() {
+        use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+
+        // cov:ignore-start: CI has pinned qpdf; this fallback is for developer hosts only.
+        if Command::new("qpdf").arg("--version").output().is_err() {
+            eprintln!("qpdf not available; skipping string decryption differential");
+            return;
+        }
+        // cov:ignore-end
+
+        for (name, encrypt, allow_weak_crypto) in [
+            (
+                "rc4",
+                EncryptParams::rc4(EncryptMethod::V2Rc4128, b"user-pw", b"owner-pw"),
+                true,
+            ),
+            (
+                "aes128",
+                EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+                false,
+            ),
+            (
+                "aes256",
+                EncryptParams::v5_r6(b"user-pw", b"owner-pw"),
+                false,
+            ),
+        ] {
+            let encrypted = encrypted_info_fixture(
+                b"<< /Title (TopSecretTitle) /Metadata << /Label (NestedSecret) >> >>",
+                encrypt,
+            );
+            let (info_ref, values) =
+                canonical_info_dictionary(encrypted.clone(), allow_weak_crypto);
+            assert_eq!(
+                values
+                    .get(b"Title".as_slice())
+                    .and_then(crate::ObjectHandle::as_string),
+                Some(b"TopSecretTitle".to_vec()),
+                "{name}: canonical resolver title"
+            );
+            assert_eq!(
+                values
+                    .get(b"Metadata".as_slice())
+                    .and_then(crate::ObjectHandle::as_dictionary)
+                    .and_then(|metadata| metadata.get(b"Label".as_slice()).cloned())
+                    .and_then(|label| label.as_string()),
+                Some(b"NestedSecret".to_vec()),
+                "{name}: canonical resolver nested label"
+            );
+
+            let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+            let path = directory.path().join(format!("{name}.pdf"));
+            fs::write(&path, encrypted).expect("write encrypted qpdf fixture");
+            let qpdf = qpdf_show_object(&path, info_ref);
+            assert!(
+                qpdf.contains("TopSecretTitle"),
+                "{name}: qpdf object:\n{qpdf}"
+            );
+            assert!(
+                qpdf.contains("NestedSecret"),
+                "{name}: qpdf object:\n{qpdf}"
+            );
+        }
+    }
+
+    // This catches a production regression where the parser leaves a
+    // signature Contents value decrypted after it has recognised the whole
+    // dictionary. qpdf's textual unparser chooses hex for this binary value,
+    // which lets the test compare the preserved ciphertext byte-for-byte.
+    #[test]
+    fn canonical_resolver_signature_contents_matches_pinned_qpdf() {
+        // cov:ignore-start: CI has pinned qpdf; this fallback is for developer hosts only.
+        if Command::new("qpdf").arg("--version").output().is_err() {
+            eprintln!("qpdf not available; skipping signature string differential");
+            return;
+        }
+        // cov:ignore-end
+
+        let encrypted = encrypted_info_fixture(
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents (SignatureCipher) /Reason (ReasonPlain) >>",
+            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+        );
+        let (info_ref, values) = canonical_info_dictionary(encrypted.clone(), false);
+        assert_eq!(
+            values
+                .get(b"Reason".as_slice())
+                .and_then(crate::ObjectHandle::as_string),
+            Some(b"ReasonPlain".to_vec())
+        );
+        let contents = values
+            .get(b"Contents".as_slice())
+            .and_then(crate::ObjectHandle::as_string)
+            .expect("signature /Contents is a string");
+        assert_ne!(contents, b"SignatureCipher");
+
+        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+        let path = directory.path().join("signature.pdf");
+        fs::write(&path, encrypted).expect("write encrypted qpdf fixture");
+        let qpdf = qpdf_show_object(&path, info_ref);
+        assert!(qpdf.contains("ReasonPlain"), "qpdf object:\n{qpdf}");
+        assert_eq!(contents, qpdf_contents_hex(&qpdf));
+
+        let no_byte_range = encrypted_info_fixture(
+            b"<< /Type /Sig /Contents (SignatureCipher) >>",
+            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+        );
+        let (_, values) = canonical_info_dictionary(no_byte_range, false);
+        assert_eq!(
+            values
+                .get(b"Contents".as_slice())
+                .and_then(crate::ObjectHandle::as_string),
+            Some(b"SignatureCipher".to_vec())
+        );
+    }
+
     /// The attach itself: a handle vended by a live document must reach that
     /// document's resolver, and now that uncompressed objects are implemented,
     /// come back resolved.
