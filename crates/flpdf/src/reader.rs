@@ -4971,6 +4971,22 @@ mod tests {
         assert_eq!(bytes.as_slice(), b"TopSecretTitle");
     }
 
+    // This catches a production regression where the parser callback treats
+    // qpdf's `/StrF /Identity` as an RC4/AES method. Replacing the `None`
+    // method branch with a cipher call changes these bytes.
+    #[test]
+    fn decrypt_object_string_leaves_identity_filter_bytes_unchanged() {
+        let mut encryption = explicit_rc4_encryption_state();
+        let mut bytes = b"identity string bytes".to_vec();
+
+        let warn = encryption
+            .decrypt_object_string(ObjectRef::new(3, 0), &mut bytes)
+            .expect("Identity string method is a no-op");
+
+        assert_eq!(bytes, b"identity string bytes");
+        assert!(!warn);
+    }
+
     #[test]
     fn decrypt_object_value_strings_skips_the_encrypt_dictionary_object() {
         let object_ref = ObjectRef::new(9, 0);

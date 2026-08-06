@@ -453,12 +453,13 @@ impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R
     fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()> {
         let warn_unknown_string = {
             let mut encryption_parameters = self.encryption_parameters.borrow_mut();
+            // cov:ignore-start: read_object_at_offset constructs this adapter only after observing Some; parsing cannot mutate the shared slot
             let encryption = encryption_parameters.as_mut().ok_or_else(|| {
                 Error::Internal("string decrypter invoked without encryption parameters".into())
             })?;
+            // cov:ignore-end
             encryption.decrypt_object_string(self.object_ref, bytes)?
         };
-
         if warn_unknown_string {
             self.resolver.push_warning(
                 "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
@@ -2561,7 +2562,7 @@ mod tests {
         .expect("re-open of V=4 output with user-pw");
         let info_ref = match rt.trailer().get("Info") {
             Some(crate::Object::Reference(object_ref)) => *object_ref,
-            other => panic!("trailer /Info must be a reference, got {other:?}"),
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
         };
 
         let info = rt.get_object_handle(info_ref);
@@ -2648,7 +2649,7 @@ mod tests {
         .expect("open encrypted fixture");
         let info_ref = match pdf.trailer().get("Info") {
             Some(crate::Object::Reference(object_ref)) => *object_ref,
-            other => panic!("trailer /Info must be a reference, got {other:?}"),
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
         };
         let info = pdf.get_object_handle(info_ref);
         info.try_dereference()
@@ -2671,9 +2672,9 @@ mod tests {
             .expect("run pinned qpdf");
         assert!(
             qpdf.status.success(),
-            "qpdf --show-object failed:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&qpdf.stdout),
-            String::from_utf8_lossy(&qpdf.stderr)
+            "qpdf --show-object failed:\nstdout:\n{}\nstderr:\n{}", // cov:ignore: failure-only qpdf diagnostic
+            String::from_utf8_lossy(&qpdf.stdout), // cov:ignore: failure-only qpdf diagnostic
+            String::from_utf8_lossy(&qpdf.stderr)  // cov:ignore: failure-only qpdf diagnostic
         );
         String::from_utf8(qpdf.stdout).expect("qpdf object display is text")
     }
@@ -2693,6 +2694,102 @@ mod tests {
                     .expect("qpdf contents must be hexadecimal")
             })
             .collect()
+    }
+
+    fn aes128_encryption_state() -> crate::reader::EncryptionState {
+        let encrypted = encrypted_info_fixture(
+            b"<< /Title (TopSecretTitle) >>",
+            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+        );
+        // cov:ignore-start: fixture setup failures are reported only by this parser-error regression test
+        let pdf = Pdf::open_with_options(
+            Cursor::new(encrypted),
+            crate::PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open encrypted fixture");
+        // cov:ignore-end
+        let encryption_parameters = pdf.resolver.encryption_parameters();
+        let encryption = encryption_parameters.borrow();
+        encryption
+            .as_ref()
+            .cloned()
+            .expect("encrypted fixture has encryption parameters")
+    }
+
+    // This catches a production regression where the resolver adapter accepts
+    // a string cipher failure and returns ciphertext. Replacing the parser
+    // callback's `?` with recovery makes this resolution succeed instead.
+    #[test]
+    fn canonical_resolver_propagates_string_decryption_errors() {
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(b"1 0 obj\n(bad AES ciphertext)\nendobj\n".to_vec()),
+            0,
+            BTreeMap::from([(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 })]),
+            false,
+            Diagnostics::default(),
+            0,
+        );
+        *resolver.encryption_parameters().borrow_mut() = Some(aes128_encryption_state());
+
+        let error = resolver
+            .read_object_at_offset(0, ObjectRef::new(1, 0))
+            .expect_err("invalid AES string data must fail object parsing");
+
+        assert!(matches!(error, Error::Encrypted(_)), "got {error:?}");
+    }
+
+    // This catches a production regression where canonical parsing omits the
+    // qpdf unknown-`/StrF` warning, or emits it for every string token. The
+    // filter is changed after successful authentication so the real parser
+    // callback must take qpdf's Unknown -> AES fallback and reset the mode.
+    #[test]
+    fn canonical_resolver_warns_once_for_an_unknown_string_filter() {
+        let encrypted = encrypted_info_fixture(
+            b"<< /Title (TopSecretTitle) /Metadata << /Label (NestedSecret) >> >>",
+            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+        );
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(encrypted),
+            crate::PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open encrypted fixture");
+        let encryption_parameters = pdf.resolver.encryption_parameters();
+        encryption_parameters
+            .borrow_mut()
+            .as_mut()
+            .expect("encryption parameters")
+            .cf_string = crate::reader::EncryptionMode::Unknown;
+
+        let info_ref = match pdf.trailer().get("Info") {
+            Some(crate::Object::Reference(object_ref)) => *object_ref,
+            other => panic!("trailer /Info must be a reference, got {other:?}"), // cov:ignore: encrypted fixture construction always emits an indirect /Info
+        };
+        let info = pdf.get_object_handle(info_ref);
+        info.try_dereference()
+            .expect("canonical resolver must decrypt with qpdf's AES fallback");
+        assert_eq!(
+            info.as_dictionary()
+                .and_then(|values| values.get(b"Title".as_slice()).cloned())
+                .and_then(|title| title.as_string()),
+            Some(b"TopSecretTitle".to_vec()) // cov:ignore: llvm maps the assertion's mismatch-only diagnostic region to this expected value
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .filter(|entry| entry
+                    .message
+                    .contains("unknown encryption filter for strings"))
+                .count(),
+            1,
+            "qpdf rewrites the unknown string filter after its first warning"
+        );
     }
 
     // This catches a production regression where a cipher-mode dispatch

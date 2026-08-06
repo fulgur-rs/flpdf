@@ -270,7 +270,7 @@ parser callback, resolver adapter, `/Contents` sideband, and the remaining
 explicit/content/ObjStm no-decrypter boundaries. Retain citations to the
 pinned source.
 
-- [ ] **Step 5: Run quality gates and changed-line coverage**
+- [x] **Step 5: Run quality gates and changed-line coverage**
 
 Run:
 
@@ -286,7 +286,7 @@ scripts/patch-coverage.sh --base origin/main --lcov /tmp/flpdf-25kg-3-17.lcov
 Expected: formatter and all tests pass; changed executable lines have 100%
 coverage before review.
 
-- [ ] **Step 6: Commit parity tests and documentation**
+- [x] **Step 6: Commit parity tests and documentation**
 
 ```bash
 git add crates/flpdf/src/parser.rs crates/flpdf/src/reader.rs crates/flpdf/tests/reader_tests.rs docs/qpdf-correspondence.md
