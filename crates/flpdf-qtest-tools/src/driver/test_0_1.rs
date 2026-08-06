@@ -236,16 +236,14 @@ fn write_object_details<R: Read + Seek>(
             let dict_handle = chased
                 .as_stream_dict()
                 .expect("type_code confirmed a stream value");
-            let dict = match dict_handle.materialize() {
+            let dict = match dict_handle.materialize()? {
                 Object::Dictionary(dict) => dict,
                 // A stream's own dictionary handle is always constructed as
                 // a direct dictionary value (`ObjectHandle::materialize`'s
                 // own doc).
                 _ => Dictionary::new(), // cov:ignore: unreachable per the invariant above
             };
-            let data = chased
-                .as_stream_data()
-                .expect("type_code confirmed a stream value");
+            let data = chased.get_raw_stream_data()?;
             write!(stdout, "/QTest is a stream.  Dictionary: ")?;
             let dictionary = write_qpdf_object(pdf, &Object::Dictionary(dict.clone()))?;
             let decode_dictionary = resolve_stream_dictionary(pdf, &dict)?;

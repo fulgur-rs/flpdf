@@ -1485,9 +1485,9 @@ fn helper_listing_rejects_a_first_non_string_name_tree_key() {
         "Names",
         Object::Array(vec![
             Object::Name(b"not-a-string".to_vec()),
-            filespec.materialize(),
+            filespec.materialize().expect("filespec materializes"),
             Object::String(b"valid".to_vec()),
-            filespec.materialize(),
+            filespec.materialize().expect("filespec materializes"),
         ]),
     );
     let mut names = Dictionary::new();
@@ -1519,11 +1519,11 @@ fn helper_listing_skips_a_later_non_string_name_tree_key() {
         "Names",
         Object::Array(vec![
             Object::String(b"a".to_vec()),
-            first.materialize(),
+            first.materialize().expect("filespec materializes"),
             Object::Name(b"not-a-string".to_vec()),
             Object::Null,
             Object::String(b"c".to_vec()),
-            last.materialize(),
+            last.materialize().expect("filespec materializes"),
         ]),
     );
     let mut names = Dictionary::new();

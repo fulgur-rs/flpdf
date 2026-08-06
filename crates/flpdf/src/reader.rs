@@ -1600,7 +1600,8 @@ impl<R: Read + Seek> Pdf<R> {
             existing_dict.replace_direct_value(dict_value);
             return Ok(ObjectValue::Stream {
                 stream_dict: existing_dict,
-                stream_data: Rc::new(stream.data.clone()),
+                stream_data: Some(Rc::new(stream.data.clone())),
+                stream_length: 0,
             });
         }
         self.lift(object, 0)
@@ -2496,7 +2497,8 @@ impl<R: Read + Seek> Pdf<R> {
         Ok((
             ObjectValue::Stream {
                 stream_dict: dict_handle,
-                stream_data: Rc::new(stream.data.clone()),
+                stream_data: Some(Rc::new(stream.data.clone())),
+                stream_length: 0,
             },
             stream_offset,
         ))
@@ -2595,7 +2597,8 @@ impl<R: Read + Seek> Pdf<R> {
                     stream_dict: ObjectHandle::from_value(ObjectValue::Dictionary(
                         self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
                     )),
-                    stream_data: Rc::new(stream.data.clone()),
+                    stream_data: Some(Rc::new(stream.data.clone())),
+                    stream_length: 0,
                 },
                 // A bare top-level reference never comes from a file/ObjStm
                 // parse (`top_level_no_reference` integerizes it there,
@@ -2806,7 +2809,7 @@ impl<R: Read + Seek> Pdf<R> {
             // `resolve_to_cache` already decrypted through the legacy
             // engine's own pipeline. `materialize()` below is a plain
             // structural copy, nothing left to decrypt here.
-            let materialized = handle.materialize();
+            let materialized = handle.materialize()?;
             self.legacy_materialized_memo
                 .insert(object_ref, materialized);
         }
@@ -2946,14 +2949,14 @@ impl<R: Read + Seek> Pdf<R> {
                 .registered_handle(object_ref)
                 .filter(ObjectHandle::is_resolved)
             {
-                return Ok(handle.materialize());
+                return handle.materialize();
             }
         }
         if self.resolve_to_cache(object_ref)? {
             if self.handle_mutated_object_refs.contains(&object_ref) {
                 let handle = self.get_object_handle(object_ref);
                 self.resolve_object_handle(&handle)?;
-                return Ok(handle.materialize());
+                return handle.materialize();
             }
             if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
                 return Ok(object.clone());
@@ -2981,7 +2984,7 @@ impl<R: Read + Seek> Pdf<R> {
             let handle = self.get_object_handle(object_ref);
             self.resolve_object_handle(&handle)?;
             self.legacy_materialized_memo
-                .insert(object_ref, handle.materialize());
+                .insert(object_ref, handle.materialize()?);
             return Ok(self
                 .legacy_materialized_memo
                 .get(&object_ref)
@@ -5061,7 +5064,10 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let mut value = ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"stream payload, untouched by string decryption".to_vec()),
+            stream_data: Some(Rc::new(
+                b"stream payload, untouched by string decryption".to_vec(),
+            )),
+            stream_length: 0,
         };
 
         decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
@@ -5070,6 +5076,7 @@ mod tests {
         let ObjectValue::Stream {
             stream_dict,
             stream_data,
+            ..
         } = &value
         else {
             panic!("value must still be a stream"); // cov:ignore: unreachable given this test's own construction of value
@@ -5081,7 +5088,10 @@ mod tests {
             Some(b"TopSecretTitle".as_slice())
         );
         assert_eq!(
-            stream_data.as_slice(),
+            stream_data
+                .as_ref()
+                .expect("direct stream retains its data")
+                .as_slice(),
             b"stream payload, untouched by string decryption",
             "stream payload bytes are never touched by string decryption"
         );
@@ -5106,7 +5116,8 @@ mod tests {
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
         let stream_child = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict,
-            stream_data: Rc::new(b"payload".to_vec()),
+            stream_data: Some(Rc::new(b"payload".to_vec())),
+            stream_length: 0,
         });
         let mut value = ObjectValue::Array(vec![stream_child]);
 
@@ -5212,7 +5223,8 @@ mod tests {
                 b"Deep".to_vec(),
                 nest(crate::object::MAX_INLINE_DEPTH - 1),
             )]),
-            stream_data: Rc::new(Vec::new()),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_length: 0,
         };
         decrypt_object_value_strings(object_ref, &mut accepted, &mut encryption).expect(
             "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
@@ -5224,7 +5236,8 @@ mod tests {
                 b"TooDeep".to_vec(),
                 nest(crate::object::MAX_INLINE_DEPTH),
             )]),
-            stream_data: Rc::new(Vec::new()),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_length: 0,
         };
         let err = decrypt_object_value_strings(object_ref, &mut rejected, &mut encryption)
             .expect_err("one level past the legacy decryptor's own boundary must still error");
@@ -5664,7 +5677,8 @@ mod tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
-            stream_data: Rc::new(b"old".to_vec()),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 0,
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let indirect = pdf

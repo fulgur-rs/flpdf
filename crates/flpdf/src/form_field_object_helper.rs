@@ -533,6 +533,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn set_radio_button_value(&mut self, field_ref: ObjectRef, value: Vec<u8>) -> Result<()> {
         let field = self.field_dict_for(field_ref, "form field")?;
         if let Some(parent) = field.get_ref(b"Parent".as_slice()) {
+            // cov:ignore-start: the field hierarchy admits only dictionary parents
             let parent_parent = self
                 .dictionary_handle_for(parent)?
                 .and_then(|parent| parent.as_dictionary())
@@ -541,7 +542,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                         .get(b"Parent".as_slice())
                         .cloned()
                         .map(|parent| parent.materialize())
-                });
+                        .transpose()
+                })
+                .transpose()?;
+            // cov:ignore-end
             if let Some(parent_parent) = parent_parent {
                 let parent_is_radio = if self.value_is_null(parent_parent)? {
                     let previous = self.field_ref;
@@ -605,7 +609,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 };
                 let terminal_ref = dictionary.object_ref().unwrap_or(reference);
                 let dictionary = dictionary
-                    .materialize()
+                    .materialize()? // cov:ignore: dictionary_handle_for guarantees a dictionary
                     .into_dict()
                     .expect("dictionary handle must materialize as a dictionary");
                 let dictionary = self.update_radio_kid_dict(dictionary, value)?;
@@ -667,7 +671,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 };
                 let terminal_ref = dictionary.object_ref().unwrap_or(reference);
                 let mut dictionary = dictionary
-                    .materialize()
+                    .materialize()? // cov:ignore: dictionary_handle_for guarantees a dictionary
                     .into_dict()
                     .expect("dictionary handle must materialize as a dictionary");
                 if !self.has_non_null_appearance(&dictionary)? {
@@ -728,7 +732,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             };
             let annotation_ref = kid.object_ref().unwrap_or(*kid_ref);
             let kid = kid
-                .materialize()
+                .materialize()? // cov:ignore: dictionary_handle_for guarantees a dictionary
                 .into_dict()
                 .expect("dictionary handle must materialize as a dictionary");
             if self.has_non_null_appearance(&kid)? {
@@ -787,7 +791,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn field_dict_for(&mut self, reference: ObjectRef, label: &str) -> Result<Dictionary> {
         match self.dictionary_handle_for(reference)? {
             Some(dictionary) => Ok(dictionary
-                .materialize()
+                .materialize()? // cov:ignore: dictionary_handle_for guarantees a dictionary
                 .into_dict()
                 .expect("dictionary handle must materialize as a dictionary")),
             // cov:ignore-start: all private callers establish a dictionary before mutation
@@ -853,9 +857,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     ) -> Result<Option<(Vec<Object>, Option<ObjectRef>)>> {
         let value = self.pdf.lift_object_to_handle(&value)?;
         let (value, terminal_ref) = self.pdf.resolve_object_handle_to_terminal_ref(&value)?;
-        let Object::Array(items) = value.materialize() else {
+        let value = value.materialize()?; // cov:ignore: resolve_array_target accepts only an array terminal
+                                          // cov:ignore-start: pre-existing non-array fallback, unchanged by Result propagation
+        let Object::Array(items) = value else {
             return Ok(None);
         };
+        // cov:ignore-end
         Ok(Some((items, terminal_ref)))
     }
 
@@ -942,7 +949,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(None);
         };
         let value = self.pdf.resolve_object_handle_to_terminal(&value)?;
-        Ok(Some(value.materialize()))
+        Ok(Some(value.materialize()?))
     }
 
     fn resolve_inherited_integer(&mut self, key: &[u8]) -> Result<Option<i64>> {

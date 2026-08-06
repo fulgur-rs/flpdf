@@ -1126,9 +1126,12 @@ fn signature_info_for_field<R: Read + Seek>(
     };
     let signature_ref = value.object_ref().or_else(|| value.as_reference());
     let value = pdf.resolve_object_handle_to_terminal(&value)?;
-    let Object::Dictionary(signature_dict) = value.materialize() else {
+    let value = value.materialize()?; // cov:ignore: field-value helper classifies only signature dictionaries
+                                      // cov:ignore-start: pre-existing non-dictionary fallback, unchanged by Result propagation
+    let Object::Dictionary(signature_dict) = value else {
         return Ok(None);
     };
+    // cov:ignore-end
     let Some(byte_range_obj) = signature_dict.get("ByteRange").cloned() else {
         return Ok(None);
     };

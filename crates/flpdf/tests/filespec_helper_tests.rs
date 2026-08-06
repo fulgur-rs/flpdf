@@ -134,6 +134,29 @@ fn embedded_file_resolves_indirect_ef_dictionary() {
     assert_eq!(ef.payload().unwrap(), b"payload");
 }
 
+#[test]
+fn embedded_file_payload_reads_lazy_original_source() {
+    let mut pdf = open(build_attachment_pdf("", "", b"lazy attachment"));
+
+    // Resolve the canonical stream through the new raw-data primitive first.
+    // A parsed stream keeps no replacement buffer: its bytes remain in the
+    // document source, precisely as qpdf's QPDF_Stream does.
+    let stream = pdf.get_object_handle(ObjectRef::new(6, 0));
+    assert_eq!(
+        stream.get_raw_stream_data().unwrap().as_slice(),
+        b"lazy attachment"
+    );
+    assert!(stream.as_stream_data().is_none());
+
+    let mut filespec =
+        FileSpec::new(pdf.get_object_handle(ObjectRef::new(5, 0)), &mut pdf).expect("filespec");
+    let embedded = filespec
+        .embedded_file()
+        .expect("embedded file lookup")
+        .expect("embedded file stream");
+    assert_eq!(embedded.payload().expect("payload"), b"lazy attachment");
+}
+
 // ── Helper: open PDF from bytes ───────────────────────────────────────────────
 
 fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {

@@ -776,13 +776,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Collect `limit` bytes — or everything left when `limit` is `None` —
     /// from the current position into an owned buffer.
     ///
-    /// Grows as it goes rather than pre-allocating `limit`, and every caller
-    /// it has wants that property, not merely the two legacy tenants below it:
-    /// [`Self::read_window`]'s bound comes from the *next* cross-reference
-    /// offset, which a corrupt table can make arbitrarily large on a small
-    /// file, and [`Self::read_stream`]'s is a declared `/Length` — a value the
-    /// input asserts about itself. `std::io::Read::take(n).read_to_end(..)`,
-    /// which this replaces, had the same property.
+    /// Grows as it goes rather than pre-allocating `limit`. The legacy
+    /// [`Self::read_window`] caller's bound comes from the *next*
+    /// cross-reference offset, which a corrupt table can make arbitrarily
+    /// large on a small file. `std::io::Read::take(n).read_to_end(..)`, which
+    /// this replaces, had the same property.
     fn read_to_owned(&self, limit: Option<u64>) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         loop {
@@ -1375,15 +1373,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         let after_endstream = self.tell()?;
 
-        // No qpdf counterpart: `QPDF_Stream` keeps `stream_offset` and
-        // `length` and reads the payload at pipe time, while
-        // `ObjectValue::Stream` carries the bytes themselves (shared, but
-        // still read here rather than at pipe time). `read_to_owned` grows to
-        // what the input actually yields rather than pre-allocating `length`,
-        // so even this now-bounded read never trusts the declaration.
-        self.seek(stream_offset)?;
-        let data = self.read_to_owned(Some(span))?;
-
         self.seek(after_endstream)?;
         // qpdf `:1350-1354`: `readObject` reads one more token after
         // `readStream` returns and warns if it is not `endobj`.
@@ -1396,7 +1385,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok((
             ObjectValue::Stream {
                 stream_dict: dict,
-                stream_data: Rc::new(data),
+                stream_data: None,
+                stream_length: length,
             },
             i64::try_from(stream_offset).unwrap_or(i64::MAX),
         ))
@@ -1615,6 +1605,28 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
+    fn pipe_stream_data(
+        &self,
+        object_ref: ObjectRef,
+        offset: i64,
+        length: usize,
+        stream_dict: &ObjectHandle,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        Ok(ResolverHandle::pipe_stream_data(
+            self,
+            object_ref,
+            offset,
+            length,
+            stream_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        ))
+    }
+
     /// Resolve `object_ref`'s slot in place.
     ///
     /// Two of `QPDF::resolve`'s branches (`libqpdf/QPDF.cc:1700-1753`) exist
@@ -1821,8 +1833,8 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 mod tests {
     use super::ResolveMark;
     use super::ResolverHandle;
-    use crate::object_handle::NO_PARSED_OFFSET;
-    use crate::{Diagnostics, Error, ObjectRef, Pdf, Severity, XrefEntry};
+    use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
+    use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::Cursor;
@@ -3462,8 +3474,9 @@ mod tests {
         }
     }
 
-    /// A stream whose `/Length` is an indirect reference resolves, with the
-    /// payload read from the position the resolver explicitly restored.
+    /// A stream whose `/Length` is an indirect reference resolves without
+    /// retaining its original payload, then reads that payload from the
+    /// position the resolver explicitly restored.
     ///
     /// This is `QPDF::readStream`'s bracketed seam
     /// (`libqpdf/QPDF.cc:1361-1381`) driven end to end: object 5 lives after
@@ -3485,8 +3498,7 @@ mod tests {
     /// collide and the hazard passes unnoticed. That is the whole reason
     /// object 5 exists.
     #[test]
-    fn a_streams_indirect_length_resolves_mid_parse_and_the_payload_is_read_from_the_restored_position(
-    ) {
+    fn a_streams_indirect_length_resolves_mid_parse_and_raw_read_uses_the_restored_position() {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
         let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
 
@@ -3494,10 +3506,30 @@ mod tests {
             .try_dereference()
             .expect("a stream with an indirect /Length resolves");
 
+        assert!(
+            stream.as_stream_data().is_none(),
+            "a parsed stream has no replacement buffer"
+        );
+        stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .replace_key(b"Length", ObjectHandle::integer(0));
         assert_eq!(
-            stream.as_stream_data().as_deref().map(Vec::as_slice),
-            Some(STREAM_PAYLOAD),
-            "the payload must come from the restored stream offset"
+            stream
+                .get_raw_stream_data()
+                .expect("raw stream data")
+                .as_slice(),
+            STREAM_PAYLOAD,
+            "the original branch must use its stored parse-time length and \
+             restored stream offset, not a fresh /Length lookup"
+        );
+        let crate::Object::Stream(materialized) = stream.materialize().expect("materialize source")
+        else {
+            panic!("resolved stream materializes as a stream"); // cov:ignore: established by setup
+        };
+        assert_eq!(
+            materialized.data, STREAM_PAYLOAD,
+            "legacy materialization reads the original source through the same raw boundary"
         );
         assert!(
             pdf.get_object_handle(ObjectRef::new(5, 0)).is_resolved(),
@@ -3506,6 +3538,39 @@ mod tests {
         assert!(
             pdf.resolver.core.borrow().resolving.is_empty(),
             "both marks must be gone once the outer resolution returns"
+        );
+    }
+
+    #[test]
+    fn raw_stream_data_reports_a_short_original_source_as_unsupported() {
+        let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
+        let stream = pdf.get_object_handle(ObjectRef::new(4, 0));
+        stream.try_dereference().expect("resolve stream");
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+
+        // `read_stream` cannot produce this shape: it validates the declared
+        // length against `endstream` before constructing the stream. This
+        // post-parse construction proves the *original source* branch reaches
+        // `QPDF::Pipe::pipeStreamData`'s false result when a later caller has
+        // a length exceeding the input, rather than mistaking it for an eager
+        // parse-time failure or rereading /Length from the dictionary.
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict,
+            stream_data: None,
+            stream_length: 1_000,
+        });
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("a short original source must fail the raw request");
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "error getting raw stream data"));
+        assert!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|entry| entry.message == "unexpected EOF reading stream data"),
+            "the existing source pipe owns its warning before returning false"
         );
     }
 
@@ -3895,8 +3960,11 @@ mod tests {
         handle.try_dereference().expect("resolve");
 
         assert_eq!(
-            handle.as_stream_data().as_deref().map(Vec::as_slice),
-            Some(STREAM_PAYLOAD),
+            handle
+                .get_raw_stream_data()
+                .expect("read raw stream data")
+                .as_slice(),
+            STREAM_PAYLOAD,
             "a `stream` keyword cut by the chunk boundary must not frame the \
              object as a plain dictionary"
         );
@@ -4418,8 +4486,11 @@ mod tests {
             |handle, outcome, warnings| {
                 outcome.expect("qpdf warns here rather than failing");
                 assert_eq!(
-                    handle.as_stream_data().as_deref().map(Vec::as_slice),
-                    Some(&b"abc"[..])
+                    handle
+                        .get_raw_stream_data()
+                        .expect("read raw stream data")
+                        .as_slice(),
+                    &b"abc"[..]
                 );
                 assert_eq!(warnings, ["expected endobj"]);
             },
@@ -4466,8 +4537,11 @@ mod tests {
             with_second_object(&body, |handle, outcome, warnings| {
                 outcome.expect("every line-ending branch still resolves the stream");
                 assert_eq!(
-                    handle.as_stream_data().as_deref().map(Vec::as_slice),
-                    Some(payload),
+                    handle
+                        .get_raw_stream_data()
+                        .expect("read raw stream data")
+                        .as_slice(),
+                    payload,
                     "separator {separator:?} moved the payload"
                 );
                 assert_eq!(warnings, expected_warnings, "separator {separator:?}");
@@ -4520,8 +4594,11 @@ mod tests {
         handle.try_dereference().expect("resolve");
 
         assert_eq!(
-            handle.as_stream_data().as_deref().map(Vec::as_slice),
-            Some(STREAM_PAYLOAD)
+            handle
+                .get_raw_stream_data()
+                .expect("read raw stream data")
+                .as_slice(),
+            STREAM_PAYLOAD
         );
     }
 
@@ -4621,8 +4698,11 @@ mod tests {
             .expect("a missing `endobj` warns rather than failing");
 
         assert_eq!(
-            handle.as_stream_data().as_deref().map(Vec::as_slice),
-            Some(&b"abc"[..]),
+            handle
+                .get_raw_stream_data()
+                .expect("read raw stream data")
+                .as_slice(),
+            &b"abc"[..],
             "and the payload is still the declared three bytes"
         );
         let messages: Vec<String> = pdf
@@ -4731,10 +4811,10 @@ mod tests {
 
         assert_eq!(
             pdf.get_object_handle(ObjectRef::new(3, 0))
-                .as_stream_data()
-                .as_deref()
-                .map(Vec::as_slice),
-            Some(inner),
+                .get_raw_stream_data()
+                .expect("read inner raw stream data")
+                .as_slice(),
+            inner,
             "the inner stream, resolved while the outer frame was live, must \
              have read from its own saved offset"
         );
@@ -4850,8 +4930,10 @@ mod tests {
         );
 
         assert_eq!(
-            n.as_stream_data().as_deref().map(Vec::as_slice),
-            Some(appearance_payload),
+            n.get_raw_stream_data()
+                .expect("read appearance raw stream data")
+                .as_slice(),
+            appearance_payload,
             "the resolved appearance stream must carry its own payload"
         );
         assert!(

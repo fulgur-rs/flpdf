@@ -224,7 +224,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         self.resolved_key(&params, key)
     }
 
-    /// Decode and return the raw payload bytes.
+    /// Decode and return the payload bytes.
     ///
     /// Applies the stream's full filter chain (e.g. `/FlateDecode`) via
     /// [`crate::filters::decode_stream_data`].
@@ -254,16 +254,14 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 "expected an /EmbeddedFile stream object".to_string(),
             ));
         };
-        // `as_stream_dict` and `as_stream_data` are paired ObjectHandle
-        // projections: a stream dictionary is always a dictionary and comes
-        // from the same stream value that owns the payload.
+        // The dictionary describes the encoded stream, while raw data goes
+        // through the stream primitive so it works for both parsed original
+        // source bytes and replacement buffers.
         let dictionary = stream_dict
-            .materialize()
+            .materialize()?
             .into_dict()
             .expect("stream dictionary handle must materialize as a dictionary");
-        let data = stream
-            .as_stream_data()
-            .expect("stream dictionary handle must have stream data");
+        let data = stream.get_raw_stream_data()?;
         decode_stream_data(&dictionary, &data)
     }
 
@@ -550,7 +548,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
             return Ok(None);
         };
         let dict = dictionary
-            .materialize()
+            .materialize()?
             .into_dict()
             .expect("dictionary handle must materialize as a dictionary");
         Ok(Some(dict))

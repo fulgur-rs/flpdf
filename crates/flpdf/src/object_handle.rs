@@ -46,6 +46,31 @@ pub type ResourceConflicts =
 /// document implementation can resolve an indirect slot.
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_stream_data(
+        &self,
+        object_ref: ObjectRef,
+        offset: i64,
+        length: usize,
+        stream_dict: &ObjectHandle,
+        pipeline: &mut dyn crate::pipeline::Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        let _ = (
+            object_ref,
+            offset,
+            length,
+            stream_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        );
+        Err(Error::Internal(
+            "stream data requested from a resolver without a stream source".to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -254,13 +279,17 @@ pub(crate) enum ObjectValue {
     Array(Vec<ObjectHandle>),
     Dictionary(std::collections::BTreeMap<Vec<u8>, ObjectHandle>),
     /// A stream's own value: its dictionary (a separately parsed handle
-    /// carrying its own `<<`-start parsed offset) and its raw encoded byte
-    /// payload. The stream value's own parsed offset (see
+    /// carrying its own `<<`-start parsed offset) and its optional replacement
+    /// buffer. The stream value's own parsed offset (see
     /// [`ObjectHandle::get_parsed_offset`]) is the encoded stream-data
     /// start, distinct from the dictionary's.
     ///
-    /// The payload is shared rather than owned, mirroring qpdf's
-    /// `std::shared_ptr<Buffer> stream_data` (`libqpdf/qpdf/QPDF_Stream.hh:104`).
+    /// `stream_data: None` is qpdf's original-source state: no payload is
+    /// retained at parse time, and `QPDF_Stream::pipeStreamData`
+    /// (`libqpdf/QPDF_Stream.cc:571-620`) reads the owning document at this
+    /// value's parsed offset instead. `Some` is the shared replacement buffer,
+    /// mirroring qpdf's `std::shared_ptr<Buffer> stream_data`
+    /// (`libqpdf/qpdf/QPDF_Stream.hh:104`).
     /// The sharing is observable behaviour, not a micro-optimization:
     /// `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2240,2256-2258`) hands one
     /// stream's buffer to a second stream — in a different document — with no
@@ -287,7 +316,12 @@ pub(crate) enum ObjectValue {
     /// regardless.
     Stream {
         stream_dict: ObjectHandle,
-        stream_data: Rc<Vec<u8>>,
+        /// `None` means original source bytes; `Some` is replacement data.
+        stream_data: Option<Rc<Vec<u8>>>,
+        /// Parse-time length for the original-source branch. qpdf's
+        /// `replaceFilterData` updates `/Length` but not this member
+        /// (`libqpdf/QPDF_Stream.cc:668-685`).
+        stream_length: usize,
     },
     // qpdf-cutover-delete(flpdf-25kg.3.3): qpdf cannot store an indirect
     // handle as another indirect object's replacement value. Delete this
@@ -580,9 +614,11 @@ impl ObjectHandle {
                 ObjectValue::Stream {
                     stream_dict,
                     stream_data,
+                    stream_length,
                 } => ObjectValue::Stream {
                     stream_dict: shallow_copy_child(stream_dict),
                     stream_data: stream_data.clone(),
+                    stream_length: *stream_length,
                 },
                 other => other.clone(),
             }),
@@ -1046,7 +1082,8 @@ impl ObjectHandle {
         Self::new_direct(
             ObjectValue::Stream {
                 stream_dict: dict,
-                stream_data: data,
+                stream_data: Some(data),
+                stream_length: 0,
             },
             NO_PARSED_OFFSET,
         )
@@ -1576,7 +1613,7 @@ impl ObjectHandle {
                 ..
             }) = v
             {
-                *existing = data;
+                *existing = Some(data);
             }
         });
     }
@@ -1607,9 +1644,82 @@ impl ObjectHandle {
     /// `std::shared_ptr<Buffer>` itself.
     pub fn as_stream_data(&self) -> Option<Rc<Vec<u8>>> {
         self.with_value(|value| match value {
-            Some(ObjectValue::Stream { stream_data, .. }) => Some(stream_data.clone()),
+            Some(ObjectValue::Stream { stream_data, .. }) => stream_data.clone(),
             _ => None,
         })
+    }
+
+    /// qpdf `QPDF_Stream::getRawStreamData` (`libqpdf/QPDF_Stream.cc:362-376`).
+    ///
+    /// Replaced stream data is written directly; original data is read through
+    /// the owning document at the parsed offset and stored parse-time length.
+    /// No filter or decoder stage is constructed here.
+    pub fn get_raw_stream_data(&self) -> Result<Rc<Vec<u8>>> {
+        let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
+        if !self.pipe_raw_stream_data(&mut buffer)? {
+            return Err(Error::Unsupported(
+                "error getting raw stream data".to_owned(),
+            ));
+        }
+        Ok(Rc::new(buffer.take_buffer()?))
+    }
+
+    fn pipe_raw_stream_data(&self, pipeline: &mut dyn crate::pipeline::Pipeline) -> Result<bool> {
+        self.try_dereference()?;
+        let Some((stream_dict, stream_data, stream_length)) =
+            self.with_value(|value| match value {
+                Some(ObjectValue::Stream {
+                    stream_dict,
+                    stream_data,
+                    stream_length,
+                }) => Some((stream_dict.clone(), stream_data.clone(), *stream_length)),
+                _ => None,
+            })
+        else {
+            return Err(Error::Internal(
+                "pipeStreamData called for non-stream".to_owned(),
+            ));
+        };
+
+        if let Some(stream_data) = stream_data {
+            pipeline.write(&stream_data)?;
+            pipeline.finish()?;
+            return Ok(true);
+        }
+
+        let parsed_offset = self.get_parsed_offset();
+        if parsed_offset == 0 {
+            return Err(Error::Internal(
+                "pipeStreamData called for stream with no data".to_owned(),
+            ));
+        }
+
+        let (object_ref, resolver) = match &self.0 {
+            Repr::Indirect(slot) => {
+                let slot = slot.borrow();
+                (slot.object_ref, slot.resolver.clone())
+            }
+            Repr::Direct(_) => {
+                return Err(Error::Internal(
+                    "pipeStreamData called for original direct stream".to_owned(),
+                ))
+            }
+        };
+        let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
+            return Err(Error::Internal(format!(
+                "object {} {} belongs to a dropped PDF",
+                object_ref.number, object_ref.generation
+            )));
+        };
+        resolver.pipe_stream_data(
+            object_ref,
+            parsed_offset,
+            stream_length,
+            &stream_dict,
+            pipeline,
+            false,
+            false,
+        )
     }
 
     /// The value as raw operator bytes if this handle's value — its own if
@@ -1780,6 +1890,12 @@ impl ObjectHandle {
     /// offset) is flattened into a plain [`Dictionary`] for
     /// `Object::Stream`.
     ///
+    /// Parsed original streams make this bridge fallible: materializing one
+    /// reads its bytes through [`Self::get_raw_stream_data`] at this call
+    /// site. New qpdf-native stream consumers must keep the handle and pipe
+    /// it instead; this legacy bridge exists only for callers that still
+    /// require an owned [`Object`].
+    ///
     /// An indirect handle that has not yet been resolved (see
     /// [`Self::is_resolved`]) materializes as `Object::Null` rather than
     /// performing hidden resolution; callers that need the real value must
@@ -1808,7 +1924,7 @@ impl ObjectHandle {
     /// `Drop`, reachable without ever calling `materialize` at all (it
     /// existed as long as those factories have been public), not something
     /// introduced or fixable here.
-    pub fn materialize(&self) -> Object {
+    pub fn materialize(&self) -> Result<Object> {
         materialize_bounded(self, 0)
     }
 
@@ -1999,20 +2115,39 @@ impl ObjectHandle {
 // value nested deeper than that, so only a tree built directly through the
 // public `ObjectHandle::array`/`dictionary` factories (which impose no depth
 // bound themselves) can reach the cap at all.
-fn materialize_bounded(handle: &ObjectHandle, depth: usize) -> Object {
+fn materialize_bounded(handle: &ObjectHandle, depth: usize) -> Result<Object> {
     if depth > crate::parser::MAX_PARSE_DEPTH {
-        return Object::Null;
+        return Ok(Object::Null);
+    }
+    let stream = handle.with_value(|value| match value {
+        Some(ObjectValue::Stream {
+            stream_dict,
+            stream_data,
+            ..
+        }) => Some((stream_dict.clone(), stream_data.clone())),
+        _ => None,
+    });
+    if let Some((stream_dict, stream_data)) = stream {
+        let dict = match materialize_bounded(&stream_dict, depth + 1)? {
+            Object::Dictionary(dict) => dict,
+            _ => Dictionary::new(),
+        };
+        let data = match stream_data {
+            Some(data) => data.as_ref().clone(),
+            None => handle.get_raw_stream_data()?.as_ref().clone(),
+        };
+        return Ok(Object::Stream(Stream::new(dict, data)));
     }
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.with_value(|value| match value {
             Some(value) => materialize_value(value, depth),
-            None => Object::Null,
+            None => Ok(Object::Null),
         })
     })
 }
 
-fn materialize_value(value: &ObjectValue, depth: usize) -> Object {
-    match value {
+fn materialize_value(value: &ObjectValue, depth: usize) -> Result<Object> {
+    Ok(match value {
         ObjectValue::Null => Object::Null,
         ObjectValue::Boolean(b) => Object::Boolean(*b),
         ObjectValue::Integer(n) => Object::Integer(*n),
@@ -2029,48 +2164,33 @@ fn materialize_value(value: &ObjectValue, depth: usize) -> Object {
             children
                 .iter()
                 .map(|child| materialize_child(child, depth + 1))
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
         ),
         ObjectValue::Dictionary(entries) => {
             let mut dict = Dictionary::new();
             for (key, value) in entries {
-                dict.insert(key.as_slice(), materialize_child(value, depth + 1));
+                dict.insert(key.as_slice(), materialize_child(value, depth + 1)?);
             }
             Object::Dictionary(dict)
         }
-        ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-        } => {
-            let dict = match materialize_bounded(stream_dict, depth + 1) {
-                Object::Dictionary(dict) => dict,
-                // A stream's own dictionary handle is always constructed as
-                // a direct `ObjectValue::Dictionary` (see
-                // `Pdf::native_parse_uncompressed_value`, `Pdf::lift`, and
-                // `Pdf::lift_for_set_object`), never an indirect reference
-                // or any other variant, unless the depth cap above already
-                // substituted `Object::Null` for it.
-                _ => Dictionary::new(), // cov:ignore: unreachable outside the depth-cap fallback, itself covered separately
-            };
-            // The legacy `Object::Stream` owns its bytes, so crossing into it
-            // copies the payload. That copy is a property of the legacy route,
-            // not of the shared representation above; it disappears with the
-            // route itself.
-            Object::Stream(Stream::new(dict, stream_data.as_ref().clone()))
+        ObjectValue::Stream { .. } => {
+            return Err(Error::Internal(
+                "stream materialization must retain its ObjectHandle source".to_owned(),
+            ));
         }
         ObjectValue::Reference(object_ref) => Object::Reference(*object_ref),
-    }
+    })
 }
 
 // An array/dictionary child handle materializes to `Object::Reference`
 // without recursing into it when indirect (identity-preserving, matching
 // the parser's pre-existing `Object::Reference` semantics); a direct child
 // is materialized in place.
-fn materialize_child(handle: &ObjectHandle, depth: usize) -> Object {
-    match handle.object_ref() {
+fn materialize_child(handle: &ObjectHandle, depth: usize) -> Result<Object> {
+    Ok(match handle.object_ref() {
         Some(object_ref) => Object::Reference(object_ref),
-        None => materialize_bounded(handle, depth),
-    }
+        None => materialize_bounded(handle, depth)?,
+    })
 }
 
 // A separate materialization walk used only by `ObjectHandle::unparse_resolved`,
@@ -2100,19 +2220,29 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
         ObjectValue::Stream {
             stream_dict,
             stream_data,
+            ..
         } => {
             let dict = match unparse_materialize(stream_dict) {
                 Object::Dictionary(dict) => dict,
                 _ => Dictionary::new(), // cov:ignore: same invariant as materialize_value's own Stream arm
             };
             // Same legacy-route payload copy as `materialize_value`'s arm.
-            Object::Stream(Stream::new(dict, stream_data.as_ref().clone()))
+            Object::Stream(Stream::new(
+                dict,
+                stream_data
+                    .as_ref()
+                    .expect("unparse requires replaced stream data")
+                    .as_ref()
+                    .clone(),
+            ))
         }
         // No other variant nests a dictionary, so the omission rule cannot
         // apply anywhere beneath it; delegate to the ordinary materializer.
         // Every remaining variant is a scalar with no further recursion, so
         // the depth this arm passes never actually matters.
-        other => materialize_value(other, 0),
+        other => {
+            materialize_value(other, 0).expect("non-stream unparse materialization is infallible")
+        }
     }
 }
 
@@ -3155,9 +3285,11 @@ fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
         ObjectValue::Stream {
             stream_dict,
             stream_data,
+            stream_length,
         } => ObjectValue::Stream {
             stream_dict: shallow_copy_child(stream_dict),
             stream_data: stream_data.clone(),
+            stream_length: *stream_length,
         },
         other => other.clone(),
     }
@@ -3445,6 +3577,26 @@ pub(crate) mod identity_tests {
         }
     }
 
+    /// Resolves a stream value but intentionally has no byte source. This
+    /// exercises `DocumentResolver::pipe_stream_data`'s default boundary: a
+    /// resolver may resolve objects without also being a file-backed reader.
+    struct NoStreamSourceResolver;
+
+    impl DocumentResolver for NoStreamSourceResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            handle.set_resolved(ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![]),
+                stream_data: None,
+                stream_length: 3,
+            });
+            Ok(())
+        }
+    }
+
     /// An unresolved indirect handle whose resolver installs `value`.
     ///
     /// `pub(crate)` so `stream_filter.rs`'s handle-shape reader tests can
@@ -3472,6 +3624,22 @@ pub(crate) mod identity_tests {
         // holds only a `Weak`, and dropping it here would turn every accessor
         // into the dropped-document error instead.
         (handle, resolver)
+    }
+
+    #[test]
+    fn raw_stream_data_requires_a_file_backed_resolver_for_original_bytes() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(NoStreamSourceResolver);
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver),
+        );
+        stream.set_parsed_offset_if_unset(9);
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("an object-only resolver has no original stream source");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "stream data requested from a resolver without a stream source"));
     }
 
     /// [`resolver_bearing_handle`] plus the resolver's [`ResolutionLog`].
@@ -4205,7 +4373,36 @@ mod object_value_tests {
         let stream = ObjectHandle::stream(dict.clone(), Rc::new(b"abc".to_vec()));
         assert!(stream.as_stream_dict().expect("stream dict").ptr_eq(&dict));
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("replaced stream data")
+                .as_slice(),
+            b"abc"
+        );
         assert_eq!(stream.type_code(), 10, "ot_stream");
+    }
+
+    #[test]
+    fn raw_stream_data_uses_replacements_including_an_empty_buffer() {
+        let stream = ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(Vec::new()));
+        assert!(
+            stream
+                .get_raw_stream_data()
+                .expect("empty replacement data")
+                .is_empty(),
+            "an empty replacement is data, not an original-stream sentinel"
+        );
+
+        stream.replace_stream_data(Rc::new(b"replacement".to_vec()), None, None);
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("replacement data")
+                .as_slice(),
+            b"replacement",
+            "replacement data wins over every original-source detail"
+        );
     }
 
     #[test]
@@ -4218,7 +4415,7 @@ mod object_value_tests {
         // doc. `object_value_tests` above already exercises its per-variant
         // behavior exhaustively; this only pins the visibility contract.
         let handle = ObjectHandle::integer(1);
-        let _: Object = ObjectHandle::materialize(&handle);
+        let _: Object = ObjectHandle::materialize(&handle).expect("scalar materializes");
     }
 
     #[test]
@@ -4249,7 +4446,7 @@ mod object_value_tests {
             handle = ObjectHandle::array(vec![handle]);
         }
 
-        let materialized = handle.materialize();
+        let materialized = handle.materialize().expect("direct tree materializes");
         std::mem::forget(handle);
 
         let mut cursor = &materialized;
@@ -4750,19 +4947,40 @@ mod materialize_tests {
 
     #[test]
     fn scalar_values_materialize_to_the_matching_object_variant() {
-        assert_eq!(ObjectHandle::null().materialize(), Object::Null);
         assert_eq!(
-            ObjectHandle::boolean(true).materialize(),
+            ObjectHandle::null()
+                .materialize()
+                .expect("null materializes"),
+            Object::Null
+        );
+        assert_eq!(
+            ObjectHandle::boolean(true)
+                .materialize()
+                .expect("boolean materializes"),
             Object::Boolean(true)
         );
-        assert_eq!(ObjectHandle::integer(7).materialize(), Object::Integer(7));
-        assert_eq!(ObjectHandle::real(1.5).materialize(), Object::Real(1.5));
         assert_eq!(
-            ObjectHandle::name(b"Foo".to_vec()).materialize(),
+            ObjectHandle::integer(7)
+                .materialize()
+                .expect("integer materializes"),
+            Object::Integer(7)
+        );
+        assert_eq!(
+            ObjectHandle::real(1.5)
+                .materialize()
+                .expect("real materializes"),
+            Object::Real(1.5)
+        );
+        assert_eq!(
+            ObjectHandle::name(b"Foo".to_vec())
+                .materialize()
+                .expect("name materializes"),
             Object::Name(b"Foo".to_vec())
         );
         assert_eq!(
-            ObjectHandle::string(b"bar".to_vec()).materialize(),
+            ObjectHandle::string(b"bar".to_vec())
+                .materialize()
+                .expect("string materializes"),
             Object::String(b"bar".to_vec())
         );
     }
@@ -4771,7 +4989,7 @@ mod materialize_tests {
     fn real_literal_materializes_with_its_source_literal_preserved() {
         let handle = ObjectHandle::real_literal(0.4, b".4".to_vec());
         assert_eq!(
-            handle.materialize(),
+            handle.materialize().expect("real literal materializes"),
             Object::RealLiteral {
                 value: 0.4,
                 literal: b".4".to_vec(),
@@ -4784,7 +5002,7 @@ mod materialize_tests {
         let indirect_child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1), indirect_child]);
 
-        let materialized = array.materialize();
+        let materialized = array.materialize().expect("array materializes");
         assert_eq!(
             materialized,
             Object::Array(vec![
@@ -4797,7 +5015,8 @@ mod materialize_tests {
     #[test]
     fn a_dictionary_materializes_its_entries_by_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        let Object::Dictionary(materialized) = dict.materialize() else {
+        let Object::Dictionary(materialized) = dict.materialize().expect("dictionary materializes")
+        else {
             panic!("expected a dictionary"); // cov:ignore: unreachable in a passing run
         };
         assert_eq!(materialized.get("A"), Some(&Object::Integer(1)));
@@ -4809,14 +5028,43 @@ mod materialize_tests {
             ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(5))]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict_handle,
-            stream_data: Rc::new(b"Hello".to_vec()),
+            stream_data: Some(Rc::new(b"Hello".to_vec())),
+            stream_length: 0,
         });
 
-        let Object::Stream(materialized) = stream.materialize() else {
+        let Object::Stream(materialized) = stream.materialize().expect("stream materializes")
+        else {
             panic!("expected a stream"); // cov:ignore: unreachable in a passing run
         };
         assert_eq!(materialized.data, b"Hello");
         assert_eq!(materialized.dict.get("Length"), Some(&Object::Integer(5)));
+    }
+
+    #[test]
+    fn stream_materialization_degrades_a_non_dictionary_stream_dictionary() {
+        let stream = ObjectHandle::stream(ObjectHandle::integer(1), Rc::new(b"data".to_vec()));
+
+        let Object::Stream(materialized) = stream.materialize().expect("stream materializes")
+        else {
+            panic!("expected a stream"); // cov:ignore: established by construction above
+        };
+        assert!(materialized.dict.iter().next().is_none());
+        assert_eq!(materialized.data, b"data");
+    }
+
+    #[test]
+    fn materialize_value_rejects_a_stream_without_its_source_handle() {
+        let error = materialize_value(
+            &ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![]),
+                stream_data: Some(Rc::new(Vec::new())),
+                stream_length: 0,
+            },
+            0,
+        )
+        .expect_err("the helper has no stream handle to read an original source from");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "stream materialization must retain its ObjectHandle source"));
     }
 
     #[test]
@@ -4825,7 +5073,12 @@ mod materialize_tests {
         // `materialize` itself must not assume that precondition holds --
         // a caller that skips resolution sees `Object::Null`, not a panic.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
-        assert_eq!(handle.materialize(), Object::Null);
+        assert_eq!(
+            handle
+                .materialize()
+                .expect("unresolved handle materializes"),
+            Object::Null
+        );
     }
 
     #[test]
@@ -4955,11 +5208,15 @@ mod token_value_tests {
     #[test]
     fn operator_and_inline_image_materialize_to_the_matching_object_variant() {
         assert_eq!(
-            ObjectHandle::operator(b"Do".to_vec()).materialize(),
+            ObjectHandle::operator(b"Do".to_vec())
+                .materialize()
+                .expect("operator materializes"),
             Object::Operator(b"Do".to_vec())
         );
         assert_eq!(
-            ObjectHandle::inline_image(b"data".to_vec()).materialize(),
+            ObjectHandle::inline_image(b"data".to_vec())
+                .materialize()
+                .expect("inline image materializes"),
             Object::InlineImage(b"data".to_vec())
         );
     }
@@ -5023,7 +5280,8 @@ mod type_code_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(Vec::new()),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_length: 0,
         });
         assert_eq!(stream.type_code(), 10);
         assert_eq!(stream.type_name(), "stream");
@@ -5137,7 +5395,8 @@ mod unparse_tests {
                 b"Length".to_vec(),
                 ObjectHandle::integer(0),
             )]),
-            stream_data: Rc::new(Vec::new()),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_length: 0,
         });
         let inner_dict = ObjectHandle::dictionary(vec![
             (b"A".to_vec(), ObjectHandle::null()),
@@ -5195,7 +5454,8 @@ mod unparse_tests {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
         handle.set_resolved(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(Vec::new()),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_length: 0,
         });
         assert_eq!(handle.unparse(), b"9 0 R");
         assert_eq!(handle.unparse_resolved(), b"9 0 R");
@@ -5230,7 +5490,8 @@ mod unparse_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         assert_eq!(
             handle.unparse_resolved(),
@@ -5781,7 +6042,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         handle.unparse_object(&mut out).unwrap();
@@ -5804,7 +6066,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         indirect.unparse_object(&mut out).unwrap();
@@ -5979,7 +6242,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         indirect.unparse_object_qdf(&mut out, 0).unwrap();
@@ -6168,7 +6432,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         handle.unparse_stream_body(&mut out, false).unwrap();
@@ -6187,7 +6452,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         indirect.unparse_stream_body(&mut out, false).unwrap();
@@ -6469,7 +6735,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         handle.unparse_stream_body_qdf(&mut out, 0).unwrap();
@@ -6485,7 +6752,8 @@ mod unparse_object_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(2))]);
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
-            stream_data: Rc::new(b"ab".to_vec()),
+            stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_length: 0,
         });
         let mut out = Vec::new();
         indirect.unparse_stream_body_qdf(&mut out, 0).unwrap();
@@ -7155,11 +7423,20 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
-            stream_data: Rc::new(b"old".to_vec()),
+            stream_data: None,
+            stream_length: 37,
         });
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
         assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
+        assert_eq!(
+            stream.with_value(|value| match value {
+                Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
+                _ => None, // cov:ignore: this test constructs a stream above
+            }),
+            Some(37),
+            "replaceStreamData changes the dictionary /Length, not the stored original length"
+        );
     }
 
     #[test]
@@ -7167,7 +7444,8 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
-            stream_data: Rc::new(b"old".to_vec()),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 0,
         });
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
         let parms =
@@ -7189,7 +7467,8 @@ mod mutation_tests {
         )]);
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
-            stream_data: Rc::new(b"old".to_vec()),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 0,
         });
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
         assert_eq!(
@@ -7203,6 +7482,67 @@ mod mutation_tests {
         let scalar = ObjectHandle::integer(1);
         scalar.replace_stream_data(Rc::new(b"x".to_vec()), None, None);
         assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn raw_stream_data_rejects_an_original_stream_with_parsed_offset_zero() {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: None,
+            stream_length: 3,
+        });
+        stream.set_parsed_offset_if_unset(0);
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("qpdf rejects an original stream with no parsed offset");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "pipeStreamData called for stream with no data"));
+    }
+
+    #[test]
+    fn raw_stream_data_rejects_non_stream_values() {
+        let error = ObjectHandle::integer(1)
+            .get_raw_stream_data()
+            .expect_err("raw stream data is only available on streams");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "pipeStreamData called for non-stream"));
+    }
+
+    #[test]
+    fn raw_stream_data_rejects_an_original_direct_stream() {
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![]),
+            stream_data: None,
+            stream_length: 3,
+        });
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("qpdf streams with original bytes are always indirect");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "pipeStreamData called for original direct stream"));
+    }
+
+    #[test]
+    fn raw_stream_data_rejects_a_dropped_original_stream_owner() {
+        let (stream, resolver) =
+            super::identity_tests::resolver_bearing_handle(ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![]),
+                stream_data: None,
+                stream_length: 3,
+            });
+        stream.set_parsed_offset_if_unset(9);
+        stream
+            .try_dereference()
+            .expect("resolve stream while owner lives");
+        drop(resolver);
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("original stream source is unavailable after document drop");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "object 20 0 belongs to a dropped PDF"));
     }
 
     // --- Coverage closers: paths the tests above never happened to reach ---
@@ -7315,7 +7655,8 @@ mod mutation_tests {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Stream {
             stream_dict: ObjectHandle::dictionary(vec![]),
-            stream_data: Rc::new(b"old".to_vec()),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 0,
         });
         let copy = indirect.shallow_copy();
         copy.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
