@@ -79,12 +79,13 @@
 //!
 //! The warning sink stays the easiest way to get this wrong, because
 //! `push_warning` needs `borrow_mut` and the code that warns is the code that
-//! has just finished reading something. [`ResolverHandle::frame_object`]
-//! therefore hands its warnings back rather than pushing them — it holds no
-//! borrow, but [`ResolverHandle::scan_forward`] runs it more than once per
-//! object, so duplicates would be the bug instead.
+//! has just finished reading something. The live file-object parser returns
+//! diagnostics to [`ResolverHandle::read_object_at_offset`] after it has
+//! released its input adapter, so each source token contributes at most one
+//! document warning.
 
 use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::parser::{parse_live_file_object, LiveInput, LiveTokenSource};
 use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
@@ -991,28 +992,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// The position advances by exactly what was appended, so `bytes` always
     /// mirrors `[scan start, current position)`.
     ///
-    /// **The chunk doubles rather than staying at [`INPUT_CHUNK`], and that is
-    /// a complexity fix, not a tuning knob.** [`Self::scan_forward`] re-runs
-    /// its `attempt` from the *start* of `bytes` after every call here, so a
-    /// fixed chunk makes an `N`-byte object cost `N/`[`INPUT_CHUNK`]
-    /// tokenizations of average length `N/2` — quadratic in `N`, for input
-    /// that is perfectly valid and merely large. Doubling makes the number of
-    /// calls logarithmic and the total tokenizing linear.
-    /// `a_large_direct_object_costs_a_logarithmic_number_of_pulls` measures
-    /// it: 258 pulls of the input source before, 11 after, over a 1 MiB
-    /// value — and 1.81 s of debug-build resolution before, 0.05 s after.
-    ///
-    /// **This is a different hazard from the one [`Self::scan_forward`]
-    /// records**, which is a *malformed* object costing one pull to EOF. That
-    /// one is unchanged: a parse that never completes still reaches the end of
-    /// the input, in fewer and larger steps.
-    ///
-    /// The cost of doubling is that a scan can pull up to twice what the
-    /// object needed. It is bounded by the file rather than by the request —
-    /// [`ResolverCore::read`] returns what was actually available and the
-    /// `truncate` below gives the rest back — so the overshoot is at worst the
-    /// bytes between the object's end and EOF, which the malformed case
-    /// already reads in full.
+    /// This belongs only to legacy token consumers that still use
+    /// [`Self::scan_forward`]. File-object parsing has moved to the live
+    /// InputSource adapter and does not accumulate or retry its prefix.
     fn refill(&self, bytes: &mut Vec<u8>) -> Result<bool> {
         let filled = bytes.len();
         let want = filled.max(INPUT_CHUNK);
@@ -1026,26 +1008,19 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// reports a complete result, then leave the position exactly where that
     /// result stopped consuming.
     ///
-    /// **This is the one place flpdf cannot follow qpdf's shape literally,
-    /// and the compromise is deliberate.** `QPDFTokenizer` and `QPDFParser`
+    /// This remains a legacy token helper. `QPDFTokenizer` and `QPDFParser`
     /// consume `m->file` a character at a time
     /// (`QPDFTokenizer::presentCharacter`, and `unreadCh` to give back the
     /// one character of overshoot — `libqpdf/QPDF.cc:1656` uses
     /// `seek(-1, SEEK_CUR)` for the same purpose), so qpdf never has to know
-    /// in advance how far an object reaches. flpdf's [`Tokenizer`] and parser
-    /// take a slice, so the bytes must be in memory before they can be
-    /// looked at.
+    /// in advance how far an object reaches. The file-object path no longer
+    /// uses this helper: it advances through `LiveTokenSource` directly.
     ///
-    /// What is preserved is what the seam depends on: the position is live,
-    /// the pull advances it, and it is left immediately after the consumed
-    /// bytes — so a nested resolution really does move it and the explicit
-    /// restore in [`Self::read_stream`] really is what puts it back. What is
-    /// *not* preserved is qpdf's "stop reading at the first bad character":
-    /// `attempt` re-runs against a longer buffer, so a malformed object costs
-    /// one pull to EOF. [`Self::read_window`]'s bounded-window shape is
-    /// **not** what this is — that one takes its extent from the next xref
-    /// entry and leaves no position behind at all, which is why it is a legacy
-    /// tenant out here and not a `ResolverCore` method.
+    /// Its position remains live and its pull leaves the source after the
+    /// consumed token. [`Self::read_window`]'s bounded-window shape is not
+    /// this helper: it takes its extent from the next xref entry and leaves no
+    /// position behind, so it remains a legacy tenant rather than a
+    /// `ResolverCore` method.
     ///
     /// `attempt` reports `(value, end)` where `end` is how many bytes it
     /// consumed. A result that consumed the *whole* buffer is treated as
@@ -1095,17 +1070,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the `endobj` half, stops *resolving at all* — there the difference is
     /// not the message but whether the object comes back.
     ///
-    /// **`allow_eof` is not this method's alone.** qpdf reaches every one of
-    /// the three token reads above through the same `QPDF::readToken` over the
-    /// same document-owned tokenizer, so the policy is a property of the
-    /// tokenizer rather than of a call site.
-    /// [`Self::frame_object`]'s trailing read — `readObject`'s `:1347`, the
-    /// one that decides `stream` from `endobj` for a *direct* value — runs
-    /// over the framing buffer rather than through here, and applies it
-    /// itself. It did not, for a while: it was left behind when this method
-    /// gained `allow_eof`, and a direct value that ended the input failed with
-    /// `unexpected EOF` while the identical stream failed with `expected
-    /// endobj`.
+    /// `allow_eof` is also used by the live file-object tokenizer, whose
+    /// trailing token is the direct equivalent of this stream-framing read.
     ///
     /// One divergence stays: qpdf passes `allow_bad = true`
     /// (`QPDF::readToken`, `:1536-1539`), so a *malformed* token is returned
@@ -1114,17 +1080,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// changes every caller's error surface, so it is recorded rather than
     /// taken here.
     ///
-    /// A second, smaller one rides on it: that error's offset is relative to
-    /// *this* scan's buffer, which begins wherever the input happened to be —
-    /// after a stream payload, say — so it is neither a file position nor an
-    /// object-relative one. [`Self::read_object_at_offset`] rebases what
-    /// [`Self::frame_object`] raises; nothing rebases this, for the same
-    /// reason [`Self::stream_length`]'s placeholders stay `0`: the position
-    /// the error would need is not carried this far down. It is reachable on
-    /// exactly the input the divergence above is about — a malformed token
-    /// where a framing keyword belonged is the only thing that raises an
-    /// [`Error::Parse`] here — so it is a strict subset of that one, and
-    /// giving qpdf's `allow_bad` treatment to this read removes both at once.
+    /// This legacy helper still reports a slice-relative error for malformed
+    /// stream framing. File-object diagnostics no longer pass through it and
+    /// retain their absolute input offsets.
     fn read_token_from_input(&self) -> Result<Token> {
         self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
@@ -1138,6 +1096,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn read_byte(&self) -> Result<Option<u8>> {
         let mut byte = [0u8; 1];
         Ok((self.read(&mut byte)? == 1).then_some(byte[0]))
+    }
+
+    /// One live `InputSource` view over this resolver's document input.
+    ///
+    /// This is intentionally a tiny adapter rather than another owner: qpdf
+    /// gives `QPDFParser` the same `m->file` that stream length resolution can
+    /// move, so the resolver remains the sole owner of position and its
+    /// canonical object cache.
+    fn live_input(&self) -> ResolverLiveInput<'_, R> {
+        ResolverLiveInput {
+            resolver: self,
+            buffer: [0; LIVE_INPUT_BUFFER],
+            buffer_start: 0,
+            buffer_len: 0,
+            buffer_index: 0,
+        }
     }
 
     /// qpdf `QPDF::readObjectAtOffset` (`libqpdf/QPDF.cc:1541-1697`),
@@ -1177,161 +1151,86 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///   returns null — see
     ///   `a_direct_value_ending_the_input_warns_and_is_still_resolved`.
     ///
-    /// **Positions reported from here are the file's, not the window's.**
-    /// [`Self::frame_object`] tokenizes a buffer that begins at the object, so
-    /// everything it raises is relative to `offset`; qpdf's are relative to
-    /// `m->file`, because `QPDFExc` carries an input position taken from
-    /// `input->getLastOffset()` (`libqpdf/QPDFParser.cc:516-519`). The
-    /// `map_err` below is where the two coordinate systems are reconciled, and
-    /// it is deliberately outside `frame_object` rather than inside it: that
-    /// method's contract is "over a buffer", and only its caller knows where
-    /// the buffer came from. `a_malformed_body_reports_its_position_in_the_file_not_in_the_window`
-    /// pins the result against an offset observed from qpdf.
-    ///
-    /// The mismatch error raised further down needs no rebasing: it is built
-    /// from `offset` directly and is already absolute.
+    /// **Positions reported from here are the file's.** The live parser reads
+    /// the resolver-owned input directly, as qpdf does; `QPDFParser::warn`
+    /// takes its position from `input->getLastOffset()`
+    /// (`libqpdf/QPDFParser.cc:516-519`).
+    /// `a_recovered_malformed_body_reports_its_warning_at_the_file_offset`
+    /// pins the absolute diagnostic. The mismatch error is likewise anchored
+    /// directly at `offset`.
     fn read_object_at_offset(
         &self,
         offset: u64,
         expected: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
         self.seek(offset)?;
-        let framed = self.scan_forward(|bytes| {
-            let framed = self
-                .frame_object(bytes, offset)
-                .map_err(|error| error.rebase_offset(offset as usize))?;
-            let end = framed.end;
-            Ok((framed, end))
-        })?;
+        let (found, parsed, trailing) = {
+            let mut input = self.live_input();
+            let mut tokenizer = LiveTokenSource::new(&mut input);
+            let number = read_live_header_integer(tokenizer.next_token()?)?;
+            let generation = read_live_header_integer(tokenizer.next_token()?)?;
+            let obj = tokenizer.next_token()?;
+            if !obj.is_word_value(b"obj") {
+                return Err(Error::parse(obj.start, "expected obj"));
+            }
+            drop(tokenizer);
 
-        if framed.found != Some(expected) {
+            let found = u32::try_from(number)
+                .ok()
+                .zip(u16::try_from(generation).ok())
+                .map(|(number, generation)| ObjectRef::new(number, generation));
+            let mut minter = ChildHandles { resolver: self };
+            let parsed = parse_live_file_object(&mut input, &mut minter)?;
+            let trailing = if parsed.empty.is_none() {
+                let mut trailing_tokens = LiveTokenSource::new(&mut input);
+                let trailing = trailing_tokens.next_token()?;
+                drop(trailing_tokens);
+                Some(trailing)
+            } else {
+                None
+            };
+            input.finish()?;
+            (found, parsed, trailing)
+        };
+
+        if found.is_some_and(|object_ref| object_ref.number == 0) {
+            return Err(Error::parse(offset as usize, "object with ID 0"));
+        }
+
+        if found != Some(expected) {
             return Err(Error::parse(
                 offset as usize,
                 format!("expected {} {} obj", expected.number, expected.generation),
             ));
         }
 
-        // Emitted here rather than inside `frame_object`, which `scan_forward`
-        // may run several times against a growing buffer: a warning pushed in
-        // there would be duplicated once per attempt.
-        for warning in framed.warnings {
-            self.push_warning(warning);
+        for warning in parsed.diagnostics {
+            self.push_warning_at(warning.relative_offset as u64, warning.message);
         }
 
-        match framed.framing {
-            ObjectFraming::Direct => Ok((framed.value, framed.value_offset)),
-            ObjectFraming::Stream => self.read_stream(framed.value, framed.value_offset),
+        if let Some(empty_offset) = parsed.empty {
+            self.push_warning_at(empty_offset, "empty object treated as null");
+            let (value, parsed_offset) = parsed
+                .value
+                .into_direct_value()
+                .expect("live file parser's recovered empty object is always a direct null");
+            debug_assert_eq!(parsed_offset, parsed.parsed_offset);
+            return Ok((value, parsed_offset));
         }
-    }
 
-    /// Tokenize `N G obj`, parse the value, and read the one token that
-    /// follows it — qpdf's `readObjectAtOffset` header check
-    /// (`libqpdf/QPDF.cc:1577-1608`) plus `QPDF::readObject`
-    /// (`:1329-1355`), over a buffer rather than over `m->file`.
-    ///
-    /// Runs once per [`Self::scan_forward`] attempt, so it must stay free of
-    /// side effects that are not idempotent. Minting a canonical child handle
-    /// is idempotent ([`Self::get_object_handle`] is entry-or-insert);
-    /// warnings are not, and are therefore returned rather than pushed.
-    ///
-    /// **The parse's own diagnostics travel out the same way**, and they are
-    /// warnings in qpdf too: `QPDFParser` calls `warn(tokenizer.getErrorMessage())`
-    /// whenever `QPDFTokenizer::nextToken` reports one — at
-    /// `libqpdf/QPDFParser.cc:38-40` for the first token and `:141-143` for
-    /// every later one — and `QPDFParser::warn` (`:488`) forwards to
-    /// `context->warn` (`:494`), i.e. the enclosing `QPDF`. A malformed name is the
-    /// reachable case: `QPDFTokenizer::inNameHex1` (`libqpdf/QPDFTokenizer.cc:448`)
-    /// and `inNameHex2` (`:463`) both set `"name with stray # will not work
-    /// with PDF >= 1.2"` and recover the token rather than rejecting it, so
-    /// the object resolves *and* warns. Dropping them here resolved the object
-    /// silently.
-    ///
-    /// One divergence stays, and it is inherited rather than introduced:
-    /// `QPDFTokenizer::nextToken` returns `error_message.empty()`
-    /// (`libqpdf/QPDFTokenizer.cc:964`), so qpdf warns for a `tt_bad` token as
-    /// well, whereas flpdf's `Parser::next_token` records a diagnostic only for
-    /// a token it did *not* classify `Bad` and the handle-producing path turns
-    /// a `Bad` token into [`Error::Parse`]. The legacy reader has the same
-    /// shape — both paths read through that one `next_token`, and
-    /// `Parser::object_inner`'s `Bad` arm outside `ParserMode::Content` is the
-    /// same `Error::Parse` as `object_inner_handle`'s. Nothing here narrows or
-    /// widens it.
-    fn frame_object(&self, bytes: &[u8], offset: u64) -> Result<FramedObject> {
-        let mut warnings = Vec::new();
-        let mut tokenizer = Tokenizer::new(bytes);
-        let number = tokenizer.next_integer()?;
-        let generation = tokenizer.next_integer()?;
-        tokenizer.expect_word(b"obj")?;
-        tokenizer.skip_ignorable()?;
-        let body_start = tokenizer.position();
-
-        // Reported rather than acted on here: this runs once per
-        // `scan_forward` attempt, and turning the mismatch into an error would
-        // make every attempt fail and pull the input to EOF before saying so.
-        let found = u32::try_from(number)
-            .ok()
-            .zip(u16::try_from(generation).ok())
-            .map(|(number, generation)| ObjectRef::new(number, generation));
-
-        let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
-        let mut minter = ChildHandles { resolver: self };
-        let parsed = crate::parser::parse_qpdf_direct_object_handle_with_end(
-            &bytes[body_start..],
-            file_origin.saturating_add(body_start as i64),
-            &mut minter,
-        )
-        .map_err(|error| error.rebase_offset(body_start))?;
-
-        // Ahead of the `endobj` check below, because qpdf raises them ahead of
-        // it too: the tokenizer warnings come out of the parse of the value,
-        // which `QPDF::readObject` completes before it reads the token that
-        // decides `stream` from `endobj` (`libqpdf/QPDF.cc:1345-1354`).
-        //
-        // The offset each diagnostic carries is dropped rather than reported:
-        // qpdf's warning position is `input->getLastOffset()`
-        // (`libqpdf/QPDFParser.cc:516-519`), and this resolver reports no input
-        // position on any warning it raises in this slice — see
-        // `a_detected_loop_warns_with_qpdfs_message_text`, which pins that.
-        warnings.extend(
-            parsed
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.message),
+        let (value, parsed_offset) = parsed.value.into_direct_value().expect(
+            "live file parser's top-level bare-reference recovery always returns a direct value",
         );
-
-        let mut after = Tokenizer::new(bytes);
-        after.set_position(body_start + parsed.end)?;
-        // Same `allow_eof` as [`Self::read_token_from_input`], and for the
-        // same reason: qpdf reads *this* token and the one after `readStream`
-        // through one `QPDF::readToken` (`libqpdf/QPDF.cc:1347-1354`) over one
-        // tokenizer, the document's, which had `allowEOF()` applied at
-        // construction (`:208`). A value that ends the input therefore reaches
-        // the check below as `tt_eof` and is reported as the missing `endobj`,
-        // not as a complaint about the EOF — see
-        // `a_direct_value_ending_the_input_warns_and_is_still_resolved` for
-        // the observed qpdf output and for the one divergence that follows it.
-        after.allow_eof();
-        let token = after.read_token(false, 0)?;
-        let end = after.position();
-
-        // qpdf `:1346-1354`.
-        let framing = if token.is_word_value(b"stream") {
-            ObjectFraming::Stream
+        debug_assert_eq!(parsed_offset, parsed.parsed_offset);
+        let trailing = trailing.expect("non-empty parse must have a framing token");
+        if trailing.is_word_value(b"stream") {
+            self.read_stream(value, parsed_offset)
         } else {
-            if !token.is_word_value(b"endobj") {
-                warnings.push("expected endobj".to_string());
+            if !trailing.is_word_value(b"endobj") {
+                self.push_warning("expected endobj");
             }
-            ObjectFraming::Direct
-        };
-
-        Ok(FramedObject {
-            found,
-            value: parsed.value,
-            value_offset: parsed.parsed_offset,
-            end,
-            framing,
-            warnings,
-        })
+            Ok((value, parsed_offset))
+        }
     }
 
     /// qpdf `QPDF::readStream` (`libqpdf/QPDF.cc:1360-1399`), entered with the
@@ -1503,9 +1402,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// cannot be holding a borrow of it when that happens.
     ///
     /// **The `0` offsets below are placeholders, and the right value is
-    /// recorded rather than taken.** [`Self::read_object_at_offset`] rebases
-    /// what [`Self::frame_object`] raises onto the object's position; nothing
-    /// rebases these, because the only caller,
+    /// recorded rather than taken.** Nothing rebases these because the only caller,
     /// [`Self::read_stream`], is not given the object's start. qpdf reports
     /// them at `readObject`'s own `offset` — `m->file->tell()` taken at
     /// `:1334`, immediately after the `obj` keyword and *before* any
@@ -1514,11 +1411,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `/Length key in stream dictionary is not an integer` at 233690 against
     /// `attempting to recover stream length` at 233721, 31 bytes apart, which
     /// is exactly `\n<< /Length 4002 0 R >>\nstream\n`. flpdf's nearest
-    /// quantity is `frame_object`'s `body_start`, which is taken *after*
-    /// `skip_ignorable`, so it is that whitespace run short of qpdf's; closing
-    /// the gap means carrying a second position through the framing, which is
-    /// more than this fix needs and is left to the slice that ports
-    /// `end_before_space`.
+    /// quantity is the live parser's post-header position, which is taken
+    /// after the header delimiter. Closing the gap means carrying the object
+    /// header offset through `read_stream`, and is left to the slice that
+    /// ports `end_before_space`.
     fn stream_length(dict: &ObjectValue) -> Result<usize> {
         let ObjectValue::Dictionary(entries) = dict else {
             return Err(Error::parse(
@@ -1567,26 +1463,84 @@ enum PipeFailure {
 /// It dies with those callers.
 const BULK_READ_CHUNK: usize = 64 * 1024;
 
-/// What followed an object's value: qpdf's `readObject` reads one token after
-/// the parse and branches on it (`libqpdf/QPDF.cc:1346-1354`).
-enum ObjectFraming {
-    /// `endobj` — or, with a warning, something else entirely.
-    Direct,
-    /// `stream`, so the value is a stream dictionary and the payload follows.
-    Stream,
+/// A live, one-byte-at-a-time parser view over [`ResolverHandle`]'s owned
+/// source. `LiveTokenSource` owns token state; this adapter owns no bytes and
+/// therefore cannot replay an already completed token.
+struct ResolverLiveInput<'a, R: Read + Seek + 'static> {
+    resolver: &'a ResolverHandle<R>,
+    buffer: [u8; LIVE_INPUT_BUFFER],
+    /// Logical source offset of `buffer[0]`.
+    buffer_start: u64,
+    buffer_len: usize,
+    buffer_index: usize,
 }
 
-/// One object's parse, before its warnings have been emitted.
-struct FramedObject {
-    /// The `N G` the file actually carries at this offset, or `None` when
-    /// either number is outside [`ObjectRef`]'s range.
-    found: Option<ObjectRef>,
-    value: ObjectValue,
-    value_offset: i64,
-    /// Bytes consumed, up to and including the framing keyword.
-    end: usize,
-    framing: ObjectFraming,
-    warnings: Vec<String>,
+impl<R: Read + Seek> LiveInput for ResolverLiveInput<'_, R> {
+    fn tell(&mut self) -> Result<u64> {
+        if self.buffer_len == 0 {
+            self.resolver.tell()
+        } else {
+            Ok(self.buffer_start.saturating_add(self.buffer_index as u64))
+        }
+    }
+
+    fn seek(&mut self, offset: u64) -> Result<()> {
+        self.resolver.seek(offset)?;
+        self.buffer_start = offset;
+        self.buffer_len = 0;
+        self.buffer_index = 0;
+        Ok(())
+    }
+
+    fn read_byte(&mut self) -> Result<Option<u8>> {
+        if self.buffer_index == self.buffer_len {
+            self.buffer_start = self.resolver.tell()?;
+            self.buffer_len = self.resolver.read(&mut self.buffer)?;
+            self.buffer_index = 0;
+            if self.buffer_len == 0 {
+                return Ok(None);
+            }
+        }
+        let byte = self.buffer[self.buffer_index];
+        self.buffer_index += 1;
+        Ok(Some(byte))
+    }
+
+    fn unread_byte(&mut self) -> Result<()> {
+        if self.buffer_index != 0 {
+            self.buffer_index -= 1;
+            Ok(())
+        } else {
+            let position = self.tell()?;
+            let previous = position
+                .checked_sub(1)
+                .ok_or_else(|| Error::parse(0, "cannot unread before the start of input"))?;
+            self.seek(previous)
+        }
+    }
+}
+
+impl<R: Read + Seek> ResolverLiveInput<'_, R> {
+    /// Flush a speculative fast-read buffer before another resolver consumer
+    /// observes `m->file`'s position. Qpdf's `InputSource::fastUnread` does
+    /// the same seek after tokenizer use (`InputSource.hh:148-153`).
+    fn finish(&mut self) -> Result<()> {
+        let position = self.tell()?;
+        self.seek(position)
+    }
+}
+
+/// qpdf's `InputSource::buf_size` (`include/qpdf/InputSource.hh:92`).
+const LIVE_INPUT_BUFFER: usize = 128;
+
+fn read_live_header_integer(token: Token) -> Result<i64> {
+    if token.token_type != crate::tokenizer::TokenType::Integer {
+        return Err(Error::parse(token.start, "expected integer"));
+    }
+    std::str::from_utf8(&token.value)
+        .ok()
+        .and_then(|text| text.parse::<i64>().ok())
+        .ok_or_else(|| Error::parse(token.start, "invalid integer"))
 }
 
 /// Lets the parser mint a canonical handle for a nested `N G R` through the
@@ -1822,7 +1776,9 @@ mod tests {
     use crate::object_handle::NO_PARSED_OFFSET;
     use crate::{Diagnostics, Error, ObjectRef, Pdf, Severity, XrefEntry};
     use std::collections::BTreeMap;
+    use std::fs;
     use std::io::Cursor;
+    use std::process::Command;
     use std::sync::Arc;
 
     /// A three-object document with a classic cross-reference table: catalog,
@@ -3185,10 +3141,9 @@ mod tests {
     ///
     /// The framing checks it performs — the object-id match
     /// (`libqpdf/QPDF.cc:1600-1608`) and the `endobj` check (`:1352-1355`) —
-    /// each warn when they fail, and `scan_forward` runs `frame_object` more
-    /// than once against a growing buffer. This pins that a well-formed
-    /// document produces exactly zero of them, which a warning pushed from
-    /// inside the retried parse would break.
+    /// each warn when they fail. The live parser emits its own diagnostics
+    /// once after its source borrow is released. This pins that a well-formed
+    /// document produces exactly zero warnings.
     #[test]
     fn resolving_a_well_formed_document_raises_no_warnings() {
         let mut pdf = Pdf::open_mem_owned(indirect_length_pdf_bytes()).expect("open");
@@ -3210,12 +3165,8 @@ mod tests {
         );
     }
 
-    /// An object whose body is larger than one input chunk still resolves.
-    ///
-    /// `scan_forward` accepts a parse only once it has consumed strictly fewer
-    /// bytes than the buffer holds, so an object that needs several pulls
-    /// exercises the refill path — and, more importantly, the guard against
-    /// accepting a value that a chunk boundary truncated.
+    /// An object whose body is larger than the legacy input chunk still
+    /// resolves through the live parser without truncation.
     #[test]
     fn an_object_longer_than_one_input_chunk_resolves_completely() {
         let filler = "x".repeat(super::INPUT_CHUNK * 2);
@@ -3249,32 +3200,15 @@ mod tests {
         );
     }
 
-    /// A large *valid* direct object costs a logarithmic number of pulls, not
-    /// one per chunk.
+    /// A large direct object is read through qpdf's 128-byte InputSource fast
+    /// buffer, not one source read per byte.
     ///
-    /// **This is not the hazard the module doc already records.** That one —
-    /// "a malformed object costs one pull to EOF", [`super::ResolverHandle::scan_forward`]
-    /// — is about an object that never parses; this is about one that parses
-    /// perfectly and is merely big. [`super::ResolverHandle::scan_forward`]
-    /// re-runs `attempt` from the *start* of the accumulated buffer after
-    /// every refill, so a fixed refill makes an `N`-byte object cost `N/chunk`
-    /// tokenizations of average length `N/2` — `O(N²)` — for a multi-megabyte
-    /// array or string that every real reader has to handle.
-    ///
-    /// Counting pulls rather than timing is what makes this assertable:
-    /// geometric growth changes no byte of the result, so the only observable
-    /// is work performed. Measured over the 1 MiB value below: 258 pulls with
-    /// the fixed refill, 11 with the doubling one. The bound sits between the
-    /// two by a wide enough margin that restoring the fixed refill fails it
-    /// outright rather than flickering.
-    ///
-    /// No qpdf correspondence exists to match here: qpdf tokenizes `m->file`
-    /// one character at a time and never re-reads a byte
-    /// (`QPDFTokenizer::presentCharacter`), so its cost is linear by
-    /// construction. This is flpdf paying for its slice-taking parser, and the
-    /// fix is to pay it once.
+    /// `InputSource::loadBuffer` fixes `buf_size` at 128 bytes
+    /// (`include/qpdf/InputSource.hh:92-96,115-121`); `QPDFTokenizer` then
+    /// advances its in-memory cursor (`QPDFTokenizer.cc:912-964`). The live
+    /// parser must retain that boundary while processing every token once.
     #[test]
-    fn a_large_direct_object_costs_a_logarithmic_number_of_pulls() {
+    fn a_large_direct_object_uses_the_inputsource_fast_read_buffer() {
         // 1 MiB of value.
         let filler = "x".repeat(super::INPUT_CHUNK * 256);
         let body = format!("1 0 obj\n<< /Type /Catalog /Filler ({filler}) >>\nendobj\n");
@@ -3300,10 +3234,9 @@ mod tests {
 
         let pulls = pdf.resolver.with_reader_mut(|reader| reader.reads) - before;
         assert!(
-            pulls <= 32,
-            "a 1 MiB object must be pulled in geometric steps, not one per \
-             {} bytes: took {pulls} pulls",
-            super::INPUT_CHUNK
+            pulls <= filler.len() / 128 + 32,
+            "a 1 MiB object must use InputSource's 128-byte fast-read buffer, \
+             not one source read per byte: took {pulls} pulls"
         );
         assert_eq!(
             handle
@@ -3340,6 +3273,123 @@ mod tests {
                 .as_bytes(),
         );
         pdf
+    }
+
+    // qpdf's file-object parser does not reject a non-name dictionary entry:
+    // it retains the value under `/QPDFFake1` and warns
+    // (`QPDFParser::fixMissingKeys`, `libqpdf/QPDFParser.cc:430-452`). This
+    // must travel through the live resolver path, not merely a parser unit
+    // test, or the resolver could regress to its former strict slice parser.
+    #[test]
+    fn a_live_resolver_recovers_a_non_name_dictionary_entry_once() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< (orphan) >>\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle.try_dereference().expect("qpdf-style recovery");
+
+        let dictionary = handle.as_dictionary().expect("recovered dictionary");
+        assert_eq!(
+            dictionary
+                .get(b"QPDFFake1".as_slice())
+                .and_then(crate::ObjectHandle::as_string),
+            Some(b"orphan".to_vec())
+        );
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expected dictionary key but found non-name object; inserting key /QPDFFake1"]
+        );
+    }
+
+    #[test]
+    fn live_object_header_and_fast_unread_fail_at_qpdfs_boundary() {
+        let bad_keyword = resolver_over(b"1 0 nope".to_vec());
+        assert!(matches!(
+            bad_keyword.read_object_at_offset(0, ObjectRef::new(1, 0)),
+            Err(Error::Parse { offset: 4, ref message }) if message == "expected obj"
+        ));
+
+        let bad_number = resolver_over(b"/N 0 obj".to_vec());
+        assert!(matches!(
+            bad_number.read_object_at_offset(0, ObjectRef::new(1, 0)),
+            Err(Error::Parse { offset: 0, ref message }) if message == "expected integer"
+        ));
+
+        let resolver = resolver_over(b"x".to_vec());
+        let mut input = resolver.live_input();
+        crate::parser::LiveInput::seek(&mut input, 1).expect("seek after the byte");
+        crate::parser::LiveInput::unread_byte(&mut input).expect("unread from an empty buffer");
+        assert_eq!(
+            crate::parser::LiveInput::tell(&mut input).expect("position"),
+            0
+        );
+        assert!(matches!(
+            crate::parser::LiveInput::unread_byte(&mut input),
+            Err(Error::Parse { offset: 0, ref message }) if message == "cannot unread before the start of input"
+        ));
+    }
+
+    #[test]
+    fn live_object_header_rejects_qpdfs_object_zero() {
+        let resolver = resolver_over(b"0 0 obj\n42\nendobj\n".to_vec());
+
+        let error = resolver
+            .read_object_at_offset(0, ObjectRef::new(0, 0))
+            .expect_err("qpdf rejects object ID zero");
+        assert_eq!(error.to_string(), "parse error at byte 0: object with ID 0");
+    }
+
+    /// Differential check against the pinned qpdf binary. `--json-object=2`
+    /// forces qpdf to parse the damaged object rather than relying on generic
+    /// document traversal to reach it.
+    #[test]
+    fn live_dictionary_recovery_matches_pinned_qpdf_warning_text() {
+        // cov:ignore-start: CI has pinned qpdf; this fallback exists only for developer hosts without it.
+        if Command::new("qpdf").arg("--version").output().is_err() {
+            eprintln!("qpdf not available; skipping live parser differential");
+            return;
+        }
+        // cov:ignore-end
+
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< (orphan) >>\nendobj\n".to_vec(),
+        ]);
+        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+        let path = directory.path().join("live-file-object-recovery.pdf");
+        fs::write(&path, &bytes).expect("write qpdf fixture");
+        let qpdf = Command::new("qpdf")
+            .args(["--json=2", "--json-object=2"])
+            .arg(&path)
+            .output()
+            .expect("run pinned qpdf");
+        let qpdf_diagnostics = String::from_utf8_lossy(&qpdf.stderr);
+        let expected =
+            "expected dictionary key but found non-name object; inserting key /QPDFFake1";
+        assert!(
+            qpdf_diagnostics.contains(expected),
+            "qpdf must report the oracle recovery warning (status {}):\n{qpdf_diagnostics}",
+            qpdf.status
+        );
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        handle.try_dereference().expect("flpdf recovery");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![expected]
+        );
     }
 
     /// A framing keyword straddling an input-chunk boundary is not accepted as
@@ -3431,9 +3481,10 @@ mod tests {
                 NO_PARSED_OFFSET,
                 "a recovered empty object has no source position of its own"
             );
-            assert!(
-                warnings.is_empty(),
-                "the framing must still see `endobj`, not the next object's header: {warnings:?}"
+            assert_eq!(
+                warnings,
+                ["empty object treated as null"],
+                "qpdf warns and returns before framing the `endobj` token"
             );
         });
     }
@@ -3526,38 +3577,15 @@ mod tests {
         );
     }
 
-    /// A value that ends exactly on an accumulated-buffer boundary, with more
-    /// file after it, still finds its `endobj`.
-    ///
-    /// **This is the hazard `allow_eof` in
-    /// [`super::ResolverHandle::frame_object`] could have created, and it is
-    /// pinned rather than argued.** Before that flag, a trailing-token read
-    /// that ran off the end of the *accumulated buffer* — not the file —
-    /// failed with `unexpected EOF`, and [`super::ResolverHandle::scan_forward`]
-    /// treated the `Err` as "refill and try again". The error was doubling as
-    /// a refill signal. With the flag the same position yields an EOF token
-    /// and an `Ok`, so whether a refill happens now rests entirely on
-    /// `scan_forward`'s `end < bytes.len()` rule.
-    ///
-    /// That rule holds, and the reason is in `Tokenizer::read_token`: its
-    /// closing `if !self.in_token && !self.before_token { self.pos -= 1 }`
-    /// gives back the one delimiter byte a token overshot by, and end of input
-    /// is not an overshoot — `present_eof` advances nothing, and the
-    /// tokenizer is still `before_token` there. So `position()` comes back as
-    /// `bytes.len()`, `complete` is false, and the scan refills.
-    ///
-    /// Were the decrement ever to fire for an EOF token, this fixture would
-    /// come back with a spurious `expected endobj` on an object that has one,
-    /// framed from a buffer the scan never finished filling — a wrong answer
-    /// rather than an error, and exactly what `scan_forward`'s rule exists to
-    /// prevent. None of the other EOF fixtures can catch it: they end at the
-    /// *file's* end, where the result is accepted either way because there is
-    /// nothing left to refill with.
+    /// A value that crosses the old slice window boundary, with more file
+    /// after it, still finds its `endobj`. The live tokenizer is independent
+    /// of that window: it retains only qpdf's one-byte delimiter unread and
+    /// continues until the real framing token.
     #[test]
     fn a_value_ending_on_a_buffer_boundary_still_finds_its_endobj() {
         let open = b"2 0 obj\n<< /Type /Whatever /F (";
         let close = b") >>";
-        // Sized so the value's last byte is the last byte of the first refill.
+        // Retain the historic window boundary as a regression input.
         let filler = vec![b'x'; super::INPUT_CHUNK - open.len() - close.len()];
         let mut body = Vec::new();
         body.extend_from_slice(open);
@@ -3570,8 +3598,7 @@ mod tests {
         );
         body.extend_from_slice(b"\nendobj\n");
 
-        // A third object keeps the input going past the boundary, so that a
-        // scan which stopped there would be stopping early rather than at EOF.
+        // A third object keeps the input going past the historic boundary.
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             body,
@@ -3609,14 +3636,10 @@ mod tests {
     /// A malformed body at a nonzero xref offset reports the offending byte's
     /// position **in the file**, not in the window the resolver read it into.
     ///
-    /// [`super::ResolverHandle::frame_object`] tokenizes a buffer that starts
-    /// at the object, so every position it produces is relative to the object.
-    /// qpdf's are not: `QPDFExc` carries an input position, and
-    /// `QPDFParser::warn` takes it from `input->getLastOffset()`
-    /// (`libqpdf/QPDFParser.cc:516-519`) on `m->file`, which is the whole
-    /// document. Left unrebased, a body error 30 bytes into an object at 256
-    /// was reported at 30 — a position near the *start of the file*, and one
-    /// that points at an unrelated byte.
+    /// qpdf's warning position is an input position, not a parser-window
+    /// position: `QPDFParser::warn` takes it from `InputSource::getLastOffset`
+    /// (`libqpdf/QPDFParser.cc:516-519`). The live parser must preserve that
+    /// absolute coordinate when it passes diagnostics to the document.
     ///
     /// **The number below is qpdf's, measured rather than derived.** The
     /// fixture this builds is byte-identical, over its header and both bodies,
@@ -3627,14 +3650,6 @@ mod tests {
     ///
     /// **Two things this does not claim.**
     ///
-    /// *The diagnostic class still differs.* qpdf treats the stray `)` as
-    /// recoverable — it warns, inserts `/QPDFFake1`, and returns
-    /// `<< /QPDFFake1 (x) /Type /Whatever >>` — where flpdf's parser rejects
-    /// the object. That is the divergence
-    /// [`super::ResolverHandle::frame_object`] already records, and it is
-    /// about which side of the warn/reject line a token falls on, not about
-    /// where it is.
-    ///
     /// *The header check anchors differently.* qpdf throws
     /// `damagedPDF(offset, "expected n n obj")` (`libqpdf/QPDF.cc:1592-1594`)
     /// with `readObjectAtOffset`'s `offset` argument — the object's own start
@@ -3644,7 +3659,7 @@ mod tests {
     /// qpdf's would mean discarding the more precise position rather than
     /// gaining one.
     #[test]
-    fn a_malformed_body_reports_its_position_in_the_file_not_in_the_window() {
+    fn a_recovered_malformed_body_reports_its_warning_at_the_file_offset() {
         // 200 bytes of filler put object 2 far enough into the file that a
         // window-relative position could not be mistaken for a file one.
         let filler = "z".repeat(200);
@@ -3665,16 +3680,24 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
         let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
-        let error = handle
+        handle
             .try_dereference()
-            .expect_err("a stray `)` is not a value flpdf's parser accepts");
+            .expect("qpdf recovers a stray close parenthesis");
 
+        let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert!(
-            matches!(&error, Error::Parse { offset, message }
-                if *offset == malformed_at && message == "unexpected )"),
-            "the error must carry the offending byte's file position ({malformed_at}), \
-             not its position within the object: {error:?}"
+            dictionary
+                .get(b"QPDFFake1".as_slice())
+                .is_some_and(|value| value.as_string().as_deref() == Some(b"x".as_slice())),
+            "qpdf retains the orphan word under /QPDFFake1"
         );
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|entry| entry.message == "unexpected )")
+            .expect("qpdf tokenizer warning");
+        assert_eq!(warning.offset, Some(malformed_at as u64));
     }
 
     /// A recoverable diagnostic raised *inside* the body's parse reaches the
@@ -3727,24 +3750,12 @@ mod tests {
         );
     }
 
-    /// The body parse's diagnostics are raised once — from the attempt that
-    /// succeeded, not from every attempt.
-    ///
-    /// [`ResolverHandle::scan_forward`] re-runs [`ResolverHandle::frame_object`]
-    /// against a growing buffer, so a diagnostic pushed as it is raised would
-    /// be duplicated once per attempt; that is the hazard this module's own
-    /// doc records for the framing warnings, and the parse's diagnostics travel
-    /// out the same way for the same reason.
-    ///
-    /// Reaching it needs an attempt that *succeeds* and is still rejected, not
-    /// merely one that fails: `frame_object` returns early on a parse error, so
-    /// a body simply cut in half by the boundary would never get as far as
-    /// reporting anything. `endobj` is therefore placed to begin three bytes
-    /// before the boundary — `end` is a perfectly good word token, so the first
-    /// attempt frames the object, hands back both warnings, and is rejected
-    /// only because it consumed the whole buffer.
+    /// A body diagnostic is raised once even when the object crosses the old
+    /// slice window boundary. The live parser has no discarded parse attempts,
+    /// so it must not duplicate an early tokenizer warning while it reaches
+    /// the final `endobj`.
     #[test]
-    fn a_parse_diagnostic_is_raised_once_across_several_scan_forward_attempts() {
+    fn a_live_parse_diagnostic_is_raised_once_across_the_old_window_boundary() {
         let head: &[u8] = b"2 0 obj\n<< /A#zB 1 /Filler (";
         let separator: &[u8] = b") >>\n";
         let filler = vec![b'x'; super::INPUT_CHUNK - 3 - head.len() - separator.len()];

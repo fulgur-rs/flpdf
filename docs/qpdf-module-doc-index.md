@@ -85,7 +85,7 @@
 | `crates/flpdf/src/page_tree_rebuild.rs` | correspondence | QPDF_pages.cc page-tree repair plus QPDFJob.cc page-selection rebuilding |
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
 | `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |
-| `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc object parsing with tokenizer responsibilities still shared elsewhere |
+| `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries |
 | `crates/flpdf/src/pdf_string.rs` | correspondence | \`libqpdf/QPDF_String.cc\` PDF string semantics |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |

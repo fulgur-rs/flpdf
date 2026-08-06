@@ -48,6 +48,115 @@ pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 }
 
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_without_context_rejects_a_nested_indirect_reference() {
+        // qpdf's `QPDFObjectHandle::parse("[1 0 R]")` has no owning
+        // document and therefore throws `std::logic_error` rather than
+        // inventing a detached reference. Returning a successfully parsed
+        // array here would hide the missing context boundary.
+        let error = ObjectHandle::parse(b"[1 0 R]").expect_err("missing parse context");
+
+        assert_eq!(
+            error.to_string(),
+            "QPDFParser::parse called without context on an object with indirect references"
+        );
+    }
+
+    #[test]
+    fn parse_without_context_turns_recovery_warnings_into_errors() {
+        let error = ObjectHandle::parse(b"{").expect_err("qpdf warning must fail explicit parse");
+
+        assert!(matches!(
+            error,
+            crate::Error::Parse {
+                offset: 0,
+                ref message,
+            } if message == "treating unexpected brace token as null"
+        ));
+    }
+
+    #[test]
+    fn parse_without_context_rejects_the_501st_nested_container() {
+        // qpdf's heap-owned parser stack accepts 500 containers, then warns
+        // for the 501st. With no QPDF context, `QPDFParser::warn` throws that
+        // warning instead of recording it on the document.
+        let input = vec![b'['; 501];
+        let error =
+            ObjectHandle::parse(&input).expect_err("depth warning must fail explicit parse");
+
+        assert!(matches!(
+            error,
+            crate::Error::Parse { ref message, .. }
+                if message == "ignoring excessively deeply nested data structure"
+        ));
+    }
+
+    #[test]
+    fn parse_without_context_keeps_the_first_warning_ahead_of_later_references() {
+        // `QPDFParser::warn` throws immediately when `context == nullptr`.
+        // The later `1 0 R` must not replace the earlier brace warning with
+        // the no-context indirect-reference logic error.
+        let error = ObjectHandle::parse(b"[ { 1 0 R ]")
+            .expect_err("the first recoverable condition must terminate parse");
+
+        assert!(matches!(
+            error,
+            crate::Error::Parse {
+                offset: 2,
+                ref message,
+            } if message == "treating unexpected brace token as null"
+        ));
+    }
+
+    #[test]
+    fn parse_without_context_propagates_each_late_recovery_warning() {
+        for (input, expected) in [
+            (
+                b"bare-word".as_slice(),
+                "unknown token while reading object; treating as string",
+            ),
+            (
+                b"<< /Last >>".as_slice(),
+                "dictionary ended prematurely; using null as value for last key",
+            ),
+            (
+                b"<< /QPDFFake1 1 2 >>".as_slice(),
+                "expected dictionary key but found non-name object; inserting key /QPDFFake2",
+            ),
+            (
+                b"<< /K 1 /K 2 >>".as_slice(),
+                "dictionary has duplicated key /K; last occurrence overrides earlier ones",
+            ),
+        ] {
+            let error = ObjectHandle::parse(input).expect_err("qpdf warning must fail parse");
+            assert!(matches!(
+                error,
+                crate::Error::Parse { ref message, .. } if message == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_without_context_allows_only_c_whitespace_after_the_object() {
+        let parsed = ObjectHandle::parse(b"1 \t\r\n").expect("C whitespace is allowed");
+        assert_eq!(parsed.as_integer(), Some(1));
+
+        let error = ObjectHandle::parse(b"1 % not trailing whitespace")
+            .expect_err("a PDF comment is not C whitespace");
+        assert!(matches!(
+            error,
+            crate::Error::Parse {
+                offset: 1,
+                ref message,
+            } if message == "trailing data found parsing object from string"
+        ));
+    }
+}
+
 /// A shared, cloneable handle to a PDF object.
 ///
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
@@ -246,6 +355,22 @@ struct IndirectSlot {
 }
 
 impl ObjectHandle {
+    /// Parse one standalone PDF object without an owning document context.
+    ///
+    /// This ports `QPDFObjectHandle::parse(string)`: malformed input that
+    /// would make qpdf warn is an error here, only C whitespace may trail the
+    /// object, and a nested indirect reference is rejected because no
+    /// document can canonicalize it. Parse an indirect file object through
+    /// [`crate::Pdf`] instead when object-cache identity is required.
+    ///
+    /// qpdf correspondence: `QPDFObjectHandle::parse`
+    /// (`libqpdf/QPDFObjectHandle.cc:1672-1698`) and no-context indirect
+    /// reference handling in `QPDFParser::parseRemainder`
+    /// (`libqpdf/QPDFParser.cc:135-176`).
+    pub fn parse(input: &[u8]) -> Result<Self> {
+        crate::parser::parse_explicit_object_handle(input)
+    }
+
     /// True if this handle wraps a value constructed directly, without an
     /// indirect object number/generation.
     pub fn is_direct(&self) -> bool {
