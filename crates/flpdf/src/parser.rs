@@ -17,6 +17,16 @@ pub(crate) trait HandleResolver {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle;
 }
 
+/// Decrypts one literal PDF string while the file-object parser still owns
+/// its token bytes.
+///
+/// qpdf correspondence: `QPDFObjectHandle::StringDecrypter`
+/// (`include/qpdf/QPDFObjectHandle.hh:192-200`) as invoked by
+/// `QPDFParser::parse` (`libqpdf/QPDFParser.cc:114-121,327-365`).
+pub(crate) trait StringDecrypter {
+    fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()>;
+}
+
 /// The narrow live-input surface that qpdf's `InputSource` gives
 /// `QPDFTokenizer`: observe the current position, consume one byte, and give
 /// back the one delimiter byte that terminated a token.
@@ -232,7 +242,17 @@ pub(crate) fn parse_live_file_object<I: LiveInput>(
     input: &mut I,
     resolver: &mut dyn HandleResolver,
 ) -> Result<LiveParsedObject> {
-    parse_live_file_object_with_context(input, resolver, true)
+    parse_live_file_object_with_context(input, resolver, true, None)
+}
+
+/// Parse one file-object value with the optional document-specific string
+/// decrypter qpdf supplies from `QPDF::readObject`.
+pub(crate) fn parse_live_file_object_with_decrypter<I: LiveInput>(
+    input: &mut I,
+    resolver: &mut dyn HandleResolver,
+    decrypter: Option<&mut dyn StringDecrypter>,
+) -> Result<LiveParsedObject> {
+    parse_live_file_object_with_context(input, resolver, true, decrypter)
 }
 
 /// Parse one standalone object string through qpdf's parser entry point with
@@ -250,7 +270,7 @@ pub(crate) fn parse_explicit_object_handle(input: &[u8]) -> Result<ObjectHandle>
     let mut input_source = SliceLiveInput::new(input);
     let mut detached_handles = DetachedHandles;
     let parsed =
-        parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false)?;
+        parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false, None)?;
 
     let trailing_offset = input_source.position();
     if input[trailing_offset..]
@@ -274,6 +294,7 @@ fn parse_live_file_object_with_context<I: LiveInput>(
     input: &mut I,
     resolver: &mut dyn HandleResolver,
     has_context: bool,
+    decrypter: Option<&mut dyn StringDecrypter>,
 ) -> Result<LiveParsedObject> {
     let mut tokens = LiveTokenSource::new(input);
     let mut parser = LiveFileParser {
@@ -285,11 +306,12 @@ fn parse_live_file_object_with_context<I: LiveInput>(
         bad_count: 0,
         give_up: false,
         has_context,
+        decrypter,
     };
     parser.parse()
 }
 
-struct LiveFileParser<'tokens, 'input, I: LiveInput> {
+struct LiveFileParser<'tokens, 'input, 'decrypter, I: LiveInput> {
     tokens: &'tokens mut LiveTokenSource<'input, I>,
     resolver: &'tokens mut dyn HandleResolver,
     buffered: VecDeque<Token>,
@@ -300,6 +322,7 @@ struct LiveFileParser<'tokens, 'input, I: LiveInput> {
     bad_count: usize,
     give_up: bool,
     has_context: bool,
+    decrypter: Option<&'decrypter mut dyn StringDecrypter>,
 }
 
 /// qpdf's `QPDFParser::StackFrame` keeps incomplete containers on the heap,
@@ -314,12 +337,13 @@ enum LiveFrame {
         values: std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
         orphan_values: Vec<ObjectHandle>,
         pending_key: Option<Vec<u8>>,
+        contents: Option<(Vec<u8>, i64)>,
         start: usize,
         frame_offset: usize,
     },
 }
 
-impl<I: LiveInput> LiveFileParser<'_, '_, I> {
+impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
     fn parse(&mut self) -> Result<LiveParsedObject> {
         // QPDFParser records `input->tell()` before reading its first token,
         // deliberately including leading whitespace in a top-level scalar's
@@ -404,6 +428,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                     self.add_to_top_frame(frames, value)?;
                 }
                 _ => {
+                    self.capture_raw_signature_contents(frames, &token);
                     let value =
                         self.parse_scalar_token(token.clone(), token.start as i64, false)?;
                     self.add_to_top_frame(frames, value)?;
@@ -435,6 +460,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                 values: std::collections::BTreeMap::new(),
                 orphan_values: Vec::new(),
                 pending_key: None,
+                contents: None,
                 start: token.start,
                 frame_offset: token.end,
             }),
@@ -446,6 +472,24 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
     fn add_to_top_frame(&mut self, frames: &mut [LiveFrame], value: ObjectHandle) -> Result<()> {
         let frame = frames.last_mut().expect("live parser has an open frame");
         self.add_to_frame(frame, value)
+    }
+
+    fn capture_raw_signature_contents(&self, frames: &mut [LiveFrame], token: &Token) {
+        if self.decrypter.is_none() || token.token_type != TokenType::String {
+            return;
+        }
+
+        let Some(LiveFrame::Dictionary {
+            pending_key,
+            contents,
+            ..
+        }) = frames.last_mut()
+        else {
+            return;
+        };
+        if pending_key.as_deref() == Some(b"Contents") {
+            *contents = Some((token.value.clone(), token.start as i64));
+        }
     }
 
     fn add_to_frame(&mut self, frame: &mut LiveFrame, value: ObjectHandle) -> Result<()> {
@@ -480,6 +524,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
             mut values,
             orphan_values,
             pending_key,
+            contents,
             start,
             frame_offset,
         } = frame
@@ -520,6 +565,24 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
             values.insert(key, value);
         }
 
+        let is_signature = values
+            .get(b"Type".as_slice())
+            .and_then(ObjectHandle::as_name)
+            .as_deref()
+            == Some(b"Sig".as_slice());
+        let has_byte_range = values.contains_key(b"ByteRange".as_slice());
+        let has_string_contents = values
+            .get(b"Contents".as_slice())
+            .and_then(ObjectHandle::as_string)
+            .is_some();
+        if is_signature && has_byte_range && has_string_contents {
+            if let Some((raw_contents, offset)) = contents {
+                let contents = ObjectHandle::string(raw_contents);
+                contents.set_parsed_offset_if_unset(offset);
+                values.insert(b"Contents".to_vec(), contents);
+            }
+        }
+
         Ok(Self::direct(ObjectValue::Dictionary(values), start))
     }
 
@@ -534,10 +597,13 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
                 ObjectValue::Name(token.value[1..].to_vec()),
                 scalar_offset,
             )),
-            TokenType::String => Ok(Self::direct_at(
-                ObjectValue::String(token.value),
-                scalar_offset,
-            )),
+            TokenType::String => {
+                let mut value = token.value;
+                if let Some(decrypter) = self.decrypter.as_deref_mut() {
+                    decrypter.decrypt_string(&mut value)?;
+                }
+                Ok(Self::direct_at(ObjectValue::String(value), scalar_offset))
+            }
             TokenType::Bool => Ok(Self::direct_at(
                 ObjectValue::Boolean(token.value == b"true"),
                 scalar_offset,
@@ -728,8 +794,9 @@ impl<I: LiveInput> LiveFileParser<'_, '_, I> {
 #[cfg(test)]
 mod live_input_tests {
     use super::{
-        parse_live_file_object, parse_qpdf_file_object, HandleResolver, LiveInput,
-        LiveParsedObject, LiveTokenSource, SliceLiveInput, MAX_PARSE_DEPTH,
+        parse_live_file_object, parse_live_file_object_with_decrypter, parse_qpdf_file_object,
+        HandleResolver, LiveInput, LiveParsedObject, LiveTokenSource, SliceLiveInput,
+        StringDecrypter, MAX_PARSE_DEPTH,
     };
     use crate::object_handle::{ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
@@ -787,10 +854,162 @@ mod live_input_tests {
         }
     }
 
+    struct RecordingDecrypter {
+        calls: Vec<Vec<u8>>,
+        fail: bool,
+    }
+
+    impl StringDecrypter for RecordingDecrypter {
+        fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()> {
+            self.calls.push(bytes.clone());
+            if self.fail {
+                return Err(Error::Internal("decrypter failure".into()));
+            }
+            bytes.extend_from_slice(b"-plain");
+            Ok(())
+        }
+    }
+
     fn parse_with_null_resolver(bytes: &'static [u8]) -> LiveParsedObject {
         let mut input = CountingInput::new(bytes);
         let mut resolver = NullResolver;
         parse_live_file_object(&mut input, &mut resolver).expect("live file object")
+    }
+
+    // This catches a production regression where the parser decrypts words,
+    // skips nested literal strings, or invokes the callback after it has lost
+    // the token's original bytes. Removing token-time callback invocation from
+    // the String branch makes this test fail.
+    #[test]
+    fn live_file_parser_decrypter_decrypts_each_literal_string_but_not_words() {
+        let mut input =
+            CountingInput::new(b"<< /Top (top) /Items [(array)] /Nested << /Value (dict) >> >>");
+        let mut resolver = NullResolver;
+        let mut decrypter = RecordingDecrypter {
+            calls: Vec::new(),
+            fail: false,
+        };
+
+        let parsed =
+            parse_live_file_object_with_decrypter(&mut input, &mut resolver, Some(&mut decrypter))
+                .expect("decrypted dictionary");
+
+        let values = parsed.value.as_dictionary().expect("dictionary");
+        assert_eq!(
+            values
+                .get(b"Top".as_slice())
+                .and_then(ObjectHandle::as_string),
+            Some(b"top-plain".to_vec())
+        );
+        assert_eq!(
+            values
+                .get(b"Items".as_slice())
+                .and_then(ObjectHandle::as_array)
+                .and_then(|items| items.first().cloned())
+                .and_then(|item| item.as_string()),
+            Some(b"array-plain".to_vec())
+        );
+        assert_eq!(
+            values
+                .get(b"Nested".as_slice())
+                .and_then(ObjectHandle::as_dictionary)
+                .and_then(|nested| nested.get(b"Value".as_slice()).cloned())
+                .and_then(|value| value.as_string()),
+            Some(b"dict-plain".to_vec())
+        );
+        assert_eq!(
+            decrypter.calls,
+            vec![b"top".to_vec(), b"array".to_vec(), b"dict".to_vec()]
+        );
+
+        let mut word_input = CountingInput::new(b"unknown-word");
+        let word = parse_live_file_object_with_decrypter(
+            &mut word_input,
+            &mut resolver,
+            Some(&mut decrypter),
+        )
+        .expect("unknown words recover as strings");
+        assert_eq!(word.value.as_string(), Some(b"unknown-word".to_vec()));
+        assert_eq!(
+            decrypter.calls.len(),
+            3,
+            "words must not enter StringDecrypter"
+        );
+    }
+
+    // This catches a production regression where the live parser swallows a
+    // string-decryption failure and continues with ciphertext. Replacing `?`
+    // at the callback boundary with recovery would make this fail.
+    #[test]
+    fn live_file_parser_decrypter_propagates_failures() {
+        let mut input = CountingInput::new(b"(ciphertext)");
+        let mut resolver = NullResolver;
+        let mut decrypter = RecordingDecrypter {
+            calls: Vec::new(),
+            fail: true,
+        };
+
+        let error =
+            parse_live_file_object_with_decrypter(&mut input, &mut resolver, Some(&mut decrypter))
+                .expect_err("decrypter errors must reach the file-object caller");
+
+        assert!(matches!(error, Error::Internal(message) if message == "decrypter failure"));
+        assert_eq!(decrypter.calls, vec![b"ciphertext".to_vec()]);
+    }
+
+    // This catches a production regression where a completed signature
+    // dictionary retains the decrypted Contents value. Removing the
+    // completed-dictionary predicate makes this test fail while ordinary
+    // signature-like dictionaries continue to expose plaintext strings.
+    #[test]
+    fn live_file_parser_decrypter_restores_signature_contents_only_with_byte_range() {
+        let mut signature_input = CountingInput::new(
+            b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents (cipher) /Reason (reason) >>",
+        );
+        let mut resolver = NullResolver;
+        let mut decrypter = RecordingDecrypter {
+            calls: Vec::new(),
+            fail: false,
+        };
+
+        let signature = parse_live_file_object_with_decrypter(
+            &mut signature_input,
+            &mut resolver,
+            Some(&mut decrypter),
+        )
+        .expect("signature dictionary");
+        let signature_values = signature.value.as_dictionary().expect("dictionary");
+        let contents = signature_values
+            .get(b"Contents".as_slice())
+            .expect("signature contents");
+        assert_eq!(contents.as_string(), Some(b"cipher".to_vec()));
+        assert_eq!(contents.get_parsed_offset(), 48);
+        assert_eq!(
+            signature_values
+                .get(b"Reason".as_slice())
+                .and_then(ObjectHandle::as_string),
+            Some(b"reason-plain".to_vec())
+        );
+        assert_eq!(
+            decrypter.calls,
+            vec![b"cipher".to_vec(), b"reason".to_vec()]
+        );
+
+        let mut non_signature_input = CountingInput::new(b"<< /Type /Sig /Contents (cipher) >>");
+        let non_signature = parse_live_file_object_with_decrypter(
+            &mut non_signature_input,
+            &mut resolver,
+            Some(&mut decrypter),
+        )
+        .expect("dictionary without byte range");
+        assert_eq!(
+            non_signature
+                .value
+                .as_dictionary()
+                .and_then(|values| values.get(b"Contents".as_slice()).cloned())
+                .and_then(|contents| contents.as_string()),
+            Some(b"cipher-plain".to_vec())
+        );
     }
 
     // This catches a production regression where the live adapter retains a

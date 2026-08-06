@@ -280,6 +280,22 @@ impl EncryptionState {
         Self::select_method(method, &mut self.cf_string, encryption_v)
     }
 
+    /// qpdf `QPDF::decryptString` (`libqpdf/QPDF_encryption.cc:977-1039`)
+    /// for one literal string owned by `object_ref`.
+    fn decrypt_object_string(
+        &mut self,
+        object_ref: ObjectRef,
+        bytes: &mut Vec<u8>,
+    ) -> Result<bool> {
+        let (use_aes, warn_unknown_string) = self.string_method();
+        if let Some(use_aes) = use_aes {
+            self.with_object_cipher(object_ref, use_aes, |cipher| {
+                decrypt_cipher_bytes(bytes, cipher)
+            })?;
+        }
+        Ok(warn_unknown_string)
+    }
+
     /// qpdf `QPDF::decryptStream`'s method selection (`:1062-1134`), minus the
     /// `/Type` and `/Crypt` inspection that chooses `method` ahead of it.
     ///
@@ -4953,6 +4969,22 @@ mod tests {
             panic!("value must still be a string"); // cov:ignore: unreachable given this test's own construction of value
         };
         assert_eq!(bytes.as_slice(), b"TopSecretTitle");
+    }
+
+    // This catches a production regression where the parser callback treats
+    // qpdf's `/StrF /Identity` as an RC4/AES method. Replacing the `None`
+    // method branch with a cipher call changes these bytes.
+    #[test]
+    fn decrypt_object_string_leaves_identity_filter_bytes_unchanged() {
+        let mut encryption = explicit_rc4_encryption_state();
+        let mut bytes = b"identity string bytes".to_vec();
+
+        let warn = encryption
+            .decrypt_object_string(ObjectRef::new(3, 0), &mut bytes)
+            .expect("Identity string method is a no-op");
+
+        assert_eq!(bytes, b"identity string bytes");
+        assert!(!warn);
     }
 
     #[test]
