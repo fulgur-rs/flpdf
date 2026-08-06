@@ -3955,6 +3955,28 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn pdf_identity_propagation_terminates_on_a_direct_cycle() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let owner = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(7, 0),
+            NO_PARSED_OFFSET,
+            41,
+            Rc::downgrade(&resolver),
+        );
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        first.replace_key(b"Second", second.clone());
+        second.replace_key(b"First", first.clone());
+
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"First".to_vec(), first.clone())].into_iter().collect(),
+        ));
+
+        assert!(first.belongs_to_pdf(41));
+        assert!(second.belongs_to_pdf(41));
+    }
+
+    #[test]
     fn resolver_bearing_indirect_slot_starts_without_a_parsed_offset() {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         let handle = ObjectHandle::new_indirect_with_resolver(
@@ -4860,6 +4882,20 @@ mod resolution_state_tests {
         // A direct handle has no resolution state to wait on — its value was
         // known at construction time.
         assert!(ObjectHandle::integer(1).is_resolved());
+    }
+
+    #[test]
+    fn into_direct_value_leaves_child_edges_attached_when_the_parent_is_shared() {
+        let child = ObjectHandle::integer(1);
+        let parent = ObjectHandle::array(vec![child.clone()]);
+        let retained_parent = parent.clone();
+
+        assert!(parent.into_direct_value().is_none());
+
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, NO_PARSED_OFFSET);
+        owner.set_resolved(ObjectValue::Array(vec![retained_parent]));
+        assert_eq!(child.containing_object_refs(), vec![owner_ref]);
     }
 
     #[test]
