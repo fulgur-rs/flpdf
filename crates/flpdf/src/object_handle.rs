@@ -7466,6 +7466,34 @@ mod mutation_tests {
     }
 
     #[test]
+    fn stream_dictionary_membership_tracks_replacement_and_root_disconnect() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, NO_PARSED_OFFSET);
+        let old_dictionary = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: old_dictionary.clone(),
+            stream_data: None,
+            stream_length: 0,
+        });
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Stream".to_vec(), stream.clone())].into_iter().collect(),
+        ));
+        assert_eq!(old_dictionary.containing_object_refs(), vec![owner_ref]);
+
+        let new_dictionary = ObjectHandle::dictionary(vec![]);
+        stream.replace_direct_value(ObjectValue::Stream {
+            stream_dict: new_dictionary.clone(),
+            stream_data: None,
+            stream_length: 0,
+        });
+        assert!(old_dictionary.containing_object_refs().is_empty());
+        assert_eq!(new_dictionary.containing_object_refs(), vec![owner_ref]);
+
+        owner.disconnect();
+        assert!(new_dictionary.containing_object_refs().is_empty());
+    }
+
+    #[test]
     fn indirect_state_replacement_detaches_old_direct_children() {
         let owner_ref = ObjectRef::new(7, 0);
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
