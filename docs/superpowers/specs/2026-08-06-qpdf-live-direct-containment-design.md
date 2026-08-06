@@ -82,7 +82,10 @@ additive Pdf identity provenance separately from its live parent edges.
 
 Attaching a root propagates its `pdf_unique_id` through current direct
 descendants, stopping at indirect boundaries, as the existing implementation
-does. Detaching an edge never erases this identity provenance. Consequently:
+does. When a new child is later attached to a contained direct parent, it
+inherits that parent's already-recorded Pdf identities through its current
+direct descendants. Detaching an edge never erases this identity provenance.
+Consequently:
 
 - `belongs_to_pdf` continues to reject a retained foreign direct child after
   it has been detached;
