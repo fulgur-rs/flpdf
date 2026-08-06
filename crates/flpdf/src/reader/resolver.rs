@@ -85,7 +85,9 @@
 //! document warning.
 
 use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
-use crate::parser::{parse_live_file_object, LiveInput, LiveTokenSource};
+use crate::parser::{
+    parse_live_file_object_with_decrypter, LiveInput, LiveTokenSource, StringDecrypter,
+};
 use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
@@ -437,6 +439,34 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// resolver has no `&Pdf`, and the value is assigned once before either
     /// is constructed, so the two copies cannot drift.
     pdf_unique_id: u64,
+}
+
+/// The `QPDF::StringDecrypter` qpdf binds to one indirect object immediately
+/// before `QPDFParser::parse` (`libqpdf/QPDF.cc:1331-1340`).
+struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
+    object_ref: ObjectRef,
+    encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    resolver: &'resolver ResolverHandle<R>,
+}
+
+impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R> {
+    fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()> {
+        let warn_unknown_string = {
+            let mut encryption_parameters = self.encryption_parameters.borrow_mut();
+            let encryption = encryption_parameters.as_mut().ok_or_else(|| {
+                Error::Internal("string decrypter invoked without encryption parameters".into())
+            })?;
+            encryption.decrypt_object_string(self.object_ref, bytes)?
+        };
+
+        if warn_unknown_string {
+            self.resolver.push_warning(
+                "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
+                 strings may be decrypted improperly",
+            );
+        }
+        Ok(())
+    }
 }
 
 impl<R: Read + Seek> ResolverHandle<R> {
@@ -1180,7 +1210,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .zip(u16::try_from(generation).ok())
                 .map(|(number, generation)| ObjectRef::new(number, generation));
             let mut minter = ChildHandles { resolver: self };
-            let parsed = parse_live_file_object(&mut input, &mut minter)?;
+            let encryption_parameters = self.encryption_parameters();
+            let has_encryption = encryption_parameters.borrow().is_some();
+            let mut decrypter = if has_encryption {
+                found.map(|object_ref| ResolverStringDecrypter {
+                    object_ref,
+                    encryption_parameters,
+                    resolver: self,
+                })
+            } else {
+                None
+            };
+            let parsed = parse_live_file_object_with_decrypter(
+                &mut input,
+                &mut minter,
+                decrypter
+                    .as_mut()
+                    .map(|decrypter| decrypter as &mut dyn StringDecrypter),
+            )?;
             let trailing = if parsed.empty.is_none() {
                 let mut trailing_tokens = LiveTokenSource::new(&mut input);
                 let trailing = trailing_tokens.next_token()?;
@@ -2446,6 +2493,95 @@ mod tests {
         let encryption = guard.as_ref().expect("AES fixture must authenticate");
         assert_eq!(encryption.cf_stream, crate::reader::EncryptionMode::Aes128);
         assert_eq!(encryption.file_key.len(), 16);
+    }
+
+    // This catches a production regression where canonical resolver parsing
+    // exposes ciphertext because it has no object-bound StringDecrypter.
+    // Removing the decrypter passed to `parse_live_file_object` makes either
+    // the top-level or nested string assertion fail.
+    #[test]
+    fn canonical_resolver_decrypts_strings_at_parse_time() {
+        use crate::encrypt_setup::EncryptParams;
+        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut entries: Vec<(u16, usize)> = Vec::new();
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+        entries.push((0, bytes.len()));
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Title (TopSecretTitle) /Metadata << /Label (NestedSecret) >> >>\nendobj\n",
+        );
+        let startxref = bytes.len();
+        bytes.extend_from_slice(format!("xref\n0 {}\n", entries.len() + 1).as_bytes());
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        for (generation, offset) in &entries {
+            bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R /Info 3 0 R >>\nstartxref\n{startxref}\n%%EOF\n",
+                entries.len() + 1
+            )
+            .as_bytes(),
+        );
+
+        let mut plaintext = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
+        let mut encrypted = Vec::new();
+        write_pdf_with_options(
+            &mut plaintext,
+            &mut encrypted,
+            &WriteOptions {
+                full_rewrite: true,
+                compress_streams: CompressStreams::No,
+                encrypt: Some(EncryptParams::v4_aes128(
+                    b"user-pw".to_vec(),
+                    b"owner-pw".to_vec(),
+                )),
+                ..WriteOptions::default()
+            },
+        )
+        .expect("V=4 AES128 encrypted write");
+        assert!(!encrypted
+            .windows(b"TopSecretTitle".len())
+            .any(|bytes| bytes == b"TopSecretTitle"));
+        assert!(!encrypted
+            .windows(b"NestedSecret".len())
+            .any(|bytes| bytes == b"NestedSecret"));
+
+        let mut rt = Pdf::open_with_options(
+            Cursor::new(encrypted),
+            crate::PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("re-open of V=4 output with user-pw");
+        let info_ref = match rt.trailer().get("Info") {
+            Some(crate::Object::Reference(object_ref)) => *object_ref,
+            other => panic!("trailer /Info must be a reference, got {other:?}"),
+        };
+
+        let info = rt.get_object_handle(info_ref);
+        info.try_dereference()
+            .expect("canonical resolver must resolve /Info");
+        let values = info.as_dictionary().expect("/Info must be a dictionary");
+        assert_eq!(
+            values
+                .get(b"Title".as_slice())
+                .and_then(crate::ObjectHandle::as_string),
+            Some(b"TopSecretTitle".to_vec())
+        );
+        assert_eq!(
+            values
+                .get(b"Metadata".as_slice())
+                .and_then(crate::ObjectHandle::as_dictionary)
+                .and_then(|metadata| metadata.get(b"Label".as_slice()).cloned())
+                .and_then(|label| label.as_string()),
+            Some(b"NestedSecret".to_vec())
+        );
     }
 
     /// The attach itself: a handle vended by a live document must reach that
