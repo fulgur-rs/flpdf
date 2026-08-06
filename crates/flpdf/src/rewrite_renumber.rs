@@ -32,8 +32,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object::{Dictionary, Object, ObjectRef, MAX_INLINE_DEPTH};
-use crate::reader::Pdf;
 use crate::Error;
+use crate::Pdf;
 
 /// Maps an original object reference to its assigned new reference.
 ///

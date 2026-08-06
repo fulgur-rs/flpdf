@@ -150,8 +150,8 @@ mod tests {
     use crate::page_combine::{CombinedPage, CombinedPlan};
     use crate::page_plan::SelectedPage;
     use crate::page_range::PageRange;
-    use crate::reader::Pdf;
     use crate::ObjectRef;
+    use crate::Pdf;
     use std::io::Cursor;
 
     // -----------------------------------------------------------------------

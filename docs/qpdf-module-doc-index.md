@@ -87,6 +87,7 @@
 | `crates/flpdf/src/pages.rs` | correspondence | QPDF_pages.cc traversal responsibilities shared with page-tree rebuild and linearization repair |
 | `crates/flpdf/src/pages/repair.rs` | correspondence | QPDF_pages.cc page-tree preparation responsibilities |
 | `crates/flpdf/src/parser.rs` | correspondence | QPDFParser.cc live file-object parsing plus slice object/content consumer boundaries |
+| `crates/flpdf/src/pdf.rs` | correspondence | QPDF's central document container, direct document-state accessors, and teardown (\`include/qpdf/QPDF.hh:1438-1518\`; \`libqpdf/QPDF.cc:215-232,2323-2358,2647-2651\`) |
 | `crates/flpdf/src/pdf_string.rs` | correspondence | \`libqpdf/QPDF_String.cc\` PDF string semantics |
 | `crates/flpdf/src/pdf_version.rs` | mirror | libqpdf/PDFVersion.cc |
 | `crates/flpdf/src/permissions.rs` | correspondence | QPDF_encryption.cc permission-bit encoding split from the Standard security handler |

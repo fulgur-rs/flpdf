@@ -212,7 +212,7 @@ impl PagePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::Pdf;
+    use crate::Pdf;
     use std::io::Cursor;
 
     // -----------------------------------------------------------------------

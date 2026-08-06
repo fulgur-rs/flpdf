@@ -22,7 +22,7 @@ use crate::object::{Dictionary, Object, ObjectRef, Stream};
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PipelineError, PlOStream, PlStdioFile};
-use crate::reader::Pdf;
+use crate::Pdf;
 use std::borrow::Cow;
 use std::io::{Read, Seek, Write};
 
@@ -935,7 +935,7 @@ impl DecodeLevel {
 /// Return the stream payload bytes to emit for a given [`DecodeLevel`].
 ///
 /// `stream.data` is assumed to be the resolved (decrypted, but still
-/// filter-encoded) bytes returned by [`Pdf::resolve`](crate::reader::Pdf::resolve).
+/// filter-encoded) bytes returned by [`Pdf::resolve`](crate::Pdf::resolve).
 ///
 /// - [`DecodeLevel::None`] → the raw filter-encoded bytes, verbatim.
 /// - Any other level → the filter-decoded content, computed via

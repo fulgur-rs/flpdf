@@ -678,19 +678,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// accessor here: nothing is held once this returns, so a caller that
     /// then does I/O through `self` cannot double-borrow.
     ///
-    /// `pub(in crate::reader)` rather than the plan's `pub(crate)`: the
-    /// return type names `EncryptionState`, which is private to `reader.rs`
-    /// (`pub(self)`), so a `pub(crate)` signature trips rustc's
-    /// `private_interfaces` lint (denied under this workspace's
-    /// `-D warnings` clippy gate) — a real signature is at most as visible
-    /// as the least visible type it names. Narrowing the *accessor* to match
-    /// is the fix that stays inside `resolver.rs`; widening `EncryptionState`
-    /// itself would touch `reader.rs`, out of scope for this task. Every
-    /// caller identified so far (`Pdf` and flpdf-25kg.3.10's pipe-time read
-    /// primitive) lives under `crate::reader`, so this is not yet known to be
-    /// too narrow — but if a later consumer lives outside `crate::reader`,
-    /// this will need widening together with `EncryptionState` itself.
-    pub(in crate::reader) fn encryption_parameters(
+    /// Crate-visible because the canonical [`crate::pdf::Pdf`] container is a
+    /// sibling of `reader`; the returned [`crate::reader::EncryptionState`]
+    /// has the same visibility. No public API exposes either implementation
+    /// type.
+    pub(crate) fn encryption_parameters(
         &self,
     ) -> Rc<RefCell<Option<crate::reader::EncryptionState>>> {
         self.core.borrow().encryption_parameters.clone()
@@ -2030,7 +2022,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     ///
     /// What is taken instead is this crate's own established answer, the one
     /// `parser.rs`'s recursive-descent hub (`Parser::object`) and
-    /// [`super::Pdf::lift_bounded`] already use: grow the stack rather than
+    /// [`crate::Pdf::lift_bounded`] already use: grow the stack rather than
     /// bound the recursion, so the depth a caller survives follows available
     /// memory instead of the thread's initial stack. The rationale beside
     /// `lift_bounded`'s own call applies verbatim — a production caller on a
