@@ -4784,6 +4784,43 @@ mod uniform_identity_tests {
     }
 
     #[test]
+    fn disconnect_of_an_unresolved_indirect_alias_becomes_destroyed_direct() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(54, 0), -1);
+        let alias = handle.clone();
+        handle.set_parsed_offset_if_unset(66);
+
+        handle.disconnect();
+
+        assert!(alias.is_same_object_as(&handle));
+        assert!(alias.is_direct());
+        assert_eq!(alias.object_ref(), None);
+        assert!(!alias.is_null());
+        assert_eq!(alias.type_code(), 14);
+        assert_eq!(alias.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_of_a_repromoted_destroyed_handle_resets_its_new_offset() {
+        let resolver = resolver();
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(56, 0), -1);
+        handle.disconnect();
+        handle.promote_to_indirect(ObjectRef::new(58, 0), 94, Rc::downgrade(&resolver));
+        handle.set_parsed_offset_if_unset(77);
+        assert!(handle.is_indirect());
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(58, 0)));
+        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.get_parsed_offset(), 77);
+
+        handle.disconnect();
+
+        assert!(handle.is_direct());
+        assert_eq!(handle.object_ref(), None);
+        assert!(!handle.is_null());
+        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
     fn destroyed_direct_handle_has_no_legacy_value_to_clone_or_consume() {
         let resolver = resolver();
         let handle = ObjectHandle::integer(1);
