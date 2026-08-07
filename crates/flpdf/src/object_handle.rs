@@ -3989,7 +3989,6 @@ pub(crate) mod identity_tests {
     struct RecordingResolver {
         calls: ResolutionLog,
         value: ObjectValue,
-        warnings: WarningLog,
     }
 
     /// Every `resolve_indirect` a [`RecordingResolver`] performed, in order.
@@ -3999,10 +3998,6 @@ pub(crate) mod identity_tests {
     /// `ObjectHandle::is_resolved` is not a substitute — a resolver that
     /// errored would leave the handle unresolved despite having been called.
     pub(crate) type ResolutionLog = Rc<RefCell<Vec<ObjectRef>>>;
-
-    /// Every warning an object emitted through a [`RecordingResolver`], in
-    /// order — the document-side sink `DocumentResolver::warn` feeds.
-    pub(crate) type WarningLog = Rc<RefCell<Vec<String>>>;
 
     impl RecordingResolver {
         /// Install `value` instead of the default one-key dictionary, so a
@@ -4019,11 +4014,7 @@ pub(crate) mod identity_tests {
 
         /// [`Self::installing`] with the call log owned by the caller instead.
         fn logging_into(calls: ResolutionLog, value: ObjectValue) -> Self {
-            Self {
-                calls,
-                value,
-                warnings: Rc::new(RefCell::new(Vec::new())),
-            }
+            Self { calls, value }
         }
     }
 
@@ -4045,11 +4036,6 @@ pub(crate) mod identity_tests {
         ) -> crate::Result<()> {
             self.calls.borrow_mut().push(object_ref);
             handle.set_resolved(self.value.clone());
-            Ok(())
-        }
-
-        fn warn(&self, message: String) -> crate::Result<()> {
-            self.warnings.borrow_mut().push(message);
             Ok(())
         }
     }
@@ -4129,29 +4115,14 @@ pub(crate) mod identity_tests {
     pub(crate) fn logged_resolver_bearing_handle(
         value: ObjectValue,
     ) -> (ObjectHandle, Rc<dyn DocumentResolver>, ResolutionLog) {
-        let (handle, resolver, calls, _warnings) = warning_logged_resolver_bearing_handle(value);
-        (handle, resolver, calls)
-    }
-
-    /// [`logged_resolver_bearing_handle`] plus the resolver's [`WarningLog`],
-    /// for the accessors whose qpdf counterparts emit a `typeWarning`.
-    pub(crate) fn warning_logged_resolver_bearing_handle(
-        value: ObjectValue,
-    ) -> (
-        ObjectHandle,
-        Rc<dyn DocumentResolver>,
-        ResolutionLog,
-        WarningLog,
-    ) {
         let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
-        let recording = RecordingResolver::logging_into(Rc::clone(&calls), value);
-        let warnings = Rc::clone(&recording.warnings);
-        let resolver: Rc<dyn DocumentResolver> = Rc::new(recording);
+        let resolver: Rc<dyn DocumentResolver> =
+            Rc::new(RecordingResolver::logging_into(Rc::clone(&calls), value));
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(20, 0),
             Rc::downgrade(&resolver),
         );
-        (handle, resolver, calls, warnings)
+        (handle, resolver, calls)
     }
 
     struct MissingResolver;
@@ -9540,6 +9511,35 @@ mod warning_emission_tests {
         // cov:ignore-end
     }
 
+    /// Serializes the tests that redirect the process-global default logger.
+    ///
+    /// `QPDFLogger::default_logger` is one shared instance, so two tests
+    /// swapping its error sink concurrently restore each other's sink and one
+    /// of them captures nothing.
+    static DEFAULT_LOGGER_ERROR_SINK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `body` with the default logger's error stream captured, restoring
+    /// the previous sink afterwards. Returns what `body` returned alongside
+    /// the captured bytes as UTF-8.
+    fn with_captured_default_error<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let guard = DEFAULT_LOGGER_ERROR_SINK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let logger = crate::QPDFLogger::default_logger();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restore = logger.get_error().unwrap();
+        logger.set_error(Some(crate::pipeline::PipelineHandle::new(
+            ErrorRecordingSink(std::sync::Arc::clone(&captured)),
+        )));
+
+        let result = body();
+
+        logger.set_error(Some(restore));
+        drop(guard);
+        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        (result, captured)
+    }
+
     #[test]
     fn as_dictionary_on_a_non_dictionary_stays_silent_like_qpdf() {
         // `asDictionary()` is the silent internal helper; only `getKey`,
@@ -9547,6 +9547,25 @@ mod warning_emission_tests {
         let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
 
         assert!(handle.try_as_dictionary().unwrap().is_none());
+
+        assert!(warnings(&recorder).is_empty());
+    }
+
+    #[test]
+    fn get_key_on_a_non_dictionary_returns_null_without_warning_yet() {
+        // qpdf raises `typeWarning("dictionary", "returning null for
+        // attempted key retrieval")` here (`libqpdf/QPDFObjectHandle.cc:984`)
+        // and its receiver always has a context, because `QPDFParser` stamps
+        // the owning document on every value it creates
+        // (`libqpdf/QPDFParser.cc:416-442`). A direct child here has none, so
+        // emitting would report an error on a path qpdf warns and continues
+        // on — the consuming `/DecodeParms` read reaches exactly that. The
+        // silent null is therefore the current behavior, pinned so the change
+        // is deliberate when contexts reach direct children.
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        assert!(handle.try_get_key(b"Type").unwrap().is_null());
+        assert!(handle.try_get_keys().unwrap().is_empty());
 
         assert!(warnings(&recorder).is_empty());
     }
@@ -9744,18 +9763,10 @@ mod warning_emission_tests {
             "the document is gone, so resolution fails"
         );
 
-        let logger = crate::QPDFLogger::default_logger();
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let restore = logger.get_error().unwrap();
-        logger.set_error(Some(crate::pipeline::PipelineHandle::new(
-            ErrorRecordingSink(std::sync::Arc::clone(&captured)),
-        )));
+        let (result, captured) =
+            with_captured_default_error(|| handle.warn_if_possible("dropped document warning"));
 
-        let result = handle.warn_if_possible("dropped document warning");
-
-        logger.set_error(Some(restore));
         result.unwrap();
-        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
         assert!(
             captured.contains("dropped document warning\n"),
             "default error stream captured {captured:?}"
@@ -9767,22 +9778,14 @@ mod warning_emission_tests {
         // The else-branch of `warnIfPossible` writes the bare message to
         // `QPDFLogger::defaultLogger()->getError()` and returns normally
         // (`libqpdf/QPDFObjectHandle.cc:2196-2200`).
-        let logger = crate::QPDFLogger::default_logger();
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let restore = logger.get_error().unwrap();
-        logger.set_error(Some(crate::pipeline::PipelineHandle::new(
-            ErrorRecordingSink(std::sync::Arc::clone(&captured)),
-        )));
+        let (result, captured) = with_captured_default_error(|| {
+            ObjectHandle::integer(7)
+                .warn_if_possible("requested value of integer is too big; returning INT_MAX")
+        });
 
-        let result = ObjectHandle::integer(7)
-            .warn_if_possible("requested value of integer is too big; returning INT_MAX");
-
-        logger.set_error(Some(restore));
         result.unwrap();
-        // The default logger is process-global and every document opened
-        // without an explicit one shares it, so this asserts the exact line
-        // is present rather than that it is the only line.
-        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        // Every document opened without an explicit logger shares this sink,
+        // so assert the exact line is present rather than that it is alone.
         assert!(
             captured.contains("requested value of integer is too big; returning INT_MAX\n"),
             "default error stream captured {captured:?}"
