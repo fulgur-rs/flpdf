@@ -1,5 +1,5 @@
 use flpdf::pipeline::{Pipeline, PipelineError, PipelineHandle, PipelineResult};
-use flpdf::{Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
+use flpdf::{check_reader_with_options, Error, ObjectRef, Pdf, PdfOpenOptions, QPDFLogger};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -209,6 +209,26 @@ fn warning_initial_replay_failure_is_returned_by_open() {
                 repair: true,
                 logger: Some(logger),
                 description: "input.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        ),
+        Err(Error::System(ref message)) if message == "warning sink failed"
+    ));
+}
+
+#[test]
+fn check_with_repair_propagates_warning_delivery_failure() {
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingSink)));
+    let (bytes, _) = warnings_only_corrupt_xref_bytes();
+
+    assert!(matches!(
+        check_reader_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: true,
+                logger: Some(logger),
+                description: "check.pdf".to_owned(),
                 ..PdfOpenOptions::default()
             },
         ),

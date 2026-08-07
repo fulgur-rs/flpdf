@@ -54,7 +54,10 @@ pub struct CheckSummary {
 /// # Errors
 ///
 /// - [`Error::Encrypted`] when the document is encrypted and cannot be opened; unlike
-///   other open failures, this is propagated rather than downgraded to a diagnostic.
+///   other input-facing open failures, this is propagated rather than downgraded to a
+///   diagnostic.
+/// - [`Error::System`] or [`Error::Internal`] when runtime or logic failures occur while
+///   delivering warnings through the configured logger; these are propagated unchanged.
 /// - A failed linearization probe (resolving object `(1, 0)` via
 ///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
 ///   document is treated as non-linearized; the error is not propagated.
@@ -84,9 +87,10 @@ pub fn check_reader<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckR
 ///
 /// # Errors
 ///
-/// - When `options.repair` is set, behaves like [`check_reader`]: only
-///   [`Error::Encrypted`] is propagated from the open path, while other open
-///   failures become an error [`Diagnostic`] inside an `Ok(CheckReport)`.
+/// - When `options.repair` is set, behaves like [`check_reader`]: [`Error::Encrypted`],
+///   [`Error::System`], and [`Error::Internal`] are propagated from the open path, while
+///   other input-facing open failures become an error [`Diagnostic`] inside an
+///   `Ok(CheckReport)`.
 /// - When `options.repair` is clear, any error from [`Pdf::open_with_options`] is
 ///   propagated unchanged (e.g. [`Error::Io`], [`Error::Parse`], [`Error::Encrypted`]).
 /// - A failed linearization probe (resolving object `(1, 0)` via
@@ -123,7 +127,9 @@ pub fn check_reader_with_options<R: Read + Seek + 'static>(
 ///
 /// # Errors
 ///
-/// Same as [`check_reader_with_options`].
+/// Same as [`check_reader_with_options`], including propagation of
+/// [`Error::Encrypted`], [`Error::System`], and [`Error::Internal`] from the repair-enabled
+/// open path.
 pub fn check_reader_with_options_and_limits<R: Read + Seek + 'static>(
     reader: R,
     options: PdfOpenOptions,
@@ -173,7 +179,9 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     let mut pdf = if allow_repair {
         match Pdf::open_with_options(reader, options) {
             Ok(pdf) => pdf,
-            Err(error @ Error::Encrypted(_)) => return Err(error),
+            Err(error @ (Error::Encrypted(_) | Error::System(_) | Error::Internal(_))) => {
+                return Err(error);
+            }
             Err(error) => {
                 let mut diagnostics = Diagnostics::default();
                 diagnostics.push(Diagnostic::error(error.to_string(), None));
