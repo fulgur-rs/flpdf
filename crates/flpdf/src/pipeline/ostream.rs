@@ -1,17 +1,17 @@
-//! qpdf correspondence: Pl_OStream.cc terminal adapter for an externally owned writer.
+//! qpdf correspondence: Pl_OStream.cc terminal adapter for a writer.
 
 use std::io::Write;
 
 use super::{Pipeline, PipelineResult};
 
-pub struct PlOStream<'a> {
+pub struct PlOStream<W: Write> {
     identifier: String,
-    writer: &'a mut dyn Write,
+    writer: W,
     failed: bool,
 }
 
-impl<'a> PlOStream<'a> {
-    pub fn new(identifier: impl Into<String>, writer: &'a mut dyn Write) -> Self {
+impl<W: Write> PlOStream<W> {
+    pub fn new(identifier: impl Into<String>, writer: W) -> Self {
         Self {
             identifier: identifier.into(),
             writer,
@@ -20,7 +20,7 @@ impl<'a> PlOStream<'a> {
     }
 }
 
-impl Pipeline for PlOStream<'_> {
+impl<W: Write> Pipeline for PlOStream<W> {
     fn identifier(&self) -> &str {
         &self.identifier
     }
