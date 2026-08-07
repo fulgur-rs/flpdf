@@ -1048,19 +1048,18 @@ impl ObjectHandle {
     /// owned before child resolution, so no container borrow crosses a
     /// resolver call.
     ///
-    /// A non-dictionary receiver raises the `typeWarning` qpdf raises at
-    /// `:1000` and yields an empty set.
+    /// A non-dictionary receiver yields an empty set. qpdf additionally
+    /// raises `typeWarning("dictionary", "treating as empty")` at `:1000`;
+    /// reproducing that here needs the receiver to reach its owning document,
+    /// which a direct child cannot yet do — see [`Self::type_warning`].
     ///
     /// # Errors
     ///
-    /// Propagates resolution failures, and — for a receiver with no reachable
-    /// document — the error [`Self::type_warning`] reports in place of the
-    /// warning.
+    /// Propagates resolution failures.
     #[allow(dead_code)] // consumed by flpdf-h8mv after this prerequisite lands
     pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         self.try_dereference()?;
         let Some(entries) = self.as_dictionary() else {
-            self.type_warning("dictionary", "treating as empty")?;
             return Ok(BTreeSet::new());
         };
         let mut result = BTreeSet::new();
@@ -1281,29 +1280,28 @@ impl ObjectHandle {
     ///
     /// Ports `QPDFObjectHandle::getKey`
     /// (`libqpdf/QPDFObjectHandle.cc:978-989`). A non-dictionary receiver
-    /// raises the `typeWarning` qpdf raises at `:984` and yields null. qpdf's
-    /// null additionally carries a child description naming the key; object
-    /// descriptions are not yet propagated, so this one is plain.
+    /// yields null. qpdf additionally raises
+    /// `typeWarning("dictionary", "returning null for attempted key
+    /// retrieval")` at `:984`, and gives its null a child description naming
+    /// the key; reproducing either needs the receiver to reach its owning
+    /// document, which a direct child cannot yet do — see
+    /// [`Self::type_warning`].
     ///
     /// # Errors
     ///
-    /// Propagates resolution failures, and — for a receiver with no reachable
-    /// document — the error [`Self::type_warning`] reports in place of the
-    /// warning.
+    /// Propagates resolution failures.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
         // One `with_value` both type-tests and fetches, so a non-dictionary
-        // is distinguishable from a missing key without the whole entry map
-        // being cloned to answer either question.
-        let Some(child) = self.with_value(|value| match value {
-            Some(ObjectValue::Dictionary(entries)) => Some(entries.get(key).cloned()),
-            _ => None,
-        }) else {
-            self.type_warning("dictionary", "returning null for attempted key retrieval")?;
-            return Ok(ObjectHandle::null());
-        };
-        Ok(child.unwrap_or_else(ObjectHandle::null))
+        // stays distinguishable from a missing key without the whole entry
+        // map being cloned to answer either question.
+        Ok(self
+            .with_value(|value| match value {
+                Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(ObjectHandle::null))
     }
 
     /// qpdf-compatible visible-key test. A present value that resolves to
@@ -4484,17 +4482,10 @@ pub(crate) mod identity_tests {
         assert!(dict.is_resolved());
         assert_eq!(*dict_calls.borrow(), vec![ObjectRef::new(20, 0)]);
 
-        let (scalar, _scalar_resolver, scalar_calls, scalar_warnings) =
-            warning_logged_resolver_bearing_handle(ObjectValue::Integer(7));
+        let (scalar, _scalar_resolver, scalar_calls) =
+            logged_resolver_bearing_handle(ObjectValue::Integer(7));
         assert_eq!(scalar.try_get_keys().unwrap(), BTreeSet::<Vec<u8>>::new());
         assert_eq!(*scalar_calls.borrow(), vec![ObjectRef::new(20, 0)]);
-        assert_eq!(
-            *scalar_warnings.borrow(),
-            vec![
-                "operation for dictionary attempted on object of type integer: treating as empty"
-                    .to_owned()
-            ]
-        );
     }
 
     #[test]
@@ -9550,35 +9541,6 @@ mod warning_emission_tests {
     }
 
     #[test]
-    fn get_keys_on_a_non_dictionary_warns_and_returns_an_empty_set() {
-        // `libqpdf/QPDFObjectHandle.cc:999-1003`
-        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
-
-        assert!(handle.try_get_keys().unwrap().is_empty());
-
-        assert_eq!(
-            warnings(&recorder),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
-        );
-    }
-
-    #[test]
-    fn get_key_on_a_non_dictionary_warns_and_returns_null() {
-        // `libqpdf/QPDFObjectHandle.cc:983-988`
-        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
-
-        assert!(handle.try_get_key(b"Type").unwrap().is_null());
-
-        assert_eq!(
-            warnings(&recorder),
-            [
-                "operation for dictionary attempted on object of type integer: \
-              returning null for attempted key retrieval"
-            ]
-        );
-    }
-
-    #[test]
     fn as_dictionary_on_a_non_dictionary_stays_silent_like_qpdf() {
         // `asDictionary()` is the silent internal helper; only `getKey`,
         // `getKeys` and `getDictAsMap` warn.
@@ -9723,10 +9685,10 @@ mod warning_emission_tests {
     }
 
     #[test]
-    fn a_stream_receiver_warns_with_its_own_type_name() {
+    fn a_stream_receiver_warns_under_its_own_type_name() {
         // `asDictionary()` is null for a stream just as it is for a scalar
-        // (`libqpdf/QPDFObjectHandle.cc:999-1003`), so a stream receiver
-        // reaches the same warning under its own type name.
+        // (`libqpdf/QPDFObjectHandle.cc:999-1003`), so the dictionary
+        // accessors reach this warning with `stream` as the actual type.
         let (handle, recorder) = handle_resolving(ObjectValue::Stream {
             stream_dict: ObjectHandle::dictionary(vec![(
                 b"Length".to_vec(),
@@ -9736,16 +9698,13 @@ mod warning_emission_tests {
             stream_length: 0,
         });
 
-        assert!(handle.try_get_keys().unwrap().is_empty());
-        assert!(handle.try_get_key(b"Length").unwrap().is_null());
+        handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
 
         assert_eq!(
             warnings(&recorder),
-            [
-                "operation for dictionary attempted on object of type stream: treating as empty",
-                "operation for dictionary attempted on object of type stream: \
-                 returning null for attempted key retrieval",
-            ]
+            ["operation for dictionary attempted on object of type stream: treating as empty"]
         );
     }
 
