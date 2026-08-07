@@ -4166,6 +4166,7 @@ fn run_page_extraction(
     options: WriteOptions,
     verbose: bool,
 ) -> CliResult<()> {
+    let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     if page_ops.empty {
         // qpdf accepts `--empty`; ignoring it would silently change which
         // document supplies the catalog/outlines. Fail loudly instead.
@@ -4427,6 +4428,10 @@ fn run_page_extraction(
                 // cov:ignore-end
             }
         }
+    } else if let Some(writer) = standard_output.as_mut() {
+        // cov:ignore-start: exercised by binary_page_extraction_dash and verbose_page_extraction_dash subprocess integration tests
+        writer.write_all(&bytes)?;
+        // cov:ignore-end
     } else {
         std::fs::write(output, &bytes)?;
         if verbose {
@@ -4490,6 +4495,7 @@ fn run_rewrite_with_page_ops(
     options: WriteOptions,
     verbose: bool,
 ) -> CliResult<()> {
+    let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
     if page_ops.empty {
         return Err(
             "--empty is accepted by qpdf but not implemented in flpdf at this layer \
@@ -4526,6 +4532,10 @@ fn run_rewrite_with_page_ops(
                 // cov:ignore-end
             }
         }
+    } else if let Some(writer) = standard_output.as_mut() {
+        // cov:ignore-start: exercised by binary_rotate_dash subprocess integration test
+        writer.write_all(&bytes)?;
+        // cov:ignore-end
     } else {
         std::fs::write(output, &bytes)?;
         if verbose {
@@ -5466,6 +5476,18 @@ fn prepare_pdf_standard_output(output: &Path) -> CliResult<Option<PipelineWriter
         Ok(None)
     }
 }
+
+// cov:ignore-start: exercised by page-operation stdout subprocess integration tests
+fn prepare_page_operation_standard_output(
+    output: &Path,
+    page_ops: &PageOpArgs,
+) -> CliResult<Option<PipelineWriter>> {
+    if output.as_os_str() == "-" && page_ops.split_pages.is_some() {
+        return Err("--split-pages may not be used when writing to standard output".into());
+    }
+    prepare_pdf_standard_output(output)
+}
+// cov:ignore-end
 
 fn logger_info(data: impl AsRef<[u8]>) -> CliResult<()> {
     cli_logger().info(data)?;

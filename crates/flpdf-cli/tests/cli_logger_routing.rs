@@ -132,6 +132,78 @@ fn binary_qdf_dash_uses_the_same_save_route() {
 }
 
 #[test]
+fn binary_page_extraction_dash_uses_the_save_route_without_creating_a_dash_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([ONE_PAGE, "--pages", ".", "1", "--", "-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+    assert!(!directory.path().join("-").exists());
+}
+
+#[test]
+fn binary_rotate_dash_uses_the_save_route_without_creating_a_dash_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([ONE_PAGE, "-", "--rotate=+90:1"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+    assert!(!directory.path().join("-").exists());
+}
+
+#[test]
+fn split_pages_dash_is_rejected_before_output_is_created() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([ONE_PAGE, "-", "--split-pages=1"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("--split-pages may not be used when writing to standard output"));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn verbose_page_extraction_dash_keeps_pdf_and_info_on_separate_routes() {
+    let output = flpdf()
+        .args(["--verbose", ONE_PAGE, "--pages", ".", "1", "--", "-"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(!output
+        .stdout
+        .windows(b"flpdf:".len())
+        .any(|window| window == b"flpdf:"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("flpdf: selecting --keep-open-files=y")
+    );
+}
+
+#[test]
 fn text_rewrite_verbose_uses_info_route_for_file_output() {
     let directory = tempfile::tempdir().unwrap();
     let output_path = directory.path().join("out.pdf");
