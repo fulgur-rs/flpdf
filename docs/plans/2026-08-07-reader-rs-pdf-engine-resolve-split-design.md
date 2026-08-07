@@ -214,6 +214,13 @@ reader.rs に残ったまま）。
   `collect_object_stream_chain`, header/startxref 探索, xref 読み取り
   （`xref.rs` の既存 API を呼ぶだけで xref.rs 自体は変更しない — 詳細は
   「非目標」参照）, `resolve_to_cache`, `native_parse_uncompressed_value` 等
+- **`decrypt_resolved_object` の private 依存閉包もここに含める**:
+  `decrypt_object_strings`(`reader.rs:3519-`), `decrypt_stream_bytes`
+  (`reader.rs:3791-`), `apply_explicit_crypt_filters`(`reader.rs:3810-`),
+  `stream_has_explicit_crypt_filter`(`reader.rs:3943-`),
+  `is_metadata_stream`(`reader.rs:3954-`),
+  `warn_unknown_crypt_filters`（`reader.rs:3197-`、`&self` メソッド）。
+  含めないと resolve 時復号ロジックの本体が reader.rs に残る
 - **`source_xref_offsets`, `source_xref_entries`, `source_header_offset`,
   `previous_xref_offset`, `last_xref_form`, `compressed_parent` もここに
   含める**（後述の「未決定」から格上げ）。これらは qtest 専用ではなく
@@ -279,7 +286,12 @@ reader.rs に残ったまま）。
   `standard_handler_r5_inputs`/`map_uo_length_to_bad_password`/
   `encrypt_metadata_flag`/`r6_perms_warning`（`reader.rs:1034-1150` 付近が
   これらを呼ぶ）/`first_file_id`（`reader.rs:4393-`）も同じ依存閉包に
-  含まれる（全て `reader.rs:4033-4393` 付近に private 定義）。これらの
+  含まれる（全て `reader.rs:4033-4393` 付近に private 定義）。**さらに**
+  `standard_handler_inputs`/`standard_handler_r5_inputs` 自体が呼ぶ
+  `required_integer`/`required_name`/`required_32_byte_string`/
+  `required_48_byte_string`/`crypt_filter_method`（`reader.rs:4033-4149`
+  付近）と、`interpret_cf` が呼ぶ `interpret_cf_name`
+  （`reader.rs:4238-4270`）も同じ依存閉包に含まれる。これらの
   ヘルパー型・関数も同じ移動対象に含める（`docs/qpdf-correspondence.md:136` が
   `interpret_cf` 系を既に `QPDF::interpretCF`（`QPDF_encryption.cc:700-716`）
   対応として記録済み）。含めないと暗号ロジックの大半が reader.rs に
@@ -366,7 +378,14 @@ reader.rs に残ったまま）。
    `signatures.rs`(245-: `removeSecurityRestrictions`) +
    `page_closure.rs`(441) + `ref_chain.rs`(159)）を更新する際は、
    **`reader/resolver.rs` は本設計の4ファイルへ差し替えるが、
-   `reader.rs` は残す（削除しない）**。`reader.rs` には legacy な
+   `reader.rs` は残す（削除しない）**。`reader/resolver.rs` を差し替える
+   際は、`QPDF.cc` 行以外にも `reader/resolver.rs` を名指ししている
+   行がある（`docs/qpdf-correspondence.md:135` `QPDF.hh`
+   `EncryptionParameters`、`:136` `QPDF::interpretCF`、`:137`
+   `QPDF::decryptStream`、`:140` `InputSource` 系、`:199` `Pl_AES_PDF`、
+   `:200` `Pl_RC4`）ので、これら6行も併せて `resolve.rs` を指すよう
+   更新する（`QPDF.cc` 行だけ直して他を放置すると存在しないファイルを
+   指す行が残る）。`reader.rs` には legacy な
    `Pdf::resolve`/`Pdf::resolve_borrowed`（`reader.rs:2702-2725`、
    doc コメントで `qpdf-cutover-delete(flpdf-25kg.3.3)` と明記）が
    残っており、production caller が実在する（`object_copy.rs:108,152`、
@@ -393,8 +412,14 @@ reader.rs に残ったまま）。
    integration + doctest）に加え、`--features qpdf-zlib-compat` での
    byte-identical テスト群（`cmp_linearize_tests.rs` の
    `assert_*_byte_identical`、`crates/flpdf-cli/tests/cli_byte_identical.rs`、
-   `deterministic_id_qpdf_parity_tests.rs`、`compat_matrix_tests.rs`）を
-   移動対象メソッドが実際に通る経路であることを確認したうえで実行する。
+   `deterministic_id_qpdf_parity_tests.rs`）を移動対象メソッドが実際に
+   通る経路であることを確認したうえで実行する。**`compat_matrix_tests.rs`
+   はこのリストに含めない**: `qpdf-zlib-compat` gate が無く、byte 比較も
+   `qdf_object_body`（部分文字列抽出）のみで、他のケースはページ数・
+   parseability・xref 形式・prefix 保持等の性質チェックであり、全体
+   byte-identity は検証しない（実際に読んで確認済み）。補助的な
+   compatibility カバレッジとして扱い、byte-identity ゲートとしては
+   数えない。
    特に resolve/認証まわりの移動は、単体テストだけでは値の materialize
    有無や byte 出力まで確認できないため、上記 byte-identical スイートを
    必ず含める。**`authenticate_if_encrypted`/暗号ヘルパーの移動には
