@@ -650,7 +650,7 @@ impl ObjectHandle {
         let slot = Rc::try_unwrap(self.0).ok()?.into_inner();
         match slot.state {
             ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
-            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None,
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
         }
     }
 
@@ -4554,7 +4554,9 @@ pub(crate) mod identity_tests {
 mod uniform_identity_tests {
     use super::*;
 
-    struct NoopResolver;
+    struct NoopResolver {
+        calls: Rc<std::cell::Cell<usize>>,
+    }
 
     impl DocumentResolver for NoopResolver {
         fn resolve_indirect(
@@ -4562,12 +4564,25 @@ mod uniform_identity_tests {
             _object_ref: ObjectRef,
             _handle: &ObjectHandle,
         ) -> crate::Result<()> {
+            self.calls.set(self.calls.get() + 1);
             Ok(())
         }
     }
 
     fn resolver() -> Rc<dyn DocumentResolver> {
-        Rc::new(NoopResolver)
+        Rc::new(NoopResolver {
+            calls: Rc::new(std::cell::Cell::new(0)),
+        })
+    }
+
+    fn recording_noop_resolver() -> (Rc<dyn DocumentResolver>, Rc<std::cell::Cell<usize>>) {
+        let calls = Rc::new(std::cell::Cell::new(0));
+        (
+            Rc::new(NoopResolver {
+                calls: calls.clone(),
+            }),
+            calls,
+        )
     }
 
     struct ReenteringResolver {
@@ -4633,16 +4648,24 @@ mod uniform_identity_tests {
         assert!(children[1].is_same_object_as(&stream));
         let promoted_dict = children[1].as_stream_dict().expect("stream dictionary");
         assert!(promoted_dict.is_same_object_as(&stream_dict));
-        children[1].with_value(|value| {
-            let Some(ObjectValue::Stream {
-                stream_data: Some(actual),
-                ..
-            }) = value
-            else {
-                panic!("promoted child must retain stream data");
-            };
-            assert!(Rc::ptr_eq(actual, &stream_data));
-        });
+        assert!(children[1].with_value(|value| matches!(value, Some(ObjectValue::Stream { stream_data: Some(actual), .. }) if Rc::ptr_eq(actual, &stream_data))));
+    }
+
+    #[test]
+    fn promotion_delegates_unresolved_access_to_its_installed_resolver() {
+        let (resolver, calls) = recording_noop_resolver();
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(20, 0), -1);
+        handle.promote_to_indirect(ObjectRef::new(20, 0), 52, Rc::downgrade(&resolver));
+
+        handle
+            .try_dereference()
+            .expect("the installed resolver accepts the lookup");
+
+        assert_eq!(calls.get(), 1);
+        assert!(
+            !handle.is_resolved(),
+            "a resolver that installs no value must not fabricate resolution"
+        );
     }
 
     #[test]
@@ -4758,6 +4781,47 @@ mod uniform_identity_tests {
         assert!(missing.is_direct());
         assert!(missing.is_null());
         assert_eq!(missing.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn destroyed_direct_handle_has_no_legacy_value_to_clone_or_consume() {
+        let resolver = resolver();
+        let handle = ObjectHandle::integer(1);
+        handle.promote_to_indirect(ObjectRef::new(55, 0), 94, Rc::downgrade(&resolver));
+        handle.disconnect();
+
+        assert!(handle.direct_value_clone().is_none());
+        assert!(!handle.is_null(), "destroyed is distinct from literal null");
+        assert!(handle.into_direct_value().is_none());
+    }
+
+    #[test]
+    fn replace_direct_value_reinstalls_a_destroyed_direct_slot_payload() {
+        let resolver = resolver();
+        let handle = ObjectHandle::integer(1);
+        handle.promote_to_indirect(ObjectRef::new(56, 0), 94, Rc::downgrade(&resolver));
+        handle.disconnect();
+
+        handle.replace_direct_value(ObjectValue::Integer(2));
+
+        assert_eq!(handle.as_integer(), Some(2));
+    }
+
+    #[test]
+    fn promotion_records_identity_on_a_destroyed_direct_child_without_descending() {
+        let resolver = resolver();
+        let child = ObjectHandle::integer(1);
+        child.promote_to_indirect(ObjectRef::new(57, 0), 95, Rc::downgrade(&resolver));
+        child.disconnect();
+        let parent = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+
+        parent.promote_to_indirect(ObjectRef::new(59, 0), 96, Rc::downgrade(&resolver));
+
+        assert!(child.belongs_to_pdf(96));
+        assert_eq!(
+            child.containing_object_refs_for_pdf(96),
+            vec![ObjectRef::new(59, 0)]
+        );
     }
 
     #[test]
@@ -5289,11 +5353,9 @@ mod resolution_state_tests {
             matches!(&missing.0.borrow().state, ObjectState::Missing),
             "`set_missing` must leave the slot in the `Missing` variant"
         );
+        let state = &null.0.borrow().state;
         assert!(
-            matches!(
-                &null.0.borrow().state,
-                ObjectState::Resolved(ObjectValue::Null)
-            ),
+            matches!(state, ObjectState::Resolved(ObjectValue::Null)),
             "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
         );
     }
