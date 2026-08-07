@@ -14,7 +14,8 @@
 - Produce exactly `pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>>`.
 - Resolve the holder and every stored child value without inspecting key names; omit direct null, indirect null, missing/dangling-to-null, and canonical loop-to-null outcomes.
 - Release the dictionary container borrow before any child resolver call.
-- Propagate holder and child resolver errors unchanged; do not convert them to an empty set or an omitted key.
+- Propagate holder and child resolver errors unchanged, preserving their `Error` variants and messages; do not convert them to an empty set or an omitted key.
+- Traverse dictionary children in the `BTreeMap`'s lexical key order and stop at the first resolver error.
 - A resolved non-dictionary holder returns an empty set; qpdf's public type-warning surface remains out of scope.
 - Do not change `try_as_dictionary`, `try_get_key`, `try_has_key`, `replace_key`, raw dictionary storage, or `visible_dict_entries`.
 - Do not change `stream_filter.rs`, `filters.rs`, `/Filter`, `/DecodeParms`, or retained-key policy; consumer integration remains `flpdf-h8mv`.
@@ -30,7 +31,7 @@
 - Test: `crates/flpdf/src/object_handle.rs` (`identity_tests`)
 
 **Interfaces:**
-- Consumes: `ObjectHandle::try_as_dictionary(&self) -> Result<Option<BTreeMap<Vec<u8>, ObjectHandle>>>`, `ObjectHandle::try_is_null(&self) -> Result<bool>`, `MissingResolver`, `error_resolving_handle`, `resolver_bearing_handle`, and `logged_resolver_bearing_handle`.
+- Consumes: `ObjectHandle::try_as_dictionary(&self) -> Result<Option<BTreeMap<Vec<u8>, ObjectHandle>>>`, `ObjectHandle::try_is_null(&self) -> Result<bool>`, `MissingResolver`, `error_resolving_handle`, `logged_error_resolving_handle`, `resolver_bearing_handle`, and `logged_resolver_bearing_handle`.
 - Produces: `pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>>` for the later `flpdf-h8mv` consumer.
 
 - [ ] **Step 1: Reconfirm the pinned qpdf source boundary**
@@ -118,21 +119,53 @@
       let (child, _resolver) = error_resolving_handle(ObjectRef::new(30, 0));
       let dict = ObjectHandle::dictionary(vec![(b"Broken".to_vec(), child.clone())]);
 
-      assert_eq!(dict.try_get_keys().unwrap_err().to_string(), "resolver failed");
+      assert!(matches!(dict.try_get_keys().unwrap_err(), Error::System(message)
+          if message == "resolver failed"));
       assert!(!child.is_resolved());
+  }
+
+  #[test]
+  fn try_get_keys_propagates_a_dropped_resolver_error_from_holder_and_child() {
+      let (holder, holder_resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
+          Default::default(),
+      ));
+      drop(holder_resolver);
+      assert!(matches!(holder.try_get_keys().unwrap_err(), Error::Internal(message)
+          if message == "object 20 0 belongs to a dropped PDF"));
+
+      let (child, child_resolver) = resolver_bearing_handle(ObjectValue::Null);
+      drop(child_resolver);
+      let dict = ObjectHandle::dictionary(vec![(b"Broken".to_vec(), child)]);
+      assert!(matches!(dict.try_get_keys().unwrap_err(), Error::Internal(message)
+          if message == "object 20 0 belongs to a dropped PDF"));
+  }
+
+  #[test]
+  fn try_get_keys_stops_at_the_lexical_first_child_resolver_error() {
+      let (zulu, _zulu_resolver, zulu_calls) =
+          logged_error_resolving_handle(ObjectRef::new(32, 0), "zulu resolver failed");
+      let (alpha, _alpha_resolver, alpha_calls) =
+          logged_error_resolving_handle(ObjectRef::new(31, 0), "alpha resolver failed");
+      let dict = ObjectHandle::dictionary(vec![
+          (b"Zulu".to_vec(), zulu),
+          (b"Alpha".to_vec(), alpha),
+      ]);
+
+      assert!(matches!(dict.try_get_keys().unwrap_err(), Error::System(message)
+          if message == "alpha resolver failed"));
+      assert_eq!(*alpha_calls.borrow(), vec![ObjectRef::new(31, 0)]);
+      assert!(zulu_calls.borrow().is_empty());
   }
   ```
 
   Extend `every_fallible_accessor_propagates_the_resolver_error` with the holder-error assertion:
 
   ```rust
-  assert_eq!(
-      handle.try_get_keys().unwrap_err().to_string(),
-      "resolver failed"
-  );
+  assert!(matches!(handle.try_get_keys().unwrap_err(), Error::System(message)
+      if message == "resolver failed"));
   ```
 
-  The mixed test deliberately uses a key named `Unknown`; its call log proves enumeration resolves a value independently of any filter/parameter allowlist.
+  The mixed test deliberately uses a key named `Unknown`; its call log proves enumeration resolves a value independently of any filter/parameter allowlist. The error tests pin both `Error::System` propagation and dropped-resolver `Error::Internal` propagation for holder and child positions. The lexical test inserts `Zulu` before `Alpha`, but asserts that only `Alpha` resolves and that its distinct `Error::System` is returned: enumeration must follow the dictionary's lexical `BTreeMap` order and fail fast before touching the later child.
 
 - [ ] **Step 3: Run the focused test filter and verify RED**
 

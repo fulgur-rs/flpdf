@@ -3888,6 +3888,28 @@ pub(crate) mod identity_tests {
         }
     }
 
+    /// Records a resolution attempt before returning its configured error.
+    ///
+    /// Unlike [`ErrorResolver`], each instance has an independently chosen
+    /// message and externally visible call log. This lets an enumeration test
+    /// distinguish qpdf's lexical fail-fast traversal from a reversed walk
+    /// that happens to return an error of the same variant.
+    struct LoggedErrorResolver {
+        calls: ResolutionLog,
+        message: String,
+    }
+
+    impl DocumentResolver for LoggedErrorResolver {
+        fn resolve_indirect(
+            &self,
+            object_ref: ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            self.calls.borrow_mut().push(object_ref);
+            Err(Error::System(self.message.clone()))
+        }
+    }
+
     /// An unresolved indirect handle whose resolver always errors, mirroring
     /// [`resolver_bearing_handle`]'s own doc but for a position that must
     /// never be resolved at all rather than one that resolves to a
@@ -3905,6 +3927,19 @@ pub(crate) mod identity_tests {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(ErrorResolver);
         let handle = ObjectHandle::new_indirect_with_resolver(object_ref, Rc::downgrade(&resolver));
         (handle, resolver)
+    }
+
+    fn logged_error_resolving_handle(
+        object_ref: ObjectRef,
+        message: impl Into<String>,
+    ) -> (ObjectHandle, Rc<dyn DocumentResolver>, ResolutionLog) {
+        let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(LoggedErrorResolver {
+            calls: Rc::clone(&calls),
+            message: message.into(),
+        });
+        let handle = ObjectHandle::new_indirect_with_resolver(object_ref, Rc::downgrade(&resolver));
+        (handle, resolver, calls)
     }
 
     #[test]
@@ -4078,9 +4113,9 @@ pub(crate) mod identity_tests {
             handle.try_as_dictionary().unwrap_err().to_string(),
             "resolver failed"
         );
-        assert_eq!(
-            handle.try_get_keys().unwrap_err().to_string(),
-            "resolver failed"
+        assert!(
+            matches!(handle.try_get_keys().unwrap_err(), Error::System(message)
+            if message == "resolver failed")
         );
         assert_eq!(
             handle.try_get_key(b"A").unwrap_err().to_string(),
@@ -4167,11 +4202,49 @@ pub(crate) mod identity_tests {
         let (child, _resolver) = error_resolving_handle(ObjectRef::new(30, 0));
         let dict = ObjectHandle::dictionary(vec![(b"Broken".to_vec(), child.clone())]);
 
-        assert_eq!(
-            dict.try_get_keys().unwrap_err().to_string(),
-            "resolver failed"
+        assert!(
+            matches!(dict.try_get_keys().unwrap_err(), Error::System(message)
+            if message == "resolver failed")
         );
         assert!(!child.is_resolved());
+    }
+
+    #[test]
+    fn try_get_keys_propagates_a_dropped_resolver_error_from_holder_and_child() {
+        let (holder, holder_resolver) =
+            resolver_bearing_handle(ObjectValue::Dictionary(Default::default()));
+        drop(holder_resolver);
+        assert!(
+            matches!(holder.try_get_keys().unwrap_err(), Error::Internal(message)
+            if message == "object 20 0 belongs to a dropped PDF")
+        );
+
+        let (child, child_resolver) = resolver_bearing_handle(ObjectValue::Null);
+        drop(child_resolver);
+        let dict = ObjectHandle::dictionary(vec![(b"Broken".to_vec(), child)]);
+        assert!(
+            matches!(dict.try_get_keys().unwrap_err(), Error::Internal(message)
+            if message == "object 20 0 belongs to a dropped PDF")
+        );
+    }
+
+    #[test]
+    fn try_get_keys_stops_at_the_lexical_first_child_resolver_error() {
+        let (zulu, _zulu_resolver, zulu_calls) =
+            logged_error_resolving_handle(ObjectRef::new(32, 0), "zulu resolver failed");
+        let (alpha, _alpha_resolver, alpha_calls) =
+            logged_error_resolving_handle(ObjectRef::new(31, 0), "alpha resolver failed");
+        // Insert in reverse lexical order: the dictionary's BTreeMap traversal
+        // must nevertheless resolve Alpha first and stop there.
+        let dict =
+            ObjectHandle::dictionary(vec![(b"Zulu".to_vec(), zulu), (b"Alpha".to_vec(), alpha)]);
+
+        assert!(
+            matches!(dict.try_get_keys().unwrap_err(), Error::System(message)
+            if message == "alpha resolver failed")
+        );
+        assert_eq!(*alpha_calls.borrow(), vec![ObjectRef::new(31, 0)]);
+        assert!(zulu_calls.borrow().is_empty());
     }
 
     #[test]
