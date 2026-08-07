@@ -300,7 +300,8 @@ fn route_warning(
     if location.is_empty() {
         logger.warn(format!("WARNING: {message}\n"))
     } else {
-        logger.warn(format!("WARNING: {location}: {message}\n"))
+        let separator = if message.starts_with('(') { " " } else { ": " };
+        logger.warn(format!("WARNING: {location}{separator}{message}\n"))
     }
 }
 
@@ -2337,6 +2338,7 @@ mod tests {
             ("", Some(7), "positive offset"),
             ("input.pdf", Some(0), "named zero offset"),
             ("input.pdf", Some(7), "named positive offset"),
+            ("input.pdf", None, "(object 5 0, offset 232): expected endobj"),
         ] {
             super::route_warning(&logger, false, description, offset, message).unwrap();
         }
@@ -2347,7 +2349,8 @@ mod tests {
               WARNING: zero offset\n\
               WARNING: offset 7: positive offset\n\
               WARNING: input.pdf: named zero offset\n\
-              WARNING: input.pdf (offset 7): named positive offset\n"
+              WARNING: input.pdf (offset 7): named positive offset\n\
+              WARNING: input.pdf (object 5 0, offset 232): expected endobj\n"
         );
     }
 

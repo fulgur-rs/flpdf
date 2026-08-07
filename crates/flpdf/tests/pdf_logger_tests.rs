@@ -303,7 +303,7 @@ fn warning_routes_lazy_resolution_immediately_and_only_once() {
 
     assert_eq!(
         output.lock().unwrap().as_slice(),
-        b"WARNING: lazy.pdf: (object 5 0, offset 232): expected endobj\n"
+        b"WARNING: lazy.pdf (object 5 0, offset 232): expected endobj\n"
     );
     assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
 }
@@ -353,7 +353,7 @@ fn live_logger_replacement_routes_only_to_the_replacement() {
     assert!(original_output.lock().unwrap().is_empty());
     assert_eq!(
         replacement_output.lock().unwrap().as_slice(),
-        b"WARNING: live.pdf: (object 5 0, offset 232): expected endobj\n"
+        b"WARNING: live.pdf (object 5 0, offset 232): expected endobj\n"
     );
 }
 
