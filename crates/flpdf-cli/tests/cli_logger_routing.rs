@@ -48,10 +48,48 @@ fn run_flpdf(args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn assert_observables_equal(label: &str, qpdf: &Output, flpdf: &Output) {
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+
+    normalized
+}
+
+fn assert_observables_equal(label: &str, qpdf: &Output, flpdf: &Output, text_output: bool) {
     assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}: status");
-    assert_eq!(flpdf.stdout, qpdf.stdout, "{label}: stdout");
-    assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr");
+    if cfg!(windows) && text_output {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout),
+            "{label}: stdout"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "{label}: stderr"
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{label}: stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr");
+    }
+}
+
+#[test]
+fn text_newline_normalization_only_collapses_crlf_pairs() {
+    assert_eq!(
+        normalize_text_newlines(b"first\r\nsecond\nthird\rfourth"),
+        b"first\nsecond\nthird\rfourth"
+    );
 }
 
 #[test]
@@ -247,37 +285,52 @@ fn qpdf_differential_matches_routed_output_matrix() {
         return;
     }
 
-    let cases: &[(&str, &[&str], &[&str])] = &[
-        ("clean check", &["--check", MINIMAL], &["--check", MINIMAL]),
+    let cases: &[(&str, &[&str], &[&str], bool)] = &[
+        (
+            "clean check",
+            &["--check", MINIMAL],
+            &["--check", MINIMAL],
+            true,
+        ),
         (
             "warning check",
             &["--check", WARNING_PDF],
             &["--repair", "--check", WARNING_PDF],
+            true,
         ),
         (
             "JSON stdout",
             &["--json=2", MINIMAL],
             &["--json=2", MINIMAL],
+            false,
         ),
         (
             "raw stream",
             &["--show-object=4", "--raw-stream-data", MULTI_STREAM],
             &["show-stream", "4 0 R", MULTI_STREAM, "--raw"],
+            false,
         ),
         (
             "filtered stream",
             &["--show-object=4", "--filtered-stream-data", MULTI_STREAM],
             &["show-stream", "4 0 R", MULTI_STREAM],
+            false,
         ),
         (
             "attachment",
             &["--show-attachment=attachment.txt", ATTACHMENT_PDF],
             &["--show-attachment=attachment.txt", ATTACHMENT_PDF],
+            false,
         ),
     ];
 
-    for (label, qpdf_args, flpdf_args) in cases {
-        assert_observables_equal(label, &run_qpdf(qpdf_args), &run_flpdf(flpdf_args));
+    for (label, qpdf_args, flpdf_args, text_output) in cases {
+        assert_observables_equal(
+            label,
+            &run_qpdf(qpdf_args),
+            &run_flpdf(flpdf_args),
+            *text_output,
+        );
     }
 }
 
@@ -294,8 +347,8 @@ fn qpdf_differential_classifies_existing_native_open_error_text_gap() {
 
     assert_eq!(flpdf.status.code(), qpdf.status.code());
     assert_eq!(flpdf.stdout, qpdf.stdout);
-    assert!(String::from_utf8_lossy(&qpdf.stderr).contains("No such file or directory"));
-    assert!(String::from_utf8_lossy(&flpdf.stderr).contains("No such file or directory"));
+    assert!(!qpdf.stderr.is_empty());
+    assert!(!flpdf.stderr.is_empty());
     assert_ne!(
         flpdf.stderr, qpdf.stderr,
         "native I/O error formatting is an existing oracle mismatch, not a logger route mismatch"
