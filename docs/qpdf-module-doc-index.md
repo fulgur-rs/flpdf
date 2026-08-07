@@ -21,6 +21,7 @@
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
+| `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\` first; \`processFile\`/\`processMemoryFile\` remain in \`reader.rs\` pending the broader split — see \`docs/plans/2026-08-07-reader-rs-pdf-engine-resolve-split-design.md\`) |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
 | `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
@@ -72,7 +73,7 @@
 | `crates/flpdf/src/page_collate.rs` | correspondence | QPDFJob.cc handlePageSpecs collate ordering split into a page-operation module |
 | `crates/flpdf/src/page_combine.rs` | correspondence | QPDFJob.cc handlePageSpecs multi-input combination split into a page-operation module |
 | `crates/flpdf/src/page_document_helper.rs` | correspondence | QPDFPageDocumentHelper.cc responsibilities split with page extraction |
-| `crates/flpdf/src/page_extract.rs` | correspondence | QPDFPageDocumentHelper.cc emptyPDF/addPage operations plus QPDFJob.cc page extraction |
+| `crates/flpdf/src/page_extract.rs` | correspondence | QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only |
 | `crates/flpdf/src/page_form_xobject.rs` | correspondence | QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper |
 | `crates/flpdf/src/page_label_document_helper.rs` | correspondence | QPDFPageLabelDocumentHelper.cc behavior without a completed public API and single-implementation audit |
 | `crates/flpdf/src/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
