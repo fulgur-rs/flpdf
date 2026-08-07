@@ -356,10 +356,16 @@ Ok(Some(Box::new(RunLength::new("runlength decode", next, RunLengthAction::Decod
 
 The three `#[cfg(test)]` filters (`TestStreamFilter`, `BorrowedInputProbe`,
 `PostPreflightFailure`) each need a body now that the method has no default. Give
-`TestStreamFilter` and `BorrowedInputProbe` a pass-through
-(`Ok(Some(Box::new(Count::new("test", next))))` or equivalent) and
-`PostPreflightFailure` an `Err(Error::Internal(..))`, matching what each already
-does in `pipe_decode_recovering`.
+each one behavior consistent with what it already does in
+`pipe_decode_recovering`, and say in the report what you chose and why.
+
+As implemented: `TestStreamFilter` and `BorrowedInputProbe` return `Ok(None)`,
+because qpdf's caller treats a null return as "this filter contributes no stage,
+keep writing to `next`" (`QPDF_Stream.cc:561-563`) — which is exactly the
+identity pass-through both already perform. `PostPreflightFailure` returns
+`Err(Error::Internal(..))` with its existing message; the name stays accurate
+because the filter does not override `preflight_decode_pipeline`, so preflight
+still succeeds and the failure follows it on both routes.
 
 **Step 5: Run the test**
 
@@ -385,9 +391,33 @@ git commit -m "feat(stream-filter): add getDecodePipeline-equivalent stage facto
 **Files:**
 - Modify: `crates/flpdf/src/stream_filter.rs` `mod tests`
 
-Add local `RecordingSink`, `WriteFaultSink`, and `FinishFaultSink` following
-`pipeline/flate.rs:493-560`. `RecordingSink` must count `write` calls and `finish`
-calls separately and keep the bytes.
+Prefer the shared `crate::pipeline::test_support::RecordingSink`
+(`pipeline/test_support.rs:38`) over hand-rolling sinks. It injects write and
+finish failures by attempt index — **1-based**, because `write_attempts`
+increments before the `contains` check — and its `trace()` returns a `Trace`
+carrying both `output: Vec<u8>` and `calls: Vec<TraceCall>`, so write/finish
+ordering is assertable, not just counts. Task 1 switched to it for exactly this
+reason. Reach for a local sink only where the shared one genuinely does not fit,
+and say why.
+
+### The hole this task must close
+
+After Task 3, the *only* committed caller of `decode_pipeline` is the single
+AsciiHex test. A reviewer replaced the whole body of
+`FlateLzwStreamFilter::decode_pipeline` with `if true { return Ok(None); }` and
+**all 3638 tests still passed**. That body is the only multi-stage path, the only
+`PipelineRef::Owned` construction site, and the only body that can return `Err`.
+
+So a Task 4 that adds tests for the three single-stage filters reads as complete
+while leaving the real hole open. **The acceptance bar for this task is that the
+same mutation fails.** Run it yourself before claiming done: mutate the body,
+confirm a test fails, revert.
+
+Concretely, `FlateLzwStreamFilter::decode_pipeline` needs, at minimum, a test
+that a PNG-predictor + Flate chain and a PNG-predictor + LZW chain each carry
+bytes through both stages to the sink correctly. Task 3's implementer reported
+verifying this with throwaway tests that were then reverted — treat that as
+**claimed but unverified**; it is precisely what this task must commit.
 
 Write these tests, one commit per bullet group is fine:
 
