@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Test qpdf module correspondence checker
         run: python3 -m unittest scripts/tests/test_qpdf_module_docs.py
@@ -81,7 +81,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
@@ -112,7 +112,7 @@ jobs:
       - name: Restore qpdf 11.9.0 (macOS)
         id: qpdf-cache
         if: runner.os == 'macOS'
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: ${{ runner.temp }}/qpdf-${{ env.QPDF_VERSION }}-install
           key: qpdf-${{ runner.os }}-${{ runner.arch }}-${{ env.QPDF_VERSION }}-static-openssl-v1
@@ -304,7 +304,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           # Full history so scripts/patch-coverage.sh can find git merge-base
           fetch-depth: 0
@@ -371,7 +371,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # cargo-fuzz needs nightly (libFuzzer / -Zsanitizer=address). Pin a known-
       # good nightly rather than floating `nightly` so a bad nightly can't break
