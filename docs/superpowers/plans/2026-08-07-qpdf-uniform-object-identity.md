@@ -20,6 +20,12 @@
 - Keep `RefCell` borrows shorter than any resolver callback or containment traversal. Snapshot metadata, drop the borrow, and only then call outward.
 - Preserve `ObjectState::Missing` separately from `Resolved(ObjectValue::Null)` and `Destroyed`.
 - Keep additive `pdf_unique_ids` provenance separate from active indirect metadata.
+- A weak incoming containment edge created while a child was direct remains
+  dormant while that child is indirect; root queries ignore it at the
+  indirect boundary. If the forward occurrence is removed while the child is
+  indirect, detach that dormant edge. If it remains, disconnect can make the
+  child direct again and the still-current forward membership becomes visible
+  without rewiring.
 - One commit per implementation task. Never commit a RED state.
 - Base all qpdf citations on the clean tree printed by `scripts/fetch-qpdf-source.sh --print-path`; never edit that tree.
 
@@ -192,6 +198,24 @@ impl DocumentResolver for NoopResolver {
 fn resolver() -> Rc<dyn DocumentResolver> {
     Rc::new(NoopResolver)
 }
+
+struct ReenteringResolver {
+    calls: Rc<RefCell<Vec<ObjectRef>>>,
+}
+
+impl DocumentResolver for ReenteringResolver {
+    fn resolve_indirect(
+        &self,
+        object_ref: ObjectRef,
+        handle: &ObjectHandle,
+    ) -> crate::Result<()> {
+        self.calls.borrow_mut().push(object_ref);
+        assert_eq!(handle.object_ref(), Some(object_ref));
+        handle.set_resolved(ObjectValue::Dictionary(Default::default()));
+        handle.replace_key(b"Resolved", ObjectHandle::boolean(true));
+        Ok(())
+    }
+}
 ```
 
 Add these tests before production code:
@@ -266,6 +290,84 @@ fn resolution_state_is_shared_by_every_alias() {
     assert!(alias.is_same_object_as(&unresolved));
     assert!(alias.is_resolved());
     assert_eq!(alias.as_integer(), Some(7));
+}
+
+#[test]
+fn re_promotion_uses_latest_resolver() {
+    let first_calls = Rc::new(RefCell::new(Vec::new()));
+    let first: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+        calls: first_calls.clone(),
+    });
+    let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+        ObjectRef::new(59, 0),
+        NO_PARSED_OFFSET,
+        101,
+        Rc::downgrade(&first),
+    );
+    let latest_calls = Rc::new(RefCell::new(Vec::new()));
+    let latest: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+        calls: latest_calls.clone(),
+    });
+    let alias = handle.promote_to_indirect(
+        ObjectRef::new(61, 7),
+        102,
+        Rc::downgrade(&latest),
+    );
+    drop(first);
+
+    alias.try_dereference().expect("latest resolver resolves");
+
+    assert!(handle.is_same_object_as(&alias));
+    assert_eq!(*first_calls.borrow(), Vec::<ObjectRef>::new());
+    assert_eq!(*latest_calls.borrow(), vec![ObjectRef::new(61, 7)]);
+    assert_eq!(handle.object_ref(), Some(ObjectRef::new(61, 7)));
+    assert_eq!(handle.get_key(b"Resolved").as_boolean(), Some(true));
+}
+
+#[test]
+fn resolver_reentry_uses_latest_metadata_without_borrow_panic() {
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let latest: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+        calls: calls.clone(),
+    });
+    let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(63, 0), -1);
+    handle.promote_to_indirect(
+        ObjectRef::new(67, 3),
+        103,
+        Rc::downgrade(&latest),
+    );
+
+    handle.try_dereference().expect("reentrant resolver");
+
+    assert_eq!(*calls.borrow(), vec![ObjectRef::new(67, 3)]);
+    assert_eq!(handle.get_key(b"Resolved").as_boolean(), Some(true));
+}
+
+#[test]
+fn dropped_latest_resolver_reports_latest_object_and_stays_unresolved() {
+    let first = resolver();
+    let latest_calls = Rc::new(RefCell::new(Vec::new()));
+    let latest: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+        calls: latest_calls.clone(),
+    });
+    let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+        ObjectRef::new(69, 0),
+        NO_PARSED_OFFSET,
+        104,
+        Rc::downgrade(&first),
+    );
+    handle.promote_to_indirect(
+        ObjectRef::new(71, 5),
+        105,
+        Rc::downgrade(&latest),
+    );
+    drop(latest);
+
+    let error = handle.try_dereference().expect_err("latest owner was dropped");
+
+    assert_eq!(error.to_string(), "object 71 5 belongs to a dropped PDF");
+    assert!(latest_calls.borrow().is_empty());
+    assert!(!handle.is_resolved());
 }
 ```
 
@@ -572,6 +674,39 @@ fn promoted_child_is_an_indirect_boundary_not_a_direct_owner_path() {
         vec![ObjectRef::new(43, 0)]
     );
 }
+
+#[test]
+fn dormant_parent_edge_tracks_removal_while_child_is_indirect() {
+    let resolver = resolver();
+    let child = ObjectHandle::dictionary(vec![]);
+    let outer = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+    outer.promote_to_indirect(
+        ObjectRef::new(73, 0),
+        111,
+        Rc::downgrade(&resolver),
+    );
+    child.promote_to_indirect(
+        ObjectRef::new(79, 0),
+        112,
+        Rc::downgrade(&resolver),
+    );
+
+    assert!(child.containing_object_refs_for_pdf(111).is_empty());
+    child.disconnect();
+    assert_eq!(
+        child.containing_object_refs_for_pdf(111),
+        vec![ObjectRef::new(73, 0)]
+    );
+
+    child.promote_to_indirect(
+        ObjectRef::new(83, 0),
+        112,
+        Rc::downgrade(&resolver),
+    );
+    outer.remove_key(b"Child");
+    child.disconnect();
+    assert!(child.containing_object_refs_for_pdf(111).is_empty());
+}
 ```
 
 - [ ] **Step 2: Run RED**
@@ -594,8 +729,8 @@ root queries. Then implement these rules:
 - `containment_parent(&self)` becomes `Rc::downgrade(&self.0)`.
 - `same_containment_parent` becomes `Weak::ptr_eq`.
 - `containment_parent_is_live` becomes `Weak::strong_count(parent) != 0`.
-- `attach_child_to_parent` first returns when `child.is_indirect()`. Otherwise it prunes expired edges, pushes one cloned weak parent, snapshots the parent's additive Pdf identities plus active Pdf identity, releases all borrows, and propagates each identity through the direct subtree.
-- `detach_child_from_parent` removes exactly one pointer-equal edge occurrence from a direct child. It must release the child borrow before any further traversal.
+- `attach_child_to_parent` first returns when `child.is_indirect()`. Otherwise it prunes expired edges, pushes one cloned weak parent, snapshots the parent's additive Pdf identities plus active Pdf identity, releases all borrows, and propagates each identity through the direct subtree. It does not remove an incoming edge created before promotion; that edge is dormant while the child is indirect.
+- `detach_child_from_parent` removes exactly one pointer-equal edge occurrence regardless of the child's current direct/indirect state. This lets a parent remove a pre-promotion occurrence while the child is indirect, preventing that stale path from reappearing after disconnect. It must release the child borrow before any further traversal.
 - `attach_value_children` and `detach_value_children` pass the weak slot returned by `containment_parent`.
 
 Do not deduplicate stored occurrences: the same child in two dictionary/array positions needs two edges so removing one position does not detach the other.
@@ -695,15 +830,15 @@ git commit -m "refactor(object_handle): derive containment roots from shared slo
 
 ---
 
-## Task 4: Enforce last-write metadata and resolver re-entry safety
+## Task 4: Re-verify last-write metadata and resolver re-entry safety
 
-**Files:**
+**Files:** No planned edits. The RED tests and implementation landed in Task
+2 so they could obey TDD; this task is a focused post-containment verification
+checkpoint.
 
-- Modify: `crates/flpdf/src/object_handle.rs`
+- [ ] **Step 1: Inspect the resolver contract introduced in Task 2**
 
-- [ ] **Step 1: Add a resolver that proves the slot is unborrowed**
-
-Inside `uniform_identity_tests`, add:
+Confirm `uniform_identity_tests` contains:
 
 ```rust
 struct ReenteringResolver {
@@ -725,7 +860,7 @@ impl DocumentResolver for ReenteringResolver {
 }
 ```
 
-Add the exact last-write/re-entry tests:
+Confirm the exact last-write/re-entry tests from Task 2 remain unchanged:
 
 ```rust
 #[test]
@@ -808,7 +943,7 @@ fn dropped_latest_resolver_reports_latest_object_and_stays_unresolved() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [ ] **Step 2: Run the focused regression tests**
 
 Run:
 
@@ -817,11 +952,13 @@ cargo test -p flpdf --lib object_handle::uniform_identity_tests::re_promotion_us
 cargo test -p flpdf --lib object_handle::uniform_identity_tests::resolver_reentry
 ```
 
-Expected: fail if `try_dereference` retains a `RefCell` borrow, retains the old resolver, or uses stale ObjGen.
+Expected: pass. If any test fails because Task 3 regressed resolver metadata or
+borrow lifetime, stop and add one minimal RED reproducer for that regression
+before changing production code.
 
-- [ ] **Step 3: Snapshot before callback**
+- [ ] **Step 3: Verify snapshot-before-callback implementation**
 
-Implement `try_dereference` with one short borrow:
+Verify `try_dereference` has this one-short-borrow shape:
 
 ```rust
 pub(crate) fn try_dereference(&self) -> Result<()> {
@@ -861,12 +998,15 @@ cargo test -p flpdf --lib reader::tests::dropping_pdf_breaks_the_pages_parent_re
 
 Expected: all pass; no borrow panic; resolver call log contains exactly the latest ObjGen once.
 
-- [ ] **Step 5: Commit metadata and borrow safety**
+- [ ] **Step 5: Commit only if this checkpoint found a regression**
 
 ```bash
 git add crates/flpdf/src/object_handle.rs
 git commit -m "fix(object_handle): use latest promotion metadata during resolution"
 ```
+
+If all focused tests pass and no code changes are required, record Task 4 as
+complete with the verification evidence and no commit.
 
 ---
 
