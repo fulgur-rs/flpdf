@@ -72,6 +72,29 @@ pub type ResourceConflicts =
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
 
+    /// The document-side half of `QPDFObjectHandle::warn`
+    /// (`libqpdf/QPDFObjectHandle.cc:2385-2396`): `QPDF::warn`
+    /// (`libqpdf/QPDF.cc:487-494`) reached from an object rather than from a
+    /// caller that holds the document.
+    ///
+    /// The message arrives fully formed, as qpdf's `QPDFExc` is by the time
+    /// it reaches `QPDF::warn`. It carries no location: the emitters fill the
+    /// exception's filename with `""` and its object slot with an object
+    /// description, which is not yet propagated.
+    ///
+    /// The default reports rather than swallows, matching
+    /// [`Self::pipe_stream_data`]'s. Every document-backed resolver overrides
+    /// it; qpdf has no resolver that cannot warn, so reaching this default is
+    /// the same condition as qpdf's null context, which `QPDFObjectHandle::warn`
+    /// also turns into a thrown exception.
+    #[allow(dead_code)] // reached once the try_* accessors gain production
+                        // consumers in flpdf-25kg.3.6
+    fn warn(&self, message: String) -> Result<()> {
+        Err(Error::Internal(format!(
+            "warning raised through a resolver with no document warning sink: {message}"
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pipe_stream_data(
         &self,
@@ -894,6 +917,60 @@ impl ObjectHandle {
             )));
         };
         resolver.resolve_indirect(object_ref, self)
+    }
+
+    /// The document that owns this handle, qpdf's `QPDF* context`.
+    ///
+    /// `QPDFValue::qpdf` is set by the description machinery
+    /// (`libqpdf/qpdf/QPDFValue.hh:60-83`), so upstream a direct object
+    /// parsed out of a file carries a context as well as an indirect one.
+    /// Here only a canonical indirect slot does, and a direct handle takes
+    /// the no-context branch — which is qpdf's own behavior for an object
+    /// built without a document, as `QPDFObjectHandle::parse` from a string
+    /// produces.
+    #[allow(dead_code)] // reached through the try_* accessors, whose own
+                        // production consumers land with flpdf-25kg.3.6
+    fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
+        self.0.borrow().resolver.as_ref().and_then(Weak::upgrade)
+    }
+
+    /// Emit `message` through this handle's context, or report it as the
+    /// error qpdf throws when there is none.
+    ///
+    /// Ports `QPDFObjectHandle::warn`
+    /// (`libqpdf/QPDFObjectHandle.cc:2385-2396`), whose contextless arm is
+    /// `throw e`. `QPDFExc` derives from `std::runtime_error`
+    /// (`include/qpdf/QPDFExc.hh:29`), which this crate classifies as
+    /// [`crate::Error::System`]; with an empty filename, object description,
+    /// and offset, `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`) renders
+    /// `what()` as the bare message, which is what that variant displays.
+    #[allow(dead_code)] // same deferred consumers as `context`
+    fn warn_through_context(&self, message: String) -> Result<()> {
+        match self.context() {
+            Some(context) => context.warn(message),
+            None => Err(Error::System(message)),
+        }
+    }
+
+    /// Report that an accessor expecting `expected_type` ran on this handle.
+    ///
+    /// Ports `QPDFObjectHandle::typeWarning`
+    /// (`libqpdf/QPDFObjectHandle.cc:2168-2189`). qpdf dereferences first and
+    /// throws `std::logic_error` when it cannot; [`Self::try_dereference`]
+    /// already returns [`crate::Error::Internal`], this crate's counterpart,
+    /// for the one state that cannot resolve.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::System`] when no owning document is reachable,
+    /// mirroring the exception qpdf throws instead of warning.
+    #[allow(dead_code)] // same deferred consumers as `context`
+    pub(crate) fn type_warning(&self, expected_type: &str, warning: &str) -> Result<()> {
+        self.try_dereference()?;
+        self.warn_through_context(format!(
+            "operation for {expected_type} attempted on object of type {}: {warning}",
+            self.type_name()
+        ))
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
@@ -9187,6 +9264,113 @@ mod mutation_tests {
         assert_eq!(
             dest.get_key(b"Font").get_key(new_name).as_integer(),
             Some(2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod warning_emission_tests {
+    use super::*;
+
+    /// A document that records every warning an object emits through it.
+    struct WarningRecorder {
+        value: ObjectValue,
+        warnings: RefCell<Vec<String>>,
+    }
+
+    impl DocumentResolver for WarningRecorder {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            handle.set_resolved(self.value.clone());
+            Ok(())
+        }
+
+        fn warn(&self, message: String) -> crate::Result<()> {
+            self.warnings.borrow_mut().push(message);
+            Ok(())
+        }
+    }
+
+    /// An indirect handle that resolves to `value`, paired with the document
+    /// it warns through.
+    fn handle_resolving(value: ObjectValue) -> (ObjectHandle, Rc<WarningRecorder>) {
+        let recorder = Rc::new(WarningRecorder {
+            value,
+            warnings: RefCell::new(Vec::new()),
+        });
+        // The erased `Rc` shares its allocation with `recorder`, so the
+        // returned recorder is what keeps the handle's `Weak` upgradable.
+        let erased: Rc<dyn DocumentResolver> = recorder.clone();
+        let handle =
+            ObjectHandle::new_indirect_with_resolver(ObjectRef::new(3, 0), Rc::downgrade(&erased));
+        (handle, recorder)
+    }
+
+    fn warnings(recorder: &Rc<WarningRecorder>) -> Vec<String> {
+        recorder.warnings.borrow().clone()
+    }
+
+    #[test]
+    fn type_warning_through_a_context_matches_qpdf_message_text() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
+
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn type_warning_names_the_type_it_actually_found() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Name(b"Foo".to_vec()));
+
+        handle.type_warning("integer", "returning 0").unwrap();
+
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for integer attempted on object of type name: returning 0"]
+        );
+    }
+
+    #[test]
+    fn type_warning_without_a_context_returns_the_error_qpdf_throws() {
+        let handle = ObjectHandle::integer(7);
+
+        let error = handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::System(ref message)
+                if message
+                    == "operation for dictionary attempted on object of type integer: \
+                        treating as empty"
+        ));
+    }
+
+    #[test]
+    fn two_warnings_from_one_handle_reach_the_sink_in_emission_order() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
+        handle.type_warning("array", "treating as empty").unwrap();
+
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "operation for dictionary attempted on object of type integer: treating as empty",
+                "operation for array attempted on object of type integer: treating as empty",
+            ]
         );
     }
 }
