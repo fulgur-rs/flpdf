@@ -60,17 +60,23 @@ itself.
 | `QPDF_optimization.cc` | `optimization.rs` |
 | `QPDF_pages.cc` | `pages.rs` + `page_tree_rebuild.rs` |
 
-**発見**: `reader.rs` の `impl<R: Read + Seek> Pdf<R>` ブロック（607-3326行、
-99メソッド）を実際に読むと、上記5ファイルに対応するエントリポイント
-メソッド（`is_encrypted`/`authenticate_if_encrypted`/`permissions` 等10個。
-`signatures` は下記の通り QPDF_encryption.cc とは無関係なので除く）が
-**reader.rs 側にも重複して存在する**。これは「reader.rs が大きすぎる」
-問題の一部が、実は「本来別の場所にあるべきコードが reader.rs に
-漏れ出している」問題であることを示す。
+**発見**: `reader.rs` の `impl<R: Read + Seek> Pdf<R>` ブロック（分析当時は
+607-3326行・99メソッド。`flpdf-0b12` が8メソッドを `pdf.rs` へ抽出した後の
+現状は444-3051行・91メソッド）を実際に読むと、上記5ファイルに対応する
+エントリポイントメソッド（`is_encrypted`/`authenticate_if_encrypted`/
+`permissions` 等10個。`signatures` は下記の通り QPDF_encryption.cc とは
+無関係なので除く）が**reader.rs 側にも重複して存在する**。これは
+「reader.rs が大きすぎる」問題の一部が、実は「本来別の場所にあるべき
+コードが reader.rs に漏れ出している」問題であることを示す。
 
-同様に `linearized_hint_ref`（`reader.rs:1815`、実装コメントが
+同様に `linearized_hint_ref`（`reader.rs:1541-1575`、実装コメントが
 `QPDF_linearization.cc:139-141` を明記）も既存の `linearization/` の
 責務が reader.rs 側に漏れ出している一例。
+
+**行番号の注記**: 以下、本設計文書内の `reader.rs:NNNN` 引用は
+`flpdf-0b12`（commit `56a01c2b`）適用後、つまり `pdf.rs` 抽出済みの
+現行 `reader.rs` を指す（`refactor/flpdf-0b12-pdf-module` ブランチで
+再確認済み）。
 
 ### `QPDF::Members` の実フィールドが Document/Engine の混在を裏付ける
 
@@ -138,10 +144,17 @@ commit `56a01c2b`）で実装され、解決済み**: `Pdf<R>` の全フィー�
 子モジュールとして宣言する」という案は不採用**（`pub(crate)` の方が
 遥かに小さい変更で同じ問題を解く）。
 
-`pdf.rs` へ実際に移動したのは8メソッド + `unique_id` + `Drop` impl のみ:
-`version`, `trailer`, `trailer_handle`, `trailer_key_handle`, `root_ref`,
-`adobe_extension_level`, `ever_called_get_all_pages`,
-`mark_get_all_pages_called`。**以前の版では `adobe_extension_level`/
+`pdf.rs` へ実際に移動したのは8メソッド + `Drop` impl のみ（`crates/flpdf/src/
+pdf.rs:179-` で確認済み）: `version`, `trailer`, `trailer_handle`,
+`trailer_key_handle`, `root_ref`, `adobe_extension_level`,
+`ever_called_get_all_pages`, `mark_get_all_pages_called`。**`unique_id()`
+アクセサ（フィールド自体は `struct Pdf` と共に `pdf.rs` にあるが、
+`pub(crate) fn unique_id(&self) -> u64 { self.unique_id }` という
+アクセサメソッドは reader.rs:1703 に残ったまま**——以前の版の「`unique_id`
+も移動済み」という記載は誤りだったため訂正する。qpdf の `getTrailer()`
+と同じ trivial 基準（下記参照）で `pdf.rs` へ移すのが妥当だが、
+`flpdf-0b12` の実装範囲には含まれていない。**以前の版では
+`adobe_extension_level`/
 `trailer_handle`/`trailer_key_handle` を「内部で resolve()/lift() を呼ぶ
 から」という理由で `resolve.rs` へ再分類する提案をしていたが、実装は
 この3つも他5メソッドと同じ「direct document-state accessor」グループとして
@@ -167,9 +180,10 @@ reader.rs に残ったまま）。
 
 **`security/standard.rs`/`encrypt_setup.rs`/`permissions.rs`/
 `object_copy.rs` も同じ解決法をそのまま使える**: `is_encrypted`
-（`self.encryption.borrow()`、`reader.rs:183,721-723`）や
-`take_foreign_object_map`（`self.foreign_object_maps`、
-`reader.rs:110,1981-`）のようなエントリポイントを移す際は、`flpdf-0b12`
+（`self.encryption.borrow()`。フィールド定義は `pdf.rs:154`、メソッド本体は
+`reader.rs:558-560`）や `take_foreign_object_map`（`self.foreign_object_maps`。
+フィールド定義は `pdf.rs:81`、メソッド本体は `reader.rs:1707-`）のような
+エントリポイントを移す際は、`flpdf-0b12`
 と同じ手法（該当フィールド／呼び出し先ヘルパーを `pub(crate)` にする）を
 適用する。`is_dirty`/`live_object_refs` 等が返す値の型は既に外部公開
 されているため、これは新規の公開面拡大ではない。
@@ -178,14 +192,17 @@ reader.rs に残ったまま）。
 - `struct Pdf<R>` 定義（全フィールド `pub(crate)`）、`Drop` impl
 - `version`, `trailer`, `trailer_handle`, `trailer_key_handle`, `root_ref`,
   `adobe_extension_level`, `ever_called_get_all_pages`,
-  `mark_get_all_pages_called`, `unique_id`（direct document-state
-  accessor として1グループにまとめる。`adobe_extension_level` が内部で
-  `resolve()`/`lift()` を呼ぶ点は上記モジュール階層節を参照）
-- `unique_id`（`reader.rs:1977-1979`、`self.unique_id` を返すのみ）は
-  **`obj_cache.rs` には含めない**（後述）: 消費者（`filespec_helper.rs:115`/
-  `embedded_files.rs:492`/`object_copy.rs:126`）はいずれも document
-  identity の照合（handle の所属確認・foreign-copy state のキー）に
-  使っており、object cache の CRUD ではない
+  `mark_get_all_pages_called`（direct document-state accessor として
+  1グループにまとめる。`adobe_extension_level` が内部で `resolve()`/
+  `lift()` を呼ぶ点は上記モジュール階層節を参照）
+- **未移動（今後の対象）**: `unique_id()` アクセサ（`reader.rs:1703`、
+  `self.unique_id` を返すのみ）は `flpdf-0b12` の移動対象に含まれて
+  おらず、まだ reader.rs に残っている。**`obj_cache.rs` には含めない**
+  （後述）: 消費者（`filespec_helper.rs:115`/`embedded_files.rs:492`/
+  `object_copy.rs:126`）はいずれも document identity の照合（handle の
+  所属確認・foreign-copy state のキー）に使っており、object cache の
+  CRUD ではない。`getTrailer()` と同じ trivial 基準（上記モジュール
+  階層節）により、移動する際は `pdf.rs` の直接アクセサ群に加える
 - 「reader.rs にあるのがおかしい」の根本原因（crate全体で使う中心型が
   narrow-purpose に見えるファイル名の下にある）をここで解消
 
@@ -215,11 +232,11 @@ reader.rs に残ったまま）。
   （`xref.rs` の既存 API を呼ぶだけで xref.rs 自体は変更しない — 詳細は
   「非目標」参照）, `resolve_to_cache`, `native_parse_uncompressed_value` 等
 - **`decrypt_resolved_object` の private 依存閉包もここに含める**:
-  `decrypt_object_strings`(`reader.rs:3519-`), `decrypt_stream_bytes`
-  (`reader.rs:3791-`), `apply_explicit_crypt_filters`(`reader.rs:3810-`),
-  `stream_has_explicit_crypt_filter`(`reader.rs:3943-`),
-  `is_metadata_stream`(`reader.rs:3954-`),
-  `warn_unknown_crypt_filters`（`reader.rs:3197-`、`&self` メソッド）。
+  `decrypt_object_strings`(`reader.rs:3236-`), `decrypt_stream_bytes`
+  (`reader.rs:3508-`), `apply_explicit_crypt_filters`(`reader.rs:3527-`),
+  `stream_has_explicit_crypt_filter`(`reader.rs:3660-`),
+  `is_metadata_stream`(`reader.rs:3671-`),
+  `warn_unknown_crypt_filters`（`reader.rs:2923-`、`&self` メソッド）。
   含めないと resolve 時復号ロジックの本体が reader.rs に残る
 - **`source_xref_offsets`, `source_xref_entries`, `source_header_offset`,
   `previous_xref_offset`, `last_xref_form`, `compressed_parent` もここに
@@ -230,17 +247,17 @@ reader.rs に残ったまま）。
   xref 由来構造情報を返す resolve/seek 隣接の状態なので、`resolve.rs`
   が正しい置き場所
 - **`source_bytes`, `lift_object_to_handle`, `source_stream_data_offset`
-  もここに含める**。`source_bytes`（`reader.rs:1649-1651`、
+  もここに含める**。`source_bytes`（`reader.rs:1380-1382`、
   `self.resolver.read_physical_input()` に委譲）の production caller は
-  `writer.rs:983`。`lift_object_to_handle`（`reader.rs:1325-1327`、
+  `writer.rs:983`。`lift_object_to_handle`（`reader.rs:1056-1058`、
   `self.lift_to_handle_bounded` へ委譲 — 上記の `lift*` 系そのもの）の
   production caller は `embedded_files.rs`/`form_field_object_helper.rs`/
-  `json_inspect.rs`。`source_stream_data_offset`（`reader.rs:1362-`、
+  `json_inspect.rs`。`source_stream_data_offset`（`reader.rs:1093-`、
   `self.resolver.xref_entry(...)` を読む）は `pub fn`（クレート外公開API）
   で、resolve/seek の一次プリミティブに直接依存する
 - `adobe_extension_level`/`trailer_handle`/`trailer_key_handle` は
   ここに**含めない**（`pdf.rs` 参照）。qpdf の `QPDF::getExtensionLevel()`
-  （`QPDF.cc:2328-2346`）は多段の間接参照 chain walk を行う実処理で
+  （`QPDF.cc:2329-2346`）は多段の間接参照 chain walk を行う実処理で
   `getTrailer()` のような単純な field 返却ではないが、`flpdf-0b12` の
   実装は「direct document-state accessor」という括りでこの3つを他の
   trivial アクセサと同じ `pdf.rs` にまとめて置いた（呼び出し先の
@@ -260,9 +277,9 @@ reader.rs に残ったまま）。
   `mark_object_handle_dirty`, `make_indirect_object_handle`,
   `get_all_object_handles`, `resolved_count`, `deleted_object_refs`
   （`resolved_count`/`deleted_object_refs` は `self.cache` への直接委譲、
-  `reader.rs:1655-1661` で確認済み）
+  `reader.rs:1386-1392` で確認済み）
 - **`get_object_handle` も engine.rs からここへ再分類**。自身の doc
-  コメント（`reader.rs:1849-1850`）が「This does not perform file I/O or
+  コメント（`reader.rs:1575-1576`）が「This does not perform file I/O or
   force object-body parsing」と明記し、qpdf の `QPDF::getObject`
   （`QPDF.cc:1951-1959`、obj_cache の登録/参照のみ）に対応する
   identity 操作であって resolve ではない。`is_canonical_object_handle`/
@@ -277,44 +294,44 @@ reader.rs に残ったまま）。
   の既存受け皿（`security/standard.rs` / `encrypt_setup.rs` /
   `permissions.rs`）へ移す。reader.rs 側の実装は重複であり、削除対象。
   **この10個の公開メソッドだけでは実装が終わらない**: `authenticate_if_
-  encrypted`（`reader.rs:945-`）は reader.rs 内で private 定義されている
-  `EncryptionState`(`reader.rs:197-`)/`EncryptionMode`(`reader.rs:470-`)/
+  encrypted`（`reader.rs:782-`）は reader.rs 内で private 定義されている
+  `EncryptionState`(`reader.rs:54-`)/`EncryptionMode`(`reader.rs:327-`)/
   `required_revision`/`required_version`/`required_permissions`
-  (`reader.rs:4228-4292`)/`interpret_cf`(`reader.rs:4263-`)/
-  `crypt_filter_modes`(`reader.rs:4293-`) に依存する。**さらに**
+  (`reader.rs:3883-3957` 付近)/`interpret_cf`(`reader.rs:3980-`)/
+  `crypt_filter_modes`(`reader.rs:4010-`) に依存する。**さらに**
   `decode_hex_file_key`/`standard_handler_inputs`/
   `standard_handler_r5_inputs`/`map_uo_length_to_bad_password`/
-  `encrypt_metadata_flag`/`r6_perms_warning`（`reader.rs:1034-1150` 付近が
-  これらを呼ぶ）/`first_file_id`（`reader.rs:4393-`）も同じ依存閉包に
-  含まれる（全て `reader.rs:4033-4393` 付近に private 定義）。**さらに**
+  `encrypt_metadata_flag`/`r6_perms_warning`（`reader.rs:782-` 付近が
+  これらを呼ぶ）/`first_file_id`（`reader.rs:4110-`）も同じ依存閉包に
+  含まれる（全て `reader.rs:3750-4149` 付近に private 定義）。**さらに**
   `standard_handler_inputs`/`standard_handler_r5_inputs` 自体が呼ぶ
   `required_integer`/`required_name`/`required_32_byte_string`/
-  `required_48_byte_string`/`crypt_filter_method`（`reader.rs:4033-4149`
+  `required_48_byte_string`/`crypt_filter_method`（`reader.rs:4039-4149`
   付近）と、`interpret_cf` が呼ぶ `interpret_cf_name`
-  （`reader.rs:4238-4270`）も同じ依存閉包に含まれる。これらの
+  （`reader.rs:3955-`）も同じ依存閉包に含まれる。これらの
   ヘルパー型・関数も同じ移動対象に含める（`docs/qpdf-correspondence.md:136` が
   `interpret_cf` 系を既に `QPDF::interpretCF`（`QPDF_encryption.cc:700-716`）
   対応として記録済み）。含めないと暗号ロジックの大半が reader.rs に
   残ったまま、10個の薄いラッパーだけを移動することになる
-- `signatures`（`reader.rs:871-873`、`crate::signatures::signatures` への
+- `signatures`（`reader.rs:708-710`、`crate::signatures::signatures` への
   薄い委譲）は上記グループに**含めない**。qpdf の `QPDF.cc` に signature
   関連コードは0件、`QPDFAcroFormDocumentHelper.cc` にあるのも
   `disableDigitalSignatures()`（削除のみ）で検査/読み取り API は無い
   （`docs/qpdf-correspondence.md:367` の記載も同じ）。qpdf に対応物のない
   flpdf 独自機能なので、既存 `signatures.rs` へ移す
-- `take_foreign_object_map`/`set_foreign_object_map`（`reader.rs:1981-1995`）
-  は `obj_cache.rs` に**含めない**。qpdf `Members::obj_cache`
+- `take_foreign_object_map`/`set_foreign_object_map`（`reader.rs:1707-1725`
+  付近）は `obj_cache.rs` に**含めない**。qpdf `Members::obj_cache`
   （`QPDF.hh:1467`）とは別フィールドの `Members::object_copiers`
   （`QPDF.hh:1476`、`ObjCopier::object_map`）に対応し、production caller は
   `object_copy.rs` の `copyForeignObject` 実装のみ（grep で確認済み）。
   既存 `object_copy.rs` へ移す
-- `linearized_hint_ref`（`reader.rs:1815-1837`、コメントが
+- `linearized_hint_ref`（`reader.rs:1541-1575`、コメントが
   `QPDF_linearization.cc:139-141` を明記）は既存 `linearization/` へ移す
-- JSON 出力準備群（`QpdfPreparedObjects`(`reader.rs:186-189`),
-  `prepare_qpdf_json_objects`(`reader.rs:1728-1777`),
-  `qpdf_json_live_object_refs`(`reader.rs:1788-1798`),
-  `resolve_qpdf_json_object`(`reader.rs:2943-2967`),
-  `resolve_qpdf_json_object_borrowed`(`reader.rs:2976-`)）は
+- JSON 出力準備群（`QpdfPreparedObjects`(`reader.rs:43-`),
+  `prepare_qpdf_json_objects`(`reader.rs:1459-`),
+  `qpdf_json_live_object_refs`(`reader.rs:1519-`),
+  `resolve_qpdf_json_object`(`reader.rs:2669-`),
+  `resolve_qpdf_json_object_borrowed`(`reader.rs:2702-`)）は
   `pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs` のどれにも含めない。
   production caller は `document_json.rs:151`
   （`prepare_qpdf_json_objects`）で、既存の `QPDF_json.cc` 出力側の受け皿
@@ -386,7 +403,7 @@ reader.rs に残ったまま）。
    `:200` `Pl_RC4`）ので、これら6行も併せて `resolve.rs` を指すよう
    更新する（`QPDF.cc` 行だけ直して他を放置すると存在しないファイルを
    指す行が残る）。`reader.rs` には legacy な
-   `Pdf::resolve`/`Pdf::resolve_borrowed`（`reader.rs:2702-2725`、
+   `Pdf::resolve`/`Pdf::resolve_borrowed`（`reader.rs:2428-2451`、
    doc コメントで `qpdf-cutover-delete(flpdf-25kg.3.3)` と明記）が
    残っており、production caller が実在する（`object_copy.rs:108,152`、
    `flpdf-cli/src/main.rs:3444` 等）。この2メソッドの削除は
