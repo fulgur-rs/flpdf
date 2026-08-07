@@ -16,23 +16,32 @@
 //! `filters::reject_crypt_stage`, which errors unconditionally, so no shape of
 //! `/DecodeParms` is currently distinguishable there. This belongs to the
 //! Phase 3 AES/Crypt cutover, where a provider that can succeed makes the
-//! difference observable; it is recorded here rather than fixed, and nothing
-//! in `flpdf-25kg.3.4` changes Crypt semantics.
+//! difference observable; it is recorded here rather than fixed.
+//!
+//! What is missing is the check, not its input: a `Crypt` stage's
+//! [`DecodeParams`] already carries the whole key set the check reads, with
+//! `/Type`'s name bytes intact — see [`retains_decode_param_key`].
 //!
 //! # Recorded deviation: `DecodeParams` is an owned, reduced snapshot
 //!
 //! qpdf replicates one `QPDFObjectHandle` — a `shared_ptr` — across the filter
 //! chain and copies no dictionary. [`DecodeParams`] owns its entries instead,
-//! so it retains only what some consumer reads:
-//! [`RETAINED_DECODE_PARAM_KEYS`] under every filter,
-//! [`CRYPT_RETAINED_DECODE_PARAM_KEY`] under `Crypt` alone, and a name's bytes
-//! only under that one key ([`is_crypt_name_key`]) — elsewhere a name reduces
-//! to [`ParamValue::Other`], which no consumer can tell apart. Output bytes,
-//! filterability and error timing are unaffected — `SF_FlateLzwDecode`'s key
-//! walk (`libqpdf/SF_FlateLzwDecode.cc:32-66`) has no `else` arm, so a key it
-//! does not name never reaches its `filterable`, and nothing reconstructs an
-//! emitted `/DecodeParms` from this type; the writer copies the source
-//! dictionary.
+//! so it retains only what some consumer reads
+//! ([`retains_decode_param_key`]): [`RETAINED_DECODE_PARAM_KEYS`] under every
+//! filter, and **every key under `Crypt`**, whose `setDecodeParms` reads the
+//! whole key set. A name's bytes survive only under the two keys some consumer
+//! compares them against ([`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]); elsewhere
+//! a name reduces to [`ParamValue::Other`], which no consumer can tell apart.
+//!
+//! Output bytes and error timing are unaffected: nothing reconstructs an
+//! emitted `/DecodeParms` from this type — the writer copies the source
+//! dictionary. **Filterability is decided from this snapshot**, so the
+//! retained set has to be exactly what each `setDecodeParms` reads.
+//! `SF_FlateLzwDecode`'s key walk (`libqpdf/SF_FlateLzwDecode.cc:32-66`) has
+//! no `else` arm, so a key it does not name never reaches its `filterable` and
+//! the five geometry keys suffice there. `SF_Crypt::setDecodeParms`
+//! (`libqpdf/QPDF_Stream.cc:33-50`) has an `else` arm that refuses on any
+//! other key, which is why a `Crypt` stage keeps all of them.
 
 use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85::Ascii85Decoder;
@@ -107,17 +116,20 @@ pub(crate) enum DecodeParams {
 /// [`param_value_without_resolving`] for what such a value classifies as and
 /// why that classification is unobservable. This enum is the same either way.
 ///
-/// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for `Crypt`'s
-/// `/Name`, which selects the crypt filter, so carrying it now keeps Phase 3's
-/// AES/Crypt cutover from having to widen this shared type. Every
-/// `StreamFilter` still treats the two identically; only the Crypt stage's
-/// provider closure is positioned to tell them apart.
+/// The `Name`/`Other` split is flpdf's, not qpdf's: `Name` exists for the two
+/// name comparisons a `Crypt` stage's consumers make — `/Name` selects the
+/// crypt filter and `/Type` is matched against `/CryptFilterDecodeParms` — so
+/// carrying it now keeps Phase 3's AES/Crypt cutover from having to widen this
+/// shared type. Every other `StreamFilter` still treats the two variants
+/// identically.
 ///
-/// **`Name` therefore carries a payload only where that provider reads one —
-/// the `/Name` key of a `Crypt` stage** ([`is_crypt_name_key`]). A name under
-/// any other retained key reduces to `Other`: `/Columns /Identity` is `Other`,
-/// not `Name(b"Identity")`. Nothing can tell the difference, because the only
-/// production match on either variant is `set_decode_params`' shared
+/// **`Name` therefore carries a payload only where one of those comparisons
+/// reads it — the `/Name` and `/Type` keys of a `Crypt` stage**
+/// ([`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]). A name under any other key
+/// reduces to `Other`: `/Columns /Identity` is `Other`, not
+/// `Name(b"Identity")`, and so is a `Crypt` stage's own `/Foo /Identity`.
+/// Nothing can tell the difference, because the only production match on
+/// either variant is `set_decode_params`' shared
 /// `ParamValue::Name(_) | ParamValue::Other => filterable = false` arm, and
 /// qpdf's counterpart asks `isInteger()` and never inspects a non-integer's
 /// kind. Keeping the payload anyway is what made a `DecodeParams` grow with
@@ -493,8 +505,9 @@ fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
 /// Is this the one filter name that is not a [`StreamFilter`]?
 ///
 /// The single spelling of the `b"Crypt"` literal
-/// [`filter_reads_decode_params`] and [`CRYPT_RETAINED_DECODE_PARAM_KEY`] both
-/// turn on. It still shadows the identical test in
+/// [`filter_reads_decode_params`], [`retains_decode_param_key`] and
+/// [`keeps_crypt_name_payload`] all turn on. It still shadows the identical
+/// test in
 /// `filters::prepare_decode_filters`, which is where a `Crypt` spec is routed
 /// away from the registry in the first place; the two must move together,
 /// because there is no registry entry to keep them in step.
@@ -545,14 +558,14 @@ fn decode_params_from_consuming_handle(
     params: &ObjectHandle,
     filter_name: &[u8],
 ) -> Result<DecodeParams> {
-    let retains_crypt_name = is_crypt_filter(filter_name);
+    let crypt_stage = is_crypt_filter(filter_name);
     let mut retained = Vec::new();
     for key in params.try_get_keys()? {
-        if !retains_decode_param_key(&key, retains_crypt_name) {
+        if !retains_decode_param_key(&key, crypt_stage) {
             continue;
         }
         let value = params.try_get_key(&key)?;
-        let keeps_name = is_crypt_name_key(&key, retains_crypt_name);
+        let keeps_name = keeps_crypt_name_payload(&key, crypt_stage);
         retained.push((key, param_value_from_handle(&value, keeps_name)?));
     }
     Ok(DecodeParams::Present(retained))
@@ -575,10 +588,10 @@ fn decode_params_from_entries(
     let Some(entries) = entries else {
         return Ok(DecodeParams::Present(Vec::new()));
     };
-    let retains_crypt_name = is_crypt_filter(filter_name);
+    let crypt_stage = is_crypt_filter(filter_name);
     let retained = entries
         .iter()
-        .filter(|(key, _)| retains_decode_param_key(key, retains_crypt_name))
+        .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
         .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
         .collect();
     Ok(DecodeParams::Present(retained))
@@ -587,11 +600,13 @@ fn decode_params_from_entries(
 /// Classify one `/DecodeParms` value, dereferencing it as qpdf's `isInteger`
 /// does.
 ///
-/// `keeps_name` is [`is_crypt_name_key`] for the key this value sits under: the
-/// name payload is owned only where the crypt provider reads one. Everywhere
-/// else a name reduces to [`ParamValue::Other`], which no consumer can
-/// distinguish from `Name` — see [`ParamValue`]. `try_as_name` still runs, so
-/// the dereference qpdf performs is unchanged; only the payload is dropped.
+/// `keeps_name` is [`keeps_crypt_name_payload`] for the key this value sits
+/// under: the name payload is owned only where a `Crypt` stage's consumers
+/// compare it. Everywhere else — including a `Crypt` stage's own unknown keys,
+/// which are retained for their names alone — a name reduces to
+/// [`ParamValue::Other`], which no consumer can distinguish from `Name` — see
+/// [`ParamValue`]. `try_as_name` still runs, so the dereference qpdf performs
+/// is unchanged; only the payload is dropped.
 fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<ParamValue> {
     if let Some(int) = value.try_as_integer()? {
         return Ok(ParamValue::Int(clamp_to_i32(int)));
@@ -611,10 +626,15 @@ fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<Par
 ///
 /// **No name test at all**, where the other two readers have one. This is
 /// reached only when [`filter_reads_decode_params`] is false, and
-/// [`is_crypt_filter`] implies that predicate, so [`is_crypt_name_key`] could
-/// never be true here: a payload kept at this position would be one nothing
-/// reads. A name reduces to `Other` exactly as it does under every other
-/// non-`Crypt` filter — see [`ParamValue`].
+/// [`is_crypt_filter`] implies that predicate, so
+/// [`keeps_crypt_name_payload`] could never be true here: a payload kept at
+/// this position would be one nothing reads. A name reduces to `Other` exactly
+/// as it does under every other non-`Crypt` filter — see [`ParamValue`].
+///
+/// That same implication is what confines [`retains_decode_param_key`]'s
+/// keep-every-key arm to `Crypt`: [`decode_params_from_entries`] passes the
+/// flag on, but the flag is unreachably `true` here, so a non-consuming stage
+/// keeps [`RETAINED_DECODE_PARAM_KEYS`] and no more.
 ///
 /// An indirect value that is *still unresolved* reduces to `Other` — the same
 /// thing the `Object` reader yields for `Object::Reference`. An indirect value
@@ -642,21 +662,22 @@ fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
 /// `Object::Reference` it classifies as [`ParamValue::Other`] without looking
 /// through (plan decision D1 of `flpdf-25kg.3.4`). `filter_name` decides both
 /// whether qpdf's filter enumerates entries — and therefore whether direct
-/// `Object::Null` values are omitted — and whether `/Name` is retained for
-/// `Crypt`. References and every other non-null shape remain
-/// `ParamValue::Other` when retained.
+/// `Object::Null` values are omitted — and whether the stage is the `Crypt`
+/// one that keeps every key ([`retains_decode_param_key`]) with name payloads
+/// under [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]. References and every other
+/// non-null shape remain `ParamValue::Other` when retained.
 fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> DecodeParams {
     let omits_null_values = filter_reads_decode_params(filter_name);
-    let retains_crypt_name = is_crypt_filter(filter_name);
+    let crypt_stage = is_crypt_filter(filter_name);
     match params {
         None | Some(Object::Null) => DecodeParams::Absent,
         Some(object) => DecodeParams::Present(match object.as_dict() {
             Some(dict) => dict
                 .iter()
                 .filter(|(_, value)| !omits_null_values || !matches!(value, Object::Null))
-                .filter(|(key, _)| retains_decode_param_key(key, retains_crypt_name))
+                .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
                 .map(|(key, value)| {
-                    let keeps_name = is_crypt_name_key(key, retains_crypt_name);
+                    let keeps_name = keeps_crypt_name_payload(key, crypt_stage);
                     (key.to_vec(), param_value_from_object(value, keeps_name))
                 })
                 .collect(),
@@ -988,8 +1009,9 @@ impl FlateLzwStreamFilter {
 
 /// The `/DecodeParms` keys some flpdf consumer reads under *every* filter.
 ///
-/// [`DecodeParams`] keeps only these, plus
-/// [`CRYPT_RETAINED_DECODE_PARAM_KEY`] under a `Crypt` stage. qpdf has no
+/// [`DecodeParams`] keeps only these, except under a `Crypt` stage, which
+/// keeps every key because its `setDecodeParms` reads every key — see
+/// [`retains_decode_param_key`]. qpdf has no
 /// counterpart, and needs none: it replicates a `QPDFObjectHandle` — a
 /// `shared_ptr` — across the filter chain and never copies the dictionary.
 /// `DecodeParams` owns its entries, so a scalar `/DecodeParms` replicated
@@ -1009,8 +1031,9 @@ impl FlateLzwStreamFilter {
 /// whichever name `filters::encode_stream_data` hands it and feeds that filter
 /// this same [`DecodeParams`], so dropping the geometry under a non-Flate name
 /// would change what the public encode path does with, say, `/Filter
-/// [/ASCII85Decode]` carrying `/Predictor 12`. `/Name` has no such second
-/// consumer, which is why it alone is per-filter.
+/// [/ASCII85Decode]` carrying `/Predictor 12`. The keys beyond these five have
+/// no such second consumer, which is why they are kept per-filter — under
+/// `Crypt` and nowhere else.
 ///
 /// This is *per key*, not per filter, within that set: `EarlyChange` survives
 /// under `/FlateDecode` even though `set_decode_params` consults it only for
@@ -1027,6 +1050,23 @@ impl FlateLzwStreamFilter {
 /// `ASCIIHexDecode` stage (49 of keys plus the 14-byte filter name), 1008 for
 /// a 16-stage chain — with a name of 16 bytes and of one mebibyte alike, in
 /// *every* retained slot at once rather than only under `/Name`.
+///
+/// **A `Crypt` stage is the exception. Per stage, it grows in key text.** It
+/// keeps every key, so its snapshot tracks the *number and length of the
+/// source's key names* — that is what makes filterability reproducible at all
+/// ([`retains_decode_param_key`]). It does not track the source's *values*:
+/// only [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`] carry a name payload, so an
+/// unknown key contributes its key bytes and nothing else.
+/// `a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry` pins that
+/// split as an exact figure, with an unknown key's value of one mebibyte.
+///
+/// **That is per stage, and the chain multiplies it.** An *n*-stage `/Crypt`
+/// chain sharing one scalar `/DecodeParms` holds *n* copies of that key text
+/// while the source grew by only *n* filter names, so the retained total is
+/// not bounded by the source's size — see
+/// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]' per-stage residual, which this
+/// widening enlarges from the `/Name` payload to the whole key set.
+/// `a_crypt_chain_holds_the_whole_key_set_once_per_stage` pins the product.
 ///
 /// **The retained keys were never the unbounded part.** They are drawn from
 /// this fixed array, so their total is fixed too, and shrinking the array was
@@ -1059,54 +1099,102 @@ const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
     b"Predictor",
 ];
 
-/// The one `/DecodeParms` key retained for `Crypt` stages and nowhere else.
+/// The two `/DecodeParms` keys whose *name payload* a `Crypt` stage's
+/// consumers read, and which are kept nowhere else.
 ///
-/// Plan decision D2 of `flpdf-25kg.3.4` has the crypt provider selecting its
-/// crypt filter from `/Name`, and `filters::CryptProvider` is
+/// `/Name` selects the crypt filter. Plan decision D2 of `flpdf-25kg.3.4` has
+/// the crypt provider doing that selection, and `filters::CryptProvider` is
 /// `FnMut(&DecodeParams, &[u8])` — no handle in it — so [`DecodeParams`] is
-/// that provider's only route to the name. Nothing else reads it: the base
+/// that provider's only route to the name. qpdf needs no such route:
+/// `decryptStream` re-reads it off the live object graph
+/// (`decode_parms.getKey("/Name")`, `libqpdf/QPDF_encryption.cc:1072`, and the
+/// `/CF` filter's own `/Name` at `:1085-1087`).
+///
+/// `/Type` decides whether the stage is filterable at all.
+/// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:44-46`) admits a
+/// `/Type`-bearing dictionary only when
+/// `isDictionaryOfType("/CryptFilterDecodeParms")` holds, and that is
+/// `getKey("/Type").isNameAndEquals(...)` (`QPDFObjectHandle.cc:462-466`) — a
+/// comparison against the name's bytes. Reduced to [`ParamValue::Other`] the
+/// value would be indistinguishable from `/Type /Foo`, which qpdf refuses.
+///
+/// No other key's payload is read anywhere: the base
 /// `StreamFilter::set_decode_params` reads only `is_absent()`,
-/// `FlateLzwStreamFilter::set_decode_params` matches only
-/// [`RETAINED_DECODE_PARAM_KEYS`] and lets every other key fall through its
+/// `FlateLzwStreamFilter::set_decode_params` asks `isInteger`-shaped questions
+/// of [`RETAINED_DECODE_PARAM_KEYS`] and lets every other key fall through its
 /// `_ => {}` arm, and [`png_encode_geometry`] reaches the parameters through
 /// that same filter.
 ///
-/// qpdf needs no such route. `SF_Crypt::setDecodeParms`
-/// (`libqpdf/QPDF_Stream.cc:33-50`) stores nothing at all — it only decides
-/// `filterable` and leaves the value to `decryptStream`, which re-reads it off
-/// the live object graph (`decode_parms.getKey("/Name")`,
-/// `libqpdf/QPDF_encryption.cc:1072`, and the `/CF` filter's own `/Name` at
-/// `:1085-1087`).
-///
 /// **This is a per-stage residual, not parity, and it is not a bound on the
-/// chain.** Each `Crypt` stage keeps its own copy, so `/Filter [/Crypt /Crypt
-/// …]` sharing one scalar `/DecodeParms` still holds one copy of the name per
-/// stage — capped by `filters::DecodeLimits::max_filter_chain` where a caller
-/// sets one (16 under `DecodeLimits::default()`) and uncapped where a caller
-/// passes `None`, which `filters::encode_stream_data` does unconditionally.
-/// qpdf holds zero copies at any chain length. Restricting retention to
-/// `Crypt` narrows the exposure to chains that name `Crypt`; it does not
+/// chain.** Each `Crypt` stage converts and keeps its own copy, so `/Filter
+/// [/Crypt /Crypt …]` sharing one scalar `/DecodeParms` holds, per stage, that
+/// dictionary's **whole key text** plus a payload for each of these two keys —
+/// [`retains_decode_param_key`] keeps every key under `Crypt`, so the residual
+/// is the key set and not just these two names. An *n*-stage chain therefore
+/// retains *n* × that quantity while the source grew by only the *n* filter
+/// names, which
+/// `a_crypt_chain_holds_the_whole_key_set_once_per_stage` pins as an exact
+/// figure at two chain lengths. It is capped by
+/// `filters::DecodeLimits::max_filter_chain` where a caller sets one (16 under
+/// `DecodeLimits::default()`) and uncapped where a caller passes `None`, which
+/// `filters::encode_stream_data` does unconditionally. qpdf holds one
+/// `shared_ptr` at any chain length.
+///
+/// Keeping every key is required — dropping one would accept a stream
+/// `SF_Crypt::setDecodeParms` rejects — so this residual is the cost of
+/// reproducing filterability, not an oversight to bound away. Restricting it
+/// to `Crypt` narrows the exposure to chains that name `Crypt`; it does not
 /// remove it.
-const CRYPT_RETAINED_DECODE_PARAM_KEY: &[u8] = b"Name";
+const CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS: [&[u8]; 2] = [b"Name", b"Type"];
 
-fn retains_decode_param_key(key: &[u8], retains_crypt_name: bool) -> bool {
-    RETAINED_DECODE_PARAM_KEYS.contains(&key) || is_crypt_name_key(key, retains_crypt_name)
+/// Does a stage's [`DecodeParams`] keep this key at all?
+///
+/// **A `Crypt` stage keeps every key, and that is this same rule rather than an
+/// exception to it.** The rule is "retain what the consumer reads", and
+/// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:33-50`) reads the whole
+/// key set: it walks `decode_parms.getKeys()` and sets `filterable = false` on
+/// the first key that is neither `/Type` nor `/Name`. A key dropped here is a
+/// key that stage could no longer refuse, so `/DecodeParms << /Foo 1 >>` would
+/// reach it as an empty entry set and be accepted where qpdf rejects.
+///
+/// Every other filter keeps [`RETAINED_DECODE_PARAM_KEYS`] only, because
+/// `SF_FlateLzwDecode::setDecodeParms` is the only other `setDecodeParms` that
+/// looks at an entry and it names exactly those five
+/// (`libqpdf/SF_FlateLzwDecode.cc:32-66`).
+///
+/// The cost of the `Crypt` arm is key bytes and nothing else:
+/// [`keeps_crypt_name_payload`] admits two keys, so an unknown key's value
+/// still reduces to [`ParamValue::Other`] — see [`RETAINED_DECODE_PARAM_KEYS`]'
+/// bound, which this widening therefore leaves standing for every filter but
+/// `Crypt`.
+fn retains_decode_param_key(key: &[u8], crypt_stage: bool) -> bool {
+    crypt_stage || RETAINED_DECODE_PARAM_KEYS.contains(&key)
 }
 
 /// Is this the entry whose *name payload* some consumer reads?
 ///
-/// The one place a `ParamValue::Name` keeps its bytes, and the same test
-/// [`retains_decode_param_key`] admits [`CRYPT_RETAINED_DECODE_PARAM_KEY`] by —
-/// spelled once so the two cannot drift into retaining a key whose value is
-/// then dropped, or owning a payload under a key that is not kept.
+/// The only place a `ParamValue::Name` keeps its bytes.
 ///
-/// `retains_crypt_name` is redundant with the key test at every present call
-/// site, since `/Name` is retained only under `Crypt`. It is passed anyway:
-/// consuming classification runs after `try_get_keys` filters nullish keys and
-/// after this retention test; a future reordering must not start owning
-/// payloads under every filter.
-fn is_crypt_name_key(key: &[u8], retains_crypt_name: bool) -> bool {
-    retains_crypt_name && key == CRYPT_RETAINED_DECODE_PARAM_KEY
+/// **A payload is never owned under a key that is not kept**, and that holds
+/// structurally rather than by keeping two lists aligned: this answers `true`
+/// only when `crypt_stage` does, and [`retains_decode_param_key`] answers
+/// `true` for *every* key when `crypt_stage` does. The shared flag is what the
+/// two cannot drift apart on, in place of the single key literal they used to
+/// share.
+///
+/// `crypt_stage` changes no *read's* answer as the two arrays stand today.
+/// This runs only for keys [`retains_decode_param_key`] already kept, and
+/// under a non-`Crypt` filter those are [`RETAINED_DECODE_PARAM_KEYS`], whose
+/// five keys happen to be disjoint from the array above. That disjointness is
+/// a property of the two current arrays, not a standing invariant: adding
+/// `/Name` to the geometry array would make them overlap and, without this
+/// gate, hand the payload back to every filter — the amplification
+/// [`RETAINED_DECODE_PARAM_KEYS`]' bound exists to prevent.
+///
+/// No read's answer depends on this gate today, so it is asserted directly by
+/// `a_name_payload_is_kept_under_a_crypt_stage_and_only_there`.
+fn keeps_crypt_name_payload(key: &[u8], crypt_stage: bool) -> bool {
+    crypt_stage && CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS.contains(&key)
 }
 
 /// Apply `getIntValueAsInt`'s saturation (`QPDFObjectHandle.cc:531-538`), which
@@ -1698,10 +1786,11 @@ pub(crate) mod tests {
     use super::{
         decode_filter_specs_from_handle, decode_filter_specs_from_object, decode_flate,
         decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
-        ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
-        Ascii85StreamFilter, AsciiHexStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter,
-        ObjectHandle, OutputBuffer, ParamValue, Pipeline, RunLengthStreamFilter, StreamFilter,
-        DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
+        ignore_codec_warning, ignore_warning, keeps_crypt_name_payload, normalize_filter_name,
+        stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter, DecodeParams, FilterSpec,
+        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline,
+        RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
@@ -1835,21 +1924,25 @@ pub(crate) mod tests {
         assert!(present[0].decode_params.entries().is_empty());
     }
 
-    /// Both halves of the reduction in one read: each value drops to its
-    /// bounded [`ParamValue`], and each key outside
-    /// [`RETAINED_DECODE_PARAM_KEYS`] drops entirely.
+    /// Each value drops to its bounded [`ParamValue`], and a null-valued key
+    /// drops entirely whatever its name.
     ///
     /// `/Whatever` carries the same `Object::Null` as the `/Predictor` above
-    /// it, which is omitted before bounded reduction. Only the key differs,
-    /// so the assertion separates "dropped because unread" from "dropped
-    /// because null". The public decode/encode behavior for this null-valued
-    /// row is asserted by `filters::tests::null_decode_params_values_are_omitted_before_decode_and_encode`
+    /// it. Under this `/Crypt` filter both are dropped for the same reason —
+    /// qpdf's `getKeys` (`libqpdf/QPDF_Dictionary.cc:118-127`) never reports a
+    /// null-valued entry, so neither reaches retention — which is what makes
+    /// the pair worth asserting here: a `Crypt` stage keeps every *reported*
+    /// key ([`retains_decode_param_key`]), so `/Whatever`'s absence can only be
+    /// the null omission. The public decode/encode behavior for this
+    /// null-valued row is asserted by
+    /// `filters::tests::null_decode_params_values_are_omitted_before_decode_and_encode`
     /// and by the corpus's "null-valued /DecodeParms key" row.
     ///
-    /// **The filter is `/Crypt` so that `/Name` is in the retained set at all**
-    /// ([`CRYPT_RETAINED_DECODE_PARAM_KEY`]); under `/FlateDecode` it would
-    /// drop as `/Whatever` does and this read would witness no
-    /// `ParamValue::Name` at all. Which filter it is changes nothing else
+    /// **The filter is `/Crypt` so that `/Name` is kept, and kept with its
+    /// bytes** ([`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]); under
+    /// `/FlateDecode` the key is outside [`RETAINED_DECODE_PARAM_KEYS`] and
+    /// drops, so this read would witness no `ParamValue::Name` at all. Which
+    /// filter it is changes nothing else
     /// here: the `Object` reader never resolves, so
     /// [`filter_reads_decode_params`] — the other decision a name settles —
     /// cannot reach this path.
@@ -1896,8 +1989,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// Exactly the keys a read keeps, spelled out — and that the set differs
-    /// by filter in exactly one key.
+    /// Exactly the keys a read keeps, spelled out — and that a `Crypt` stage's
+    /// set is the whole dictionary where every other filter's is five keys.
     ///
     /// **The expectation is a literal, not [`RETAINED_DECODE_PARAM_KEYS`]
     /// itself.** Reading the constant on both sides would be tautological in
@@ -1917,27 +2010,32 @@ pub(crate) mod tests {
     /// key moves both readers together.
     ///
     /// The two halves fail in opposite directions, which is what makes the
-    /// `Crypt`-only rule falsifiable from here. Measured on
+    /// `Crypt` rule falsifiable from here. Measured on
     /// `cargo test -p flpdf --lib`, in each direction:
     ///
-    /// - Dropping `/Name` from `retains_decode_param_key` outright reddens the
-    ///   `/Crypt` half — five tests, this one plus
-    ///   `filters::tests::crypt_stage_receives_the_name_parameter_a_provider_selects_on`,
-    ///   [`handle_reader_resolves_a_crypt_decode_parms_value`],
-    ///   [`object_shape_reader_reduces_each_parameter_value_to_its_bounded_shape`]
-    ///   and
-    ///   [`retained_decode_parameter_bytes_do_not_grow_with_a_name_valued_parameter`].
-    /// - Dropping the `Crypt` gate from [`is_crypt_name_key`], so `/Name` is
-    ///   kept whatever the filter, reddens the `/FlateDecode` half — two, this
-    ///   one and that byte test.
+    /// - Narrowing [`retains_decode_param_key`] back to
+    ///   `RETAINED_DECODE_PARAM_KEYS ∪ CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`,
+    ///   so a `Crypt` stage no longer keeps its unknown keys, reddens the
+    ///   `/Crypt` half — four tests, this one plus
+    ///   [`a_crypt_stage_retains_every_key_so_unknown_ones_stay_visible`],
+    ///   [`a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`] and
+    ///   [`a_crypt_chain_holds_the_whole_key_set_once_per_stage`].
     /// - Owning a name payload under *every* retained key — the half-fix that
-    ///   leaves `/Predictor /<long name>` amplifying — reddens two others:
-    ///   that byte test and
+    ///   leaves `/Predictor /<long name>` amplifying — reddens four: those two
+    ///   again,
+    ///   [`retained_decode_parameter_bytes_do_not_grow_with_a_name_valued_parameter`]
+    ///   and
     ///   [`a_non_resolving_read_classifies_direct_values_exactly_as_the_object_reader_does`].
+    /// - Dropping `/Type` from [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`] reddens
+    ///   exactly one, [`a_crypt_stage_keeps_the_type_name_bytes`] — so the two
+    ///   payload keys are independently droppable and each has its own witness.
     ///
-    /// No codec or encode-path test moved in any of the three, which is the
-    /// same enumeration [`CRYPT_RETAINED_DECODE_PARAM_KEY`] states from the
-    /// reading side.
+    /// No codec or encode-path test moved in any of the three.
+    ///
+    /// A fourth mutation belongs on this map but not in this test: dropping the
+    /// `crypt_stage` gate from [`keeps_crypt_name_payload`] reddens no read at
+    /// all, and is witnessed by
+    /// [`a_name_payload_is_kept_under_a_crypt_stage_and_only_there`] instead.
     #[test]
     fn the_object_reader_keeps_exactly_the_read_decode_parameter_keys() {
         let dictionary = params(&[
@@ -1984,8 +2082,131 @@ pub(crate) mod tests {
                 b"EarlyChange".to_vec(),
                 b"Name".to_vec(),
                 b"Predictor".to_vec(),
+                b"Unread".to_vec(),
             ]
         );
+    }
+
+    /// One direct `/Filter` + `/DecodeParms` pair as *both* shape readers
+    /// produce it, which must be the same specs.
+    ///
+    /// Retention and classification are applied separately in
+    /// [`decode_params_from_object`] and [`decode_params_from_consuming_handle`],
+    /// so a rule stated for one reader alone would go unnoticed by an
+    /// object-reader-only assertion. Both arguments are direct, which is what
+    /// makes agreement the right expectation at all — the two readers diverge
+    /// on an indirect child by design, as [`shape_corpus`] explains.
+    fn specs_from_both_readers(filter: &Object, parms: &Object) -> Vec<FilterSpec> {
+        let from_object = decode_filter_specs_from_object(Some(filter), Some(parms), None).unwrap();
+        let from_handle = decode_filter_specs_from_handle(
+            &handle_from_object(Some(filter)),
+            &handle_from_object(Some(parms)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(from_object, from_handle, "the two readers disagreed");
+        from_object
+    }
+
+    /// [`specs_from_both_readers`] for a single-stage `/Filter`.
+    fn decode_params_from_both_readers(filter: &[u8], parms: &Object) -> DecodeParams {
+        specs_from_both_readers(&Object::Name(filter.to_vec()), parms)
+            .swap_remove(0)
+            .decode_params
+    }
+
+    /// A `Crypt` stage keeps every key, because its qpdf counterpart reads
+    /// every key.
+    ///
+    /// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:33-50`) walks
+    /// `decode_parms.getKeys()` and sets `filterable = false` on the first key
+    /// that is neither `/Type` nor `/Name`. The key *set* is what decides
+    /// filterability there, so a key dropped during retention is a key the
+    /// stage can no longer refuse: `/DecodeParms << /Foo … >>` would arrive as
+    /// an empty entry set and be accepted where qpdf rejects.
+    ///
+    /// This is [`RETAINED_DECODE_PARAM_KEYS`]' own rule — keep what the
+    /// consumer reads — applied to a consumer that reads all of them. It is
+    /// not an exception carved out for `Crypt`.
+    ///
+    /// **The unknown key arrives without a value payload.** `/Foo` carries a
+    /// name and still reduces to [`ParamValue::Other`], exactly as a name
+    /// under a retained-but-unread key does everywhere else, so widening the
+    /// key set costs key bytes and nothing more;
+    /// [`a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`] is
+    /// the byte-level statement of that.
+    #[test]
+    fn a_crypt_stage_retains_every_key_so_unknown_ones_stay_visible() {
+        let params = decode_params_from_both_readers(
+            b"Crypt",
+            &params(&[
+                ("Foo", Object::Name(b"Identity".to_vec())),
+                ("Name", Object::Name(b"Identity".to_vec())),
+            ]),
+        );
+
+        assert_eq!(
+            params.entries(),
+            [
+                (b"Foo".to_vec(), ParamValue::Other),
+                (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
+            ]
+        );
+    }
+
+    /// `/Type` reaches a `Crypt` stage with its name bytes, because
+    /// `isDictionaryOfType` compares them.
+    ///
+    /// `SF_Crypt::setDecodeParms` accepts a `/Type`-bearing dictionary only
+    /// when `decode_parms.isDictionaryOfType("/CryptFilterDecodeParms")`
+    /// (`libqpdf/QPDF_Stream.cc:44-46`), which reads the `/Type` value's name.
+    /// [`ParamValue::Other`] would make that test irreproducible: it cannot be
+    /// told apart from `/Type /Foo`, which qpdf refuses.
+    ///
+    /// `/Type` is therefore the second key whose name payload some consumer
+    /// reads, alongside `/Name` — and, like `/Name`, only under `Crypt`.
+    #[test]
+    fn a_crypt_stage_keeps_the_type_name_bytes() {
+        let params = decode_params_from_both_readers(
+            b"Crypt",
+            &params(&[("Type", Object::Name(b"CryptFilterDecodeParms".to_vec()))]),
+        );
+
+        assert_eq!(
+            params.entries(),
+            [(
+                b"Type".to_vec(),
+                ParamValue::Name(b"CryptFilterDecodeParms".to_vec())
+            )]
+        );
+    }
+
+    /// The `crypt_stage` gate on [`keeps_crypt_name_payload`], asserted
+    /// directly because no read can reach it.
+    ///
+    /// **Predicate-level rather than end-to-end, because no read can reach the
+    /// gate.** It is consulted only for keys [`retains_decode_param_key`]
+    /// already kept, and under a non-`Crypt` filter those are
+    /// [`RETAINED_DECODE_PARAM_KEYS`], disjoint from the payload array — so
+    /// removing the gate changes no read's answer, measured. These assertions
+    /// are the only thing that turns red.
+    ///
+    /// The keys are spelled as literals rather than read from
+    /// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`], for the reason
+    /// [`the_object_reader_keeps_exactly_the_read_decode_parameter_keys`]
+    /// gives: reading the constant on both sides would shrink expectation and
+    /// result together.
+    #[test]
+    fn a_name_payload_is_kept_under_a_crypt_stage_and_only_there() {
+        assert!(keeps_crypt_name_payload(b"Name", true));
+        assert!(keeps_crypt_name_payload(b"Type", true));
+
+        assert!(!keeps_crypt_name_payload(b"Name", false));
+        assert!(!keeps_crypt_name_payload(b"Type", false));
+
+        // Not every key, even under `Crypt`: retention keeps `/Foo`, the
+        // payload rule does not.
+        assert!(!keeps_crypt_name_payload(b"Foo", true));
     }
 
     /// The bytes a read holds onto: each filter name, plus each retained key
@@ -2015,7 +2236,18 @@ pub(crate) mod tests {
             .sum()
     }
 
-    /// The cost [`RETAINED_DECODE_PARAM_KEYS`] exists to bound.
+    /// The cost [`RETAINED_DECODE_PARAM_KEYS`] exists to bound, **under every
+    /// filter but `Crypt`**.
+    ///
+    /// The scope is not an escape hatch. A `Crypt` stage keeps every key
+    /// ([`retains_decode_param_key`]) because `SF_Crypt::setDecodeParms`
+    /// (`libqpdf/QPDF_Stream.cc:33-50`) refuses on any key outside `/Type` and
+    /// `/Name`, so there the count of unread keys is precisely what decides
+    /// filterability and cannot be dropped. Bounding it away would make flpdf
+    /// accept streams qpdf rejects. What is still bounded there is the *value*
+    /// side, which is
+    /// [`a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`]. The
+    /// chain below is `ASCIIHexDecode` for that reason, not incidentally.
     ///
     /// **Not a qpdf-parity test.** qpdf replicates a `QPDFObjectHandle` — a
     /// `shared_ptr` — across the chain and copies no dictionary, so there is no
@@ -2047,7 +2279,7 @@ pub(crate) mod tests {
             for key in RETAINED_DECODE_PARAM_KEYS {
                 dictionary.insert(key, Object::Integer(1));
             }
-            // `/Name` is retained only under `/Crypt`, so beneath the
+            // `/Name` is kept only under `/Crypt`, so beneath the
             // `ASCIIHexDecode` chain below it is simply one more unread key.
             dictionary.insert("Name", Object::Name(vec![b'v'; 64]));
             // 64-byte keys with 64-byte `/Name` values, as measured.
@@ -2093,24 +2325,26 @@ pub(crate) mod tests {
     /// owns a heap buffer of the input's own size, and a scalar `/DecodeParms`
     /// replicated across the chain cloned it once per stage.
     ///
-    /// **Every retained key carries a name, not just `/Name`.** Restricting the
-    /// *key* `/Name` to `Crypt` does not bound this on its own, because a name
-    /// value fits any slot: `/Predictor /<one-mebibyte-name>` passes the key
-    /// test too. Measured against that half-fix — `/Name` `Crypt`-only but a
+    /// **Every retained key carries a name, not just `/Name`.** No rule on
+    /// *which keys are kept* bounds this, because a name value fits any slot:
+    /// `/Predictor /<one-mebibyte-name>` passes the geometry key test too.
+    /// Measured against that half-fix — `/Name` restricted to `Crypt` but a
     /// name payload owned wherever it appears — this chain retained 16,777,584
     /// bytes. Filling only one slot would let the next forgotten slot pass.
+    /// [`keeps_crypt_name_payload`] is what bounds it, which is why widening
+    /// the *key* set for `Crypt` did not move any figure here.
     ///
     /// **All three shape readers are measured**, because the legacy `Object`
     /// route [`decode_params_from_object`], consuming handle route
     /// [`decode_params_from_consuming_handle`], and non-consuming handle route
     /// [`decode_params_from_entries`] apply retention and classification
-    /// separately. The corpus's "/Name under a filter that is not Crypt" row
-    /// catches a rule applied to only one of these routes — measured, forcing
-    /// the non-consuming handle route's retention gate to `true` reddens
-    /// [`handle_reader_matches_object_reader_for_every_filter_shape`] naming
-    /// exactly that row — but it is a *relative* gate and would stay green if
-    /// the rule were dropped from all three routes together. This test is the
-    /// absolute one.
+    /// separately. The corpus's "/Name and /Type under a filter that reads no
+    /// entry" row catches a rule applied to only one of these routes —
+    /// measured, forcing the non-consuming handle route's retention gate to
+    /// `true` reddens [`handle_reader_matches_object_reader_for_every_filter_shape`]
+    /// naming exactly that row — but it is a *relative* gate and would stay
+    /// green if the rule were dropped from all three routes together. This
+    /// test is the absolute one.
     ///
     /// Both a non-consuming and a consuming filter are measured, because they
     /// classify through different functions
@@ -2134,19 +2368,6 @@ pub(crate) mod tests {
             dictionary.insert("Name", Object::Name(vec![b'v'; name_len]));
             Object::Dictionary(dictionary)
         };
-        let both_readers = |filter: &Object, parms: &Object| {
-            let from_object =
-                decode_filter_specs_from_object(Some(filter), Some(parms), None).unwrap();
-            let from_handle = decode_filter_specs_from_handle(
-                &handle_from_object(Some(filter)),
-                &handle_from_object(Some(parms)),
-                None,
-            )
-            .unwrap();
-            assert_eq!(from_object, from_handle, "the two readers disagreed");
-            from_object
-        };
-
         // One scalar `/DecodeParms` replicated across the chain: the shape the
         // review comments named, where a retained name is cloned per stage.
         // `ASCIIHexDecode` reads no entry, `FlateDecode` reads five.
@@ -2157,7 +2378,8 @@ pub(crate) mod tests {
             // which would only ever run on failure.
             let named = String::from_utf8_lossy(filter).into_owned();
             for name_len in [16, 1 << 20] {
-                let retained = retained_bytes(&both_readers(&chain, &all_slots_named(name_len)));
+                let retained =
+                    retained_bytes(&specs_from_both_readers(&chain, &all_slots_named(name_len)));
                 assert_eq!(
                     retained, expected,
                     "retained {retained} bytes under {named} at name length {name_len}"
@@ -2171,8 +2393,16 @@ pub(crate) mod tests {
         // authorized per-stage residual, so the figure grows with the name
         // where the others do not — and only for `/Name`, so the four other
         // slots' mebibyte names are still absent from it.
+        //
+        // Every key here is one the geometry set already kept, so the *key*
+        // widening a `Crypt` stage brings does not move this figure; what it
+        // costs is measured by
+        // `a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`.
         for name_len in [16, 1 << 20] {
-            let crypt = both_readers(&Object::Name(b"Crypt".to_vec()), &all_slots_named(name_len));
+            let crypt = specs_from_both_readers(
+                &Object::Name(b"Crypt".to_vec()),
+                &all_slots_named(name_len),
+            );
             assert!(crypt[0]
                 .decode_params
                 .entries()
@@ -2180,6 +2410,101 @@ pub(crate) mod tests {
             // 5 bytes of filter name, 49 of geometry keys, `Name` itself, and
             // its payload — once.
             assert_eq!(retained_bytes(&crypt), 5 + KEYS + 4 + name_len);
+        }
+    }
+
+    /// What a `Crypt` stage's widened key set actually costs: the *key* bytes
+    /// of each unknown entry, and not one byte of its value.
+    ///
+    /// [`a_crypt_stage_retains_every_key_so_unknown_ones_stay_visible`] states
+    /// the rule; this puts a number on it, because "no payload" is the half
+    /// that a bound depends on and that a `ParamValue` assertion at one small
+    /// size would not catch. The unknown key's value is a name of one mebibyte
+    /// in the second round, so a reader that owned payloads under every key
+    /// would miss the expected figure by a factor of 16,000.
+    ///
+    /// The unknown key is itself long (64 bytes) so that the key half is not
+    /// swamped by the constants around it: dropping unknown keys entirely —
+    /// the pre-widening behavior — misses the figure too.
+    ///
+    /// **`Crypt` is where the growth is authorized**, so this is the
+    /// counterpart of
+    /// [`retained_decode_parameter_bytes_do_not_grow_with_the_source_dictionary`],
+    /// which pins the *absence* of any such growth under every other filter.
+    #[test]
+    fn a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry() {
+        const UNKNOWN_KEY_LEN: usize = 64;
+
+        for name_len in [16, 1 << 20] {
+            let mut dictionary = Dictionary::new();
+            dictionary.insert("Name", Object::Name(vec![b'v'; name_len]));
+            dictionary.insert(
+                format!("Unread{:058}", 0),
+                Object::Name(vec![b'v'; name_len]),
+            );
+            let specs = specs_from_both_readers(
+                &Object::Name(b"Crypt".to_vec()),
+                &Object::Dictionary(dictionary),
+            );
+
+            // 5 bytes of filter name, `Name` plus its payload, and the unknown
+            // key's 64 bytes of key text — its mebibyte value is not there.
+            assert_eq!(
+                retained_bytes(&specs),
+                5 + 4 + name_len + UNKNOWN_KEY_LEN,
+                "at name length {name_len}"
+            );
+        }
+    }
+
+    /// The cell the two byte tests above leave uncrossed: a `Crypt` stage's
+    /// widened key set, replicated across a chain.
+    ///
+    /// [`retained_decode_parameter_bytes_do_not_grow_with_the_source_dictionary`]
+    /// runs a 16-stage chain but deliberately under `ASCIIHexDecode`, and
+    /// [`a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`] is a
+    /// single `Crypt` stage. Neither measures the product, which is where the
+    /// cost lives: one scalar `/DecodeParms` shared by an *n*-stage `/Crypt`
+    /// chain is converted and stored once per stage, so the retained total is
+    /// *n* × the source's whole key text while the source itself grew by only
+    /// the *n* filter names.
+    ///
+    /// **This pins a cost, not a bound**, which is why it asserts an equality
+    /// at two chain lengths rather than a ceiling. The growth is required:
+    /// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:33-50`) decides
+    /// filterability from the key set, so a stage that dropped keys to stay
+    /// small would accept streams qpdf rejects. The assertion therefore states
+    /// what the figure *is*, and fails just as loudly if a later change makes
+    /// it smaller. qpdf holds one `shared_ptr` at any chain length — see
+    /// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]' per-stage residual note, which
+    /// is the deviation this measures rather than a defect it guards.
+    ///
+    /// The unknown keys carry integers, so nothing here is payload: the figure
+    /// is key text alone, multiplied by the chain.
+    #[test]
+    fn a_crypt_chain_holds_the_whole_key_set_once_per_stage() {
+        const UNKNOWN_KEYS: usize = 8;
+        const UNKNOWN_KEY_LEN: usize = 64;
+        // Per stage: 5 bytes of filter name, `Name` (4) with its 8-byte
+        // payload, and eight 64-byte unknown keys carrying nothing — 529.
+        const PER_STAGE: usize = 5 + 4 + 8 + UNKNOWN_KEYS * UNKNOWN_KEY_LEN;
+
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Name", Object::Name(b"Identity".to_vec()));
+        for index in 0..UNKNOWN_KEYS {
+            dictionary.insert(format!("Unread{index:058}"), Object::Integer(1));
+        }
+        let parms = Object::Dictionary(dictionary);
+
+        for chain in [1, 16] {
+            let filter = Object::Array(vec![Object::Name(b"Crypt".to_vec()); chain]);
+            let retained = retained_bytes(&specs_from_both_readers(&filter, &parms));
+
+            assert_eq!(
+                retained,
+                chain * PER_STAGE,
+                "retained {retained} bytes across a {chain}-stage /Crypt chain"
+            );
         }
     }
 
@@ -2322,15 +2647,67 @@ pub(crate) mod tests {
                 Some(Object::Name(b"Crypt".to_vec())),
                 Some(params(&[("Name", Object::Name(b"Identity".to_vec()))])),
             ),
+            // The two shapes `SF_Crypt::setDecodeParms` decides on that no
+            // other filter's `setDecodeParms` looks at: a key outside
+            // `/Type`/`/Name`, which it refuses, and a `/Type` whose name it
+            // compares. Both are kept by `retains_decode_param_key`'s `Crypt`
+            // arm, and only `/Type` carries its name bytes out of the second.
+            (
+                "Crypt filter with a key it must refuse",
+                Some(Object::Name(b"Crypt".to_vec())),
+                Some(params(&[("Foo", Object::Name(b"Identity".to_vec()))])),
+            ),
+            (
+                "Crypt filter with /Type and /Name",
+                Some(Object::Name(b"Crypt".to_vec())),
+                Some(params(&[
+                    ("Name", Object::Name(b"Identity".to_vec())),
+                    ("Type", Object::Name(b"CryptFilterDecodeParms".to_vec())),
+                ])),
+            ),
             // The same `/DecodeParms` under a filter that is not `Crypt`.
-            // `CRYPT_RETAINED_DECODE_PARAM_KEY` makes the two rows differ —
-            // this one retains nothing — and nothing else in this corpus pairs
-            // a `/Name` with a non-`Crypt` filter, so without it a retention
-            // rule applied to only one reader would go unnoticed here.
+            // The `Crypt` arm of `retains_decode_param_key` makes the two rows
+            // differ — this one retains nothing — and nothing else in this
+            // corpus pairs a `/Name` with a non-`Crypt` filter, so without it a
+            // retention rule applied to only one reader would go unnoticed
+            // here. Like every row, it is a *relative* gate: it reddens when
+            // one reader is changed and not the other, and stays green when
+            // neither is. The absolute statements live in
+            // `a_crypt_stage_retains_every_key_so_unknown_ones_stay_visible`
+            // and `a_crypt_stage_keeps_the_type_name_bytes`, which assert
+            // through both readers.
             (
                 "/Name under a filter that is not Crypt",
                 Some(flate()),
                 Some(params(&[("Name", Object::Name(b"Identity".to_vec()))])),
+            ),
+            // The counterpart for `/Type`, which joined `/Name` as a
+            // name-payload key: under a non-`Crypt` filter it is dropped.
+            (
+                "/Type under a filter that is not Crypt",
+                Some(flate()),
+                Some(params(&[(
+                    "Type",
+                    Object::Name(b"CryptFilterDecodeParms".to_vec()),
+                )])),
+            ),
+            // A shape `filterable` genuinely distinguishes: `SF_ASCII85Decode`
+            // inherits the base `setDecodeParms`, `return decode_parms.isNull()`
+            // (`libqpdf/QPDFStreamFilter.cc:3-7`), so a present non-null
+            // `/DecodeParms` makes the stage unfilterable whatever its keys
+            // are — the opposite of the `/Crypt` rows above, where the keys
+            // decide. It is also the only way into `decode_params_from_entries`,
+            // the third retention site, which every other row here reaches
+            // past. Measured: forcing that route's `crypt_stage` to `true`
+            // reddens `handle_reader_matches_object_reader_for_every_filter_shape`
+            // naming this row.
+            (
+                "/Name and /Type under a filter that reads no entry",
+                Some(ascii85()),
+                Some(params(&[
+                    ("Name", Object::Name(b"Identity".to_vec())),
+                    ("Type", Object::Name(b"CryptFilterDecodeParms".to_vec())),
+                ])),
             ),
             (
                 "unknown filter name",
@@ -3113,8 +3490,9 @@ pub(crate) mod tests {
         // Every key is one `RETAINED_DECODE_PARAM_KEYS` keeps, so retention
         // cannot hide a classification difference by dropping the entry that
         // would have shown it. `ParamValue::Name` is not among the variants
-        // here and cannot be: it carries a payload only under `/Crypt`'s
-        // `/Name` (`is_crypt_name_key`), and neither filter below is `/Crypt`.
+        // here and cannot be: it carries a payload only under a `/Crypt`
+        // stage's `/Name` or `/Type` (`keeps_crypt_name_payload`), and neither
+        // filter below is `/Crypt`.
         // `handle_reader_resolves_a_crypt_decode_parms_value` and the corpus's
         // "Crypt filter" row are where the two readers are held to the same
         // answer for that variant.
@@ -3510,12 +3888,14 @@ pub(crate) mod tests {
     /// [`decode_params_from_object`] under `/FlateDecode`, for the filter tests
     /// below that feed a real dictionary to a `FlateLzwStreamFilter`.
     ///
-    /// The filter name reaching that reader decides one thing only —
-    /// whether `/Name` is retained ([`CRYPT_RETAINED_DECODE_PARAM_KEY`]) — and
-    /// no dictionary passed through here carries a `/Name`, so every call is
-    /// unaffected by which non-`Crypt` name is used. Tests that are *about*
-    /// that decision call `decode_filter_specs_from_object` and name their
-    /// filter explicitly.
+    /// The filter name reaching that reader decides one thing only — whether
+    /// this is the `Crypt` stage that keeps every key
+    /// ([`retains_decode_param_key`]) with name payloads under
+    /// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]. Every non-`Crypt` name
+    /// therefore produces the identical reduction whatever the dictionary
+    /// holds, so no call here is sensitive to the name chosen. Tests that are
+    /// *about* that decision call `decode_filter_specs_from_object` and name
+    /// their filter explicitly.
     fn flate_decode_params(params: Option<&Object>) -> DecodeParams {
         decode_params_from_object(params, b"FlateDecode")
     }
