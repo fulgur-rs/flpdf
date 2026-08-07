@@ -129,43 +129,23 @@ git commit -m "feat(pipeline): add public Discard terminal"
 
 **Files:**
 - Modify: `crates/flpdf/src/filespec_helper.rs:83-89,851-879`
-- Modify/Test: `crates/flpdf/tests/filespec_helper_tests.rs:1514-1528`
+- Verify: `crates/flpdf/tests/filespec_helper_tests.rs:1514-1528`
 
 **Interfaces:**
 - Consumes: Task 1's public `crate::pipeline::Discard` and the existing internal `PlMd5`.
 - Produces: the unchanged public `md5_checksum(&[u8]) -> Vec<u8>` with no consumer-local terminal implementation.
 
-- [ ] **Step 1: Write the failing sole-route guard**
-
-Add this test beside `md5_checksum_length_and_known_value`:
-
-```rust
-#[test]
-fn embedded_file_checksum_uses_the_canonical_discard_terminal() {
-    let source = include_str!("../src/filespec_helper.rs");
-
-    assert!(
-        !source.contains("struct ChecksumDiscard"),
-        "consumer-local checksum discard remains"
-    );
-    assert!(
-        source.contains("let mut discard = Discard;"),
-        "EmbeddedFile checksum does not use pipeline::Discard"
-    );
-}
-```
-
-- [ ] **Step 2: Run the guard and verify RED**
+- [ ] **Step 1: Establish the checksum behavior before refactoring**
 
 Run:
 
 ```bash
-cargo test -p flpdf --test filespec_helper_tests embedded_file_checksum_uses_the_canonical_discard_terminal
+cargo test -p flpdf --test filespec_helper_tests md5_checksum_length_and_known_value
 ```
 
-Expected: the test fails with `consumer-local checksum discard remains` because `ChecksumDiscard` still exists.
+Expected: the existing known empty-MD5 vector passes. The public Discard component already completed its RED to GREEN cycle in Task 1; this task is the refactor step and must preserve that consumer-visible behavior.
 
-- [ ] **Step 3: Replace the local terminal with Discard**
+- [ ] **Step 2: Replace the local terminal with Discard**
 
 Change the pipeline import to:
 
@@ -182,23 +162,30 @@ let mut discard = Discard;
 
 Keep the remaining `PlMd5` write, finish, digest, and `hex::decode` statements byte-for-byte unchanged.
 
-- [ ] **Step 4: Verify GREEN and checksum stability**
+- [ ] **Step 3: Verify GREEN and checksum stability**
 
 Run:
 
 ```bash
 cargo fmt --all
-cargo test -p flpdf --test filespec_helper_tests embedded_file_checksum_uses_the_canonical_discard_terminal
 cargo test -p flpdf --test filespec_helper_tests md5_checksum_length_and_known_value
 cargo test -p flpdf --test filespec_helper_tests
 ```
 
-Expected: the guard, known empty-MD5 vector, and all Filespec integration tests pass.
+Expected: the known empty-MD5 vector and all Filespec integration tests pass.
 
-- [ ] **Step 5: Commit the production cutover**
+- [ ] **Step 4: Review the structural cutover and commit it**
+
+Run:
 
 ```bash
-git add crates/flpdf/src/filespec_helper.rs crates/flpdf/tests/filespec_helper_tests.rs
+git diff -- crates/flpdf/src/filespec_helper.rs
+```
+
+Expected: the diff imports `Discard`, deletes the complete consumer-local `ChecksumDiscard`, and changes only the terminal construction inside `md5_checksum`; behavior statements remain unchanged.
+
+```bash
+git add crates/flpdf/src/filespec_helper.rs
 git commit -m "refactor(filespec): use canonical Discard terminal"
 ```
 
@@ -304,7 +291,7 @@ git status --short --branch
 git diff --check origin/main...HEAD
 git diff --stat origin/main...HEAD
 git log --oneline --decorate origin/main..HEAD
-git diff origin/main...HEAD -- crates/flpdf/src/pipeline.rs crates/flpdf/src/pipeline/discard.rs crates/flpdf/src/filespec_helper.rs crates/flpdf/tests/pipeline_public_api.rs crates/flpdf/tests/filespec_helper_tests.rs docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md
+git diff origin/main...HEAD -- crates/flpdf/src/pipeline.rs crates/flpdf/src/pipeline/discard.rs crates/flpdf/src/filespec_helper.rs crates/flpdf/tests/pipeline_public_api.rs docs/qpdf-correspondence.md docs/qpdf-module-doc-index.md
 ```
 
 Expected: the worktree is clean; source changes are limited to Discard, its public export, and the Filespec terminal replacement; tests and documentation match the approved scope.
