@@ -961,8 +961,8 @@ pub(crate) trait StreamFilter {
     /// The Flate warn callback is deliberately absent: qpdf installs it at the
     /// `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), not here. That
     /// installation sits *outside* the `if (decode_pipeline)` guard, so a
-    /// filter contributing no stage leaves the previous filter's stage as the
-    /// chain head and lets it take the callback again.
+    /// filter contributing no stage leaves the stage the preceding iteration
+    /// installed as the chain head and lets it take the callback again.
     // Production decoding still runs through pipe_decode_recovering, so nothing
     // outside tests calls this yet.
     #[allow(dead_code)]
@@ -1451,6 +1451,14 @@ impl FlateLzwStreamFilter {
     /// iteration whose filter builds nothing lands it on a stage constructed
     /// elsewhere — see [`StreamFilter::decode_pipeline`]. Both that case and
     /// the placement belong with the port of `QPDF_Stream::pipeStreamData`.
+    ///
+    /// Nothing today can observe the difference: this route decodes each
+    /// filter's whole buffer in one call, constructing and finishing that
+    /// filter's stages within it, so no chain head survives into the next
+    /// filter — and `Crypt`, the only filter whose `decode_pipeline` builds
+    /// nothing, never reaches this function at all, because
+    /// `filters::prepare_decode_filters` routes its spec to
+    /// `PreparedStage::Crypt` instead of to a codec adapter.
     fn pipe_codec(
         &self,
         next: &mut dyn Pipeline,
