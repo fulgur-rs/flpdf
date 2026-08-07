@@ -1135,7 +1135,7 @@ const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
 /// `/CF` filter's own `/Name` at `:1085-1087`).
 ///
 /// `/Type` decides whether the stage is filterable at all.
-/// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:44-46`) admits a
+/// `SF_Crypt::setDecodeParms` (`libqpdf/QPDF_Stream.cc:41-43`) admits a
 /// `/Type`-bearing dictionary only when
 /// `isDictionaryOfType("/CryptFilterDecodeParms")` holds, and that is
 /// `getKey("/Type").isNameAndEquals(...)` (`QPDFObjectHandle.cc:462-466`) — a
@@ -2222,19 +2222,31 @@ pub(crate) mod tests {
     ///   [`a_crypt_stage_retains_every_key_so_unknown_ones_stay_visible`],
     ///   [`a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`] and
     ///   [`a_crypt_chain_holds_the_whole_key_set_once_per_stage`].
-    /// - Owning a name payload under *every* retained key — the half-fix that
-    ///   leaves `/Predictor /<long name>` amplifying — reddens four: those two
-    ///   again,
-    ///   [`retained_decode_parameter_bytes_do_not_grow_with_a_name_valued_parameter`]
+    /// - Widening it the other way — every stage keeping every key, so the
+    ///   rule stops being `Crypt`-only — reddens the `/FlateDecode` half
+    ///   instead, and only that half: five tests, this one plus
+    ///   [`retained_decode_parameter_bytes_do_not_grow_with_the_source_dictionary`],
+    ///   [`retained_decode_parameter_bytes_do_not_grow_with_a_name_valued_parameter`],
+    ///   [`handle_reader_never_resolves_a_decode_parms_value_for_a_filter_that_ignores_them`]
     ///   and
-    ///   [`a_non_resolving_read_classifies_direct_values_exactly_as_the_object_reader_does`].
+    ///   [`handle_reader_resolves_an_unretained_decode_parms_value_for_a_filter_that_reads_them`].
+    /// - Owning a name payload under *every* retained key — the half-fix that
+    ///   leaves `/Predictor /<long name>` amplifying — reddens five:
+    ///   [`a_crypt_stage_retains_every_key_so_unknown_ones_stay_visible`] and
+    ///   [`a_crypt_stage_grows_only_by_the_key_bytes_of_an_unknown_entry`]
+    ///   again, plus
+    ///   [`retained_decode_parameter_bytes_do_not_grow_with_a_name_valued_parameter`],
+    ///   [`a_non_resolving_read_classifies_direct_values_exactly_as_the_object_reader_does`]
+    ///   and [`a_name_payload_is_kept_under_a_crypt_stage_and_only_there`].
     /// - Dropping `/Type` from [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`] reddens
-    ///   exactly one, [`a_crypt_stage_keeps_the_type_name_bytes`] — so the two
-    ///   payload keys are independently droppable and each has its own witness.
+    ///   two, [`a_crypt_stage_keeps_the_type_name_bytes`] and
+    ///   [`a_name_payload_is_kept_under_a_crypt_stage_and_only_there`] — so the
+    ///   two payload keys are independently droppable and each has its own
+    ///   witness.
     ///
-    /// No codec or encode-path test moved in any of the three.
+    /// No codec or encode-path test moved in any of the four.
     ///
-    /// A fourth mutation belongs on this map but not in this test: dropping the
+    /// A fifth mutation belongs on this map but not in this test: dropping the
     /// `crypt_stage` gate from [`keeps_crypt_name_payload`] reddens no read at
     /// all, and is witnessed by
     /// [`a_name_payload_is_kept_under_a_crypt_stage_and_only_there`] instead.
@@ -2361,7 +2373,7 @@ pub(crate) mod tests {
     ///
     /// `SF_Crypt::setDecodeParms` accepts a `/Type`-bearing dictionary only
     /// when `decode_parms.isDictionaryOfType("/CryptFilterDecodeParms")`
-    /// (`libqpdf/QPDF_Stream.cc:44-46`), which reads the `/Type` value's name.
+    /// (`libqpdf/QPDF_Stream.cc:41-43`), which reads the `/Type` value's name.
     /// [`ParamValue::Other`] would make that test irreproducible: it cannot be
     /// told apart from `/Type /Foo`, which qpdf refuses.
     ///
@@ -4101,6 +4113,20 @@ pub(crate) mod tests {
     #[test]
     fn crypt_filter_reads_its_decode_params() {
         assert!(CryptStreamFilter.reads_decode_params());
+    }
+
+    /// `SF_Crypt` (`QPDF_Stream.cc:27-58`) declares only `setDecodeParms` and
+    /// `getDecodePipeline`, overriding neither `isSpecializedCompression` nor
+    /// `isLossyCompression`, so both fall through to the base class's `false`
+    /// (`QPDFStreamFilter.cc:9-19`).
+    ///
+    /// Inheriting is the whole assertion: every other registered filter states
+    /// this classification somewhere, and `Crypt` is registered like any of
+    /// them, so an override added here would otherwise go unwitnessed.
+    #[test]
+    fn crypt_inherits_the_default_compression_classification() {
+        assert!(!CryptStreamFilter.is_specialized_compression());
+        assert!(!CryptStreamFilter.is_lossy_compression());
     }
 
     /// Build the entry set a `Crypt` stage's `/DecodeParms` reduce to.
