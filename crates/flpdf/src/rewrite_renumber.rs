@@ -651,6 +651,9 @@ impl ObjectStreamRenumber {
                         continue;
                     }
                     let object = pdf.resolve(source)?;
+                    if matches!(object, Object::Null) {
+                        continue;
+                    }
                     let stream = object.as_stream().ok_or_else(|| {
                         Error::Unsupported(format!(
                             "object-stream renumber: source container {source} is not a stream"
