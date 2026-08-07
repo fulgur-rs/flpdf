@@ -12,7 +12,7 @@
 
 - Work only in `/home/ubuntu/flpdf/.worktrees/flpdf-25kg.3.26-uniform-object` on `feature/flpdf-25kg.3.26-uniform-object`.
 - Read `docs/superpowers/specs/2026-08-07-qpdf-uniform-object-identity-design.md` and `bd show flpdf-25kg.3.26` before implementation. If they differ, pinned qpdf 11.9.0 source and observed behavior win; record any resulting design change in the Bead before proceeding.
-- Production allowlist: `crates/flpdf/src/object_handle.rs` only. `crates/flpdf/src/reader.rs` may change only inside its `#[cfg(test)]` tests to strengthen `Pdf::drop` coverage. Oracle additions are limited to `tests/oracle/qpdf_objecthandle_uniform_identity_probe.cc` and `scripts/qpdf-objecthandle-uniform-identity-probe.sh`. This plan and the approved spec are the only documentation additions.
+- Production allowlist: `crates/flpdf/src/object_handle.rs` only. `crates/flpdf/src/reader.rs` may change only inside its `#[cfg(test)]` tests to strengthen `Pdf::drop` coverage. Post-review scope correction: `crates/flpdf/src/reader/resolver.rs` may change only inside `#[cfg(test)] mod tests` for the post-disconnect owner-drop expectation update; no production code there may change. Oracle additions are limited to `tests/oracle/qpdf_objecthandle_uniform_identity_probe.cc` and `scripts/qpdf-objecthandle-uniform-identity-probe.sh`. This plan and the approved spec are the only documentation additions.
 - Do not change `Pdf::make_indirect_object_handle`, `Pdf::next_available_object_ref`, `ResolverCore::object_cache`, dirty tracking, canonical enumeration, writer scheduling, or public API behavior. Those are owned by `flpdf-25kg.3.24` and `flpdf-25kg.3.6`.
 - Do not introduce double-promotion or cross-document errors. Re-promotion is last-write-wins for active `ObjectRef`, Pdf identity, and resolver.
 - Do not add a redirect variant, sentinel ObjGen, compatibility bridge, raw `Object` materialization, panic path, or payload/container/stream clone to promotion.
@@ -1377,6 +1377,7 @@ Expected files only:
 
 - `crates/flpdf/src/object_handle.rs`
 - `crates/flpdf/src/reader.rs` only if its test module changed
+- `crates/flpdf/src/reader/resolver.rs` only for the `#[cfg(test)]` post-disconnect owner-drop expectation update (post-review scope correction)
 - `tests/oracle/qpdf_objecthandle_uniform_identity_probe.cc`
 - `scripts/qpdf-objecthandle-uniform-identity-probe.sh`
 - the approved design spec
