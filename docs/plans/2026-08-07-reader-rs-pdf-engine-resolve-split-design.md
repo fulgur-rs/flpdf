@@ -235,13 +235,57 @@ reader.rs に残ったまま）。
   `collect_object_stream_chain`, header/startxref 探索, xref 読み取り
   （`xref.rs` の既存 API を呼ぶだけで xref.rs 自体は変更しない — 詳細は
   「非目標」参照）, `resolve_to_cache`, `native_parse_uncompressed_value` 等
+- **`resolve_compressed_entry` の圧縮オブジェクトストリーム parser 閉包も
+  ここに含める**: `parse_object_stream_chain_entry`(`reader.rs:2938-`)
+  が `object_stream_chain_member`(`reader.rs:2982-`、`private`) 経由で
+  到達する `parse_object_stream_entry`(`reader.rs:3686-`、`pub(crate)`)/
+  `ParsedObjectStreamEntry`(`reader.rs:3745-`、`pub(crate) struct` だが
+  `diagnostics` フィールドは private — `resolve_compressed_entry` の
+  分配先で読むため `pub(crate)` 化が必要)/
+  `object_stream_count`(`reader.rs:4147-`、`pub(crate)`)/
+  `parse_non_negative_i64`(`reader.rs:4158-`、`private`)/
+  `parse_non_negative_u64`(`reader.rs:4168-`、`private`)。
+  `decrypt_resolved_object` の依存閉包（上記）とは別系統で、圧縮
+  オブジェクト解決経路のために別途必要
+- **`set_object`（`obj_cache.rs` 側）と `resolve_compressed_entry`
+  （本ファイル側）が共有する `compressed_parent_for_entry`
+  (`reader.rs:2968-`、`private`) もここに置く**。`compressed_parent`
+  （既存キャッシュの単純 getter、上記リスト参照）とは別の関数で、
+  `object_stream_chain_member`/`collect_object_stream_chain` を呼んで
+  圧縮チェーンを実際に辿る側。`obj_cache.rs` からは `pub(crate)` 化した
+  この関数を呼ぶ（`set_object` はこの関数を計算するのではなく結果を
+  読むだけ）
 - **`decrypt_resolved_object` の private 依存閉包もここに含める**:
   `decrypt_object_strings`(`reader.rs:3236-`), `decrypt_stream_bytes`
   (`reader.rs:3508-`), `apply_explicit_crypt_filters`(`reader.rs:3527-`),
   `stream_has_explicit_crypt_filter`(`reader.rs:3660-`),
   `is_metadata_stream`(`reader.rs:3671-`),
   `warn_unknown_crypt_filters`（`reader.rs:2923-`、`&self` メソッド）。
-  含めないと resolve 時復号ロジックの本体が reader.rs に残る
+  含めないと resolve 時復号ロジックの本体が reader.rs に残る。**さらに
+  この6個だけでも閉じない**: `decrypt_object_strings` が呼ぶ
+  `object_contains_string`(`reader.rs:3259-`) と、
+  `apply_explicit_crypt_filters` が呼ぶ `explicit_crypt_mode`
+  (`reader.rs:3650-`)/`decode_params_at`(`reader.rs:3617-`)/
+  `filter_prefix_dict`(`reader.rs:3626-`) も同じ閉包に含める
+  （`decrypt_object_strings`(`security/standard.rs`)の呼び出し先は既に
+  security 側にあり対象外。混同しないこと）。**`explicit_crypt_mode` は
+  `interpret_cf`(`reader.rs:3980-`、現状 private) を呼ぶ**が、
+  `interpret_cf`/`interpret_cf_name` 自体は下記「新規ファイルを作らず
+  既存へ委譲するもの」の暗号エントリ依存閉包の一部として `security/*`
+  へ移す対象なので、`resolve.rs` からは `pub(crate)` 化した
+  `interpret_cf` を呼ぶ形になる（`EncryptionState` と同じ
+  cross-module `pub(crate)` シームパターン）
+- **`recovered_stream_eol` アクセサ(`reader.rs:541-555`、`pub(crate)`)も
+  ここに含める**。単なる warning ではなく、`endstream` スキャンで検出
+  した source framing を復元する production API: 消費者は
+  `writer.rs:3817`、`writer/plain/body.rs:54`、`linearization/writer.rs`
+  （複数箇所）で、いずれも書き出しバイト列に直接影響する。この
+  アクセサが読む `recovered_stream_eols`/`transformed_stream_refs`
+  フィールド自体は既に `pdf.rs:129,136` にあり変更しない。移すのは
+  アクセサ本体と、これらのフィールドへ書き込む resolve 時の書き込み
+  箇所（`resolve_compressed_entry`/`decrypt_resolved_object` 経路、
+  `reader.rs:2752-2824` 付近）——後者は上記の `decrypt_resolved_object`
+  依存閉包そのものなので二重の追加ではない
 - **`source_xref_offsets`, `source_xref_entries`, `source_header_offset`,
   `previous_xref_offset`, `last_xref_form`, `compressed_parent` もここに
   含める**（後述の「未決定」から格上げ）。これらは qtest 専用ではなく
@@ -249,7 +293,12 @@ reader.rs に残ったまま）。
   （xref stream 生成時の source offset 参照）と
   `subset_prune.rs:196`（`compressed_parent`）。ソース document の
   xref 由来構造情報を返す resolve/seek 隣接の状態なので、`resolve.rs`
-  が正しい置き場所
+  が正しい置き場所。**`previous_xref_offset` が委譲する
+  `startxref`(`reader.rs:1060-1062`) 自体も同じ理由でここに含める**
+  （`previous_xref_offset` は `self.startxref()` を呼ぶだけの薄い
+  wrapper — `reader.rs:1064-1066`）。フィールド `startxref: u64` 自体は
+  既に `pdf.rs:65` にあり変更しない。移すのはこの2つのアクセサ
+  メソッドのみ
 - **`source_bytes`, `lift_object_to_handle`, `source_stream_data_offset`
   もここに含める**。`source_bytes`（`reader.rs:1380-1382`、
   `self.resolver.read_physical_input()` に委譲）の production caller は
@@ -282,6 +331,14 @@ reader.rs に残ったまま）。
   `get_all_object_handles`, `resolved_count`, `deleted_object_refs`
   （`resolved_count`/`deleted_object_refs` は `self.cache` への直接委譲、
   `reader.rs:1386-1392` で確認済み）
+- **`set_object` が呼ぶ `lift_for_set_object`(`reader.rs:1320-1337`、
+  `private`) もここに含める**。通常の `lift` とは異なり、stream 置換時に
+  既存の dictionary handle をその場で書き換えて共有 identity と
+  parsed offset を保つ特殊化版（`reader.rs:1311-1319` のコメント参照）で、
+  `set_object` から見て delegate 先が obj_cache.rs 外に残ると
+  cache 書き込みの正しさを保証するロジックが分離してしまう。内部で
+  呼ぶ `self.lift`（`reader.rs:1336`）自体は上記の通り `pub(crate)` 化
+  済みのまま `reader.rs` に残るので、追加の可視性変更は不要
 - **`get_object_handle` も engine.rs からここへ再分類**。自身の doc
   コメント（`reader.rs:1575-1576`）が「This does not perform file I/O or
   force object-body parsing」と明記し、qpdf の `QPDF::getObject`
@@ -352,8 +409,10 @@ reader.rs に残ったまま）。
   基盤。`resolve.rs` に同居させるか独立ファイルにするかは実装時に決める。
   `source_xref_offsets`/`compressed_parent` 等は production consumer が
   あるため上記 `resolve.rs` へ格上げ済み（この bullet からは除外）
-- `warnings`（`repair_diagnostics`, `push_warning`, `recovered_stream_eol`）
-  の最終置き場所（`engine.rs` か `pdf.rs` か、小規模なので実装時判断）
+- `warnings`（`repair_diagnostics`, `push_warning`）の最終置き場所
+  （`engine.rs` か `pdf.rs` か、いずれも `self.resolver.*` への薄い
+  delegate なので小規模、実装時判断）。**`recovered_stream_eol` は
+  この bucket から除外し `resolve.rs` へ格上げ済み**（下記参照）
 
 ## 非目標
 
@@ -408,9 +467,22 @@ reader.rs に残ったまま）。
    行がある（`docs/qpdf-correspondence.md:135` `QPDF.hh`
    `EncryptionParameters`、`:136` `QPDF::interpretCF`、`:137`
    `QPDF::decryptStream`、`:140` `InputSource` 系、`:199` `Pl_AES_PDF`、
-   `:200` `Pl_RC4`）ので、これら6行も併せて `resolve.rs` を指すよう
-   更新する（`QPDF.cc` 行だけ直して他を放置すると存在しないファイルを
-   指す行が残る）。`reader.rs` には legacy な
+   `:200` `Pl_RC4`）ので、`reader/resolver.rs` という**ファイル名の
+   言及だけ**はこれら6行すべてで `resolve.rs` に更新する（`QPDF.cc`
+   行だけ直して他を放置すると存在しないファイルを指す行が残る）。
+   **ただし135/136行は実装の帰属先そのものが変わる点に注意**:
+   `:135`（`EncryptionParameters` → `EncryptionState`）と
+   `:136`（`interpretCF` → `interpret_cf`/`interpret_cf_name`/
+   `interpret_cf_from_handle`）が指す実装は、上記「新規ファイルを作らず
+   既存へ委譲するもの」の暗号エントリ依存閉包の一部として `security/*`
+   （`security/standard.rs` 等）へ移る対象であり、`resolve.rs` には
+   残らない。この2行は「`reader/resolver.rs` という記述」を
+   `resolve.rs` に置き換えつつ、実装の帰属列は `security/*` の該当
+   モジュールへ retarget する（ファイル名置換と実装先の変更を両方行う
+   必要があり、単純な文字列置換では済まない）。`:137`/`:140`/`:199`/
+   `:200` は実装がそのまま resolve/pipe-time 側に残るので、単純な
+   `reader/resolver.rs` → `resolve.rs` の置換でよい。`reader.rs` には
+   legacy な
    `Pdf::resolve`/`Pdf::resolve_borrowed`（`reader.rs:2428-2451`、
    doc コメントで `qpdf-cutover-delete(flpdf-25kg.3.3)` と明記）が
    残っており、production caller が実在する（`object_copy.rs:108,152`、
@@ -438,7 +510,16 @@ reader.rs に残ったまま）。
    byte-identical テスト群（`cmp_linearize_tests.rs` の
    `assert_*_byte_identical`、`crates/flpdf-cli/tests/cli_byte_identical.rs`、
    `deterministic_id_qpdf_parity_tests.rs`）を移動対象メソッドが実際に
-   通る経路であることを確認したうえで実行する。**`compat_matrix_tests.rs`
+   通る経路であることを確認したうえで実行する。**open/resolve/認証の
+   共有経路（`pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs` いずれの
+   ステップも該当）を触るステップでは、上記4本に加えて
+   `cargo test -p flpdf-cli --test cli_tests` も実行する**
+   （`AGENTS.md:12` が「CLI uses the same reader/writer paths as
+   library, so regressions often surface in both `flpdf` and
+   `flpdf-cli` test suites」と明記し、`AGENTS.md:35` がその標準チェック
+   コマンドとして挙げている）。byte-parity 系テストはページ内容の
+   byte 一致のみを見ており、CLI の通常コマンド・フラグ・失敗パスの
+   回帰は捕捉しない。**`compat_matrix_tests.rs`
    はこのリストに含めない**: `qpdf-zlib-compat` gate が無く、byte 比較も
    `qdf_object_body`（部分文字列抽出）のみで、他のケースはページ数・
    parseability・xref 形式・prefix 保持等の性質チェックであり、全体
