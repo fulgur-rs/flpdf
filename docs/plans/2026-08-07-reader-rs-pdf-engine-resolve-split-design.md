@@ -174,9 +174,14 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
 - `struct Pdf<R>` 定義、`Drop` impl
 - **真に trivial な**（qpdf 側でも1ステップの field 返却のみ）直接
   フィールドアクセサ: `version`, `trailer`, `root_ref`,
-  `ever_called_get_all_pages`, `mark_get_all_pages_called`。
+  `ever_called_get_all_pages`, `mark_get_all_pages_called`, `unique_id`。
   根拠: qpdf の `QPDF::getTrailer()`（`QPDF.cc:2349-2352`）は
-  `return m->trailer;` のみで解決処理を一切行わない
+  `return m->trailer;` のみで解決処理を一切行わない。`unique_id`
+  （`reader.rs:1977-1979`、`self.unique_id` を返すのみ）も同様で、
+  **`obj_cache.rs` には含めない**（後述）: 消費者（`filespec_helper.rs:115`/
+  `embedded_files.rs:492`/`object_copy.rs:126`）はいずれも document
+  identity の照合（handle の所属確認・foreign-copy state のキー）に
+  使っており、object cache の CRUD ではない
 - 「reader.rs にあるのがおかしい」の根本原因（crate全体で使う中心型が
   narrow-purpose に見えるファイル名の下にある）をここで解消
 
@@ -240,7 +245,7 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
   resolve を経由しない document 自身の CRUD）: `set_object`, `delete_object`,
   `is_dirty`, `dirty_object_refs`, `clear_dirty`, `object_refs`,
   `live_object_refs`, `is_canonical_object_handle`,
-  `next_available_object_ref`, `object_number_is_available`, `unique_id`,
+  `next_available_object_ref`, `object_number_is_available`,
   `mark_object_dirty`, `mark_object_handle_mutated`,
   `mark_object_handle_dirty`, `make_indirect_object_handle`,
   `get_all_object_handles`, `resolved_count`, `deleted_object_refs`
@@ -266,8 +271,13 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
   `EncryptionState`(`reader.rs:197-`)/`EncryptionMode`(`reader.rs:470-`)/
   `required_revision`/`required_version`/`required_permissions`
   (`reader.rs:4228-4292`)/`interpret_cf`(`reader.rs:4263-`)/
-  `crypt_filter_modes`(`reader.rs:4293-`) に依存する。これらのヘルパー型・
-  関数も同じ移動対象に含める（`docs/qpdf-correspondence.md:136` が
+  `crypt_filter_modes`(`reader.rs:4293-`) に依存する。**さらに**
+  `decode_hex_file_key`/`standard_handler_inputs`/
+  `standard_handler_r5_inputs`/`map_uo_length_to_bad_password`/
+  `encrypt_metadata_flag`/`r6_perms_warning`（`reader.rs:1034-1150` 付近が
+  これらを呼ぶ）/`first_file_id`（`reader.rs:4393-`）も同じ依存閉包に
+  含まれる（全て `reader.rs:4033-4393` 付近に private 定義）。これらの
+  ヘルパー型・関数も同じ移動対象に含める（`docs/qpdf-correspondence.md:136` が
   `interpret_cf` 系を既に `QPDF::interpretCF`（`QPDF_encryption.cc:700-716`）
   対応として記録済み）。含めないと暗号ロジックの大半が reader.rs に
   残ったまま、10個の薄いラッパーだけを移動することになる
@@ -328,10 +338,29 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
 このセッションでは設計のみ。以下は別セッションで:
 
 1. bd issue（epic + サブタスク）を本設計に基づいて作成する
-2. 実装順序の決定（`pdf.rs` 抽出 → `obj_cache.rs` 抽出 →
-   `resolve.rs`/`reader/resolver.rs` 統合 → `engine.rs` 抽出 →
-   暗号/認証エントリの既存ファイルへの移動、が依存の少ない順と思われるが
-   要検証）
+2. 実装順序: `struct Pdf<R>` を独立ステップとして `pdf.rs` へ抽出する
+   ことは**単独ではコンパイルできない**。`open_with_repair_mode`
+   （`reader.rs:875-`、`Pdf { .. }` 構造体リテラルで全フィールドを直接
+   構築する）や `set_object`（`cache`/`resolver` フィールドを直接触る）
+   等、まだ `reader.rs` に残る大多数のメソッドが `Pdf` の private
+   フィールドに依存しており、`struct Pdf` だけを別モジュール
+   （sibling）へ切り離すと、残った `reader.rs` 側がコンパイル不能になる
+   （モジュール階層節で確認済みの private 境界がそのまま阻害要因になる）。
+   代わりに次の遷移的な手順を取る:
+   (a) まず `reader.rs` を丸ごと（中身は変更せず）`pdf` の子モジュール
+   `pdf::reader`（ファイルパス `crates/flpdf/src/pdf/reader.rs`）として
+   再配置し、`struct Pdf` の定義だけを `pdf.rs` 側へ引き上げる
+   （`pdf::reader` は `super::Pdf` を使う）。この時点で private 境界は
+   「`pdf` とその子孫」内に収まるため、コンパイル可能な1ステップになる。
+   (b) 以降、`obj_cache.rs`/`resolve.rs`/`engine.rs` の各グループを
+   `pdf::reader` から `pdf::obj_cache`/`pdf::resolve`/`pdf::engine`
+   （すべて `pdf` の子孫のまま）へ1グループずつ抽出する。`pdf::reader`
+   は各ステップでメソッドが減っていき、最終的に空になったら削除する。
+   (c) 暗号/認証エントリの `security/*` への移動、`take_foreign_object_map`
+   等の `object_copy.rs` への移動は、モジュール階層節で述べた
+   「フィールドを限定的に `pub(crate)` にする」か「エントリポイントは
+   `pdf` 側に残す」のどちらかを選んでから最後に行う（既存の並列モジュール
+   なので (a)(b) の「`pdf` の子孫内に留める」手法が使えない）
 3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、現行本文
    `reader.rs`(7898) + `reader/resolver.rs`(...) + `reader/file_object.rs`
    (1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) +
