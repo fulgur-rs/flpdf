@@ -12,7 +12,18 @@
 
 **Status:** design, with the `pdf.rs` slice already implemented
 (`flpdf-0b12`, see モジュール階層節). The rest is design only; see
-「次のステップ」. Produced via `superpowers:brainstorming` after the
+「次のステップ」.
+
+**`reader.rs:NNN` 行番号の基準**: 本文書中のすべての `reader.rs:NNN`
+citation は、`refactor/flpdf-0b12-pdf-module`（commit `56a01c2b`）の
+**`flpdf-0b12` 適用後**の状態を基準にしている。`obj_cache.rs`/
+`resolve.rs`/`engine.rs` の抽出は `flpdf-0b12` の後に実装されるため、
+実装時に参照する reader.rs はこの状態になっている。現在の
+`main`（本 PR の base、`flpdf-0b12` 未適用）の reader.rs では、
+本文書の各 citation より **約280行低い**（`main` の reader.rs は
+8758行、`flpdf-0b12` 適用後は8475行 — 差分283行が `pdf.rs` へ移った分）。
+
+Produced via `superpowers:brainstorming` after the
 `flpdf-25kg.3.19` (`Pdf::empty()`) session surfaced that `reader.rs` is an
 uncomfortable home for the new factory: the name "reader" doesn't semantically
 fit a zero-external-input constructor, and more broadly `reader.rs` has become
@@ -247,14 +258,6 @@ reader.rs に残ったまま）。
   `parse_non_negative_u64`(`reader.rs:4168-`、`private`)。
   `decrypt_resolved_object` の依存閉包（上記）とは別系統で、圧縮
   オブジェクト解決経路のために別途必要
-- **`set_object`（`obj_cache.rs` 側）と `resolve_compressed_entry`
-  （本ファイル側）が共有する `compressed_parent_for_entry`
-  (`reader.rs:2968-`、`private`) もここに置く**。`compressed_parent`
-  （既存キャッシュの単純 getter、上記リスト参照）とは別の関数で、
-  `object_stream_chain_member`/`collect_object_stream_chain` を呼んで
-  圧縮チェーンを実際に辿る側。`obj_cache.rs` からは `pub(crate)` 化した
-  この関数を呼ぶ（`set_object` はこの関数を計算するのではなく結果を
-  読むだけ）
 - **`decrypt_resolved_object` の private 依存閉包もここに含める**:
   `decrypt_object_strings`(`reader.rs:3236-`), `decrypt_stream_bytes`
   (`reader.rs:3508-`), `apply_explicit_crypt_filters`(`reader.rs:3527-`),
@@ -275,6 +278,22 @@ reader.rs に残ったまま）。
   へ移す対象なので、`resolve.rs` からは `pub(crate)` 化した
   `interpret_cf` を呼ぶ形になる（`EncryptionState` と同じ
   cross-module `pub(crate)` シームパターン）
+- **上記は legacy `Object` 版の閉包。`resolve_object_handle`
+  （engine.rs のエントリポイント）が native-parse 成功時に呼ぶ
+  `decrypt_object_value_strings`(`reader.rs:1976-` 呼び出し、定義は
+  `reader.rs:3306-`) は別系統の native `ObjectHandle` 版の閉包で、
+  これも `resolve.rs` に含める**: `object_value_contains_string`
+  (`reader.rs:3327-`)/`handles_contain_string`(`reader.rs:3350-`)/
+  `handle_contains_string`(`reader.rs:3362-`)/
+  `decrypt_strings_in_object_value`(`reader.rs:3396-`)/
+  `decrypt_handle_strings_in_place`(`reader.rs:3439-`)/
+  `decrypt_stream_dict_strings_in_place`(`reader.rs:3490-`)。
+  「resolve.rs のエントリポイントが engine.rs から呼ばれ、resolve.rs
+  内部で完結する」という二層構造の一例で、上記 legacy 閉包とは名前も
+  対象型も別なので統合しない。閉包が呼ぶ
+  `decrypt_cipher_bytes`/`EncryptionState::string_method`/
+  `EncryptionState::with_object_cipher` は既に `security/standard.rs`
+  側にあり、この6個で閉じる
 - **`recovered_stream_eol` アクセサ(`reader.rs:541-555`、`pub(crate)`)も
   ここに含める**。単なる warning ではなく、`endstream` スキャンで検出
   した source framing を復元する production API: 消費者は
@@ -339,6 +358,19 @@ reader.rs に残ったまま）。
   cache 書き込みの正しさを保証するロジックが分離してしまう。内部で
   呼ぶ `self.lift`（`reader.rs:1336`）自体は上記の通り `pub(crate)` 化
   済みのまま `reader.rs` に残るので、追加の可視性変更は不要
+- **`set_object` が呼ぶ `compressed_parent_for_entry`
+  (`reader.rs:2968-`、`private`) も同じ理由でここに含める**（前版では
+  `resolve_compressed_entry` との共有関数と誤って記載していたが、
+  実際の呼び出し元は `set_object`（`reader.rs:1264`）1箇所のみで、
+  `resolve_compressed_entry` は同じ処理に `parse_object_stream_chain_entry`
+  を直接使っており `compressed_parent_for_entry` を呼ばない — 訂正）。
+  唯一の呼び出し元が `set_object` である以上、`lift_for_set_object` と
+  同じく `obj_cache.rs` に置く。内部で呼ぶ
+  `object_stream_chain_member`/`collect_object_stream_chain`
+  （`resolve.rs` 側のプリミティブ）は `pub(crate)` 化して呼ぶ —
+  `set_object` が既に `self.lift`/`self.lift_dictionary`（`resolve.rs`
+  側）を同じ形で呼んでいるのと同じ向きのシームで、新しい種類の境界は
+  増えない
 - **`get_object_handle` も engine.rs からここへ再分類**。自身の doc
   コメント（`reader.rs:1575-1576`）が「This does not perform file I/O or
   force object-body parsing」と明記し、qpdf の `QPDF::getObject`
