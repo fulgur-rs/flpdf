@@ -42,7 +42,7 @@ use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
 use crate::pipeline::lzw::LzwDecoder;
 use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
 use crate::pipeline::run_length::{RunLength, RunLengthAction};
-use crate::pipeline::{Pipeline, PipelineError, PipelineResult};
+use crate::pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::{Error, Object, Result};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -900,6 +900,30 @@ pub(crate) trait StreamFilter {
         Ok(())
     }
 
+    /// Port of `QPDFStreamFilter::getDecodePipeline`
+    /// (`include/qpdf/QPDFStreamFilter.hh:46-49`): build this filter's decode
+    /// stage around `next` and return it without decoding anything. qpdf
+    /// declares it pure virtual, so there is no default here either.
+    ///
+    /// `Result` carries the construction failures qpdf raises from the stage
+    /// constructors themselves; `None` is qpdf's `nullptr`, which the caller
+    /// reads as "this filter contributes no stage" and leaves its own `next`
+    /// in place (`QPDF_Stream.cc:561-563`). In qpdf 11.9.0 the only filter
+    /// that returns it is `SF_Crypt` (`QPDF_Stream.cc:52-56`).
+    ///
+    /// qpdf keeps each constructed stage in the filter instance and hands the
+    /// caller a non-owning pointer. The stage is returned by value here
+    /// instead — see [`crate::pipeline::PipelineRef`] for why, and
+    /// `QPDF_Stream.cc:559-568` for the caller-side loop this feeds.
+    ///
+    /// The Flate warn callback is deliberately absent: qpdf installs it at the
+    /// `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), not here.
+    #[allow(dead_code)]
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>>;
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1197,6 +1221,46 @@ impl StreamFilter for FlateLzwStreamFilter {
         Ok(())
     }
 
+    /// Mirrors `SF_FlateLzwDecode::getDecodePipeline`
+    /// (`libqpdf/SF_FlateLzwDecode.cc:75-110`): a predictor stage first when
+    /// the parameters call for one, with `next` reassigned to it, then the
+    /// codec wrapping whichever `next` resulted. The codec is what the caller
+    /// receives.
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        let next: PipelineRef<'a> = match self.decode_predictor_geometry()? {
+            Some((columns, colors, bits_per_component)) => {
+                let predictor = PngFilter::new(
+                    "png decode",
+                    next,
+                    PngFilterAction::Decode,
+                    columns,
+                    colors,
+                    bits_per_component,
+                )
+                .map_err(map_pipeline_error)?;
+                PipelineRef::Owned(Box::new(predictor))
+            }
+            None => PipelineRef::Borrowed(next),
+        };
+        let stage: Box<dyn Pipeline + 'a> = if self.lzw {
+            Box::new(LzwDecoder::new("lzw decode", next, self.early_code_change))
+        } else {
+            Box::new(
+                Flate::new(
+                    "stream inflate",
+                    next,
+                    FlateAction::Inflate,
+                    DEFAULT_OUT_BUFFER_SIZE,
+                )
+                .map_err(map_pipeline_error)?,
+            )
+        };
+        Ok(Some(stage))
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1301,6 +1365,15 @@ fn filter_decode_phase(finish_phase: Option<&Cell<bool>>) -> FilterDecodePhase {
 struct Ascii85StreamFilter;
 
 impl StreamFilter for Ascii85StreamFilter {
+    /// Mirrors `SF_ASCII85Decode::getDecodePipeline`
+    /// (`libqpdf/qpdf/SF_ASCII85Decode.hh:14-19`), a single `Pl_ASCII85Decoder`.
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(Some(Box::new(Ascii85Decoder::new("ascii85 decode", next))))
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1314,6 +1387,19 @@ impl StreamFilter for Ascii85StreamFilter {
 struct AsciiHexStreamFilter;
 
 impl StreamFilter for AsciiHexStreamFilter {
+    /// Mirrors `SF_ASCIIHexDecode::getDecodePipeline`
+    /// (`libqpdf/qpdf/SF_ASCIIHexDecode.hh:14-19`), a single
+    /// `Pl_ASCIIHexDecoder`.
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(Some(Box::new(AsciiHexDecoder::new(
+            "asciiHex decode",
+            next,
+        ))))
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1327,6 +1413,20 @@ impl StreamFilter for AsciiHexStreamFilter {
 struct RunLengthStreamFilter;
 
 impl StreamFilter for RunLengthStreamFilter {
+    /// Mirrors `SF_RunLengthDecode::getDecodePipeline`
+    /// (`libqpdf/qpdf/SF_RunLengthDecode.hh:14-20`), a single `Pl_RunLength`
+    /// in its decode action.
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(Some(Box::new(RunLength::new(
+            "runlength decode",
+            next,
+            RunLengthAction::Decode,
+        ))))
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1346,6 +1446,15 @@ struct TestStreamFilter;
 
 #[cfg(test)]
 impl StreamFilter for TestStreamFilter {
+    // Passes data through untouched, so it builds no stage of its own —
+    // qpdf's nullptr, which leaves the caller writing straight to `next`.
+    fn decode_pipeline<'a>(
+        &mut self,
+        _: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(None)
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1361,6 +1470,15 @@ struct BorrowedInputProbe;
 
 #[cfg(test)]
 impl StreamFilter for BorrowedInputProbe {
+    // The probe only inspects the input buffer it is handed; it transforms
+    // nothing, so it contributes no stage.
+    fn decode_pipeline<'a>(
+        &mut self,
+        _: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(None)
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         data: &[u8],
@@ -1379,6 +1497,16 @@ struct PostPreflightFailure;
 
 #[cfg(test)]
 impl StreamFilter for PostPreflightFailure {
+    // Fails on every route past the preflight, the decode route included.
+    fn decode_pipeline<'a>(
+        &mut self,
+        _: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Err(Error::Internal(
+            "test post-preflight decode failure".to_string(),
+        ))
+    }
+
     fn pipe_decode_recovering(
         &mut self,
         _: &[u8],
@@ -1569,8 +1697,9 @@ pub(crate) mod tests {
         decode_filter_specs_from_handle, decode_filter_specs_from_object, decode_flate,
         decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
         ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
-        DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
-        Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
+        AsciiHexStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle,
+        OutputBuffer, ParamValue, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
@@ -3898,6 +4027,18 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(decoded, expected, "{name:?}");
         }
+    }
+
+    #[test]
+    fn ascii_hex_decode_pipeline_decodes_through_the_caller_sink() {
+        let mut sink = OutputBuffer::new(None);
+        {
+            let mut filter = AsciiHexStreamFilter;
+            let mut stage = filter.decode_pipeline(&mut sink).unwrap().unwrap();
+            stage.write(b"616263>").unwrap();
+            stage.finish().unwrap();
+        }
+        assert_eq!(sink.data, b"abc");
     }
 
     #[test]
