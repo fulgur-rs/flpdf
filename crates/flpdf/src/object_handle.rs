@@ -26,6 +26,7 @@
 
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
 
 /// The no-offset sentinel qpdf uses for values that were not parsed from a
@@ -344,11 +345,21 @@ pub(crate) enum ObjectValue {
 struct DirectSlot {
     value: ObjectValue,
     parsed_offset: i64,
-    /// Canonical indirect objects that contain this direct value. qpdf keeps
-    /// one shared QPDFObject payload, so direct mutation has no document-wide
-    /// owner-discovery phase. The Rust port records the same containment at
-    /// insertion/resolution time for incremental-write dirty tracking.
-    containing_object_refs: std::collections::BTreeSet<ContainmentOwner>,
+    /// Pdf identities this value has belonged to. This provenance is
+    /// additive, like qpdf's owning `QPDF*`, and deliberately survives
+    /// removal from a container.
+    pdf_unique_ids: BTreeSet<u64>,
+    /// One weak reverse edge for each current forward occurrence in an
+    /// array, dictionary, stream dictionary, or indirect root. qpdf's
+    /// forward membership remains authoritative; this derived index exists
+    /// only so incremental dirty tracking can find live indirect roots.
+    containment_parents: Vec<ContainmentParent>,
+}
+
+#[derive(Debug, Clone)]
+enum ContainmentParent {
+    Root(ContainmentOwner),
+    Direct(Weak<RefCell<DirectSlot>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -462,8 +473,8 @@ impl ObjectHandle {
     ///
     /// Neither half is sufficient alone. The resolver is what
     /// [`Self::try_dereference`] upgrades and calls; the identity is what
-    /// [`Self::belongs_to_pdf`] answers on, and what [`Self::set_resolved`]
-    /// stamps onto each direct child for
+    /// [`Self::belongs_to_pdf`] answers on. [`Self::set_resolved`] propagates
+    /// that identity separately from the live immediate-parent edges used by
     /// [`Self::containing_object_refs_for_pdf`].
     ///
     /// `pdf_unique_id` itself ports qpdf's document-level unique id:
@@ -506,8 +517,8 @@ impl ObjectHandle {
     /// surviving handle cannot keep its document alive.
     ///
     /// Identity-less, so [`Self::belongs_to_pdf`] answers `false` for every
-    /// document, and the owner [`Self::set_resolved`] records on each direct
-    /// child carries `None` as its document — which makes
+    /// document, and the root edge [`Self::set_resolved`] records on each
+    /// direct child carries `None` as its document — which makes
     /// [`Self::containing_object_refs_for_pdf`] empty for every id, since
     /// `None` matches no `Some`. That makes this the *narrower* of the two
     /// constructors, not the qpdf-native one — upstream a single `QPDF*`
@@ -547,11 +558,18 @@ impl ObjectHandle {
     }
 
     fn new_direct(value: ObjectValue, parsed_offset: i64) -> Self {
-        Self(Repr::Direct(Rc::new(RefCell::new(DirectSlot {
+        let handle = Self(Repr::Direct(Rc::new(RefCell::new(DirectSlot {
             value,
             parsed_offset,
-            containing_object_refs: Default::default(),
-        }))))
+            pdf_unique_ids: Default::default(),
+            containment_parents: Vec::new(),
+        }))));
+        handle.with_value(|value| {
+            if let Some(value) = value {
+                handle.attach_value_children(value);
+            }
+        });
+        handle
     }
 
     /// Construct a direct handle wrapping an already-built [`ObjectValue`], at
@@ -579,6 +597,14 @@ impl ObjectHandle {
     pub(crate) fn into_direct_value(self) -> Option<(ObjectValue, i64)> {
         match self.0 {
             Repr::Direct(rc) => {
+                if Rc::strong_count(&rc) != 1 {
+                    return None;
+                }
+                let parent = ContainmentParent::Direct(Rc::downgrade(&rc));
+                let children = Self::direct_children(&rc.borrow().value);
+                for child in children {
+                    Self::detach_child_from_parent(&child, &parent);
+                }
                 let slot = Rc::try_unwrap(rc).ok()?.into_inner();
                 Some((slot.value, slot.parsed_offset))
             }
@@ -630,15 +656,29 @@ impl ObjectHandle {
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if let Repr::Indirect(slot) = &self.0 {
-            let owner = {
-                let slot = slot.borrow();
-                ContainmentOwner {
+            let new_children = Self::direct_children(&value);
+            let (owner, old_value) = {
+                let mut slot = slot.borrow_mut();
+                let owner = ContainmentOwner {
                     pdf_unique_id: slot.pdf_unique_id,
                     object_ref: slot.object_ref,
-                }
+                };
+                let old_value =
+                    match std::mem::replace(&mut slot.state, IndirectState::Resolved(value)) {
+                        IndirectState::Resolved(old_value) => Some(old_value),
+                        _ => None,
+                    };
+                (owner, old_value)
             };
-            Self::associate_value_with_owners(&value, &[owner], 0);
-            slot.borrow_mut().state = IndirectState::Resolved(value);
+            let parent = ContainmentParent::Root(owner);
+            if let Some(old_value) = old_value {
+                for child in Self::direct_children(&old_value) {
+                    Self::detach_child_from_parent(&child, &parent);
+                }
+            }
+            for child in new_children {
+                Self::attach_child_to_parent(&child, &parent);
+            }
         }
     }
 
@@ -647,39 +687,26 @@ impl ObjectHandle {
     /// that need that case already use [`Self::object_ref`].
     #[cfg(test)]
     pub(crate) fn containing_object_refs(&self) -> Vec<ObjectRef> {
-        match &self.0 {
-            Repr::Direct(slot) => slot
-                .borrow()
-                .containing_object_refs
-                .iter()
-                .map(|owner| owner.object_ref)
-                .collect(),
-            Repr::Indirect(_) => Vec::new(),
-        }
+        self.containment_roots()
+            .into_iter()
+            .map(|owner| owner.object_ref)
+            .collect()
     }
 
     pub(crate) fn containing_object_refs_for_pdf(&self, pdf_unique_id: u64) -> Vec<ObjectRef> {
-        match &self.0 {
-            Repr::Direct(slot) => slot
-                .borrow()
-                .containing_object_refs
-                .iter()
-                .filter(|owner| owner.pdf_unique_id == Some(pdf_unique_id))
-                .map(|owner| owner.object_ref)
-                .collect(),
-            Repr::Indirect(_) => Vec::new(),
-        }
+        self.containment_roots()
+            .into_iter()
+            .filter(|owner| owner.pdf_unique_id == Some(pdf_unique_id))
+            .map(|owner| owner.object_ref)
+            .collect()
     }
 
     pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
         match &self.0 {
             Repr::Indirect(slot) => slot.borrow().pdf_unique_id == Some(pdf_unique_id),
             Repr::Direct(slot) => {
-                let owners = &slot.borrow().containing_object_refs;
-                owners.is_empty()
-                    || owners
-                        .iter()
-                        .any(|owner| owner.pdf_unique_id == Some(pdf_unique_id))
+                let ids = &slot.borrow().pdf_unique_ids;
+                ids.is_empty() || ids.contains(&pdf_unique_id)
             }
         }
     }
@@ -699,9 +726,25 @@ impl ObjectHandle {
     /// source position even though the value now reads as null.
     pub(crate) fn set_missing(&self) {
         if let Repr::Indirect(slot) = &self.0 {
-            let mut slot = slot.borrow_mut();
-            slot.state = IndirectState::Missing;
-            slot.parsed_offset = NO_PARSED_OFFSET;
+            let (owner, old_value) = {
+                let mut slot = slot.borrow_mut();
+                let owner = ContainmentOwner {
+                    pdf_unique_id: slot.pdf_unique_id,
+                    object_ref: slot.object_ref,
+                };
+                let old_value = match std::mem::replace(&mut slot.state, IndirectState::Missing) {
+                    IndirectState::Resolved(old_value) => Some(old_value),
+                    _ => None,
+                };
+                slot.parsed_offset = NO_PARSED_OFFSET;
+                (owner, old_value)
+            };
+            if let Some(old_value) = old_value {
+                let parent = ContainmentParent::Root(owner);
+                for child in Self::direct_children(&old_value) {
+                    Self::detach_child_from_parent(&child, &parent);
+                }
+            }
         }
     }
 
@@ -731,9 +774,25 @@ impl ObjectHandle {
     /// the destroyed value's former source position.
     pub(crate) fn disconnect(&self) {
         if let Repr::Indirect(slot) = &self.0 {
-            let mut slot = slot.borrow_mut();
-            slot.state = IndirectState::Destroyed;
-            slot.parsed_offset = NO_PARSED_OFFSET;
+            let (owner, old_value) = {
+                let mut slot = slot.borrow_mut();
+                let owner = ContainmentOwner {
+                    pdf_unique_id: slot.pdf_unique_id,
+                    object_ref: slot.object_ref,
+                };
+                let old_value = match std::mem::replace(&mut slot.state, IndirectState::Destroyed) {
+                    IndirectState::Resolved(old_value) => Some(old_value),
+                    _ => None,
+                };
+                slot.parsed_offset = NO_PARSED_OFFSET;
+                (owner, old_value)
+            };
+            if let Some(old_value) = old_value {
+                let parent = ContainmentParent::Root(owner);
+                for child in Self::direct_children(&old_value) {
+                    Self::detach_child_from_parent(&child, &parent);
+                }
+            }
         }
     }
 
@@ -1297,16 +1356,18 @@ impl ObjectHandle {
         if self.is_same_direct_handle(&value) {
             return;
         }
-        let owner_refs = self.child_owner_refs();
-        let inserted = self.with_value_mut(|v| {
+        let replaced = self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
-                entries.insert(key.to_vec(), value.clone());
-                return true;
+                return Some(entries.insert(key.to_vec(), value.clone()));
             }
-            false
+            None
         });
-        if inserted {
-            value.associate_with_owners(&owner_refs, 0);
+        if let Some(old_value) = replaced {
+            let parent = self.containment_parent();
+            if let Some(old_value) = old_value {
+                Self::detach_child_from_parent(&old_value, &parent);
+            }
+            Self::attach_child_to_parent(&value, &parent);
         }
     }
 
@@ -1317,21 +1378,23 @@ impl ObjectHandle {
         if self.is_same_direct_handle(&value) {
             return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
         }
-        let owner_refs = self.child_owner_refs();
-        let replaced = self.with_value_mut(|current| {
+        let old_value = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(items)) = current else {
-                return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
+                return None; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
             };
             let Some(item) = items.get_mut(index) else {
-                return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
+                return None; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
             };
-            *item = value.clone();
-            true
+            Some(std::mem::replace(item, value.clone()))
         });
-        if replaced {
-            value.associate_with_owners(&owner_refs, 0);
+        if let Some(old_value) = old_value {
+            let parent = self.containment_parent();
+            Self::detach_child_from_parent(&old_value, &parent);
+            Self::attach_child_to_parent(&value, &parent);
+            true
+        } else {
+            false
         }
-        replaced
     }
 
     /// Replace every item in this live array while preserving the array
@@ -1341,19 +1404,21 @@ impl ObjectHandle {
         if items.iter().any(|item| self.is_same_direct_handle(item)) {
             return false; // cov:ignore: internal callers only replay materialized child arrays
         }
-        let owner_refs = self.child_owner_refs();
-        let replaced = self.with_value_mut(|current| {
+        let old_items = self.with_value_mut(|current| {
             let Some(ObjectValue::Array(current_items)) = current else {
-                return false; // cov:ignore: internal callers confirm the array type first
+                return None; // cov:ignore: internal callers confirm the array type first
             };
-            *current_items = items.clone();
-            true
+            Some(std::mem::replace(current_items, items.clone()))
         });
-        if !replaced {
+        let Some(old_items) = old_items else {
             return false; // cov:ignore: internal callers confirm the array type first
+        };
+        let parent = self.containment_parent();
+        for item in old_items {
+            Self::detach_child_from_parent(&item, &parent);
         }
-        for item in items {
-            item.associate_with_owners(&owner_refs, 0);
+        for item in &items {
+            Self::attach_child_to_parent(item, &parent);
         }
         true
     }
@@ -1369,60 +1434,147 @@ impl ObjectHandle {
         matches!((&self.0, &other.0), (Repr::Direct(a), Repr::Direct(b)) if Rc::ptr_eq(a, b))
     }
 
-    /// The indirect object refs inherited by a newly inserted direct child.
-    /// An indirect parent is its own containment root; a direct parent can be
-    /// shared by more than one indirect root and therefore propagates all of
-    /// its recorded owners.
-    fn child_owner_refs(&self) -> Vec<ContainmentOwner> {
-        match &self.0 {
-            Repr::Direct(slot) => slot
-                .borrow()
-                .containing_object_refs
-                .iter()
-                .copied()
-                .collect(),
-            Repr::Indirect(slot) => {
-                let slot = slot.borrow();
-                vec![ContainmentOwner {
-                    pdf_unique_id: slot.pdf_unique_id,
-                    object_ref: slot.object_ref,
-                }]
-            }
-        }
-    }
-
-    fn associate_value_with_owners(value: &ObjectValue, owners: &[ContainmentOwner], depth: usize) {
-        let children = match value {
+    fn direct_children(value: &ObjectValue) -> Vec<ObjectHandle> {
+        match value {
             ObjectValue::Array(children) => children.clone(),
             ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
             ObjectValue::Stream { stream_dict, .. } => vec![stream_dict.clone()],
-            _ => return,
-        };
-        for child in children {
-            child.associate_with_owners(owners, depth + 1);
+            _ => Vec::new(),
         }
     }
 
-    fn associate_with_owners(&self, owners: &[ContainmentOwner], depth: usize) {
-        if !self.is_direct() || owners.is_empty() || depth >= crate::object::MAX_INLINE_DEPTH {
-            return;
-        }
-        let Repr::Direct(slot) = &self.0 else {
-            return; // cov:ignore: is_direct guard above excludes Indirect
-        };
-        let children = {
-            let mut slot = slot.borrow_mut();
-            slot.containing_object_refs.extend(owners.iter().copied());
-            match &slot.value {
-                ObjectValue::Array(children) => children.clone(),
-                ObjectValue::Dictionary(entries) => entries.values().cloned().collect(),
-                ObjectValue::Stream { stream_dict, .. } => vec![stream_dict.clone()],
-                _ => Vec::new(),
+    fn containment_parent(&self) -> ContainmentParent {
+        match &self.0 {
+            Repr::Direct(slot) => ContainmentParent::Direct(Rc::downgrade(slot)),
+            Repr::Indirect(slot) => {
+                let slot = slot.borrow();
+                ContainmentParent::Root(ContainmentOwner {
+                    pdf_unique_id: slot.pdf_unique_id,
+                    object_ref: slot.object_ref,
+                })
             }
-        };
-        for child in children {
-            child.associate_with_owners(owners, depth + 1);
         }
+    }
+
+    fn same_containment_parent(left: &ContainmentParent, right: &ContainmentParent) -> bool {
+        match (left, right) {
+            (ContainmentParent::Root(left), ContainmentParent::Root(right)) => left == right,
+            (ContainmentParent::Direct(left), ContainmentParent::Direct(right)) => {
+                Weak::ptr_eq(left, right)
+            }
+            _ => false,
+        }
+    }
+
+    fn attach_child_to_parent(child: &ObjectHandle, parent: &ContainmentParent) {
+        let Repr::Direct(slot) = &child.0 else {
+            return;
+        };
+        {
+            let mut slot = slot.borrow_mut();
+            slot.containment_parents
+                .retain(Self::containment_parent_is_live);
+            slot.containment_parents.push(parent.clone());
+        }
+
+        let pdf_unique_ids: Vec<u64> = match parent {
+            ContainmentParent::Root(owner) => owner.pdf_unique_id.into_iter().collect(),
+            ContainmentParent::Direct(parent) => parent
+                .upgrade()
+                .map(|parent| parent.borrow().pdf_unique_ids.iter().copied().collect())
+                .unwrap_or_default(),
+        };
+        for pdf_unique_id in pdf_unique_ids {
+            child.associate_pdf_identity(pdf_unique_id, &mut BTreeSet::new());
+        }
+    }
+
+    fn containment_parent_is_live(parent: &ContainmentParent) -> bool {
+        match parent {
+            ContainmentParent::Root(_) => true,
+            ContainmentParent::Direct(parent) => parent.strong_count() != 0,
+        }
+    }
+
+    fn detach_child_from_parent(child: &ObjectHandle, parent: &ContainmentParent) {
+        let Repr::Direct(slot) = &child.0 else {
+            return;
+        };
+        let mut slot = slot.borrow_mut();
+        if let Some(index) = slot
+            .containment_parents
+            .iter()
+            .position(|candidate| Self::same_containment_parent(candidate, parent))
+        {
+            slot.containment_parents.remove(index);
+        }
+    }
+
+    fn attach_value_children(&self, value: &ObjectValue) {
+        let parent = self.containment_parent();
+        for child in Self::direct_children(value) {
+            Self::attach_child_to_parent(&child, &parent);
+        }
+    }
+
+    fn detach_value_children(&self, value: &ObjectValue) {
+        let parent = self.containment_parent();
+        for child in Self::direct_children(value) {
+            Self::detach_child_from_parent(&child, &parent);
+        }
+    }
+
+    fn associate_pdf_identity(&self, pdf_unique_id: u64, visited: &mut BTreeSet<usize>) {
+        let mut pending = vec![self.clone()];
+        while let Some(handle) = pending.pop() {
+            let Repr::Direct(slot) = &handle.0 else {
+                continue;
+            };
+            let identity = Rc::as_ptr(slot) as usize;
+            if !visited.insert(identity) {
+                continue;
+            }
+            let children = {
+                let mut slot = slot.borrow_mut();
+                slot.pdf_unique_ids.insert(pdf_unique_id);
+                Self::direct_children(&slot.value)
+            };
+            pending.extend(children);
+        }
+    }
+
+    fn containment_roots(&self) -> BTreeSet<ContainmentOwner> {
+        let mut roots = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![self.clone()];
+        while let Some(handle) = pending.pop() {
+            let Repr::Direct(slot) = &handle.0 else {
+                continue;
+            };
+            let identity = Rc::as_ptr(slot) as usize;
+            if !visited.insert(identity) {
+                continue;
+            }
+            let parents = {
+                let mut slot = slot.borrow_mut();
+                slot.containment_parents
+                    .retain(Self::containment_parent_is_live);
+                slot.containment_parents.clone()
+            };
+            for parent in parents {
+                match parent {
+                    ContainmentParent::Root(owner) => {
+                        roots.insert(owner);
+                    }
+                    ContainmentParent::Direct(parent) => {
+                        if let Some(parent) = parent.upgrade() {
+                            pending.push(ObjectHandle(Repr::Direct(parent)));
+                        }
+                    }
+                }
+            }
+        }
+        roots
     }
 
     /// Remove `key` from this handle's dictionary if present, mutating the
@@ -1436,11 +1588,15 @@ impl ObjectHandle {
     /// `resolve`/`resolve_borrowed` staleness caveat and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too.
     pub fn remove_key(&self, key: &[u8]) {
-        self.with_value_mut(|v| {
+        let removed = self.with_value_mut(|v| {
             if let Some(ObjectValue::Dictionary(entries)) = v {
-                entries.remove(key);
+                return entries.remove(key);
             }
+            None
         });
+        if let Some(removed) = removed {
+            Self::detach_child_from_parent(&removed, &self.containment_parent());
+        }
     }
 
     /// A fresh, direct handle with a value copied from `self` — mirrors
@@ -2006,14 +2162,14 @@ impl ObjectHandle {
     /// dictionary handle's already-recorded `<<`-start parsed offset
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
-        let owner_refs = self.child_owner_refs();
         if let Repr::Direct(slot) = &self.0 {
-            slot.borrow_mut().value = value;
-            self.with_value(|value| {
-                if let Some(value) = value {
-                    Self::associate_value_with_owners(value, &owner_refs, 0);
-                }
-            });
+            let new_children = Self::direct_children(&value);
+            let old_value = std::mem::replace(&mut slot.borrow_mut().value, value);
+            self.detach_value_children(&old_value);
+            let parent = self.containment_parent();
+            for child in new_children {
+                Self::attach_child_to_parent(&child, &parent);
+            }
         }
     }
 
@@ -3386,11 +3542,18 @@ fn merge_resource_array(this_val: &ObjectHandle, other_val: &ObjectHandle) {
 }
 
 fn append_array_item(handle: &ObjectHandle, item: ObjectHandle) {
-    handle.with_value_mut(|v| {
+    let child = item.clone();
+    let appended = handle.with_value_mut(|v| {
         if let Some(ObjectValue::Array(items)) = v {
             items.push(item);
+            true
+        } else {
+            false // cov:ignore: merge_resource_array only calls after confirming this_val is an array
         }
     });
+    if appended {
+        ObjectHandle::attach_child_to_parent(&child, &handle.containment_parent());
+    }
 }
 
 // Mirrors `isScalar()` (`libqpdf/QPDFObjectHandle.cc:450-453`): bool,
@@ -3739,12 +3902,12 @@ pub(crate) mod identity_tests {
     /// resolver at once: `Pdf::get_object_handle` hands out one handle that
     /// must answer both questions.
     ///
-    /// The identity is not decorative. `set_resolved` stamps the slot's
-    /// `pdf_unique_id` onto every direct child it installs (via
-    /// `associate_value_with_owners`), and that stamp is what
-    /// [`ObjectHandle::belongs_to_pdf`] and
-    /// [`ObjectHandle::containing_object_refs_for_pdf`] read — the
-    /// foreign-object rejection and owner lookup in
+    /// The identity is not decorative. `set_resolved` propagates the slot's
+    /// `pdf_unique_id` through every current direct descendant independently
+    /// of the live immediate-parent edges. The identity provenance drives
+    /// [`ObjectHandle::belongs_to_pdf`], while those edges drive
+    /// [`ObjectHandle::containing_object_refs_for_pdf`] — respectively the
+    /// foreign-object rejection and current owner lookup in
     /// `Pdf::mark_object_handle_dirty`, `filespec_helper`, and
     /// `embedded_files`. Measured against the current tree, not predicted:
     /// this is now the constructor `Pdf::get_object_handle` uses — the
@@ -3779,9 +3942,9 @@ pub(crate) mod identity_tests {
         handle.try_dereference().unwrap();
         assert!(handle.is_resolved());
 
-        // Both at once. The child's owner stamp is written by `set_resolved`
-        // out of the slot's own `pdf_unique_id`, so it can only carry this id
-        // if the identity survived *into* the resolution the resolver drove.
+        // Both at once. The child's identity and live root edge are written
+        // by `set_resolved`, so both can only be present if the document
+        // identity survived *into* the resolution the resolver drove.
         let child = handle.get_key(b"A");
         assert_eq!(child.as_integer(), Some(1));
         assert_eq!(
@@ -3789,6 +3952,52 @@ pub(crate) mod identity_tests {
             vec![object_ref]
         );
         assert!(child.containing_object_refs_for_pdf(PDF_ID + 1).is_empty());
+    }
+
+    #[test]
+    fn detached_child_preserves_pdf_identity_without_a_live_root() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let owner = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            owner_ref,
+            NO_PARSED_OFFSET,
+            41,
+            Rc::downgrade(&resolver),
+        );
+        let parent = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Parent".to_vec(), parent.clone())].into_iter().collect(),
+        ));
+        let child = ObjectHandle::dictionary(vec![]);
+        parent.replace_key(b"Child", child.clone());
+
+        parent.remove_key(b"Child");
+
+        assert!(child.belongs_to_pdf(41));
+        assert!(!child.belongs_to_pdf(42));
+        assert!(child.containing_object_refs_for_pdf(41).is_empty());
+    }
+
+    #[test]
+    fn pdf_identity_propagation_terminates_on_a_direct_cycle() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let owner = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(7, 0),
+            NO_PARSED_OFFSET,
+            41,
+            Rc::downgrade(&resolver),
+        );
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        first.replace_key(b"Second", second.clone());
+        second.replace_key(b"First", first.clone());
+
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"First".to_vec(), first.clone())].into_iter().collect(),
+        ));
+
+        assert!(first.belongs_to_pdf(41));
+        assert!(second.belongs_to_pdf(41));
     }
 
     #[test]
@@ -4700,6 +4909,20 @@ mod resolution_state_tests {
     }
 
     #[test]
+    fn into_direct_value_leaves_child_edges_attached_when_the_parent_is_shared() {
+        let child = ObjectHandle::integer(1);
+        let parent = ObjectHandle::array(vec![child.clone()]);
+        let retained_parent = parent.clone();
+
+        assert!(parent.into_direct_value().is_none());
+
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, NO_PARSED_OFFSET);
+        owner.set_resolved(ObjectValue::Array(vec![retained_parent]));
+        assert_eq!(child.containing_object_refs(), vec![owner_ref]);
+    }
+
+    #[test]
     fn fresh_indirect_handle_is_not_resolved() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         assert!(!handle.is_resolved());
@@ -5090,6 +5313,31 @@ mod materialize_tests {
 
         assert_eq!(handle.as_integer(), Some(2));
         assert_eq!(handle.get_parsed_offset(), 100);
+    }
+
+    #[test]
+    fn replace_direct_value_moves_dictionary_storage_without_cloning_it() {
+        let handle = ObjectHandle::integer(1);
+        let key = vec![b'K'; 4_096];
+        let original_key_allocation = key.as_ptr();
+        let value =
+            ObjectValue::Dictionary([(key, ObjectHandle::integer(2))].into_iter().collect());
+
+        handle.replace_direct_value(value);
+
+        let Repr::Direct(slot) = &handle.0 else {
+            panic!("test handle must remain direct"); // cov:ignore: test constructor guarantees this variant
+        };
+        let slot = slot.borrow();
+        let ObjectValue::Dictionary(entries) = &slot.value else {
+            panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
+        };
+        let replaced_key_allocation = entries
+            .keys()
+            .next()
+            .expect("replacement dictionary retains its key")
+            .as_ptr();
+        assert_eq!(replaced_key_allocation, original_key_allocation);
     }
 
     #[test]
@@ -7187,6 +7435,260 @@ mod mutation_tests {
     }
 
     #[test]
+    fn dictionary_detach_removes_only_the_removed_live_path() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let child = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [
+                (b"A".to_vec(), child.clone()),
+                (b"B".to_vec(), child.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        owner.remove_key(b"A");
+        assert_eq!(child.containing_object_refs(), vec![owner_ref]);
+        owner.remove_key(b"B");
+        assert!(child.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn set_resolved_moves_dictionary_storage_without_cloning_it() {
+        let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
+        let key = vec![b'K'; 4_096];
+        let original_key_allocation = key.as_ptr();
+        let value =
+            ObjectValue::Dictionary([(key, ObjectHandle::integer(1))].into_iter().collect());
+
+        owner.set_resolved(value);
+
+        let Repr::Indirect(slot) = &owner.0 else {
+            panic!("test owner must remain indirect"); // cov:ignore: test constructor guarantees this variant
+        };
+        let slot = slot.borrow();
+        let IndirectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
+            panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
+        };
+        let resolved_key_allocation = entries
+            .keys()
+            .next()
+            .expect("resolved dictionary retains its key")
+            .as_ptr();
+        assert_eq!(resolved_key_allocation, original_key_allocation);
+    }
+
+    #[test]
+    fn expired_direct_parent_edges_are_pruned_on_attach_and_query() {
+        fn parent_count(handle: &ObjectHandle) -> usize {
+            let Repr::Direct(slot) = &handle.0 else {
+                panic!("test child must be direct"); // cov:ignore: test factory guarantees this variant
+            };
+            slot.borrow().containment_parents.len()
+        }
+
+        let child = ObjectHandle::integer(1);
+        for _ in 0..64 {
+            let transient_parent = ObjectHandle::array(vec![child.clone()]);
+            drop(transient_parent);
+        }
+
+        let live_parent = ObjectHandle::array(vec![child.clone()]);
+        assert_eq!(parent_count(&child), 1);
+
+        drop(live_parent);
+        assert!(child.containing_object_refs().is_empty());
+        assert_eq!(parent_count(&child), 0);
+    }
+
+    #[test]
+    fn deep_containment_traversals_do_not_overflow_the_stack() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "object_handle::mutation_tests::deep_containment_traversals_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FLPDF_DEEP_CONTAINMENT_PROBE", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "deep-containment probe failed: status={} stderr={}",
+            output.status,
+            stderr
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess-only stack-overflow regression probe"]
+    fn deep_containment_traversals_probe() {
+        assert_eq!(
+            std::env::var_os("FLPDF_DEEP_CONTAINMENT_PROBE").as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved_with_identity(
+            owner_ref,
+            NO_PARSED_OFFSET,
+            Some(41),
+            None,
+        );
+        let leaf = ObjectHandle::integer(1);
+        let mut nested = leaf.clone();
+        for _ in 0..100_000 {
+            nested = ObjectHandle::array(vec![nested]);
+        }
+
+        owner.set_resolved(ObjectValue::Array(vec![nested.clone()]));
+        assert_eq!(leaf.containing_object_refs_for_pdf(41), vec![owner_ref]);
+
+        // These user-constructed values are intentionally deeper than Rust's
+        // recursive Rc drop can safely release. Keep this probe scoped to the
+        // two containment traversals under test.
+        std::mem::forget(owner);
+        std::mem::forget(nested);
+    }
+
+    #[test]
+    fn replacing_a_nested_dictionary_path_detaches_the_old_subtree() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let leaf = ObjectHandle::integer(1);
+        let nested = ObjectHandle::dictionary(vec![(b"Leaf".to_vec(), leaf.clone())]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Nested".to_vec(), nested.clone())].into_iter().collect(),
+        ));
+
+        owner.replace_key(b"Nested", ObjectHandle::dictionary(vec![]));
+
+        assert!(nested.containing_object_refs().is_empty());
+        assert!(leaf.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn shared_subtree_loses_only_the_detached_indirect_root() {
+        let first_ref = ObjectRef::new(7, 0);
+        let second_ref = ObjectRef::new(9, 0);
+        let first = ObjectHandle::new_indirect_unresolved(first_ref, -1);
+        let second = ObjectHandle::new_indirect_unresolved(second_ref, -1);
+        let shared = ObjectHandle::dictionary(vec![]);
+        first.set_resolved(ObjectValue::Dictionary(
+            [(b"Shared".to_vec(), shared.clone())].into_iter().collect(),
+        ));
+        second.set_resolved(ObjectValue::Dictionary(
+            [(b"Shared".to_vec(), shared.clone())].into_iter().collect(),
+        ));
+
+        first.remove_key(b"Shared");
+
+        assert_eq!(shared.containing_object_refs(), vec![second_ref]);
+    }
+
+    #[test]
+    fn array_and_direct_value_replacement_detach_old_children() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let first = ObjectHandle::integer(1);
+        let second = ObjectHandle::integer(2);
+        let array = ObjectHandle::array(vec![first.clone(), first.clone()]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Array".to_vec(), array.clone())].into_iter().collect(),
+        ));
+
+        assert!(array.replace_array_item(0, second.clone()));
+        assert_eq!(first.containing_object_refs(), vec![owner_ref]);
+        assert_eq!(second.containing_object_refs(), vec![owner_ref]);
+        assert!(array.replace_array_items(vec![]));
+        assert!(first.containing_object_refs().is_empty());
+        assert!(second.containing_object_refs().is_empty());
+
+        let replacement = ObjectHandle::integer(3);
+        array.replace_direct_value(ObjectValue::Array(vec![replacement.clone()]));
+        assert_eq!(replacement.containing_object_refs(), vec![owner_ref]);
+        array.replace_direct_value(ObjectValue::Array(vec![]));
+        assert!(replacement.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn stream_dictionary_membership_tracks_replacement_and_root_disconnect() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, NO_PARSED_OFFSET);
+        let old_dictionary = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: old_dictionary.clone(),
+            stream_data: None,
+            stream_length: 0,
+        });
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Stream".to_vec(), stream.clone())].into_iter().collect(),
+        ));
+        assert_eq!(old_dictionary.containing_object_refs(), vec![owner_ref]);
+
+        let new_dictionary = ObjectHandle::dictionary(vec![]);
+        stream.replace_direct_value(ObjectValue::Stream {
+            stream_dict: new_dictionary.clone(),
+            stream_data: None,
+            stream_length: 0,
+        });
+        assert!(old_dictionary.containing_object_refs().is_empty());
+        assert_eq!(new_dictionary.containing_object_refs(), vec![owner_ref]);
+
+        owner.disconnect();
+        assert!(new_dictionary.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn indirect_state_replacement_detaches_old_direct_children() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let replaced = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Child".to_vec(), replaced.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        let missing = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Child".to_vec(), missing.clone())].into_iter().collect(),
+        ));
+        assert!(replaced.containing_object_refs().is_empty());
+        assert_eq!(missing.containing_object_refs(), vec![owner_ref]);
+
+        owner.set_missing();
+        assert!(missing.containing_object_refs().is_empty());
+
+        let disconnected = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Child".to_vec(), disconnected.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        owner.disconnect();
+        assert!(disconnected.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn current_root_lookup_terminates_on_a_direct_cycle() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        first.replace_key(b"Second", second.clone());
+        second.replace_key(b"First", first.clone());
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"First".to_vec(), first.clone())].into_iter().collect(),
+        ));
+
+        assert_eq!(second.containing_object_refs(), vec![owner_ref]);
+    }
+
+    #[test]
     fn shallow_copy_is_always_direct_even_from_an_indirect_source() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
@@ -7405,6 +7907,36 @@ mod mutation_tests {
         let items = dest.get_key(b"ProcSet").as_array().unwrap();
         let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
         assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
+    }
+
+    #[test]
+    fn merge_resources_array_union_records_the_destination_owner() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner =
+            ObjectHandle::new_indirect_unresolved_with_identity(owner_ref, -1, Some(41), None);
+        let dest = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"PDF".to_vec())]),
+        )]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"Resources".to_vec(), dest.clone())]
+                .into_iter()
+                .collect(),
+        ));
+        let retained = ObjectHandle::name(b"Text".to_vec());
+        let other = ObjectHandle::dictionary(vec![(
+            b"ProcSet".to_vec(),
+            ObjectHandle::array(vec![retained.clone()]),
+        )]);
+
+        dest.merge_resources(&other, None);
+
+        let merged = dest
+            .get_key(b"ProcSet")
+            .as_array()
+            .expect("merged ProcSet remains an array");
+        assert!(merged[1].is_same_object_as(&retained));
+        assert_eq!(retained.containing_object_refs_for_pdf(41), vec![owner_ref]);
     }
 
     #[test]
