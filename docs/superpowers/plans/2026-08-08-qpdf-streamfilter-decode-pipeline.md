@@ -430,7 +430,11 @@ fn predictor_construction_failure_precedes_every_write() {
     let mut filter = FlateLzwStreamFilter::new(false);
     // /Colors 0 is what PngFilter::new rejects as invalid samples_per_pixel.
     assert!(filter.set_decode_params(&params(&[("Predictor", 12), ("Colors", 0)])));
-    let err = filter.decode_pipeline(&mut sink).unwrap_err();
+    // `.err().unwrap()`, not `.unwrap_err()`: the latter needs `T: Debug`, and
+    // here `T` is `Option<Box<dyn Pipeline + 'a>>`, which has no `Debug`. Do not
+    // "fix" that by giving `Pipeline` a `Debug` supertrait — qpdf's `Pipeline`
+    // has no counterpart, and it would propagate to every stage.
+    let err = filter.decode_pipeline(&mut sink).err().unwrap();
     assert!(err.to_string().contains("samples_per_pixel"));
     assert_eq!(sink.writes, 0);
     assert_eq!(sink.finishes, 0);
@@ -771,6 +775,15 @@ scripts/patch-coverage.sh --base main \
 
 Every changed line in `flpdf` must be covered. If a line is genuinely unreachable,
 mark it `// cov:ignore: <reason>` and note the reason for the PR description.
+
+One line looks like a `cov:ignore` candidate and is not. The `Flate::new(..)
+.map_err(map_pipeline_error)?` inside `FlateLzwStreamFilter::decode_pipeline` can
+never take its `Err` branch: `Flate::new` fails only when the output buffer size is
+zero or exceeds `u32::MAX`, and the argument is the constant
+`DEFAULT_OUT_BUFFER_SIZE`. Keep the `?` anyway — qpdf's `Pl_Flate` constructor is
+likewise fallible-but-never-failing at the default buffer size, and silently making
+it infallible would be an unrecorded divergence. The line is executed on the `Ok`
+path, so line coverage is satisfied without an ignore marker.
 
 After the numbers, do the qualitative pass CLAUDE.md requires: confirm the error
 arms, boundaries, and empty/extreme inputs of the new behavior have tests whose
