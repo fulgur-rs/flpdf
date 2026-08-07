@@ -1504,7 +1504,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// "uninitialized handle" state to reject separately, since every
     /// `ObjectHandle` is always validly constructed).
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        let Some(value) = handle.direct_value_clone() else {
+        let Some(value) = handle.direct_value_clone()? else {
             return Err(Error::Unsupported(
                 "cannot make an already-indirect ObjectHandle indirect".to_string(),
             ));
@@ -5294,35 +5294,55 @@ mod tests {
     }
 
     #[test]
-    fn make_indirect_object_handle_shares_a_streams_dict_with_the_source() {
-        // qpdf promotes by registering the caller's *existing* QPDFObject
-        // under a fresh QPDFObjGen (`QPDF::makeIndirectObject` ->
-        // `makeIndirectFromQPDFObject(oh.getObj())`,
-        // `libqpdf/QPDF.cc:1883-1898`); there is no copy, and
-        // `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`) offers none
-        // to make. So a promoted stream observes the source's own dictionary,
-        // the same Rc-sharing every other variant's child handles already get.
-        let dict = ObjectHandle::dictionary(vec![]);
+    fn make_indirect_object_handle_keeps_a_promoted_streams_metadata_consistent() {
+        // qpdf shares the *whole* QPDFObject on promotion
+        // (`QPDF::makeIndirectObject` -> `makeIndirectFromQPDFObject(oh.getObj())`,
+        // `libqpdf/QPDF.cc:1883-1898`), so an edit through either handle is
+        // one edit to one stream. This allocator still mints a separate slot
+        // (flpdf-25kg.3.6), and there a *partial* share corrupts: stream_dict
+        // is an ObjectHandle (shared mutability) while stream_data is a
+        // per-value field, so a shared dictionary would let this
+        // replace_stream_data rewrite the promoted stream's /Length while
+        // leaving its bytes alone. Each slot must stay self-consistent.
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
-            stream_dict: dict.clone(),
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"Length".to_vec(),
+                ObjectHandle::integer(3),
+            )]),
             stream_data: Some(Rc::new(b"old".to_vec())),
-            stream_length: 0,
+            stream_length: 3,
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
-        let indirect = pdf
-            .make_indirect_object_handle(direct_stream)
+        let promoted = pdf
+            .make_indirect_object_handle(direct_stream.clone())
             .expect("make indirect");
 
-        dict.replace_key(b"Length", ObjectHandle::integer(999));
+        direct_stream.replace_stream_data(Rc::new(b"brand new bytes".to_vec()), None, None);
 
+        let promoted_length = promoted
+            .as_stream_dict()
+            .expect("promoted stream dict")
+            .get_key(b"Length")
+            .as_integer();
         assert_eq!(
-            indirect
+            promoted_length,
+            Some(3),
+            "the promoted stream keeps its own /Length; the source's replacement \
+             must not describe bytes the promoted object does not hold"
+        );
+        assert_eq!(
+            promoted.as_stream_data(),
+            Some(Rc::new(b"old".to_vec())),
+            "and keeps its own bytes"
+        );
+        assert_eq!(
+            direct_stream
                 .as_stream_dict()
-                .unwrap()
+                .expect("source stream dict")
                 .get_key(b"Length")
                 .as_integer(),
-            Some(999),
-            "the promoted object's dict is the source's own dict"
+            Some(15),
+            "while the source records its own replacement"
         );
     }
 
