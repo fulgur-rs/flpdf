@@ -918,6 +918,8 @@ pub(crate) trait StreamFilter {
     ///
     /// The Flate warn callback is deliberately absent: qpdf installs it at the
     /// `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), not here.
+    // Production decoding still runs through pipe_decode_recovering, so nothing
+    // outside tests calls this yet.
     #[allow(dead_code)]
     fn decode_pipeline<'a>(
         &mut self,
@@ -1697,18 +1699,20 @@ pub(crate) mod tests {
         decode_filter_specs_from_handle, decode_filter_specs_from_object, decode_flate,
         decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
         ignore_codec_warning, ignore_warning, normalize_filter_name, stream_filter_for,
-        AsciiHexStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle,
-        OutputBuffer, ParamValue, Pipeline, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
-        RETAINED_DECODE_PARAM_KEYS,
+        Ascii85StreamFilter, AsciiHexStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter,
+        ObjectHandle, OutputBuffer, ParamValue, Pipeline, RunLengthStreamFilter, StreamFilter,
+        DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
     };
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
+    use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
     use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
     use std::cell::{Cell, RefCell};
     use std::io::Cursor;
+    use std::rc::Rc;
 
     #[test]
     fn run_length_encoder_uses_qpdf_two_byte_run() {
@@ -4039,6 +4043,294 @@ pub(crate) mod tests {
             stage.finish().unwrap();
         }
         assert_eq!(sink.data, b"abc");
+    }
+
+    /// Two complete PNG rows for a `/Columns 4 /Colors 1 /BitsPerComponent 8`
+    /// geometry: filter byte 0 (None) passes `abcd` through, filter byte 2 (Up)
+    /// adds the decoded row above, so `1 1 1 1` becomes `bcde`.
+    const PNG_PREDICTED_ROWS: &[u8] = &[0, b'a', b'b', b'c', b'd', 2, 1, 1, 1, 1];
+    const PNG_PREDICTOR_DECODED: &[u8] = b"abcdbcde";
+
+    /// Pack `data` as one literal LZW code per byte between a clear and an EOD
+    /// code, the shape
+    /// `flate_and_lzw_predictor_finish_output_keeps_its_cleanup_boundary`
+    /// already uses.
+    ///
+    /// Every code stays 9 bits wide because the table grows by one entry per
+    /// code and the width change is 252 codes away.
+    fn lzw_encoded(data: &[u8]) -> Vec<u8> {
+        let mut codes = vec![256];
+        codes.extend(data.iter().map(|&byte| u32::from(byte)));
+        codes.push(257);
+        pack_codes(&codes, true)
+    }
+
+    fn png_predictor_params() -> DecodeParams {
+        neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Columns", ParamValue::Int(4)),
+        ])
+    }
+
+    /// Drive `filter`'s decode stage over `encoded` in `chunk`-sized writes
+    /// followed by a single `finish`, and report what the sink saw.
+    ///
+    /// The payload must span at least three writes so the stage is exercised
+    /// across write boundaries rather than handed a whole buffer.
+    fn stream_decode_pipeline(
+        filter: &mut dyn StreamFilter,
+        encoded: &[u8],
+        chunk: usize,
+    ) -> Rc<RefCell<Trace>> {
+        assert!(
+            encoded.chunks(chunk).count() >= 3,
+            "the payload must span at least three writes"
+        );
+        let mut sink = RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
+        {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("stage construction must succeed")
+                .expect("this filter contributes a stage");
+            for part in encoded.chunks(chunk) {
+                stage.write(part).expect("write must succeed");
+            }
+            stage.finish().expect("finish must succeed");
+        }
+        trace
+    }
+
+    fn finish_count(trace: &Trace) -> usize {
+        trace
+            .calls
+            .iter()
+            .filter(|call| matches!(call, TraceCall::Finish { .. }))
+            .count()
+    }
+
+    #[test]
+    fn predictor_construction_failure_precedes_every_write() {
+        let mut sink = RecordingSink::new(&[], &[]);
+        let trace = sink.trace();
+        let mut filter = FlateLzwStreamFilter::new(false);
+        // /Colors 0 is what `PngFilter::new` rejects as an invalid
+        // samples_per_pixel; /Columns keeps its default 1, so the filter still
+        // accepts the parameters and the rejection lands in the stage factory.
+        assert!(filter.set_decode_params(&neutral_params(&[
+            ("Predictor", ParamValue::Int(12)),
+            ("Colors", ParamValue::Int(0)),
+        ])));
+
+        // `.err().unwrap()` rather than `.unwrap_err()`: the success type is
+        // `Option<Box<dyn Pipeline>>`, which has no `Debug`.
+        let error = filter.decode_pipeline(&mut sink).err().unwrap();
+
+        assert!(error.to_string().contains("samples_per_pixel"), "{error}");
+        assert!(trace.borrow().calls.is_empty());
+    }
+
+    #[test]
+    fn flate_decode_pipeline_streams_chunked_writes_to_the_sink() {
+        let encoded = encode_flate(b"hello flate world").unwrap();
+        let mut filter = FlateLzwStreamFilter::new(false);
+        let trace = stream_decode_pipeline(&mut filter, &encoded, 3);
+        let trace = trace.borrow();
+        assert_eq!(trace.output, b"hello flate world");
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn lzw_decode_pipeline_streams_chunked_writes_to_the_sink() {
+        let encoded = lzw_encoded(b"hello lzw world");
+        let mut filter = FlateLzwStreamFilter::new(true);
+        let trace = stream_decode_pipeline(&mut filter, &encoded, 3);
+        let trace = trace.borrow();
+        assert_eq!(trace.output, b"hello lzw world");
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn ascii85_decode_pipeline_streams_chunked_writes_to_the_sink() {
+        let mut filter = Ascii85StreamFilter;
+        let trace = stream_decode_pipeline(&mut filter, b"9jqo^BlbD-~>", 3);
+        let trace = trace.borrow();
+        assert_eq!(trace.output, b"Man is d");
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn ascii_hex_decode_pipeline_streams_chunked_writes_to_the_sink() {
+        let mut filter = AsciiHexStreamFilter;
+        let trace = stream_decode_pipeline(&mut filter, b"616263>", 3);
+        let trace = trace.borrow();
+        assert_eq!(trace.output, b"abc");
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn run_length_decode_pipeline_streams_chunked_writes_to_the_sink() {
+        // A three-byte literal run, then 'z' repeated 257 - 0xfe = 3 times.
+        let encoded: &[u8] = &[0x02, b'a', b'b', b'c', 0xfe, b'z', 0x80];
+        let mut filter = RunLengthStreamFilter;
+        let trace = stream_decode_pipeline(&mut filter, encoded, 3);
+        let trace = trace.borrow();
+        assert_eq!(trace.output, b"abczzz");
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn predictor_flate_decode_pipeline_streams_through_both_stages() {
+        let encoded = encode_flate(PNG_PREDICTED_ROWS).unwrap();
+        let mut filter = FlateLzwStreamFilter::new(false);
+        assert!(filter.set_decode_params(&png_predictor_params()));
+
+        let trace = stream_decode_pipeline(&mut filter, &encoded, 3);
+
+        let trace = trace.borrow();
+        assert_eq!(trace.output, PNG_PREDICTOR_DECODED);
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn predictor_lzw_decode_pipeline_streams_through_both_stages() {
+        let encoded = lzw_encoded(PNG_PREDICTED_ROWS);
+        let mut filter = FlateLzwStreamFilter::new(true);
+        assert!(filter.set_decode_params(&png_predictor_params()));
+
+        let trace = stream_decode_pipeline(&mut filter, &encoded, 3);
+
+        let trace = trace.borrow();
+        assert_eq!(trace.output, PNG_PREDICTOR_DECODED);
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    #[test]
+    fn downstream_write_failure_propagates_out_of_the_stage() {
+        let mut sink = RecordingSink::new(&[1], &[]);
+        let trace = sink.trace();
+        let error = {
+            let mut filter = AsciiHexStreamFilter;
+            let mut stage = filter.decode_pipeline(&mut sink).unwrap().unwrap();
+            stage.write(b"616263>").unwrap_err()
+        };
+
+        assert_eq!(error.to_string(), "sink write failure 1");
+        assert_eq!(
+            trace.borrow().calls,
+            [TraceCall::Write {
+                data: b"a".to_vec(),
+                failed: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn downstream_finish_failure_propagates_out_of_the_stage() {
+        let mut sink = RecordingSink::new(&[], &[1]);
+        let trace = sink.trace();
+        let error = {
+            let mut filter = AsciiHexStreamFilter;
+            let mut stage = filter.decode_pipeline(&mut sink).unwrap().unwrap();
+            stage.write(b"616263>").unwrap();
+            stage.finish().unwrap_err()
+        };
+
+        assert_eq!(error.to_string(), "sink finish failure 1");
+        let trace = trace.borrow();
+        assert_eq!(trace.output, b"abc");
+        assert_eq!(
+            trace.calls.last(),
+            Some(&TraceCall::Finish { failed: true }),
+            "the failure must follow every write"
+        );
+    }
+
+    /// The failure has to cross the owned predictor stage the two-stage chain
+    /// holds, which the single-stage cases above never construct.
+    ///
+    /// `finish` is the crossing chosen here; a write failure would work too,
+    /// because the predictor re-chunks by row and the sink's first write is
+    /// always the first decoded row regardless of how the codec buffered.
+    #[test]
+    fn a_two_stage_chain_forwards_a_finish_failure_through_the_owned_predictor() {
+        let encoded = encode_flate(PNG_PREDICTED_ROWS).unwrap();
+        let mut sink = RecordingSink::new(&[], &[1]);
+        let trace = sink.trace();
+        let error = {
+            let mut filter = FlateLzwStreamFilter::new(false);
+            assert!(filter.set_decode_params(&png_predictor_params()));
+            let mut stage = filter.decode_pipeline(&mut sink).unwrap().unwrap();
+            for chunk in encoded.chunks(3) {
+                stage.write(chunk).unwrap();
+            }
+            stage.finish().unwrap_err()
+        };
+
+        assert_eq!(error.to_string(), "sink finish failure 1");
+        let trace = trace.borrow();
+        assert_eq!(trace.output, PNG_PREDICTOR_DECODED);
+        assert_eq!(finish_count(&trace), 1);
+    }
+
+    /// The stage outlives its constructor, not just its construction.
+    ///
+    /// Dropping the filter before the stage is driven is what distinguishes
+    /// returning the chain by value from qpdf's arrangement, where the filter
+    /// instance owns every stage it builds and the caller holds a non-owning
+    /// pointer (`QPDF_Stream.cc:559-568`). Tie the stage's lifetime back to
+    /// `&mut self` and this scope stops compiling.
+    #[test]
+    fn the_stage_may_outlive_construction_and_be_dropped_before_the_sink_is_read() {
+        let encoded = encode_flate(PNG_PREDICTED_ROWS).unwrap();
+        let mut sink = OutputBuffer::new(None);
+        {
+            let mut stage = {
+                let mut filter = FlateLzwStreamFilter::new(false);
+                assert!(filter.set_decode_params(&png_predictor_params()));
+                filter.decode_pipeline(&mut sink).unwrap().unwrap()
+            };
+            for chunk in encoded.chunks(3) {
+                stage.write(chunk).unwrap();
+            }
+            stage.finish().unwrap();
+        }
+        assert_eq!(sink.data, PNG_PREDICTOR_DECODED);
+    }
+
+    /// The two routes coexist, so they must agree on the bytes they produce.
+    ///
+    /// Agreement is only expected where the payload emits no codec warning:
+    /// `pipe_decode_recovering` installs the Flate warn callback qpdf installs
+    /// at its `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), and
+    /// `decode_pipeline` deliberately does not.
+    #[test]
+    fn decode_pipeline_and_whole_buffer_route_agree() {
+        let flate = encode_flate(b"agreement across routes").unwrap();
+        let lzw = lzw_encoded(b"agreement across routes");
+        let cases: &[(&[u8], &[u8], &[u8])] = &[
+            (b"FlateDecode", &flate, b"agreement across routes"),
+            (b"LZWDecode", &lzw, b"agreement across routes"),
+            (b"ASCII85Decode", b"9jqo^BlbD-~>", b"Man is d"),
+            (b"ASCIIHexDecode", b"616263>", b"abc"),
+            (
+                b"RunLengthDecode",
+                &[0x02, b'a', b'b', b'c', 0xfe, b'z', 0x80],
+                b"abczzz",
+            ),
+        ];
+
+        for &(name, encoded, expected) in cases {
+            let mut streaming = stream_filter_for(name).expect("registered stream filter");
+            let trace = stream_decode_pipeline(&mut *streaming, encoded, 3);
+            let whole_buffer = stream_filter_for(name)
+                .expect("registered stream filter")
+                .pipe_decode(encoded, None, &mut ignore_warning)
+                .unwrap();
+
+            assert_eq!(whole_buffer, expected, "{name:?}");
+            assert_eq!(trace.borrow().output, whole_buffer, "{name:?}");
+        }
     }
 
     #[test]
