@@ -90,7 +90,23 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn open_with_repair_mode(mut reader: R, options: PdfOpenOptions) -> Result<Self> {
-        let loaded_state = load_xref_state_with_repair(&mut reader, options.repair)?;
+        let warning_options = ResolverWarningOptions::new(
+            options
+                .logger
+                .clone()
+                .unwrap_or_else(crate::QPDFLogger::default_logger),
+            options.suppress_warnings,
+            options.description.clone(),
+        );
+        let loaded_state = match load_xref_state_with_repair(&mut reader, options.repair) {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some((_, diagnostics)) = error.open_failure() {
+                    warning_options.replay_warnings(diagnostics)?;
+                }
+                return Err(error);
+            }
+        };
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
         let source_xref_offsets = loaded
@@ -117,10 +133,6 @@ impl<R: Read + Seek> Pdf<R> {
         // same id: it stamps `pdf_unique_id` onto every canonical handle it
         // mints, which `ObjectHandle::belongs_to_pdf` answers on.
         let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
-        let logger = options
-            .logger
-            .clone()
-            .unwrap_or_else(crate::QPDFLogger::default_logger);
         let initial_diagnostics = loaded.repair_diagnostics.clone();
         let resolver = ResolverHandle::new_shared(
             reader,
@@ -128,11 +140,7 @@ impl<R: Read + Seek> Pdf<R> {
             source_xref_entries,
             options.repair,
             loaded.repair_diagnostics,
-            ResolverWarningOptions::new(
-                logger,
-                options.suppress_warnings,
-                options.description.clone(),
-            ),
+            warning_options,
             unique_id,
         );
         resolver.replay_warnings(&initial_diagnostics)?;

@@ -261,6 +261,47 @@ impl ResolverWarningOptions {
             description,
         }
     }
+
+    fn route_warning(&self, offset: Option<u64>, message: &str) -> Result<()> {
+        route_warning(
+            &self.logger,
+            self.suppress_warnings,
+            &self.description,
+            offset,
+            message,
+        )
+    }
+
+    pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
+        for diagnostic in diagnostics.entries() {
+            self.route_warning(diagnostic.offset, &diagnostic.message)?;
+        }
+        Ok(())
+    }
+}
+
+fn route_warning(
+    logger: &crate::QPDFLogger,
+    suppress_warnings: bool,
+    description: &str,
+    offset: Option<u64>,
+    message: &str,
+) -> Result<()> {
+    if suppress_warnings {
+        return Ok(());
+    }
+    let positive_offset = offset.filter(|offset| *offset > 0);
+    let location = match (description.is_empty(), positive_offset) {
+        (false, Some(offset)) => format!("{description} (offset {offset})"),
+        (false, None) => description.to_owned(),
+        (true, Some(offset)) => format!("offset {offset}"),
+        (true, None) => String::new(),
+    };
+    if location.is_empty() {
+        logger.warn(format!("WARNING: {message}\n"))
+    } else {
+        logger.warn(format!("WARNING: {location}: {message}\n"))
+    }
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -687,31 +728,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 core.description.clone(),
             )
         };
-        Self::route_warning(&logger, suppress_warnings, &description, offset, &message)
-    }
-
-    fn route_warning(
-        logger: &crate::QPDFLogger,
-        suppress_warnings: bool,
-        description: &str,
-        offset: Option<u64>,
-        message: &str,
-    ) -> Result<()> {
-        if suppress_warnings {
-            return Ok(());
-        }
-        let positive_offset = offset.filter(|offset| *offset > 0);
-        let location = match (description.is_empty(), positive_offset) {
-            (false, Some(offset)) => format!("{description} (offset {offset})"),
-            (false, None) => description.to_owned(),
-            (true, Some(offset)) => format!("offset {offset}"),
-            (true, None) => String::new(),
-        };
-        if location.is_empty() {
-            logger.warn(format!("WARNING: {message}\n"))
-        } else {
-            logger.warn(format!("WARNING: {location}: {message}\n"))
-        }
+        route_warning(&logger, suppress_warnings, &description, offset, &message)
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
@@ -724,7 +741,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             )
         };
         for diagnostic in diagnostics.entries() {
-            Self::route_warning(
+            route_warning(
                 &logger,
                 suppress_warnings,
                 &description,

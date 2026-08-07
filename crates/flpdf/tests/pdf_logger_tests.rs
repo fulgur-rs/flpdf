@@ -75,6 +75,17 @@ fn warnings_only_corrupt_xref_bytes() -> (Vec<u8>, usize) {
     (pdf, xref_start)
 }
 
+fn terminal_repair_failure_bytes() -> (Vec<u8>, usize) {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    pdf.extend_from_slice(
+        format!("traile_\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    (pdf, xref_start)
+}
+
 fn two_lazy_warning_objects() -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
@@ -198,6 +209,55 @@ fn warning_initial_replay_failure_is_returned_by_open() {
                 repair: true,
                 logger: Some(logger),
                 description: "input.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        ),
+        Err(Error::System(ref message)) if message == "warning sink failed"
+    ));
+}
+
+#[test]
+fn terminal_open_failure_delivers_accumulated_repair_warnings_first() {
+    let (logger, output) = recording_logger();
+    let (bytes, xref_start) = terminal_repair_failure_bytes();
+    let error = match Pdf::open_with_options(
+        Cursor::new(bytes),
+        PdfOpenOptions {
+            repair: true,
+            logger: Some(logger),
+            description: "broken.pdf".to_owned(),
+            ..PdfOpenOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("repair must still fail without a trailer keyword"),
+        Err(error) => error,
+    };
+
+    assert!(error.open_failure().is_some());
+    assert_eq!(
+        output.lock().unwrap().as_slice(),
+        format!(
+            "WARNING: broken.pdf: file is damaged\n\
+             WARNING: broken.pdf (offset {xref_start}): expected integer\n\
+             WARNING: broken.pdf: Attempting to reconstruct cross-reference table\n"
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn terminal_open_failure_returns_warning_delivery_failure() {
+    let logger = QPDFLogger::create();
+    logger.set_warn(Some(PipelineHandle::new(FailingSink)));
+    let (bytes, _) = terminal_repair_failure_bytes();
+
+    assert!(matches!(
+        Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                repair: true,
+                logger: Some(logger),
+                description: "broken.pdf".to_owned(),
                 ..PdfOpenOptions::default()
             },
         ),
