@@ -4394,6 +4394,8 @@ fn write_linearized_impl<R: Read + Seek>(
             pass1_bytes
                 .windows(marker.len())
                 .rposition(|window| window == marker)
+                // cov:ignore-start: unreachable internal invariant — xref-stream
+                // pass 1 always ends with the startxref marker emitted by do_write_pass.
                 .ok_or_else(|| {
                     crate::Error::Unsupported(
                         "linearization writer: pass-1 xref-stream output has no trailing \
@@ -4401,6 +4403,7 @@ fn write_linearized_impl<R: Read + Seek>(
                             .to_string(),
                     )
                 })?
+            // cov:ignore-end
         };
         pass1_bytes.extend_from_slice(
             format!(
