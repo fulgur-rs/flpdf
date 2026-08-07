@@ -19,9 +19,14 @@ citation は、`refactor/flpdf-0b12-pdf-module`（commit `56a01c2b`）の
 **`flpdf-0b12` 適用後**の状態を基準にしている。`obj_cache.rs`/
 `resolve.rs`/`engine.rs` の抽出は `flpdf-0b12` の後に実装されるため、
 実装時に参照する reader.rs はこの状態になっている。現在の
-`main`（本 PR の base、`flpdf-0b12` 未適用）の reader.rs では、
-本文書の各 citation より **約280行低い**（`main` の reader.rs は
-8758行、`flpdf-0b12` 適用後は8475行 — 差分283行が `pdf.rs` へ移った分）。
+`main`（本 PR の base、`flpdf-0b12` 未適用）の reader.rs と比較する際は
+**一律のオフセットを仮定しない**こと: `flpdf-0b12` が抽出した内容は
+ファイル中の複数箇所に散らばっており、実測した差分だけでも
+`EncryptionState` 定義で143行、`is_encrypted` で163行、
+`startxref`/`set_object` で269行、`resolve_compressed_entry`/
+`parse_object_stream_chain_entry` で274行、`decrypt_object_strings` で
+283行と一様ではない。`main` ツリーで該当箇所を探す際はシンボル名で
+検索すること。
 
 Produced via `superpowers:brainstorming` after the
 `flpdf-25kg.3.19` (`Pdf::empty()`) session surfaced that `reader.rs` is an
@@ -290,10 +295,26 @@ reader.rs に残ったまま）。
   `decrypt_stream_dict_strings_in_place`(`reader.rs:3490-`)。
   「resolve.rs のエントリポイントが engine.rs から呼ばれ、resolve.rs
   内部で完結する」という二層構造の一例で、上記 legacy 閉包とは名前も
-  対象型も別なので統合しない。閉包が呼ぶ
-  `decrypt_cipher_bytes`/`EncryptionState::string_method`/
-  `EncryptionState::with_object_cipher` は既に `security/standard.rs`
-  側にあり、この6個で閉じる
+  対象型も別なので統合しない。閉包が呼ぶ `decrypt_cipher_bytes` は既に
+  `security/standard.rs` 側にある。**訂正**:
+  `EncryptionState::string_method`/`with_object_cipher` は
+  `security/standard.rs` に**まだ無い**——`impl EncryptionState`
+  （`reader.rs:98-`、`string_method`(135)/`compute_data_key`(174)/
+  `with_object_cipher`(207)/`key_for_object`(239) を含む、全て
+  private）は reader.rs にあり、上記「新規ファイルを作らず既存へ
+  委譲するもの」の暗号エントリ依存閉包が既に挙げている
+  `EncryptionState`(`reader.rs:54-`) の実装本体そのものである。新たな
+  移動対象を増やすのではなく、この既存の closure が struct 定義と
+  一緒に impl ブロックごと security/* へ移る、という1点を明記すれば
+  よい。resolve.rs 側は `interpret_cf` と同じ cross-module `pub(crate)`
+  シームでこれらを呼ぶ。**この resolve.rs 抽出は `EncryptionState` の
+  security/* 移動より前には実装できない**（移動前は呼び出すための
+  `pub(crate)` シームが存在しない）——「次のステップ」の実装順序に
+  この依存を明記する
+- **`aes128_object_key`(`reader.rs:3677-`、`private`) も同じ暗号エントリ
+  依存閉包に含める**。`with_object_cipher` が呼ぶが、上記
+  「暗号/認証エントリ」バレットが挙げる `reader.rs:3750-4149` の範囲外
+  にあり、これまでどの依存閉包にも含まれていなかった
 - **`recovered_stream_eol` アクセサ(`reader.rs:541-555`、`pub(crate)`)も
   ここに含める**。単なる warning ではなく、`endstream` スキャンで検出
   した source framing を復元する production API: 消費者は
@@ -484,7 +505,13 @@ reader.rs に残ったまま）。
    になっている前例に倣って広げる。暗号/認証エントリの `security/*` への
    移動、`take_foreign_object_map` 等の `object_copy.rs` への移動も
    同じ手法（該当フィールド・呼び出し先ヘルパーを `pub(crate)` にする）
-   でよい
+   でよい。**依存順序の制約**: `resolve.rs` の native `ObjectHandle`
+   復号閉包（`decrypt_object_value_strings` 系、上記参照）は
+   `EncryptionState`（`impl EncryptionState` 全体、`reader.rs:98-`）が
+   `security/*` へ移り `pub(crate)` シームができるまで抽出できない
+   （移動前はこの閉包が呼ぶ `string_method`/`with_object_cipher` へ
+   到達する手段が無い）。暗号/認証エントリの `security/*` 移動を
+   `resolve.rs` のこの部分より先に実施する
 3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、対応表側の既存
    記載時点での行数 `reader.rs`(7898) — 実際の現状行数（8475、上記
    「動機」参照）とは別の、対応表が最後に更新された時点のスナップショット
@@ -573,9 +600,23 @@ reader.rs に残ったまま）。
    byte 比較ではない。**探索した範囲では、flpdf 側が暗号化入力を認証し
    つつ byte-identical 比較まで行う既存テストは無い**。したがって
    `authenticate_if_encrypted` 系の移動には、既存テストを流用するのでは
-   なく新規の encrypted-input rewrite golden（パスワード付きで開く →
-   何らかの操作 → 書き出し → qpdf の同等操作と byte 比較）を実装の一部
-   として追加することを前提条件とする。加えて各ステップ実行前後で
+   なく新規の encrypted-input rewrite golden をこの前提条件として実装の
+   一部に追加する。**ただし qpdf の同等操作との全体 byte 比較は要求
+   しない**: `crates/flpdf-cli/tests/encrypted_rewrite_tests.rs:31-33`
+   のコメントが明記する通り、flpdf の平文書き出しは独自の incidental
+   serialization を持ち、`qpdf --decrypt` の出力と全体 byte 一致しない
+   ことは既知（同テストは qpdf の object JSON 比較で妥協している）。
+   全体 byte 比較を新規に要求すると、本設計の移動が正しくても
+   この既存の乖離だけで golden が fail する。新規 golden は
+   (a) 既存パターンと同じ `qpdf --json=1 --json-key=objects` での
+   object-level parity（暗号化入力を認証して開く → qpdf の同等操作との
+   絶対値比較、oracle に紐づく）と、(b) `--static-id` で決定化した
+   flpdf 自身の出力を移動前後で比較する byte-stability golden（本設計の
+   移動が出力バイトを一切変えていないことを確認する相対比較）の
+   **両方**で構成する。(a) だけでは認証経路が通ることしか確認できず、
+   (b) だけでは flpdf が qpdf からドリフトしても検出できない
+   （`bd recall tests-that-pin-flpdf-against-itself` 参照）。
+   加えて各ステップ実行前後で
    `scripts/patch-coverage.sh` を回し、変更行 100% カバレッジを維持する。
    **各ステップは `flpdf-0b12` のように前段のステップに stack する PR に
    なる**ため、`patch-coverage.sh` は必ず `--base <親ブランチ>` 付きで
