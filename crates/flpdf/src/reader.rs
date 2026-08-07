@@ -1961,6 +1961,15 @@ impl<R: Read + Seek> Pdf<R> {
                 // No canonical state is written either way, so a later call
                 // simply redoes the chase rather than being stuck observing
                 // a stale result.
+                //
+                // `hop` is always Resolved or Missing here, so it presents a
+                // value exactly as a copy of it would: the one state that
+                // would differ, `NotYetResolved`, needs `resolve_object_handle`
+                // to have hit a `CacheEntry::Reserved` entry, and that guard
+                // exists only while `resolve_pending_stream_length` is on the
+                // stack (it is the sole `set_reserved` caller and clears the
+                // entry before returning). This `&mut self` entry point cannot
+                // be reached from inside a resolution.
                 None => return Ok((hop, Some(current_ref))),
             }
         }
