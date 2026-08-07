@@ -4641,7 +4641,7 @@ mod uniform_identity_tests {
             else {
                 panic!("promoted child must retain stream data");
             };
-            assert!(Rc::ptr_eq(&actual, &stream_data));
+            assert!(Rc::ptr_eq(actual, &stream_data));
         });
     }
 
