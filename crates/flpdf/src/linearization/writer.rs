@@ -3799,7 +3799,7 @@ fn write_linearized_impl<R: Read + Seek>(
         // sites, so there is no single `[` cutoff; pass the last index as the
         // inclusive end (matching the prior patch step's digest range).
         Some(crate::writer::compute_deterministic_id(
-            &pass1_bytes,
+            pass1_bytes,
             pass1_bytes.len() - 1,
             &det_id_info_suffix,
             det_id_source_id0.as_deref(),
