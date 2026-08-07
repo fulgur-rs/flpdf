@@ -29,33 +29,45 @@
 
 - [ ] **Step 1: Replace the write-after-finish rejection test**
 
-Add a loop over `[256, 384, 512]` that hashes `abc`, finishes, writes `def`,
-finishes again, and compares the result to `digest_of(bits, b"def")`.
+Add a table of OpenSSL-derived literal digests. Hash `abc`, finish, write
+`def`, finish again, and compare the result to the independent literal for the
+selected size.
 
 ```rust
 #[test]
 fn write_after_finish_starts_a_fresh_cycle_with_the_same_bit_size() {
-    for bits in [256, 384, 512] {
+    let cases = [
+        (256, "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34"),
+        (384, "180c325cccb299e76ec6c03a5b5a7755af8ef499906dbf531f18d0ca509e4871b0805cac0f122b962d54badc6119f3cf"),
+        (512, "40a855bf0a93c1019d75dd5b59cd8157608811dd75c5977e07f3bc4be0cad98b22dde4db9ddb429fc2ad3cf9ca379fedf6c1dc4d4bb8829f10c2f0ee04a66663"),
+    ];
+    for (bits, expected) in cases {
         let mut sha2 = PlSha2::new("sha2", None, bits).unwrap();
         sha2.write(b"abc").unwrap();
         sha2.finish().unwrap();
         sha2.write(b"def").unwrap();
         sha2.finish().unwrap();
 
-        assert_eq!(sha2.get_hex_digest().unwrap(), digest_of(bits, b"def"));
+        assert_eq!(sha2.get_hex_digest().unwrap(), expected);
     }
 }
 ```
 
 - [ ] **Step 2: Replace the repeated-finish rejection test**
 
-For every supported size, finish `abc` twice, compare the second result to
-`digest_of(bits, b"")`, and assert the downstream sink observed two finishes.
+For every supported size, finish `abc` twice, compare the second result to an
+independently derived empty-input literal, and assert the downstream sink
+observed two finishes.
 
 ```rust
 #[test]
 fn repeated_finish_starts_an_empty_cycle_and_forwards_each_time() {
-    for bits in [256, 384, 512] {
+    let cases = [
+        (256, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        (384, "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"),
+        (512, "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"),
+    ];
+    for (bits, expected) in cases {
         let mut sink = RecordingSink::default();
         let second_digest;
         {
@@ -67,7 +79,7 @@ fn repeated_finish_starts_an_empty_cycle_and_forwards_each_time() {
             second_digest = sha2.get_hex_digest().unwrap();
         }
 
-        assert_eq!(second_digest, digest_of(bits, b""));
+        assert_eq!(second_digest, expected);
         assert_eq!(sink.finishes, 2);
     }
 }
