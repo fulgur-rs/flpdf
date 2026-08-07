@@ -3,6 +3,29 @@
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
 //!
+//! `QPDFObjectHandle` holds `std::shared_ptr<QPDFObject>` and defines object
+//! sameness by that pointer, not by structural equality
+//! (`include/qpdf/QPDFObjectHandle.hh:304-309,1338-1350`,
+//! `libqpdf/QPDFObjectHandle.cc:224-227`). [`ObjectHandle`] maps that one
+//! shared allocation to one uniform `Rc<RefCell<ObjectSlot>>`: direct and
+//! indirect forms therefore share one identity, payload, and metadata slot.
+//!
+//! qpdf's `QPDFObject` owns one shared `QPDFValue`; that value carries the
+//! current `QPDF*`, object generation, and parsed offset
+//! (`libqpdf/qpdf/QPDFObject_private.hh:19-29,60-68,117-150,176-180`,
+//! `libqpdf/qpdf/QPDFValue.hh:60-72,90-110,144-152`). Resolution reads the
+//! current metadata from this same allocation
+//! (`libqpdf/QPDFObject.cc:7-16`). `ObjectSlot` likewise keeps the active
+//! object reference, resolver, parsed offset, and value state together.
+//!
+//! qpdf promotion registers and updates the existing allocation rather than
+//! cloning a direct payload (`libqpdf/QPDF.cc:1835-1839,1882-1897`); this
+//! port's [`ObjectHandle::promote_to_indirect`] mutates its existing slot on
+//! the same boundary. During teardown qpdf disconnects each cached object and
+//! destroys every non-null value (`libqpdf/QPDF.cc:215-235`); this port's
+//! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
+//! state-sensitive value.
+//!
 //! `QPDFObjectHandle.cc:456-466,759-785,1027-1039` supplies the
 //! name/dictionary/array inspection mirrored by `try_is_name_and_equals`,
 //! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
@@ -186,8 +209,11 @@ mod parse_tests {
 /// A shared, cloneable handle to a PDF object.
 ///
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
-/// every clone of an indirect handle shares the same canonical identity and
-/// resolution state.
+/// every clone, direct or indirect, shares one canonical identity, payload,
+/// and resolution state. This maps qpdf's shared `QPDFObject` allocation and
+/// pointer-identity `isSameObjectAs` comparison
+/// (`include/qpdf/QPDFObjectHandle.hh:304-309,1338-1350`,
+/// `libqpdf/QPDFObjectHandle.cc:224-227`).
 ///
 /// Lazy dereference stays crate-internal until every document-created handle
 /// is attached to the complete qpdf-native resolver.
@@ -231,6 +257,9 @@ impl std::fmt::Debug for ObjectHandle {
 
 // Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
 // impl above for why a derived one is unsafe here (object-handle cycles).
+// This uniform allocation corresponds to qpdf's QPDFObject/QPDFValue pair:
+// it keeps the current payload and all indirect metadata together rather
+// than placing direct and indirect forms in separate backing storage.
 struct ObjectSlot {
     state: ObjectState,
     object_ref: Option<ObjectRef>,
@@ -404,7 +433,9 @@ impl ObjectHandle {
     /// same canonical object, not merely an equal value.
     ///
     /// This is qpdf's `QPDFObjectHandle::isSameObjectAs`: mutations and lazy
-    /// resolution observed through either handle affect the same object.
+    /// resolution observed through either handle affect the same allocation
+    /// (`include/qpdf/QPDFObjectHandle.hh:304-309`,
+    /// `libqpdf/QPDFObjectHandle.cc:224-227`).
     pub fn is_same_object_as(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
@@ -472,19 +503,20 @@ impl ObjectHandle {
     }
 
     /// Construct a canonical unresolved slot attached to a document resolver
-    /// but carrying no document identity tag. The resolver link is weak so a
-    /// surviving handle cannot keep its document alive.
+    /// but initially without active document metadata. The resolver link is
+    /// weak so a surviving handle cannot keep its document alive.
     ///
-    /// Identity-less, so [`Self::belongs_to_pdf`] answers `false` for every
-    /// document, and the root edge [`Self::set_resolved`] records on each
-    /// direct child carries `None` as its document — which makes
-    /// [`Self::containing_object_refs_for_pdf`] empty for every id, since
-    /// `None` matches no `Some`. That makes this the *narrower* of the two
-    /// constructors, not the qpdf-native one — upstream a single `QPDF*`
-    /// carries identity and resolver together, so
-    /// [`Self::new_indirect_for_pdf_with_resolver`] is the shape that
-    /// corresponds to qpdf, and is what a handle vended by a `Pdf` needs.
-    /// This one exists for resolver tests that never consult identity.
+    /// Its resolved direct children keep only weak immediate-parent links.
+    /// [`Self::containing_object_refs_for_pdf`] follows those live links at
+    /// query time and reads the reached indirect slot's *current* object
+    /// reference and active document identity. It neither copies Root
+    /// metadata to children nor records a permanent `None` root. Until this
+    /// slot is promoted, it has no active identity, so
+    /// [`Self::belongs_to_pdf`] is false and owner lookup is empty for every
+    /// document. That makes this the narrower test constructor, not the
+    /// qpdf-native shape: upstream one `QPDF*` carries both identity and the
+    /// resolver, while [`Self::new_indirect_for_pdf_with_resolver`] is what a
+    /// handle vended by a `Pdf` needs.
     #[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5;
                         // this primitive slice exercises the constructor with
                         // sealed resolver unit tests only
@@ -536,7 +568,15 @@ impl ObjectHandle {
         handle
     }
 
-    #[allow(dead_code)] // consumed by the canonical insertion cutover after this storage primitive
+    /// Promote this existing uniform slot to an indirect object in place.
+    ///
+    /// qpdf registers the existing `QPDFObject` in its cache, then gives that
+    /// same allocation its object generation and owning document
+    /// (`libqpdf/QPDF.cc:1835-1839,1882-1897`); it does not clone a direct
+    /// payload during promotion. This is the corresponding primitive here:
+    /// every alias keeps its `Rc` identity while this slot receives its active
+    /// object reference, document identity, and weak resolver.
+    #[allow(dead_code)] // consumer migration in flpdf-25kg.3.6 will use this primitive
     pub(crate) fn promote_to_indirect(
         &self,
         object_ref: ObjectRef,
@@ -613,24 +653,13 @@ impl ObjectHandle {
         }
     }
 
-    /// This handle's value, cloned, if it is direct — `None` for an
-    /// indirect handle. Unlike [`Self::into_direct_value`], this works
-    /// regardless of how many other clones of this handle are outstanding
-    /// (it clones the value rather than requiring exclusive `Rc`
-    /// ownership). Used by `Pdf::make_indirect_object_handle`, which
-    /// cannot assume its caller holds the only reference to the direct
-    /// handle it passes in.
-    ///
-    /// A `Stream` value's `stream_dict` gets the same `shallow_copy_child`
-    /// treatment [`Self::shallow_copy`] gives it, rather than the plain
-    /// `ObjectValue::clone()` every other variant gets: leaving it Rc-shared
-    /// with `self` would let a later [`Self::replace_stream_data`] on either
-    /// handle rewrite the other's `/Length`/`/Filter`/`/DecodeParms`, since
-    /// that method installs those keys on the dictionary. That is the only
-    /// difference from a plain clone — the payload is shared either way, as
-    /// an `Rc` mirroring qpdf's `std::shared_ptr<Buffer>`
-    /// (`libqpdf/qpdf/QPDF_Stream.hh:104`), and sharing it is harmless
-    /// because nothing writes through it.
+    /// Legacy cloning helper for the unchanged public
+    /// `Pdf::make_indirect_object_handle` allocator: returns a direct value
+    /// copy, or `None` for an indirect handle. It is not the qpdf-native
+    /// promotion primitive — qpdf promotes by registering and updating the
+    /// existing `QPDFObject` allocation (`libqpdf/QPDF.cc:1835-1839,1882-1897`).
+    /// Consumer migration to [`Self::promote_to_indirect`] is scheduled in
+    /// `flpdf-25kg.3.6`.
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         let slot = self.0.borrow();
         if slot.object_ref.is_some() {
