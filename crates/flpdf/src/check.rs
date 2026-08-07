@@ -47,9 +47,9 @@ pub struct CheckSummary {
 
 /// Validate the document behind `reader` using the repair-enabled open path.
 ///
-/// Errors during the strict parse are downgraded to a single error diagnostic so the
-/// caller always receives a report. Equivalent to `qpdf --check` (which also runs the
-/// recovery heuristics).
+/// Input-derived structural and open failures are downgraded to error diagnostics.
+/// [`Error::Encrypted`], [`Error::System`], and [`Error::Internal`] propagate instead.
+/// Equivalent to `qpdf --check` (which also runs the recovery heuristics).
 ///
 /// # Errors
 ///
@@ -183,7 +183,10 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
                 return Err(error);
             }
             Err(error) => {
-                let mut diagnostics = Diagnostics::default();
+                let mut diagnostics = error
+                    .open_failure()
+                    .map(|(_, diagnostics)| diagnostics.clone())
+                    .unwrap_or_default();
                 diagnostics.push(Diagnostic::error(error.to_string(), None));
                 return Ok(CheckReport {
                     valid: false,

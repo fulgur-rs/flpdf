@@ -504,6 +504,29 @@ fn check_corrupt_pdf_exits_2() {
         .code(2);
 }
 
+#[test]
+fn check_terminal_open_failure_prints_repair_warnings_before_error_once() {
+    let input = "../../tests/fixtures/test_driver/open_repair_failure.pdf";
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let output = cmd
+        .env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--repair", input])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "WARNING: {input}: file is damaged\n\
+             WARNING: {input}: can't find startxref\n\
+             WARNING: {input}: Attempting to reconstruct cross-reference table\n\
+             flpdf: {input}: parse error at byte 0: trailer dictionary not found\n"
+        )
+    );
+}
+
 /// A document that opens cleanly but whose page content stream fails to decode
 /// is an error, not a warning: `--check` exits 2 and, because the run is not
 /// valid, suppresses the trailing "No syntax or stream encoding errors found"
