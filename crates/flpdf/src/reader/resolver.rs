@@ -290,6 +290,10 @@ fn route_warning(
     if suppress_warnings {
         return Ok(());
     }
+    if message.starts_with("(object ") {
+        let separator = if description.is_empty() { "" } else { " " };
+        return logger.warn(format!("WARNING: {description}{separator}{message}\n"));
+    }
     let positive_offset = offset.filter(|offset| *offset > 0);
     let location = match (description.is_empty(), positive_offset) {
         (false, Some(offset)) => format!("{description} (offset {offset})"),
@@ -2355,6 +2359,29 @@ mod tests {
               WARNING: input.pdf: named zero offset\n\
               WARNING: input.pdf (offset 7): named positive offset\n\
               WARNING: input.pdf (object 5 0, offset 232): expected endobj\n"
+        );
+    }
+
+    #[test]
+    fn warning_location_does_not_repeat_offset_for_object_prefixed_message() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+
+        super::route_warning(
+            &logger,
+            false,
+            "input.pdf",
+            Some(123),
+            "(object 5 0, offset 123): expected endobj",
+        )
+        .unwrap();
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: input.pdf (object 5 0, offset 123): expected endobj\n"
         );
     }
 
