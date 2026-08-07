@@ -2687,6 +2687,20 @@ mod tests {
     }
 
     #[test]
+    fn encoding_rejects_null_decode_params_for_a_filter_that_does_not_enumerate_them() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Null);
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"ASCIIHexDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"abc").unwrap_err().to_string(),
+            "unsupported PDF feature: stream filter ASCIIHexDecode does not support supplied /DecodeParms"
+        );
+    }
+
+    #[test]
     fn encoding_rejects_a_predictor_outside_the_supported_set() {
         let mut dict = Dictionary::new();
         dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));

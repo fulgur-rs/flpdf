@@ -638,23 +638,22 @@ fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
 
 /// The legacy `Object` shape reader's counterpart of the handle reduction.
 ///
-/// `filter_name` settles only the retention half here: this reader resolves
-/// nothing, because an indirect value is an `Object::Reference` it classifies
-/// as [`ParamValue::Other`] without looking through (plan decision D1 of
-/// `flpdf-25kg.3.4`). The retention half must match the handle reader's
-/// exactly, or the two disagree on a shape the equivalence corpus compares;
-/// the corpus's "/Name under a filter that is not Crypt" row is the one that
-/// would catch a rule applied to only one of them. It has no resolver, so it
-/// can omit only direct `Object::Null` values; references and every other
-/// non-null shape remain `ParamValue::Other` when retained.
+/// This reader resolves nothing, because an indirect value is an
+/// `Object::Reference` it classifies as [`ParamValue::Other`] without looking
+/// through (plan decision D1 of `flpdf-25kg.3.4`). `filter_name` decides both
+/// whether qpdf's filter enumerates entries — and therefore whether direct
+/// `Object::Null` values are omitted — and whether `/Name` is retained for
+/// `Crypt`. References and every other non-null shape remain
+/// `ParamValue::Other` when retained.
 fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> DecodeParams {
+    let omits_null_values = filter_reads_decode_params(filter_name);
     let retains_crypt_name = is_crypt_filter(filter_name);
     match params {
         None | Some(Object::Null) => DecodeParams::Absent,
         Some(object) => DecodeParams::Present(match object.as_dict() {
             Some(dict) => dict
                 .iter()
-                .filter(|(_, value)| !matches!(value, Object::Null))
+                .filter(|(_, value)| !omits_null_values || !matches!(value, Object::Null))
                 .filter(|(key, _)| retains_decode_param_key(key, retains_crypt_name))
                 .map(|(key, value)| {
                     let keeps_name = is_crypt_name_key(key, retains_crypt_name);
