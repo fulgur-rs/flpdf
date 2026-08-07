@@ -5377,7 +5377,7 @@ mod tests {
         let target = ObjectRef::new(5, 0);
         pdf.set_object(holder, Object::Reference(target));
         let redirected = pdf.get_object_handle(holder);
-        let direct_reference_handle = redirected.shallow_copy();
+        let direct_reference_handle = redirected.shallow_copy().expect("reference copy");
         assert!(
             direct_reference_handle.is_direct(),
             "sanity: shallow_copy always returns a direct handle"

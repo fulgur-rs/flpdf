@@ -1504,7 +1504,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// "uninitialized handle" state to reject separately, since every
     /// `ObjectHandle` is always validly constructed).
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
-        let Some(value) = handle.direct_value_clone() else {
+        let Some(value) = handle.direct_value_clone()? else {
             return Err(Error::Unsupported(
                 "cannot make an already-indirect ObjectHandle indirect".to_string(),
             ));
@@ -1853,28 +1853,29 @@ impl<R: Read + Seek> Pdf<R> {
     /// call [`ObjectHandle::unparse`] on `handle` itself, not on the
     /// returned value.
     ///
-    /// If `handle`'s value is not a redirect at all — the common case —
-    /// this returns `handle.clone()` unchanged: an `Rc` clone of the same
-    /// live, canonical, still-indirect handle, so mutating it behaves
-    /// exactly as mutating `handle` itself always would. Otherwise the
-    /// returned handle is a **direct**, independent copy of the terminal
-    /// value ([`ObjectHandle::shallow_copy`]'s own recursive-through-direct-
-    /// descendants semantics: any nested indirect child stays canonically
-    /// shared, but every direct one — including the top level — is its own
-    /// copy), and `handle` itself, and every intermediate hop's own
-    /// canonical handle (as [`Pdf::get_object_handle`] would return it), are
-    /// never mutated. In this case mutating the returned handle (`replace_key`,
-    /// `insert_key`, …) has no effect on anything the writer will ever
-    /// observe: it carries no indirect identity of its own, so there is
-    /// nothing a caller could pass to `mark_object_dirty` to make the edit
-    /// visible even by mistake. This matters because `handle` and each
-    /// intermediate hop are the *same* canonical handles
-    /// [`Pdf::resolve_borrowed`] resolves through — overwriting one in place
-    /// would permanently change what a later `resolve_borrowed` call for
-    /// that same ref returns, silently discarding the redirect
-    /// `Pdf::set_object` recorded.
+    /// The returned handle is always the live, canonical handle for the
+    /// terminal object, never a copy: an `Rc` clone of `handle` itself when
+    /// its value is not a redirect at all (the common case), or of the last
+    /// hop's [`Pdf::get_object_handle`] handle when one or more redirects
+    /// were chased. Mutating it (`replace_key`, `insert_key`, …) therefore
+    /// mutates that document object, exactly as mutating its own handle
+    /// always would, and the returned [`ObjectRef`] is what the caller
+    /// passes to [`Pdf::mark_object_dirty`] to make such an edit visible to
+    /// the writer. This mirrors qpdf, whose `QPDFObjectHandle::dereference`
+    /// (`libqpdf/QPDFObjectHandle.cc:2376-2383`, delegating to
+    /// `QPDFObject::resolve`) hands back the canonical `QPDFObject` that
+    /// `QPDF::resolve` cached and lets every mutator operate on it in
+    /// place; qpdf has no copying dereference to port here. It is also the
+    /// only contract compatible with a stream terminal, which
+    /// [`ObjectHandle::shallow_copy`] refuses to copy at all, matching
+    /// `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`).
     ///
-    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: terminal-clone legacy API.
+    /// The chase itself still mutates nothing: only the *last* hop's own
+    /// handle is returned, so `handle` and every intermediate hop keep the
+    /// redirect [`Pdf::set_object`] recorded, and a later
+    /// [`Pdf::resolve_borrowed`] for any ref in the chain still observes it.
+    ///
+    /// `qpdf-cutover-delete(flpdf-25kg.3.3)`: terminal-chase legacy API.
     /// Delete with `ObjectValue::Reference`; do not call from new code.
     ///
     /// A self- or mutually-cyclic redirect chain is bounded by
@@ -1914,7 +1915,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// from. This is `None` exactly when the returned handle is direct with
     /// no indirect identity of its own — either `handle` itself was direct,
     /// or the chase hit the `ref_chain::MAX_REF_CHAIN_DEPTH` bound and fell
-    /// back to a null handle. Otherwise it is `handle.object_ref()` when no
+    /// back to a null handle. Whenever it is `Some`, the returned handle is
+    /// that object's own canonical, indirect handle. Otherwise it is `handle.object_ref()` when no
     /// [`Pdf::set_object`] redirect was chased (matching
     /// [`Pdf::resolve_object_handle_to_terminal`]'s own "returns `handle`
     /// unchanged" case), or the *last* hop's ref when one or more redirects
@@ -1942,23 +1944,33 @@ impl<R: Read + Seek> Pdf<R> {
             self.resolve_object_handle(&hop)?;
             match hop.as_reference() {
                 Some(next) => current_ref = next,
-                // `hop.shallow_copy()` recursively copies every *direct*
-                // array/dictionary/stream-dict descendant independently,
-                // sharing `Rc` identity only with a genuinely *indirect*
-                // descendant (see its own doc) — required here, not just a
-                // nicety: a single-level clone would leave a direct nested
-                // child Rc-shared with `hop`'s own canonical value, so
-                // mutating it through the returned handle (e.g.
-                // `result.get_key(...).replace_key(...)`) would silently
-                // mutate the real document too. It also already handles the
-                // transient `CacheEntry::Reserved` cycle guard
-                // `resolve_object_handle`'s own doc describes (`hop` stays
-                // unresolved → `shallow_copy` gives a direct null handle,
-                // matching `resolve_borrowed`'s own transient placeholder).
+                // `hop` itself, not a copy of it: qpdf's own dereference
+                // (`QPDFObjectHandle::dereference`,
+                // `libqpdf/QPDFObjectHandle.cc:2376-2383`, delegating to
+                // `QPDFObject::resolve`) hands back the canonical object
+                // that `QPDF::resolve` cached, never a clone, and every
+                // qpdf mutator then operates on that canonical handle. The
+                // sibling "already terminal" arm above already returns
+                // `handle.clone()` — the canonical handle — so copying only
+                // on the redirect path split this one function into two
+                // different aliasing contracts. Copying here also cannot be
+                // reconciled with `ObjectValue::Stream`: qpdf's
+                // `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`)
+                // refuses to clone a stream at all.
+                //
                 // No canonical state is written either way, so a later call
                 // simply redoes the chase rather than being stuck observing
                 // a stale result.
-                None => return Ok((hop.shallow_copy(), Some(current_ref))),
+                //
+                // `hop` is always Resolved or Missing here, so it presents a
+                // value exactly as a copy of it would: the one state that
+                // would differ, `NotYetResolved`, needs `resolve_object_handle`
+                // to have hit a `CacheEntry::Reserved` entry, and that guard
+                // exists only while `resolve_pending_stream_length` is on the
+                // stack (it is the sole `set_reserved` caller and clears the
+                // entry before returning). This `&mut self` entry point cannot
+                // be reached from inside a resolution.
+                None => return Ok((hop, Some(current_ref))),
             }
         }
         self.push_warning(format!(
@@ -5282,36 +5294,55 @@ mod tests {
     }
 
     #[test]
-    fn make_indirect_object_handle_gives_a_stream_its_own_independent_dict() {
-        // Regression test: cloning a direct Stream value naively (the
-        // #[derive(Clone)] every other variant gets) would Rc-share
-        // `stream_dict` with the caller's original handle, so a later
-        // `replace_stream_data` on either would rewrite the other's
-        // `/Length` -- the same sharing `shallow_copy` privatizes the
-        // dictionary to avoid. Mutating the *original* handle's stream data
-        // after making it indirect must not affect the new indirect object's
-        // dictionary.
-        let dict = ObjectHandle::dictionary(vec![]);
+    fn make_indirect_object_handle_keeps_a_promoted_streams_metadata_consistent() {
+        // qpdf shares the *whole* QPDFObject on promotion
+        // (`QPDF::makeIndirectObject` -> `makeIndirectFromQPDFObject(oh.getObj())`,
+        // `libqpdf/QPDF.cc:1883-1898`), so an edit through either handle is
+        // one edit to one stream. This allocator still mints a separate slot
+        // (flpdf-25kg.3.6), and there a *partial* share corrupts: stream_dict
+        // is an ObjectHandle (shared mutability) while stream_data is a
+        // per-value field, so a shared dictionary would let this
+        // replace_stream_data rewrite the promoted stream's /Length while
+        // leaving its bytes alone. Each slot must stay self-consistent.
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
-            stream_dict: dict.clone(),
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"Length".to_vec(),
+                ObjectHandle::integer(3),
+            )]),
             stream_data: Some(Rc::new(b"old".to_vec())),
-            stream_length: 0,
+            stream_length: 3,
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
-        let indirect = pdf
-            .make_indirect_object_handle(direct_stream)
+        let promoted = pdf
+            .make_indirect_object_handle(direct_stream.clone())
             .expect("make indirect");
 
-        dict.replace_key(b"Length", ObjectHandle::integer(999));
+        direct_stream.replace_stream_data(Rc::new(b"brand new bytes".to_vec()), None, None);
 
-        assert!(
-            indirect
+        let promoted_length = promoted
+            .as_stream_dict()
+            .expect("promoted stream dict")
+            .get_key(b"Length")
+            .as_integer();
+        assert_eq!(
+            promoted_length,
+            Some(3),
+            "the promoted stream keeps its own /Length; the source's replacement \
+             must not describe bytes the promoted object does not hold"
+        );
+        assert_eq!(
+            promoted.as_stream_data(),
+            Some(Rc::new(b"old".to_vec())),
+            "and keeps its own bytes"
+        );
+        assert_eq!(
+            direct_stream
                 .as_stream_dict()
-                .unwrap()
+                .expect("source stream dict")
                 .get_key(b"Length")
-                .is_null(),
-            "the new indirect object's dict must not observe a mutation \
-             made through the original handle's dict"
+                .as_integer(),
+            Some(15),
+            "while the source records its own replacement"
         );
     }
 
@@ -7501,13 +7532,13 @@ mod tests {
         assert_eq!(result.type_name(), "boolean");
         assert_eq!(
             result.object_ref(),
-            None,
-            "result is a direct, unregistered handle"
+            Some(target_ref),
+            "result is the terminal object's own canonical handle"
         );
         assert_eq!(
             result.unparse(),
-            b"true",
-            "direct: same as unparse_resolved()"
+            b"100 0 R",
+            "indirect: its own reference form, the terminal's not the redirect's"
         );
         assert_eq!(result.unparse_resolved(), b"true");
 
@@ -7535,13 +7566,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_to_terminal_deep_copies_direct_nested_children() {
-        // A single-level clone of the terminal `ObjectValue` would leave a
-        // *direct* nested child Rc-shared with the canonical target's own
-        // value (only an indirect child is meant to stay shared) — mutating
-        // it through the returned handle would then silently mutate the
-        // real document too. `ObjectHandle::shallow_copy` (used internally)
-        // must recurse through direct descendants independently.
+    fn resolve_object_handle_to_terminal_returns_the_canonical_handle_not_a_copy() {
+        // qpdf's `QPDFObjectHandle::dereference`
+        // (`libqpdf/QPDFObjectHandle.cc:2376-2383`) hands back the canonical
+        // `QPDFObject` and every mutator edits it in place; there is no
+        // copying dereference in qpdf to port. So the chased terminal is the
+        // target's own handle — mutating a nested child through it reaches
+        // the real document, exactly as mutating the target's own handle
+        // would.
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let target_ref = ObjectRef::new(100, 0);
         let redirect_ref = ObjectRef::new(200, 0);
@@ -7569,6 +7601,16 @@ mod tests {
         let canonical_target = pdf.get_object_handle(target_ref);
         pdf.resolve_object_handle(&canonical_target)
             .expect("resolve canonical target");
+        assert!(
+            result.is_same_object_as(&canonical_target),
+            "the chased terminal is the target's own canonical handle"
+        );
+        assert_eq!(
+            result.object_ref(),
+            Some(target_ref),
+            "and keeps that object's indirect identity, so a caller can \
+             mark_object_dirty the edit it just made"
+        );
         let canonical_inner = canonical_target
             .as_dictionary()
             .expect("canonical target is a dictionary")
@@ -7581,8 +7623,8 @@ mod tests {
             });
         assert_eq!(
             canonical_inner,
-            Some(1),
-            "mutating the detached terminal's nested child must not affect the canonical document"
+            Some(999),
+            "mutating the chased terminal's nested child edits the real document"
         );
     }
 
@@ -7604,8 +7646,9 @@ mod tests {
         assert_eq!(result.as_integer(), Some(42));
         assert_eq!(
             result.object_ref(),
-            None,
-            "result is a direct, unregistered handle"
+            Some(terminal_ref),
+            "result is the chain's *last* hop's own canonical handle, not the \
+             first (outer_ref) or middle"
         );
 
         let (_ref_result, observed_terminal_ref) = pdf
