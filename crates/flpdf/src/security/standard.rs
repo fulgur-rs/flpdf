@@ -1304,7 +1304,7 @@ pub(crate) fn build_v5_r6_encrypt_dict(
         &secrets.file_key,
         &secrets.user_validation_salt,
         &secrets.user_key_salt,
-    )?;
+    )?; // cov:ignore: unreachable — Pl_SHA2 with a literal bit size and no downstream stage cannot fail, and qpdf's hash_V5 likewise never catches (`QPDF_encryption.cc:246,296`)
 
     // Algorithm 9: /O + /OE (uses /U as extra).
     let (o_entry, oe_entry) = compute_o_oe_r6(
@@ -1313,7 +1313,7 @@ pub(crate) fn build_v5_r6_encrypt_dict(
         &secrets.file_key,
         &secrets.owner_validation_salt,
         &secrets.owner_key_salt,
-    )?;
+    )?; // cov:ignore: unreachable — Pl_SHA2 with a literal bit size and no downstream stage cannot fail, and qpdf's hash_V5 likewise never catches (`QPDF_encryption.cc:246,296`)
 
     // Algorithm 10: /Perms.
     let perms = compute_perms_blob(
@@ -1436,7 +1436,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
         &secrets.file_key,
         &secrets.user_validation_salt,
         &secrets.user_key_salt,
-    )?;
+    )?; // cov:ignore: unreachable — Pl_SHA2 with a literal bit size and no downstream stage cannot fail, and qpdf's hash_V5 likewise never catches (`QPDF_encryption.cc:246`)
 
     let (o_entry, oe_entry) = compute_o_oe_r5(
         params.owner_password,
@@ -1444,7 +1444,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
         &secrets.file_key,
         &secrets.owner_validation_salt,
         &secrets.owner_key_salt,
-    )?;
+    )?; // cov:ignore: unreachable — Pl_SHA2 with a literal bit size and no downstream stage cannot fail, and qpdf's hash_V5 likewise never catches (`QPDF_encryption.cc:246`)
 
     let mut std_cf = Dictionary::new();
     std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
