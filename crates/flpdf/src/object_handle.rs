@@ -1320,7 +1320,11 @@ impl ObjectHandle {
     /// Insert or overwrite `key` in this handle's dictionary with `value`,
     /// mutating the live value every other clone of this handle also
     /// observes — mirrors `QPDFObjectHandle::replaceKey`
-    /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`). A no-op on a
+    /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`) and
+    /// `QPDF_Dictionary::replaceKey`
+    /// (`libqpdf/QPDF_Dictionary.cc:135-153`). A direct null removes the
+    /// key, while an indirect null or dangling indirect reference is
+    /// retained as the dictionary value. A no-op on a
     /// non-dictionary handle or an unresolved/missing/destroyed indirect
     /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
     /// than panicking. Also a no-op if `value` is the same direct handle as
@@ -1353,6 +1357,10 @@ impl ObjectHandle {
     /// call [`crate::Pdf::mark_object_dirty`] with the same ref or the
     /// change is silently dropped from the written output.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
+        if value.is_direct() && value.is_null() {
+            self.remove_key(key);
+            return;
+        }
         if self.is_same_direct_handle(&value) {
             return;
         }
@@ -7366,6 +7374,83 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         dict.replace_key(b"A", ObjectHandle::integer(2));
         assert_eq!(dict.get_key(b"A").as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replace_key_with_direct_null_removes_an_existing_key_and_detaches_its_child() {
+        let owner_ref = ObjectRef::new(7, 0);
+        let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
+        let child = ObjectHandle::dictionary(vec![]);
+        owner.set_resolved(ObjectValue::Dictionary(
+            [(b"A".to_vec(), child.clone())].into_iter().collect(),
+        ));
+
+        owner.replace_key(b"A", ObjectHandle::null());
+
+        assert!(!owner.has_key(b"A"));
+        assert!(child.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn replace_key_with_direct_null_keeps_a_missing_key_absent() {
+        let dict = ObjectHandle::dictionary(vec![]);
+
+        dict.replace_key(b"Missing", ObjectHandle::null());
+
+        assert!(!dict.has_key(b"Missing"));
+    }
+
+    #[test]
+    fn replace_key_with_direct_null_mutates_a_resolved_indirect_dictionary() {
+        let dict = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
+        dict.set_resolved(ObjectValue::Dictionary(
+            [(b"A".to_vec(), ObjectHandle::integer(1))]
+                .into_iter()
+                .collect(),
+        ));
+
+        dict.replace_key(b"A", ObjectHandle::null());
+
+        assert!(!dict.has_key(b"A"));
+    }
+
+    #[test]
+    fn replace_key_with_direct_null_on_a_non_dictionary_is_a_no_op() {
+        let scalar = ObjectHandle::integer(1);
+
+        scalar.replace_key(b"A", ObjectHandle::null());
+
+        assert_eq!(scalar.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_preserves_a_resolved_indirect_null_and_its_identity() {
+        let indirect_null = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
+        indirect_null.set_resolved(ObjectValue::Null);
+        let dict = ObjectHandle::dictionary(vec![]);
+
+        dict.replace_key(b"Null", indirect_null.clone());
+
+        let retained = dict.get_key(b"Null");
+        assert!(dict.has_key(b"Null"));
+        assert!(retained.is_indirect());
+        assert!(retained.is_null());
+        assert!(retained.is_same_object_as(&indirect_null));
+    }
+
+    #[test]
+    fn replace_key_preserves_a_dangling_indirect_reference_and_its_identity() {
+        let dangling = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        dangling.set_missing();
+        let dict = ObjectHandle::dictionary(vec![]);
+
+        dict.replace_key(b"Dangling", dangling.clone());
+
+        let retained = dict.get_key(b"Dangling");
+        assert!(dict.has_key(b"Dangling"));
+        assert!(retained.is_indirect());
+        assert!(retained.is_null());
+        assert!(retained.is_same_object_as(&dangling));
     }
 
     #[test]
