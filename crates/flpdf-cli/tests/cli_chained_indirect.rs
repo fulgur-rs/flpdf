@@ -7,7 +7,7 @@ fn fixture() -> PathBuf {
 
 fn expected_warning(input: &std::path::Path) -> String {
     format!(
-        "WARNING: {}: (object 5 0, offset 232): expected endobj",
+        "WARNING: {} (object 5 0, offset 232): expected endobj",
         input.display()
     )
 }
