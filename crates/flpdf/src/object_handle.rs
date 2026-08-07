@@ -1221,10 +1221,60 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible integer inspection with lazy dereference.
+    ///
+    /// Ports `QPDFObjectHandle::asInteger`, the silent internal helper.
+    /// [`Self::try_get_int_value`] is the accessor that warns.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_integer(&self) -> Result<Option<i64>> {
         self.try_dereference()?;
         Ok(self.as_integer())
+    }
+
+    /// This handle's integer value, warning and yielding `0` for any other
+    /// type.
+    ///
+    /// Ports `QPDFObjectHandle::getIntValue`
+    /// (`libqpdf/QPDFObjectHandle.cc:502-513`).
+    ///
+    /// # Errors
+    ///
+    /// Propagates resolution failures, and — for a receiver with no reachable
+    /// document — the error [`Self::type_warning`] reports in place of the
+    /// warning.
+    #[allow(dead_code)] // same deferred consumers as `context`
+    pub(crate) fn try_get_int_value(&self) -> Result<i64> {
+        match self.try_as_integer()? {
+            Some(value) => Ok(value),
+            None => {
+                self.type_warning("integer", "returning 0")?;
+                Ok(0)
+            }
+        }
+    }
+
+    /// [`Self::try_get_int_value`] saturated into `i32`, warning at each
+    /// clamp.
+    ///
+    /// Ports `QPDFObjectHandle::getIntValueAsInt`
+    /// (`libqpdf/QPDFObjectHandle.cc:525-543`). The comparisons are strict,
+    /// so `i32::MIN` and `i32::MAX` themselves pass through unwarned.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_get_int_value`]. The clamp warnings themselves go
+    /// through [`Self::warn_if_possible`], which reports no error of its own.
+    #[allow(dead_code)] // same deferred consumers as `context`
+    pub(crate) fn try_get_int_value_as_int(&self) -> Result<i32> {
+        let value = self.try_get_int_value()?;
+        if value < i64::from(i32::MIN) {
+            self.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
+            Ok(i32::MIN)
+        } else if value > i64::from(i32::MAX) {
+            self.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
+            Ok(i32::MAX)
+        } else {
+            Ok(value as i32)
+        }
     }
 
     /// qpdf-compatible dictionary lookup. The holder dictionary is resolved;
@@ -9552,6 +9602,72 @@ mod warning_emission_tests {
         assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
         assert!(handle.try_get_key(b"Missing").unwrap().is_null());
         assert!(warnings(&recorder).is_empty());
+    }
+
+    #[test]
+    fn get_int_value_on_a_non_integer_warns_and_returns_zero() {
+        // `libqpdf/QPDFObjectHandle.cc:503-513`
+        let (handle, recorder) = handle_resolving(ObjectValue::Name(b"Foo".to_vec()));
+
+        assert_eq!(handle.try_get_int_value().unwrap(), 0);
+
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for integer attempted on object of type name: returning 0"]
+        );
+    }
+
+    #[test]
+    fn an_integer_below_int_min_saturates_and_warns() {
+        // `libqpdf/QPDFObjectHandle.cc:528-532`
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(i64::from(i32::MIN) - 1));
+
+        assert_eq!(handle.try_get_int_value_as_int().unwrap(), i32::MIN);
+
+        assert_eq!(
+            warnings(&recorder),
+            ["requested value of integer is too small; returning INT_MIN"]
+        );
+    }
+
+    #[test]
+    fn an_integer_above_int_max_saturates_and_warns() {
+        // `libqpdf/QPDFObjectHandle.cc:532-536`
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(i64::from(i32::MAX) + 1));
+
+        assert_eq!(handle.try_get_int_value_as_int().unwrap(), i32::MAX);
+
+        assert_eq!(
+            warnings(&recorder),
+            ["requested value of integer is too big; returning INT_MAX"]
+        );
+    }
+
+    #[test]
+    fn the_int_endpoints_themselves_neither_saturate_nor_warn() {
+        // qpdf compares strictly (`v < INT_MIN`, `v > INT_MAX`), so the
+        // endpoints pass through unwarned.
+        for value in [i32::MIN, -1, 0, 7, i32::MAX] {
+            let (handle, recorder) = handle_resolving(ObjectValue::Integer(i64::from(value)));
+
+            assert_eq!(handle.try_get_int_value_as_int().unwrap(), value);
+            assert_eq!(handle.try_get_int_value().unwrap(), i64::from(value));
+            assert!(warnings(&recorder).is_empty(), "{value} warned");
+        }
+    }
+
+    #[test]
+    fn a_non_integer_reached_as_an_int_warns_once_for_the_type_and_not_for_range() {
+        // getIntValueAsInt delegates to getIntValue, whose 0 fallback is in
+        // range, so only the type warning is emitted.
+        let (handle, recorder) = handle_resolving(ObjectValue::Name(b"Foo".to_vec()));
+
+        assert_eq!(handle.try_get_int_value_as_int().unwrap(), 0);
+
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for integer attempted on object of type name: returning 0"]
+        );
     }
 
     #[test]
