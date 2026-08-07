@@ -72,6 +72,7 @@ use crate::linearization::plan::{
 };
 use crate::linearization::renumber::{ObjStmRelocation, RenumberMap, SecondHalfContainerAnchor};
 use crate::object::MAX_INLINE_DEPTH;
+use crate::pipeline::stdio_file::StdioBuffer;
 use crate::writer::encrypted_strings::EncryptedStringEmitter;
 use crate::writer::object_streams::{
     emit_objstm_body_from_resolved, planner_config_from_options, wrap_objstm_body,
@@ -83,6 +84,8 @@ use crate::writer::{
     WriteOptions, QPDF_STATIC_ID,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
+
+const EBADF_ERRNO: i32 = 9;
 
 // ---------------------------------------------------------------------------
 // ObjStm layout (flpdf-9hc.5.8.2)
@@ -3044,6 +3047,56 @@ pub fn write_linearized_with_pass1_file<R: Read + Seek>(
     write_linearized_impl(plan, renumber, pdf, options, Some(pass1_path))
 }
 
+/// Write the pass-1 body through qpdf's stdio-shaped buffering boundary.
+///
+/// qpdf writes this body through `Pl_StdioFile` backed by a buffered `FILE*`.
+/// Direct `fwrite` failures are terminal, while `finish()` ignores every
+/// `fflush` failure except `EBADF`, which is a logic error. Keep that behavior
+/// in the core [`crate::Error`] channel instead of allowing a
+/// [`crate::pipeline::PipelineError`] to escape the pipeline boundary.
+fn write_pass1_stdio_body(
+    writer: &mut dyn Write,
+    mut body: &[u8],
+    pass1_path: &Path,
+) -> Result<()> {
+    let mut buffered = StdioBuffer::new(writer);
+    while !body.is_empty() {
+        match buffered.write(body) {
+            Ok(0) => {
+                return Err(crate::Error::file_io(
+                    "write",
+                    pass1_path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write buffered data",
+                    ),
+                ));
+            }
+            Ok(written) => body = &body[written..],
+            Err(source) => {
+                return Err(crate::Error::file_io("write", pass1_path, source));
+            }
+        }
+    }
+
+    match buffered.flush() {
+        Err(source) if source.raw_os_error() == Some(EBADF_ERRNO) => Err(crate::Error::Internal(
+            "linearization pass1: Pl_StdioFile::finish: stream already closed".to_string(),
+        )),
+        Ok(()) | Err(_) => Ok(()),
+    }
+}
+
+/// Append qpdf's pass-1 debugging comments after the body pipeline has been
+/// finished. `QPDFWriter.cc:2886-2900` uses unchecked `fprintf` calls followed
+/// by an unchecked `fclose`, so comment write/close failures are intentionally
+/// not promoted to the writer's public error channel.
+fn write_pass1_debug_comments(writer: &mut dyn Write, comments: &[u8]) {
+    debug_assert!(comments.len() < 4096);
+    let mut buffered = StdioBuffer::new(writer);
+    let _ = buffered.write(comments);
+}
+
 fn write_linearized_impl<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -4405,7 +4458,7 @@ fn write_linearized_impl<R: Read + Seek>(
     }
 
     if let Some(pass1_path) = pass1_path {
-        let (mut pass1_bytes, pass1_hint_stream_offset, pass1_main_xref_offset) =
+        let (pass1_bytes, pass1_hint_stream_offset, pass1_main_xref_offset) =
             pass1_output.expect("requesting a pass-1 file always builds pass-1 output");
         let second_xref_end = if objstm_layout.is_empty() {
             0
@@ -4425,20 +4478,16 @@ fn write_linearized_impl<R: Read + Seek>(
                 })?
             // cov:ignore-end
         };
-        pass1_bytes.extend_from_slice(
-            format!(
-                "% hint_offset={pass1_hint_stream_offset}\n\
-                 % hint_length={final_hint_stream_obj_total_len}\n\
-                 % second_xref_offset={pass1_main_xref_offset}\n\
-                 % second_xref_end={second_xref_end}\n"
-            )
-            .as_bytes(),
+        let debug_comments = format!(
+            "% hint_offset={pass1_hint_stream_offset}\n\
+             % hint_length={final_hint_stream_obj_total_len}\n\
+             % second_xref_offset={pass1_main_xref_offset}\n\
+             % second_xref_end={second_xref_end}\n"
         );
         let mut pass1_file = std::fs::File::create(pass1_path)
             .map_err(|source| crate::Error::file_io("open", pass1_path, source))?;
-        pass1_file
-            .write_all(&pass1_bytes)
-            .map_err(|source| crate::Error::file_io("write", pass1_path, source))?;
+        write_pass1_stdio_body(&mut pass1_file, &pass1_bytes, pass1_path)?;
+        write_pass1_debug_comments(&mut pass1_file, debug_comments.as_bytes());
     }
 
     // ------------------------------------------------------------------
@@ -4482,6 +4531,36 @@ mod tests {
     use crate::writer::{WriteOptions, DETERMINISTIC_ID_ARRAY_LEN};
     use crate::Pdf;
     use std::io::Cursor;
+
+    struct FinishErrorWriter {
+        errno: i32,
+        bytes: Vec<u8>,
+    }
+
+    struct ZeroWriter;
+
+    impl std::io::Write for ZeroWriter {
+        fn write(&mut self, _data: &[u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+
+        // cov:ignore-start: the zero-progress write returns before this test double can be flushed
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    impl std::io::Write for FinishErrorWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(self.errno))
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Fixture: minimal single-page PDF
@@ -4709,9 +4788,55 @@ mod tests {
         assert!(diagnostic.contains("No such file") || diagnostic.contains("cannot find"));
     }
 
+    #[test]
+    fn pass1_stdio_finish_ignores_non_ebadf_and_maps_ebadf_to_internal_error() {
+        let path = Path::new("pass1.pdf");
+        let body = vec![b'x'; 4095];
+        let mut enospc = FinishErrorWriter {
+            errno: 28,
+            bytes: Vec::new(),
+        };
+        write_pass1_stdio_body(&mut enospc, &body, path)
+            .expect("qpdf ignores non-EBADF stdio finish failures");
+        assert_eq!(enospc.bytes, body);
+
+        let mut ebadf = FinishErrorWriter {
+            errno: 9,
+            bytes: Vec::new(),
+        };
+        let error = write_pass1_stdio_body(&mut ebadf, &body, path)
+            .expect_err("qpdf maps EBADF during stdio finish to a logic error");
+        assert!(matches!(
+            error,
+            crate::Error::Internal(ref message)
+                if message == "linearization pass1: Pl_StdioFile::finish: stream already closed"
+        ));
+    }
+
+    #[test]
+    fn pass1_stdio_direct_zero_progress_maps_to_file_aware_write_error() {
+        let path = Path::new("pass1.pdf");
+        let mut writer = ZeroWriter;
+        let error = write_pass1_stdio_body(&mut writer, &[b'x'; 4096], path)
+            .expect_err("qpdf treats zero fwrite progress as a direct write failure");
+
+        match error {
+            crate::Error::FileIo {
+                operation,
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(operation, "write");
+                assert_eq!(error_path, path);
+                assert_eq!(source.kind(), std::io::ErrorKind::WriteZero);
+            }
+            other => panic!("expected file-aware zero-progress error, got {other:?}"), // cov:ignore: assertion failure arm
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn write_linearized_with_pass1_file_preserves_write_error_context() {
+    fn write_linearized_with_pass1_file_ignores_small_body_finish_enospc() {
         let pass1_path = Path::new("/dev/full");
         if !pass1_path.exists() {
             // cov:ignore-start: environment-specific skip for Unix systems without /dev/full
@@ -4724,14 +4849,52 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let mut writing_pdf = open_tiny_pdf();
 
-        let error = write_linearized_with_pass1_file(
+        let document = write_linearized_with_pass1_file(
             &plan,
             &renumber,
             &mut writing_pdf,
             &WriteOptions::default(),
             pass1_path,
         )
-        .expect_err("full pass-1 sink must reject the write");
+        .expect("qpdf ignores non-EBADF failure while finishing a buffered small pass-1 body");
+
+        assert!(document.bytes.starts_with(b"%PDF-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_linearized_with_pass1_file_propagates_large_body_direct_enospc() {
+        let pass1_path = Path::new("/dev/full");
+        if !pass1_path.exists() {
+            // cov:ignore-start: environment-specific skip for Unix systems without /dev/full
+            eprintln!("skipping: /dev/full is unavailable");
+            return;
+            // cov:ignore-end
+        }
+        let input_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/objstm-lin-outlines-80-200.pdf");
+        let planning_file = std::fs::File::open(&input_path).expect("open large fixture for plan");
+        let mut planning_pdf = Pdf::open(std::io::BufReader::new(planning_file))
+            .expect("large fixture parses for plan");
+        let options = WriteOptions::default();
+        let plan = LinearizationPlan::from_pdf_with_object_stream_mode(
+            &mut planning_pdf,
+            options.object_streams,
+        )
+        .expect("large fixture plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let writing_file = std::fs::File::open(&input_path).expect("open large fixture for write");
+        let mut writing_pdf = Pdf::open(std::io::BufReader::new(writing_file))
+            .expect("large fixture parses for write");
+
+        let error = write_linearized_with_pass1_file(
+            &plan,
+            &renumber,
+            &mut writing_pdf,
+            &options,
+            pass1_path,
+        )
+        .expect_err("large pass-1 body must surface its direct write failure");
 
         match &error {
             crate::Error::FileIo {

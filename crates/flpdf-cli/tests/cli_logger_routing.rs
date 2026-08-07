@@ -24,6 +24,10 @@ const ATTACHMENT_PDF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/compat/attachment-two-page.pdf"
 );
+const LARGE_LINEARIZED: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/objstm-lin-outlines-80-200.pdf"
+);
 const EXPECTED_QPDF_VERSION: &str = "11.9.0";
 
 fn flpdf() -> Command {
@@ -236,6 +240,44 @@ fn binary_linearized_pass1_open_failure_names_path_before_final_stdout() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&format!("open {}: ", pass1.display())));
     assert!(stderr.contains("No such file") || stderr.contains("cannot find"));
+}
+
+#[cfg(unix)]
+#[test]
+fn qpdf_differential_matches_small_and_large_pass1_dev_full_boundaries() {
+    if !Path::new("/dev/full").exists() || !qpdf_available() {
+        eprintln!("skipping pass-1 /dev/full differential");
+        return;
+    }
+
+    let small_args = ["--linearize", "--linearize-pass1=/dev/full", ONE_PAGE, "-"];
+    let qpdf_small = run_qpdf(&small_args);
+    let flpdf_small = run_flpdf(&small_args);
+    assert_eq!(qpdf_small.status.code(), Some(0), "qpdf small status");
+    assert_eq!(flpdf_small.status.code(), Some(0), "flpdf small status");
+    assert!(qpdf_small.stdout.starts_with(b"%PDF-"));
+    assert!(flpdf_small.stdout.starts_with(b"%PDF-"));
+    assert!(qpdf_small.stderr.is_empty());
+    assert!(flpdf_small.stderr.is_empty());
+
+    let large_args = [
+        "--linearize",
+        "--linearize-pass1=/dev/full",
+        LARGE_LINEARIZED,
+        "-",
+    ];
+    let qpdf_large = run_qpdf(&large_args);
+    let flpdf_large = run_flpdf(&large_args);
+    assert_eq!(qpdf_large.status.code(), Some(2), "qpdf large status");
+    assert_eq!(flpdf_large.status.code(), Some(2), "flpdf large status");
+    assert!(qpdf_large.stdout.is_empty());
+    assert!(flpdf_large.stdout.is_empty());
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf_large.stderr);
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf_large.stderr);
+    assert!(qpdf_stderr.contains("linearization pass1: Pl_StdioFile::write"));
+    assert!(flpdf_stderr.contains("write /dev/full:"));
+    assert!(qpdf_stderr.contains("No space left on device"));
+    assert!(flpdf_stderr.contains("No space left on device"));
 }
 
 #[test]
