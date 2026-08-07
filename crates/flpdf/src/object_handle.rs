@@ -973,6 +973,54 @@ impl ObjectHandle {
         ))
     }
 
+    /// Report damage this handle noticed about itself.
+    ///
+    /// Ports `QPDFObjectHandle::warnIfPossible`
+    /// (`libqpdf/QPDFObjectHandle.cc:2191-2201`). Its guard is
+    /// `dereference() && obj->getDescription(context, description)`, and that
+    /// second call returns `qpdf != nullptr`
+    /// (`libqpdf/qpdf/QPDFObject_private.hh:94-100`), so the else-branch is
+    /// exactly the no-context case. Unlike [`Self::type_warning`] it writes
+    /// the bare message to the process-global default logger's error stream
+    /// and returns normally rather than reporting an error.
+    ///
+    /// A handle whose document has been dropped is this port's closest
+    /// counterpart to qpdf's failed `dereference()`, and takes the same
+    /// branch rather than propagating the resolution error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the receiving sink itself fails to accept
+    /// the message.
+    #[allow(dead_code)] // same deferred consumers as `context`
+    pub(crate) fn warn_if_possible(&self, warning: &str) -> Result<()> {
+        let context = match self.try_dereference() {
+            Ok(()) => self.context(),
+            Err(_) => None,
+        };
+        match context {
+            Some(context) => context.warn(warning.to_owned()),
+            None => crate::QPDFLogger::default_logger().error(format!("{warning}\n")),
+        }
+    }
+
+    /// Report an object-level problem whose message qpdf passes through
+    /// unchanged.
+    ///
+    /// Ports `QPDFObjectHandle::objectWarning`
+    /// (`libqpdf/QPDFObjectHandle.cc:2203-2212`). No type name is interposed,
+    /// and — unlike [`Self::type_warning`] — qpdf performs no dereference
+    /// here, because the callers that reach it have already type-checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::System`] when no owning document is reachable,
+    /// mirroring the exception qpdf throws instead of warning.
+    #[allow(dead_code)] // same deferred consumers as `context`
+    pub(crate) fn object_warning(&self, warning: &str) -> Result<()> {
+        self.warn_through_context(warning.to_owned())
+    }
+
     /// qpdf-compatible null inspection with lazy dereference.
     pub(crate) fn try_is_null(&self) -> Result<bool> {
         self.try_dereference()?;
@@ -9353,6 +9401,94 @@ mod warning_emission_tests {
                 if message
                     == "operation for dictionary attempted on object of type integer: \
                         treating as empty"
+        ));
+    }
+
+    /// A sink that appends every write to a shared buffer.
+    struct ErrorRecordingSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl crate::pipeline::Pipeline for ErrorRecordingSink {
+        // cov:ignore-start: the default logger does not inspect a sink identifier
+        fn identifier(&self) -> &str {
+            "error recording sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        // cov:ignore-start: the default logger leaves caller-owned sinks unfinished
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    #[test]
+    fn warn_if_possible_without_a_context_logs_instead_of_failing() {
+        // The else-branch of `warnIfPossible` writes the bare message to
+        // `QPDFLogger::defaultLogger()->getError()` and returns normally
+        // (`libqpdf/QPDFObjectHandle.cc:2196-2200`).
+        let logger = crate::QPDFLogger::default_logger();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restore = logger.get_error().unwrap();
+        logger.set_error(Some(crate::pipeline::PipelineHandle::new(
+            ErrorRecordingSink(std::sync::Arc::clone(&captured)),
+        )));
+
+        let result = ObjectHandle::integer(7)
+            .warn_if_possible("requested value of integer is too big; returning INT_MAX");
+
+        logger.set_error(Some(restore));
+        result.unwrap();
+        // The default logger is process-global and every document opened
+        // without an explicit one shares it, so this asserts the exact line
+        // is present rather than that it is the only line.
+        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("requested value of integer is too big; returning INT_MAX\n"),
+            "default error stream captured {captured:?}"
+        );
+    }
+
+    #[test]
+    fn warn_if_possible_through_a_context_reaches_the_document_sink() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle
+            .warn_if_possible("requested value of integer is too small; returning INT_MIN")
+            .unwrap();
+
+        assert_eq!(
+            warnings(&recorder),
+            ["requested value of integer is too small; returning INT_MIN"]
+        );
+    }
+
+    #[test]
+    fn object_warning_passes_its_message_through_without_dereferencing() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle.object_warning("unresolved name object").unwrap();
+
+        assert_eq!(warnings(&recorder), ["unresolved name object"]);
+        assert!(
+            !handle.is_resolved(),
+            "objectWarning does not dereference its receiver"
+        );
+    }
+
+    #[test]
+    fn object_warning_without_a_context_returns_the_error_qpdf_throws() {
+        let handle = ObjectHandle::integer(7);
+
+        let error = handle.object_warning("unresolved name object").unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::System(ref message) if message == "unresolved name object"
         ));
     }
 
