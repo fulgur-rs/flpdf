@@ -116,6 +116,34 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
 不採用 — qpdf 自身が持たない構造を新設することになるため）。`impl` ブロック
 だけを責務ごとに複数ファイルへ分割する。
 
+### モジュール階層: `engine.rs`/`resolve.rs`/`obj_cache.rs` は `pdf` の子モジュール
+
+`struct Pdf<R>` の全フィールドは現状 `pub`/`pub(crate)` 修飾なし、つまり
+モジュール private（`reader.rs:78-` で確認済み）。Rust の private は
+「定義モジュールとその子孫」にしか見えないため、`pdf.rs`/`engine.rs`/
+`resolve.rs`/`obj_cache.rs` を `lib.rs` 直下の並列モジュール（`pub mod pdf;`
+`pub mod engine;` ...）として追加すると、`engine.rs`/`resolve.rs`/
+`obj_cache.rs` は `Pdf` のフィールドに一切アクセスできない
+（フィールドを `pub(crate)` に広げてクレート全体へ mutation を晒すか、
+どちらかを迫られる）。
+
+既存の `reader.rs` は既にこの問題を解決済みで、`file_object`/`resolver`
+サブモジュールを `reader.rs` 冒頭で `pub(crate) mod file_object;` /
+`pub(crate) mod resolver;` と**子モジュールとして**宣言している
+（`reader.rs:2-3`）。同じパターンに従い、`engine.rs`/`resolve.rs`/
+`obj_cache.rs` は `pdf.rs` の子モジュール（`pdf::engine` /
+`pdf::resolve` / `pdf::obj_cache`、ファイルパスは
+`crates/flpdf/src/pdf/engine.rs` 等）として宣言する。`lib.rs` からは
+`pub mod pdf;` のみ追加すればよい。
+
+**既存 `crates/flpdf/src/engine.rs`（PR #657 でマージ済み、`Pdf::empty()`
+のみ）への影響**: 現状は `lib.rs` 直下の並列モジュールとして存在するが、
+`empty()` は既存の `pub fn open_mem_owned` を呼ぶだけで `Pdf` の private
+フィールドに触れないため、たまたま並列モジュールのままコンパイルが通って
+いる。今回の `open_with_repair_mode`（フィールドを直接構築する private
+constructor、上記参照）をここへ追加する際に、`pdf::engine` への再配置が
+必要になる。
+
 ### `pdf.rs`（新規）
 - `struct Pdf<R>` 定義、`Drop` impl
 - **真に trivial な**（qpdf 側でも1ステップの field 返却のみ）直接
@@ -135,9 +163,11 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
   これに委譲する。ここを含めないと構築のオーケストレーション本体が
   reader.rs に残る）
   （qpdf の `processFile`/`processMemoryFile`/`emptyPDF` に対応）
-- 解決のエントリポイント: `get_object_handle`, `resolve_object_handle`,
+- 解決のエントリポイント: `resolve_object_handle`,
   `resolve_object_handle_to_terminal(_ref)` 等、呼び出し側から見える
-  「解決してくれ」という要求の受け口
+  「解決してくれ」という要求の受け口。**`get_object_handle` はここに
+  含めない**（`obj_cache.rs` 参照 — 実処理は cache 登録のみで resolve では
+  ない）
 - 上記が内部で `resolve.rs` の一次プリミティブを呼ぶ、という二層構造
 
 ### `resolve.rs`（新規、`reader/resolver.rs` の `ResolverCore` を統合・拡張）
@@ -173,6 +203,13 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
   `get_all_object_handles`, `resolved_count`, `deleted_object_refs`
   （`resolved_count`/`deleted_object_refs` は `self.cache` への直接委譲、
   `reader.rs:1655-1661` で確認済み）
+- **`get_object_handle` も engine.rs からここへ再分類**。自身の doc
+  コメント（`reader.rs:1849-1850`）が「This does not perform file I/O or
+  force object-body parsing」と明記し、qpdf の `QPDF::getObject`
+  （`QPDF.cc:1951-1959`、obj_cache の登録/参照のみ）に対応する
+  identity 操作であって resolve ではない。`is_canonical_object_handle`/
+  `make_indirect_object_handle`/`get_all_object_handles` と同じ cache
+  identity API 群としてまとめる
 
 ### 新規ファイルを作らず既存へ委譲するもの
 - 暗号/認証エントリ（`is_encrypted`, `authenticate_if_encrypted`,
@@ -180,7 +217,17 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
   `encryption_info`, `permissions`, `user_password_matched`,
   `owner_password_matched`, `encryption_file_key`）は `QPDF_encryption.cc`
   の既存受け皿（`security/standard.rs` / `encrypt_setup.rs` /
-  `permissions.rs`）へ移す。reader.rs 側の実装は重複であり、削除対象
+  `permissions.rs`）へ移す。reader.rs 側の実装は重複であり、削除対象。
+  **この10個の公開メソッドだけでは実装が終わらない**: `authenticate_if_
+  encrypted`（`reader.rs:945-`）は reader.rs 内で private 定義されている
+  `EncryptionState`(`reader.rs:197-`)/`EncryptionMode`(`reader.rs:470-`)/
+  `required_revision`/`required_version`/`required_permissions`
+  (`reader.rs:4228-4292`)/`interpret_cf`(`reader.rs:4263-`)/
+  `crypt_filter_modes`(`reader.rs:4293-`) に依存する。これらのヘルパー型・
+  関数も同じ移動対象に含める（`docs/qpdf-correspondence.md:136` が
+  `interpret_cf` 系を既に `QPDF::interpretCF`（`QPDF_encryption.cc:700-716`）
+  対応として記録済み）。含めないと暗号ロジックの大半が reader.rs に
+  残ったまま、10個の薄いラッパーだけを移動することになる
 - `signatures`（`reader.rs:871-873`、`crate::signatures::signatures` への
   薄い委譲）は上記グループに**含めない**。qpdf の `QPDF.cc` に signature
   関連コードは0件、`QPDFAcroFormDocumentHelper.cc` にあるのも
@@ -195,6 +242,18 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
   既存 `object_copy.rs` へ移す
 - `linearized_hint_ref`（`reader.rs:1815-1837`、コメントが
   `QPDF_linearization.cc:139-141` を明記）は既存 `linearization/` へ移す
+- JSON 出力準備群（`QpdfPreparedObjects`(`reader.rs:186-189`),
+  `prepare_qpdf_json_objects`(`reader.rs:1728-1777`),
+  `qpdf_json_live_object_refs`(`reader.rs:1788-1798`),
+  `resolve_qpdf_json_object`(`reader.rs:2943-2967`),
+  `resolve_qpdf_json_object_borrowed`(`reader.rs:2976-`)）は
+  `pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs` のどれにも含めない。
+  production caller は `document_json.rs:151`
+  （`prepare_qpdf_json_objects`）で、既存の `QPDF_json.cc` 出力側の受け皿
+  （`document_json.rs`、上表参照）に対応する。実装は resolve/cache 両方に
+  触れる（`self.resolver`/`self.cache` を直接操作）ため、
+  `document_json.rs` 側からこの2ファイルの private API を呼ぶ形になるか、
+  `document_json.rs` 自身へ実装ごと移すかは実装時に決める
 
 ### 未決定（実装時に判断してよい細部）
 - qtest 用の source-offset introspection（`qtest_*`, `source_xref_offsets`,
@@ -226,13 +285,35 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
    `resolve.rs`/`reader/resolver.rs` 統合 → `engine.rs` 抽出 →
    暗号/認証エントリの既存ファイルへの移動、が依存の少ない順と思われるが
    要検証）
-3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1）を、本設計の4ファイル
-   （`pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs`）のみを指すよう更新する。
-   `QPDF_encryption.cc`/`QPDF_json.cc`/`QPDF_linearization.cc`/
-   `QPDF_optimization.cc`/`QPDF_pages.cc` は既に独立した行を持つため、
-   `QPDF.cc` 行にこれらを再掲して二重帰属を作らない。上記「新規ファイルを
-   作らず既存へ委譲するもの」で個別に触れた `signatures.rs`/
-   `object_copy.rs`/`linearization/` への移動は、それぞれの既存行を
-   個別に更新する
+3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、現行本文
+   `reader.rs`(7898) + `reader/resolver.rs`(...) + `reader/file_object.rs`
+   (1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) +
+   `cache.rs`(112) + `writer/object_streams.rs`(207-237) +
+   `signatures.rs`(245-: `removeSecurityRestrictions`) +
+   `page_closure.rs`(441) + `ref_chain.rs`(159)）を更新する際は、
+   **`reader.rs` と `reader/resolver.rs` の2項目だけを本設計の4ファイル
+   （`pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs`）に差し替える**。
+   `reader/file_object.rs`/`xref.rs`/`object_copy.rs`/`cache.rs`/
+   `writer/object_streams.rs`/`signatures.rs`/`page_closure.rs`/
+   `ref_chain.rs` は本設計が触れない別責務なので、既存の記載をそのまま
+   残す（`docs/qpdf-correspondence.md:372-373` が `object_copy.rs` を
+   `QPDF.cc` 行にあえて置いている理由を明記しており、同じ理由で他の
+   7ファイルも残す必要がある。`QPDF_encryption.cc`/`QPDF_json.cc`/
+   `QPDF_linearization.cc`/`QPDF_optimization.cc`/`QPDF_pages.cc` は
+   これとは別に既に独立行を持つため、そちらとの二重帰属だけを避ける）。
+   上記「新規ファイルを作らず既存へ委譲するもの」で個別に触れた
+   `signatures.rs`/`object_copy.rs`/`linearization/`/`document_json.rs`
+   への移動は、それぞれの既存行（§7/§8）を個別に更新する
 4. 各ステップは出力バイトに影響しない「入れ物」の変更のみ
-   （CLAUDE.md 分類(B)）なので、バイト差分ゼロを都度確認しながら進める
+   （CLAUDE.md 分類(B)）なので、バイト差分ゼロを都度確認しながら進める。
+   AGENTS.md §7 の acceptance-criteria 階層として、各ステップの検証には
+   具体的なコマンドを紐付ける: `cargo test -p flpdf`（lib 全件 + 全
+   integration + doctest）に加え、`--features qpdf-zlib-compat` での
+   byte-identical テスト群（`cmp_linearize_tests.rs` の
+   `assert_*_byte_identical`、`crates/flpdf-cli/tests/cli_byte_identical.rs`、
+   `deterministic_id_qpdf_parity_tests.rs`、`compat_matrix_tests.rs`）を
+   移動対象メソッドが実際に通る経路であることを確認したうえで実行する。
+   特に resolve/認証まわりの移動は、単体テストだけでは値の materialize
+   有無や byte 出力まで確認できないため、上記 byte-identical スイートを
+   必ず含める。加えて各ステップ実行前後で `scripts/patch-coverage.sh`
+   を回し、変更行 100% カバレッジを維持する
