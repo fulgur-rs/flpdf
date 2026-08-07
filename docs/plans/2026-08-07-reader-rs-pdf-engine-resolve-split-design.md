@@ -4,12 +4,15 @@
 > qpdf oracle facts below (QPDF.cc method inventory, `QPDF::Members` field
 > layout, the `QPDF_*.cc` file split, the `qpdf-rs` crate structure) were
 > verified against pinned qpdf 11.9.0 source and live lookups; review them for
-> correctness like any other claim. No bd issue exists yet for this work —
-> file one (or a small epic) before implementing; this document is the design
-> that issue's acceptance criteria should be built from.
+> correctness like any other claim. `flpdf-0b12` (issue filed, implemented in
+> `refactor/flpdf-0b12-pdf-module`, stacked on this PR) covers the `pdf.rs`
+> slice; file bd issues for the remaining slices (`obj_cache.rs`/
+> `resolve.rs`/`engine.rs` extraction, encryption-entry/foreign-object-map/
+> JSON-prep/`linearized_hint_ref` relocation) before implementing them.
 
-**Status:** design only. No code changes, no bd issues filed yet (deliberate
-— see 「次のステップ」). Produced via `superpowers:brainstorming` after the
+**Status:** design, with the `pdf.rs` slice already implemented
+(`flpdf-0b12`, see モジュール階層節). The rest is design only; see
+「次のステップ」. Produced via `superpowers:brainstorming` after the
 `flpdf-25kg.3.19` (`Pdf::empty()`) session surfaced that `reader.rs` is an
 uncomfortable home for the new factory: the name "reader" doesn't semantically
 fit a zero-external-input constructor, and more broadly `reader.rs` has become
@@ -116,68 +119,69 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
 不採用 — qpdf 自身が持たない構造を新設することになるため）。`impl` ブロック
 だけを責務ごとに複数ファイルへ分割する。
 
-### モジュール階層: `engine.rs`/`resolve.rs`/`obj_cache.rs` は `pdf` の子モジュール
+### モジュール階層: `pub(crate)` フィールドで解決済み（実装済み）
 
-`struct Pdf<R>` の全フィールドは現状 `pub`/`pub(crate)` 修飾なし、つまり
-モジュール private（`reader.rs:78-` で確認済み）。Rust の private は
-「定義モジュールとその子孫」にしか見えないため、`pdf.rs`/`engine.rs`/
-`resolve.rs`/`obj_cache.rs` を `lib.rs` 直下の並列モジュール（`pub mod pdf;`
-`pub mod engine;` ...）として追加すると、`engine.rs`/`resolve.rs`/
-`obj_cache.rs` は `Pdf` のフィールドに一切アクセスできない
-（フィールドを `pub(crate)` に広げてクレート全体へ mutation を晒すか、
-どちらかを迫られる）。
+`struct Pdf<R>` の全フィールドは元々 module private（`reader.rs:78-` 参照）
+だった。`pdf.rs` を `lib.rs` 直下の並列モジュールとして追加すると、
+`reader.rs` 側に残る他の `impl Pdf<R>` ブロック（大半のメソッドはまだ
+そこにある）が private フィールドへアクセスできなくなる、という懸念が
+あった。
 
-既存の `reader.rs` は既にこの問題を解決済みで、`file_object`/`resolver`
-サブモジュールを `reader.rs` 冒頭で `pub(crate) mod file_object;` /
-`pub(crate) mod resolver;` と**子モジュールとして**宣言している
-（`reader.rs:2-3`）。同じパターンに従い、`engine.rs`/`resolve.rs`/
-`obj_cache.rs` は `pdf.rs` の子モジュール（`pdf::engine` /
-`pdf::resolve` / `pdf::obj_cache`、ファイルパスは
-`crates/flpdf/src/pdf/engine.rs` 等）として宣言する。`lib.rs` からは
-`pub mod pdf;` のみ追加すればよい。
+**この懸念は `flpdf-0b12`（`refactor/flpdf-0b12-pdf-module`、
+commit `56a01c2b`）で実装され、解決済み**: `Pdf<R>` の全フィールドを
+`pub(crate)` にし（`crates/flpdf/src/pdf.rs:51-`）、`reader.rs` 側は
+並列モジュールのまま変更しない。`reader.rs` に残る `lift`/
+`lift_to_handle_bounded`/`EncryptionState`/
+`ResolverHandle::encryption_parameters` も同様に可視性だけ `pub(crate)`
+へ広げ（実装自体は移動しない）、`pdf.rs` 側から呼べるようにした。
+**以前の版にあった「`engine.rs`/`resolve.rs`/`obj_cache.rs` は `pdf` の
+子モジュールとして宣言する」という案は不採用**（`pub(crate)` の方が
+遥かに小さい変更で同じ問題を解く）。
 
-**既存 `crates/flpdf/src/engine.rs`（PR #657 でマージ済み、`Pdf::empty()`
-のみ）への影響**: 現状は `lib.rs:102` の `pub mod engine;` で並列モジュール
-として宣言されており、実際に存在する（`empty()` は既存の
-`pub fn open_mem_owned` を呼ぶだけで `Pdf` の private フィールドに触れない
-ため、たまたま並列モジュールのままコンパイルが通っている）。`struct Pdf<R>`
-を `pdf.rs` へ移し、`engine.rs` を `pdf::engine` へ再配置する際、
-配線を更新する必要がある: (1) `lib.rs:102` の `pub mod engine;` を削除し
-（中身は `pdf.rs` 内の `mod engine;` 宣言に置き換わる）、(2) `lib.rs:258`
-の `pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};`
-を `pub use pdf::Pdf;`（他の型の移動先に応じて分割）に retarget する。
-公開パス `flpdf::Pdf` 自体は変わらない（re-export 元が変わるだけ）。
+`pdf.rs` へ実際に移動したのは8メソッド + `unique_id` + `Drop` impl のみ:
+`version`, `trailer`, `trailer_handle`, `trailer_key_handle`, `root_ref`,
+`adobe_extension_level`, `ever_called_get_all_pages`,
+`mark_get_all_pages_called`。**以前の版では `adobe_extension_level`/
+`trailer_handle`/`trailer_key_handle` を「内部で resolve()/lift() を呼ぶ
+から」という理由で `resolve.rs` へ再分類する提案をしていたが、実装は
+この3つも他5メソッドと同じ「direct document-state accessor」グループとして
+`pdf.rs` にまとめて置いた**（呼び出し先の `lift`/`lift_to_handle_bounded`
+自体は reader.rs に残したまま可視性だけ広げているので、物理的な移動は
+発生していない）。本設計もこれに合わせて `resolve.rs` の対象リストから
+この3メソッドを外す。
+
+**`pub(crate)` 化により、`engine.rs`/将来の `resolve.rs`/`obj_cache.rs`/
+`security/*`/`object_copy.rs` はどれも lib.rs 直下の並列モジュールの
+ままでよい**。フィールド・helper の可視性だけ `pub(crate)` に広げれば、
+モジュール階層をどう組んでも private 境界の問題は起きない。
+
+**既存 `crates/flpdf/src/engine.rs`（PR #657 でマージ済み）への実際の
+変更**（`flpdf-0b12` で確認済み）: `use crate::reader::Pdf;` →
+`use crate::Pdf;` の1行のみ。ファイルの再配置は発生しない。
+
+**lib.rs の配線変更**（`flpdf-0b12` で実施済み）: `pub mod pdf;` を追加、
+`pub use pdf::Pdf;` を追加、既存の
+`pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};` から
+`Pdf` を除去（`EncryptionInfo`/`PdfOpenOptions`/`Permissions` は
+reader.rs に残ったまま）。
 
 **`security/standard.rs`/`encrypt_setup.rs`/`permissions.rs`/
-`object_copy.rs` は同じ解決法が使えない**: これらは `engine.rs` 等と違い
-**既存の**（本設計が新設しない）`lib.rs` 直下の並列モジュールで、独自の
-既存責務を持つため `pdf` の子へ付け替えるのは大きすぎる変更になる。
-一方 `is_encrypted`（`self.encryption.borrow()` を直接読む、
-`reader.rs:183,721-723`）や `take_foreign_object_map`（`self.
-foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
-エントリポイントは `Pdf` の private フィールドに直接アクセスするため、
-そのまま `security/*`/`object_copy.rs` に移すとコンパイルできない。
-2通りの解決策があり、実装時に選ぶ: (a) 該当フィールドだけ
-`pub(crate)` にする（クレート内アクセスは許すが、公開APIは晒さない。
-`is_dirty`/`live_object_refs` 等 `obj_cache.rs` グループが返す値の型は
-既に外部公開されているため、これは新規の公開面拡大ではない）。
-(b) エントリポイント自体は `Pdf` が定義されるモジュール
-（`pdf.rs`/`pdf::obj_cache` 等）に残し、`security/*`/`object_copy.rs` へは
-**既に `&Dictionary`/`&mut EncryptionState` 等の抽出済み値だけを取る
-純粋関数**（`required_revision`/`interpret_cf`/`crypt_filter_modes` は
-既にこの形）だけを移す。エントリポイント本体はこれらの純粋関数を
-呼ぶだけの薄いラッパーとして `Pdf` 側に留まる。(b) の方が公開面を一切
-広げずに済むため望ましいが、`authenticate_if_encrypted` 全体をこの形に
-分解できるかは実装時に確認する。
+`object_copy.rs` も同じ解決法をそのまま使える**: `is_encrypted`
+（`self.encryption.borrow()`、`reader.rs:183,721-723`）や
+`take_foreign_object_map`（`self.foreign_object_maps`、
+`reader.rs:110,1981-`）のようなエントリポイントを移す際は、`flpdf-0b12`
+と同じ手法（該当フィールド／呼び出し先ヘルパーを `pub(crate)` にする）を
+適用する。`is_dirty`/`live_object_refs` 等が返す値の型は既に外部公開
+されているため、これは新規の公開面拡大ではない。
 
-### `pdf.rs`（新規）
-- `struct Pdf<R>` 定義、`Drop` impl
-- **真に trivial な**（qpdf 側でも1ステップの field 返却のみ）直接
-  フィールドアクセサ: `version`, `trailer`, `root_ref`,
-  `ever_called_get_all_pages`, `mark_get_all_pages_called`, `unique_id`。
-  根拠: qpdf の `QPDF::getTrailer()`（`QPDF.cc:2349-2352`）は
-  `return m->trailer;` のみで解決処理を一切行わない。`unique_id`
-  （`reader.rs:1977-1979`、`self.unique_id` を返すのみ）も同様で、
+### `pdf.rs`（実装済み — `flpdf-0b12`）
+- `struct Pdf<R>` 定義（全フィールド `pub(crate)`）、`Drop` impl
+- `version`, `trailer`, `trailer_handle`, `trailer_key_handle`, `root_ref`,
+  `adobe_extension_level`, `ever_called_get_all_pages`,
+  `mark_get_all_pages_called`, `unique_id`（direct document-state
+  accessor として1グループにまとめる。`adobe_extension_level` が内部で
+  `resolve()`/`lift()` を呼ぶ点は上記モジュール階層節を参照）
+- `unique_id`（`reader.rs:1977-1979`、`self.unique_id` を返すのみ）は
   **`obj_cache.rs` には含めない**（後述）: 消費者（`filespec_helper.rs:115`/
   `embedded_files.rs:492`/`object_copy.rs:126`）はいずれも document
   identity の照合（handle の所属確認・foreign-copy state のキー）に
@@ -227,15 +231,14 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
   `json_inspect.rs`。`source_stream_data_offset`（`reader.rs:1362-`、
   `self.resolver.xref_entry(...)` を読む）は `pub fn`（クレート外公開API）
   で、resolve/seek の一次プリミティブに直接依存する
-- **`adobe_extension_level`, `trailer_handle`, `trailer_key_handle` も
-  ここに含める**（`pdf.rs` からの再分類）。根拠: qpdf の
-  `QPDF::getExtensionLevel()`（`QPDF.cc:2328-2346`）は
-  `getRoot().getKey("/Extensions").getKey("/ADBE").getKey("/ExtensionLevel")`
-  という多段の間接参照 chain walk を行う実処理で、`getTrailer()` のような
-  単純な field 返却ではない。flpdf 側でも `adobe_extension_level` は
-  `resolve()` を呼び、`trailer_handle`/`trailer_key_handle` は
-  `resolve.rs` に割り当てた `lift()` を呼ぶ（`reader.rs:1218-1298` で確認
-  済み）ため、双方の実装が一致してこの分類を裏付ける
+- `adobe_extension_level`/`trailer_handle`/`trailer_key_handle` は
+  ここに**含めない**（`pdf.rs` 参照）。qpdf の `QPDF::getExtensionLevel()`
+  （`QPDF.cc:2328-2346`）は多段の間接参照 chain walk を行う実処理で
+  `getTrailer()` のような単純な field 返却ではないが、`flpdf-0b12` の
+  実装は「direct document-state accessor」という括りでこの3つを他の
+  trivial アクセサと同じ `pdf.rs` にまとめて置いた（呼び出し先の
+  `lift`/`lift_to_handle_bounded` 自体は `pub(crate)` 化のみで
+  reader.rs に残る）。本設計もこれに合わせる
 - 既存 `reader/resolver.rs` の `ResolverCore<R>`（`pub(crate)`,
   `object_cache: BTreeMap<ObjectRef, ObjectHandle>` 等）が既にこの領域の
   一部を担っているため、実装時に統合対象を精査する
@@ -337,30 +340,22 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
 
 このセッションでは設計のみ。以下は別セッションで:
 
-1. bd issue（epic + サブタスク）を本設計に基づいて作成する
-2. 実装順序: `struct Pdf<R>` を独立ステップとして `pdf.rs` へ抽出する
-   ことは**単独ではコンパイルできない**。`open_with_repair_mode`
-   （`reader.rs:875-`、`Pdf { .. }` 構造体リテラルで全フィールドを直接
-   構築する）や `set_object`（`cache`/`resolver` フィールドを直接触る）
-   等、まだ `reader.rs` に残る大多数のメソッドが `Pdf` の private
-   フィールドに依存しており、`struct Pdf` だけを別モジュール
-   （sibling）へ切り離すと、残った `reader.rs` 側がコンパイル不能になる
-   （モジュール階層節で確認済みの private 境界がそのまま阻害要因になる）。
-   代わりに次の遷移的な手順を取る:
-   (a) まず `reader.rs` を丸ごと（中身は変更せず）`pdf` の子モジュール
-   `pdf::reader`（ファイルパス `crates/flpdf/src/pdf/reader.rs`）として
-   再配置し、`struct Pdf` の定義だけを `pdf.rs` 側へ引き上げる
-   （`pdf::reader` は `super::Pdf` を使う）。この時点で private 境界は
-   「`pdf` とその子孫」内に収まるため、コンパイル可能な1ステップになる。
-   (b) 以降、`obj_cache.rs`/`resolve.rs`/`engine.rs` の各グループを
-   `pdf::reader` から `pdf::obj_cache`/`pdf::resolve`/`pdf::engine`
-   （すべて `pdf` の子孫のまま）へ1グループずつ抽出する。`pdf::reader`
-   は各ステップでメソッドが減っていき、最終的に空になったら削除する。
-   (c) 暗号/認証エントリの `security/*` への移動、`take_foreign_object_map`
-   等の `object_copy.rs` への移動は、モジュール階層節で述べた
-   「フィールドを限定的に `pub(crate)` にする」か「エントリポイントは
-   `pdf` 側に残す」のどちらかを選んでから最後に行う（既存の並列モジュール
-   なので (a)(b) の「`pdf` の子孫内に留める」手法が使えない）
+1. bd issue（epic + 残りのサブタスク）を本設計に基づいて作成する。
+   `pdf.rs` 抽出（`struct Pdf<R>` + 8メソッド + `unique_id` + `Drop`）は
+   `flpdf-0b12`（`refactor/flpdf-0b12-pdf-module`、PR #658 スタック）で
+   **実装済み** — フィールドを `pub(crate)` にするだけで sibling モジュール
+   のまま解決した（モジュール階層節参照）。残りは `obj_cache.rs`/
+   `resolve.rs`/`engine.rs` 抽出と、暗号/認証エントリ・
+   `take_foreign_object_map`・JSON準備群・`linearized_hint_ref` の
+   既存ファイルへの移動
+2. 実装順序: `pdf.rs` の前例（`pub(crate)` フィールド化）と同じ手法を
+   横展開すればよく、特別な遷移的ネストは不要（モジュール階層節参照）。
+   `obj_cache.rs`/`resolve.rs`/`engine.rs` はいずれも新規の並列モジュール
+   としてそのまま追加でき、`Pdf` 側で必要なフィールド/helper は既に
+   `pub(crate)` になっている前例に倣って広げる。暗号/認証エントリの
+   `security/*` への移動、`take_foreign_object_map` 等の `object_copy.rs`
+   への移動も同じ手法（該当フィールド・呼び出し先ヘルパーを
+   `pub(crate)` にする）でよい
 3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、現行本文
    `reader.rs`(7898) + `reader/resolver.rs`(...) + `reader/file_object.rs`
    (1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) +
