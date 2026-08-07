@@ -7381,13 +7381,14 @@ mod mutation_tests {
         let owner_ref = ObjectRef::new(7, 0);
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
         let child = ObjectHandle::dictionary(vec![]);
+        let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
         owner.set_resolved(ObjectValue::Dictionary(
-            [(b"A".to_vec(), child.clone())].into_iter().collect(),
+            [(b"Nested".to_vec(), dict.clone())].into_iter().collect(),
         ));
 
-        owner.replace_key(b"A", ObjectHandle::null());
+        dict.replace_key(b"A", ObjectHandle::null());
 
-        assert!(!owner.has_key(b"A"));
+        assert!(!dict.has_key(b"A"));
         assert!(child.containing_object_refs().is_empty());
     }
 
