@@ -739,10 +739,30 @@ Record, in prose an outside reader can check:
 4. A note for that downstream port: qpdf's `dynamic_cast` sits *outside* the
    `if (decode_pipeline)` guard, so a null-returning filter such as Crypt leaves the
    previous iteration's stage in `pipeline` and can re-apply the callback to it.
+5. The `/Type`-lookup hoist in `CryptStreamFilter::set_decode_params`. qpdf re-reads
+   `/Type` from a `std::map` on every iteration of the key loop
+   (`QPDF_Stream.cc:36-44`); flpdf locates the entry once before the loop and reads
+   it per iteration, because `DecodeParams` is an owned `Vec` and a Crypt stage
+   retains every key. Both predicates still evaluate where qpdf evaluates them, and
+   the read is loop-invariant, resolves nothing, warns about nothing, and cannot
+   fail — so no observable operation changes order. Task 6 recorded this in the
+   module doc only; the ⚪ row is what completes CLAUDE.md class (B) condition 3.
+   State the justification as loop-invariance and non-observability. Do **not**
+   state it as an efficiency or DoS mitigation: that is the one motive CLAUDE.md
+   rules out pre-v1.0, and a record whose stated reason is a forbidden one invites
+   a later reader to reverse it.
+
+Also carry forward, for the consumer cutover rather than for this task: `Crypt`'s
+`decode_pipeline` returns `Ok(None)` (no stage — bytes pass through) while its
+`pipe_decode_recovering` returns `Err(Unsupported)`. The two routes say opposite
+things about the same filter today. Whoever moves the codec loop onto the
+`decode_pipeline` route must decide which one survives, or an undecrypted payload
+will pass through silently where it currently errors. qpdf has no counterpart that
+settles it, because there the whole question lives in `decryptStream`.
 
 Public doc rules apply (`.claude/rules/pdf-rust-doc-review-patterns.md`): no beads
-IDs, no epic or follow-up jargon, English only on `///` and `//!`. Point 3 and 4
-name the qpdf symbol and file, not an issue ID.
+IDs, no epic or follow-up jargon, English only on `///` and `//!`. Points 3, 4, and
+5 name the qpdf symbol and file, not an issue ID.
 
 ```bash
 git add crates/flpdf/src/stream_filter.rs crates/flpdf/src/pipeline.rs docs/qpdf-correspondence.md
