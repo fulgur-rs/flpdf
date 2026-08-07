@@ -350,31 +350,42 @@ reader.rs に残ったまま）。
    既存ファイルへの移動
 2. 実装順序: `pdf.rs` の前例（`pub(crate)` フィールド化）と同じ手法を
    横展開すればよく、特別な遷移的ネストは不要（モジュール階層節参照）。
-   `obj_cache.rs`/`resolve.rs`/`engine.rs` はいずれも新規の並列モジュール
-   としてそのまま追加でき、`Pdf` 側で必要なフィールド/helper は既に
-   `pub(crate)` になっている前例に倣って広げる。暗号/認証エントリの
-   `security/*` への移動、`take_foreign_object_map` 等の `object_copy.rs`
-   への移動も同じ手法（該当フィールド・呼び出し先ヘルパーを
-   `pub(crate)` にする）でよい
+   `obj_cache.rs`/`resolve.rs` は新規の並列モジュールとしてそのまま
+   追加できる。**`engine.rs` は新規ではなく PR #657 で既に存在する
+   既存モジュール**（`Pdf::empty()` のみ実装済み）なので、「追加」では
+   なく「拡張」する（`open`/`open_with_repair_mode` 等をこのファイルに
+   足していく）。`Pdf` 側で必要なフィールド/helper は既に `pub(crate)`
+   になっている前例に倣って広げる。暗号/認証エントリの `security/*` への
+   移動、`take_foreign_object_map` 等の `object_copy.rs` への移動も
+   同じ手法（該当フィールド・呼び出し先ヘルパーを `pub(crate)` にする）
+   でよい
 3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、現行本文
    `reader.rs`(7898) + `reader/resolver.rs`(...) + `reader/file_object.rs`
    (1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) +
    `cache.rs`(112) + `writer/object_streams.rs`(207-237) +
    `signatures.rs`(245-: `removeSecurityRestrictions`) +
    `page_closure.rs`(441) + `ref_chain.rs`(159)）を更新する際は、
-   **`reader.rs` と `reader/resolver.rs` の2項目だけを本設計の4ファイル
-   （`pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs`）に差し替える**。
-   `reader/file_object.rs`/`xref.rs`/`object_copy.rs`/`cache.rs`/
-   `writer/object_streams.rs`/`signatures.rs`/`page_closure.rs`/
-   `ref_chain.rs` は本設計が触れない別責務なので、既存の記載をそのまま
-   残す（`docs/qpdf-correspondence.md:372-373` が `object_copy.rs` を
-   `QPDF.cc` 行にあえて置いている理由を明記しており、同じ理由で他の
-   7ファイルも残す必要がある。`QPDF_encryption.cc`/`QPDF_json.cc`/
-   `QPDF_linearization.cc`/`QPDF_optimization.cc`/`QPDF_pages.cc` は
-   これとは別に既に独立行を持つため、そちらとの二重帰属だけを避ける）。
-   上記「新規ファイルを作らず既存へ委譲するもの」で個別に触れた
-   `signatures.rs`/`object_copy.rs`/`linearization/`/`document_json.rs`
-   への移動は、それぞれの既存行（§7/§8）を個別に更新する
+   **`reader/resolver.rs` は本設計の4ファイルへ差し替えるが、
+   `reader.rs` は残す（削除しない）**。`reader.rs` には legacy な
+   `Pdf::resolve`/`Pdf::resolve_borrowed`（`reader.rs:2702-2725`、
+   doc コメントで `qpdf-cutover-delete(flpdf-25kg.3.3)` と明記）が
+   残っており、production caller が実在する（`object_copy.rs:108,152`、
+   `flpdf-cli/src/main.rs:3444` 等）。この2メソッドの削除は
+   `flpdf-25kg.3.3`（呼び出し側の `ObjectHandle` 移行）が前提で、
+   本設計はそれを前提にしない・実施もしないため、`reader.rs` は
+   本設計の4ファイル抽出後も実体を持つモジュールとして correspondence
+   行に残す。`reader/file_object.rs`/`xref.rs`/`object_copy.rs`/
+   `cache.rs`/`writer/object_streams.rs`/`signatures.rs`/
+   `page_closure.rs`/`ref_chain.rs` も本設計が触れない別責務なので、
+   既存の記載をそのまま残す（`docs/qpdf-correspondence.md:372-373` が
+   `object_copy.rs` を `QPDF.cc` 行にあえて置いている理由を明記しており、
+   同じ理由で他の7ファイルも残す必要がある。`QPDF_encryption.cc`/
+   `QPDF_json.cc`/`QPDF_linearization.cc`/`QPDF_optimization.cc`/
+   `QPDF_pages.cc` はこれとは別に既に独立行を持つため、そちらとの
+   二重帰属だけを避ける）。上記「新規ファイルを作らず既存へ委譲する
+   もの」で個別に触れた `signatures.rs`/`object_copy.rs`/
+   `linearization/`/`document_json.rs` への移動は、それぞれの既存行
+   （§7/§8）を個別に更新する
 4. 各ステップは出力バイトに影響しない「入れ物」の変更のみ
    （CLAUDE.md 分類(B)）なので、バイト差分ゼロを都度確認しながら進める。
    AGENTS.md §7 の acceptance-criteria 階層として、各ステップの検証には
@@ -402,4 +413,18 @@ reader.rs に残ったまま）。
    なく新規の encrypted-input rewrite golden（パスワード付きで開く →
    何らかの操作 → 書き出し → qpdf の同等操作と byte 比較）を実装の一部
    として追加することを前提条件とする。加えて各ステップ実行前後で
-   `scripts/patch-coverage.sh` を回し、変更行 100% カバレッジを維持する
+   `scripts/patch-coverage.sh` を回し、変更行 100% カバレッジを維持する。
+   **各ステップは `flpdf-0b12` のように前段のステップに stack する PR に
+   なる**ため、`patch-coverage.sh` は必ず `--base <親ブランチ>` 付きで
+   実行する（引数無しだと既定の `origin/main` と比較してしまい、前段の
+   ステップで既に入った変更まで当該ステップの変更行として扱われて
+   誤判定する）
+5. **各抽出は CLAUDE.md 逸脱分類 (B) に該当する**（qpdf 自身の
+   `QPDF.cc` 単一ファイルという足場を、flpdf 側で複数の Rust モジュールに
+   置き換える「入れ物」の変更）。CLAUDE.md 条件3（該当箇所参照）により、
+   `docs/qpdf-correspondence.md` の更新（上記ステップ3）に加えて
+   **各新規/拡張モジュール（`pdf.rs`/`engine.rs`/`resolve.rs`/
+   `obj_cache.rs`）自身にも逸脱理由を1行記録することを受け入れ基準に
+   含める**（`crates/flpdf/src/engine.rs` の `Pdf::empty()` 移動時に
+   既にこの形式で記録済み — モジュール内コメント + 対応表 ⚪ 行の
+   両方、が前例）。correspondence table の更新だけでは条件3を満たさない
