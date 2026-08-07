@@ -402,6 +402,47 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
 }
 
 #[test]
+fn preserve_deleted_source_container_rebuilds_its_surviving_members() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/compat/three-page-objstm.pdf");
+    let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+    for number in 2..=9 {
+        pdf.resolve(ObjectRef::new(number, 0)).unwrap();
+    }
+    pdf.delete_object(ObjectRef::new(1, 0));
+
+    let mut options = WriteOptions::default();
+    options.full_rewrite = true;
+    options.object_streams = ObjectStreamMode::Preserve;
+    options.static_id = true;
+
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let report = check_reader(Cursor::new(output.clone())).unwrap();
+    assert!(
+        report.valid,
+        "rewritten output must be valid: {:?}",
+        report.diagnostics.entries()
+    );
+    assert_eq!(
+        output
+            .windows(b"/Type /ObjStm".len())
+            .filter(|window| *window == b"/Type /ObjStm")
+            .count(),
+        1,
+        "qpdf reconstructs the deleted source identity as one ObjStm placeholder"
+    );
+
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
+    for reference in reopened.object_refs() {
+        reopened
+            .resolve(reference)
+            .unwrap_or_else(|error| panic!("object {reference} did not resolve: {error}"));
+    }
+}
+
+#[test]
 fn preserve_xref_stream_without_objstm_downgrades_to_classic_table() {
     let source = build_xref_stream_pdf_no_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();

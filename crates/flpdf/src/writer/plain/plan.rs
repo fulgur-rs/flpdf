@@ -81,12 +81,9 @@ impl PlainWritePlan {
                     placement.removed_refs = explicitly_removed;
                     placement
                 } else {
-                    let renumber = ObjectStreamRenumber::build(
-                        pdf,
-                        &packing.groups,
-                        true,
-                        &packing.removed_refs,
-                    )?; // cov:ignore: qpdf packing and ObjectStreamRenumber share the same validated inputs
+                    let groups = &packing.groups;
+                    let removed = &packing.removed_refs;
+                    let renumber = renumber_plain(pdf, groups, removed)?;
                     build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
             }
@@ -104,12 +101,8 @@ impl PlainWritePlan {
                     .cloned()
                     .map(|members| ObjectStreamGroup::Synthetic { members })
                     .collect();
-                let renumber = ObjectStreamRenumber::build(
-                    pdf,
-                    &renumber_groups,
-                    true,
-                    &compressible.removed_refs,
-                )?; // cov:ignore: Generate derives valid unique groups after the same successful reachability walk
+                let removed = &compressible.removed_refs;
+                let renumber = renumber_plain(pdf, &renumber_groups, removed)?;
                 build_container_aware(renumber, renumber_groups, compressible.removed_refs)?
             }
         };
@@ -202,6 +195,7 @@ impl PlainWritePlan {
     pub(crate) fn validate(&self) -> crate::Result<()> {
         let mut outputs = BTreeSet::new();
         let mut sources = BTreeSet::new();
+        let mut source_backed_containers = BTreeSet::new();
         let mut has_object_stream = false;
 
         for object in &self.objects {
@@ -220,11 +214,11 @@ impl PlainWritePlan {
                     has_object_stream = true;
                     require_unique_output(&mut outputs, *output)?;
                     if let PlannedObjectStreamOrigin::SourceBacked(source) = origin {
-                        require_not_removed(
-                            &self.removed_refs,
-                            *source,
-                            "ObjStm source container",
-                        )?;
+                        // A removed source container still owns the preserved
+                        // membership and output identity. qpdf reconstructs it
+                        // from a null placeholder while treating ordinary
+                        // references to the removed source as null.
+                        source_backed_containers.insert(*source);
                         require_unique_source(&mut sources, *source)?;
                         require_matching_mapping(&self.old_to_new, *source, *output)?;
                     }
@@ -249,11 +243,9 @@ impl PlainWritePlan {
             }
         }
 
-        if let Some(removed) = self
-            .removed_refs
-            .iter()
-            .find(|removed| self.old_to_new.contains_key(removed))
-        {
+        if let Some(removed) = self.removed_refs.iter().find(|removed| {
+            self.old_to_new.contains_key(removed) && !source_backed_containers.contains(removed)
+        }) {
             return Err(crate::Error::Unsupported(format!(
                 "plain writer plan: removed source {} {} R remains in old-to-new map",
                 removed.number, removed.generation
@@ -342,6 +334,14 @@ fn build_sources_from_catalog_first(renumber: CatalogFirstRenumber) -> Placement
         old_to_new,
         removed_refs: BTreeSet::new(),
     }
+}
+
+fn renumber_plain<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    groups: &[ObjectStreamGroup],
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> crate::Result<ObjectStreamRenumber> {
+    ObjectStreamRenumber::build(pdf, groups, true, removed_refs)
 }
 
 fn build_container_aware(
@@ -768,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_removed_source_backed_container_placement() {
+    fn validation_allows_removed_source_backed_container_placeholder() {
         let container_source = ObjectRef::new(2, 0);
         let mut plan = plan_for_test(vec![
             source(1, 1),
@@ -783,10 +783,7 @@ mod tests {
         plan.removed_refs.insert(container_source);
         plan.trailer.form = XrefForm::Stream;
 
-        let error = plan.validate().unwrap_err();
-
-        assert!(matches!(error, crate::Error::Unsupported(message)
-            if message.contains("removed source 2 0 R has ObjStm source container placement")));
+        plan.validate().unwrap();
     }
 
     #[test]

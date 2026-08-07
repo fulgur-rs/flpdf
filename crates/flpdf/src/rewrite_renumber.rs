@@ -640,6 +640,16 @@ impl ObjectStreamRenumber {
                     }
                 }
                 RenumberWork::SourceContainer(source) => {
+                    // qpdf's object-stream membership comes from the source
+                    // xref table and survives replaceObject(source, null).
+                    // writeObjectStream then treats that indirect null as a
+                    // generated placeholder: it rebuilds the same container
+                    // but has no original dictionary from which to copy
+                    // /Extends (QPDF.cc:2381-2390;
+                    // QPDFWriter.cc:1621-1625,1731-1739,1939-1965).
+                    if removed_refs.contains(&source) {
+                        continue;
+                    }
                     let object = pdf.resolve(source)?;
                     let stream = object.as_stream().ok_or_else(|| {
                         Error::Unsupported(format!(
@@ -701,9 +711,8 @@ fn enqueue_object_stream(
         .copied();
     match group_index {
         Some(gi) => {
-            if container_new[gi].is_some() {
-                return; // cov:ignore: activation inserts every source/member, so the leading map guard wins
-            }
+            // Activation inserts the source and every member into old_to_new,
+            // so the leading map guard makes a second activation impossible.
             let container = *next;
             container_new[gi] = Some(container);
             *next += 1;
