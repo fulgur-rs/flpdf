@@ -28,6 +28,17 @@ citation は、`refactor/flpdf-0b12-pdf-module`（commit `56a01c2b`）の
 283行と一様ではない。`main` ツリーで該当箇所を探す際はシンボル名で
 検索すること。
 
+**移動状態の3分類**: 本文書が名指しする private helper には毎回、次の
+3つのうちどれに該当するかを明記する（`unique_id`/`EncryptionState`/
+`compressed_parent_for_entry`/`resolve_object_value`/`lift` で
+「物理的に移動済み」「`pub(crate)` 化のみで留まる」「将来の抽出で移動
+予定」を取り違えた誤りが繰り返し発生したため、以後この3分類を明示する
+運用にする）: (1) **既に `flpdf-0b12` で物理的に移動済み**（`pdf.rs`
+に実体がある）、(2) **`reader.rs` に残り `pub(crate)` 化のみ**（実体は
+動かないが cross-module から呼べる）、(3) **将来のスライス
+（`obj_cache.rs`/`resolve.rs`/`engine.rs`）で物理的に移動予定**
+（現時点ではまだ `reader.rs` にある）。
+
 Produced via `superpowers:brainstorming` after the
 `flpdf-25kg.3.19` (`Pdf::empty()`) session surfaced that `reader.rs` is an
 uncomfortable home for the new factory: the name "reader" doesn't semantically
@@ -178,10 +189,18 @@ pdf.rs:179-` で確認済み）: `version`, `trailer`, `trailer_handle`,
 `trailer_handle`/`trailer_key_handle` を「内部で resolve()/lift() を呼ぶ
 から」という理由で `resolve.rs` へ再分類する提案をしていたが、実装は
 この3つも他5メソッドと同じ「direct document-state accessor」グループとして
-`pdf.rs` にまとめて置いた**（呼び出し先の `lift`/`lift_to_handle_bounded`
-自体は reader.rs に残したまま可視性だけ広げているので、物理的な移動は
-発生していない）。本設計もこれに合わせて `resolve.rs` の対象リストから
-この3メソッドを外す。
+`pdf.rs` にまとめて置いた**。ただし3つが呼ぶ private helper は同一では
+ない: `trailer_handle`（`pdf.rs:247`）は `self.lift`、
+`trailer_key_handle`（`pdf.rs:280`）は `self.lift_to_handle_bounded` を
+呼び、これらは reader.rs に残したまま可視性だけ広げている（物理的な
+移動は発生していない）。**一方 `adobe_extension_level`
+（`pdf.rs:201-208`）が実際に呼ぶのは `lift`/`lift_to_handle_bounded`
+ではなく `resolve_object_value`（3回呼び出し）で、この private
+free function 自体が `pdf.rs:292` へ物理的に移動している**——
+`adobe_extension_level` はメソッドと依存 helper が両方 `pdf.rs` に
+揃って移動した唯一の例で、他の2つ（可視性のみ広げて実装は
+reader.rs に残す）とは移動の種類が異なる。本設計もこれに合わせて
+`resolve.rs` の対象リストからこの3メソッドを外す。
 
 **`pub(crate)` 化により、`engine.rs`/将来の `resolve.rs`/`obj_cache.rs`/
 `security/*`/`object_copy.rs` はどれも lib.rs 直下の並列モジュールの
@@ -234,7 +253,14 @@ reader.rs に残ったまま）。
   各フィールド構築・resolver 設置・暗号認証を行い、公開 `open*` 全部が
   これに委譲する。ここを含めないと構築のオーケストレーション本体が
   reader.rs に残る）
-  （qpdf の `processFile`/`processMemoryFile`/`emptyPDF` に対応）
+  （qpdf の `processFile`/`processMemoryFile`/`emptyPDF` に対応）。
+  **`open_with_repair_mode` が使う module-level private 定数2つもここに
+  含める**: `NEXT_PDF_ID`（`static NEXT_PDF_ID: AtomicU64`、
+  `reader.rs:39`、document identity 採番に使用、`reader.rs:739`）と
+  `MAX_RESOLUTION_FALLBACKS`（`const MAX_RESOLUTION_FALLBACKS: u32`、
+  `reader.rs:430`、resolution budget 初期化に使用、`reader.rs:765`）。
+  いずれも `pub`/`pub(crate)` 無しの private で、factory を engine.rs へ
+  抽出する際は定数ごと移すか `pub(crate)` 化する
 - 解決のエントリポイント: `resolve_object_handle`,
   `resolve_object_handle_to_terminal(_ref)` 等、呼び出し側から見える
   「解決してくれ」という要求の受け口。**`get_object_handle` はここに
@@ -395,9 +421,16 @@ reader.rs に残ったまま）。
   既存の dictionary handle をその場で書き換えて共有 identity と
   parsed offset を保つ特殊化版（`reader.rs:1311-1319` のコメント参照）で、
   `set_object` から見て delegate 先が obj_cache.rs 外に残ると
-  cache 書き込みの正しさを保証するロジックが分離してしまう。内部で
-  呼ぶ `self.lift`（`reader.rs:1336`）自体は上記の通り `pub(crate)` 化
-  済みのまま `reader.rs` に残るので、追加の可視性変更は不要
+  cache 書き込みの正しさを保証するロジックが分離してしまう。**訂正**:
+  内部で呼ぶ `self.lift`（`reader.rs:1336`）は現状 `pub(crate)` 化
+  済みで reader.rs にあるが、`resolve.rs` の対象リスト（上記「対象:
+  `lift`/`lift_bounded`/...」）が明示する通り、将来の抽出で
+  `resolve.rs` へ物理的に移る予定（3分類の(3)）——「reader.rs に残る」は
+  現状描写であって最終配置ではない。ただし `self.lift(...)` という
+  呼び出し構文自体は `lift` の実装がどのファイルにあっても変わらない
+  （`pub(crate)` 化済みの inherent method は sibling module から
+  そのまま呼べる）ため、`lift_for_set_object` 側に追加の可視性変更は
+  不要という結論自体は変わらない
 - **`set_object` が呼ぶ `compressed_parent_for_entry`
   (`reader.rs:2968-`、`private`) も同じ理由でここに含める**（前版では
   `resolve_compressed_entry` との共有関数と誤って記載していたが、
@@ -445,7 +478,13 @@ reader.rs に残ったまま）。
   ヘルパー型・関数も同じ移動対象に含める（`docs/qpdf-correspondence.md:136` が
   `interpret_cf` 系を既に `QPDF::interpretCF`（`QPDF_encryption.cc:700-716`）
   対応として記録済み）。含めないと暗号ロジックの大半が reader.rs に
-  残ったまま、10個の薄いラッパーだけを移動することになる
+  残ったまま、10個の薄いラッパーだけを移動することになる。**さらに**
+  `authenticate_if_encrypted` が構築する `Permissions::new`
+  （`impl Permissions`、`reader.rs:259-`、`private`、呼び出しは
+  `reader.rs:793`）も同じ閉包に含める。`Permissions` 型自体は公開型
+  だが、コンストラクタは reader モジュール private のため、
+  `security/*` へ移った `authenticate_if_encrypted` から呼ぶには
+  `impl Permissions` ごと一緒に移すか `pub(crate)` 化が必要
 - `signatures`（`reader.rs:708-710`、`crate::signatures::signatures` への
   薄い委譲）は上記グループに**含めない**。qpdf の `QPDF.cc` に signature
   関連コードは0件、`QPDFAcroFormDocumentHelper.cc` にあるのも
@@ -462,16 +501,27 @@ reader.rs に残ったまま）。
   `QPDF_linearization.cc:139-141` を明記）は既存 `linearization/` へ移す
 - JSON 出力準備群（`QpdfPreparedObjects`(`reader.rs:43-`),
   `prepare_qpdf_json_objects`(`reader.rs:1459-`),
-  `qpdf_json_live_object_refs`(`reader.rs:1519-`),
-  `resolve_qpdf_json_object`(`reader.rs:2669-`),
-  `resolve_qpdf_json_object_borrowed`(`reader.rs:2702-`)）は
+  `qpdf_json_live_object_refs`(`reader.rs:1519-`)）は
   `pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs` のどれにも含めない。
   production caller は `document_json.rs:151`
-  （`prepare_qpdf_json_objects`）で、既存の `QPDF_json.cc` 出力側の受け皿
-  （`document_json.rs`、上表参照）に対応する。実装は resolve/cache 両方に
-  触れる（`self.resolver`/`self.cache` を直接操作）ため、
-  `document_json.rs` 側からこの2ファイルの private API を呼ぶ形になるか、
-  `document_json.rs` 自身へ実装ごと移すかは実装時に決める
+  （`prepare_qpdf_json_objects`）のみで、既存の `QPDF_json.cc` 出力側の
+  受け皿（`document_json.rs`、上表参照）に対応する。`document_json.rs`
+  自身へ実装ごと移すかは実装時に決める。**`resolve_qpdf_json_object`
+  (`reader.rs:2669-`)/`resolve_qpdf_json_object_borrowed`
+  (`reader.rs:2702-`) はこのグループから分離する**: 上の3つとは異なり
+  `document_json.rs` 以外にも production caller を持つ——
+  `resolve_qpdf_json_object` は `json_inspect.rs:595`
+  （`qpdf_resolve_top_level_object`）、
+  `resolve_qpdf_json_object_borrowed` は `qpdf_null.rs:23`
+  （`reference_is_null`）が呼ぶ。この2メソッドを `document_json.rs` へ
+  実装ごと移すと、`json_inspect.rs`/`qpdf_null.rs` からのアクセス手段を
+  別途用意する必要が生じる。実装は resolve/cache 両方に触れる
+  （`self.resolver`/`self.cache` を直接操作）ため、2メソッドは
+  `pdf.rs`/`engine.rs`/`resolve.rs`/`obj_cache.rs` のいずれにも
+  自然には収まらない——3つの production caller（`document_json.rs`/
+  `json_inspect.rs`/`qpdf_null.rs`）全てから届く境界を維持する形（現状の
+  reader.rs に留めて `pub(crate)` のまま、または独立した小さな
+  受け皿を新設する）を実装時に決める
 
 ### 未決定（実装時に判断してよい細部）
 - qtest 専用の source-offset introspection（`qtest_decode_parms_source_offset`
