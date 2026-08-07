@@ -5029,30 +5029,33 @@ fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs
 fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    let page_refs = pages::page_refs(&mut pdf)?;
-    let mut output = String::new();
+    write_page_descriptions(&mut pdf, &cli_logger())
+}
+
+fn write_page_descriptions<R: Read + Seek>(pdf: &mut Pdf<R>, logger: &QPDFLogger) -> CliResult<()> {
+    let page_refs = pages::page_refs(&mut *pdf)?;
     for (index, page_ref) in page_refs.iter().enumerate() {
         let page = pdf.resolve_borrowed(*page_ref)?;
         let Object::Dictionary(dict) = page else {
             continue;
         };
 
-        output.push_str(&format!("page {}: {}\n", index + 1, page_ref));
+        logger.info(format!("page {}: {}\n", index + 1, page_ref))?;
         if let Some(media_box) = dict.get("MediaBox") {
-            output.push_str(&format!("  media-box: {}\n", object_to_pdf(media_box)));
+            logger.info(format!("  media-box: {}\n", object_to_pdf(media_box)))?;
         }
         if let Some(resources) = dict.get("Resources") {
-            output.push_str(&format!("  resources: {}\n", object_to_pdf(resources)));
+            logger.info(format!("  resources: {}\n", object_to_pdf(resources)))?;
         }
         if let Some(contents) = dict.get("Contents") {
-            output.push_str(&format!("  contents: {}\n", object_to_pdf(contents)));
+            logger.info(format!("  contents: {}\n", object_to_pdf(contents)))?;
         }
         if let Some(rotate) = dict.get("Rotate") {
-            output.push_str(&format!("  rotate: {}\n", object_to_pdf(rotate)));
+            logger.info(format!("  rotate: {}\n", object_to_pdf(rotate)))?;
         }
     }
 
-    logger_info(output)
+    Ok(())
 }
 
 fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
@@ -5998,6 +6001,27 @@ fn run_copy_attachments_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flpdf::pipeline::{Pipeline, PipelineResult};
+    use std::sync::{Arc, Mutex};
+
+    struct ChunkRecordingSink {
+        chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Pipeline for ChunkRecordingSink {
+        fn identifier(&self) -> &str {
+            "chunk recording sink"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.chunks.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            Ok(())
+        }
+    }
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -6013,6 +6037,28 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "QPDFLogger: called setSave on standard output after standard output has already been used"
+        );
+    }
+
+    #[test]
+    fn show_pages_writes_each_logical_line_incrementally() {
+        let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let logger = QPDFLogger::create();
+        logger.set_info(Some(PipelineHandle::new(ChunkRecordingSink {
+            chunks: Arc::clone(&chunks),
+        })));
+        let mut pdf = Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
+        )
+        .unwrap();
+
+        write_page_descriptions(&mut pdf, &logger).unwrap();
+
+        let chunks = chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 5);
+        assert_eq!(
+            chunks.concat(),
+            b"page 1: 3 0 R\n  media-box: [ 0 0 612 792 ]\n  resources: << /Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] >>\n  contents: 7 0 R\n  rotate: 0\n"
         );
     }
 
