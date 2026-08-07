@@ -2,8 +2,8 @@
 
 ## Status
 
-Proposed for `flpdf-um4z`. This document records the primitive boundary approved
-by the readiness audit; implementation starts after written design review.
+Approved for `flpdf-um4z` on 2026-08-08. This document records the primitive
+boundary approved by the readiness audit and written design review.
 
 ## Goal
 
@@ -105,8 +105,10 @@ reaches it.
 >
 > The traversal queue may distinguish ordinary source work from source-backed
 > container work. Group activation records the container number, records the
-> source mapping only for `SourceBacked`, queues the special container work,
-> then records and queues each member. The special work resolves the original
+> source mapping only for `SourceBacked`, then records and queues each member
+> before queueing the special container work. This preserves qpdf's order in
+> which writing members enqueues their child references before the reconstructed
+> dictionary enqueues `/Extends`. The special work resolves the original
 > stream dictionary and conditionally enqueues its raw indirect `/Extends`
 > reference; ordinary work continues through the existing qpdf-shaped enqueue
 > reference collector.
