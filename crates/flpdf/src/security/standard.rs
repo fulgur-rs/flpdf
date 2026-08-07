@@ -43,7 +43,9 @@
 #![allow(dead_code)]
 
 use crate::error::{EncryptedError, Result};
-use crate::security::primitives::{md5, sha256, sha384, sha512};
+use crate::pipeline::sha2::PlSha2;
+use crate::pipeline::Pipeline;
+use crate::security::primitives::md5;
 use crate::security::rc4::Rc4;
 use crate::{Dictionary, Object, ObjectRef};
 use aes::{Aes128, Aes256};
@@ -210,13 +212,26 @@ fn validate_v4_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
     Ok(16)
 }
 
-fn r5_salted_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
+/// The R<6 result of qpdf's `hash_V5` (`QPDF_encryption.cc:245-251`).
+///
+/// qpdf streams the three inputs into `Pl_SHA2` as separate writes rather than
+/// concatenating them first, so this port does the same.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
+fn r5_salted_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> Result<[u8; 32]> {
     let password = &password[..password.len().min(127)];
-    let mut input = Vec::with_capacity(password.len() + salt.len() + extra.len());
-    input.extend_from_slice(password);
-    input.extend_from_slice(salt);
-    input.extend_from_slice(extra);
-    sha256(&input)
+    let mut hash = PlSha2::new("sha2", None, 256)?;
+    hash.write(password)?;
+    hash.write(salt)?;
+    hash.write(extra)?;
+    hash.finish()?;
+    let mut key = [0u8; 32];
+    key.copy_from_slice(hash.get_raw_digest()?);
+    Ok(key)
 }
 
 fn aes256_cbc_zero_iv_unwrap(encrypted_key: &[u8; 32], aes_key: &[u8; 32]) -> Result<Vec<u8>> {
@@ -239,22 +254,29 @@ fn decrypt_r5_file_key(
     let validation_salt = &entry[32..40];
     let key_salt = &entry[40..48];
 
-    let validation_hash = r5_salted_hash(password, validation_salt, extra);
+    let validation_hash = r5_salted_hash(password, validation_salt, extra)?;
     if validation_hash[..] != entry[..32] {
         return Err(EncryptedError::BadPassword.into());
     }
 
-    let aes_key = r5_salted_hash(password, key_salt, extra);
+    let aes_key = r5_salted_hash(password, key_salt, extra)?;
     aes256_cbc_zero_iv_unwrap(encrypted_key, &aes_key)
 }
 
-fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
+/// ISO 32000-2 Algorithm 2.B, the R=6 branch of qpdf's `hash_V5`
+/// (`QPDF_encryption.cc:256-309`).
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
+fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> Result<[u8; 32]> {
     let password = &password[..password.len().min(127)];
-    let mut input = Vec::with_capacity(password.len() + salt.len() + extra.len());
-    input.extend_from_slice(password);
-    input.extend_from_slice(salt);
-    input.extend_from_slice(extra);
-    let mut key = sha256(&input).to_vec();
+    // qpdf computes this SHA-256 once in `hash_V5` and only then branches on the
+    // revision, so Algorithm 2.B's round 0 is exactly the R<6 value
+    // (`QPDF_encryption.cc:245-258`).
+    let mut key = r5_salted_hash(password, salt, extra)?.to_vec();
 
     let mut round_number = 0usize;
     loop {
@@ -282,18 +304,22 @@ fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
             .iter()
             .fold(0u16, |acc, byte| acc + u16::from(*byte))
             % 3;
-        key = match e_mod_3 {
-            0 => sha256(&e).to_vec(),
-            1 => sha384(&e).to_vec(),
-            _ => sha512(&e).to_vec(),
+        let next_hash = match e_mod_3 {
+            0 => 256,
+            1 => 384,
+            _ => 512,
         };
+        let mut sha2 = PlSha2::new("sha2", None, next_hash)?;
+        sha2.write(&e)?;
+        sha2.finish()?;
+        key = sha2.get_raw_digest()?.to_vec();
 
         if round_number >= 64
             && usize::from(*e.last().expect("R=6 E is non-empty")) <= round_number - 32
         {
             let mut out = [0u8; 32];
             out.copy_from_slice(&key[..32]);
-            return out;
+            return Ok(out);
         }
     }
 }
@@ -307,12 +333,12 @@ fn decrypt_r6_file_key(
     let validation_salt = &entry[32..40];
     let key_salt = &entry[40..48];
 
-    let validation_hash = r6_password_hash(password, validation_salt, extra);
+    let validation_hash = r6_password_hash(password, validation_salt, extra)?;
     if validation_hash[..] != entry[..32] {
         return Err(EncryptedError::BadPassword.into());
     }
 
-    let aes_key = r6_password_hash(password, key_salt, extra);
+    let aes_key = r6_password_hash(password, key_salt, extra)?;
     aes256_cbc_zero_iv_unwrap(encrypted_key, &aes_key)
 }
 
@@ -1146,21 +1172,27 @@ fn aes256_cbc_zero_iv_wrap(file_key: &[u8; 32], aes_key: &[u8; 32]) -> [u8; 32] 
 /// `file_key` is a spec-mandated random 32-byte value. The caller supplies
 /// them so that production callers can use a CSPRNG and tests can use
 /// fixed bytes for reproducibility.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
 pub(crate) fn compute_u_ue_r6(
     user_password: &[u8],
     file_key: &[u8; 32],
     validation_salt: &[u8; 8],
     key_salt: &[u8; 8],
-) -> ([u8; 48], [u8; 32]) {
-    let validation_hash = r6_password_hash(user_password, validation_salt, &[]);
-    let aes_key = r6_password_hash(user_password, key_salt, &[]);
+) -> Result<([u8; 48], [u8; 32])> {
+    let validation_hash = r6_password_hash(user_password, validation_salt, &[])?;
+    let aes_key = r6_password_hash(user_password, key_salt, &[])?;
     let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
 
     let mut u_entry = [0u8; 48];
     u_entry[0..32].copy_from_slice(&validation_hash);
     u_entry[32..40].copy_from_slice(validation_salt);
     u_entry[40..48].copy_from_slice(key_salt);
-    (u_entry, ue_entry)
+    Ok((u_entry, ue_entry))
 }
 
 /// ISO 32000-2 Algorithm 9 — Compute the V=5 R=6 `/O` and `/OE` entries.
@@ -1169,22 +1201,28 @@ pub(crate) fn compute_u_ue_r6(
 /// and with `user_entry` (the full 48-byte `/U`) appended to the hash
 /// inputs, per the spec's "extra" parameter. `/U` must therefore be
 /// computed first.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
 pub(crate) fn compute_o_oe_r6(
     owner_password: &[u8],
     user_entry: &[u8; 48],
     file_key: &[u8; 32],
     validation_salt: &[u8; 8],
     key_salt: &[u8; 8],
-) -> ([u8; 48], [u8; 32]) {
-    let validation_hash = r6_password_hash(owner_password, validation_salt, user_entry);
-    let aes_key = r6_password_hash(owner_password, key_salt, user_entry);
+) -> Result<([u8; 48], [u8; 32])> {
+    let validation_hash = r6_password_hash(owner_password, validation_salt, user_entry)?;
+    let aes_key = r6_password_hash(owner_password, key_salt, user_entry)?;
     let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
 
     let mut o_entry = [0u8; 48];
     o_entry[0..32].copy_from_slice(&validation_hash);
     o_entry[32..40].copy_from_slice(validation_salt);
     o_entry[40..48].copy_from_slice(key_salt);
-    (o_entry, oe_entry)
+    Ok((o_entry, oe_entry))
 }
 
 /// User-supplied configuration for [`build_v5_r6_encrypt_dict`].
@@ -1250,17 +1288,23 @@ pub(crate) struct V5R6Secrets {
 /// `/O` `/OE` `/P` `/Perms` `/R` `/StmF` `/StrF` `/U` `/UE` `/V`
 /// (and `/EncryptMetadata` only when false). `/CF/StdCF/CFM` is `AESV3`
 /// per the V=5 R=6 spec.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
 pub(crate) fn build_v5_r6_encrypt_dict(
     params: &V5R6EncryptParams<'_>,
     secrets: &V5R6Secrets,
-) -> Dictionary {
+) -> Result<Dictionary> {
     // Algorithm 8: /U + /UE.
     let (u_entry, ue_entry) = compute_u_ue_r6(
         params.user_password,
         &secrets.file_key,
         &secrets.user_validation_salt,
         &secrets.user_key_salt,
-    );
+    )?;
 
     // Algorithm 9: /O + /OE (uses /U as extra).
     let (o_entry, oe_entry) = compute_o_oe_r6(
@@ -1269,7 +1313,7 @@ pub(crate) fn build_v5_r6_encrypt_dict(
         &secrets.file_key,
         &secrets.owner_validation_salt,
         &secrets.owner_key_salt,
-    );
+    )?;
 
     // Algorithm 10: /Perms.
     let perms = compute_perms_blob(
@@ -1305,7 +1349,7 @@ pub(crate) fn build_v5_r6_encrypt_dict(
     if !params.encrypt_metadata {
         dict.insert("EncryptMetadata", Object::Boolean(false));
     }
-    dict
+    Ok(dict)
 }
 
 /// Spec-random secret material consumed by [`build_v5_r5_encrypt_dict`].
@@ -1318,43 +1362,55 @@ pub(crate) type V5R5Secrets = V5R6Secrets;
 ///
 /// Identical to [`compute_u_ue_r6`] except the hash function is
 /// [`r5_salted_hash`] — the deprecated simpler SHA-256 path.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
 pub(crate) fn compute_u_ue_r5(
     user_password: &[u8],
     file_key: &[u8; 32],
     validation_salt: &[u8; 8],
     key_salt: &[u8; 8],
-) -> ([u8; 48], [u8; 32]) {
-    let validation_hash = r5_salted_hash(user_password, validation_salt, &[]);
-    let aes_key = r5_salted_hash(user_password, key_salt, &[]);
+) -> Result<([u8; 48], [u8; 32])> {
+    let validation_hash = r5_salted_hash(user_password, validation_salt, &[])?;
+    let aes_key = r5_salted_hash(user_password, key_salt, &[])?;
     let ue_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
 
     let mut u_entry = [0u8; 48];
     u_entry[0..32].copy_from_slice(&validation_hash);
     u_entry[32..40].copy_from_slice(validation_salt);
     u_entry[40..48].copy_from_slice(key_salt);
-    (u_entry, ue_entry)
+    Ok((u_entry, ue_entry))
 }
 
 /// Compute the V=5 R=5 `/O` and `/OE` entries using SHA-256 (not Algorithm 2.B).
 ///
 /// Mirrors [`compute_u_ue_r5`] using `owner_password` and appending the 48-byte
 /// `/U` entry as the extra hash input for the owner path.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
 pub(crate) fn compute_o_oe_r5(
     owner_password: &[u8],
     user_entry: &[u8; 48],
     file_key: &[u8; 32],
     validation_salt: &[u8; 8],
     key_salt: &[u8; 8],
-) -> ([u8; 48], [u8; 32]) {
-    let validation_hash = r5_salted_hash(owner_password, validation_salt, user_entry);
-    let aes_key = r5_salted_hash(owner_password, key_salt, user_entry);
+) -> Result<([u8; 48], [u8; 32])> {
+    let validation_hash = r5_salted_hash(owner_password, validation_salt, user_entry)?;
+    let aes_key = r5_salted_hash(owner_password, key_salt, user_entry)?;
     let oe_entry = aes256_cbc_zero_iv_wrap(file_key, &aes_key);
 
     let mut o_entry = [0u8; 48];
     o_entry[0..32].copy_from_slice(&validation_hash);
     o_entry[32..40].copy_from_slice(validation_salt);
     o_entry[40..48].copy_from_slice(key_salt);
-    (o_entry, oe_entry)
+    Ok((o_entry, oe_entry))
 }
 
 /// Construct the `/Encrypt` dictionary for V=5 R=5 (deprecated pre-ISO 32000-2
@@ -1365,16 +1421,22 @@ pub(crate) fn compute_o_oe_r5(
 /// - Emits `/R 5` instead of `/R 6`.
 /// - Still emits `/Perms` (Algorithm 10) — qpdf 11.x requires it for all V=5
 ///   documents regardless of revision.
+///
+/// # Errors
+///
+/// Returns [`crate::Error::Internal`] if the SHA-2 pipeline rejects a
+/// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
+/// (`Pl_SHA2.cc:53,63`).
 pub(crate) fn build_v5_r5_encrypt_dict(
     params: &V5R6EncryptParams<'_>,
     secrets: &V5R5Secrets,
-) -> Dictionary {
+) -> Result<Dictionary> {
     let (u_entry, ue_entry) = compute_u_ue_r5(
         params.user_password,
         &secrets.file_key,
         &secrets.user_validation_salt,
         &secrets.user_key_salt,
-    );
+    )?;
 
     let (o_entry, oe_entry) = compute_o_oe_r5(
         params.owner_password,
@@ -1382,7 +1444,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
         &secrets.file_key,
         &secrets.owner_validation_salt,
         &secrets.owner_key_salt,
-    );
+    )?;
 
     let mut std_cf = Dictionary::new();
     std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
@@ -1417,7 +1479,7 @@ pub(crate) fn build_v5_r5_encrypt_dict(
     if !params.encrypt_metadata {
         dict.insert("EncryptMetadata", Object::Boolean(false));
     }
-    dict
+    Ok(dict)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -3116,11 +3178,48 @@ mod tests {
         }
     }
 
+    // ── R=5 salted hash ──────────────────────────────────────────────────────
+    //
+    // qpdf's `hash_V5` streams password, salt, and udata into `Pl_SHA2` as three
+    // separate writes (`QPDF_encryption.cc:246-249`), so these vectors pin the
+    // concatenation order independently of the pipeline plumbing. Expected
+    // digests come from CPython `hashlib.sha256`, not from flpdf.
+
+    #[test]
+    fn r5_salted_hash_matches_sha256_of_password_and_salt() {
+        let salt = from_hex("0102030405060708");
+        assert_eq!(
+            r5_salted_hash(b"password", &salt, &[]).unwrap(),
+            hex32("2435177f1410536baad2acc155c0f94783d58384573cb0f72157443606285d3f")
+        );
+    }
+
+    #[test]
+    fn r5_salted_hash_appends_owner_extra_data_after_the_salt() {
+        let salt = from_hex("1021324354657687");
+        assert_eq!(
+            r5_salted_hash(b"ownerpass", &salt, &r5_fixture().u).unwrap(),
+            hex32("d95e9aa87833363eccce3e1ba1161b87fcc36c3a2e144b199ddd543db3ad480a")
+        );
+    }
+
+    #[test]
+    fn r5_salted_hash_truncates_password_to_127_bytes() {
+        let salt = from_hex("0102030405060708");
+        let mut password = vec![b'a'; 127];
+        password.extend_from_slice(b"zzz");
+
+        assert_eq!(
+            r5_salted_hash(&password, &salt, b"extra").unwrap(),
+            hex32("eb379d8ff1ba98ac43e50cad80b867521a50cc7f9e1173c4bc1aa887c88b29ba")
+        );
+    }
+
     #[test]
     fn r6_password_hash_matches_algorithm_2b_kat() {
         let salt = from_hex("0102030405060708");
         assert_eq!(
-            r6_password_hash(b"password", &salt, &[]),
+            r6_password_hash(b"password", &salt, &[]).unwrap(),
             hex32("22d08d1860cb92edcadda1451a4aebb49c1873722bbfca2aef1a7e5f51e69935")
         );
     }
@@ -3130,7 +3229,7 @@ mod tests {
         let fixture = r6_fixture();
         let salt = from_hex("1021324354657687");
         assert_eq!(
-            r6_password_hash(b"ownerpass", &salt, &fixture.u),
+            r6_password_hash(b"ownerpass", &salt, &fixture.u).unwrap(),
             hex32("b03bdf6b914364dcdecf182d4cc04bacff9e9a38ea5fd1af31acd59c654495e1")
         );
     }
@@ -3142,7 +3241,7 @@ mod tests {
         password.extend_from_slice(b"zzz");
 
         assert_eq!(
-            r6_password_hash(&password, &salt, b"extra"),
+            r6_password_hash(&password, &salt, b"extra").unwrap(),
             hex32("87d58b9b16c2aacf4cb477fa9b5cb57b4b7f6b34d6cfb051b5b35c92a772e723")
         );
     }
@@ -4060,7 +4159,8 @@ mod tests {
             &s.file_key,
             &s.user_validation_salt,
             &s.user_key_salt,
-        );
+        )
+        .unwrap();
 
         // The reader's check function requires a full StandardHandlerR5Inputs;
         // for the user-only path it only reads `u` and `ue`, so the owner
@@ -4084,7 +4184,8 @@ mod tests {
             &s.file_key,
             &s.user_validation_salt,
             &s.user_key_salt,
-        );
+        )
+        .unwrap();
         let dummy_oe = [0u8; 32];
         let inputs = StandardHandlerR5Inputs {
             u: &u_entry,
@@ -4110,14 +4211,16 @@ mod tests {
             &s.file_key,
             &s.user_validation_salt,
             &s.user_key_salt,
-        );
+        )
+        .unwrap();
         let (o_entry, oe_entry) = compute_o_oe_r6(
             owner_pw,
             &u_entry,
             &s.file_key,
             &s.owner_validation_salt,
             &s.owner_key_salt,
-        );
+        )
+        .unwrap();
 
         let inputs = StandardHandlerR5Inputs {
             u: &u_entry,
@@ -4157,7 +4260,8 @@ mod tests {
                     owner_key_salt: s.owner_key_salt,
                     perms_random_tail: s.perms_random_tail,
                 },
-            );
+            )
+            .unwrap();
 
             // Static dict fields.
             assert_eq!(dict.get("V"), Some(&Object::Integer(5)));
@@ -4250,7 +4354,8 @@ mod tests {
                 owner_key_salt: s.owner_key_salt,
                 perms_random_tail: s.perms_random_tail,
             },
-        );
+        )
+        .unwrap();
 
         let Some(Object::String(u)) = dict.get("U") else {
             unreachable!()

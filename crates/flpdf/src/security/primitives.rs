@@ -1,12 +1,16 @@
-//! qpdf correspondence: Rust crypto-crate substitution for qpdf AES, MD5, and SHA2 native implementations.
+//! qpdf correspondence: Rust crypto-crate substitution for qpdf AES and MD5 native implementations.
 //! Low-level cryptographic primitives used by the PDF security handler.
 //!
 //! All functions are `pub(crate)`; no dependency types from RustCrypto crates
 //! are exposed through the `flpdf` public API.
 //!
+//! SHA-2 is not here: qpdf reaches SHA-256/384/512 only through `Pl_SHA2`
+//! (`libqpdf/QPDF_encryption.cc:246,296`), so the RustCrypto SHA-2 hashers live
+//! inside [`crate::pipeline::sha2`] instead.
+//!
 //! # Dead-code notice
 //! Several primitives in this module support encrypted-PDF handling
-//! (V=1/V=2 key derivation, AES decryption, V=5 R=6 hashing) and are not
+//! (V=1/V=2 key derivation, AES decryption) and are not
 //! all wired up to a call site yet. The module-level `allow(dead_code)`
 //! keeps the build clean without losing the unused-detector for everything
 //! else.
@@ -17,11 +21,7 @@ use aes::Aes128;
 use aes::Aes256;
 use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use cbc::Decryptor;
-// The `Digest` trait is re-exported by both `md5` and `sha2`; importing once
-// (from `sha2`) makes it available for all four types.
-use md5::Md5;
-use sha2::Digest;
-use sha2::{Sha256, Sha384, Sha512};
+use md5::{Digest, Md5};
 
 use thiserror::Error;
 
@@ -108,28 +108,6 @@ pub(crate) fn md5(data: &[u8]) -> [u8; 16] {
     result.into()
 }
 
-/// Compute the SHA-256 digest of `data`.
-pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
-    let result = Sha256::digest(data);
-    result.into()
-}
-
-/// Compute the SHA-384 digest of `data`.
-///
-/// Used by the V=5 R=6 password hashing path.
-pub(crate) fn sha384(data: &[u8]) -> [u8; 48] {
-    let result = Sha384::digest(data);
-    result.into()
-}
-
-/// Compute the SHA-512 digest of `data`.
-///
-/// Used by the V=5 R=6 password hashing path.
-pub(crate) fn sha512(data: &[u8]) -> [u8; 64] {
-    let result = Sha512::digest(data);
-    result.into()
-}
-
 // ────────────────────────────────────────────────────────────────────────────
 // Known-answer tests (KAT)
 // ────────────────────────────────────────────────────────────────────────────
@@ -166,43 +144,6 @@ mod tests {
     fn md5_abc() {
         let got = md5(b"abc");
         let want = from_hex("900150983cd24fb0d6963f7d28e17f72");
-        assert_eq!(got.as_slice(), want.as_slice());
-    }
-
-    // ── SHA-256 ──────────────────────────────────────────────────────────────
-
-    /// NIST FIPS 180-4 example – "abc"
-    #[test]
-    fn sha256_abc() {
-        let got = sha256(b"abc");
-        let want = from_hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        assert_eq!(got.as_slice(), want.as_slice());
-    }
-
-    // ── SHA-384 ──────────────────────────────────────────────────────────────
-
-    /// NIST FIPS 180-4 example – "abc"
-    #[test]
-    fn sha384_abc() {
-        let got = sha384(b"abc");
-        let want = from_hex(
-            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded163\
-             1a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
-        );
-        assert_eq!(got.as_slice(), want.as_slice());
-    }
-
-    // ── SHA-512 ──────────────────────────────────────────────────────────────
-
-    /// NIST FIPS 180-4 example – "abc"
-    #[test]
-    fn sha512_abc() {
-        let got = sha512(b"abc");
-        let want = from_hex(
-            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea2\
-             0a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd\
-             454d4423643ce80e2a9ac94fa54ca49f",
-        );
         assert_eq!(got.as_slice(), want.as_slice());
     }
 

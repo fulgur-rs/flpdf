@@ -2361,7 +2361,7 @@ pub(crate) fn build_encryption_context(
                 p: params.permissions.to_p_bits(),
                 encrypt_metadata: params.encrypt_metadata,
             };
-            let dict = build_v5_r6_encrypt_dict(&v5, &secrets);
+            let dict = build_v5_r6_encrypt_dict(&v5, &secrets)?;
             (
                 dict,
                 secrets.file_key.to_vec(),
@@ -2379,7 +2379,7 @@ pub(crate) fn build_encryption_context(
                 p: params.permissions.to_p_bits(),
                 encrypt_metadata: params.encrypt_metadata,
             };
-            let dict = build_v5_r5_encrypt_dict(&v5, &secrets);
+            let dict = build_v5_r5_encrypt_dict(&v5, &secrets)?;
             (
                 dict,
                 secrets.file_key.to_vec(),
