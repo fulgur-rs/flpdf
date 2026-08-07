@@ -472,8 +472,8 @@ impl CatalogFirstRenumber {
 /// traversal split into even groups); this type only assigns the numbers in
 /// qpdf's order.
 //
-// Consumed by the upcoming generate-mode writer wiring; suppress dead_code
-// until that code lands (mirrors `object_streams`).
+// Shared by Preserve and Generate plain-writer planning. Some accessors remain
+// test-only until later body/xref consumers use the complete plan.
 #[allow(dead_code)]
 pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
@@ -702,7 +702,7 @@ fn enqueue_object_stream(
     match group_index {
         Some(gi) => {
             if container_new[gi].is_some() {
-                return;
+                return; // cov:ignore: activation inserts every source/member, so the leading map guard wins
             }
             let container = *next;
             container_new[gi] = Some(container);
@@ -1091,6 +1091,42 @@ mod tests {
             );
             assert_eq!(map.container_numbers(), vec![2]);
         }
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_missing_root() {
+        let mut bytes = build_raw_pdf(&[(1, b"<< /Type /Catalog >>")]);
+        let root_key = bytes
+            .windows(b"/Root".len())
+            .position(|window| window == b"/Root")
+            .expect("fixture trailer has /Root");
+        bytes[root_key..root_key + b"/Root".len()].copy_from_slice(b"/Nope");
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error = ObjectStreamRenumber::build(&mut pdf, &[], true, &BTreeSet::new())
+            .err()
+            .expect("missing root must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "object-stream renumber: trailer has no /Root"));
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_non_stream_source_container() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+            (4, b"<< /Type /NotAnObjStm >>"),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error =
+            ObjectStreamRenumber::build(&mut pdf, &[source_group(4, &[2])], true, &BTreeSet::new())
+                .err()
+                .expect("non-stream source container must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "object-stream renumber: source container 4 0 R is not a stream"));
     }
 
     #[test]

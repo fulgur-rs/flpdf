@@ -109,7 +109,7 @@ impl PlainWritePlan {
                     &renumber_groups,
                     true,
                     &compressible.removed_refs,
-                )?;
+                )?; // cov:ignore: Generate derives valid unique groups after the same successful reachability walk
                 build_container_aware(renumber, renumber_groups, compressible.removed_refs)?
             }
         };
@@ -765,6 +765,28 @@ mod tests {
 
         assert!(matches!(err, crate::Error::Unsupported(ref message)
             if message.contains("removed source 7 0 R has ObjStm member placement")));
+    }
+
+    #[test]
+    fn validation_rejects_removed_source_backed_container_placement() {
+        let container_source = ObjectRef::new(2, 0);
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::SourceBacked(container_source),
+                output: ObjectRef::new(2, 0),
+                members: Vec::new(),
+            },
+        ]);
+        plan.old_to_new
+            .insert(container_source, ObjectRef::new(2, 0));
+        plan.removed_refs.insert(container_source);
+        plan.trailer.form = XrefForm::Stream;
+
+        let error = plan.validate().unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("removed source 2 0 R has ObjStm source container placement")));
     }
 
     #[test]
