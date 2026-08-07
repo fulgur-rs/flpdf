@@ -4694,7 +4694,7 @@ mod tests {
                 assert_eq!(path, &pass1_path);
                 assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
             }
-            other => panic!("expected file-aware pass-1 error, got {other:?}"),
+            other => panic!("expected file-aware pass-1 error, got {other:?}"), // cov:ignore: assertion failure arm
         }
         assert_eq!(
             std::error::Error::source(&error)
@@ -4714,8 +4714,10 @@ mod tests {
     fn write_linearized_with_pass1_file_preserves_write_error_context() {
         let pass1_path = Path::new("/dev/full");
         if !pass1_path.exists() {
+            // cov:ignore-start: environment-specific skip for Unix systems without /dev/full
             eprintln!("skipping: /dev/full is unavailable");
             return;
+            // cov:ignore-end
         }
         let mut planning_pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut planning_pdf, false).expect("plan");
@@ -4741,7 +4743,7 @@ mod tests {
                 assert_eq!(path, pass1_path);
                 assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
             }
-            other => panic!("expected file-aware pass-1 write error, got {other:?}"),
+            other => panic!("expected file-aware pass-1 write error, got {other:?}"), // cov:ignore: assertion failure arm
         }
     }
 
@@ -5825,8 +5827,7 @@ mod tests {
                 );
                 assert!(
                     final_ids[0].starts_with(expected_final_prefix),
-                    "{policy}/{object_streams:?}: final output must preserve source /ID[0]: {:?}",
-                    final_ids[0]
+                    "{policy}/{object_streams:?}: final output must preserve source /ID[0]"
                 );
                 assert_ne!(
                     final_ids[0].as_slice(),
