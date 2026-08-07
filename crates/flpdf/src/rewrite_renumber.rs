@@ -32,13 +32,14 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object::{Dictionary, Object, ObjectRef, MAX_INLINE_DEPTH};
+use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
 use crate::Pdf;
 
 /// Maps an original object reference to its assigned new reference.
 ///
 /// Implemented by both renumber schemes ([`CatalogFirstRenumber`] for plain
-/// rewrite, [`GenerateRenumber`] for `--object-streams=generate`) so that
+/// rewrite, [`ObjectStreamRenumber`] for object-stream output) so that
 /// [`renumber_refs_in_place`] can rewrite an object's internal references under
 /// either numbering without duplication.
 pub(crate) trait NewNumberLookup {
@@ -52,7 +53,7 @@ impl NewNumberLookup for CatalogFirstRenumber {
     }
 }
 
-impl NewNumberLookup for GenerateRenumber {
+impl NewNumberLookup for ObjectStreamRenumber {
     fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
     }
@@ -459,7 +460,7 @@ impl CatalogFirstRenumber {
     }
 }
 
-/// Generate-mode renumbering: the Catalog-first BFS extended with qpdf's
+/// Object-stream renumbering: the Catalog-first BFS extended with qpdf's
 /// object-stream branch (`QPDFWriter::enqueueObject` QPDFWriter.cc:1097-1118 +
 /// `assignCompressedObjectNumbers` 1057). When the walk first reaches a member
 /// of an object stream, the stream's container is numbered immediately, then
@@ -471,10 +472,10 @@ impl CatalogFirstRenumber {
 /// traversal split into even groups); this type only assigns the numbers in
 /// qpdf's order.
 //
-// Consumed by the upcoming generate-mode writer wiring; suppress dead_code
-// until that code lands (mirrors `object_streams`).
+// Shared by Preserve and Generate plain-writer planning. Some accessors remain
+// test-only until later body/xref consumers use the complete plan.
 #[allow(dead_code)]
-pub(crate) struct GenerateRenumber {
+pub(crate) struct ObjectStreamRenumber {
     old_to_new: HashMap<ObjectRef, ObjectRef>,
     /// New object number assigned to each input group's container, in group
     /// order. `container_new[i]` is `None` only if group `i` was never reached.
@@ -482,7 +483,7 @@ pub(crate) struct GenerateRenumber {
 }
 
 #[allow(dead_code)]
-impl GenerateRenumber {
+impl ObjectStreamRenumber {
     /// Return the new reference assigned to `original`, if it was reachable.
     pub(crate) fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
         self.old_to_new.get(&original).copied()
@@ -503,18 +504,18 @@ impl GenerateRenumber {
         self.container_new.get(group_index).copied().flatten()
     }
 
-    /// Iterate `(new_ref, old_ref)` pairs for every reachable input object
-    /// (object-stream members and plain objects alike). Container objects are
-    /// synthetic and have no original ref, so they are not included; obtain their
-    /// numbers via [`Self::container_number`]. Yield order is unspecified (backed
-    /// by a hash map); callers that need ordering sort by the new number.
+    /// Iterate `(new_ref, old_ref)` pairs for every reachable input object.
+    /// Source-backed containers, object-stream members, and plain objects are
+    /// included. Synthetic containers have no original ref; obtain their numbers
+    /// via [`Self::container_number`]. Yield order is unspecified (backed by a
+    /// hash map); callers that need ordering sort by the new number.
     pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
         self.old_to_new.iter().map(|(&old, &new)| (new, old))
     }
 
-    /// Compute the generate-mode renumbering for `pdf` given the object-stream
-    /// `groups` (each inner slice is one container's members, in any order; they
-    /// are numbered ascending-source within the container).
+    /// Compute the renumbering for `pdf` given source-backed or synthetic
+    /// object-stream groups. Members are numbered ascending-source within each
+    /// container regardless of their supplied order.
     ///
     /// `skip_length` is always `true` here: generate mode emits a direct
     /// `/Length` (qdf forces object streams off), so a stream's indirect
@@ -529,26 +530,50 @@ impl GenerateRenumber {
     /// propagates load errors from the object walk.
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
-        groups: &[Vec<ObjectRef>],
+        groups: &[ObjectStreamGroup],
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<Self> {
-        // member -> group index, and per-group members sorted ascending-source.
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
+        let mut source_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut groups_sorted: Vec<Vec<ObjectRef>> = Vec::with_capacity(groups.len());
         for (gi, group) in groups.iter().enumerate() {
-            let mut sorted = group.clone();
+            let mut sorted = group.members().to_vec();
+            if sorted.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "object-stream renumber: group {gi} has no members"
+                )));
+            }
             sorted.sort_unstable_by_key(|r| (r.number, r.generation));
             for &m in &sorted {
-                member_to_group.insert(m, gi);
+                if let Some(previous) = member_to_group.insert(m, gi) {
+                    return Err(Error::Unsupported(format!(
+                        "object-stream renumber: member {m} occurs in groups {previous} and {gi}"
+                    )));
+                }
+            }
+            if let ObjectStreamGroup::SourceBacked { source, .. } = group {
+                if let Some(previous) = source_to_group.insert(*source, gi) {
+                    return Err(Error::Unsupported(format!(
+                        "object-stream renumber: source container {source} occurs in groups {previous} and {gi}"
+                    )));
+                }
             }
             groups_sorted.push(sorted);
+        }
+        if let Some(source) = source_to_group
+            .keys()
+            .find(|source| member_to_group.contains_key(source))
+        {
+            return Err(Error::Unsupported(format!(
+                "object-stream renumber: source container {source} is also a member"
+            )));
         }
 
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
         let mut container_new: Vec<Option<u32>> = vec![None; groups.len()];
         let mut next: u32 = 1;
-        let mut queue: VecDeque<ObjectRef> = VecDeque::new();
+        let mut queue: VecDeque<RenumberWork> = VecDeque::new();
 
         // Seeds match the plain Catalog-first walk: `/Root` first, then the
         // remaining indirect trailer entries in lexicographic key order. The
@@ -559,9 +584,9 @@ impl GenerateRenumber {
         // path (the encryption writer emits it as a plaintext indirect object),
         // not through the renumber walk. Seeding it here would assign it a
         // walk-order number and diverge from qpdf.
-        let root = pdf
-            .root_ref()
-            .ok_or_else(|| Error::Unsupported("generate: trailer has no /Root".to_string()))?;
+        let root = pdf.root_ref().ok_or_else(|| {
+            Error::Unsupported("object-stream renumber: trailer has no /Root".to_string())
+        })?;
         let mut seeds: Vec<ObjectRef> = vec![root];
         let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
         let trailer_entries = crate::qpdf_null::visible_entries(pdf, trailer_entries)?;
@@ -580,9 +605,11 @@ impl GenerateRenumber {
         seeds.retain(|reference| !removed_refs.contains(reference));
 
         for seed in seeds {
-            enqueue_gen(
+            enqueue_object_stream(
                 seed,
+                groups,
                 &member_to_group,
+                &source_to_group,
                 &groups_sorted,
                 &mut old_to_new,
                 &mut container_new,
@@ -591,21 +618,63 @@ impl GenerateRenumber {
             );
         }
 
-        while let Some(cur) = queue.pop_front() {
-            let obj = pdf.resolve(cur)?;
-            let mut found = Vec::new();
-            collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
-            found.retain(|reference| !removed_refs.contains(reference));
-            for reference in found {
-                enqueue_gen(
-                    reference,
-                    &member_to_group,
-                    &groups_sorted,
-                    &mut old_to_new,
-                    &mut container_new,
-                    &mut next,
-                    &mut queue,
-                );
+        while let Some(work) = queue.pop_front() {
+            match work {
+                RenumberWork::Ordinary(cur) => {
+                    let obj = pdf.resolve(cur)?;
+                    let mut found = Vec::new();
+                    collect_qpdf_enqueue_refs(pdf, &obj, 0, skip_length, &mut found)?;
+                    found.retain(|reference| !removed_refs.contains(reference));
+                    for reference in found {
+                        enqueue_object_stream(
+                            reference,
+                            groups,
+                            &member_to_group,
+                            &source_to_group,
+                            &groups_sorted,
+                            &mut old_to_new,
+                            &mut container_new,
+                            &mut next,
+                            &mut queue,
+                        );
+                    }
+                }
+                RenumberWork::SourceContainer(source) => {
+                    // qpdf's object-stream membership comes from the source
+                    // xref table and survives replaceObject(source, null).
+                    // writeObjectStream then treats that indirect null as a
+                    // generated placeholder: it rebuilds the same container
+                    // but has no original dictionary from which to copy
+                    // /Extends (QPDF.cc:2381-2390;
+                    // QPDFWriter.cc:1621-1625,1731-1739,1939-1965).
+                    if removed_refs.contains(&source) {
+                        continue;
+                    }
+                    let object = pdf.resolve(source)?;
+                    if matches!(object, Object::Null) {
+                        continue;
+                    }
+                    let stream = object.as_stream().ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "object-stream renumber: source container {source} is not a stream"
+                        ))
+                    })?;
+                    if let Some(Object::Reference(extends)) = stream.dict.get("Extends") {
+                        if !removed_refs.contains(extends) {
+                            enqueue_object_stream(
+                                *extends,
+                                groups,
+                                &member_to_group,
+                                &source_to_group,
+                                &groups_sorted,
+                                &mut old_to_new,
+                                &mut container_new,
+                                &mut next,
+                                &mut queue,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -616,43 +685,61 @@ impl GenerateRenumber {
     }
 }
 
-/// Generate-mode enqueue: number a plain object directly, or — for an
-/// object-stream member — reserve the container number then number all members
-/// of that container ascending-source. A member already numbered as part of its
-/// container batch is a no-op. Members are pushed to the queue so their child
-/// references are traversed (qpdf reaches further containers' members this way).
+#[derive(Clone, Copy, Debug)]
+enum RenumberWork {
+    Ordinary(ObjectRef),
+    SourceContainer(ObjectRef),
+}
+
+/// Number a plain object directly, or activate its source-backed/synthetic
+/// object-stream group from either the source container or any member.
 #[allow(dead_code, clippy::too_many_arguments)]
-fn enqueue_gen(
+fn enqueue_object_stream(
     r: ObjectRef,
+    groups: &[ObjectStreamGroup],
     member_to_group: &HashMap<ObjectRef, usize>,
+    source_to_group: &HashMap<ObjectRef, usize>,
     groups_sorted: &[Vec<ObjectRef>],
     old_to_new: &mut HashMap<ObjectRef, ObjectRef>,
     container_new: &mut [Option<u32>],
     next: &mut u32,
-    queue: &mut VecDeque<ObjectRef>,
+    queue: &mut VecDeque<RenumberWork>,
 ) {
     if old_to_new.contains_key(&r) {
         return;
     }
-    match member_to_group.get(&r) {
-        Some(&gi) => {
-            // The `old_to_new` guard above means we only reach here on a member's
-            // first encounter, so its container is not yet numbered. Number the
-            // container, then every member of that container consecutively in
-            // ascending-source order.
-            debug_assert!(container_new[gi].is_none());
-            container_new[gi] = Some(*next);
+    let group_index = member_to_group
+        .get(&r)
+        .or_else(|| source_to_group.get(&r))
+        .copied();
+    match group_index {
+        Some(gi) => {
+            // Activation inserts the source and every member into old_to_new,
+            // so the leading map guard makes a second activation impossible.
+            let container = *next;
+            container_new[gi] = Some(container);
             *next += 1;
+
+            let source = match &groups[gi] {
+                ObjectStreamGroup::SourceBacked { source, .. } => {
+                    old_to_new.insert(*source, ObjectRef::new(container, 0));
+                    Some(*source)
+                }
+                ObjectStreamGroup::Synthetic { .. } => None,
+            };
             for &m in &groups_sorted[gi] {
                 old_to_new.insert(m, ObjectRef::new(*next, 0));
                 *next += 1;
-                queue.push_back(m);
+                queue.push_back(RenumberWork::Ordinary(m));
+            }
+            if let Some(source) = source {
+                queue.push_back(RenumberWork::SourceContainer(source));
             }
         }
         None => {
             old_to_new.insert(r, ObjectRef::new(*next, 0));
             *next += 1;
-            queue.push_back(r);
+            queue.push_back(RenumberWork::Ordinary(r));
         }
     }
 }
@@ -896,6 +983,7 @@ fn rewrite<M: NewNumberLookup>(obj: &mut Object, depth: usize, map: &M) -> crate
 mod tests {
     use super::*;
     use crate::object::{Dictionary, Stream};
+    use crate::writer::object_streams::ObjectStreamGroup;
     use std::io::Cursor;
     use std::sync::Arc;
 
@@ -960,6 +1048,230 @@ mod tests {
         out.extend_from_slice(b" >>\n");
         out.extend_from_slice(format!("startxref\n{xref}\n%%EOF\n").as_bytes());
         out
+    }
+
+    fn source_group(source: u32, members: &[u32]) -> ObjectStreamGroup {
+        ObjectStreamGroup::SourceBacked {
+            source: ObjectRef::new(source, 0),
+            members: members
+                .iter()
+                .map(|&number| ObjectRef::new(number, 0))
+                .collect(),
+        }
+    }
+
+    fn synthetic_group(members: &[u32]) -> ObjectStreamGroup {
+        ObjectStreamGroup::Synthetic {
+            members: members
+                .iter()
+                .map(|&number| ObjectRef::new(number, 0))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn source_backed_member_first_and_container_first_number_identically() {
+        let bodies = |first: u32| {
+            let catalog = format!("<< /Type /Catalog /First {first} 0 R >>").into_bytes();
+            build_raw_pdf(&[
+                (1, catalog.as_slice()),
+                (2, b"<< /Value 2 >>"),
+                (3, b"<< /Value 3 >>"),
+                (
+                    4,
+                    b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream",
+                ),
+            ])
+        };
+        let groups = vec![source_group(4, &[3, 2])];
+
+        for first in [2, 4] {
+            let mut pdf = Pdf::open_mem_owned(bodies(first)).unwrap();
+            let map =
+                ObjectStreamRenumber::build(&mut pdf, &groups, true, &BTreeSet::new()).unwrap();
+            assert_eq!(
+                map.new_for_original(ObjectRef::new(4, 0)),
+                Some(ObjectRef::new(2, 0))
+            );
+            assert_eq!(
+                map.new_for_original(ObjectRef::new(2, 0)),
+                Some(ObjectRef::new(3, 0))
+            );
+            assert_eq!(
+                map.new_for_original(ObjectRef::new(3, 0)),
+                Some(ObjectRef::new(4, 0))
+            );
+            assert_eq!(map.container_numbers(), vec![2]);
+        }
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_missing_root() {
+        let mut bytes = build_raw_pdf(&[(1, b"<< /Type /Catalog >>")]);
+        let root_key = bytes
+            .windows(b"/Root".len())
+            .position(|window| window == b"/Root")
+            .expect("fixture trailer has /Root");
+        bytes[root_key..root_key + b"/Root".len()].copy_from_slice(b"/Nope");
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error = ObjectStreamRenumber::build(&mut pdf, &[], true, &BTreeSet::new())
+            .err()
+            .expect("missing root must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "object-stream renumber: trailer has no /Root"));
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_non_stream_source_container() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+            (4, b"<< /Type /NotAnObjStm >>"),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error =
+            ObjectStreamRenumber::build(&mut pdf, &[source_group(4, &[2])], true, &BTreeSet::new())
+                .err()
+                .expect("non-stream source container must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "object-stream renumber: source container 4 0 R is not a stream"));
+    }
+
+    #[test]
+    fn source_container_follows_only_indirect_extends() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+            (
+                4,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 /Extends 5 0 R /Aux 6 0 R >>\nstream\n\nendstream",
+            ),
+            (
+                5,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream",
+            ),
+            (6, b"<< /WronglyReachable true >>"),
+            (7, b"<< /Value 7 >>"),
+        ]);
+        let groups = vec![source_group(4, &[2]), source_group(5, &[7])];
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let map = ObjectStreamRenumber::build(&mut pdf, &groups, true, &BTreeSet::new()).unwrap();
+
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(5, 0)),
+            Some(ObjectRef::new(4, 0))
+        );
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(7, 0)),
+            Some(ObjectRef::new(5, 0))
+        );
+        assert_eq!(map.new_for_original(ObjectRef::new(6, 0)), None);
+        assert_eq!(map.container_numbers(), vec![2, 4]);
+    }
+
+    #[test]
+    fn extends_target_without_retained_group_is_an_ordinary_source() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+            (
+                4,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 /Extends 5 0 R /Aux 6 0 R >>\nstream\n\nendstream",
+            ),
+            (
+                5,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream",
+            ),
+            (6, b"<< /WronglyReachable true >>"),
+        ]);
+        let groups = vec![source_group(4, &[2])];
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let map = ObjectStreamRenumber::build(&mut pdf, &groups, true, &BTreeSet::new()).unwrap();
+
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(5, 0)),
+            Some(ObjectRef::new(4, 0))
+        );
+        assert_eq!(map.new_for_original(ObjectRef::new(6, 0)), None);
+        assert_eq!(map.container_numbers(), vec![2]);
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_empty_group() {
+        let bytes = build_raw_pdf(&[(1, b"<< /Type /Catalog >>")]);
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error =
+            ObjectStreamRenumber::build(&mut pdf, &[synthetic_group(&[])], true, &BTreeSet::new())
+                .err()
+                .expect("empty group must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message.contains("group 0 has no members")));
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_duplicate_member() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+        ]);
+        let mut pdf = Pdf::open_mem_owned(bytes).unwrap();
+
+        let error = ObjectStreamRenumber::build(
+            &mut pdf,
+            &[synthetic_group(&[2]), synthetic_group(&[2])],
+            true,
+            &BTreeSet::new(),
+        )
+        .err()
+        .expect("duplicate member must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message.contains("member 2 0 R occurs in groups 0 and 1")));
+    }
+
+    #[test]
+    fn object_stream_renumber_rejects_conflicting_source_roles() {
+        let bytes = build_raw_pdf(&[
+            (1, b"<< /Type /Catalog /First 2 0 R >>"),
+            (2, b"<< /Value 2 >>"),
+            (3, b"<< /Value 3 >>"),
+            (
+                4,
+                b"<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n\nendstream",
+            ),
+        ]);
+
+        let mut duplicate_source_pdf = Pdf::open_mem_owned(bytes.clone()).unwrap();
+        let duplicate_source = ObjectStreamRenumber::build(
+            &mut duplicate_source_pdf,
+            &[source_group(4, &[2]), source_group(4, &[3])],
+            true,
+            &BTreeSet::new(),
+        )
+        .err()
+        .expect("duplicate source container must be rejected");
+        assert!(matches!(duplicate_source, Error::Unsupported(message)
+            if message.contains("source container 4 0 R occurs in groups 0 and 1")));
+
+        let mut source_member_pdf = Pdf::open_mem_owned(bytes).unwrap();
+        let source_member = ObjectStreamRenumber::build(
+            &mut source_member_pdf,
+            &[source_group(4, &[2]), synthetic_group(&[4])],
+            true,
+            &BTreeSet::new(),
+        )
+        .err()
+        .expect("source/member role conflict must be rejected");
+        assert!(matches!(source_member, Error::Unsupported(message)
+            if message.contains("source container 4 0 R is also a member")));
     }
 
     #[test]
@@ -1483,7 +1795,8 @@ mod tests {
         // Empty groups: every reachable object is numbered as a plain object, so
         // this isolates the generate walk. With `skip_length = true` the holder
         // (obj 7) is dropped; the page's /Contents stream (obj 4) is still numbered.
-        let map = GenerateRenumber::build(&mut pdf, &[], true, &BTreeSet::new()).expect("build");
+        let map =
+            ObjectStreamRenumber::build(&mut pdf, &[], true, &BTreeSet::new()).expect("build");
         assert!(map.new_for_original(ObjectRef::new(7, 0)).is_none());
         assert!(map.new_for_original(ObjectRef::new(4, 0)).is_some());
         assert_eq!(map.pairs().count(), 6);
