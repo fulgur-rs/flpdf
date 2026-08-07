@@ -262,6 +262,14 @@ reader.rs に残ったまま）。
   (`reader.rs:1227-`、`private`) も同じ `next_object_offset` に依存する
   ため、ここに含める**。含めないと file-object 解析の本体が reader.rs
   に残ったまま、公開エントリポイントだけが移動することになる
+- **resolve 時の diagnostic emitter もここに含める**:
+  `resolve_to_cache`/`resolve_compressed_entry` が呼ぶ
+  `record_file_object_diagnostics`(`reader.rs:2777-`、`private`、
+  呼び出しは `reader.rs:2761,2826`) と、`resolve_compressed_entry` の
+  圧縮経路が呼ぶ `record_object_stream_diagnostics`
+  (`reader.rs:2950-`、`private`、呼び出しは `reader.rs:2853`)。
+  どちらも `self.push_warning`（上記「warnings」参照、engine.rs/pdf.rs
+  のいずれかで既存）へ委譲するだけで閉じる
 - **`resolve_compressed_entry` の圧縮オブジェクトストリーム parser 閉包も
   ここに含める**: `parse_object_stream_chain_entry`(`reader.rs:2938-`)
   が `object_stream_chain_member`(`reader.rs:2982-`、`private`) 経由で
@@ -571,7 +579,24 @@ reader.rs に残ったまま）。
    二重帰属だけを避ける）。上記「新規ファイルを作らず既存へ委譲する
    もの」で個別に触れた `signatures.rs`/`object_copy.rs`/
    `linearization/`/`document_json.rs` への移動は、それぞれの既存行
-   （§7/§8）を個別に更新する
+   （§7/§8）を個別に更新する。
+   **上記6行以外にも、「reader/resolver.rs」というファイル名指定では
+   なく地の文で reader.rs 内の実装を名指ししている行が3つあり、これらも
+   本設計の移動対象と重なるため更新が必要**:
+   `docs/qpdf-correspondence.md:138`（`QPDFParser.cc` 行、地の文で
+   `reader.rs::parse_object_stream_entry` を名指し——この関数は上記
+   「圧縮オブジェクトストリーム parser 閉包」で `resolve.rs` へ移る対象）、
+   `:179`（`QPDF_encryption.cc` 行、地の文で「`reader.rs:604` が呼ぶ」と
+   `normalize_password` の呼び出し元を名指し——実際の呼び出し元は
+   `authenticate_if_encrypted`（`reader.rs:782-`）で、上記「暗号/認証
+   エントリ」閉包の一部として `security/*` へ移る対象）、
+   `:200`（`Pl_RC4` 行、`reader/resolver.rs` の pipe-time decrypt stage
+   とは別に「`reader.rs` / `writer.rs` の既存 stream consumer」も併記——
+   前者は `decrypt_stream_bytes`（`reader.rs:3508-`）で、これは既に
+   `decrypt_resolved_object` 依存閉包の一部として `resolve.rs` へ移る
+   対象と重複する。`writer.rs` 側は本設計のスコープ外のためそのまま）。
+   この3行は「reader/resolver.rs」という単純な文字列置換の対象ではない
+   ため、上記6行の一括更新とは別に個別に確認する
 4. 各ステップは出力バイトに影響しない「入れ物」の変更のみ
    （CLAUDE.md 分類(B)）なので、バイト差分ゼロを都度確認しながら進める。
    AGENTS.md §7 の acceptance-criteria 階層として、各ステップの検証には
@@ -626,7 +651,16 @@ reader.rs に残ったまま）。
    移動が出力バイトを一切変えていないことを確認する相対比較）の
    **両方**で構成する。(a) だけでは認証経路が通ることしか確認できず、
    (b) だけでは flpdf が qpdf からドリフトしても検出できない
-   （`bd recall tests-that-pin-flpdf-against-itself` 参照）。
+   （`bd recall tests-that-pin-flpdf-against-itself` 参照）。この golden
+   は `crates/flpdf-cli/tests/encrypted_rewrite_tests.rs` に追加する
+   想定だが、この新規 golden 自体は既存の `--test cli_tests` では
+   実行されない（`cargo test --test <NAME>` は指定した1ターゲットのみを
+   走らせるため、`tests/` 直下の別ファイルである
+   `encrypted_rewrite_tests.rs` は対象外）。`authenticate_if_encrypted`
+   系の移動ステップのゲートには、上記 `cargo test -p flpdf-cli --test
+   cli_tests` に加えて
+   `cargo test -p flpdf-cli --test encrypted_rewrite_tests` を明示的に
+   実行することをこのステップのゲートに含める。
    加えて各ステップ実行前後で
    `scripts/patch-coverage.sh` を回し、変更行 100% カバレッジを維持する。
    **各ステップは `flpdf-0b12` のように前段のステップに stack する PR に
