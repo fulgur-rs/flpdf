@@ -137,12 +137,38 @@ https://github.com/ancwrd1/qpdf-rs（`qpdf` crate、libqpdf への薄い FFI
 `pub mod pdf;` のみ追加すればよい。
 
 **既存 `crates/flpdf/src/engine.rs`（PR #657 でマージ済み、`Pdf::empty()`
-のみ）への影響**: 現状は `lib.rs` 直下の並列モジュールとして存在するが、
-`empty()` は既存の `pub fn open_mem_owned` を呼ぶだけで `Pdf` の private
-フィールドに触れないため、たまたま並列モジュールのままコンパイルが通って
-いる。今回の `open_with_repair_mode`（フィールドを直接構築する private
-constructor、上記参照）をここへ追加する際に、`pdf::engine` への再配置が
-必要になる。
+のみ）への影響**: 現状は `lib.rs:102` の `pub mod engine;` で並列モジュール
+として宣言されており、実際に存在する（`empty()` は既存の
+`pub fn open_mem_owned` を呼ぶだけで `Pdf` の private フィールドに触れない
+ため、たまたま並列モジュールのままコンパイルが通っている）。`struct Pdf<R>`
+を `pdf.rs` へ移し、`engine.rs` を `pdf::engine` へ再配置する際、
+配線を更新する必要がある: (1) `lib.rs:102` の `pub mod engine;` を削除し
+（中身は `pdf.rs` 内の `mod engine;` 宣言に置き換わる）、(2) `lib.rs:258`
+の `pub use reader::{EncryptionInfo, Pdf, PdfOpenOptions, Permissions};`
+を `pub use pdf::Pdf;`（他の型の移動先に応じて分割）に retarget する。
+公開パス `flpdf::Pdf` 自体は変わらない（re-export 元が変わるだけ）。
+
+**`security/standard.rs`/`encrypt_setup.rs`/`permissions.rs`/
+`object_copy.rs` は同じ解決法が使えない**: これらは `engine.rs` 等と違い
+**既存の**（本設計が新設しない）`lib.rs` 直下の並列モジュールで、独自の
+既存責務を持つため `pdf` の子へ付け替えるのは大きすぎる変更になる。
+一方 `is_encrypted`（`self.encryption.borrow()` を直接読む、
+`reader.rs:183,721-723`）や `take_foreign_object_map`（`self.
+foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
+エントリポイントは `Pdf` の private フィールドに直接アクセスするため、
+そのまま `security/*`/`object_copy.rs` に移すとコンパイルできない。
+2通りの解決策があり、実装時に選ぶ: (a) 該当フィールドだけ
+`pub(crate)` にする（クレート内アクセスは許すが、公開APIは晒さない。
+`is_dirty`/`live_object_refs` 等 `obj_cache.rs` グループが返す値の型は
+既に外部公開されているため、これは新規の公開面拡大ではない）。
+(b) エントリポイント自体は `Pdf` が定義されるモジュール
+（`pdf.rs`/`pdf::obj_cache` 等）に残し、`security/*`/`object_copy.rs` へは
+**既に `&Dictionary`/`&mut EncryptionState` 等の抽出済み値だけを取る
+純粋関数**（`required_revision`/`interpret_cf`/`crypt_filter_modes` は
+既にこの形）だけを移す。エントリポイント本体はこれらの純粋関数を
+呼ぶだけの薄いラッパーとして `Pdf` 側に留まる。(b) の方が公開面を一切
+広げずに済むため望ましいが、`authenticate_if_encrypted` 全体をこの形に
+分解できるかは実装時に確認する。
 
 ### `pdf.rs`（新規）
 - `struct Pdf<R>` 定義、`Drop` impl
@@ -179,6 +205,14 @@ constructor、上記参照）をここへ追加する際に、`pdf::engine` へ�
   `collect_object_stream_chain`, header/startxref 探索, xref 読み取り
   （`xref.rs` の既存 API を呼ぶだけで xref.rs 自体は変更しない — 詳細は
   「非目標」参照）, `resolve_to_cache`, `native_parse_uncompressed_value` 等
+- **`source_xref_offsets`, `source_xref_entries`, `source_header_offset`,
+  `previous_xref_offset`, `last_xref_form`, `compressed_parent` もここに
+  含める**（後述の「未決定」から格上げ）。これらは qtest 専用ではなく
+  production consumer が存在する: `writer.rs:1004-1005,1027,1151,1469`
+  （xref stream 生成時の source offset 参照）と
+  `subset_prune.rs:196`（`compressed_parent`）。ソース document の
+  xref 由来構造情報を返す resolve/seek 隣接の状態なので、`resolve.rs`
+  が正しい置き場所
 - **`adobe_extension_level`, `trailer_handle`, `trailer_key_handle` も
   ここに含める**（`pdf.rs` からの再分類）。根拠: qpdf の
   `QPDF::getExtensionLevel()`（`QPDF.cc:2328-2346`）は
@@ -256,9 +290,13 @@ constructor、上記参照）をここへ追加する際に、`pdf::engine` へ�
   `document_json.rs` 自身へ実装ごと移すかは実装時に決める
 
 ### 未決定（実装時に判断してよい細部）
-- qtest 用の source-offset introspection（`qtest_*`, `source_xref_offsets`,
-  `compressed_parent` 等15個）: qpdf に対応物が無い flpdf 独自のテスト基盤。
-  `resolve.rs` に同居させるか独立ファイルにするかは実装時に決める
+- qtest 専用の source-offset introspection（`qtest_decode_parms_source_offset`
+  / `qtest_object_value_source_offset` / `qtest_array_item_source_offset` /
+  `qtest_read_source_object_with_retry` 等、`qtest_` 接頭辞を持つ本当に
+  production consumer の無いもの）: qpdf に対応物が無い flpdf 独自のテスト
+  基盤。`resolve.rs` に同居させるか独立ファイルにするかは実装時に決める。
+  `source_xref_offsets`/`compressed_parent` 等は production consumer が
+  あるため上記 `resolve.rs` へ格上げ済み（この bullet からは除外）
 - `warnings`（`repair_diagnostics`, `push_warning`, `recovered_stream_eol`）
   の最終置き場所（`engine.rs` か `pdf.rs` か、小規模なので実装時判断）
 
@@ -315,5 +353,12 @@ constructor、上記参照）をここへ追加する際に、`pdf::engine` へ�
    移動対象メソッドが実際に通る経路であることを確認したうえで実行する。
    特に resolve/認証まわりの移動は、単体テストだけでは値の materialize
    有無や byte 出力まで確認できないため、上記 byte-identical スイートを
-   必ず含める。加えて各ステップ実行前後で `scripts/patch-coverage.sh`
-   を回し、変更行 100% カバレッジを維持する
+   必ず含める。**`authenticate_if_encrypted`/暗号ヘルパーの移動には上記
+   4本では不十分**（いずれも暗号化フィクスチャ・パスワード・
+   `PdfOpenOptions` を使わないため認証経路を通らない）。代わりに
+   `qpdf-zlib-compat` gated かつ暗号化ラウンドトリップを検証する
+   `crates/flpdf-cli/tests/encrypt_cli_tests.rs`
+   （`--encrypt` で書いた出力を qpdf で再オープン検証、パスワード付き
+   フィクスチャを使用）を必須テストとして追加する。加えて各ステップ
+   実行前後で `scripts/patch-coverage.sh` を回し、変更行 100%
+   カバレッジを維持する
