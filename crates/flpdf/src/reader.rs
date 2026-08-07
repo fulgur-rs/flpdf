@@ -5791,6 +5791,39 @@ mod tests {
         // itself drops, so only this test's own local handles remain live.
         assert_eq!(pages.strong_count(), 1);
         assert_eq!(page.strong_count(), 1);
+        assert!(pages.is_direct());
+        assert!(page.is_direct());
+        assert!(!pages.is_null());
+        assert!(!page.is_null());
+    }
+
+    #[test]
+    fn dropping_pdf_preserves_a_surviving_literal_null_handle() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let object_ref = ObjectRef::new(90, 0);
+        pdf.set_object(object_ref, Object::Null);
+        let handle = pdf.get_object_handle(object_ref);
+        assert!(handle.is_indirect());
+        assert!(handle.is_null());
+
+        drop(pdf);
+
+        assert!(handle.is_direct());
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn dropping_pdf_preserves_a_surviving_missing_handle() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(91, 0));
+        handle.set_missing();
+        assert!(handle.is_indirect());
+        assert!(handle.is_null());
+
+        drop(pdf);
+
+        assert!(handle.is_direct());
+        assert!(handle.is_null());
     }
 
     #[test]

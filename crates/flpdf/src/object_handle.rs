@@ -749,39 +749,54 @@ impl ObjectHandle {
     /// PDFs) therefore form a strong reference cycle once both are resolved,
     /// which `Rc` alone never collects.
     ///
-    /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache
-    /// and disconnects every resolved object, replacing it with
-    /// `QPDF_Destroyed()`, specifically to break cycles like this one
-    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). The reader's `Pdf::drop` calls
-    /// this for every entry in its handle registry — the sole owner of the
-    /// canonical `Rc`s — before the registry itself is dropped, so no
-    /// lingering cycle keeps a document's object graph (and any reachable
-    /// stream buffers) alive past the `Pdf` that produced it.
+    /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache,
+    /// disconnects every resolved object, and replaces every non-null value
+    /// with `QPDF_Destroyed()`, specifically to break cycles like this one
+    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Literal null and missing values stay
+    /// null. The reader's `Pdf::drop` calls this for every entry in its handle
+    /// registry — the sole owner of the canonical `Rc`s — before the registry
+    /// itself is dropped, so no lingering cycle keeps a document's object
+    /// graph (and any reachable stream buffers) alive past the `Pdf` that
+    /// produced it.
     ///
-    /// Also resets the parsed offset to the no-offset sentinel, mirroring
-    /// [`Self::set_missing`]'s own reset and the same Parsed-Offset Contract
-    /// clause it cites: a surviving destroyed handle must not keep reporting
-    /// the destroyed value's former source position.
+    /// Resets the parsed offset to the no-offset sentinel only when the value
+    /// is destroyed. Surviving null and missing values retain their existing
+    /// parsed-offset provenance.
     pub(crate) fn disconnect(&self) {
-        if self.is_indirect() {
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                slot.object_ref = None;
-                slot.active_pdf_unique_id = None;
-                slot.resolver = None;
-                let old_value = match std::mem::replace(&mut slot.state, ObjectState::Destroyed) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    _ => None,
-                };
-                slot.parsed_offset = NO_PARSED_OFFSET;
-                old_value
-            };
-            if let Some(old_value) = old_value {
-                let parent = self.containment_parent();
-                for child in Self::direct_children(&old_value) {
-                    Self::detach_child_from_parent(&child, &parent);
+        let old_value = {
+            let mut slot = self.0.borrow_mut();
+            if slot.object_ref.is_none() {
+                return;
+            }
+            slot.object_ref = None;
+            slot.active_pdf_unique_id = None;
+            slot.resolver = None;
+            let old_state = std::mem::replace(&mut slot.state, ObjectState::Destroyed);
+            match old_state {
+                ObjectState::Resolved(ObjectValue::Null) => {
+                    slot.state = ObjectState::Resolved(ObjectValue::Null);
+                    None
+                }
+                ObjectState::Missing => {
+                    slot.state = ObjectState::Missing;
+                    None
+                }
+                ObjectState::Resolved(value) => {
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    Some(value)
+                }
+                ObjectState::NotYetResolved => {
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    None
+                }
+                ObjectState::Destroyed => {
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    None
                 }
             }
+        };
+        if let Some(old_value) = old_value {
+            self.detach_value_children(&old_value);
         }
     }
 
@@ -4675,6 +4690,43 @@ mod uniform_identity_tests {
         outer.remove_key(b"Child");
         child.disconnect();
         assert!(child.containing_object_refs_for_pdf(111).is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_indirect_metadata_for_every_non_null_alias() {
+        let resolver = resolver();
+        let original = ObjectHandle::integer(9);
+        original.set_parsed_offset_if_unset(44);
+        let promoted =
+            original.promote_to_indirect(ObjectRef::new(47, 0), 91, Rc::downgrade(&resolver));
+
+        promoted.disconnect();
+
+        assert!(original.is_same_object_as(&promoted));
+        assert!(original.is_direct());
+        assert_eq!(original.object_ref(), None);
+        assert!(!original.is_null());
+        assert_eq!(original.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_preserves_literal_null_and_missing_as_null() {
+        let resolver = resolver();
+        let literal_null = ObjectHandle::null();
+        literal_null.set_parsed_offset_if_unset(55);
+        literal_null.promote_to_indirect(ObjectRef::new(49, 0), 92, Rc::downgrade(&resolver));
+        literal_null.disconnect();
+        assert!(literal_null.is_direct());
+        assert!(literal_null.is_null());
+        assert_eq!(literal_null.get_parsed_offset(), 55);
+
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(51, 0), -1);
+        missing.set_missing();
+        missing.promote_to_indirect(ObjectRef::new(53, 0), 93, Rc::downgrade(&resolver));
+        missing.disconnect();
+        assert!(missing.is_direct());
+        assert!(missing.is_null());
+        assert_eq!(missing.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
     #[test]
