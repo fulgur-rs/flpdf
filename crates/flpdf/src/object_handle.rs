@@ -984,24 +984,23 @@ impl ObjectHandle {
     /// the bare message to the process-global default logger's error stream
     /// and returns normally rather than reporting an error.
     ///
-    /// A handle whose document has been dropped is this port's closest
-    /// counterpart to qpdf's failed `dereference()`, and takes the same
-    /// branch rather than propagating the resolution error.
+    /// A handle whose document has been dropped is this port's counterpart of
+    /// that null context, so the context is tested before resolution is
+    /// attempted: dereferencing first would turn the dropped document into a
+    /// resolution error and lose the branch. Any *other* resolution failure
+    /// still propagates rather than being reported as a contextless warning.
     ///
     /// # Errors
     ///
-    /// Returns an error only when the receiving sink itself fails to accept
-    /// the message.
+    /// Propagates a resolution failure from a document that is still
+    /// reachable, and reports a sink that refuses the message.
     #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn warn_if_possible(&self, warning: &str) -> Result<()> {
-        let context = match self.try_dereference() {
-            Ok(()) => self.context(),
-            Err(_) => None,
+        let Some(context) = self.context() else {
+            return crate::QPDFLogger::default_logger().error(format!("{warning}\n"));
         };
-        match context {
-            Some(context) => context.warn(warning.to_owned()),
-            None => crate::QPDFLogger::default_logger().error(format!("{warning}\n")),
-        }
+        self.try_dereference()?;
+        context.warn(warning.to_owned())
     }
 
     /// Report an object-level problem whose message qpdf passes through
@@ -1294,11 +1293,17 @@ impl ObjectHandle {
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
-        if self.as_dictionary().is_none() {
+        // One `with_value` both type-tests and fetches, so a non-dictionary
+        // is distinguishable from a missing key without the whole entry map
+        // being cloned to answer either question.
+        let Some(child) = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => Some(entries.get(key).cloned()),
+            _ => None,
+        }) else {
             self.type_warning("dictionary", "returning null for attempted key retrieval")?;
             return Ok(ObjectHandle::null());
-        }
-        Ok(self.get_key(key))
+        };
+        Ok(child.unwrap_or_else(ObjectHandle::null))
     }
 
     /// qpdf-compatible visible-key test. A present value that resolves to
@@ -9683,6 +9688,65 @@ mod warning_emission_tests {
             handle.set_resolved(ObjectValue::Integer(7));
             Ok(())
         }
+    }
+
+    /// A document whose resolution always fails, so a warning path can be
+    /// asked whether it propagates that or misreports it as no context.
+    struct FailingResolver;
+
+    impl DocumentResolver for FailingResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            Err(crate::Error::System("resolver failed".to_owned()))
+        }
+    }
+
+    #[test]
+    fn warn_if_possible_propagates_a_live_documents_resolution_failure() {
+        // A reachable document that cannot resolve is not qpdf's null
+        // context, so this must not silently divert to the default logger.
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(FailingResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        let error = handle.warn_if_possible("damage").unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::System(ref message) if message == "resolver failed"
+        ));
+    }
+
+    #[test]
+    fn a_stream_receiver_warns_with_its_own_type_name() {
+        // `asDictionary()` is null for a stream just as it is for a scalar
+        // (`libqpdf/QPDFObjectHandle.cc:999-1003`), so a stream receiver
+        // reaches the same warning under its own type name.
+        let (handle, recorder) = handle_resolving(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![(
+                b"Length".to_vec(),
+                ObjectHandle::integer(0),
+            )]),
+            stream_data: None,
+            stream_length: 0,
+        });
+
+        assert!(handle.try_get_keys().unwrap().is_empty());
+        assert!(handle.try_get_key(b"Length").unwrap().is_null());
+
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "operation for dictionary attempted on object of type stream: treating as empty",
+                "operation for dictionary attempted on object of type stream: \
+                 returning null for attempted key retrieval",
+            ]
+        );
     }
 
     #[test]
