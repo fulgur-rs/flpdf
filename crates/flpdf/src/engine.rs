@@ -1,7 +1,6 @@
-//! qpdf correspondence: QPDF.cc document-construction entry points (`emptyPDF()`,
-//! `processFile`, and `processMemoryFile`; reader/resolution remains in `reader.rs`
-//! pending the broader split — see
-//! `docs/plans/2026-08-07-reader-rs-pdf-engine-resolve-split-design.md`).
+//! qpdf correspondence: QPDF.cc document-construction entry points (`emptyPDF()`, `processFile()`, and `processMemoryFile()`) and their shared construction orchestration.
+//!
+//! Rust splits QPDF.cc construction into `engine.rs` while retaining the single `Pdf<R>` type.
 
 use crate::cache::ObjectCache;
 // Used by the public factory API's intra-doc links.

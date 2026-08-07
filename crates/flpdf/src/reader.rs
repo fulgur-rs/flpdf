@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDF.cc document reading, object resolution, recovery, and authentication responsibilities.
+//! qpdf correspondence: QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities.
 pub(crate) mod file_object;
 pub(crate) mod resolver;
 
