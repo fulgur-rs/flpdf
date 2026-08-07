@@ -5285,15 +5285,14 @@ mod tests {
     }
 
     #[test]
-    fn make_indirect_object_handle_gives_a_stream_its_own_independent_dict() {
-        // Regression test: cloning a direct Stream value naively (the
-        // #[derive(Clone)] every other variant gets) would Rc-share
-        // `stream_dict` with the caller's original handle, so a later
-        // `replace_stream_data` on either would rewrite the other's
-        // `/Length` -- the same sharing `shallow_copy` privatizes the
-        // dictionary to avoid. Mutating the *original* handle's stream data
-        // after making it indirect must not affect the new indirect object's
-        // dictionary.
+    fn make_indirect_object_handle_shares_a_streams_dict_with_the_source() {
+        // qpdf promotes by registering the caller's *existing* QPDFObject
+        // under a fresh QPDFObjGen (`QPDF::makeIndirectObject` ->
+        // `makeIndirectFromQPDFObject(oh.getObj())`,
+        // `libqpdf/QPDF.cc:1883-1898`); there is no copy, and
+        // `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`) offers none
+        // to make. So a promoted stream observes the source's own dictionary,
+        // the same Rc-sharing every other variant's child handles already get.
         let dict = ObjectHandle::dictionary(vec![]);
         let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
@@ -5307,14 +5306,14 @@ mod tests {
 
         dict.replace_key(b"Length", ObjectHandle::integer(999));
 
-        assert!(
+        assert_eq!(
             indirect
                 .as_stream_dict()
                 .unwrap()
                 .get_key(b"Length")
-                .is_null(),
-            "the new indirect object's dict must not observe a mutation \
-             made through the original handle's dict"
+                .as_integer(),
+            Some(999),
+            "the promoted object's dict is the source's own dict"
         );
     }
 

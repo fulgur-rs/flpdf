@@ -661,24 +661,23 @@ impl ObjectHandle {
     /// existing `QPDFObject` allocation (`libqpdf/QPDF.cc:1835-1839,1882-1897`).
     /// Consumer migration to [`Self::promote_to_indirect`] is scheduled in
     /// `flpdf-25kg.3.6`.
+    ///
+    /// Every variant is cloned by the same rule: containers share their
+    /// children's `Rc` identity and a stream shares both its `stream_dict`
+    /// handle and its payload allocation. Promotion is not a copy in qpdf —
+    /// `QPDF::makeIndirectObject` registers `oh.getObj()`, the caller's
+    /// *existing* `QPDFObject`, under a fresh `QPDFObjGen`
+    /// (`libqpdf/QPDF.cc:1883-1898`) — so the promoted value must observe
+    /// the same allocation the source handle does, and a stream in
+    /// particular must not be privatized: qpdf's own `QPDF_Stream::copy`
+    /// (`libqpdf/QPDF_Stream.cc:140-145`) has no copying path at all.
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
         let slot = self.0.borrow();
         if slot.object_ref.is_some() {
             return None;
         }
         match &slot.state {
-            ObjectState::Resolved(value) => Some(match value {
-                ObjectValue::Stream {
-                    stream_dict,
-                    stream_data,
-                    stream_length,
-                } => ObjectValue::Stream {
-                    stream_dict: shallow_copy_child(stream_dict),
-                    stream_data: stream_data.clone(),
-                    stream_length: *stream_length,
-                },
-                other => other.clone(),
-            }),
+            ObjectState::Resolved(value) => Some(value.clone()),
             ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None,
         }
     }
@@ -5387,15 +5386,30 @@ mod stream_payload_sharing_tests {
 
     // qpdf's payload is a `std::shared_ptr<Buffer>`
     // (`libqpdf/qpdf/QPDF_Stream.hh:104`), so copying a stream value shares
-    // the bytes instead of duplicating them.
+    // the bytes instead of duplicating them. `QPDF::makeIndirectObject`
+    // registers the caller's *existing* `QPDFObject`
+    // (`libqpdf/QPDF.cc:1883-1898`), so the stream dictionary is shared for
+    // the same reason: promotion observes one allocation, not two.
     #[test]
-    fn direct_value_clone_shares_the_stream_payload_allocation() {
+    fn direct_value_clone_shares_the_stream_payload_and_dictionary() {
         let shared = Rc::new(vec![0x5a; 4096]);
         let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
+        let source_dict = stream.as_stream_dict().expect("source stream dict");
 
         let copy = ObjectHandle::from_value(stream.direct_value_clone().expect("direct value"));
 
         assert!(Rc::ptr_eq(&payload_of(&copy), &shared));
+        let copy_dict = copy.as_stream_dict().expect("copied stream dict");
+        assert!(
+            copy_dict.is_same_object_as(&source_dict),
+            "the promoted value observes the source's own stream dictionary"
+        );
+        copy_dict.replace_key(b"Length", ObjectHandle::integer(7));
+        assert_eq!(
+            source_dict.get_key(b"Length").as_integer(),
+            Some(7),
+            "one allocation: an edit through either handle is visible through both"
+        );
     }
 
     #[test]
