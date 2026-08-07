@@ -8,11 +8,9 @@ description: Use when merging a chain of dependent PRs (epic/<id>/sub-* branches
 ## Overview
 
 Merge a chain of dependent PRs (`epic/<id>/sub-1..N`) into `main`
-**bottom-to-top, one at a time**, fully autonomously. The full design and
-rationale live in `docs/plans/2026-05-16-resilient-stacked-merge-design.md`
-— **read it before first use**. This skill is the *how*; the design doc is
-the *why*. The gaps below are exactly the ones a capable agent gets wrong
-without this skill.
+**bottom-to-top, one at a time**, fully autonomously. This skill is the
+authoritative, self-contained workflow and rationale. The gaps below are
+exactly the ones a capable agent gets wrong without this skill.
 
 **This repo does NOT use gh-stack tooling for these PRs.** They are plain
 chained PRs (base pointers only); `gh stack view` errors with "not part of
@@ -152,6 +150,7 @@ Everything else (pause, rate-limit, CHANGES_REQUESTED) is automatic.
 
 ## Alternative mode
 
-If direct-to-main has friction, see design doc §9: insert an
-`epic/<id>` acceptance branch, merge the stack into it, then one final
-acceptance→main PR. Switch criteria are in §9.
+If direct-to-main has friction, insert an `epic/<id>` acceptance branch,
+merge the stack into it, then open one final acceptance→main PR. Use this
+mode when branch protection interferes with the stack, the epic should land
+atomically, or one final human/qtest acceptance pass is required.
