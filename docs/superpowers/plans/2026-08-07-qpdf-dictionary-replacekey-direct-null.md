@@ -27,25 +27,25 @@
 - Consumes: `ObjectHandle::is_direct()`, `ObjectHandle::is_null()`, and `ObjectHandle::remove_key(&self, key: &[u8])`.
 - Produces: qpdf-compatible `ObjectHandle::replace_key(&self, key: &[u8], value: ObjectHandle)` direct-null behavior without changing its signature.
 
-- [ ] **Step 1: Add regression tests for the acceptance matrix**
+- [x] **Step 1: Add regression tests for the acceptance matrix**
 
   Add focused tests covering existing and missing keys on direct dictionaries, a resolved indirect dictionary, a non-dictionary handle, a resolved indirect null value, a missing/dangling indirect value, retained handle identity, and containment detachment.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
   Run: `cargo test -p flpdf --lib object_handle::mutation_tests::replace_key`
 
   Expected: direct-null cases fail because the key remains present; indirect-preservation cases remain green.
 
-- [ ] **Step 3: Implement the minimal qpdf branch**
+- [x] **Step 3: Implement the minimal qpdf branch**
 
   At the start of `replace_key`, check `value.is_direct() && value.is_null()`. Delegate that case to `self.remove_key(key)` and return. Leave the existing insertion and containment logic unchanged for indirect and non-null values.
 
-- [ ] **Step 4: Verify GREEN and regressions**
+- [x] **Step 4: Verify GREEN and regressions**
 
   Run the focused mutation tests, `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo test`.
 
-- [ ] **Step 5: Verify changed-line coverage and qpdf-compatible corpus**
+- [x] **Step 5: Verify changed-line coverage and qpdf-compatible corpus**
 
   Generate fresh LCOV coverage for the workspace with `qpdf-zlib-compat`, run `scripts/patch-coverage.sh` against `main`, and run the byte-identical compatibility tests relevant to `flpdf`.
 
