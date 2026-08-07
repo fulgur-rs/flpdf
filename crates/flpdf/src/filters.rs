@@ -2645,34 +2645,45 @@ mod tests {
         assert_eq!(decode_stream_data(&dict, &encoded).unwrap(), b"AB");
     }
 
-    /// A `/DecodeParms` value that is not an integer must still reach the
-    /// filter as a non-integer once the shape-neutral `FilterSpec` has reduced
-    /// it to `ParamValue::Name` or `ParamValue::Other`, so the stream stays
-    /// unfilterable on both the decode and the encode side.
+    /// A non-null `/DecodeParms` value that is not an integer must still reach
+    /// the filter as a non-integer once the shape-neutral `FilterSpec` has
+    /// reduced it to `ParamValue::Name` or `ParamValue::Other`, so the stream
+    /// stays unfilterable on both the decode and the encode side.
     #[test]
-    fn non_integer_decode_params_values_remain_unfilterable() {
-        for value in [Object::Name(b"12".to_vec()), Object::Null] {
-            let mut parms = Dictionary::new();
-            parms.insert("Predictor", value.clone());
-            let mut dict = Dictionary::new();
-            dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
-            dict.insert("DecodeParms", Object::Dictionary(parms));
+    fn non_null_non_integer_decode_params_values_remain_unfilterable() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Name(b"12".to_vec()));
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
 
-            let expected =
-                "unsupported PDF feature: stream filter FlateDecode does not support supplied /DecodeParms";
-            assert_eq!(
-                decode_stream_data(&dict, b"not deflate data")
-                    .unwrap_err()
-                    .to_string(),
-                expected,
-                "decode {value:?}"
-            );
-            assert_eq!(
-                encode_stream_data(&dict, b"data").unwrap_err().to_string(),
-                expected,
-                "encode {value:?}"
-            );
-        }
+        let expected =
+            "unsupported PDF feature: stream filter FlateDecode does not support supplied /DecodeParms";
+        assert_eq!(
+            decode_stream_data(&dict, b"not deflate data")
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn null_decode_params_values_are_omitted_before_decode_and_encode() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Null);
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        let encoded = flate_only(b"abc");
+        assert_eq!(decode_stream_data(&dict, &encoded).unwrap(), b"abc");
+
+        let reencoded = encode_stream_data(&dict, b"abc").unwrap();
+        assert_eq!(decode_stream_data(&dict, &reencoded).unwrap(), b"abc");
     }
 
     #[test]
@@ -4060,13 +4071,10 @@ mod tests {
         /// chain is buildable run a real codec instead of stopping at the
         /// reader.
         ///
-        /// The D4 row ("null-valued /DecodeParms key (flpdf-h8mv)") pins
-        /// **reader agreement, not qpdf agreement**: qpdf's
-        /// `QPDF_Dictionary::getKeys` skips null-valued entries and tolerates
-        /// the stream, flpdf rejects it, and the divergence is tracked as beads
-        /// `flpdf-h8mv` rather than fixed here. Two readers agreeing is not
-        /// evidence either is right; `shape_corpus`'s own comment on that row
-        /// carries the qpdf citation.
+        /// The D4 row ("null-valued /DecodeParms key (flpdf-h8mv)") pins the
+        /// qpdf-compatible success path: qpdf's `QPDF_Dictionary::getKeys`
+        /// skips null-valued entries, so the stream remains filterable. Both
+        /// readers must preserve that behavior.
         fn corpus() -> Vec<Row> {
             let flate = encode_flate(b"shape corpus payload").unwrap();
             shape_corpus()

@@ -1721,12 +1721,11 @@ pub(crate) mod tests {
     /// [`RETAINED_DECODE_PARAM_KEYS`] drops entirely.
     ///
     /// `/Whatever` carries the same `Object::Null` as the `/Predictor` above
-    /// it, which survives as `Other`. Only the key differs, so the assertion
-    /// separates "dropped because unread" from "kept but classified as
-    /// `Other`". That second row is also `flpdf-h8mv`'s shape, retained
-    /// unchanged by this filter — what it goes on to *do* is asserted by
-    /// `filters::tests::non_integer_decode_params_values_remain_unfilterable`
-    /// and by the corpus's "null-valued /DecodeParms key" row, not here.
+    /// it, which is omitted before bounded reduction. Only the key differs,
+    /// so the assertion separates "dropped because unread" from "dropped
+    /// because null". The public decode/encode behavior for this null-valued
+    /// row is asserted by `filters::tests::null_decode_params_values_are_omitted_before_decode_and_encode`
+    /// and by the corpus's "null-valued /DecodeParms key" row.
     ///
     /// **The filter is `/Crypt` so that `/Name` is in the retained set at all**
     /// ([`CRYPT_RETAINED_DECODE_PARAM_KEY`]); under `/FlateDecode` it would
@@ -1755,8 +1754,26 @@ pub(crate) mod tests {
                 (b"Colors".to_vec(), ParamValue::Int(i32::MIN)),
                 (b"Columns".to_vec(), ParamValue::Int(i32::MAX)),
                 (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
-                (b"Predictor".to_vec(), ParamValue::Other),
             ]
+        );
+    }
+
+    #[test]
+    fn object_shape_reader_omits_null_valued_keys_before_retention() {
+        let specs = decode_filter_specs_from_object(
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            Some(&params(&[
+                ("Columns", Object::Integer(4)),
+                ("Predictor", Object::Null),
+                ("Unused", Object::Null),
+            ])),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
         );
     }
 
@@ -2172,9 +2189,9 @@ pub(crate) mod tests {
             ),
             // Decision D4: qpdf's `QPDF_Dictionary::getKeys`
             // (`libqpdf/QPDF_Dictionary.cc:118-127`) skips every null-valued
-            // entry, so qpdf tolerates this while flpdf rejects it. Both
-            // readers must keep flpdf's current behavior; the divergence is
-            // tracked as beads `flpdf-h8mv`, not fixed here.
+            // entry, so qpdf tolerates this. Both readers must preserve the
+            // qpdf-compatible success path; this row is tracked as beads
+            // `flpdf-h8mv`.
             (
                 "null-valued /DecodeParms key (flpdf-h8mv)",
                 Some(flate()),
@@ -2613,6 +2630,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn handle_reader_omits_direct_indirect_and_missing_null_valued_keys() {
+        let (indirect_null, _resolver) = resolver_bearing_handle(ObjectValue::Null);
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(21, 0), -1);
+        missing.set_missing();
+        let parms = ObjectHandle::dictionary(vec![
+            (b"Columns".to_vec(), ObjectHandle::integer(4)),
+            (b"Predictor".to_vec(), ObjectHandle::null()),
+            (b"Colors".to_vec(), indirect_null.clone()),
+            (b"BitsPerComponent".to_vec(), missing.clone()),
+        ]);
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert!(indirect_null.is_resolved());
+        assert!(missing.is_resolved());
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
+        );
+    }
+
+    #[test]
     fn handle_reader_dereferences_an_indirect_decode_parms_array_and_its_items() {
         let (item, _item_resolver) = resolver_bearing_handle(ObjectValue::Dictionary(
             [(b"Columns".to_vec(), ObjectHandle::integer(7))]
@@ -3015,6 +3059,25 @@ pub(crate) mod tests {
             specs[0].decode_params,
             DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Other)])
         );
+    }
+
+    #[test]
+    fn handle_reader_propagates_get_keys_errors_before_retention() {
+        let dropped = {
+            let (handle, resolver) = resolver_bearing_handle(ObjectValue::Integer(4));
+            drop(resolver);
+            handle
+        };
+        let parms = ObjectHandle::dictionary(vec![(b"Unused".to_vec(), dropped)]);
+
+        let error = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "object 20 0 belongs to a dropped PDF");
     }
 
     #[test]
