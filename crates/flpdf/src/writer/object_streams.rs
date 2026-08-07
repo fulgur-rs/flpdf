@@ -145,6 +145,39 @@ pub(crate) struct PackingPlan {
     pub removed_refs: BTreeSet<ObjectRef>,
 }
 
+/// One object-stream group in the qpdf-shaped plain-writer plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObjectStreamGroup {
+    /// A Preserve group reconstructed from this exact source ObjStm.
+    SourceBacked {
+        source: ObjectRef,
+        members: Vec<ObjectRef>,
+    },
+    /// A Generate group whose container has no source identity.
+    Synthetic { members: Vec<ObjectRef> },
+}
+
+impl ObjectStreamGroup {
+    pub(crate) fn members(&self) -> &[ObjectRef] {
+        match self {
+            Self::SourceBacked { members, .. } | Self::Synthetic { members } => members,
+        }
+    }
+
+    pub(crate) fn members_mut(&mut self) -> &mut Vec<ObjectRef> {
+        match self {
+            Self::SourceBacked { members, .. } | Self::Synthetic { members } => members,
+        }
+    }
+}
+
+/// Source-aware object-stream plan for the qpdf-shaped plain writer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct ObjectStreamPlan {
+    pub(crate) groups: Vec<ObjectStreamGroup>,
+    pub(crate) removed_refs: BTreeSet<ObjectRef>,
+}
+
 /// Convert public [`WriteOptions`](crate::WriteOptions) into an internal
 /// [`PlannerConfig`].  The conversion is direct: `WriteOptions.object_streams`
 /// names the policy, and the planner's batch cap defaults to qpdf's value of
@@ -219,6 +252,55 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
     let mut plan = plan_preserve(pdf, &ctx, &length_exclusions, Some(&eligible), None)?;
     plan.removed_refs = compressible.removed_refs;
     Ok(plan)
+}
+
+/// Build qpdf Preserve groups without discarding each source ObjStm identity.
+pub(crate) fn plan_qpdf_preserve_groups<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::Pdf<R>,
+) -> crate::Result<ObjectStreamPlan> {
+    let ctx = eligibility_context(pdf)?;
+    let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
+    let compressible = compressible_objgens_qpdf_plan(pdf)?;
+    let eligible: BTreeSet<ObjectRef> = compressible.eligible.iter().copied().collect();
+    let mut by_container: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
+
+    for (member, entry) in pdf.source_xref_entries() {
+        if let XrefEntry::Compressed { stream, .. } = entry {
+            by_container
+                .entry(ObjectRef::new(stream, 0))
+                .or_default()
+                .push(member);
+        }
+    }
+
+    let mut groups = Vec::new();
+    for (source, members) in by_container {
+        let mut retained = Vec::new();
+        for member in members {
+            if length_exclusions.contains(&member) || !eligible.contains(&member) {
+                continue;
+            }
+            let eligible_for_objstm = {
+                let object = pdf.resolve_borrowed(member)?;
+                is_eligible_for_objstm(member, object, &ctx)
+            };
+            if eligible_for_objstm {
+                retained.push(member);
+            }
+        }
+        retained.sort_unstable_by_key(|member| (member.number, member.generation));
+        if !retained.is_empty() {
+            groups.push(ObjectStreamGroup::SourceBacked {
+                source,
+                members: retained,
+            });
+        }
+    }
+
+    Ok(ObjectStreamPlan {
+        groups,
+        removed_refs: compressible.removed_refs,
+    })
 }
 
 /// Eligible objects in qpdf's `QPDF::getCompressibleObjGens` order
@@ -1566,6 +1648,26 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0], ObjectRef::new(2, 0));
         assert_eq!(batch[1], ObjectRef::new(3, 0));
+    }
+
+    #[test]
+    fn qpdf_preserve_plan_retains_source_container_and_sorted_members() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/three-page-objstm.pdf"
+        );
+        let mut pdf =
+            crate::Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
+
+        let plan = plan_qpdf_preserve_groups(&mut pdf).unwrap();
+
+        assert_eq!(
+            plan.groups,
+            vec![ObjectStreamGroup::SourceBacked {
+                source: ObjectRef::new(1, 0),
+                members: (2..=9).map(|number| ObjectRef::new(number, 0)).collect(),
+            }]
+        );
     }
 
     #[test]
