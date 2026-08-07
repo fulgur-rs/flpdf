@@ -1028,6 +1028,11 @@ impl ObjectHandle {
     }
 
     /// qpdf-compatible dictionary inspection with lazy dereference.
+    ///
+    /// Ports `QPDFObjectHandle::asDictionary`, the silent internal helper the
+    /// dictionary accessors branch on. It raises no warning of its own; the
+    /// warning belongs to [`Self::try_get_key`] and [`Self::try_get_keys`],
+    /// which is where qpdf places it.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_as_dictionary(
         &self,
@@ -1043,9 +1048,20 @@ impl ObjectHandle {
     /// `libqpdf/QPDFObjectHandle.cc:997-1009`). The dictionary snapshot is
     /// owned before child resolution, so no container borrow crosses a
     /// resolver call.
+    ///
+    /// A non-dictionary receiver raises the `typeWarning` qpdf raises at
+    /// `:1000` and yields an empty set.
+    ///
+    /// # Errors
+    ///
+    /// Propagates resolution failures, and — for a receiver with no reachable
+    /// document — the error [`Self::type_warning`] reports in place of the
+    /// warning.
     #[allow(dead_code)] // consumed by flpdf-h8mv after this prerequisite lands
     pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
-        let Some(entries) = self.try_as_dictionary()? else {
+        self.try_dereference()?;
+        let Some(entries) = self.as_dictionary() else {
+            self.type_warning("dictionary", "treating as empty")?;
             return Ok(BTreeSet::new());
         };
         let mut result = BTreeSet::new();
@@ -1213,9 +1229,25 @@ impl ObjectHandle {
 
     /// qpdf-compatible dictionary lookup. The holder dictionary is resolved;
     /// the returned child retains its own direct/indirect identity.
+    ///
+    /// Ports `QPDFObjectHandle::getKey`
+    /// (`libqpdf/QPDFObjectHandle.cc:978-989`). A non-dictionary receiver
+    /// raises the `typeWarning` qpdf raises at `:984` and yields null. qpdf's
+    /// null additionally carries a child description naming the key; object
+    /// descriptions are not yet propagated, so this one is plain.
+    ///
+    /// # Errors
+    ///
+    /// Propagates resolution failures, and — for a receiver with no reachable
+    /// document — the error [`Self::type_warning`] reports in place of the
+    /// warning.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
+        if self.as_dictionary().is_none() {
+            self.type_warning("dictionary", "returning null for attempted key retrieval")?;
+            return Ok(ObjectHandle::null());
+        }
         Ok(self.get_key(key))
     }
 
@@ -3904,6 +3936,7 @@ pub(crate) mod identity_tests {
     struct RecordingResolver {
         calls: ResolutionLog,
         value: ObjectValue,
+        warnings: WarningLog,
     }
 
     /// Every `resolve_indirect` a [`RecordingResolver`] performed, in order.
@@ -3913,6 +3946,10 @@ pub(crate) mod identity_tests {
     /// `ObjectHandle::is_resolved` is not a substitute — a resolver that
     /// errored would leave the handle unresolved despite having been called.
     pub(crate) type ResolutionLog = Rc<RefCell<Vec<ObjectRef>>>;
+
+    /// Every warning an object emitted through a [`RecordingResolver`], in
+    /// order — the document-side sink `DocumentResolver::warn` feeds.
+    pub(crate) type WarningLog = Rc<RefCell<Vec<String>>>;
 
     impl RecordingResolver {
         /// Install `value` instead of the default one-key dictionary, so a
@@ -3929,7 +3966,11 @@ pub(crate) mod identity_tests {
 
         /// [`Self::installing`] with the call log owned by the caller instead.
         fn logging_into(calls: ResolutionLog, value: ObjectValue) -> Self {
-            Self { calls, value }
+            Self {
+                calls,
+                value,
+                warnings: Rc::new(RefCell::new(Vec::new())),
+            }
         }
     }
 
@@ -3951,6 +3992,11 @@ pub(crate) mod identity_tests {
         ) -> crate::Result<()> {
             self.calls.borrow_mut().push(object_ref);
             handle.set_resolved(self.value.clone());
+            Ok(())
+        }
+
+        fn warn(&self, message: String) -> crate::Result<()> {
+            self.warnings.borrow_mut().push(message);
             Ok(())
         }
     }
@@ -4030,14 +4076,29 @@ pub(crate) mod identity_tests {
     pub(crate) fn logged_resolver_bearing_handle(
         value: ObjectValue,
     ) -> (ObjectHandle, Rc<dyn DocumentResolver>, ResolutionLog) {
+        let (handle, resolver, calls, _warnings) = warning_logged_resolver_bearing_handle(value);
+        (handle, resolver, calls)
+    }
+
+    /// [`logged_resolver_bearing_handle`] plus the resolver's [`WarningLog`],
+    /// for the accessors whose qpdf counterparts emit a `typeWarning`.
+    pub(crate) fn warning_logged_resolver_bearing_handle(
+        value: ObjectValue,
+    ) -> (
+        ObjectHandle,
+        Rc<dyn DocumentResolver>,
+        ResolutionLog,
+        WarningLog,
+    ) {
         let calls: ResolutionLog = Rc::new(RefCell::new(Vec::new()));
-        let resolver: Rc<dyn DocumentResolver> =
-            Rc::new(RecordingResolver::logging_into(Rc::clone(&calls), value));
+        let recording = RecordingResolver::logging_into(Rc::clone(&calls), value);
+        let warnings = Rc::clone(&recording.warnings);
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(recording);
         let handle = ObjectHandle::new_indirect_with_resolver(
             ObjectRef::new(20, 0),
             Rc::downgrade(&resolver),
         );
-        (handle, resolver, calls)
+        (handle, resolver, calls, warnings)
     }
 
     struct MissingResolver;
@@ -4368,10 +4429,17 @@ pub(crate) mod identity_tests {
         assert!(dict.is_resolved());
         assert_eq!(*dict_calls.borrow(), vec![ObjectRef::new(20, 0)]);
 
-        let (scalar, _scalar_resolver, scalar_calls) =
-            logged_resolver_bearing_handle(ObjectValue::Integer(7));
+        let (scalar, _scalar_resolver, scalar_calls, scalar_warnings) =
+            warning_logged_resolver_bearing_handle(ObjectValue::Integer(7));
         assert_eq!(scalar.try_get_keys().unwrap(), BTreeSet::<Vec<u8>>::new());
         assert_eq!(*scalar_calls.borrow(), vec![ObjectRef::new(20, 0)]);
+        assert_eq!(
+            *scalar_warnings.borrow(),
+            vec![
+                "operation for dictionary attempted on object of type integer: treating as empty"
+                    .to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -9424,6 +9492,66 @@ mod warning_emission_tests {
             Ok(())
         }
         // cov:ignore-end
+    }
+
+    #[test]
+    fn get_keys_on_a_non_dictionary_warns_and_returns_an_empty_set() {
+        // `libqpdf/QPDFObjectHandle.cc:999-1003`
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        assert!(handle.try_get_keys().unwrap().is_empty());
+
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn get_key_on_a_non_dictionary_warns_and_returns_null() {
+        // `libqpdf/QPDFObjectHandle.cc:983-988`
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        assert!(handle.try_get_key(b"Type").unwrap().is_null());
+
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "operation for dictionary attempted on object of type integer: \
+              returning null for attempted key retrieval"
+            ]
+        );
+    }
+
+    #[test]
+    fn as_dictionary_on_a_non_dictionary_stays_silent_like_qpdf() {
+        // `asDictionary()` is the silent internal helper; only `getKey`,
+        // `getKeys` and `getDictAsMap` warn.
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        assert!(handle.try_as_dictionary().unwrap().is_none());
+
+        assert!(warnings(&recorder).is_empty());
+    }
+
+    #[test]
+    fn dictionary_accessors_neither_warn_nor_change_their_result() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Dictionary(
+            [
+                (b"A".to_vec(), ObjectHandle::integer(1)),
+                (b"B".to_vec(), ObjectHandle::null()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        assert_eq!(
+            handle.try_get_keys().unwrap(),
+            [b"A".to_vec()].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
+        assert!(handle.try_get_key(b"Missing").unwrap().is_null());
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]
