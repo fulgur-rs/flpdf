@@ -9,6 +9,8 @@ use crate::error::EncryptedError;
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::PdfOpenOptions;
 use crate::xref::load_xref_state_with_repair;
+#[allow(unused_imports)]
+use crate::{Error, ObjectHandle};
 use crate::{Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read, Seek};
