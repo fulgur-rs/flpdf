@@ -6031,9 +6031,12 @@ mod tests {
     fn show_pages_writes_each_logical_line_incrementally() {
         let chunks = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         let logger = QPDFLogger::create();
-        logger.set_info(Some(PipelineHandle::new(ChunkRecordingSink {
+        let mut sink = ChunkRecordingSink {
             chunks: Arc::clone(&chunks),
-        })));
+        };
+        assert_eq!(sink.identifier(), "chunk recording sink");
+        sink.finish().unwrap();
+        logger.set_info(Some(PipelineHandle::new(sink)));
         let mut pdf = Pdf::open_mem_owned(
             include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         )
