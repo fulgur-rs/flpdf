@@ -378,39 +378,36 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
 /// [`decode_params_from_handle`] for the one `/DecodeParms` handle a non-null,
 /// non-array value replicates across the whole chain.
 ///
-/// **Why not [`decode_params_from_handle`] in a loop.** That function reaches
-/// [`ObjectHandle::try_as_dictionary`], which hands back a *clone* of the whole
-/// `BTreeMap` — every key copied, plus one `Rc` bump per value, `ObjectHandle`
-/// being a newtype over one. Calling it once per filter turned an oversized
-/// `/DecodeParms` into one full snapshot per stage — measured, sixteen for a
-/// sixteen-filter chain — however few keys survive
-/// [`RETAINED_DECODE_PARAM_KEYS`], because the retention test runs inside the
-/// walk, after the snapshot. Nor was the stage count capped in general:
+/// **Why not [`decode_params_from_handle`] in a loop.** Consuming stages use
+/// [`decode_params_from_consuming_handle`]'s `try_get_keys` path per stage,
+/// without taking a raw-map snapshot. Non-consuming stages use
+/// [`decode_params_from_entries`]'s [`ObjectHandle::try_as_dictionary`] path,
+/// which hands back a *clone* of the whole `BTreeMap` — every key copied, plus
+/// one `Rc` bump per value, `ObjectHandle` being a newtype over one. Calling
+/// that route once per filter turned an oversized `/DecodeParms` into one full
+/// snapshot per stage — measured, sixteen for a sixteen-filter chain — however
+/// few keys survive [`RETAINED_DECODE_PARAM_KEYS`], because the retention test
+/// runs inside the walk, after the snapshot. Nor was the stage count capped in
+/// general:
 /// `max_filter_chain` bounds it only where [`crate::filters::DecodeLimits`]
 /// carries one. `DecodeLimits::default()` does, but the field is a `pub
 /// Option` a caller may set to `None`, which the entry-point corpus sweeps.
-/// Taking the snapshot here instead costs one whatever the chain length is,
-/// and the per-filter walk then borrows it.
+/// Taking the non-consuming snapshot here instead costs at most one whatever
+/// the chain length is, and those per-filter walks then borrow it.
 ///
 /// **The per-filter walk itself is deliberately kept.** qpdf calls
 /// `filter->setDecodeParms(decode_item)` once per filter
-/// (`libqpdf/QPDF_Stream.cc:467-482`), and `SF_FlateLzwDecode::setDecodeParms`
-/// answers each call with a fresh `decode_parms.getKeys()`
-/// (`libqpdf/SF_FlateLzwDecode.cc:29-31`), which copies every key string and
-/// tests `!isNull()` — a dereference — on every value, unrecognized keys
-/// included (`libqpdf/QPDF_Dictionary.cc:117-127`). Converting once and sharing
-/// the result between filters would stop touching per stage the objects qpdf
-/// touches per stage, and would additionally freeze what a *later*
-/// non-consuming filter classifies a value as; see
+/// (`libqpdf/QPDF_Stream.cc:467-482`). Each consuming call uses
+/// `decode_parms.getKeys()` followed by retained `getKey(key)` calls
+/// (`libqpdf/SF_FlateLzwDecode.cc:29-31`): `getKeys` resolves every child and
+/// omits nullish keys before retention, including unrecognized keys. flpdf
+/// follows that order through [`decode_params_from_consuming_handle`].
+///
+/// Non-consuming stages do not inspect children in qpdf. They instead borrow
+/// one shared raw-map snapshot, so a child resolved by an earlier consuming
+/// stage remains live for a later non-consuming stage; see
 /// [`param_value_without_resolving`] and
 /// `handle_reader_lets_a_later_stage_see_a_value_an_earlier_stage_resolved`.
-///
-/// **This bounds the gap; it does not close it.** For *n* consuming filters
-/// flpdf now takes 1 map snapshot where qpdf makes *n* key-set copies, and for
-/// *n* non-consuming ones 1 where qpdf makes 0 — `QPDFStreamFilter`'s base
-/// `setDecodeParms` is `return decode_parms.isNull();`
-/// (`libqpdf/QPDFStreamFilter.cc:3-7`) and copies nothing. The non-consuming
-/// residual is one snapshot rather than one per stage, not parity.
 ///
 /// The null test [`decode_params_from_handle`] opens with is deliberately not
 /// repeated here: this is reached only from
@@ -421,10 +418,23 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
 /// `handle_reader_reads_an_indirect_scalar_decode_parms_resolving_to_null_as_absent`
 /// pins.
 fn replicated_decode_params(params: &ObjectHandle, names: &[Vec<u8>]) -> Result<Vec<DecodeParams>> {
-    let entries = params.try_as_dictionary()?;
+    let entries = names
+        .iter()
+        .any(|name| !filter_reads_decode_params(name))
+        .then(|| params.try_as_dictionary())
+        .transpose()?;
     names
         .iter()
-        .map(|name| decode_params_from_entries(entries.as_ref(), name))
+        .map(|name| {
+            if filter_reads_decode_params(name) {
+                decode_params_from_consuming_handle(params, name)
+            } else {
+                decode_params_from_entries(
+                    entries.as_ref().and_then(|entries| entries.as_ref()),
+                    name,
+                )
+            }
+        })
         .collect()
 }
 
@@ -503,45 +513,54 @@ fn is_crypt_filter(filter_name: &[u8]) -> bool {
 
 /// Read a `/DecodeParms` value into [`DecodeParams`].
 ///
-/// `filter_name` is the filter this parameter set belongs to; the two
-/// decisions it settles are [`decode_params_from_entries`]'. One of them is
-/// whether an entry's value is dereferenced — which changes nothing for a
-/// direct value, because `ObjectHandle::try_dereference` short-circuits on a
-/// direct handle.
+/// `filter_name` determines whether this call follows qpdf's consuming
+/// `getKeys`/`getKey` reduction or a non-consuming stage borrows the shared
+/// raw dictionary snapshot.
 ///
-/// The two calls on `params` itself stay unconditional, because qpdf makes
-/// them for the position this reads: `QPDF_Stream::filterable` asks
-/// `decode_obj.isArray()` (`QPDF_Stream.cc:442`) before splitting the value
-/// per index, and the base `setDecodeParms` asks `decode_parms.isNull()`
-/// (`QPDFStreamFilter.cc:6`). Only `try_is_null` can resolve anything here
-/// anyway — `try_as_dictionary` runs on the slot it just resolved, and
-/// `try_dereference` is idempotent.
+/// `try_is_null` stays unconditional: qpdf's base `setDecodeParms` asks
+/// `decode_parms.isNull()` (`QPDFStreamFilter.cc:6`) for this array item.
+/// The consuming branch then lets `try_get_keys` resolve all children; only a
+/// non-consuming branch takes `try_as_dictionary`'s shared snapshot.
 ///
-/// **Only the `/DecodeParms` *array* arm reaches this.** A replicated scalar
-/// goes through [`replicated_decode_params`], which shares one dictionary
-/// snapshot across the chain instead of taking one per filter; see that
-/// function for why the per-filter *walk* stays and the per-filter *snapshot*
-/// does not.
+/// A replicated scalar goes through [`replicated_decode_params`], which calls
+/// [`decode_params_from_consuming_handle`] once per consuming stage and takes
+/// at most one shared snapshot for all non-consuming stages.
 ///
-/// The array arm keeps a known residual of the same shape: `/DecodeParms
-/// [5 0 R 5 0 R ...]`, one object repeated at every index, still snapshots
-/// that dictionary once per index. Reading each index separately is qpdf's
-/// own shape — it pushes `getArrayItem(i)` per index (`QPDF_Stream.cc:447-449`)
-/// and hands each to that filter's `setDecodeParms` — so only the snapshot is
-/// flpdf's cost, and collapsing it needs identity-keyed sharing this seam does
-/// not have. Left unfixed deliberately, not overlooked.
 fn decode_params_from_handle(params: &ObjectHandle, filter_name: &[u8]) -> Result<DecodeParams> {
     if params.try_is_null()? {
         return Ok(DecodeParams::Absent);
     }
+    if filter_reads_decode_params(filter_name) {
+        return decode_params_from_consuming_handle(params, filter_name);
+    }
     decode_params_from_entries(params.try_as_dictionary()?.as_ref(), filter_name)
 }
 
-/// One filter's read of an already-snapshotted `/DecodeParms` dictionary, or
-/// of `None` for a present non-dictionary — which yields `Present` with no
-/// entries, because it is `QPDFObjectHandle::getKeys` that treats a
-/// non-dictionary as empty (`QPDFObjectHandle.cc:997-1009`), not
-/// `setDecodeParms`.
+/// One consuming filter's qpdf-shaped `/DecodeParms` read.
+///
+/// `try_get_keys` resolves every child and omits nullish keys before this
+/// reader retains the bounded set. Retained values are then fetched with
+/// `try_get_key`, matching qpdf's `getKeys` then `getKey` order.
+fn decode_params_from_consuming_handle(
+    params: &ObjectHandle,
+    filter_name: &[u8],
+) -> Result<DecodeParams> {
+    let retains_crypt_name = is_crypt_filter(filter_name);
+    let mut retained = Vec::new();
+    for key in params.try_get_keys()? {
+        if !retains_decode_param_key(&key, retains_crypt_name) {
+            continue;
+        }
+        let value = params.try_get_key(&key)?;
+        let keeps_name = is_crypt_name_key(&key, retains_crypt_name);
+        retained.push((key, param_value_from_handle(&value, keeps_name)?));
+    }
+    Ok(DecodeParams::Present(retained))
+}
+
+/// One non-consuming filter's read of an already-snapshotted `/DecodeParms`
+/// dictionary. `None` is a present non-dictionary and yields `Present` with no
+/// entries. Non-consuming stages never resolve children.
 ///
 /// Borrowing rather than owning is what lets [`replicated_decode_params`] run
 /// this once per filter off a single snapshot. The children are the live
@@ -549,28 +568,6 @@ fn decode_params_from_handle(params: &ObjectHandle, filter_name: &[u8]) -> Resul
 /// is resolved for a later one too — the same thing that held when every stage
 /// re-snapshotted the dictionary, since `ObjectHandle::clone` shares the
 /// indirect slot.
-///
-/// **Which values are touched is decided before [`RETAINED_DECODE_PARAM_KEYS`],
-/// not after.** `SF_FlateLzwDecode::setDecodeParms` walks
-/// `decode_parms.getKeys()` (`SF_FlateLzwDecode.cc:29-31`), and
-/// `QPDF_Dictionary::getKeys` tests `!isNull()` on *every* value including the
-/// ones no filter names (`libqpdf/QPDF_Dictionary.cc:118-127`) — each of which
-/// dereferences. So a consuming filter resolves an unrecognized indirect value
-/// even though this function then drops it, which
-/// `handle_reader_resolves_an_unretained_decode_parms_value_for_a_filter_that_reads_them`
-/// pins. `try_is_null` is that `isNull`, called for the dereference rather
-/// than the answer; ordering the retention test ahead of it would silently
-/// stop touching objects qpdf touches once `flpdf-25kg.3.5` wires the
-/// resolver.
-///
-/// **The filter name settles two independent things here**, and they are not
-/// the same question. [`filter_reads_decode_params`] decides whether values
-/// are *dereferenced*, and tracks what qpdf's `setDecodeParms` overrides
-/// touch. [`is_crypt_filter`] decides whether `/Name` is *retained*, and
-/// tracks what flpdf's own consumers read — see
-/// [`CRYPT_RETAINED_DECODE_PARAM_KEY`]. The two coincide for every name except
-/// the consuming codecs (`/FlateDecode`, `/LZWDecode` and their
-/// abbreviations), which resolve values but keep no `/Name`.
 fn decode_params_from_entries(
     entries: Option<&BTreeMap<Vec<u8>, ObjectHandle>>,
     filter_name: &[u8],
@@ -578,26 +575,12 @@ fn decode_params_from_entries(
     let Some(entries) = entries else {
         return Ok(DecodeParams::Present(Vec::new()));
     };
-    let resolve_values = filter_reads_decode_params(filter_name);
     let retains_crypt_name = is_crypt_filter(filter_name);
-    let mut retained = Vec::new();
-    for (key, value) in entries {
-        if resolve_values {
-            // qpdf's `getKeys()` walk, whose answer this deliberately drops:
-            // the null-valued entry it would skip is `flpdf-h8mv`, unchanged
-            // here.
-            value.try_is_null()?;
-        }
-        if !retains_decode_param_key(key, retains_crypt_name) {
-            continue;
-        }
-        let value = if resolve_values {
-            param_value_from_handle(value, is_crypt_name_key(key, retains_crypt_name))?
-        } else {
-            param_value_without_resolving(value)
-        };
-        retained.push((key.clone(), value));
-    }
+    let retained = entries
+        .iter()
+        .filter(|(key, _)| retains_decode_param_key(key, retains_crypt_name))
+        .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
+        .collect();
     Ok(DecodeParams::Present(retained))
 }
 
@@ -619,7 +602,8 @@ fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<Par
     })
 }
 
-/// [`param_value_from_handle`] for a filter that never reads the entry.
+/// [`param_value_from_handle`] for a non-consuming filter that never reads an
+/// entry. It only classifies shared-snapshot children and never resolves them.
 ///
 /// Deliberately the shape of [`param_value_from_object`]: the same
 /// classification off the same non-resolving accessor, so a *direct* value
@@ -652,22 +636,24 @@ fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
     }
 }
 
-/// The `Object` shape reader's counterpart of [`decode_params_from_entries`].
+/// The legacy `Object` shape reader's counterpart of the handle reduction.
 ///
-/// `filter_name` settles only the retention half here: this reader resolves
-/// nothing, because an indirect value is an `Object::Reference` it classifies
-/// as [`ParamValue::Other`] without looking through (plan decision D1 of
-/// `flpdf-25kg.3.4`). The retention half must match the handle reader's
-/// exactly, or the two disagree on a shape the equivalence corpus compares;
-/// the corpus's "/Name under a filter that is not Crypt" row is the one that
-/// would catch a rule applied to only one of them.
+/// This reader resolves nothing, because an indirect value is an
+/// `Object::Reference` it classifies as [`ParamValue::Other`] without looking
+/// through (plan decision D1 of `flpdf-25kg.3.4`). `filter_name` decides both
+/// whether qpdf's filter enumerates entries — and therefore whether direct
+/// `Object::Null` values are omitted — and whether `/Name` is retained for
+/// `Crypt`. References and every other non-null shape remain
+/// `ParamValue::Other` when retained.
 fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> DecodeParams {
+    let omits_null_values = filter_reads_decode_params(filter_name);
     let retains_crypt_name = is_crypt_filter(filter_name);
     match params {
         None | Some(Object::Null) => DecodeParams::Absent,
         Some(object) => DecodeParams::Present(match object.as_dict() {
             Some(dict) => dict
                 .iter()
+                .filter(|(_, value)| !omits_null_values || !matches!(value, Object::Null))
                 .filter(|(key, _)| retains_decode_param_key(key, retains_crypt_name))
                 .map(|(key, value)| {
                     let keeps_name = is_crypt_name_key(key, retains_crypt_name);
@@ -1033,12 +1019,12 @@ impl FlateLzwStreamFilter {
 /// [`ParamValue`] is the other half, and it is what makes this a bound rather
 /// than a bound on one key.
 ///
-/// **Retention is not resolution.** [`decode_params_from_entries`] still
-/// dereferences every value a consuming filter's `getKeys()` walk touches,
-/// including the ones dropped here; see its own comment for why. Nor does
-/// retention bound the *snapshot* the walk runs over — that is
-/// [`replicated_decode_params`]' job, because the retention test runs inside
-/// the walk, after `try_as_dictionary` has already cloned the map.
+/// **Retention is not resolution.** A consuming stage first calls
+/// [`decode_params_from_consuming_handle`], whose `try_get_keys` resolves every
+/// child and omits nullish keys before this retained-key bound applies. A
+/// non-consuming stage instead uses [`decode_params_from_entries`] over the
+/// shared snapshot and resolves no children. The former closes the
+/// `flpdf-h8mv` null-key divergence without widening either retained set.
 const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
     b"BitsPerComponent",
     b"Colors",
@@ -1090,9 +1076,9 @@ fn retains_decode_param_key(key: &[u8], retains_crypt_name: bool) -> bool {
 ///
 /// `retains_crypt_name` is redundant with the key test at every present call
 /// site, since `/Name` is retained only under `Crypt`. It is passed anyway:
-/// the classification runs inside [`decode_params_from_entries`]' walk, after
-/// the retention test rather than as part of it, and a future reordering would
-/// otherwise make this silently start owning payloads under every filter.
+/// consuming classification runs after `try_get_keys` filters nullish keys and
+/// after this retention test; a future reordering must not start owning
+/// payloads under every filter.
 fn is_crypt_name_key(key: &[u8], retains_crypt_name: bool) -> bool {
     retains_crypt_name && key == CRYPT_RETAINED_DECODE_PARAM_KEY
 }
@@ -1721,12 +1707,11 @@ pub(crate) mod tests {
     /// [`RETAINED_DECODE_PARAM_KEYS`] drops entirely.
     ///
     /// `/Whatever` carries the same `Object::Null` as the `/Predictor` above
-    /// it, which survives as `Other`. Only the key differs, so the assertion
-    /// separates "dropped because unread" from "kept but classified as
-    /// `Other`". That second row is also `flpdf-h8mv`'s shape, retained
-    /// unchanged by this filter — what it goes on to *do* is asserted by
-    /// `filters::tests::non_integer_decode_params_values_remain_unfilterable`
-    /// and by the corpus's "null-valued /DecodeParms key" row, not here.
+    /// it, which is omitted before bounded reduction. Only the key differs,
+    /// so the assertion separates "dropped because unread" from "dropped
+    /// because null". The public decode/encode behavior for this null-valued
+    /// row is asserted by `filters::tests::null_decode_params_values_are_omitted_before_decode_and_encode`
+    /// and by the corpus's "null-valued /DecodeParms key" row.
     ///
     /// **The filter is `/Crypt` so that `/Name` is in the retained set at all**
     /// ([`CRYPT_RETAINED_DECODE_PARAM_KEY`]); under `/FlateDecode` it would
@@ -1755,8 +1740,26 @@ pub(crate) mod tests {
                 (b"Colors".to_vec(), ParamValue::Int(i32::MIN)),
                 (b"Columns".to_vec(), ParamValue::Int(i32::MAX)),
                 (b"Name".to_vec(), ParamValue::Name(b"Identity".to_vec())),
-                (b"Predictor".to_vec(), ParamValue::Other),
             ]
+        );
+    }
+
+    #[test]
+    fn object_shape_reader_omits_null_valued_keys_before_retention() {
+        let specs = decode_filter_specs_from_object(
+            Some(&Object::Name(b"FlateDecode".to_vec())),
+            Some(&params(&[
+                ("Columns", Object::Integer(4)),
+                ("Predictor", Object::Null),
+                ("Unused", Object::Null),
+            ])),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
         );
     }
 
@@ -1964,15 +1967,16 @@ pub(crate) mod tests {
     /// name payload owned wherever it appears — this chain retained 16,777,584
     /// bytes. Filling only one slot would let the next forgotten slot pass.
     ///
-    /// **Both shape readers are measured**, because
-    /// `decode_params_from_object` and `decode_params_from_entries` decide
-    /// retention and classification separately. The corpus's "/Name under a
-    /// filter that is not Crypt" row does catch a rule applied to only one of
-    /// them — measured, forcing `decode_params_from_entries`' retention flag to
-    /// `true` reddens
+    /// **All three shape readers are measured**, because the legacy `Object`
+    /// route [`decode_params_from_object`], consuming handle route
+    /// [`decode_params_from_consuming_handle`], and non-consuming handle route
+    /// [`decode_params_from_entries`] apply retention and classification
+    /// separately. The corpus's "/Name under a filter that is not Crypt" row
+    /// catches a rule applied to only one of these routes — measured, forcing
+    /// the non-consuming handle route's retention gate to `true` reddens
     /// [`handle_reader_matches_object_reader_for_every_filter_shape`] naming
     /// exactly that row — but it is a *relative* gate and would stay green if
-    /// the rule were dropped from both readers together. This test is the
+    /// the rule were dropped from all three routes together. This test is the
     /// absolute one.
     ///
     /// Both a non-consuming and a consuming filter are measured, because they
@@ -2172,9 +2176,9 @@ pub(crate) mod tests {
             ),
             // Decision D4: qpdf's `QPDF_Dictionary::getKeys`
             // (`libqpdf/QPDF_Dictionary.cc:118-127`) skips every null-valued
-            // entry, so qpdf tolerates this while flpdf rejects it. Both
-            // readers must keep flpdf's current behavior; the divergence is
-            // tracked as beads `flpdf-h8mv`, not fixed here.
+            // entry, so qpdf tolerates this. Both readers must preserve the
+            // qpdf-compatible success path; this row is tracked as beads
+            // `flpdf-h8mv`.
             (
                 "null-valued /DecodeParms key (flpdf-h8mv)",
                 Some(flate()),
@@ -2489,9 +2493,9 @@ pub(crate) mod tests {
     // looked" is not observable in the returned value alone.
     //
     // **What that does and does not pin.** A per-site mutation matrix,
-    // swapping each `try_*` in `decode_filter_specs_from_handle` and its four
-    // resolving helpers for its non-resolving twin one at a time, kills five of
-    // the fourteen sites:
+    // replacing each resolving access in `decode_filter_specs_from_handle` and
+    // its helpers with its non-resolving counterpart, one at a time, kills the
+    // following five positions:
     //
     // - `filter.try_is_null` —
     //   `handle_reader_reads_an_indirect_filter_resolving_to_null_as_no_filters`
@@ -2501,30 +2505,31 @@ pub(crate) mod tests {
     //   `handle_reader_reads_an_indirect_scalar_decode_parms_resolving_to_null_as_absent`
     // - `decode_params_from_handle`'s `try_is_null` —
     //   `handle_reader_dereferences_a_decode_parms_array_item_that_resolves_to_null`
-    // - `decode_params_from_entries`'s per-value `try_is_null` —
+    // - `decode_params_from_consuming_handle`'s `try_get_keys` —
     //   `handle_reader_resolves_an_unretained_decode_parms_value_for_a_filter_that_reads_them`
     //
-    // Seven survive as *already-resolved* sites, and that is not a bug:
+    // The accessor calls that remain survive as *already-resolved* sites, and
+    // that is not a bug:
     // `try_dereference` is idempotent, so `filter.try_as_name`/`try_as_array`,
-    // `decode_params.try_as_array`, both `try_as_dictionary` sites
-    // (`decode_params_from_handle`'s and `replicated_decode_params`'s), and
-    // `param_value_from_handle`'s `try_as_integer`/`try_as_name` each inspect a
-    // slot an earlier `try_*` at the same position already resolved, and behave
-    // identically to their non-resolving twins. `param_value_from_handle`'s
-    // pair is reached only with `resolve_values` set, where the per-value
-    // `try_is_null` above ran first.
+    // `decode_params.try_as_array`, the non-consuming `try_as_dictionary`
+    // snapshot sites, and `param_value_from_handle`'s
+    // `try_as_integer`/`try_as_name` each inspect a slot an earlier `try_*` at
+    // the same position already resolved, and behave identically to their
+    // non-resolving twins. `param_value_from_handle` is reached only after
+    // `try_get_keys` has resolved and filtered children.
     //
-    // The remaining two, `filter.try_array_len` and
-    // `decode_params.try_array_len`, have no non-resolving twin to swap in. The
+    // `filter.try_array_len` and `decode_params.try_array_len` have no
+    // non-resolving twin to swap in. The
     // equivalent mutation is deleting `try_dereference` from the accessor
     // itself, which likewise survives here and is killed instead by
     // `object_handle`'s own
     // `try_array_len_resolves_an_indirect_array_through_its_document`.
     //
-    // The matrix covers only those fourteen `try_*` sites. It says nothing
+    // The matrix covers only those resolving positions. It says nothing
     // about `param_value_without_resolving`, which has no `try_*` to mutate:
-    // the mutation that discriminates *it* is flipping `resolve_values` itself,
-    // which the paired tests above cover in both directions. Nor does it cover
+    // the mutation that discriminates *it* is routing a non-consuming stage
+    // through the consuming helper, which the paired tests above cover in both
+    // directions. Nor does it cover
     // *where* `replicated_decode_params` takes its one dictionary snapshot —
     // moving that call back inside the per-filter loop leaves the whole suite
     // green, because a snapshot count is not observable through any harness
@@ -2609,6 +2614,33 @@ pub(crate) mod tests {
                 (b"Columns".to_vec(), ParamValue::Int(4)),
                 (b"Predictor".to_vec(), ParamValue::Int(12)),
             ])
+        );
+    }
+
+    #[test]
+    fn handle_reader_omits_direct_indirect_and_missing_null_valued_keys() {
+        let (indirect_null, _resolver) = resolver_bearing_handle(ObjectValue::Null);
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(21, 0), -1);
+        missing.set_missing();
+        let parms = ObjectHandle::dictionary(vec![
+            (b"Columns".to_vec(), ObjectHandle::integer(4)),
+            (b"Predictor".to_vec(), ObjectHandle::null()),
+            (b"Colors".to_vec(), indirect_null.clone()),
+            (b"BitsPerComponent".to_vec(), missing.clone()),
+        ]);
+
+        let specs = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap();
+
+        assert!(indirect_null.is_resolved());
+        assert!(missing.is_resolved());
+        assert_eq!(
+            specs[0].decode_params,
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(4))])
         );
     }
 
@@ -2715,9 +2747,8 @@ pub(crate) mod tests {
         // `/FlateDecode` reports `(object 99 0, offset 342): expected n n obj`
         // while `/ASCIIHexDecode` says nothing about 99.
         //
-        // Moving the `retains_decode_param_key` test ahead of the
-        // `try_is_null` in `decode_params_from_handle` reddens this and
-        // nothing else.
+        // Replacing `try_get_keys` with raw dictionary enumeration leaves this
+        // unretained value unresolved and reddens this test.
         let (value, _resolver, calls) = logged_resolver_bearing_handle(ObjectValue::Integer(4));
         let parms = ObjectHandle::dictionary(vec![(b"Unused".to_vec(), value.clone())]);
 
@@ -2813,7 +2844,8 @@ pub(crate) mod tests {
         // (`try_get_key_resolves_the_same_indirect_slot_once`, `object_handle`).
         //
         // It is also what rules out the other shape this could have taken —
-        // converting once per distinct `resolve_values` and cloning the result
+        // converting once per distinct consuming/non-consuming group and
+        // cloning the result
         // between stages. That would hand `specs[2]` the `Other` computed for
         // `specs[0]`, changing the output for this input. Which of `Other` and
         // `Int(4)` a non-consuming stage gets is inert downstream: a filter
@@ -3015,6 +3047,25 @@ pub(crate) mod tests {
             specs[0].decode_params,
             DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Other)])
         );
+    }
+
+    #[test]
+    fn handle_reader_propagates_get_keys_errors_before_retention() {
+        let dropped = {
+            let (handle, resolver) = resolver_bearing_handle(ObjectValue::Integer(4));
+            drop(resolver);
+            handle
+        };
+        let parms = ObjectHandle::dictionary(vec![(b"Unused".to_vec(), dropped)]);
+
+        let error = decode_filter_specs_from_handle(
+            &ObjectHandle::name(b"FlateDecode".to_vec()),
+            &parms,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "object 20 0 belongs to a dropped PDF");
     }
 
     #[test]
