@@ -2169,13 +2169,15 @@ impl ObjectHandle {
             let old_value = {
                 let mut slot = self.0.borrow_mut();
                 match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
-                    ObjectState::Resolved(old_value) => old_value,
+                    ObjectState::Resolved(old_value) => Some(old_value),
                     ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
-                        return
+                        None
                     }
                 }
             };
-            self.detach_value_children(&old_value);
+            if let Some(old_value) = old_value {
+                self.detach_value_children(&old_value);
+            }
             let parent = self.containment_parent();
             for child in new_children {
                 Self::attach_child_to_parent(&child, &parent);
@@ -4842,6 +4844,33 @@ mod uniform_identity_tests {
         handle.replace_direct_value(ObjectValue::Integer(2));
 
         assert_eq!(handle.as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replacing_a_destroyed_direct_slot_attaches_nested_children_to_its_indirect_root() {
+        let resolver = resolver();
+        let root_ref = ObjectRef::new(57, 0);
+        let root = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            root_ref,
+            NO_PARSED_OFFSET,
+            95,
+            Rc::downgrade(&resolver),
+        );
+        let terminal = ObjectHandle::integer(1);
+        root.set_resolved(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+            (b"Terminal".to_vec(), terminal.clone()),
+        ])));
+        terminal.promote_to_indirect(ObjectRef::new(58, 0), 96, Rc::downgrade(&resolver));
+        terminal.disconnect();
+
+        let leaf = ObjectHandle::integer(2);
+        terminal.replace_direct_value(ObjectValue::Dictionary(
+            [(b"Nested".to_vec(), ObjectHandle::array(vec![leaf.clone()]))]
+                .into_iter()
+                .collect(),
+        ));
+
+        assert_eq!(leaf.containing_object_refs_for_pdf(95), vec![root_ref]);
     }
 
     #[test]
