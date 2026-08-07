@@ -1,40 +1,13 @@
 //! qpdf correspondence: Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
-//
-// Four states this port rejects with a `PipelineError::logic` instead of reproducing
-// qpdf, for two different reasons:
-//
-// 1. Memory-unsafe (never-defined in C++, so there is no byte sequence to match). Only
-//    one state is actually this: `Pl_SHA2::write` with `bits=0` (the uncommitted
-//    default, `resetBits` never called even once) dereferences a genuinely null
-//    `shared_ptr<QPDFCryptoImpl>` — the constructor only calls `resetBits` when
-//    `bits != 0`. A digest read before any `finish()` similarly reads uninitialized
-//    `SHA2_native::shaXXXsum` memory (those buffers have no default member initializer
-//    and are only ever written by `finalize()`). qpdf's own `libtests/sha2.cc` never
-//    exercises either (it always calls `resetBits` immediately before each use).
-// 2. Deterministic but unreplicable through this crate's public API. Two states land
-//    here, and — importantly — neither is memory-unsafe: `finish()` does not clear the
-//    crypto-provider pointer, so it stays alive and valid afterward.
-//    - A second `finish()`: `sph_sha2`'s `md_helper.c` close() helper states "The
-//      context is NOT reinitialized by this function" and leaves the running state
-//      (`sc->val`) and bit count (`sc->count`) untouched, so a repeat close()
-//      recompresses the identical reconstructed padding block on top of the
-//      already-finalized state via `RFUN`, producing a second, different digest.
-//    - `write()` reused after `finish()` without an intervening `resetBits()`: the same
-//      `sc->count`/`sc->buf` are still there, so new data gets buffered and compressed
-//      starting from the padding-contaminated state `finish()` left behind, again a
-//      deterministic but distinct result.
-//    Both are fully deterministic — not UB — but reproducing either exactly is
-//    impossible through `sha2`'s safe API for SHA-384 specifically: qpdf's
-//    `sph_sha384_close` truncates an 8×u64-word running state to a 48-byte (6-word)
-//    output (`sha2big.c`: `sha384_close(cc, dst, 6)`, vs. 8 for SHA-512), and
-//    `Sha384::finalize()` likewise only yields those 48 bytes — the other two words are
-//    gone, so there is no way to reconstruct the full state a recompression would need.
-//    (Even for 256/512, where the crate's public `compress256`/`compress512` exist, the
-//    leftover partial-block bytes below the padding are not exposed by the safe API
-//    either, so full replication isn't achievable without this pipeline buffering its
-//    own copy of up to one block of trailing input — which no real caller needs.)
-//    Rather than replicate two bit lengths and error only on 384, both states are
-//    rejected uniformly across all three.
+//!
+//! qpdf's native SHA2 close functions reinitialize the selected context after finalize
+//! (`sha2.c:670-673`, `sha2big.c:209-228`). This port mirrors that lifecycle with
+//! `Digest::finalize_reset`: a repeated `finish()` digests an empty cycle, and the first
+//! `write()` after `finish()` starts a fresh cycle with the same bit size.
+//!
+//! The uncommitted `bits=0` write/finish paths would dereference qpdf's null crypto
+//! provider, and digest access before the first `finish()` would read its uninitialized
+//! result buffer. Rust translates those memory-unsafe states into defined logic errors.
 use super::{Pipeline, PipelineError, PipelineResult};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
@@ -64,11 +37,13 @@ impl Sha2Digest {
         }
     }
 
-    fn finalize(self) -> Vec<u8> {
+    fn finalize_and_reset(&mut self) -> Vec<u8> {
+        // qpdf's native close functions return the digest and reinitialize the same
+        // selected context (`sha2.c:670-673`, `sha2big.c:209-228`).
         match self {
-            Self::Bits256(hasher) => hasher.finalize().to_vec(),
-            Self::Bits384(hasher) => hasher.finalize().to_vec(),
-            Self::Bits512(hasher) => hasher.finalize().to_vec(),
+            Self::Bits256(hasher) => hasher.finalize_reset().to_vec(),
+            Self::Bits384(hasher) => hasher.finalize_reset().to_vec(),
+            Self::Bits512(hasher) => hasher.finalize_reset().to_vec(),
         }
     }
 }
@@ -141,16 +116,9 @@ impl Pipeline for PlSha2<'_> {
             Some(digest) => digest,
             None => {
                 let identifier = &self.identifier;
-                let message = if self.raw_digest.is_some() {
-                    format!(
-                        "{identifier}: Pl_SHA2: write() reuse after finish() without resetBits() is not reproducible"
-                    )
-                } else {
-                    format!(
-                        "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
-                    )
-                };
-                return Err(PipelineError::logic(message));
+                return Err(PipelineError::logic(format!(
+                    "{identifier}: Pl_SHA2: write() called before resetBits() selected a digest size"
+                )));
             }
         };
         self.in_progress = true;
@@ -167,17 +135,12 @@ impl Pipeline for PlSha2<'_> {
         if let Some(next) = self.next.as_deref_mut() {
             next.finish()?;
         }
-        if let Some(digest) = self.digest.take() {
-            self.raw_digest = Some(digest.finalize());
+        if let Some(digest) = self.digest.as_mut() {
+            self.raw_digest = Some(digest.finalize_and_reset());
             self.in_progress = false;
             return Ok(());
         }
         let identifier = &self.identifier;
-        if self.raw_digest.is_some() {
-            return Err(PipelineError::logic(format!(
-                "{identifier}: Pl_SHA2: repeated finish() is not reproducible without resetBits()"
-            )));
-        }
         Err(PipelineError::logic(format!(
             "{identifier}: Pl_SHA2: finish() called before resetBits() selected a digest size"
         )))
@@ -402,26 +365,40 @@ mod tests {
         );
     }
 
-    /// qpdf's `Pl_SHA2::finish` forwards to `next` on every call including repeats
-    /// (unconditional, verified against `next.finish()` running before any digest
-    /// state is touched), but a second `finish()`'s digest is genuinely different
-    /// from the first (see module doc: `sph_sha2`'s close() recompresses the same
-    /// padding block onto the already-finalized state) and unreplicable for
-    /// SHA-384 through this crate's public API, so the digest itself is rejected.
     #[test]
-    fn repeated_finish_forwards_to_next_each_time_but_rejects_the_second_digest() {
-        let mut sink = RecordingSink::default();
-        {
-            let mut sha2 = PlSha2::new("sha2", Some(&mut sink as &mut dyn Pipeline), 256).unwrap();
-            sha2.write(b"abc").unwrap();
-            sha2.finish().unwrap();
-            let error = sha2.finish().unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "sha2: Pl_SHA2: repeated finish() is not reproducible without resetBits()"
-            );
+    fn repeated_finish_starts_an_empty_cycle_and_forwards_each_time() {
+        let cases = [
+            (
+                256,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                384,
+                "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1d\
+                 a274edebfe76f65fbd51ad2f14898b95b",
+            ),
+            (
+                512,
+                "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9\
+                 ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+            ),
+        ];
+
+        for (bits, expected) in cases {
+            let mut sink = RecordingSink::default();
+            let second_digest;
+            {
+                let mut sha2 =
+                    PlSha2::new("sha2", Some(&mut sink as &mut dyn Pipeline), bits).unwrap();
+                sha2.write(b"abc").unwrap();
+                sha2.finish().unwrap();
+                sha2.finish().unwrap();
+                second_digest = sha2.get_hex_digest().unwrap();
+            }
+
+            assert_eq!(second_digest, expected);
+            assert_eq!(sink.finishes, 2);
         }
-        assert_eq!(sink.finishes, 2);
     }
 
     struct WriteFaultSink;
@@ -624,20 +601,33 @@ mod tests {
         );
     }
 
-    // ── deterministic-but-unreplicable safety (the crypto provider stays alive and
-    //    valid after `finish()` — not null, not stale — but reproducing what it would
-    //    deterministically compute next is unreachable through the crate's public API
-    //    for SHA-384; see module doc §2.) ─────────────────────────────────────────────
-
     #[test]
-    fn write_after_finish_without_reset_bits_is_rejected() {
-        let mut sha2 = PlSha2::new("sha2-stage", None, 256).unwrap();
-        sha2.write(b"abc").unwrap();
-        sha2.finish().unwrap();
-        let error = sha2.write(b"more").unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "sha2-stage: Pl_SHA2: write() reuse after finish() without resetBits() is not reproducible"
-        );
+    fn write_after_finish_starts_a_fresh_cycle_with_the_same_bit_size() {
+        let cases = [
+            (
+                256,
+                "cb8379ac2098aa165029e3938a51da0bcecfc008fd6795f401178647f96c5b34",
+            ),
+            (
+                384,
+                "180c325cccb299e76ec6c03a5b5a7755af8ef499906dbf531f18d0ca509e4871\
+                 b0805cac0f122b962d54badc6119f3cf",
+            ),
+            (
+                512,
+                "40a855bf0a93c1019d75dd5b59cd8157608811dd75c5977e07f3bc4be0cad98\
+                 b22dde4db9ddb429fc2ad3cf9ca379fedf6c1dc4d4bb8829f10c2f0ee04a66663",
+            ),
+        ];
+
+        for (bits, expected) in cases {
+            let mut sha2 = PlSha2::new("sha2-stage", None, bits).unwrap();
+            sha2.write(b"abc").unwrap();
+            sha2.finish().unwrap();
+            sha2.write(b"def").unwrap();
+            sha2.finish().unwrap();
+
+            assert_eq!(sha2.get_hex_digest().unwrap(), expected);
+        }
     }
 }
