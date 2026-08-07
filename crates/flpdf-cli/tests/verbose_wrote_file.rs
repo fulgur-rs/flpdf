@@ -1,7 +1,7 @@
 //! End-to-end CLI test for `--verbose` "wrote file" completion line.
 //!
 //! qpdf `--verbose` prints `qpdf: wrote file <output-path>` after a successful
-//! rewrite. flpdf-cli emits `flpdf: wrote file <path>` to stderr; the
+//! rewrite. flpdf-cli emits `flpdf: wrote file <path>` through logger info; the
 //! flpdf-qtest shim normalizes the prefix. This is the second verbose line
 //! flpdf-9hc.16.12 adds to reach parity with qpdf's uo-1..uo-5, uo-7 goldens.
 
@@ -32,10 +32,11 @@ fn verbose_prints_wrote_file_line() {
         .args(["rewrite", "--static-id", "--verbose", &input, &out_path])
         .assert()
         .success()
-        .stderr(predicate::str::contains(format!(
+        .stdout(predicate::str::contains(format!(
             "flpdf: wrote file {}\n",
             out_path
-        )));
+        )))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -60,10 +61,11 @@ fn verbose_prints_wrote_file_line_after_linearized_rewrite() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains(format!(
+        .stdout(predicate::str::contains(format!(
             "flpdf: wrote file {}\n",
             out_path
-        )));
+        )))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -77,5 +79,6 @@ fn no_verbose_does_not_print_wrote_file() {
         .args(["rewrite", "--static-id", &input, out.to_str().unwrap()])
         .assert()
         .success()
+        .stdout(predicate::str::contains("wrote file").not())
         .stderr(predicate::str::contains("wrote file").not());
 }

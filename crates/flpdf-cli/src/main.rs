@@ -6,6 +6,7 @@ use flpdf::filespec_helper::ascii_filename_fallback;
 use flpdf::job::{
     write_json, JsonJobError, JsonJobOptions, JsonJobOutput, JsonStreamData, UsageError,
 };
+use flpdf::pipeline::PipelineHandle;
 use flpdf::{
     acroform_field_prune::prune_acroform_after_subset,
     objr_obj_annot_p::drop_objr_obj_annot_dangling_p, outline_dest_remap::remap_outline_and_dests,
@@ -41,6 +42,21 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+struct PipelineWriter {
+    pipeline: PipelineHandle,
+}
+
+impl Write for PipelineWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.pipeline.write(data).map_err(std::io::Error::other)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // qpdf-compatible exit-code infrastructure (flpdf-9hc.23.2)
@@ -1923,25 +1939,27 @@ fn main() {
             // exit-2 path passes an empty message because the error diagnostics
             // were already printed in qpdf shape).
             if !exit_err.message.is_empty() {
-                eprintln!("{}: {}", progname(), exit_err.message);
+                // cov:ignore-start: no production CliExitError currently carries a non-empty message
+                emit_logger_error(format!("{}: {}\n", progname(), exit_err.message));
+                // cov:ignore-end
             }
             std::process::exit(exit_err.code.as_i32());
         }
         if let Some(usage_error) = error.downcast_ref::<UsageError>() {
             usage_exit(usage_error);
         }
-        eprintln!("{}: {error}", progname());
+        emit_logger_error(format!("{}: {error}\n", progname()));
         std::process::exit(2);
     }
 }
 
 fn usage_exit(error: &UsageError) -> ! {
     let who = progname();
-    eprintln!(
+    emit_logger_error(format!(
         "\n{who}: {error}\n\nFor help:\n  {who} --help=usage       usage information\n  \
 {who} --help=topic       help on a topic\n  {who} --help=--option    help on an option\n  \
-{who} --help             general help and a topic list\n"
-    );
+{who} --help             general help and a topic list\n\n"
+    ));
     std::process::exit(2);
 }
 
@@ -2016,6 +2034,14 @@ fn run_json(cli: &Cli) -> CliResult<()> {
         reject_same_json_output(input, output)?;
     }
 
+    // qpdf reserves standard output for binary/structured save data before
+    // opening the document, so warnings and later info cannot claim stdout.
+    let mut standard_output = if cli.json_output.is_none() {
+        Some(standard_save_writer()?)
+    } else {
+        None
+    };
+
     // 5. Open PDF once and retain an identity handle for the output check.
     let input_file = File::open(input).map_err(|error| json_input_open_error(input, error))?;
     let input_identity = input_file
@@ -2053,8 +2079,6 @@ fn run_json(cli: &Cli) -> CliResult<()> {
             }
         }
     } else {
-        let stdout = std::io::stdout();
-        let mut locked = stdout.lock();
         let options = JsonJobOptions {
             decode_level: DecodeLevel::Generalized,
             stream_data,
@@ -2062,7 +2086,15 @@ fn run_json(cli: &Cli) -> CliResult<()> {
             keys: &json_keys,
             objects: &json_objects,
         };
-        write_json(&mut pdf, options, JsonJobOutput::Stdout(&mut locked))
+        write_json(
+            &mut pdf,
+            options,
+            JsonJobOutput::Stdout(
+                standard_output
+                    .as_mut()
+                    .expect("stdout writer prepared for JSON stdout"),
+            ),
+        )
     };
     match json_result {
         Ok(()) => {}
@@ -2076,7 +2108,10 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     // processing warned. The document logger has already delivered every
     // warning; the snapshots here control only exit status and the summary.
     if had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start {
-        eprintln!("{}: operation succeeded with warnings", progname());
+        logger_warn(format!(
+            "{}: operation succeeded with warnings\n",
+            progname()
+        ))?; // cov:ignore: exercised by json warning subprocess integration tests
         return Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
             message: String::new(),
@@ -2098,18 +2133,15 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
             },
         ),
         Commands::CheckLinearization(cmd) => match check_linearization_path(&cmd.input) {
-            Ok(()) => {
-                println!("linearization OK");
-                Ok(())
-            }
+            Ok(()) => logger_info("linearization OK\n"),
             Err(LinearizationCheckError::NotLinearized) => {
-                eprintln!(
-                    "flpdf: not a linearized PDF: the first object in the file has no /Linearized key"
-                );
+                logger_error(
+                    "flpdf: not a linearized PDF: the first object in the file has no /Linearized key\n",
+                )?; // cov:ignore: exercised by check-linearization subprocess integration tests
                 std::process::exit(1);
             }
             Err(LinearizationCheckError::InvalidParam { message }) => {
-                eprintln!("flpdf: linearization check failed: {message}");
+                logger_error(format!("flpdf: linearization check failed: {message}\n"))?;
                 std::process::exit(1);
             }
             Err(LinearizationCheckError::Io(e)) => Err(e.to_string().into()),
@@ -2424,9 +2456,11 @@ fn run_check(
                 let warning = format!("WARNING: {location}{separator}{}\n", diagnostic.message);
                 cli_logger().warn(warning)?
             }
-            Severity::Error => {
-                eprintln!("{}: {location}: {}", progname(), diagnostic.message)
-            }
+            Severity::Error => logger_error(format!(
+                "{}: {location}: {}\n",
+                progname(),
+                diagnostic.message
+            ))?, // cov:ignore: exercised by check error subprocess integration tests
         }
     }
 
@@ -2456,7 +2490,7 @@ fn run_check(
     // summary is present whenever the document opened, which is implied by
     // `report.valid`; the `if let` is a defensive match.
     if let Some(summary) = &report.summary {
-        print_check_block(&input, summary);
+        print_check_block(&input, summary)?;
     }
 
     if has_warnings {
@@ -2464,7 +2498,10 @@ fn run_check(
         // but omits the trailing "No syntax ..." note. Pass an empty message so
         // main() does not emit a redundant "flpdf: ..." line.
         // qpdf 11.9.0 ends the warning-bearing run with this stderr summary.
-        eprintln!("{}: operation succeeded with warnings", progname());
+        logger_warn(format!(
+            "{}: operation succeeded with warnings\n",
+            progname()
+        ))?; // cov:ignore: exercised by check warning subprocess integration tests
         return Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
             message: String::new(),
@@ -2473,8 +2510,10 @@ fn run_check(
 
     // Clean — exit 0. qpdf closes a clean check with this two-line note; the
     // subject mirrors progname() so it is byte-identical under FLPDF_PROGNAME=qpdf.
-    println!("No syntax or stream encoding errors found; the file may still contain");
-    println!("errors that {} cannot detect", progname());
+    logger_info(format!(
+        "No syntax or stream encoding errors found; the file may still contain\nerrors that {} cannot detect\n",
+        progname()
+    ))?; // cov:ignore: exercised by clean check subprocess integration tests
     Ok(())
 }
 
@@ -2484,35 +2523,33 @@ fn run_check(
 /// `checking <file>` banner, header version, encryption status and
 /// linearization status. `<file>` is echoed verbatim as supplied on the command
 /// line (qpdf prints the argument, not a canonicalised path).
-fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) {
-    println!("checking {}", input.display());
+fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) -> CliResult<()> {
+    let mut output = format!("checking {}\n", input.display());
     // qpdf appends "extension level N" to the version when the catalog declares
     // an Adobe extension level (`/Extensions /ADBE /ExtensionLevel`).
     match summary.extension_level {
-        Some(level) => println!("PDF Version: {} extension level {level}", summary.version),
-        None => println!("PDF Version: {}", summary.version),
+        Some(level) => output.push_str(&format!(
+            "PDF Version: {} extension level {level}\n",
+            summary.version
+        )),
+        None => output.push_str(&format!("PDF Version: {}\n", summary.version)),
     }
     // Interim: encrypted files emit a single line. The detailed qpdf
     // `R = / P = / permission / method` block is tracked in flpdf-oox1.
-    println!(
-        "{}",
-        if summary.encrypted {
-            "File is encrypted"
-        } else {
-            "File is not encrypted"
-        }
-    );
+    output.push_str(if summary.encrypted {
+        "File is encrypted\n"
+    } else {
+        "File is not encrypted\n"
+    });
     // The linearization status reflects the structural detector (object (1,0)
     // only). qpdf-accurate detection — plus the entangled warning / exit-code /
     // trailing-line behaviour — is tracked in flpdf-u1ro.
-    println!(
-        "{}",
-        if summary.linearized {
-            "File is linearized"
-        } else {
-            "File is not linearized"
-        }
-    );
+    output.push_str(if summary.linearized {
+        "File is linearized\n"
+    } else {
+        "File is not linearized\n"
+    });
+    logger_info(output)
 }
 
 /// Wire `--encrypt` / `--copy-encryption-from` onto `options`, shared by the
@@ -3040,6 +3077,7 @@ fn run_rewrite(
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
 
     // Overlay/underlay stacking mutates page dictionaries and adds objects that
     // only surface on the full-rewrite path; the linearize path computes its
@@ -3124,12 +3162,16 @@ fn run_rewrite(
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
         doc.back_patch()?;
 
-        std::fs::write(&output, &doc.bytes)?;
-        if verbose {
-            eprintln!("flpdf: wrote file {}", output.display());
+        if let Some(writer) = standard_output.as_mut() {
+            writer.write_all(&doc.bytes)?; // cov:ignore: exercised by binary_linearized_pdf_dash subprocess integration test
+        } else {
+            std::fs::write(&output, &doc.bytes)?;
+        }
+        if verbose && standard_output.is_none() {
+            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
         if had_signatures {
-            eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
+            logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
         }
         // The linearize branch rejects encrypted input outright via
         // reject_encrypted_write above, so an encrypted (restricted) input
@@ -3333,34 +3375,39 @@ fn run_rewrite(
             // order across specs) is source-shared with apply_overlay_specs.
             if verbose {
                 let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
-                eprintln!("flpdf: processing underlay/overlay");
+                let mut message = String::from("flpdf: processing underlay/overlay\n");
                 for page in &report {
-                    eprintln!("  page {}", page.dest_page);
+                    message.push_str(&format!("  page {}\n", page.dest_page));
                     for src in &page.sources {
                         let file = &overlay_specs[src.spec_index].file;
                         let kind_str = match src.kind {
                             flpdf::OverlayKind::Underlay => "underlay",
                             flpdf::OverlayKind::Overlay => "overlay",
                         };
-                        eprintln!("    {} {} {}", file, kind_str, src.src_page);
+                        message.push_str(&format!("    {} {} {}\n", file, kind_str, src.src_page));
                     }
                 }
+                logger_info(message)?;
             }
 
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 
-        let mut out = File::create(&output)?;
-        write_pdf_with_options(&mut pdf, &mut out, &options)?;
+        if let Some(writer) = standard_output.as_mut() {
+            write_pdf_with_options(&mut pdf, writer, &options)?;
+        } else {
+            let mut out = File::create(&output)?;
+            write_pdf_with_options(&mut pdf, &mut out, &options)?;
+        }
 
-        if verbose {
-            eprintln!("flpdf: wrote file {}", output.display());
+        if verbose && standard_output.is_none() {
+            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
         if remove_restrictions && was_encrypted {
             eprintln!("flpdf: removed restrictions (encryption and advisory permissions stripped)");
         }
         if had_signatures {
-            eprintln!("flpdf: warning: removed signatures; signatures are now invalidated");
+            logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
         }
         // Unencrypted input + --remove-restrictions is a no-op rewrite
         // (exit 0, valid output, no diagnostic) — nothing was restricted,
@@ -4190,12 +4237,14 @@ fn run_page_extraction(
     // emit "y" unconditionally when the block fires. Both are documented
     // parity divergences.
     if verbose {
-        eprintln!("flpdf: selecting --keep-open-files=y");
+        let mut message = String::from("flpdf: selecting --keep-open-files=y\n");
         for path in &distinct {
             let fname = pages_progress_filename(path);
-            eprintln!("flpdf: {fname}: checking for shared resources");
-            eprintln!("flpdf: no shared resources found");
+            message.push_str(&format!(
+                "flpdf: {fname}: checking for shared resources\nflpdf: no shared resources found\n"
+            ));
         }
+        logger_info(message)?;
     }
 
     // CombinedPlan::from_specs opens each file itself; its per-input
@@ -4205,13 +4254,14 @@ fn run_page_extraction(
     let plan = CombinedPlan::from_specs(inputs.clone())?;
 
     if verbose {
-        eprintln!("flpdf: removing unreferenced pages from primary input");
+        let mut message = String::from("flpdf: removing unreferenced pages from primary input\n");
         for spec in &inputs {
-            eprintln!(
-                "flpdf: adding pages from {}",
+            message.push_str(&format!(
+                "flpdf: adding pages from {}\n",
                 pages_progress_filename(&spec.path)
-            );
+            ));
         }
+        logger_info(message)?;
     }
 
     let combined_pages = match page_ops.collate.as_deref() {
@@ -4341,18 +4391,19 @@ fn run_page_extraction(
 
         if verbose {
             let report = flpdf::overlay_verbose_report(&mut pdf, &mut built)?;
-            eprintln!("flpdf: processing underlay/overlay");
+            let mut message = String::from("flpdf: processing underlay/overlay\n");
             for page in &report {
-                eprintln!("  page {}", page.dest_page);
+                message.push_str(&format!("  page {}\n", page.dest_page));
                 for src in &page.sources {
                     let file = &overlay_specs[src.spec_index].file;
                     let kind_str = match src.kind {
                         flpdf::OverlayKind::Underlay => "underlay",
                         flpdf::OverlayKind::Overlay => "overlay",
                     };
-                    eprintln!("    {} {} {}", file, kind_str, src.src_page);
+                    message.push_str(&format!("    {} {} {}\n", file, kind_str, src.src_page));
                 }
             }
+            logger_info(message)?;
         }
 
         flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
@@ -4371,13 +4422,15 @@ fn run_page_extraction(
         let written = split_pages(bytes, n, output, options.deterministic_id)?;
         if verbose {
             for path in &written {
-                eprintln!("flpdf: wrote file {}", path.display());
+                // cov:ignore-start: exercised by verbose split-pages subprocess integration tests
+                logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
+                // cov:ignore-end
             }
         }
     } else {
         std::fs::write(output, &bytes)?;
         if verbose {
-            eprintln!("flpdf: wrote file {}", output.display());
+            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
     Ok(())
@@ -4468,13 +4521,15 @@ fn run_rewrite_with_page_ops(
         let written = split_pages(bytes, n, output, options.deterministic_id)?;
         if verbose {
             for path in &written {
-                eprintln!("flpdf: wrote file {}", path.display());
+                // cov:ignore-start: exercised by verbose split-pages subprocess integration tests
+                logger_info(format!("flpdf: wrote file {}\n", path.display()))?;
+                // cov:ignore-end
             }
         }
     } else {
         std::fs::write(output, &bytes)?;
         if verbose {
-            eprintln!("flpdf: wrote file {}", output.display());
+            logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
     }
     Ok(())
@@ -4570,6 +4625,7 @@ fn run_qdf(
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
+    let mut standard_output = prepare_pdf_standard_output(&output)?;
     let mut pdf = open_pdf(&input, repair, password)?;
     reject_encrypted_write(&pdf)?;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
@@ -4581,8 +4637,12 @@ fn run_qdf(
     let mut options = WriteOptions::default();
     options.qdf = true;
     options.full_rewrite = true;
-    let mut out = File::create(output)?;
-    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    if let Some(writer) = standard_output.as_mut() {
+        write_pdf_with_options(&mut pdf, writer, &options)?; // cov:ignore: exercised by binary_qdf_dash subprocess integration test
+    } else {
+        let mut out = File::create(output)?;
+        write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    }
     finish_lazy_warnings(&input, &pdf, diagnostics_start)
 }
 
@@ -4707,7 +4767,8 @@ fn run_dump_object(
 
         let mut out = Vec::new();
         object.write_pdf(&mut out);
-        println!("{}", String::from_utf8_lossy(&out));
+        out.push(b'\n');
+        logger_info(out)?;
     }
 
     finish_lazy_warnings(&input, &pdf, diagnostics_start)
@@ -4740,8 +4801,7 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
             if let Some(path) = cmd.out.as_ref() {
                 std::fs::write(path, &stream.data)?;
             } else {
-                std::io::stdout().write_all(&stream.data)?;
-                std::io::stdout().flush()?;
+                standard_save_writer()?.write_all(&stream.data)?;
             }
             return Ok(());
         }
@@ -4777,8 +4837,7 @@ fn run_show_stream(cmd: ShowStreamCommand) -> CliResult<()> {
         if let Some(path) = cmd.out.as_ref() {
             std::fs::write(path, bytes)?;
         } else {
-            std::io::stdout().write_all(&bytes)?;
-            std::io::stdout().flush()?;
+            standard_save_writer()?.write_all(&bytes)?;
         }
         Ok(())
     })();
@@ -4954,36 +5013,36 @@ fn run_show_npages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let pages = pages::page_refs(&mut pdf)?;
-    println!("{}", pages.len());
-    Ok(())
+    logger_info(format!("{}\n", pages.len()))
 }
 
 fn run_show_pages(input: Option<PathBuf>, repair: bool, password: &PasswordArgs) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let mut pdf = open_pdf(&input, repair, password)?;
     let page_refs = pages::page_refs(&mut pdf)?;
+    let mut output = String::new();
     for (index, page_ref) in page_refs.iter().enumerate() {
         let page = pdf.resolve_borrowed(*page_ref)?;
         let Object::Dictionary(dict) = page else {
             continue;
         };
 
-        println!("page {}: {}", index + 1, page_ref);
+        output.push_str(&format!("page {}: {}\n", index + 1, page_ref));
         if let Some(media_box) = dict.get("MediaBox") {
-            println!("  media-box: {}", object_to_pdf(media_box));
+            output.push_str(&format!("  media-box: {}\n", object_to_pdf(media_box)));
         }
         if let Some(resources) = dict.get("Resources") {
-            println!("  resources: {}", object_to_pdf(resources));
+            output.push_str(&format!("  resources: {}\n", object_to_pdf(resources)));
         }
         if let Some(contents) = dict.get("Contents") {
-            println!("  contents: {}", object_to_pdf(contents));
+            output.push_str(&format!("  contents: {}\n", object_to_pdf(contents)));
         }
         if let Some(rotate) = dict.get("Rotate") {
-            println!("  rotate: {}", object_to_pdf(rotate));
+            output.push_str(&format!("  rotate: {}\n", object_to_pdf(rotate)));
         }
     }
 
-    Ok(())
+    logger_info(output)
 }
 
 fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
@@ -4993,11 +5052,10 @@ fn run_show_linearization(input: Option<PathBuf>) -> CliResult<()> {
             // `dump` already ends with a trailing newline (the hint-table
             // dump, or qpdf's "<name> is not linearized" line). qpdf prints
             // both to stdout and exits 0; use print! to avoid a second LF.
-            print!("{dump}");
-            Ok(())
+            logger_info(dump)
         }
         Err(ShowLinearizationError::Malformed { message }) => {
-            eprintln!("flpdf: malformed linearization data: {message}");
+            logger_error(format!("flpdf: malformed linearization data: {message}\n"))?; // cov:ignore: exercised by malformed linearization subprocess integration test
             std::process::exit(ExitCode::Errors.as_i32());
         }
         Err(ShowLinearizationError::Io(e)) => Err(e.to_string().into()),
@@ -5150,10 +5208,7 @@ fn run_show_encryption_key(
 ) -> CliResult<()> {
     let pdf = open_pdf_for_inspection(input, repair, password)?;
     match pdf.encryption_file_key() {
-        Some(key) => {
-            println!("{}", hex_lower(&key));
-            Ok(())
-        }
+        Some(key) => logger_info(format!("{}\n", hex_lower(&key))),
         None => {
             // qpdf --show-encryption-key requires an encrypted file; exit 2.
             Err("file is not encrypted; no encryption key to show".into())
@@ -5174,41 +5229,42 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
     // case first.
     let mut pdf = open_pdf_for_inspection(input, repair, password)?;
     let Some(info) = pdf.encryption_info()? else {
-        println!("File is not encrypted");
-        return Ok(());
+        return logger_info("File is not encrypted\n");
     };
+
+    let mut output = String::new();
 
     // ── flpdf-specific leading lines (placed BEFORE the qpdf block so a
     //    qpdf-compatible grep still matches the qpdf lines verbatim) ──
-    println!("V = {}", info.v);
-    println!("Length = {}", info.length_bits);
-    println!("Filter = {}", info.filter);
-    println!(
-        "EncryptMetadata = {}",
+    output.push_str(&format!("V = {}\n", info.v));
+    output.push_str(&format!("Length = {}\n", info.length_bits));
+    output.push_str(&format!("Filter = {}\n", info.filter));
+    output.push_str(&format!(
+        "EncryptMetadata = {}\n",
         if info.encrypt_metadata {
             "true"
         } else {
             "false"
         }
-    );
+    ));
     let mut cf_names: Vec<_> = info.named_crypt_filters.clone();
     cf_names.sort();
     for (name, method) in &cf_names {
-        println!("CF /{name} = {method}");
+        output.push_str(&format!("CF /{name} = {method}\n"));
     }
 
     // ── Verbatim qpdf `--show-encryption` lines (source:
     //    qpdf libqpdf/QPDFJob.cc QPDFJob::showEncryption) ──
-    println!("R = {}", info.r);
-    println!("P = {}", info.permissions.raw());
+    output.push_str(&format!("R = {}\n", info.r));
+    output.push_str(&format!("P = {}\n", info.permissions.raw()));
     // qpdf prints `User password = <recovered cleartext>` here; flpdf does
     // not recover the cleartext user password (documented divergence), so
     // that line is intentionally omitted.
     if pdf.owner_password_matched() {
-        println!("Supplied password is owner password");
+        output.push_str("Supplied password is owner password\n"); // cov:ignore: exercised by show-encryption subprocess integration tests
     }
     if pdf.user_password_matched() {
-        println!("Supplied password is user password");
+        output.push_str("Supplied password is user password\n");
     }
 
     // qpdf's allow* booleans are revision-dependent. Replicate the exact
@@ -5229,23 +5285,47 @@ fn run_show_encryption(input: &PathBuf, repair: bool, password: &PasswordArgs) -
         && allow_modify_other
         && (r < 3 || (allow_modify_form && allow_modify_assembly));
     let show = |v: bool| if v { "allowed" } else { "not allowed" };
-    println!("extract for accessibility: {}", show(allow_accessibility));
-    println!("extract for any purpose: {}", show(allow_extract_all));
-    println!("print low resolution: {}", show(allow_print_low));
-    println!("print high resolution: {}", show(allow_print_high));
-    println!("modify document assembly: {}", show(allow_modify_assembly));
-    println!("modify forms: {}", show(allow_modify_form));
-    println!("modify annotations: {}", show(allow_modify_annotation));
-    println!("modify other: {}", show(allow_modify_other));
-    println!("modify anything: {}", show(allow_modify_all));
+    output.push_str(&format!(
+        "extract for accessibility: {}\n",
+        show(allow_accessibility)
+    ));
+    output.push_str(&format!(
+        "extract for any purpose: {}\n",
+        show(allow_extract_all)
+    ));
+    output.push_str(&format!(
+        "print low resolution: {}\n",
+        show(allow_print_low)
+    ));
+    output.push_str(&format!(
+        "print high resolution: {}\n",
+        show(allow_print_high)
+    ));
+    output.push_str(&format!(
+        "modify document assembly: {}\n",
+        show(allow_modify_assembly)
+    ));
+    output.push_str(&format!("modify forms: {}\n", show(allow_modify_form)));
+    output.push_str(&format!(
+        "modify annotations: {}\n",
+        show(allow_modify_annotation)
+    ));
+    output.push_str(&format!("modify other: {}\n", show(allow_modify_other)));
+    output.push_str(&format!("modify anything: {}\n", show(allow_modify_all)));
     if info.v >= 4 {
-        println!("stream encryption method: {}", info.stream_method);
-        println!("string encryption method: {}", info.string_method);
+        output.push_str(&format!(
+            "stream encryption method: {}\n",
+            info.stream_method
+        ));
+        output.push_str(&format!(
+            "string encryption method: {}\n",
+            info.string_method
+        ));
         // qpdf prints the embedded-file ("file") method; the no-/EFF fallback
         // to the stream method happens where `cf_file` is resolved, not here.
-        println!("file encryption method: {}", info.eff_method);
+        output.push_str(&format!("file encryption method: {}\n", info.eff_method));
     }
-    Ok(())
+    logger_info(output)
 }
 
 /// Lowercase hex encoding (qpdf `--show-encryption-key` format).
@@ -5322,10 +5402,10 @@ fn open_pdf_file_impl(
     // such warning for `--show-encryption[-key]`. On the normal path a weak
     // file only opens when the user did pass the flag, so the warning is apt.
     if pdf.uses_weak_crypto() && !force_allow_weak_crypto {
-        eprintln!(
-            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied",
+        logger_warn(format!(
+            "WARNING: {}: encrypted PDF uses weak crypto; processing because --allow-weak-crypto was supplied\n",
             input.display()
-        );
+        ))?; // cov:ignore: exercised by weak-crypto subprocess integration tests
     }
 
     Ok(pdf)
@@ -5368,6 +5448,46 @@ fn cli_logger() -> QPDFLogger {
     LOGGER.get_or_init(QPDFLogger::create).clone()
 }
 
+fn standard_save_writer() -> CliResult<PipelineWriter> {
+    standard_save_writer_for(&cli_logger())
+}
+
+fn standard_save_writer_for(logger: &QPDFLogger) -> CliResult<PipelineWriter> {
+    logger.save_to_standard_output(true)?;
+    Ok(PipelineWriter {
+        pipeline: logger.get_save()?,
+    })
+}
+
+fn prepare_pdf_standard_output(output: &Path) -> CliResult<Option<PipelineWriter>> {
+    if output.as_os_str() == "-" {
+        Ok(Some(standard_save_writer()?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn logger_info(data: impl AsRef<[u8]>) -> CliResult<()> {
+    cli_logger().info(data)?;
+    Ok(())
+}
+
+fn logger_warn(data: impl AsRef<[u8]>) -> CliResult<()> {
+    cli_logger().warn(data)?;
+    Ok(())
+}
+
+fn logger_error(data: impl AsRef<[u8]>) -> CliResult<()> {
+    cli_logger().error(data)?;
+    Ok(())
+}
+
+fn emit_logger_error(data: impl AsRef<[u8]>) {
+    if let Err(error) = cli_logger().error(data) {
+        eprintln!("flpdf: unable to write diagnostic: {error}"); // cov:ignore: last-resort path after the standard error sink itself fails
+    }
+}
+
 fn configure_document_logger(options: &mut PdfOpenOptions, input: &Path) {
     options.logger = Some(cli_logger());
     options.description = input.display().to_string();
@@ -5405,29 +5525,34 @@ fn finish_lazy_warnings<R: Read + Seek>(
     if pdf.repair_diagnostics().entries().len() == diagnostics_start {
         return Ok(());
     }
-    eprintln!("{}: operation succeeded with warnings", progname());
+    logger_warn(format!(
+        "{}: operation succeeded with warnings\n",
+        progname()
+    ))?; // cov:ignore: exercised by lazy-warning subprocess integration tests
     Err(Box::new(CliExitError {
         code: ExitCode::Warnings,
         message: String::new(),
     }))
 }
 
-fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) {
+fn emit_content_normalization_warnings(input: &Path, last_token_was_bad: bool) -> CliResult<()> {
     let location = diagnostic_location(input, None);
-    eprintln!("WARNING: {location}: content normalization encountered bad tokens");
+    let mut message =
+        format!("WARNING: {location}: content normalization encountered bad tokens\n");
     if last_token_was_bad {
-        eprintln!(
+        message.push_str(&format!(
             "WARNING: {location}: normalized content ended with a bad token; \
              you may be able to resolve this by coalescing content streams in \
              combination with normalizing content. From the command line, \
-             specify --coalesce-contents"
-        );
+             specify --coalesce-contents\n"
+        ));
     }
-    eprintln!(
+    message.push_str(&format!(
         "WARNING: {location}: Resulting stream data may be corrupted but is may \
          still useful for manual inspection. For more information on this \
-         warning, search for content normalization in the manual."
-    );
+         warning, search for content normalization in the manual.\n"
+    ));
+    logger_warn(message)
 }
 
 fn finish_rewrite_warnings<R: Read + Seek>(
@@ -5438,15 +5563,18 @@ fn finish_rewrite_warnings<R: Read + Seek>(
 ) -> CliResult<()> {
     let has_lazy = pdf.repair_diagnostics().entries().len() != diagnostics_start;
     for &last_bad in normalization_last_bad {
-        emit_content_normalization_warnings(input, last_bad);
+        emit_content_normalization_warnings(input, last_bad)?;
     }
     if !normalization_last_bad.is_empty() {
-        eprintln!(
-            "{}: operation succeeded with warnings; resulting file may have some problems",
+        logger_warn(format!(
+            "{}: operation succeeded with warnings; resulting file may have some problems\n",
             progname()
-        );
+        ))?; // cov:ignore: exercised by normalization-warning subprocess integration tests
     } else if has_lazy {
-        eprintln!("{}: operation succeeded with warnings", progname());
+        logger_warn(format!(
+            "{}: operation succeeded with warnings\n",
+            progname()
+        ))?; // cov:ignore: exercised by lazy rewrite-warning subprocess integration tests
     } else {
         return Ok(());
     }
@@ -5766,8 +5894,8 @@ fn run_list_attachments(
     // file name (QPDFJob::doListAttachments), so that branch stays with the
     // caller that knows the name.
     match format_attachment_list(&mut pdf, verbose)? {
-        Some(listing) => std::io::stdout().write_all(&listing)?,
-        None => println!("{} has no embedded files", input.display()),
+        Some(listing) => logger_info(listing)?,
+        None => logger_info(format!("{} has no embedded files\n", input.display()))?,
     }
     Ok(())
 }
@@ -5781,6 +5909,11 @@ fn run_show_attachment(
     out_path: Option<PathBuf>,
 ) -> CliResult<()> {
     let input = input.ok_or("--show-attachment: missing input PDF")?;
+    let mut standard_output = if out_path.is_none() {
+        Some(standard_save_writer()?)
+    } else {
+        None
+    };
     let mut pdf = open_pdf(&input, repair, password)?;
     let bytes = extract_attachment(&mut pdf, key.as_bytes()).map_err(|e| {
         format!(
@@ -5792,8 +5925,10 @@ fn run_show_attachment(
         std::fs::write(&path, &bytes)
             .map_err(|e| format!("--show-attachment: cannot write to {:?}: {e}", path))?;
     } else {
-        std::io::stdout().write_all(&bytes)?;
-        std::io::stdout().flush()?;
+        standard_output
+            .as_mut()
+            .expect("stdout writer prepared for attachment output")
+            .write_all(&bytes)?;
     }
     Ok(())
 }
@@ -5844,6 +5979,19 @@ mod tests {
 
     fn strs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn standard_save_writer_rejects_stdout_after_info_use() {
+        let logger = QPDFLogger::create();
+        logger.info([]).unwrap();
+
+        let error = standard_save_writer_for(&logger).err().unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            "QPDFLogger: called setSave on standard output after standard output has already been used"
+        );
     }
 
     #[test]
