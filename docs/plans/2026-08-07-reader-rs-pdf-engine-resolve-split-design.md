@@ -251,6 +251,17 @@ reader.rs に残ったまま）。
   `collect_object_stream_chain`, header/startxref 探索, xref 読み取り
   （`xref.rs` の既存 API を呼ぶだけで xref.rs 自体は変更しない — 詳細は
   「非目標」参照）, `resolve_to_cache`, `native_parse_uncompressed_value` 等
+- **`read_object_at*` の file-object parsing 閉包もここに含める**:
+  `read_object_at_with_policy`(`reader.rs:2584-`) が呼ぶ
+  `read_bounded_object_window`(`reader.rs:2579-`、`private`)/
+  `parse_and_finish_file_object`(`reader.rs:2614-`、`private`) と、
+  後者が呼ぶ `resolve_pending_stream_length`(`reader.rs:2628-`、
+  `private`)。両者は `next_object_offset`(`reader.rs:2728-`、`private`)
+  を共有する。**別途 `pub fn source_stream_data_offset`
+  (`reader.rs:1093-`) が呼ぶ `parse_source_file_object_at`
+  (`reader.rs:1227-`、`private`) も同じ `next_object_offset` に依存する
+  ため、ここに含める**。含めないと file-object 解析の本体が reader.rs
+  に残ったまま、公開エントリポイントだけが移動することになる
 - **`resolve_compressed_entry` の圧縮オブジェクトストリーム parser 閉包も
   ここに含める**: `parse_object_stream_chain_entry`(`reader.rs:2938-`)
   が `object_stream_chain_member`(`reader.rs:2982-`、`private`) 経由で
