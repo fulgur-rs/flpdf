@@ -17,12 +17,19 @@ pub(crate) struct PlannedMember {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PlannedObjectStreamOrigin {
+    SourceBacked(ObjectRef),
+    Synthetic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlannedIndirectObject {
     Source {
         source: ObjectRef,
         output: ObjectRef,
     },
     ObjectStream {
+        origin: PlannedObjectStreamOrigin,
         output: ObjectRef,
         members: Vec<PlannedMember>,
     },
@@ -61,30 +68,26 @@ impl PlainWritePlan {
                 packing
                     .removed_refs
                     .extend(explicitly_removed.iter().copied());
-                for batch in &mut packing.batches {
-                    batch.retain(|member| !packing.removed_refs.contains(member));
+                for group in &mut packing.groups {
+                    group
+                        .members_mut()
+                        .retain(|member| !packing.removed_refs.contains(member));
                 }
-                packing.batches.retain(|batch| !batch.is_empty());
-                if packing.batches.is_empty() && !source_had_compressed_objects {
+                packing.groups.retain(|group| !group.members().is_empty());
+                if packing.groups.is_empty() && !source_had_compressed_objects {
                     let renumber =
                         CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?;
                     let mut placement = build_sources_from_catalog_first(renumber);
                     placement.removed_refs = explicitly_removed;
                     placement
                 } else {
-                    let renumber_groups: Vec<ObjectStreamGroup> = packing
-                        .batches
-                        .iter()
-                        .cloned()
-                        .map(|members| ObjectStreamGroup::Synthetic { members })
-                        .collect();
                     let renumber = ObjectStreamRenumber::build(
                         pdf,
-                        &renumber_groups,
+                        &packing.groups,
                         true,
                         &packing.removed_refs,
                     )?; // cov:ignore: qpdf packing and ObjectStreamRenumber share the same validated inputs
-                    build_container_aware(renumber, packing.batches, packing.removed_refs)?
+                    build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
             }
             ObjectStreamMode::Generate => {
@@ -107,7 +110,7 @@ impl PlainWritePlan {
                     true,
                     &compressible.removed_refs,
                 )?;
-                build_container_aware(renumber, groups, compressible.removed_refs)?
+                build_container_aware(renumber, renumber_groups, compressible.removed_refs)?
             }
         };
 
@@ -209,9 +212,22 @@ impl PlainWritePlan {
                     require_unique_source(&mut sources, *source)?;
                     require_matching_mapping(&self.old_to_new, *source, *output)?;
                 }
-                PlannedIndirectObject::ObjectStream { output, members } => {
+                PlannedIndirectObject::ObjectStream {
+                    origin,
+                    output,
+                    members,
+                } => {
                     has_object_stream = true;
                     require_unique_output(&mut outputs, *output)?;
+                    if let PlannedObjectStreamOrigin::SourceBacked(source) = origin {
+                        require_not_removed(
+                            &self.removed_refs,
+                            *source,
+                            "ObjStm source container",
+                        )?;
+                        require_unique_source(&mut sources, *source)?;
+                        require_matching_mapping(&self.old_to_new, *source, *output)?;
+                    }
                     for member in members {
                         require_not_removed(&self.removed_refs, member.source, "ObjStm member")?;
                         if member.output.generation != 0 {
@@ -330,17 +346,30 @@ fn build_sources_from_catalog_first(renumber: CatalogFirstRenumber) -> Placement
 
 fn build_container_aware(
     renumber: ObjectStreamRenumber,
-    groups: Vec<Vec<ObjectRef>>,
+    groups: Vec<ObjectStreamGroup>,
     removed_refs: BTreeSet<ObjectRef>,
 ) -> crate::Result<PlacementPlan> {
     let old_to_new: HashMap<ObjectRef, ObjectRef> = renumber
         .pairs()
         .map(|(output, source)| (source, output))
         .collect();
-    let member_sources: BTreeSet<ObjectRef> = groups.iter().flatten().copied().collect();
+    let member_sources: BTreeSet<ObjectRef> = groups
+        .iter()
+        .flat_map(ObjectStreamGroup::members)
+        .copied()
+        .collect();
+    let container_sources: BTreeSet<ObjectRef> = groups
+        .iter()
+        .filter_map(|group| match group {
+            ObjectStreamGroup::SourceBacked { source, .. } => Some(*source),
+            ObjectStreamGroup::Synthetic { .. } => None,
+        })
+        .collect();
     let mut objects: Vec<PlannedIndirectObject> = old_to_new
         .iter()
-        .filter(|(source, _)| !member_sources.contains(source))
+        .filter(|(source, _)| {
+            !member_sources.contains(source) && !container_sources.contains(source)
+        })
         .map(|(&source, &output)| PlannedIndirectObject::Source { source, output })
         .collect();
 
@@ -353,6 +382,7 @@ fn build_container_aware(
         })?;
         // cov:ignore-end
         let mut members: Vec<PlannedMember> = group
+            .members()
             .iter()
             .map(|&source| {
                 old_to_new
@@ -370,7 +400,14 @@ fn build_container_aware(
             })
             .collect::<crate::Result<Vec<_>>>()?;
         members.sort_unstable_by_key(|member| member.output.number);
+        let origin = match group {
+            ObjectStreamGroup::SourceBacked { source, .. } => {
+                PlannedObjectStreamOrigin::SourceBacked(*source)
+            }
+            ObjectStreamGroup::Synthetic { .. } => PlannedObjectStreamOrigin::Synthetic,
+        };
         objects.push(PlannedIndirectObject::ObjectStream {
+            origin,
             output: ObjectRef::new(container, 0),
             members,
         });
@@ -531,12 +568,35 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_source_and_source_backed_container_for_same_source() {
+        let container_source = ObjectRef::new(2, 0);
+        let mut plan = plan_for_test(vec![
+            source(1, 1),
+            source(2, 3),
+            PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::SourceBacked(container_source),
+                output: ObjectRef::new(2, 0),
+                members: Vec::new(),
+            },
+        ]);
+        plan.old_to_new
+            .insert(container_source, ObjectRef::new(3, 0));
+        plan.trailer.form = XrefForm::Stream;
+
+        let error = plan.validate().unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("source 2 0 R has multiple placements")));
+    }
+
+    #[test]
     fn validation_rejects_objstm_output_with_nonzero_generation() {
         let member = PlannedMember {
             source: ObjectRef::new(7, 1),
             output: ObjectRef::new(2, 1),
         };
         let plan = plan_for_test(vec![PlannedIndirectObject::ObjectStream {
+            origin: PlannedObjectStreamOrigin::Synthetic,
             output: ObjectRef::new(1, 0),
             members: vec![member],
         }]);
@@ -554,6 +614,7 @@ mod tests {
         let mut plan = plan_for_test(vec![
             source(1, 1),
             PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::Synthetic,
                 output: ObjectRef::new(3, 0),
                 members: vec![member],
             },
@@ -576,6 +637,7 @@ mod tests {
         let mut plan = plan_for_test(vec![
             source(1, 1),
             PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::Synthetic,
                 output: ObjectRef::new(3, 0),
                 members: vec![member],
             },
@@ -647,6 +709,7 @@ mod tests {
         let mut plan = plan_for_test(vec![
             source(1, 1),
             PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::Synthetic,
                 output: ObjectRef::new(3, 0),
                 members: vec![member],
             },
@@ -688,6 +751,7 @@ mod tests {
         let mut plan = plan_for_test(vec![
             source(1, 1),
             PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::Synthetic,
                 output: ObjectRef::new(3, 0),
                 members: vec![member],
             },
@@ -731,6 +795,7 @@ mod tests {
         let mut plan = plan_for_test(vec![
             source(1, 1),
             PlannedIndirectObject::ObjectStream {
+                origin: PlannedObjectStreamOrigin::Synthetic,
                 output: ObjectRef::new(3, 0),
                 members: vec![
                     PlannedMember {
@@ -932,15 +997,30 @@ mod tests {
             .objects
             .iter()
             .filter_map(|object| match object {
-                PlannedIndirectObject::ObjectStream { output, members } => {
-                    Some((*output, members.clone()))
-                }
+                PlannedIndirectObject::ObjectStream {
+                    origin,
+                    output,
+                    members,
+                } => Some((origin.clone(), *output, members.clone())),
                 _ => None,
             })
             .collect();
         assert_eq!(containers.len(), 1);
-        assert!(!containers[0].1.is_empty());
-        for member in &containers[0].1 {
+        assert_eq!(
+            containers[0].0,
+            PlannedObjectStreamOrigin::SourceBacked(ObjectRef::new(1, 0))
+        );
+        assert_eq!(
+            plan.old_to_new.get(&ObjectRef::new(1, 0)),
+            Some(&containers[0].1)
+        );
+        assert!(plan.objects.iter().all(|object| !matches!(
+            object,
+            PlannedIndirectObject::Source { source, .. }
+                if *source == ObjectRef::new(1, 0)
+        )));
+        assert!(!containers[0].2.is_empty());
+        for member in &containers[0].2 {
             assert_eq!(member.output.generation, 0);
         }
         assert_eq!(plan.trailer.form, XrefForm::Stream);
@@ -1012,15 +1092,23 @@ mod tests {
     #[test]
     fn generate_plan_even_splits_132_eligible_objects() {
         let plan = build("objstm-gen-nostream-130rev.pdf", ObjectStreamMode::Generate);
-        let sizes: Vec<usize> = plan
+        let containers: Vec<(PlannedObjectStreamOrigin, usize)> = plan
             .objects
             .iter()
             .filter_map(|object| match object {
-                PlannedIndirectObject::ObjectStream { members, .. } => Some(members.len()),
+                PlannedIndirectObject::ObjectStream {
+                    origin, members, ..
+                } => Some((origin.clone(), members.len())),
                 _ => None, // cov:ignore: this fixture deliberately packs every planned source
             })
             .collect();
-        assert_eq!(sizes, vec![66, 66]);
+        assert_eq!(
+            containers,
+            vec![
+                (PlannedObjectStreamOrigin::Synthetic, 66),
+                (PlannedObjectStreamOrigin::Synthetic, 66),
+            ]
+        );
         plan.validate().unwrap();
     }
 }

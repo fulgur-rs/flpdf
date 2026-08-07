@@ -69,7 +69,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                     .uncompressed
                     .insert(output.number, (output.generation, offset));
             }
-            PlannedIndirectObject::ObjectStream { output, members } => {
+            PlannedIndirectObject::ObjectStream {
+                output, members, ..
+            } => {
                 let mut resolved = Vec::with_capacity(members.len());
                 for member in members {
                     let mut object = pdf.resolve(member.source)?;
@@ -241,7 +243,9 @@ mod tests {
                             format!("{} {} obj\n", output.number, output.generation).as_bytes()
                         ));
                     }
-                    PlannedIndirectObject::ObjectStream { output, members } => {
+                    PlannedIndirectObject::ObjectStream {
+                        output, members, ..
+                    } => {
                         let (_, offset) = layout.uncompressed[&output.number];
                         assert!(bytes[offset..].starts_with(
                             format!("{} {} obj\n", output.number, output.generation).as_bytes()

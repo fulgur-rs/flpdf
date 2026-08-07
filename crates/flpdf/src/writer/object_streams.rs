@@ -242,20 +242,8 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
 /// are retained, and Preserve never applies Generate's 100-member cap. The
 /// traversal's operation-specific stale-generation removals are returned with
 /// the batches for the dedicated serializer.
-pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
-    pdf: &mut crate::Pdf<R>,
-) -> crate::Result<PackingPlan> {
-    let ctx = eligibility_context(pdf)?;
-    let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
-    let compressible = compressible_objgens_qpdf_plan(pdf)?;
-    let eligible: BTreeSet<ObjectRef> = compressible.eligible.iter().copied().collect();
-    let mut plan = plan_preserve(pdf, &ctx, &length_exclusions, Some(&eligible), None)?;
-    plan.removed_refs = compressible.removed_refs;
-    Ok(plan)
-}
-
 /// Build qpdf Preserve groups without discarding each source ObjStm identity.
-pub(crate) fn plan_qpdf_preserve_groups<R: std::io::Read + std::io::Seek>(
+pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<ObjectStreamPlan> {
     let ctx = eligibility_context(pdf)?;
@@ -1664,7 +1652,7 @@ mod tests {
         let mut pdf =
             crate::Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
 
-        let plan = plan_qpdf_preserve_groups(&mut pdf).unwrap();
+        let plan = plan_qpdf_preserve_object_streams(&mut pdf).unwrap();
 
         assert_eq!(
             plan.groups,
