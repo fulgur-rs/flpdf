@@ -29,11 +29,11 @@
 - Consumes: `ObjectHandle::as_stream_dict`, `ObjectHandle::replace_key`, `ObjectHandle::remove_key`, and the existing `Rc<Vec<u8>>` stream payload slot.
 - Produces: private `ObjectHandle::replace_filter_data(filter: Option<ObjectHandle>, decode_parms: Option<ObjectHandle>, length: usize)` and qpdf-compatible `ObjectHandle::replace_stream_data` length behavior.
 
-- [ ] **Step 1: Write failing zero-length tests**
+- [x] **Step 1: Write failing zero-length tests**
 
   Change `an_empty_payload_is_shared_like_any_other` to assert `!dict.has_key(b"Length")`. Add tests that start with existing and missing `/Length`, exercise repeated empty/non-empty replacement, and mutate a document-owned indirect stream.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
   Run:
 
@@ -44,7 +44,7 @@
 
   Expected: empty-buffer assertions fail because current code writes `/Length 0`; existing non-empty assertions remain green.
 
-- [ ] **Step 3: Implement the minimal shared boundary**
+- [x] **Step 3: Implement the minimal shared boundary**
 
   Add the private helper with the qpdf branch:
 
@@ -75,9 +75,9 @@
   }
   ```
 
-  In `replace_stream_data`, retain the stream guard and shared payload installation, then delegate dictionary mutation to this helper with `data.len()`.
+  In `replace_stream_data`, retain the shared payload installation, then delegate dictionary mutation and the non-stream guard to this helper with `data.len()`.
 
-- [ ] **Step 4: Verify GREEN and update correspondence docs**
+- [x] **Step 4: Verify GREEN and update correspondence docs**
 
   Run the two focused commands from Step 2 and the full `replace_stream_data` unit-test filter. Update the method rustdoc and the `QPDF_Stream::stream_data` correspondence annotation to record the shared zero/nonzero boundary.
 

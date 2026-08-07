@@ -1769,11 +1769,10 @@ impl ObjectHandle {
     /// are `Some` exactly where qpdf's own overload checks
     /// `QPDFObjectHandle::isInitialized()`: `Some` installs the key via
     /// [`Self::replace_key`], `None` leaves it untouched rather than
-    /// removing it. `/Length` is always set to `data`'s byte length —
-    /// qpdf's "unknown length, remove `/Length`" branch only applies to its
-    /// deferred-`StreamDataProvider` overloads, which this method does not
-    /// port (no caller in this crate needs deferred stream production). A
-    /// no-op if this handle's value is not a stream.
+    /// removing it. A zero byte length removes `/Length`; a nonzero length
+    /// installs the exact integer, matching qpdf's shared
+    /// `QPDF_Stream::replaceFilterData` boundary for buffer and provider
+    /// replacement. A no-op if this handle's value is not a stream.
     ///
     /// `data` is installed as given, not copied — qpdf's own
     /// `std::shared_ptr<Buffer>` overload is documented against its
@@ -1793,19 +1792,7 @@ impl ObjectHandle {
         filter: Option<ObjectHandle>,
         decode_parms: Option<ObjectHandle>,
     ) {
-        let Some(dict) = self.as_stream_dict() else {
-            return;
-        };
-        if let Some(filter) = filter {
-            dict.replace_key(b"Filter", filter);
-        }
-        if let Some(decode_parms) = decode_parms {
-            dict.replace_key(b"DecodeParms", decode_parms);
-        }
-        dict.replace_key(
-            b"Length",
-            ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
-        );
+        let length = data.len();
         self.with_value_mut(|v| {
             if let Some(ObjectValue::Stream {
                 stream_data: existing,
@@ -1815,6 +1802,35 @@ impl ObjectHandle {
                 *existing = Some(data);
             }
         });
+        self.replace_filter_data(filter, decode_parms, length);
+    }
+
+    /// Apply the filter and length dictionary mutations shared by qpdf's
+    /// buffer and provider `QPDF_Stream::replaceStreamData` overloads
+    /// (`libqpdf/QPDF_Stream.cc:640-684`).
+    fn replace_filter_data(
+        &self,
+        filter: Option<ObjectHandle>,
+        decode_parms: Option<ObjectHandle>,
+        length: usize,
+    ) {
+        let Some(dict) = self.as_stream_dict() else {
+            return;
+        };
+        if let Some(filter) = filter {
+            dict.replace_key(b"Filter", filter);
+        }
+        if let Some(decode_parms) = decode_parms {
+            dict.replace_key(b"DecodeParms", decode_parms);
+        }
+        if length == 0 {
+            dict.remove_key(b"Length");
+        } else {
+            dict.replace_key(
+                b"Length",
+                ObjectHandle::integer(i64::try_from(length).unwrap_or(i64::MAX)),
+            );
+        }
     }
 
     /// The stream's own dictionary handle if this handle's value — its own
@@ -5407,8 +5423,8 @@ mod stream_payload_sharing_tests {
     }
 
     // An empty payload is still a buffer, not an absent one: it is handed out
-    // and shared like any other, and replacing with one sets `/Length` to 0
-    // rather than leaving the previous length behind.
+    // and shared like any other. qpdf nevertheless treats its zero byte length
+    // as the unknown-length boundary and removes `/Length`.
     #[test]
     fn an_empty_payload_is_shared_like_any_other() {
         let shared = Rc::new(Vec::new());
@@ -5418,14 +5434,10 @@ mod stream_payload_sharing_tests {
 
         assert!(Rc::ptr_eq(&payload_of(&stream), &shared));
         assert!(Rc::ptr_eq(&payload_of(&stream.shallow_copy()), &shared));
-        assert_eq!(
-            stream
-                .as_stream_dict()
-                .expect("stream dict")
-                .get_key(b"Length")
-                .as_integer(),
-            Some(0),
-        );
+        assert!(!stream
+            .as_stream_dict()
+            .expect("stream dict")
+            .has_key(b"Length"));
     }
 }
 
@@ -8632,6 +8644,76 @@ mod mutation_tests {
             Some(37),
             "replaceStreamData changes the dictionary /Length, not the stored original length"
         );
+    }
+
+    #[test]
+    fn replace_stream_data_empty_buffer_removes_an_existing_length() {
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(37))]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: dict.clone(),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 37,
+        });
+
+        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+
+        assert!(!dict.has_key(b"Length"));
+    }
+
+    #[test]
+    fn replace_stream_data_empty_buffer_keeps_a_missing_length_absent() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: dict.clone(),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 3,
+        });
+
+        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+
+        assert!(!dict.has_key(b"Length"));
+    }
+
+    #[test]
+    fn replace_stream_data_repeated_empty_and_nonempty_calls_follow_the_length_boundary() {
+        let dict = ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]);
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: dict.clone(),
+            stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_length: 3,
+        });
+
+        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+        assert!(!dict.has_key(b"Length"));
+
+        stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
+        assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
+
+        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+        assert!(!dict.has_key(b"Length"));
+    }
+
+    #[test]
+    fn replace_stream_data_mutates_a_document_owned_indirect_stream_dictionary() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream_ref = ObjectRef::new(3, 0);
+        let mut dict = crate::Dictionary::new();
+        dict.insert("Length", crate::Object::Integer(3));
+        pdf.set_object(
+            stream_ref,
+            crate::Object::Stream(crate::Stream::new(dict, b"old".to_vec())),
+        );
+        let stream = pdf.get_object_handle(stream_ref);
+        stream.try_dereference().expect("document-owned stream");
+
+        stream.replace_stream_data(Rc::new(Vec::new()), None, None);
+
+        assert!(stream.is_indirect());
+        assert_eq!(stream.object_ref(), Some(stream_ref));
+        assert!(!stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .has_key(b"Length"));
     }
 
     #[test]
