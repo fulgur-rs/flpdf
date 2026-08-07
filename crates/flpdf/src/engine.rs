@@ -18,6 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 static NEXT_PDF_ID: AtomicU64 = AtomicU64::new(1);
+// Upper bound on read-to-end fallbacks during object resolution (see
+// `resolution_fallbacks_remaining`). Each fallback may scan to EOF, so the total
+// fallback work is bounded by this many file scans — O(file size), not the
+// quadratic cost an unbounded read-to-end per object would incur. 64 tolerates a
+// handful of corrupt/overlapping offsets in an otherwise valid file while still
+// defeating a flood of objects whose bodies run to EOF.
 const MAX_RESOLUTION_FALLBACKS: u32 = 64;
 
 impl<R: Read + Seek> Pdf<R> {

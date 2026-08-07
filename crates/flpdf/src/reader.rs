@@ -2910,6 +2910,7 @@ impl<R: Read + Seek> crate::parser::HandleResolver for Pdf<R> {
     }
 }
 
+/// qpdf `QPDF::decryptString`'s decryption half (`:1009-1038`), applied to
 /// every string reachable from `object`.
 fn decrypt_object_strings(
     object_ref: ObjectRef,
