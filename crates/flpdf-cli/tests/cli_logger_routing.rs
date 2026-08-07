@@ -156,6 +156,31 @@ fn binary_linearized_pdf_dash_uses_the_same_save_route() {
 }
 
 #[test]
+fn binary_linearized_pdf_dash_writes_pass1_independently() {
+    let directory = tempfile::tempdir().unwrap();
+    let pass1 = directory.path().join("pass1.pdf");
+    let pass1_arg = format!("--linearize-pass1={}", pass1.display());
+    let output = flpdf()
+        .args(["--linearize", &pass1_arg, ONE_PAGE, "-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+    let pass1_bytes = std::fs::read(pass1).unwrap();
+    assert!(pass1_bytes.starts_with(b"%PDF-"));
+    assert_ne!(pass1_bytes, output.stdout);
+    assert!(pass1_bytes
+        .windows(b"% hint_offset=".len())
+        .any(|window| window == b"% hint_offset="));
+}
+
+#[test]
 fn binary_qdf_dash_uses_the_same_save_route() {
     let output = flpdf().args(["qdf", MINIMAL, "-"]).output().unwrap();
 

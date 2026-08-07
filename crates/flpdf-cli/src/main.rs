@@ -21,7 +21,8 @@ use flpdf::{
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
         check_linearization_path, show_linearization_path, write_linearized,
-        LinearizationCheckError, LinearizationPlan, RenumberMap, ShowLinearizationError,
+        write_linearized_with_pass1_file, LinearizationCheckError, LinearizationPlan, RenumberMap,
+        ShowLinearizationError,
     },
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
@@ -359,10 +360,8 @@ struct Cli {
     /// rewrite.  Provided so qtest commands parse cleanly.
     #[arg(long = "compress-streams")]
     compress_streams: Option<String>,
-    /// `qpdf --linearize-pass1=PATH` compatibility flag.  Accepted; flpdf
-    /// writes the pass-1 intermediate file as a copy of the final
-    /// linearized output (qpdf writes a distinct intermediate; matching
-    /// those bytes is out of scope here).
+    /// `qpdf --linearize-pass1=PATH` compatibility flag. Writes the
+    /// linearization writer's distinct pass-1 intermediate file.
     #[arg(long = "linearize-pass1")]
     linearize_pass1: Option<PathBuf>,
     /// Omit the `%% Original object ID: N M` comments that QDF output would
@@ -1746,6 +1745,7 @@ fn main() {
             args.repair,
             &args.password,
             true,
+            args.linearize_pass1.as_deref(),
             args.remove_restrictions,
             args.decrypt,
             normalize_content,
@@ -1758,27 +1758,6 @@ fn main() {
             args.verbose,
             options,
         );
-        let output_was_written = match &result {
-            Ok(()) => true,
-            Err(error) => error
-                .downcast_ref::<CliExitError>()
-                .is_some_and(|error| error.code == ExitCode::Warnings),
-        };
-        if output_was_written {
-            if let (Some(pass1), Some(output)) =
-                (args.linearize_pass1.as_ref(), args.output.as_ref())
-            {
-                // qpdf --linearize-pass1=PATH dumps the pre-back-patched pass1
-                // intermediate. flpdf does not currently expose that internal
-                // state; copy the final output instead so the path exists and
-                // downstream byte-equality checks fail meaningfully rather
-                // than the file being absent.
-                if let Err(error) = std::fs::copy(output, pass1) {
-                    eprintln!("flpdf: failed to write --linearize-pass1 file: {error}");
-                    std::process::exit(2);
-                }
-            }
-        }
         result
     } else if page_ops_active(&args.page_ops) {
         // Top-level page-operation path (qpdf-shaped invocation:
@@ -1914,6 +1893,7 @@ fn main() {
             args.repair,
             &args.password,
             false,
+            None,
             args.remove_restrictions,
             args.decrypt,
             normalize_content,
@@ -2394,6 +2374,7 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.repair,
                 &cmd.password,
                 cmd.linearize,
+                None,
                 cmd.remove_restrictions,
                 cmd.decrypt,
                 normalize_content,
@@ -3063,6 +3044,7 @@ fn run_rewrite(
     repair: bool,
     password: &PasswordArgs,
     linearize: bool,
+    linearize_pass1: Option<&Path>,
     remove_restrictions: bool,
     decrypt: bool,
     normalize_content: bool,
@@ -3159,7 +3141,12 @@ fn run_rewrite(
         if had_signatures {
             options.full_rewrite = true;
         }
-        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &options)?;
+        let mut doc = match linearize_pass1 {
+            Some(path) => {
+                write_linearized_with_pass1_file(&plan, &renumber, &mut pdf2, &options, path)?
+            }
+            None => write_linearized(&plan, &renumber, &mut pdf2, &options)?,
+        };
         doc.back_patch()?;
 
         if let Some(writer) = standard_output.as_mut() {
