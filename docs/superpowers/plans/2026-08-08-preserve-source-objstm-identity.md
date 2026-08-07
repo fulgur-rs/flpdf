@@ -28,7 +28,7 @@
 - Consumes: existing `ObjectRef`, `CompressiblePlan`, `plan_preserve`, and `one_objstm_pdf_n` fixture helper.
 - Produces: `ObjectStreamGroup`, `ObjectStreamPlan`, and the internal `plan_qpdf_preserve_groups(...) -> crate::Result<ObjectStreamPlan>` for Tasks 2 and 3. The existing batch-returning consumer entry point remains unchanged until the atomic plain-plan cutover in Task 3.
 
-- [ ] **Step 1: Write the failing Preserve identity/order test**
+- [x] **Step 1: Write the failing Preserve identity/order test**
 
 Add a unit test beside `planner_preserve_mode_reuses_source_membership`. The production break it catches is discarding source container `4 0 R` or retaining xref index order instead of qpdf's ascending `ObjectRef` order.
 
@@ -49,7 +49,7 @@ fn qpdf_preserve_plan_retains_source_container_and_sorted_members() {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -59,7 +59,7 @@ cargo test -p flpdf writer::object_streams::tests::qpdf_preserve_plan_retains_so
 
 Expected: compilation fails because `ObjectStreamPlan`, `ObjectStreamGroup`, `plan_qpdf_preserve_groups`, and `groups` do not exist. The existing batch-only plan must not satisfy the assertion.
 
-- [ ] **Step 3: Add the explicit group and plan types**
+- [x] **Step 3: Add the explicit group and plan types**
 
 Add beside the legacy `PackingPlan`:
 
@@ -98,7 +98,7 @@ pub(crate) struct ObjectStreamPlan {
 
 Keep `PackingPlan` and `plan_object_streams` unchanged.
 
-- [ ] **Step 4: Make only the qpdf Preserve planner source-aware**
+- [x] **Step 4: Make only the qpdf Preserve planner source-aware**
 
 Add `plan_qpdf_preserve_groups` returning `ObjectStreamPlan`. Build its groups directly from `pdf.source_xref_entries()`:
 
@@ -118,7 +118,7 @@ For each container, retain only members in the existing compressible eligible se
 
 Do not change or redirect the existing batch-returning `plan_qpdf_preserve_object_streams` in this task. It remains the production consumer until Task 3, which removes it while renaming `plan_qpdf_preserve_groups` to the final entry-point name.
 
-- [ ] **Step 5: Run the focused test and related planner regression**
+- [x] **Step 5: Run the focused test and related planner regression**
 
 Run:
 
@@ -129,7 +129,7 @@ cargo test -p flpdf writer::object_streams::tests::planner_preserve_mode_reuses_
 
 Expected: both tests pass; the first proves the new qpdf-shaped plan and the second proves the legacy `PackingPlan` behavior stayed intact.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```bash
 git add crates/flpdf/src/writer/object_streams.rs
@@ -149,7 +149,7 @@ git commit -m "refactor(writer): retain Preserve ObjStm group identity"
 - Consumes: `ObjectStreamGroup` from Task 1 and existing qpdf-shaped trailer/reference collection.
 - Produces: `ObjectStreamRenumber::build(pdf, groups, skip_length, removed_refs)`, `container_number`, `container_numbers`, `pairs`, and `NewNumberLookup` for Task 3.
 
-- [ ] **Step 1: Write failing container-first/member-first tests**
+- [x] **Step 1: Write failing container-first/member-first tests**
 
 Use existing `build_raw_pdf` in `rewrite_renumber.rs`. The production break caught is treating source-backed groups as synthetic or allocating a second placement when the source container is encountered first.
 
@@ -188,7 +188,7 @@ fn source_backed_member_first_and_container_first_number_identically() {
 
 Use owned `Vec<u8>` bodies if the existing helper's borrowed-slice signature requires values to outlive the call.
 
-- [ ] **Step 2: Run the numbering test and verify RED**
+- [x] **Step 2: Run the numbering test and verify RED**
 
 Run:
 
@@ -198,7 +198,7 @@ cargo test -p flpdf rewrite_renumber::tests::source_backed_member_first_and_cont
 
 Expected: compilation fails because `ObjectStreamRenumber` is absent and `GenerateRenumber` cannot accept `ObjectStreamGroup`.
 
-- [ ] **Step 3: Generalize the renumber type and validate groups**
+- [x] **Step 3: Generalize the renumber type and validate groups**
 
 Rename `GenerateRenumber` to `ObjectStreamRenumber` without a compatibility alias. Update `NewNumberLookup` and module documentation. Change `build` to accept `&[ObjectStreamGroup]` and precompute:
 
@@ -212,7 +212,7 @@ For every group, clone and ascending-sort `members()`. Return `Error::Unsupporte
 
 Update the two existing production call sites in `writer/plain/plan.rs` only far enough to preserve current behavior and compile after the rename: convert each existing Preserve or Generate `Vec<Vec<ObjectRef>>` batch to `ObjectStreamGroup::Synthetic { members }` for `ObjectStreamRenumber::build`, while continuing to pass the original batches to `build_container_aware`. Change that helper's parameter type from `GenerateRenumber` to `ObjectStreamRenumber`. The source-aware Preserve cutover and planned origin remain Task 3 behavior, protected by its RED tests.
 
-- [ ] **Step 4: Implement idempotent source/synthetic activation**
+- [x] **Step 4: Implement idempotent source/synthetic activation**
 
 Replace `enqueue_gen` with an object-stream enqueue helper. A group activation:
 
@@ -233,11 +233,11 @@ enum RenumberWork {
 
 The source/member lookup selects the same group, and `container_new[group_index].is_some()` makes activation idempotent. Synthetic groups never add a source mapping or source-container queue item.
 
-- [ ] **Step 5: Run the numbering test and verify GREEN**
+- [x] **Step 5: Run the numbering test and verify GREEN**
 
 Run the Step 2 command. Expected: pass with literal mappings `1->1`, source container `4->2`, member `2->3`, member `3->4` for both encounter orders.
 
-- [ ] **Step 6: Write failing `/Extends`-only reachability tests**
+- [x] **Step 6: Write failing `/Extends`-only reachability tests**
 
 Add two real-PDF tests. The production breaks caught are walking `/Aux` from a reconstructed source container and failing to activate an `/Extends` target group.
 
@@ -283,7 +283,7 @@ fn extends_target_without_retained_group_is_an_ordinary_source() {
 }
 ```
 
-- [ ] **Step 7: Run the reachability tests and verify RED**
+- [x] **Step 7: Run the reachability tests and verify RED**
 
 Run:
 
@@ -294,13 +294,13 @@ cargo test -p flpdf rewrite_renumber::tests::extends_target_without_retained_gro
 
 Expected before the special role is implemented: `/Aux` receives a mapping or the `/Extends` target is absent/misclassified.
 
-- [ ] **Step 8: Implement the source-container work role**
+- [x] **Step 8: Implement the source-container work role**
 
 For `RenumberWork::Ordinary`, retain the existing `pdf.resolve` plus `collect_qpdf_enqueue_refs` walk. For `RenumberWork::SourceContainer(source)`, resolve the source, require a stream body, inspect only `stream.dict.get("Extends")`, and enqueue it only when it is `Object::Reference`. Apply the same `removed_refs` filter before enqueue. Do not call `collect_qpdf_enqueue_refs` on the original container.
 
 Queue members before the source-container role so member child references are numbered before `/Extends`, matching qpdf `writeObjectStream`.
 
-- [ ] **Step 9: Run all Task 2 tests and Generate regression**
+- [x] **Step 9: Run all Task 2 tests and Generate regression**
 
 Run:
 
@@ -313,7 +313,7 @@ cargo test -p flpdf writer::object_streams::tests::generate_renumber_matches_qpd
 
 Expected: all pass. Update the Generate regression to wrap even-split batches as `ObjectStreamGroup::Synthetic { members }`; its measured mappings and container numbers must remain unchanged.
 
-- [ ] **Step 10: Commit Task 2**
+- [x] **Step 10: Commit Task 2**
 
 ```bash
 git add crates/flpdf/src/rewrite_renumber.rs crates/flpdf/src/writer/object_streams.rs crates/flpdf/src/writer/plain/plan.rs
@@ -333,7 +333,7 @@ git commit -m "refactor(writer): renumber source-backed ObjStm groups"
 - Consumes: `ObjectStreamPlan`, `ObjectStreamGroup`, and `ObjectStreamRenumber` from Tasks 1-2.
 - Produces: `PlannedObjectStreamOrigin` retained in each `PlannedIndirectObject::ObjectStream` and validated source-container placement.
 
-- [ ] **Step 1: Write failing plain-plan source-origin test**
+- [x] **Step 1: Write failing plain-plan source-origin test**
 
 Extend `preserve_source_objstm_members_keep_one_container_and_indices`. The production break caught is a synthetic placement with no source identity or a duplicate ordinary `Source` placement for source container `1 0 R`.
 
@@ -357,7 +357,7 @@ assert!(plan.objects.iter().all(|object| !matches!(
 assert!(!members.is_empty());
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -367,7 +367,7 @@ cargo test -p flpdf writer::plain::plan::tests::preserve_source_objstm_members_k
 
 Expected: compilation fails because `PlannedObjectStreamOrigin` and the `origin` field do not exist.
 
-- [ ] **Step 3: Carry explicit origin through the plain placement**
+- [x] **Step 3: Carry explicit origin through the plain placement**
 
 Add:
 
@@ -385,7 +385,7 @@ Update every existing hand-constructed `PlannedIndirectObject::ObjectStream` in 
 
 In Preserve mode, filter removed members through `group.members_mut()` and drop empty groups. Keep the existing classic fallback when all groups are empty and the source had no compressed objects. In Generate mode, wrap every even-split batch in `ObjectStreamGroup::Synthetic` before renumbering.
 
-- [ ] **Step 4: Update body pattern matches without changing serialization**
+- [x] **Step 4: Update body pattern matches without changing serialization**
 
 Change exact destructuring sites to ignore the new field:
 
@@ -399,11 +399,11 @@ PlannedIndirectObject::ObjectStream {
 
 Do not read the origin in `body.rs`; `/Extends` serialization belongs to the dependent consumer issue.
 
-- [ ] **Step 5: Run the source-origin test and verify GREEN**
+- [x] **Step 5: Run the source-origin test and verify GREEN**
 
 Run the Step 2 command. Expected: pass with source `1 0 R` mapped to the one reconstructed container and absent from ordinary `Source` placements.
 
-- [ ] **Step 6: Write failing duplicate-placement validation test**
+- [x] **Step 6: Write failing duplicate-placement validation test**
 
 The production break caught is accepting one source as both an ordinary object and the origin of a reconstructed ObjStm.
 
@@ -430,7 +430,7 @@ fn validation_rejects_source_and_source_backed_container_for_same_source() {
 }
 ```
 
-- [ ] **Step 7: Run the validation test and verify RED**
+- [x] **Step 7: Run the validation test and verify RED**
 
 Run:
 
@@ -440,7 +440,7 @@ cargo test -p flpdf writer::plain::plan::tests::validation_rejects_source_and_so
 
 Expected: test fails because validation does not count the ObjectStream origin as a source placement.
 
-- [ ] **Step 8: Validate the source-backed origin**
+- [x] **Step 8: Validate the source-backed origin**
 
 In the ObjectStream arm of `PlainWritePlan::validate`, before member validation:
 
@@ -454,7 +454,7 @@ if let PlannedObjectStreamOrigin::SourceBacked(source) = origin {
 
 Leave `Synthetic` out of source uniqueness and old-to-new completeness.
 
-- [ ] **Step 9: Run focused plain-plan tests and existing Preserve/Generate regressions**
+- [x] **Step 9: Run focused plain-plan tests and existing Preserve/Generate regressions**
 
 Run:
 
@@ -467,7 +467,7 @@ cargo test -p flpdf writer::plain::plan::tests::generate_plan_even_splits_132_el
 
 Expected: all pass and `PlainWritePlan::validate()` accepts all valid plans.
 
-- [ ] **Step 10: Commit Task 3**
+- [x] **Step 10: Commit Task 3**
 
 ```bash
 git add crates/flpdf/src/writer/object_streams.rs crates/flpdf/src/writer/plain/plan.rs crates/flpdf/src/writer/plain/body.rs
@@ -486,7 +486,7 @@ git commit -m "refactor(writer): place Preserve ObjStm by source identity"
 - Consumes: all production and test changes from Tasks 1-3.
 - Produces: formatted, warning-clean, workspace-tested branch and persisted Beads evidence.
 
-- [ ] **Step 1: Run formatting and focused component tests**
+- [x] **Step 1: Run formatting and focused component tests**
 
 ```bash
 cargo fmt -- --check
@@ -497,7 +497,7 @@ cargo test -p flpdf writer::plain::plan::tests
 
 Expected: all commands exit 0 with no failed tests.
 
-- [ ] **Step 2: Run crate and workspace verification**
+- [x] **Step 2: Run crate and workspace verification**
 
 ```bash
 cargo test -p flpdf
@@ -506,7 +506,7 @@ cargo test
 
 Expected: both commands exit 0 with zero failures.
 
-- [ ] **Step 3: Review diff against every acceptance criterion**
+- [x] **Step 3: Review diff against every acceptance criterion**
 
 Check `git diff origin/main...HEAD` and confirm literal evidence for:
 
@@ -521,7 +521,7 @@ Check `git diff origin/main...HEAD` and confirm literal evidence for:
 - duplicate placement validation without panic;
 - unchanged legacy Preserve and Generate regressions.
 
-- [ ] **Step 4: Record and persist Beads evidence**
+- [x] **Step 4: Record and persist Beads evidence**
 
 Append the exact tests and oracle correspondence to `flpdf-um4z`, then close it only if all criteria above are met:
 
@@ -533,7 +533,7 @@ bd dolt push
 
 Read the issue back with `bd show flpdf-um4z --json` and verify `closed` plus the evidence text.
 
-- [ ] **Step 5: Commit plan completion and push the branch**
+- [x] **Step 5: Commit plan completion and push the branch**
 
 ```bash
 git add docs/superpowers/plans/2026-08-08-preserve-source-objstm-identity.md
@@ -542,3 +542,12 @@ git push
 ```
 
 Read back the remote branch SHA and require it to equal local `HEAD` before handoff.
+
+## Completion evidence
+
+- Independent review: no Critical, Important, or Minor findings; Ready to merge.
+- Focused tests: object-stream planner 52/52, renumber 38/38, plain plan 36/36.
+- Oracle parity: Preserve 12/12 and Generate 9/9 byte-parity matrices.
+- Quality gates: `cargo fmt -- --check`, `cargo test -p flpdf`, and `cargo test` passed.
+- Patch coverage: 452 changed executable lines, 0 uncovered (100%) against `origin/main`.
+- Beads: `flpdf-um4z` closed and pushed to the Dolt remote on 2026-08-08.
