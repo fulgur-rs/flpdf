@@ -959,7 +959,10 @@ pub(crate) trait StreamFilter {
     /// `QPDF_Stream.cc:559-568` for the caller-side loop this feeds.
     ///
     /// The Flate warn callback is deliberately absent: qpdf installs it at the
-    /// `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), not here.
+    /// `pipeStreamData` caller (`QPDF_Stream.cc:564-567`), not here. That
+    /// installation sits *outside* the `if (decode_pipeline)` guard, so a
+    /// filter contributing no stage leaves the previous filter's stage as the
+    /// chain head and lets it take the callback again.
     // Production decoding still runs through pipe_decode_recovering, so nothing
     // outside tests calls this yet.
     #[allow(dead_code)]
@@ -1436,6 +1439,15 @@ impl FlateLzwStreamFilter {
         Ok(None)
     }
 
+    /// Run the codec stage of the whole-buffer route over `data`.
+    ///
+    /// **Recorded deviation:** the `Pl_Flate` warn callback is installed here,
+    /// on the stage this function constructs, where qpdf installs it at the
+    /// `getDecodePipeline` caller (`QPDF_Stream.cc:564-567`). Both reach the
+    /// same stage — this route builds one filter's chain at a time, so the
+    /// stage it constructs is the chain head qpdf's `dynamic_cast` would find
+    /// — leaving warning text and order unchanged. Placing it at the caller
+    /// instead belongs with the port of `QPDF_Stream::pipeStreamData`.
     fn pipe_codec(
         &self,
         next: &mut dyn Pipeline,
@@ -1771,6 +1783,16 @@ impl StreamFilter for PostPreflightFailure {
     }
 }
 
+/// Construct the filter registered under `filter_name`, if any.
+///
+/// **Recorded deviation (CLAUDE.md class (B)):** qpdf holds the same registry
+/// in a `std::map`, `QPDF_Stream::filter_factories` (`QPDF_Stream.cc:85-94`).
+/// Nothing iterates that map — the only read is a lookup by name
+/// (`QPDF_Stream.cc:425-426`) — so a `match` carries the same information.
+/// What a `match` cannot carry is `QPDF_Stream::registerStreamFilter`
+/// (`QPDF_Stream.cc:148-151`), which lets a library user add a factory at run
+/// time; flpdf exposes no counterpart, and adding one would mean replacing
+/// this `match`.
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         // qpdf's `filter_factories` lists `/Crypt` first (`QPDF_Stream.cc:87`).
