@@ -207,6 +207,12 @@ fn pipeline_handle_clones_share_writes_and_identity() {
     assert_eq!(handle.identifier(), "shared");
     assert!(handle.is_same(&clone));
     assert!(!handle.is_same(&distinct));
+    assert_eq!(handle, clone);
+    assert_ne!(handle, distinct);
+    assert_eq!(
+        format!("{handle:?}"),
+        "PipelineHandle { identifier: \"shared\", .. }"
+    );
     assert_eq!(&*bytes.lock().unwrap(), b"one two");
 }
 

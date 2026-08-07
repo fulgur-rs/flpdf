@@ -42,6 +42,7 @@ fn recording(identifier: &'static str) -> (PipelineHandle, Arc<Mutex<SinkState>>
 fn default_routes_and_unset_save_match_qpdf() {
     let logger = QPDFLogger::create();
 
+    assert_eq!(logger.standard_output().identifier(), "track stdout");
     assert!(logger
         .get_info()
         .unwrap()
@@ -52,6 +53,7 @@ fn default_routes_and_unset_save_match_qpdf() {
         .unwrap()
         .is_same(&logger.standard_error()));
     assert!(logger.get_save_if_set().is_none());
+    logger.set_save(None, false).unwrap();
 
     let error = logger.get_save().unwrap_err();
     assert!(matches!(
@@ -59,6 +61,17 @@ fn default_routes_and_unset_save_match_qpdf() {
         Error::Internal(ref message)
             if message == "QPDFLogger: requested a null pipeline without null_okay == true"
     ));
+}
+
+#[test]
+fn default_logger_is_process_global_and_create_is_independent() {
+    let first = QPDFLogger::default_logger();
+    let second = QPDFLogger::default_logger();
+    let independent = QPDFLogger::create();
+
+    assert_eq!(first, second);
+    assert_ne!(first, independent);
+    assert!(format!("{first:?}").starts_with("QPDFLogger { shared: "));
 }
 
 #[test]
@@ -129,6 +142,30 @@ fn reset_and_set_output_streams_restore_qpdf_route_relationships() {
         b"warn follows reset error\nerror\n"
     );
     assert!(separate_warn_state.lock().unwrap().bytes.is_empty());
+}
+
+#[test]
+fn null_output_streams_select_defaults_around_stdout_save() {
+    let normal = QPDFLogger::create();
+    let (output, _) = recording("output");
+    let (errors, _) = recording("errors");
+    normal.set_output_streams(Some(output), Some(errors));
+    normal.set_output_streams(None, None);
+
+    assert!(normal
+        .get_info()
+        .unwrap()
+        .is_same(&normal.standard_output()));
+    assert!(normal
+        .get_error()
+        .unwrap()
+        .is_same(&normal.standard_error()));
+    assert!(normal.get_warn().unwrap().is_same(&normal.standard_error()));
+
+    let saving = QPDFLogger::create();
+    saving.save_to_standard_output(false).unwrap();
+    saving.set_output_streams(None, None);
+    assert!(saving.get_info().unwrap().is_same(&saving.standard_error()));
 }
 
 #[test]
