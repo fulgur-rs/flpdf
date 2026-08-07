@@ -2443,6 +2443,39 @@ mod tests {
     }
 
     #[test]
+    fn a_handle_warns_through_the_live_resolver_it_was_minted_from() {
+        // The end-to-end route acceptance asks for: an object emits through
+        // its own context and lands in the collection `Pdf::repair_diagnostics`
+        // hands back, without the caller holding a `&mut Pdf`.
+        let (resolver, output) = named_resolver_with_captured_warnings();
+        let erased: std::rc::Rc<dyn DocumentResolver> = resolver.clone();
+        let handle = crate::object_handle::ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            std::rc::Rc::downgrade(&erased),
+        );
+        handle.set_resolved(ObjectValue::Integer(7));
+
+        handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
+
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: operation for dictionary attempted on object of type integer: \
+              treating as empty\n"
+        );
+    }
+
+    #[test]
     fn an_object_warning_carries_no_location_even_when_the_document_is_named() {
         let (resolver, output) = named_resolver_with_captured_warnings();
 

@@ -9670,6 +9670,75 @@ mod warning_emission_tests {
         );
     }
 
+    /// A document that resolves but never implements a warning sink, so the
+    /// trait default decides what happens.
+    struct SinklessResolver;
+
+    impl DocumentResolver for SinklessResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            handle.set_resolved(ObjectValue::Integer(7));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_resolver_without_a_warning_sink_reports_rather_than_swallows() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            Rc::downgrade(&resolver),
+        );
+
+        let error = handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::Internal(ref message)
+                if message
+                    == "warning raised through a resolver with no document warning sink: \
+                        operation for dictionary attempted on object of type integer: \
+                        treating as empty"
+        ));
+    }
+
+    #[test]
+    fn warn_if_possible_treats_a_dropped_document_as_no_context() {
+        // `warnIfPossible`'s guard fails on a handle it cannot dereference
+        // and takes the logger branch rather than reporting
+        // (`libqpdf/QPDFObjectHandle.cc:2195-2200`).
+        let handle = {
+            let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+            ObjectHandle::new_indirect_with_resolver(ObjectRef::new(3, 0), Rc::downgrade(&resolver))
+        };
+        assert!(
+            handle.try_dereference().is_err(),
+            "the document is gone, so resolution fails"
+        );
+
+        let logger = crate::QPDFLogger::default_logger();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let restore = logger.get_error().unwrap();
+        logger.set_error(Some(crate::pipeline::PipelineHandle::new(
+            ErrorRecordingSink(std::sync::Arc::clone(&captured)),
+        )));
+
+        let result = handle.warn_if_possible("dropped document warning");
+
+        logger.set_error(Some(restore));
+        result.unwrap();
+        let captured = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("dropped document warning\n"),
+            "default error stream captured {captured:?}"
+        );
+    }
+
     #[test]
     fn warn_if_possible_without_a_context_logs_instead_of_failing() {
         // The else-branch of `warnIfPossible` writes the bare message to
