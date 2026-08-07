@@ -2338,14 +2338,7 @@ mod tests {
             ("input.pdf", Some(0), "named zero offset"),
             ("input.pdf", Some(7), "named positive offset"),
         ] {
-            ResolverHandle::<Cursor<Vec<u8>>>::route_warning(
-                &logger,
-                false,
-                description,
-                offset,
-                message,
-            )
-            .unwrap();
+            super::route_warning(&logger, false, description, offset, message).unwrap();
         }
 
         assert_eq!(
