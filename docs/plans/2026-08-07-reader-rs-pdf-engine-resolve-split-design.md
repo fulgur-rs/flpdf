@@ -213,6 +213,15 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
   `subset_prune.rs:196`（`compressed_parent`）。ソース document の
   xref 由来構造情報を返す resolve/seek 隣接の状態なので、`resolve.rs`
   が正しい置き場所
+- **`source_bytes`, `lift_object_to_handle`, `source_stream_data_offset`
+  もここに含める**。`source_bytes`（`reader.rs:1649-1651`、
+  `self.resolver.read_physical_input()` に委譲）の production caller は
+  `writer.rs:983`。`lift_object_to_handle`（`reader.rs:1325-1327`、
+  `self.lift_to_handle_bounded` へ委譲 — 上記の `lift*` 系そのもの）の
+  production caller は `embedded_files.rs`/`form_field_object_helper.rs`/
+  `json_inspect.rs`。`source_stream_data_offset`（`reader.rs:1362-`、
+  `self.resolver.xref_entry(...)` を読む）は `pub fn`（クレート外公開API）
+  で、resolve/seek の一次プリミティブに直接依存する
 - **`adobe_extension_level`, `trailer_handle`, `trailer_key_handle` も
   ここに含める**（`pdf.rs` からの再分類）。根拠: qpdf の
   `QPDF::getExtensionLevel()`（`QPDF.cc:2328-2346`）は
@@ -353,12 +362,20 @@ foreign_object_maps` を直接読む、`reader.rs:110,1981-`）のような
    移動対象メソッドが実際に通る経路であることを確認したうえで実行する。
    特に resolve/認証まわりの移動は、単体テストだけでは値の materialize
    有無や byte 出力まで確認できないため、上記 byte-identical スイートを
-   必ず含める。**`authenticate_if_encrypted`/暗号ヘルパーの移動には上記
-   4本では不十分**（いずれも暗号化フィクスチャ・パスワード・
-   `PdfOpenOptions` を使わないため認証経路を通らない）。代わりに
-   `qpdf-zlib-compat` gated かつ暗号化ラウンドトリップを検証する
-   `crates/flpdf-cli/tests/encrypt_cli_tests.rs`
-   （`--encrypt` で書いた出力を qpdf で再オープン検証、パスワード付き
-   フィクスチャを使用）を必須テストとして追加する。加えて各ステップ
-   実行前後で `scripts/patch-coverage.sh` を回し、変更行 100%
-   カバレッジを維持する
+   必ず含める。**`authenticate_if_encrypted`/暗号ヘルパーの移動には
+   上記4本では不十分**（いずれも暗号化フィクスチャ・パスワード・
+   `PdfOpenOptions` を使わないため認証経路を通らない）。
+   `crates/flpdf-cli/tests/encrypt_cli_tests.rs` も確認したが、
+   `encrypted_document_is_byte_identical_to_qpdf`（:1154-1199）は平文
+   入力を暗号化して**書く**経路のみを byte 比較しており、暗号化された
+   入力を**開いて**認証する経路は通らない。`copy_encryption_from_
+   decrypts_with_donor_user_password_via_qpdf`（:1416-）はドナーの
+   暗号化 PDF をパスワード付きで開く（`authenticate_if_encrypted` を
+   通る）が、アサーションは `qpdf --show-encryption` の構造チェックで
+   byte 比較ではない。**探索した範囲では、flpdf 側が暗号化入力を認証し
+   つつ byte-identical 比較まで行う既存テストは無い**。したがって
+   `authenticate_if_encrypted` 系の移動には、既存テストを流用するのでは
+   なく新規の encrypted-input rewrite golden（パスワード付きで開く →
+   何らかの操作 → 書き出し → qpdf の同等操作と byte 比較）を実装の一部
+   として追加することを前提条件とする。加えて各ステップ実行前後で
+   `scripts/patch-coverage.sh` を回し、変更行 100% カバレッジを維持する
