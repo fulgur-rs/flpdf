@@ -1,6 +1,6 @@
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
-use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
 use cbc::Encryptor;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -1873,7 +1873,7 @@ fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -
     let mut data = vec![0u8; plaintext.len() + 16];
     data[..plaintext.len()].copy_from_slice(plaintext);
     let encrypted = <Encryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into())
-        .encrypt_padded_mut::<Pkcs7>(&mut data, plaintext.len())
+        .encrypt_padded::<Pkcs7>(&mut data, plaintext.len())
         .unwrap();
     let mut out = iv.to_vec();
     out.extend_from_slice(encrypted);

@@ -3440,7 +3440,7 @@ pub fn write_linearized<R: Read + Seek>(
             // any platform this crate's test suite runs on; mirrors the
             // same untested-in-practice getrandom failure arm in
             // `crate::writer::encrypt_stream_payload_for_writer`.
-            getrandom::getrandom(&mut iv).map_err(|e| {
+            getrandom::fill(&mut iv).map_err(|e| {
                 crate::Error::Unsupported(format!(
                     "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
                 ))

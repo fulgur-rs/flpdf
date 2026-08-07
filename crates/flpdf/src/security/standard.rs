@@ -47,7 +47,7 @@ use crate::security::primitives::{md5, sha256, sha384, sha512};
 use crate::security::rc4::Rc4;
 use crate::{Dictionary, Object, ObjectRef};
 use aes::{Aes128, Aes256};
-use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{block_padding::NoPadding, BlockModeDecrypt, BlockModeEncrypt, KeyIvInit};
 use cbc::{Decryptor, Encryptor};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ fn aes256_cbc_zero_iv_unwrap(encrypted_key: &[u8; 32], aes_key: &[u8; 32]) -> Re
     let iv = [0u8; 16];
     let mut ciphertext = encrypted_key.to_vec();
     let dec = <Decryptor<Aes256> as KeyIvInit>::new(aes_key.into(), (&iv).into());
-    dec.decrypt_padded_mut::<NoPadding>(&mut ciphertext)
+    dec.decrypt_padded::<NoPadding>(&mut ciphertext)
         .map_err(|_| EncryptedError::Malformed {
             reason: "invalid V=5 encrypted file-key entry".into(),
         })?;
@@ -275,7 +275,7 @@ fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> [u8; 32] {
         let mut iv = [0u8; 16];
         iv.copy_from_slice(&key[16..32]);
         let enc = <Encryptor<Aes128> as KeyIvInit>::new((&aes_key).into(), (&iv).into());
-        enc.encrypt_padded_mut::<NoPadding>(&mut e, k1.len() * 64)
+        enc.encrypt_padded::<NoPadding>(&mut e, k1.len() * 64)
             .expect("R=6 hash input repeated 64 times is block-aligned");
 
         let e_mod_3 = e[..16]
@@ -1128,7 +1128,7 @@ fn aes256_cbc_zero_iv_wrap(file_key: &[u8; 32], aes_key: &[u8; 32]) -> [u8; 32] 
     let mut buf = *file_key;
     let enc = <Encryptor<Aes256> as KeyIvInit>::new(aes_key.into(), (&iv).into());
     // Plaintext is exactly two 16-byte blocks, so no padding is appended.
-    enc.encrypt_padded_mut::<NoPadding>(&mut buf, 32)
+    enc.encrypt_padded::<NoPadding>(&mut buf, 32)
         .expect("32-byte input is exactly 2 AES blocks; padding-less encrypt cannot fail");
     buf
 }
@@ -1661,7 +1661,7 @@ pub(crate) fn encrypt_cipher_bytes(
 }
 
 fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
-    // `encrypt_padded_mut::<Pkcs7>` always appends at least one byte of
+    // `encrypt_padded::<Pkcs7>` always appends at least one byte of
     // padding (a full block of `0x10` when plaintext is block-aligned), so
     // the worst-case ciphertext length is `plaintext.len() + 16`.
     let pt_len = plaintext.len();
@@ -1671,7 +1671,7 @@ fn aes128_cbc_encrypt_with_iv(key: &[u8; 16], iv: &[u8; 16], plaintext: &[u8]) -
     buf.resize(16 + pt_len + 16, 0);
     let enc = <Encryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
     let ciphertext = enc
-        .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
+        .encrypt_padded::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
         .expect("Pkcs7 encrypt cannot fail with sufficient buffer");
     let ct_len = ciphertext.len();
     buf.truncate(16 + ct_len);
@@ -1686,7 +1686,7 @@ fn aes256_cbc_encrypt_with_iv(key: &[u8; 32], iv: &[u8; 16], plaintext: &[u8]) -
     buf.resize(16 + pt_len + 16, 0);
     let enc = <Encryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
     let ciphertext = enc
-        .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
+        .encrypt_padded::<cbc::cipher::block_padding::Pkcs7>(&mut buf[16..], pt_len)
         .expect("Pkcs7 encrypt cannot fail with sufficient buffer");
     let ct_len = ciphertext.len();
     buf.truncate(16 + ct_len);
@@ -1960,7 +1960,7 @@ mod tests {
         let msg_len = buf.len();
         buf.resize(msg_len + 16, 0);
         let ciphertext = enc
-            .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf, msg_len)
+            .encrypt_padded::<cbc::cipher::block_padding::Pkcs7>(&mut buf, msg_len)
             .unwrap();
         let mut out = iv.to_vec();
         out.extend_from_slice(ciphertext);
@@ -1973,7 +1973,7 @@ mod tests {
         let msg_len = buf.len();
         buf.resize(msg_len + 16, 0);
         let ciphertext = enc
-            .encrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(&mut buf, msg_len)
+            .encrypt_padded::<cbc::cipher::block_padding::Pkcs7>(&mut buf, msg_len)
             .unwrap();
         let mut out = iv.to_vec();
         out.extend_from_slice(ciphertext);

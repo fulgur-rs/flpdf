@@ -10,7 +10,7 @@
 
 use super::{Pipeline, PipelineError, PipelineResult};
 use aes::cipher::{
-    BlockDecrypt, BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit,
+    BlockCipherDecrypt, BlockCipherEncrypt, BlockModeDecrypt, BlockModeEncrypt, KeyInit, KeyIvInit,
 };
 use aes::{Aes128, Aes256};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,18 +64,10 @@ impl Cipher {
     /// qpdf `rijndael_process` (`Pl_AES_PDF.cc:182`), one block in, one out.
     fn process(&mut self, inbuf: &[u8; BUF_SIZE], outbuf: &mut [u8; BUF_SIZE]) {
         match self {
-            Self::Cbc128Decrypt(cipher) => {
-                cipher.decrypt_block_b2b_mut(inbuf.into(), outbuf.into())
-            }
-            Self::Cbc256Decrypt(cipher) => {
-                cipher.decrypt_block_b2b_mut(inbuf.into(), outbuf.into())
-            }
-            Self::Cbc128Encrypt(cipher) => {
-                cipher.encrypt_block_b2b_mut(inbuf.into(), outbuf.into())
-            }
-            Self::Cbc256Encrypt(cipher) => {
-                cipher.encrypt_block_b2b_mut(inbuf.into(), outbuf.into())
-            }
+            Self::Cbc128Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Cbc256Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Cbc128Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
+            Self::Cbc256Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb128Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb256Decrypt(cipher) => cipher.decrypt_block_b2b(inbuf.into(), outbuf.into()),
             Self::Ecb128Encrypt(cipher) => cipher.encrypt_block_b2b(inbuf.into(), outbuf.into()),
@@ -235,7 +227,7 @@ impl<'a> PlAesPdf<'a> {
         } else {
             // qpdf `QUtil::initializeWithRandomBytes` (`:141`).
             // cov:ignore-start: a getrandom failure cannot be injected here
-            getrandom::getrandom(&mut self.cbc_block).map_err(|error| {
+            getrandom::fill(&mut self.cbc_block).map_err(|error| {
                 PipelineError::runtime(format!(
                     "Pl_AES_PDF: OS CSPRNG unavailable for AES IV generation: {error}"
                 ))
@@ -670,7 +662,7 @@ mod tests {
     // qpdf's padding strip is deliberately not PKCS#7-strict
     // (`libqpdf/Pl_AES_PDF.cc:184-196`): a trailing byte larger than the block
     // size is not padding, so the block is emitted whole. flpdf's existing
-    // `decrypt_padded_mut::<Pkcs7>` helpers return an error for this input, so
+    // `decrypt_padded::<Pkcs7>` helpers return an error for this input, so
     // a document qpdf accepts would be rejected on that path but not here.
     #[test]
     fn a_trailing_byte_larger_than_the_block_size_is_not_padding() {
