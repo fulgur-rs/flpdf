@@ -1338,9 +1338,14 @@ mod tests {
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(reverse_kids_pdf(130))).unwrap();
         let eligible = compressible_objgens(&mut pdf).unwrap();
         let groups = even_split_into_streams(&eligible);
-        let rn = crate::rewrite_renumber::GenerateRenumber::build(
+        let renumber_groups: Vec<ObjectStreamGroup> = groups
+            .iter()
+            .cloned()
+            .map(|members| ObjectStreamGroup::Synthetic { members })
+            .collect();
+        let rn = crate::rewrite_renumber::ObjectStreamRenumber::build(
             &mut pdf,
-            &groups,
+            &renumber_groups,
             true,
             &BTreeSet::new(),
         )

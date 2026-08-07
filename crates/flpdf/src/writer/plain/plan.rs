@@ -5,8 +5,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek};
 
 use crate::pdf_version::{parse_pdf_version, PDF_1_5};
-use crate::rewrite_renumber::{CatalogFirstRenumber, GenerateRenumber, NewNumberLookup};
-use crate::writer::object_streams::{self, ObjectStreamMode};
+use crate::rewrite_renumber::{CatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber};
+use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::xref::{IdPlan, TrailerPlan};
 use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefEntry, XrefForm};
 
@@ -72,12 +72,18 @@ impl PlainWritePlan {
                     placement.removed_refs = explicitly_removed;
                     placement
                 } else {
-                    let renumber = GenerateRenumber::build(
+                    let renumber_groups: Vec<ObjectStreamGroup> = packing
+                        .batches
+                        .iter()
+                        .cloned()
+                        .map(|members| ObjectStreamGroup::Synthetic { members })
+                        .collect();
+                    let renumber = ObjectStreamRenumber::build(
                         pdf,
-                        &packing.batches,
+                        &renumber_groups,
                         true,
                         &packing.removed_refs,
-                    )?; // cov:ignore: qpdf packing and GenerateRenumber share the same validated inputs
+                    )?; // cov:ignore: qpdf packing and ObjectStreamRenumber share the same validated inputs
                     build_container_aware(renumber, packing.batches, packing.removed_refs)?
                 }
             }
@@ -90,8 +96,17 @@ impl PlainWritePlan {
                     .eligible
                     .retain(|member| !compressible.removed_refs.contains(member));
                 let groups = object_streams::even_split_into_streams(&compressible.eligible);
-                let renumber =
-                    GenerateRenumber::build(pdf, &groups, true, &compressible.removed_refs)?;
+                let renumber_groups: Vec<ObjectStreamGroup> = groups
+                    .iter()
+                    .cloned()
+                    .map(|members| ObjectStreamGroup::Synthetic { members })
+                    .collect();
+                let renumber = ObjectStreamRenumber::build(
+                    pdf,
+                    &renumber_groups,
+                    true,
+                    &compressible.removed_refs,
+                )?;
                 build_container_aware(renumber, groups, compressible.removed_refs)?
             }
         };
@@ -314,7 +329,7 @@ fn build_sources_from_catalog_first(renumber: CatalogFirstRenumber) -> Placement
 }
 
 fn build_container_aware(
-    renumber: GenerateRenumber,
+    renumber: ObjectStreamRenumber,
     groups: Vec<Vec<ObjectRef>>,
     removed_refs: BTreeSet<ObjectRef>,
 ) -> crate::Result<PlacementPlan> {
@@ -330,7 +345,7 @@ fn build_container_aware(
         .collect();
 
     for (group_index, group) in groups.iter().enumerate() {
-        // cov:ignore-start: GenerateRenumber assigns a container for every supplied group
+        // cov:ignore-start: ObjectStreamRenumber assigns a container for every supplied group
         let container = renumber.container_number(group_index).ok_or_else(|| {
             crate::Error::Unsupported(format!(
                 "plain writer plan: ObjStm group {group_index} was never reached"
