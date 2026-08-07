@@ -7,10 +7,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors produced by the public APIs of `flpdf`.
 ///
-/// I/O failures bubble up via [`Error::Io`]. Structural problems (malformed tokens,
-/// unexpected types, depth limits, oversized fields) use [`Error::Parse`] or
-/// [`Error::Unsupported`]. [`Error::Missing`] is reserved for required dictionary
-/// entries that the spec mandates, e.g. `/Root` on the trailer.
+/// Unscoped I/O failures bubble up via [`Error::Io`]. Filesystem operations
+/// whose path is part of the public operation use [`Error::FileIo`] so callers
+/// retain the operation, path, and source error. Structural problems (malformed
+/// tokens, unexpected types, depth limits, oversized fields) use
+/// [`Error::Parse`] or [`Error::Unsupported`]. [`Error::Missing`] is reserved
+/// for required dictionary entries that the spec mandates, e.g. `/Root` on the
+/// trailer.
 /// [`Error::Encrypted`] covers all encryption-related failures; its subkind is
 /// carried by [`EncryptedError`].
 /// [`Error::Internal`] and [`Error::System`] mirror qpdf's public classification
@@ -22,6 +25,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A filesystem failure whose operation and path are known at this API
+    /// boundary.
+    #[error("{operation} {}: {source}", path.display())]
+    FileIo {
+        operation: &'static str,
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("parse error at byte {offset}: {message}")]
     Parse { offset: usize, message: String },
@@ -57,6 +70,20 @@ impl Error {
         Self::Parse {
             offset,
             message: message.into(),
+        }
+    }
+
+    /// Preserve filesystem operation context without routing it through a
+    /// pipeline-specific error type.
+    pub(crate) fn file_io(
+        operation: &'static str,
+        path: impl Into<std::path::PathBuf>,
+        source: std::io::Error,
+    ) -> Self {
+        Self::FileIo {
+            operation,
+            path: path.into(),
+            source,
         }
     }
 

@@ -60,7 +60,7 @@
 //! for that step.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use crate::linearization::hint_page::{bits_needed, PageOffsetHintTable};
@@ -1108,6 +1108,23 @@ fn finalize_linearized_id(
     } else {
         crate::writer::random_id_array(source_trailer.get("ID"))
     }
+}
+
+/// Build qpdf's pass-1 `/ID` placeholder from the original trailer.
+///
+/// `QPDFWriter::writeTrailer` (qpdf 11.9.0, lines 1197-1213) ignores the
+/// selected final-ID policy during linearization pass 1. It writes an all-zero
+/// first string with the same byte width as the original `/ID[0]` (falling
+/// back to 16 bytes when there is no non-empty original identifier), followed
+/// by a 16-byte all-zero changing identifier.
+fn linearization_pass1_id(source_trailer: &Dictionary) -> Object {
+    let first_len = crate::writer::source_permanent_id(source_trailer)
+        .map(|id| id.len())
+        .unwrap_or(16);
+    Object::Array(vec![
+        Object::String(vec![0u8; first_len]),
+        Object::String(vec![0u8; 16]),
+    ])
 }
 
 /// `/ID` array for the split xref stream dicts.  Reads the file-scoped
@@ -3078,6 +3095,7 @@ fn write_linearized_impl<R: Read + Seek>(
         } else {
             (None, Vec::new())
         };
+    let pass1_id = linearization_pass1_id(&source_trailer);
     let finalized_id =
         finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
     // Extract `/ID[0]` now, before `finalized_id` moves into `source_trailer`,
@@ -3116,6 +3134,8 @@ fn write_linearized_impl<R: Read + Seek>(
         })?; // cov:ignore-end
     source_trailer.insert("ID", finalized_id);
     let source_trailer = source_trailer;
+    let mut pass1_source_trailer = source_trailer.clone();
+    pass1_source_trailer.insert("ID", pass1_id);
 
     // This guard mirrors a real qpdf restriction, not a blanket rejection of
     // linearize+encrypt — verified empirically against qpdf 11.9.0: `qpdf
@@ -3760,7 +3780,7 @@ fn write_linearized_impl<R: Read + Seek>(
                     structural_streams_filtered,
                     0,
                     None,
-                    &source_trailer,
+                    &pass1_source_trailer,
                     &objstm_layout,
                     &relocation,
                     options,
@@ -4414,7 +4434,11 @@ fn write_linearized_impl<R: Read + Seek>(
             )
             .as_bytes(),
         );
-        std::fs::write(pass1_path, pass1_bytes)?;
+        let mut pass1_file = std::fs::File::create(pass1_path)
+            .map_err(|source| crate::Error::file_io("open", pass1_path, source))?;
+        pass1_file
+            .write_all(&pass1_bytes)
+            .map_err(|source| crate::Error::file_io("write", pass1_path, source))?;
     }
 
     // ------------------------------------------------------------------
@@ -4640,6 +4664,85 @@ mod tests {
             .windows(b"% hint_length=".len())
             .any(|w| w == b"% hint_length="));
         assert!(pass1_comment_value(&pass1, b"% second_xref_end=") > 0);
+    }
+
+    #[test]
+    fn write_linearized_with_pass1_file_preserves_open_error_context() {
+        let mut planning_pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut planning_pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let pass1_path = temp.path().join("missing-parent").join("pass1.pdf");
+        let mut writing_pdf = open_tiny_pdf();
+
+        let error = write_linearized_with_pass1_file(
+            &plan,
+            &renumber,
+            &mut writing_pdf,
+            &WriteOptions::default(),
+            &pass1_path,
+        )
+        .expect_err("missing pass-1 parent must fail before returning final output");
+
+        match &error {
+            crate::Error::FileIo {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(*operation, "open");
+                assert_eq!(path, &pass1_path);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected file-aware pass-1 error, got {other:?}"),
+        }
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("file-aware error must retain source")
+                .downcast_ref::<std::io::Error>()
+                .expect("source must be io::Error")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let diagnostic = error.to_string();
+        assert!(diagnostic.starts_with(&format!("open {}: ", pass1_path.display())));
+        assert!(diagnostic.contains("No such file") || diagnostic.contains("cannot find"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_linearized_with_pass1_file_preserves_write_error_context() {
+        let pass1_path = Path::new("/dev/full");
+        if !pass1_path.exists() {
+            eprintln!("skipping: /dev/full is unavailable");
+            return;
+        }
+        let mut planning_pdf = open_tiny_pdf();
+        let plan = LinearizationPlan::from_pdf(&mut planning_pdf, false).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let mut writing_pdf = open_tiny_pdf();
+
+        let error = write_linearized_with_pass1_file(
+            &plan,
+            &renumber,
+            &mut writing_pdf,
+            &WriteOptions::default(),
+            pass1_path,
+        )
+        .expect_err("full pass-1 sink must reject the write");
+
+        match &error {
+            crate::Error::FileIo {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(*operation, "write");
+                assert_eq!(path, pass1_path);
+                assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected file-aware pass-1 write error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5628,6 +5731,110 @@ mod tests {
         );
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    fn linearize_with_pass1(
+        source_bytes: &[u8],
+        object_streams: crate::writer::ObjectStreamMode,
+        options: WriteOptions,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let use_generate = object_streams == crate::writer::ObjectStreamMode::Generate;
+        let mut planning_pdf =
+            Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses for planning");
+        let plan = LinearizationPlan::from_pdf(&mut planning_pdf, use_generate).expect("plan");
+        let renumber = RenumberMap::from_plan(&plan);
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let pass1_path = temp.path().join("pass1.pdf");
+        let mut writing_pdf =
+            Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses for writing");
+        let mut document = write_linearized_with_pass1_file(
+            &plan,
+            &renumber,
+            &mut writing_pdf,
+            &WriteOptions {
+                object_streams,
+                ..options
+            },
+            &pass1_path,
+        )
+        .expect("linearized write with pass-1 file");
+        document.back_patch().expect("back-patch final document");
+        let pass1 = std::fs::read(pass1_path).expect("read pass-1 file");
+        (pass1, document.bytes)
+    }
+
+    /// qpdf 11.9.0 `QPDFWriter::writeTrailer` writes placeholders at every
+    /// pass-1 `/ID` site regardless of the final ID policy. The first zero
+    /// string keeps the original `/ID[0]` byte width and the second is always
+    /// 16 bytes. The final pass still preserves the original permanent ID.
+    #[test]
+    fn pass1_ids_are_zero_placeholders_for_every_id_policy_and_xref_shape() {
+        let source = tiny_pdf_with(
+            "/ID [<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa> \
+             <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]",
+            None,
+        );
+        let expected_pass1 =
+            b"[<0000000000000000000000000000000000000000><00000000000000000000000000000000>]";
+        let expected_final_prefix = b"[<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa><";
+
+        for object_streams in [
+            crate::writer::ObjectStreamMode::Disable,
+            crate::writer::ObjectStreamMode::Generate,
+        ] {
+            for (policy, options) in [
+                ("default", WriteOptions::default()),
+                (
+                    "static",
+                    WriteOptions {
+                        static_id: true,
+                        ..WriteOptions::default()
+                    },
+                ),
+                (
+                    "deterministic",
+                    WriteOptions {
+                        deterministic_id: true,
+                        ..WriteOptions::default()
+                    },
+                ),
+            ] {
+                let (pass1, final_bytes) = linearize_with_pass1(&source, object_streams, options);
+                let pass1_ids = collect_id_arrays(&pass1);
+                assert_eq!(
+                    pass1_ids.len(),
+                    2,
+                    "{policy}/{object_streams:?}: pass 1 must carry two /ID sites"
+                );
+                assert!(
+                    pass1_ids
+                        .iter()
+                        .all(|id| id.as_slice() == expected_pass1),
+                    "{policy}/{object_streams:?}: every pass-1 /ID must be the qpdf-width zero placeholder: {pass1_ids:?}"
+                );
+
+                let final_ids = collect_id_arrays(&final_bytes);
+                assert_eq!(
+                    final_ids.len(),
+                    2,
+                    "{policy}/{object_streams:?}: final output must carry two /ID sites"
+                );
+                assert!(
+                    final_ids.iter().all(|id| id == &final_ids[0]),
+                    "{policy}/{object_streams:?}: final /ID sites must agree: {final_ids:?}"
+                );
+                assert!(
+                    final_ids[0].starts_with(expected_final_prefix),
+                    "{policy}/{object_streams:?}: final output must preserve source /ID[0]: {:?}",
+                    final_ids[0]
+                );
+                assert_ne!(
+                    final_ids[0].as_slice(),
+                    expected_pass1,
+                    "{policy}/{object_streams:?}: pass-1 placeholder must not replace the final /ID"
+                );
+            }
+        }
     }
 
     #[test]

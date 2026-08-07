@@ -24,16 +24,45 @@ const ATTACHMENT_PDF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tests/fixtures/compat/attachment-two-page.pdf"
 );
+const EXPECTED_QPDF_VERSION: &str = "11.9.0";
 
 fn flpdf() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("flpdf"))
 }
 
+fn qpdf_version_is_expected(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        == Some(&format!("qpdf version {EXPECTED_QPDF_VERSION}"))
+}
+
 fn qpdf_available() -> bool {
-    ProcessCommand::new("qpdf")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
+    let observation = match ProcessCommand::new("qpdf").arg("--version").output() {
+        Ok(output) if output.status.success() && qpdf_version_is_expected(&output.stdout) => {
+            return true;
+        }
+        Ok(output) => {
+            let first_line = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("<empty stdout>")
+                .to_owned();
+            format!("found {first_line:?} (status {})", output.status)
+        }
+        Err(error) => format!("unable to run qpdf --version: {error}"),
+    };
+
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "qpdf {EXPECTED_QPDF_VERSION} is required for cli_logger_routing differential tests on CI; {observation}"
+        );
+    }
+    eprintln!(
+        "skipping logger routing differential: qpdf {EXPECTED_QPDF_VERSION} is required; {observation}"
+    );
+    false
 }
 
 fn run_qpdf(args: &[&str]) -> Output {
@@ -90,6 +119,15 @@ fn text_newline_normalization_only_collapses_crlf_pairs() {
         normalize_text_newlines(b"first\r\nsecond\nthird\rfourth"),
         b"first\nsecond\nthird\rfourth"
     );
+}
+
+#[test]
+fn qpdf_logger_oracle_version_gate_accepts_only_11_9_0() {
+    assert!(qpdf_version_is_expected(
+        b"qpdf version 11.9.0\nRun qpdf --copyright for details\n"
+    ));
+    assert!(!qpdf_version_is_expected(b"qpdf version 12.0.0\n"));
+    assert!(!qpdf_version_is_expected(b"qpdf version 11.9.0-custom\n"));
 }
 
 #[test]
@@ -178,6 +216,26 @@ fn binary_linearized_pdf_dash_writes_pass1_independently() {
     assert!(pass1_bytes
         .windows(b"% hint_offset=".len())
         .any(|window| window == b"% hint_offset="));
+}
+
+#[test]
+fn binary_linearized_pass1_open_failure_names_path_before_final_stdout() {
+    let directory = tempfile::tempdir().unwrap();
+    let pass1 = directory.path().join("missing-parent").join("pass1.pdf");
+    let pass1_arg = format!("--linearize-pass1={}", pass1.display());
+    let output = flpdf()
+        .args(["--linearize", &pass1_arg, ONE_PAGE, "-"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "final PDF must not be emitted after pass-1 open failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("open {}: ", pass1.display())));
+    assert!(stderr.contains("No such file") || stderr.contains("cannot find"));
 }
 
 #[test]
