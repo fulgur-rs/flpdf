@@ -51,6 +51,7 @@
 | `crates/flpdf/src/linearization/show.rs` | correspondence | QPDF_linearization.cc hint decoding plus QPDFJob.cc display formatting |
 | `crates/flpdf/src/linearization/writer.rs` | correspondence | QPDFWriter.cc linearized write path split from the standard writer |
 | `crates/flpdf/src/linearization/xref_stream.rs` | correspondence | compatibility namespace for QPDFWriter.cc xref-stream serialization |
+| `crates/flpdf/src/logger.rs` | correspondence | QPDFLogger.cc shared info, warning, error, and binary-save pipeline routing |
 | `crates/flpdf/src/matrix.rs` | mirror | libqpdf/QPDFMatrix.cc |
 | `crates/flpdf/src/name_number_tree.rs` | correspondence | compatibility wrappers around the qpdf-shaped \`NameTree\` and \`NumberTree\` helpers in \`nntree.rs\` |
 | `crates/flpdf/src/name_tree_dests.rs` | correspondence | QPDFNameTreeObjectHelper.cc destination-tree access split from the generic tree module |
@@ -104,7 +105,7 @@
 | `crates/flpdf/src/pipeline/lzw.rs` | correspondence | Pl_LZWDecoder.cc bit accumulation, table growth, code-width transitions, end-of-data latching, output boundaries, and error text |
 | `crates/flpdf/src/pipeline/lzw_png_oracle.rs` | correspondence | live differential instrumentation for Pl_LZWDecoder.cc and Pl_PNGFilter.cc |
 | `crates/flpdf/src/pipeline/md5.rs` | correspondence | libqpdf/Pl_MD5.cc:5-65 and libqpdf/qpdf/Pl_MD5.hh:4-33 — unchanged forwarding, enable/persist state, reusable finish lifecycle, and hexadecimal digest retrieval |
-| `crates/flpdf/src/pipeline/ostream.rs` | correspondence | Pl_OStream.cc terminal adapter for an externally owned writer |
+| `crates/flpdf/src/pipeline/ostream.rs` | correspondence | Pl_OStream.cc terminal adapter for a writer |
 | `crates/flpdf/src/pipeline/png_filter.rs` | correspondence | Pl_PNGFilter.cc row geometry, buffer rotation, per-filter decoding, hard-coded Up encoding, partial-row finish, and constructor validation |
 | `crates/flpdf/src/pipeline/qpdf_tokenizer.rs` | correspondence | Pl_QPDFTokenizer.cc buffered token-filter pipeline |
 | `crates/flpdf/src/pipeline/rc4.rs` | correspondence | Pl_RC4.cc bounded streaming over one retained RC4 state |
