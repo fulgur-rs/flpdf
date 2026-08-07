@@ -81,7 +81,7 @@
 
   Run the two focused commands from Step 2 and the full `replace_stream_data` unit-test filter. Update the method rustdoc and the `QPDF_Stream::stream_data` correspondence annotation to record the shared zero/nonzero boundary.
 
-- [ ] **Step 5: Run repository quality gates**
+- [x] **Step 5: Run repository quality gates**
 
   Run:
 
@@ -93,6 +93,6 @@
 
   Then run the relevant qpdf byte-identical corpus under `qpdf-zlib-compat` and produce fresh workspace LCOV plus `scripts/patch-coverage.sh --base main` evidence with zero uncovered changed executable lines.
 
-- [ ] **Step 6: Review, commit, and publish**
+- [x] **Step 6: Review, commit, and publish**
 
   Inspect `git diff --check` and the exact `main...HEAD` diff, commit only the plan, implementation, tests, and correspondence update, push the feature branch, persist Beads with `bd dolt push`, and report without closing the issue until integration is confirmed.
