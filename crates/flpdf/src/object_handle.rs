@@ -1656,21 +1656,26 @@ impl ObjectHandle {
     /// indirect handle produces a direct null handle, matching every other
     /// accessor's "no hidden I/O" rule.
     ///
-    /// qpdf's own `QPDF_Stream::copy` throws outright ("stream objects
-    /// cannot be cloned", `libqpdf/QPDF_Stream.cc`), and this crate has no
-    /// exception channel to mirror that with — the same precedent
-    /// [`Self::unparse_resolved`]'s own doc comment already establishes for
-    /// a different qpdf-throws case. Instead of leaving a stream's `stream_dict`
-    /// Rc-shared with the source (which would let a later
-    /// [`Self::replace_stream_data`] on the copy silently corrupt the
-    /// source's `/Length`/`/Filter`/`/DecodeParms`), a stream's `stream_dict` is
-    /// treated as a child exactly like an array/dictionary entry: copied
-    /// independently when direct, shared when indirect.
-    pub fn shallow_copy(&self) -> ObjectHandle {
+    /// # Errors
+    ///
+    /// Returns [`Error::System`] for a stream, whether it is this handle's
+    /// own value or a *direct* descendant reached by the recursion.
+    /// `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`) ignores its
+    /// `shallow` argument and unconditionally throws
+    /// `std::runtime_error("stream objects cannot be cloned")`, so both
+    /// `shallowCopy` and `unsafeShallowCopy` refuse a stream; a direct
+    /// stream nested in a copied container throws from the same place,
+    /// since `QPDF_Dictionary::copy`/`QPDF_Array::copy` call `shallowCopy`
+    /// on each direct child. qpdf's own supported way to copy a stream is
+    /// `QPDFObjectHandle::copyStream` (`libqpdf/QPDFObjectHandle.cc:2136-2151`),
+    /// which mints a *new* stream object and backs it with the source's
+    /// buffer instead of duplicating this one in place; the buffer-sharing
+    /// half of that is available here through [`Self::replace_stream_data`].
+    pub fn shallow_copy(&self) -> Result<ObjectHandle> {
         stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
             self.with_value(|value| match value {
-                Some(v) => ObjectHandle::from_value(shallow_copy_value(v)),
-                None => ObjectHandle::null(),
+                Some(v) => Ok(ObjectHandle::from_value(shallow_copy_value(v)?)),
+                None => Ok(ObjectHandle::null()),
             })
         })
     }
@@ -1729,27 +1734,37 @@ impl ObjectHandle {
     /// `resolve`/`resolve_borrowed` staleness caveat and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
     /// since this method installs and rebinds entries via `replace_key`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Self::shallow_copy`]'s stream rejection: qpdf privatizes
+    /// an incoming value with `shallowCopy` (`libqpdf/QPDFObjectHandle.cc:1090`,
+    /// `:1113`, `:1122`), which throws for a *direct* stream, so a resources
+    /// dictionary holding one — rather than the indirect reference a stream
+    /// must be in a valid PDF — fails here too. Entries merged before the
+    /// failing one stay installed, matching an exception unwinding out of
+    /// qpdf's own loop.
     pub fn merge_resources(
         &self,
         other: &ObjectHandle,
         mut conflicts: Option<&mut ResourceConflicts>,
-    ) {
+    ) -> Result<()> {
         let (Some(_), Some(other_entries)) = (self.as_dictionary(), other.as_dictionary()) else {
-            return;
+            return Ok(());
         };
         for (rtype, other_val) in other_entries {
             if !self.has_key(&rtype) {
-                self.replace_key(&rtype, other_val.shallow_copy());
+                self.replace_key(&rtype, other_val.shallow_copy()?);
                 continue;
             }
             let mut this_val = self.get_key(&rtype);
             if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
                 if this_val.is_indirect() {
-                    let privatized = this_val.shallow_copy();
+                    let privatized = this_val.shallow_copy()?;
                     self.replace_key(&rtype, privatized.clone());
                     this_val = privatized;
                 }
-                merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut());
+                merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut())?;
             } else if this_val.as_array().is_some() && other_val.as_array().is_some() {
                 merge_resource_array(&this_val, &other_val);
             }
@@ -1757,6 +1772,7 @@ impl ObjectHandle {
             // matching qpdf's own fallthrough (neither the dictionary nor
             // the array arm matches, and there is no further branch).
         }
+        Ok(())
     }
 
     /// Replace this handle's stream data with the given buffer, and — when
@@ -3473,40 +3489,37 @@ fn write_id_style_value_handle(value: &ObjectHandle, out: &mut Vec<u8>) -> Resul
 // child is recursively shallow-copied through `shallow_copy_child` (which
 // re-enters `ObjectHandle::shallow_copy`, the recursion hub carrying its
 // own `stacker::maybe_grow` wrap — the same hub-per-call shape as
-// `unparse_materialize`/`unparse_materialize_child` above). A `Stream`'s
-// `stream_dict` field is a child in exactly the same sense as an
-// array/dictionary entry and gets the same `shallow_copy_child` treatment, so
-// the copy's dictionary is independent of the source's rather than Rc-shared
-// with it (see `shallow_copy`'s own doc comment for why that matters).
-// `stream_data` is shared either way. Every other variant is cloned as-is
-// with no further recursion.
-fn shallow_copy_value(value: &ObjectValue) -> ObjectValue {
-    match value {
-        ObjectValue::Array(items) => {
-            ObjectValue::Array(items.iter().map(shallow_copy_child).collect())
-        }
+// `unparse_materialize`/`unparse_materialize_child` above), mirroring
+// `QPDF_Dictionary::copy`/`QPDF_Array::copy`, which call `shallowCopy` on
+// each direct child and keep an indirect one shared. A `Stream` has no
+// copy at all: `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`)
+// throws, and it throws from here too — for this value itself and, through
+// the recursion, for any direct stream descendant. Every other variant is
+// cloned as-is with no further recursion.
+fn shallow_copy_value(value: &ObjectValue) -> Result<ObjectValue> {
+    Ok(match value {
+        ObjectValue::Array(items) => ObjectValue::Array(
+            items
+                .iter()
+                .map(shallow_copy_child)
+                .collect::<Result<Vec<_>>>()?,
+        ),
         ObjectValue::Dictionary(entries) => ObjectValue::Dictionary(
             entries
                 .iter()
-                .map(|(k, v)| (k.clone(), shallow_copy_child(v)))
-                .collect(),
+                .map(|(k, v)| Ok((k.clone(), shallow_copy_child(v)?)))
+                .collect::<Result<std::collections::BTreeMap<_, _>>>()?,
         ),
-        ObjectValue::Stream {
-            stream_dict,
-            stream_data,
-            stream_length,
-        } => ObjectValue::Stream {
-            stream_dict: shallow_copy_child(stream_dict),
-            stream_data: stream_data.clone(),
-            stream_length: *stream_length,
-        },
+        ObjectValue::Stream { .. } => {
+            return Err(Error::System("stream objects cannot be cloned".to_string()))
+        }
         other => other.clone(),
-    }
+    })
 }
 
-fn shallow_copy_child(child: &ObjectHandle) -> ObjectHandle {
+fn shallow_copy_child(child: &ObjectHandle) -> Result<ObjectHandle> {
     if child.is_indirect() {
-        child.clone()
+        Ok(child.clone())
     } else {
         child.shallow_copy()
     }
@@ -3522,19 +3535,19 @@ fn merge_resource_subdict(
     other_val: &ObjectHandle,
     rtype: &[u8],
     mut conflicts: Option<&mut ResourceConflicts>,
-) {
+) -> Result<()> {
     let mut og_to_name: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
     let mut rnames: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     let mut min_suffix: usize = 1;
     let Some(other_sub_entries) = other_val.as_dictionary() else {
-        return; // cov:ignore: caller already confirmed other_val.as_dictionary().is_some()
+        return Ok(()); // cov:ignore: caller already confirmed other_val.as_dictionary().is_some()
     };
     for (key, rval) in other_sub_entries {
         if !this_val.has_key(&key) {
             let installed = if rval.is_indirect() {
                 rval
             } else {
-                rval.shallow_copy()
+                rval.shallow_copy()?
             };
             this_val.replace_key(&key, installed);
             continue;
@@ -3565,6 +3578,7 @@ fn merge_resource_subdict(
             this_val.replace_key(&new_key, rval);
         }
     }
+    Ok(())
 }
 
 // `ObjectHandle::merge_resources`'s per-rtype array merge (the
@@ -5412,14 +5426,64 @@ mod stream_payload_sharing_tests {
         );
     }
 
+    // `QPDF_Stream::copy` (`libqpdf/QPDF_Stream.cc:140-145`) ignores its
+    // `shallow` argument and unconditionally throws
+    // `std::runtime_error("stream objects cannot be cloned")`, so
+    // `shallowCopy` has no stream path to reach.
     #[test]
-    fn shallow_copy_shares_the_stream_payload_allocation() {
+    fn shallow_copy_refuses_a_stream() {
         let shared = Rc::new(vec![0x5a; 4096]);
         let stream = ObjectHandle::stream(length_dict(4096), Rc::clone(&shared));
 
-        let copy = stream.shallow_copy();
+        let error = stream.shallow_copy().expect_err("streams cannot be cloned");
 
-        assert!(Rc::ptr_eq(&payload_of(&copy), &shared));
+        assert!(
+            matches!(error, Error::System(ref message)
+                if message == "stream objects cannot be cloned"),
+            "qpdf throws std::runtime_error here, which this crate classifies \
+             as Error::System: {error:?}"
+        );
+    }
+
+    // A stream reached through the recursion is refused for the same reason:
+    // `QPDF_Dictionary::copy`/`QPDF_Array::copy` shallow-copy each *direct*
+    // child, so the throw comes from the same `QPDF_Stream::copy`.
+    #[test]
+    fn shallow_copy_refuses_a_direct_stream_nested_in_a_container() {
+        let stream = ObjectHandle::stream(length_dict(4096), Rc::new(vec![0x5a; 4096]));
+        let dictionary = ObjectHandle::dictionary(vec![(b"Nested".to_vec(), stream.clone())]);
+        let array = ObjectHandle::array(vec![ObjectHandle::array(vec![stream])]);
+
+        for container in [dictionary, array] {
+            let error = container
+                .shallow_copy()
+                .expect_err("a direct stream descendant is refused too");
+            assert!(
+                matches!(error, Error::System(ref message)
+                    if message == "stream objects cannot be cloned"),
+                "{error:?}"
+            );
+        }
+    }
+
+    // An *indirect* stream child is not copied at all — it keeps its shared
+    // identity, exactly as `QPDF_Dictionary::copy`'s `value.isIndirect()`
+    // arm does — so the container copy succeeds.
+    #[test]
+    fn shallow_copy_keeps_an_indirect_stream_child_shared() {
+        let stream = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict: length_dict(4096),
+            stream_data: Some(Rc::new(vec![0x5a; 4096])),
+            stream_length: 4096,
+        });
+        let dictionary = ObjectHandle::dictionary(vec![(b"Nested".to_vec(), stream.clone())]);
+
+        let copy = dictionary
+            .shallow_copy()
+            .expect("an indirect stream child is shared, never copied");
+
+        assert!(copy.get_key(b"Nested").is_same_object_as(&stream));
     }
 
     // `QPDF_Stream::getStreamDataBuffer` (`libqpdf/qpdf/QPDF_Stream.hh:39`)
@@ -5447,7 +5511,6 @@ mod stream_payload_sharing_tests {
         stream.replace_stream_data(Rc::clone(&shared), None, None);
 
         assert!(Rc::ptr_eq(&payload_of(&stream), &shared));
-        assert!(Rc::ptr_eq(&payload_of(&stream.shallow_copy()), &shared));
         assert!(!stream
             .as_stream_dict()
             .expect("stream dict")
@@ -8381,14 +8444,14 @@ mod mutation_tests {
     fn shallow_copy_is_always_direct_even_from_an_indirect_source() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
-        let copy = indirect.shallow_copy();
+        let copy = indirect.shallow_copy().expect("dictionary copy");
         assert!(copy.is_direct());
     }
 
     #[test]
     fn shallow_copy_mutation_does_not_affect_the_source() {
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        let copy = original.shallow_copy();
+        let copy = original.shallow_copy().expect("dictionary copy");
         copy.replace_key(b"A", ObjectHandle::integer(2));
         assert_eq!(original.get_key(b"A").as_integer(), Some(1));
         assert_eq!(copy.get_key(b"A").as_integer(), Some(2));
@@ -8405,7 +8468,7 @@ mod mutation_tests {
             b"A".to_vec(),
             ObjectHandle::dictionary(vec![(b"Inner".to_vec(), ObjectHandle::integer(1))]),
         )]);
-        let copy = original.shallow_copy();
+        let copy = original.shallow_copy().expect("dictionary copy");
         copy.get_key(b"A")
             .replace_key(b"Inner", ObjectHandle::integer(2));
         assert_eq!(
@@ -8420,14 +8483,14 @@ mod mutation_tests {
         let child = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         child.set_resolved(ObjectValue::Integer(1));
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
-        let copy = original.shallow_copy();
+        let copy = original.shallow_copy().expect("dictionary copy");
         assert!(copy.get_key(b"A").ptr_eq(&child));
     }
 
     #[test]
     fn shallow_copy_of_a_non_container_clones_the_scalar_value() {
         let original = ObjectHandle::integer(5);
-        let copy = original.shallow_copy();
+        let copy = original.shallow_copy().expect("scalar copy");
         assert!(!copy.ptr_eq(&original));
         assert_eq!(copy.as_integer(), Some(5));
     }
@@ -8449,10 +8512,55 @@ mod mutation_tests {
     fn merge_resources_is_a_no_op_unless_both_sides_are_dictionaries() {
         let scalar = ObjectHandle::integer(1);
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        scalar.merge_resources(&dict, None);
-        dict.merge_resources(&scalar, None);
+        scalar.merge_resources(&dict, None).expect("merge");
+        dict.merge_resources(&scalar, None).expect("merge");
         assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
         assert!(dict.get_key(b"B").is_null());
+    }
+
+    // qpdf privatizes an incoming resource value with `shallowCopy`
+    // (`libqpdf/QPDFObjectHandle.cc:1090`, `:1113`, `:1122`), so a *direct*
+    // stream anywhere it reaches propagates `QPDF_Stream::copy`'s throw out
+    // of `mergeResources` rather than being merged. Both privatizing sites
+    // are covered: a whole rtype `self` lacks, and an inner key inside a
+    // shared rtype.
+    #[test]
+    fn merge_resources_propagates_the_stream_rejection_from_either_privatizing_site() {
+        let stream = || {
+            ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
+                Rc::new(b"abc".to_vec()),
+            )
+        };
+
+        let new_rtype_dest = ObjectHandle::dictionary(vec![]);
+        let new_rtype_other = ObjectHandle::dictionary(vec![(
+            b"XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"Im1".to_vec(), stream())]),
+        )]);
+
+        let inner_key_dest = ObjectHandle::dictionary(vec![(
+            b"XObject".to_vec(),
+            ObjectHandle::dictionary(vec![]),
+        )]);
+        let inner_key_other = ObjectHandle::dictionary(vec![(
+            b"XObject".to_vec(),
+            ObjectHandle::dictionary(vec![(b"Im1".to_vec(), stream())]),
+        )]);
+
+        for (dest, other) in [
+            (new_rtype_dest, new_rtype_other),
+            (inner_key_dest, inner_key_other),
+        ] {
+            let error = dest
+                .merge_resources(&other, None)
+                .expect_err("a direct stream resource cannot be privatized");
+            assert!(
+                matches!(error, Error::System(ref message)
+                    if message == "stream objects cannot be cloned"),
+                "{error:?}"
+            );
+        }
     }
 
     #[test]
@@ -8460,7 +8568,7 @@ mod mutation_tests {
         let source_sub = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(1))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), source_sub.clone())]);
         let dest = ObjectHandle::dictionary(vec![]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         let installed = dest.get_key(b"Font");
         assert_eq!(installed.get_key(b"F1").as_integer(), Some(1));
         assert!(!installed.ptr_eq(&source_sub)); // privatized, not shared
@@ -8472,7 +8580,7 @@ mod mutation_tests {
         let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
         let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         let font = dest.get_key(b"Font");
         assert_eq!(font.get_key(b"F1").as_integer(), Some(1));
         assert_eq!(font.get_key(b"F2").as_integer(), Some(2));
@@ -8485,7 +8593,7 @@ mod mutation_tests {
         let other_font =
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(99))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
     }
 
@@ -8501,7 +8609,8 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts));
+        dest.merge_resources(&other, Some(&mut conflicts))
+            .expect("merge");
         assert!(conflicts.is_empty());
         assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
     }
@@ -8521,7 +8630,8 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts));
+        dest.merge_resources(&other, Some(&mut conflicts))
+            .expect("merge");
         assert_eq!(
             conflicts
                 .get(b"Font".as_slice())
@@ -8540,7 +8650,8 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts));
+        dest.merge_resources(&other, Some(&mut conflicts))
+            .expect("merge");
         let new_name = conflicts
             .get(b"Font".as_slice())
             .and_then(|m| m.get(b"F1".as_slice()))
@@ -8566,7 +8677,7 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"Font".to_vec(), indirect_font.clone())]);
         let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        shared_dest.merge_resources(&other, None);
+        shared_dest.merge_resources(&other, None).expect("merge");
         // shared_dest's own /Font is now a private direct copy...
         assert!(shared_dest.get_key(b"Font").is_direct());
         assert_eq!(
@@ -8592,7 +8703,7 @@ mod mutation_tests {
                 ObjectHandle::name(b"Text".to_vec()),
             ]),
         )]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         let items = dest.get_key(b"ProcSet").as_array().unwrap();
         let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
         assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
@@ -8618,7 +8729,7 @@ mod mutation_tests {
             ObjectHandle::array(vec![retained.clone()]),
         )]);
 
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
 
         let merged = dest
             .get_key(b"ProcSet")
@@ -8635,7 +8746,7 @@ mod mutation_tests {
             b"Font".to_vec(),
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]),
         )]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         assert_eq!(dest.get_key(b"Font").as_integer(), Some(1));
     }
 
@@ -8920,7 +9031,7 @@ mod mutation_tests {
     #[test]
     fn shallow_copy_of_an_unresolved_indirect_handle_is_a_direct_null() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        let copy = indirect.shallow_copy();
+        let copy = indirect.shallow_copy().expect("unresolved copy");
         assert!(copy.is_direct());
         assert!(copy.is_null());
     }
@@ -8929,7 +9040,7 @@ mod mutation_tests {
     fn shallow_copy_of_an_array_recurses_through_direct_elements() {
         let inner = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
         let original = ObjectHandle::array(vec![inner]);
-        let copy = original.shallow_copy();
+        let copy = original.shallow_copy().expect("array copy");
         let copy_inner = copy.as_array().unwrap()[0].clone();
         assert!(!copy_inner.ptr_eq(&original.as_array().unwrap()[0]));
         assert_eq!(
@@ -8939,33 +9050,28 @@ mod mutation_tests {
     }
 
     #[test]
-    fn shallow_copy_of_a_resolved_indirect_stream_gives_the_copy_its_own_dictionary() {
-        // Regression test: the copy's dict must not be Rc-shared with the
-        // source's, or mutating the copy via replace_stream_data would
-        // silently corrupt the source stream's /Length/Filter/DecodeParms.
+    fn shallow_copy_refuses_a_resolved_indirect_stream() {
+        // `shallowCopy` dereferences first (`libqpdf/QPDFObjectHandle.cc:2074-2078`)
+        // and only then calls `obj->copy()`, so an indirect handle whose
+        // resolved value is a stream reaches `QPDF_Stream::copy`'s throw just
+        // as a direct one does — the resolution state changes nothing.
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Stream {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_length: 0,
         });
-        let copy = indirect.shallow_copy();
-        copy.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
 
-        assert_eq!(copy.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
-        assert_eq!(
-            copy.as_stream_dict()
-                .unwrap()
-                .get_key(b"Length")
-                .as_integer(),
-            Some(8)
+        let error = indirect
+            .shallow_copy()
+            .expect_err("streams cannot be cloned");
+
+        assert!(
+            matches!(error, Error::System(ref message)
+                if message == "stream objects cannot be cloned"),
+            "{error:?}"
         );
         assert_eq!(indirect.as_stream_data(), Some(Rc::new(b"old".to_vec())));
-        assert!(indirect
-            .as_stream_dict()
-            .unwrap()
-            .get_key(b"Length")
-            .is_null());
     }
 
     #[test]
@@ -8976,7 +9082,7 @@ mod mutation_tests {
         let dest = ObjectHandle::dictionary(vec![(b"Font".to_vec(), this_font)]);
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
     }
 
@@ -8988,7 +9094,7 @@ mod mutation_tests {
             b"ProcSet".to_vec(),
             ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
         )]);
-        dest.merge_resources(&other, None);
+        dest.merge_resources(&other, None).expect("merge");
         assert!(dest.get_key(b"ProcSet").as_array().unwrap().is_empty());
     }
 
@@ -9022,7 +9128,8 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         let mut conflicts = std::collections::BTreeMap::new();
-        dest.merge_resources(&other, Some(&mut conflicts));
+        dest.merge_resources(&other, Some(&mut conflicts))
+            .expect("merge");
         let new_name = conflicts
             .get(b"Font".as_slice())
             .and_then(|m| m.get(b"F1".as_slice()))
