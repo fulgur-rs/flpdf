@@ -5078,4 +5078,51 @@ pub(crate) mod tests {
             b"test filter"
         );
     }
+
+    /// Every registered test double answers `decode_pipeline` the way its own
+    /// `pipe_decode_recovering` behaves.
+    ///
+    /// The trait declares `decode_pipeline` without a default, so these doubles
+    /// carry bodies purely to satisfy it — and an unexercised body is free to
+    /// drift from the double's stated role. `PostPreflightFailure` is the one
+    /// whose role reaches past "contributes no stage": it exists to fail on
+    /// *every* route past the preflight, and only the whole-buffer half of that
+    /// claim is checked elsewhere
+    /// (`filters::tests::recovering_decode_propagates_a_post_preflight_adapter_error`).
+    #[test]
+    fn the_registered_test_doubles_agree_across_both_decode_routes() {
+        let mut sink = OutputBuffer::new(None);
+
+        // Both transform nothing, so each is qpdf's nullptr: no stage, and the
+        // caller keeps writing straight to its own `next`.
+        for name in [
+            b"TestRejectDecode".as_slice(),
+            b"TestBorrowedInput".as_slice(),
+        ] {
+            let mut filter = stream_filter_for(name).expect("registered test filter");
+            assert!(
+                filter
+                    .decode_pipeline(&mut sink)
+                    .expect("neither double fails construction")
+                    .is_none(),
+                "{name:?} transforms nothing, so it contributes no stage"
+            );
+        }
+        assert!(
+            sink.data.is_empty(),
+            "a filter contributing no stage writes nothing of its own"
+        );
+
+        let mut filter =
+            stream_filter_for(b"TestPostPreflightFailure").expect("registered test filter");
+        // `.err().unwrap()` rather than `.unwrap_err()`: the success type is
+        // `Option<Box<dyn Pipeline>>`, which has no `Debug`.
+        let staged = filter.decode_pipeline(&mut sink).err().unwrap();
+        let buffered = filter
+            .pipe_decode(b"encoded input", None, &mut ignore_warning)
+            .unwrap_err();
+
+        assert_eq!(staged.to_string(), "test post-preflight decode failure");
+        assert_eq!(buffered.to_string(), staged.to_string());
+    }
 }
