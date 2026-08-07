@@ -21,8 +21,9 @@
 //! qpdf promotion registers and updates the existing allocation rather than
 //! cloning a direct payload (`libqpdf/QPDF.cc:1835-1839,1882-1897`); this
 //! port's [`ObjectHandle::promote_to_indirect`] mutates its existing slot on
-//! the same boundary. During teardown qpdf disconnects each cached object and
-//! destroys every non-null value (`libqpdf/QPDF.cc:215-235`); this port's
+//! the same boundary. During teardown qpdf disconnects every cached indirect
+//! object, including unresolved entries, and destroys only non-null values
+//! (`libqpdf/QPDF.cc:215-235`); this port's
 //! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
 //! state-sensitive value.
 //!
@@ -779,8 +780,9 @@ impl ObjectHandle {
     /// which `Rc` alone never collects.
     ///
     /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache,
-    /// disconnects every resolved object, and replaces every non-null value
-    /// with `QPDF_Destroyed()`, specifically to break cycles like this one
+    /// disconnects every cached indirect object, including unresolved entries,
+    /// and replaces only non-null values with `QPDF_Destroyed()`, specifically
+    /// to break cycles like this one
     /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Literal null and missing values stay
     /// null. The reader's `Pdf::drop` calls this for every entry in its handle
     /// registry — the sole owner of the canonical `Rc`s — before the registry
