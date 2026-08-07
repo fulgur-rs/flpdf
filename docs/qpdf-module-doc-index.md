@@ -21,7 +21,7 @@
 | `crates/flpdf/src/document_json.rs` | correspondence | QPDF_json.cc output side — the free function \`writeJSONStreamFile\` and both \`QPDF::writeJSON\` overloads; the input side (\`JSONReactor\`, \`createFromJSON\`, \`updateFromJSON\`, \`importJSON\`) has no counterpart here |
 | `crates/flpdf/src/embedded_files.rs` | correspondence | QPDFEmbeddedFileDocumentHelper.cc behavior without its complete public helper API boundary |
 | `crates/flpdf/src/encrypt_setup.rs` | correspondence | QPDF_encryption.cc writer-side encryption configuration split from the security handler |
-| `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\` first; \`processFile\`/\`processMemoryFile\` remain in \`reader.rs\` pending the broader split — see \`docs/plans/2026-08-07-reader-rs-pdf-engine-resolve-split-design.md\`) |
+| `crates/flpdf/src/engine.rs` | correspondence | QPDF.cc document-construction entry points (\`emptyPDF()\`, \`processFile()\`, and \`processMemoryFile()\`) and their shared construction orchestration |
 | `crates/flpdf/src/error.rs` | correspondence | QPDFExc.cc and QPDFSystemError.cc concepts combined with flpdf-specific errors; public APIs are incomplete |
 | `crates/flpdf/src/filespec_helper.rs` | correspondence | QPDFFileSpecObjectHelper.cc and QPDFEFStreamObjectHelper.cc |
 | `crates/flpdf/src/filters.rs` | correspondence | QPDF_Stream filter-chain orchestration; QPDFStreamFilter dispatch, codec construction, and Pipeline execution are delegated to stream_filter |
@@ -115,7 +115,7 @@
 | `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
-| `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc document reading, object resolution, recovery, and authentication responsibilities |
+| `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
 | `crates/flpdf/src/reader/file_object.rs` | correspondence | QPDF.cc readObject/readStream framing and recovery split from the document reader |
 | `crates/flpdf/src/reader/resolver.rs` | correspondence | \`QPDF::resolve\` (\`libqpdf/QPDF.cc:1700-1753\`) and the \`QPDF::Members\` fields it touches |
 | `crates/flpdf/src/ref_chain.rs` | correspondence | QPDF.cc indirect-reference resolution represented as a bounded shared primitive |
