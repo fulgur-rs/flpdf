@@ -25,7 +25,9 @@ itself.
    今回のセッションだけで `emptyPDF()` の帰属を2回間違えた（最初は
    flpdf-cli、次に flpdf 独自の「QPDFJob」概念）。実際には
    `crates/flpdf/src/job/` が既に QPDFJob の受け皿として存在していた。
-2. **`reader.rs` 自体の肥大化**（8700行超）がレビュー・ナビゲーションを
+2. **`reader.rs` 自体の肥大化**（本設計の分析着手時点で8700行超。
+   `flpdf-0b12` が8メソッドを `pdf.rs` へ抽出した現状は8475行）が
+   レビュー・ナビゲーションを
    阻害している。
 3. **flpdf 固有の概念（「reader」「writer」のような分類語）を排除して
    qpdf の実際のクラス・ファイル構成に寄せる**ことが、将来 flpdf 独自実装を
@@ -62,16 +64,18 @@ itself.
 
 **発見**: `reader.rs` の `impl<R: Read + Seek> Pdf<R>` ブロック（分析当時は
 607-3326行・99メソッド。`flpdf-0b12` が8メソッドを `pdf.rs` へ抽出した後の
-現状は444-3051行・91メソッド）を実際に読むと、上記5ファイルに対応する
-エントリポイントメソッド（`is_encrypted`/`authenticate_if_encrypted`/
-`permissions` 等10個。`signatures` は下記の通り QPDF_encryption.cc とは
-無関係なので除く）が**reader.rs 側にも重複して存在する**。これは
-「reader.rs が大きすぎる」問題の一部が、実は「本来別の場所にあるべき
-コードが reader.rs に漏れ出している」問題であることを示す。
+現状は444-3051行・91メソッド）を実際に読むと、上記5ファイルのうち
+**`QPDF_encryption.cc` に対応するエントリポイントメソッド**
+（`is_encrypted`/`authenticate_if_encrypted`/`permissions` 等10個。
+`signatures` は下記の通り QPDF_encryption.cc とは無関係なので除く）が
+**reader.rs 側にも重複して存在する**。これは「reader.rs が大きすぎる」
+問題の一部が、実は「本来別の場所にあるべきコードが reader.rs に
+漏れ出している」問題であることを示す。
 
 同様に `linearized_hint_ref`（`reader.rs:1541-1575`、実装コメントが
-`QPDF_linearization.cc:139-141` を明記）も既存の `linearization/` の
-責務が reader.rs 側に漏れ出している一例。
+`QPDF_linearization.cc:139-141` を明記）は、上記5ファイルのうち
+`QPDF_linearization.cc`（既存の `linearization/` が受け皿）の責務が
+reader.rs 側に漏れ出している別の一例。
 
 **行番号の注記**: 以下、本設計文書内の `reader.rs:NNNN` 引用は
 `flpdf-0b12`（commit `56a01c2b`）適用後、つまり `pdf.rs` 抽出済みの
@@ -206,7 +210,7 @@ reader.rs に残ったまま）。
 - 「reader.rs にあるのがおかしい」の根本原因（crate全体で使う中心型が
   narrow-purpose に見えるファイル名の下にある）をここで解消
 
-### `engine.rs`（新規、orchestration 層）
+### `engine.rs`（PR #657 で既に存在、拡張対象。orchestration 層）
 - `Pdf` を返す factory 全部: `open`, `open_with_repair`, `open_best_effort`,
   `open_with_options`, `empty`, `open_mem`, `open_mem_owned`,
   `open_mem_with_options`, `open_mem_owned_with_options`、および実際の
@@ -370,11 +374,13 @@ reader.rs に残ったまま）。
 このセッションでは設計のみ。以下は別セッションで:
 
 1. bd issue（epic + 残りのサブタスク）を本設計に基づいて作成する。
-   `pdf.rs` 抽出（`struct Pdf<R>` + 8メソッド + `unique_id` + `Drop`）は
+   `pdf.rs` 抽出（`struct Pdf<R>` + 8メソッド + `Drop`）は
    `flpdf-0b12`（`refactor/flpdf-0b12-pdf-module`、PR #658 スタック）で
    **実装済み** — フィールドを `pub(crate)` にするだけで sibling モジュール
-   のまま解決した（モジュール階層節参照）。残りは `obj_cache.rs`/
-   `resolve.rs`/`engine.rs` 抽出と、暗号/認証エントリ・
+   のまま解決した（モジュール階層節参照）。**`unique_id()` アクセサは
+   この実装済み範囲に含まれない**（reader.rs に残ったまま、上記
+   `pdf.rs` 節参照）。残りは `unique_id()` アクセサの `pdf.rs` への移動、
+   `obj_cache.rs`/`resolve.rs`/`engine.rs` 抽出と、暗号/認証エントリ・
    `take_foreign_object_map`・JSON準備群・`linearized_hint_ref` の
    既存ファイルへの移動
 2. 実装順序: `pdf.rs` の前例（`pub(crate)` フィールド化）と同じ手法を
@@ -388,8 +394,10 @@ reader.rs に残ったまま）。
    移動、`take_foreign_object_map` 等の `object_copy.rs` への移動も
    同じ手法（該当フィールド・呼び出し先ヘルパーを `pub(crate)` にする）
    でよい
-3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、現行本文
-   `reader.rs`(7898) + `reader/resolver.rs`(...) + `reader/file_object.rs`
+3. `docs/qpdf-correspondence.md` の `QPDF.cc` 行（§1、対応表側の既存
+   記載時点での行数 `reader.rs`(7898) — 実際の現状行数（8475、上記
+   「動機」参照）とは別の、対応表が最後に更新された時点のスナップショット
+   ） + `reader/resolver.rs`(...) + `reader/file_object.rs`
    (1405) + `xref.rs`(1220) + `object_copy.rs`(342: `copyForeignObject`) +
    `cache.rs`(112) + `writer/object_streams.rs`(207-237) +
    `signatures.rs`(245-: `removeSecurityRestrictions`) +
