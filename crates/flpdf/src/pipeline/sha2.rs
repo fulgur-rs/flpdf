@@ -1,4 +1,4 @@
-//! qpdf correspondence: `Pl_SHA2.cc` reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
+//! qpdf correspondence: Pl_SHA2.cc reusable streaming SHA-256/384/512 digest with next-pipeline passthrough.
 //!
 //! qpdf's native SHA2 close functions reinitialize the selected context after finalize
 //! (`sha2.c:670-673`, `sha2big.c:209-228`). This port mirrors that lifecycle with
