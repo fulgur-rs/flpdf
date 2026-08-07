@@ -2338,7 +2338,11 @@ mod tests {
             ("", Some(7), "positive offset"),
             ("input.pdf", Some(0), "named zero offset"),
             ("input.pdf", Some(7), "named positive offset"),
-            ("input.pdf", None, "(object 5 0, offset 232): expected endobj"),
+            (
+                "input.pdf",
+                None,
+                "(object 5 0, offset 232): expected endobj",
+            ),
         ] {
             super::route_warning(&logger, false, description, offset, message).unwrap();
         }
