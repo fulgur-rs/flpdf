@@ -84,7 +84,7 @@ use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::pipeline::md5::PlMd5;
-use crate::pipeline::{Pipeline, PipelineResult};
+use crate::pipeline::{Discard, Pipeline};
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cell::RefCell;
@@ -848,25 +848,11 @@ pub fn format_pdf_date(year: u16, month: u8, day: u8, hour: u8, minute: u8, seco
 // pass raw logical bytes straight to `Object::Name`. The canonical escaper now
 // lives at `crate::object::escape_name_bytes` and is serializer-internal.
 
-struct ChecksumDiscard;
-
-impl Pipeline for ChecksumDiscard {
-    #[rustfmt::skip]
-    fn identifier(&self) -> &str { "embedded file checksum discard" } // cov:ignore: consumer-local infallible discard identifier is not called by the qpdf-shaped PlMd5 -> discard production topology
-    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
-        Ok(())
-    }
-
-    fn finish(&mut self) -> PipelineResult<()> {
-        Ok(())
-    }
-}
-
 /// Compute the MD5 checksum of `data` and return it as a 16-byte `Vec<u8>`.
 ///
 /// This is the checksum stored in `/Params /CheckSum` (ISO 32000-1 §7.11.4).
 pub fn md5_checksum(data: &[u8]) -> Vec<u8> {
-    let mut discard = ChecksumDiscard;
+    let mut discard = Discard;
     let mut md5 = PlMd5::new("EF md5", &mut discard);
     md5.write(data)
         .expect("embedded-file MD5 discard write is infallible");

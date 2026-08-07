@@ -1,6 +1,6 @@
 use flpdf::pipeline::{
-    Base64Action, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate, PlOStream,
-    PlStdioFile, PlString,
+    Base64Action, Discard, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate,
+    PlOStream, PlStdioFile, PlString,
 };
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -99,6 +99,27 @@ fn status(result: PipelineResult<()>) -> String {
     result
         .map(|()| "ok".to_owned())
         .unwrap_or_else(|error| error.message().to_string())
+}
+
+#[test]
+fn discard_is_a_public_pipeline_with_the_qpdf_identifier() {
+    let discard = Discard;
+    let pipeline: &dyn Pipeline = &discard;
+
+    assert_eq!(pipeline.identifier(), "discard");
+}
+
+#[test]
+fn discard_accepts_empty_and_nonempty_writes_across_finish_boundaries() {
+    let mut discard = Discard;
+    let pipeline: &mut dyn Pipeline = &mut discard;
+
+    pipeline.write(b"").unwrap();
+    pipeline.write(b"discarded bytes").unwrap();
+    pipeline.finish().unwrap();
+    pipeline.finish().unwrap();
+    pipeline.write(b"after finish").unwrap();
+    pipeline.finish().unwrap();
 }
 
 fn record(
