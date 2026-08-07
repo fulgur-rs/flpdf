@@ -378,19 +378,22 @@ fn absent_params(count: usize) -> Vec<DecodeParams> {
 /// [`decode_params_from_handle`] for the one `/DecodeParms` handle a non-null,
 /// non-array value replicates across the whole chain.
 ///
-/// **Why not [`decode_params_from_handle`] in a loop.** That function reaches
-/// [`ObjectHandle::try_as_dictionary`], which hands back a *clone* of the whole
-/// `BTreeMap` — every key copied, plus one `Rc` bump per value, `ObjectHandle`
-/// being a newtype over one. Calling it once per filter turned an oversized
-/// `/DecodeParms` into one full snapshot per stage — measured, sixteen for a
-/// sixteen-filter chain — however few keys survive
-/// [`RETAINED_DECODE_PARAM_KEYS`], because the retention test runs inside the
-/// walk, after the snapshot. Nor was the stage count capped in general:
+/// **Why not [`decode_params_from_handle`] in a loop.** Consuming stages use
+/// [`decode_params_from_consuming_handle`]'s `try_get_keys` path per stage,
+/// without taking a raw-map snapshot. Non-consuming stages use
+/// [`decode_params_from_entries`]'s [`ObjectHandle::try_as_dictionary`] path,
+/// which hands back a *clone* of the whole `BTreeMap` — every key copied, plus
+/// one `Rc` bump per value, `ObjectHandle` being a newtype over one. Calling
+/// that route once per filter turned an oversized `/DecodeParms` into one full
+/// snapshot per stage — measured, sixteen for a sixteen-filter chain — however
+/// few keys survive [`RETAINED_DECODE_PARAM_KEYS`], because the retention test
+/// runs inside the walk, after the snapshot. Nor was the stage count capped in
+/// general:
 /// `max_filter_chain` bounds it only where [`crate::filters::DecodeLimits`]
 /// carries one. `DecodeLimits::default()` does, but the field is a `pub
 /// Option` a caller may set to `None`, which the entry-point corpus sweeps.
-/// Taking the snapshot here instead costs one whatever the chain length is,
-/// and the per-filter walk then borrows it.
+/// Taking the non-consuming snapshot here instead costs at most one whatever
+/// the chain length is, and those per-filter walks then borrow it.
 ///
 /// **The per-filter walk itself is deliberately kept.** qpdf calls
 /// `filter->setDecodeParms(decode_item)` once per filter
@@ -1965,15 +1968,16 @@ pub(crate) mod tests {
     /// name payload owned wherever it appears — this chain retained 16,777,584
     /// bytes. Filling only one slot would let the next forgotten slot pass.
     ///
-    /// **Both shape readers are measured**, because
-    /// `decode_params_from_object` and `decode_params_from_entries` decide
-    /// retention and classification separately. The corpus's "/Name under a
-    /// filter that is not Crypt" row does catch a rule applied to only one of
-    /// them — measured, forcing `decode_params_from_entries`' retention flag to
-    /// `true` reddens
+    /// **All three shape readers are measured**, because the legacy `Object`
+    /// route [`decode_params_from_object`], consuming handle route
+    /// [`decode_params_from_consuming_handle`], and non-consuming handle route
+    /// [`decode_params_from_entries`] apply retention and classification
+    /// separately. The corpus's "/Name under a filter that is not Crypt" row
+    /// catches a rule applied to only one of these routes — measured, forcing
+    /// the non-consuming handle route's retention gate to `true` reddens
     /// [`handle_reader_matches_object_reader_for_every_filter_shape`] naming
     /// exactly that row — but it is a *relative* gate and would stay green if
-    /// the rule were dropped from both readers together. This test is the
+    /// the rule were dropped from all three routes together. This test is the
     /// absolute one.
     ///
     /// Both a non-consuming and a consuming filter are measured, because they

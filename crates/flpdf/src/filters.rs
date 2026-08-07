@@ -4152,10 +4152,10 @@ mod tests {
         ///
         /// This is the empirical form of the claim `RETAINED_DECODE_PARAM_KEYS`
         /// makes in prose, and it is deliberately insensitive to retention
-        /// itself: measured, deleting the `retains_decode_param_key` test from
-        /// `decode_params_from_object` leaves it green, and so does deleting
-        /// the one in `decode_params_from_entries`. The dropped keys are
-        /// genuinely inert. What this catches is the opposite change — a
+        /// itself: measured, deleting the `retains_decode_param_key` gate from
+        /// `decode_params_from_object`, `decode_params_from_consuming_handle`,
+        /// or `decode_params_from_entries` leaves it green. The dropped keys
+        /// are genuinely inert. What this catches is the opposite change — a
         /// consumer that starts reading a key the constant does not name.
         #[test]
         fn a_dictionary_of_only_unread_keys_decodes_as_an_empty_one() {
