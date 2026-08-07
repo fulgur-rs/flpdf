@@ -274,9 +274,26 @@ reader.rs に残ったまま）。
   対応する、最も qpdf 語彙に忠実な名前
 - 対象: `lift`/`lift_bounded`/`lift_dictionary*`, `read_object_at*`,
   `resolve_compressed_entry`, `decrypt_resolved_object`,
-  `collect_object_stream_chain`, header/startxref 探索, xref 読み取り
-  （`xref.rs` の既存 API を呼ぶだけで xref.rs 自体は変更しない — 詳細は
-  「非目標」参照）, `resolve_to_cache`, `native_parse_uncompressed_value` 等
+  `collect_object_stream_chain`, `resolve_to_cache`,
+  `native_parse_uncompressed_value` 等
+- **訂正**: 「header/startxref 探索, xref 読み取り」を resolve.rs の
+  対象として以前ここに挙げていたが誤り。header discovery/`startxref`
+  parsing/xref table のロードは `xref.rs` の
+  `load_xref_state_with_repair`（`pub(crate) fn`、`xref.rs:84-173`）が
+  一括して行い、呼び出し元は `open_with_repair_mode`
+  （**engine.rs** の factory、`reader.rs:713`）の1箇所のみ。
+  resolve.rs 側のプリミティブ（`lift`/`read_object_at*` 等）は
+  `self.resolver.xref_entry(...)`/`xref_entries()` で**既にロード済みの
+  xref table を読むだけ**で、`xref.rs` の API を再度呼ぶことはない。
+  「header/startxref 探索, xref 読み取り」は resolve.rs の対象から削除し、
+  「非目標」節の記載もこれに合わせて修正する（下記参照）
+- **再帰制限用の private 定数もここに含める**: `lift_bounded`
+  （`reader.rs:2267-`）が呼ぶ `READER_STACK_RED_ZONE`/
+  `READER_STACK_GROWTH_SIZE`（`reader.rs:441-442`、使用箇所
+  `reader.rs:2290`）と、`collect_object_stream_chain`
+  （`reader.rs:3015-`）が呼ぶ `MAX_OBJECT_STREAM_CHAIN_DEPTH`
+  （`reader.rs:422`、使用箇所 `reader.rs:3027`）。3つとも module-level
+  private const で、どの依存閉包にも含まれていなかった
 - **`read_object_at*` の file-object parsing 閉包もここに含める**:
   `read_object_at_with_policy`(`reader.rs:2584-`) が呼ぶ
   `read_bounded_object_window`(`reader.rs:2579-`、`private`)/
@@ -545,8 +562,10 @@ reader.rs に残ったまま）。
 - `QPDFWriter.cc` 等、他の肥大 qpdf ファイルへの同種分解は今回の
   スコープ外（将来別途判断）
 - `xref.rs` / `object_copy.rs` / `pages.rs` など、既に qpdf 対応が
-  取れているファイルの**既存ロジックの変更**は無い。`resolve.rs` は
-  `xref.rs` の既存 API を呼ぶだけで `xref.rs` 自体は変更しない。
+  取れているファイルの**既存ロジックの変更**は無い。`xref.rs` の
+  既存 API（`load_xref_state_with_repair`）を呼ぶのは **engine.rs**
+  の `open_with_repair_mode` であり、`resolve.rs` ではない
+  （resolve.rs 節の訂正を参照）。`xref.rs` 自体は変更しない。
   `object_copy.rs` へは `take_foreign_object_map`/`set_foreign_object_map`
   の追加移動のみ（上記参照）
 
