@@ -105,7 +105,7 @@ fn push_direct_node<R: Read + Seek>(
                 pdf.push_warning(format!(
                     "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
                     String::from_utf8_lossy(&key),
-                ));
+                ))?;
             }
         }
     }
@@ -286,7 +286,7 @@ fn push_internal<R: Read + Seek>(
                 pdf.push_warning(format!(
                     "Unknown key /{} in /Pages object is being discarded as a result of flattening the /Pages tree",
                     String::from_utf8_lossy(&key),
-                ));
+                ))?;
             }
         }
     }
@@ -335,6 +335,8 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::test_support::NthWriteFailure;
+    use crate::pipeline::PipelineHandle;
     use crate::{Dictionary, Object, Pdf};
 
     fn pdf_bytes(bodies: &[(u32, &[u8])]) -> Vec<u8> {
@@ -424,6 +426,27 @@ mod tests {
             pdf.resolve(prepared.pages[0]).unwrap(),
             Object::Dictionary(ref page) if page.get("MediaBox").is_some()
         ));
+    }
+
+    #[test]
+    fn warning_sink_failure_propagates_from_an_intermediate_pages_key() {
+        let mut pdf = Pdf::open_mem_owned(pdf_with_unknown_intermediate_pages_key()).unwrap();
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .unwrap()
+            .unwrap();
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
+        pdf.set_logger(logger);
+
+        assert!(matches!(
+            push(&mut pdf, &prepared, true, true),
+            Err(crate::Error::System(ref message)) if message == "sink write failure 1"
+        ));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Unknown key /Unknown")));
     }
 
     #[test]

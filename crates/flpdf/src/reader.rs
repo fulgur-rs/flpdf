@@ -402,6 +402,14 @@ pub struct PdfOpenOptions {
     /// (Algorithm 2 / 2.A / 2.B / 6 / 7) is skipped and `hex_decode(password)`
     /// is used directly as the file key for stream/string decryption.
     pub password_is_hex_key: bool,
+    /// Logger that receives document warnings as they occur. `None` selects
+    /// the process-global qpdf-compatible default logger.
+    pub logger: Option<crate::QPDFLogger>,
+    /// Suppress warning delivery to the logger without removing warnings from
+    /// [`Pdf::repair_diagnostics`].
+    pub suppress_warnings: bool,
+    /// Input-source description used in qpdf-compatible warning prefixes.
+    pub description: String,
 }
 
 // Maximum number of object streams an `/Extends` chain may link before
@@ -429,6 +437,28 @@ const READER_STACK_RED_ZONE: usize = 32 * 1024;
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
 impl<R: Read + Seek> Pdf<R> {
+    /// Return this document's current shared logger.
+    pub fn logger(&self) -> crate::QPDFLogger {
+        self.resolver.logger()
+    }
+
+    /// Replace the shared logger used for warnings raised after this call.
+    pub fn set_logger(&mut self, logger: crate::QPDFLogger) {
+        self.resolver.set_logger(logger);
+    }
+
+    /// Return whether warning delivery is currently suppressed.
+    ///
+    /// Suppression never removes warnings from [`Self::repair_diagnostics`].
+    pub fn suppress_warnings(&self) -> bool {
+        self.resolver.suppress_warnings()
+    }
+
+    /// Enable or disable warning delivery without changing warning collection.
+    pub fn set_suppress_warnings(&mut self, suppress: bool) {
+        self.resolver.set_suppress_warnings(suppress);
+    }
+
     /// Diagnostics emitted while opening the document — typically warnings from the
     /// xref/trailer recovery path. Always non-empty when the parse hit a soft failure.
     ///
@@ -458,8 +488,8 @@ impl<R: Read + Seek> Pdf<R> {
     /// caller already holds a `&mut Pdf`, and the resolver's own warnings go
     /// through [`resolver::ResolverHandle::push_warning`] instead. Both doors
     /// reach the one collection.
-    pub(crate) fn push_warning(&mut self, message: impl Into<String>) {
-        self.resolver.push_warning(message);
+    pub(crate) fn push_warning(&mut self, message: impl Into<String>) -> Result<()> {
+        self.resolver.push_warning(message)
     }
 
     /// Exact source framing removed by an authoritative `endstream` scan.
@@ -861,7 +891,7 @@ impl<R: Read + Seek> Pdf<R> {
             cached_key_og: None,
         });
         if let Some(warning) = r6_perms_warning {
-            self.push_warning(warning);
+            self.push_warning(warning)?;
         }
         Ok(())
     }
@@ -1833,7 +1863,7 @@ impl<R: Read + Seek> Pdf<R> {
                 None => false,
             };
             drop(encryption_guard);
-            self.warn_unknown_crypt_filters(warn, false);
+            self.warn_unknown_crypt_filters(warn, false)?;
         }
         handle.set_resolved(value);
         handle.set_parsed_offset_if_unset(parsed_offset);
@@ -1979,7 +2009,7 @@ impl<R: Read + Seek> Pdf<R> {
             current_ref.number,
             current_ref.generation,
             crate::ref_chain::MAX_REF_CHAIN_DEPTH
-        ));
+        ))?;
         // Ref and handle degrade together: a null value paired with a
         // live-looking ref would let a caller compute an "offset of
         // terminal" for an object it was just told is null.
@@ -2625,7 +2655,7 @@ impl<R: Read + Seek> Pdf<R> {
                 } else {
                     self.recovered_stream_eols.remove(&object_ref);
                 }
-                self.record_file_object_diagnostics(object_ref, offset, parsed.diagnostics);
+                self.record_file_object_diagnostics(object_ref, offset, parsed.diagnostics)?;
                 Ok(true)
             }
             Some(CacheEntry::Compressed { stream, index }) => {
@@ -2646,7 +2676,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         offset: u64,
         diagnostics: Vec<FileObjectDiagnostic>,
-    ) {
+    ) -> Result<()> {
         for diagnostic in diagnostics {
             self.push_warning(format!(
                 "(object {} {}, offset {}): {}",
@@ -2654,8 +2684,9 @@ impl<R: Read + Seek> Pdf<R> {
                 object_ref.generation,
                 offset.saturating_add(diagnostic.relative_offset as u64),
                 diagnostic.kind.message()
-            ));
+            ))?;
         }
+        Ok(())
     }
 
     fn resolve_compressed_entry(
@@ -2690,7 +2721,7 @@ impl<R: Read + Seek> Pdf<R> {
                 } else {
                     self.recovered_stream_eols.remove(&stream_ref);
                 }
-                self.record_file_object_diagnostics(stream_ref, offset, parsed.diagnostics);
+                self.record_file_object_diagnostics(stream_ref, offset, parsed.diagnostics)?;
                 object
             }
             Some(
@@ -2717,7 +2748,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.compressed_member_parents
             .insert(object_ref, (parent_ref, parent_index));
         self.cache.set_resolved(object_ref, object);
-        self.record_object_stream_diagnostics(parent_ref, object_ref, diagnostics);
+        self.record_object_stream_diagnostics(parent_ref, object_ref, diagnostics)?;
         Ok(true)
     }
 
@@ -2746,7 +2777,7 @@ impl<R: Read + Seek> Pdf<R> {
         if let Object::Stream(stream) = &mut object {
             if !encryption.encrypt_metadata && is_metadata_stream(&stream.dict) {
                 drop(encryption_guard);
-                self.warn_unknown_crypt_filters(warn_unknown_string, false);
+                self.warn_unknown_crypt_filters(warn_unknown_string, false)?;
                 return Ok((object, false));
             } else if stream_has_explicit_crypt_filter(&stream.dict) {
                 warn_unknown_stream = apply_explicit_crypt_filters(
@@ -2776,7 +2807,7 @@ impl<R: Read + Seek> Pdf<R> {
             }
         }
         drop(encryption_guard);
-        self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream);
+        self.warn_unknown_crypt_filters(warn_unknown_string, warn_unknown_stream)?;
         Ok((object, stream_payload_transformed))
     }
 
@@ -2787,19 +2818,20 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// Each fires at most once per document because the selection that
     /// requests it also rewrites the crypt filter it complained about.
-    fn warn_unknown_crypt_filters(&self, strings: bool, streams: bool) {
+    fn warn_unknown_crypt_filters(&self, strings: bool, streams: bool) -> Result<()> {
         if strings {
             self.resolver.push_warning(
                 "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
                  strings may be decrypted improperly",
-            );
+            )?;
         }
         if streams {
             self.resolver.push_warning(
                 "unknown encryption filter for streams (check /StmF from /Encrypt dictionary); \
                  streams may be decrypted improperly",
-            );
+            )?;
         }
+        Ok(())
     }
 
     fn parse_object_stream_chain_entry(
@@ -2819,7 +2851,7 @@ impl<R: Read + Seek> Pdf<R> {
         stream_ref: ObjectRef,
         object_ref: ObjectRef,
         diagnostics: Vec<crate::parser::ParserDiagnostic>,
-    ) {
+    ) -> Result<()> {
         for diagnostic in diagnostics {
             self.push_warning(format!(
                 "object stream {} (object {} {}, offset {}): {}",
@@ -2828,8 +2860,9 @@ impl<R: Read + Seek> Pdf<R> {
                 object_ref.generation,
                 diagnostic.relative_offset,
                 diagnostic.message
-            ));
+            ))?;
         }
+        Ok(())
     }
 
     fn compressed_parent_for_entry(
@@ -3867,6 +3900,8 @@ fn parse_non_negative_u64(value: i64, context: &str) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::pages::page_refs;
+    use crate::pipeline::test_support::NthWriteFailure;
+    use crate::pipeline::PipelineHandle;
     use crate::write_pdf;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
@@ -3899,6 +3934,12 @@ mod tests {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(pos)
         }
+    }
+
+    fn fail_warning_delivery<R: Read + Seek>(pdf: &mut Pdf<R>) {
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
+        pdf.set_logger(logger);
     }
 
     #[test]
@@ -5690,6 +5731,24 @@ mod tests {
             pdf.resolve(object_ref).unwrap(),
             Object::Name(b"a\0\x31x".to_vec())
         );
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+    }
+
+    #[test]
+    fn compressed_member_warning_sink_failure_propagates_after_collection() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length 9 >>\nstream\n7 0 /a#1x\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open compressed stray-name fixture");
+        let object_ref = ObjectRef::new(7, 0);
+        pdf.cache.set_compressed(object_ref, 1, 0);
+        fail_warning_delivery(&mut pdf);
+
+        assert!(matches!(
+            pdf.resolve(object_ref),
+            Err(crate::Error::System(ref message)) if message == "sink write failure 1"
+        ));
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 
@@ -7764,6 +7823,27 @@ mod tests {
             observed_terminal_ref, None,
             "ref and handle degrade together on the depth-cap fallback"
         );
+    }
+
+    #[test]
+    fn redirect_chain_warning_sink_failure_propagates_after_collection() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let terminal_ref = ObjectRef::new(1000, 0);
+        pdf.set_object(terminal_ref, Object::Integer(7));
+        let mut current_ref = terminal_ref;
+        for i in 0..=crate::ref_chain::MAX_REF_CHAIN_DEPTH {
+            let next_ref = ObjectRef::new(3000 + i as u32, 0);
+            pdf.set_object(next_ref, Object::Reference(current_ref));
+            current_ref = next_ref;
+        }
+        let handle = pdf.get_object_handle(current_ref);
+        fail_warning_delivery(&mut pdf);
+
+        assert!(matches!(
+            pdf.resolve_object_handle_to_terminal_ref(&handle),
+            Err(crate::Error::System(ref message)) if message == "sink write failure 1"
+        ));
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 
     /// White-box companion to the public-API

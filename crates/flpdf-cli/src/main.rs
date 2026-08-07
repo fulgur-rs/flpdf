@@ -27,7 +27,7 @@ use flpdf::{
     parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
     CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FormFieldObjectHelper,
     NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper,
-    PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig, PrintPermission,
+    PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
 };
 use flpdf::{
@@ -38,6 +38,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -1477,6 +1478,10 @@ fn warn_if_static_id(args: &Cli) {
 }
 
 fn main() {
+    // One private qpdf-style logger owns all document routes for this
+    // invocation. It is deliberately distinct from the library process
+    // default so later save/info routing can be configured as one unit.
+    let _ = cli_logger();
     // Extract the `--overlay`/`--underlay` groups from the raw argv before clap
     // parses (see `extract_overlay_groups`): clap's derive would flatten the
     // repeated occurrences and lose the per-group boundaries and declaration
@@ -2044,7 +2049,6 @@ fn run_json(cli: &Cli) -> CliResult<()> {
                 )
             }
             Err(error) => {
-                emit_warnings_since(input, &pdf, diagnostics_start);
                 return Err(error);
             }
         }
@@ -2063,17 +2067,15 @@ fn run_json(cli: &Cli) -> CliResult<()> {
     match json_result {
         Ok(()) => {}
         Err(JsonJobError::Output(error)) => {
-            emit_warnings_since(input, &pdf, diagnostics_start);
             return Err(Box::new(error));
         }
         Err(JsonJobError::Usage(error)) => return Err(Box::new(error)),
     }
 
     // qpdf exits 3 after successful JSON output when either opening or later
-    // processing warned. Open-time warnings were already emitted by
-    // `open_pdf`; only emit the post-snapshot range here, then one summary.
+    // processing warned. The document logger has already delivered every
+    // warning; the snapshots here control only exit status and the summary.
     if had_open_warnings || pdf.repair_diagnostics().entries().len() > diagnostics_start {
-        emit_warnings_since(input, &pdf, diagnostics_start);
         eprintln!("{}: operation succeeded with warnings", progname());
         return Err(Box::new(CliExitError {
             code: ExitCode::Warnings,
@@ -2392,6 +2394,11 @@ fn run_check(
     // qpdf 11.9.0). Force the gate open here. Authentication still runs first,
     // so a wrong password fails exactly as before.
     options.allow_weak_crypto = true;
+    configure_document_logger(&mut options, &input);
+    // `check_reader` aggregates parser and checker warnings into one ordered
+    // report. Suppress immediate document delivery here, then route every
+    // report warning through the same CLI logger exactly once below.
+    options.suppress_warnings = true;
     let report = check_reader_with_options_and_limits(BufReader::new(file), options, decode_limits)
         .map_err(|error| error_with_file(&input, actionable_password_error(error)))?;
     // The library always emits a weak-crypto advisory when a weak file opens
@@ -2408,7 +2415,9 @@ fn run_check(
         }
         let location = diagnostic_location(&input, diagnostic.offset);
         match diagnostic.severity {
-            Severity::Warning => eprintln!("WARNING: {location}: {}", diagnostic.message),
+            Severity::Warning => {
+                cli_logger().warn(format!("WARNING: {location}: {}\n", diagnostic.message))?
+            }
             Severity::Error => {
                 eprintln!("{}: {location}: {}", progname(), diagnostic.message)
             }
@@ -2565,6 +2574,8 @@ fn build_copy_encryption_source(
         repair: true,
         ..PdfOpenOptions::default()
     };
+    let mut opts = opts;
+    configure_document_logger(&mut opts, path);
     let mut donor = Pdf::open_with_options(reader, opts)
         .map_err(|e| format!("--copy-encryption-from: failed to open {:?}: {e}", path))?;
 
@@ -3983,7 +3994,7 @@ fn build_overlay_specs(
         // qpdf and unblock RC4 overlays — same pattern `run_check` uses
         // for its inspection open (search for `options.allow_weak_crypto`
         // in `run_check`).
-        let options = PdfOpenOptions {
+        let mut options = PdfOpenOptions {
             repair,
             allow_weak_crypto: true,
             password: spec
@@ -3993,13 +4004,9 @@ fn build_overlay_specs(
                 .unwrap_or_default(),
             ..Default::default()
         };
+        configure_document_logger(&mut options, &path);
         let source = Pdf::open_with_options(BufReader::new(file), options)
             .map_err(|error| error_with_file(&path, actionable_password_error(error)))?;
-        // Print qpdf-style WARNING lines for any repair diagnostics the
-        // source triggered (matches qpdf 11.9.0's stderr output for
-        // `--overlay`/`--underlay`; qpdf does not add these warnings to
-        // its exit-code accumulator, so exit code is unchanged).
-        emit_open_warnings(&path, &source);
 
         let kind = match spec.kind {
             OverlayKind::Overlay => flpdf::OverlayKind::Overlay,
@@ -5045,6 +5052,7 @@ fn probe_encryption(
     let file = File::open(input)?;
     let mut options = pdf_open_options(repair, password)?;
     options.allow_weak_crypto = true;
+    configure_document_logger(&mut options, input);
     match Pdf::open_with_options(BufReader::new(file), options) {
         Ok(pdf) => Ok(EncryptionProbe::Opened {
             encrypted: pdf.is_encrypted(),
@@ -5300,10 +5308,9 @@ fn open_pdf_file_impl(
     if force_allow_weak_crypto {
         options.allow_weak_crypto = true;
     }
+    configure_document_logger(&mut options, input);
     let pdf = Pdf::open_with_options(BufReader::new(file), options)
         .map_err(|error| error_with_file(input, actionable_password_error(error)))?;
-
-    emit_open_warnings(input, &pdf);
     // Skip the weak-crypto warning on the forced (inspection) path: the user
     // supplied no `--allow-weak-crypto` flag to acknowledge, and qpdf emits no
     // such warning for `--show-encryption[-key]`. On the normal path a weak
@@ -5346,7 +5353,18 @@ fn pdf_open_options(repair: bool, password: &PasswordArgs) -> CliResult<PdfOpenO
         password_mode,
         allow_weak_crypto,
         password_is_hex_key,
+        ..PdfOpenOptions::default()
     })
+}
+
+fn cli_logger() -> QPDFLogger {
+    static LOGGER: OnceLock<QPDFLogger> = OnceLock::new();
+    LOGGER.get_or_init(QPDFLogger::create).clone()
+}
+
+fn configure_document_logger(options: &mut PdfOpenOptions, input: &Path) {
+    options.logger = Some(cli_logger());
+    options.description = input.display().to_string();
 }
 
 /// Program name used in qpdf-parity diagnostic prefixes.
@@ -5370,34 +5388,17 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
     }
 }
 
-/// Emit each entry from `pdf.repair_diagnostics()` to stderr in qpdf's
-/// `WARNING: <file>[ (offset N)]: <message>` shape. Shared between the
-/// primary-input open (`open_pdf_impl`) and the overlay/underlay source
-/// open (`build_overlay_specs`) so both surfaces print open-time warnings
-/// identically.
-fn emit_open_warnings<R: Read + Seek>(path: &Path, pdf: &Pdf<R>) {
-    emit_warnings_since(path, pdf, 0);
-}
-
-fn emit_warnings_since<R: Read + Seek>(path: &Path, pdf: &Pdf<R>, start: usize) {
-    for diagnostic in pdf.repair_diagnostics().entries().iter().skip(start) {
-        let location = diagnostic_location(path, diagnostic.offset);
-        eprintln!("WARNING: {location}: {}", diagnostic.message);
-    }
-}
-
 /// Finish a successful operation that accumulated lazy object-recovery
 /// warnings. Any requested output has already been emitted before this is
 /// called; qpdf likewise leaves the output in place and reports exit 3.
 fn finish_lazy_warnings<R: Read + Seek>(
-    input: &Path,
+    _input: &Path,
     pdf: &Pdf<R>,
     diagnostics_start: usize,
 ) -> CliResult<()> {
     if pdf.repair_diagnostics().entries().len() == diagnostics_start {
         return Ok(());
     }
-    emit_warnings_since(input, pdf, diagnostics_start);
     eprintln!("{}: operation succeeded with warnings", progname());
     Err(Box::new(CliExitError {
         code: ExitCode::Warnings,
@@ -5430,9 +5431,6 @@ fn finish_rewrite_warnings<R: Read + Seek>(
     normalization_last_bad: &[bool],
 ) -> CliResult<()> {
     let has_lazy = pdf.repair_diagnostics().entries().len() != diagnostics_start;
-    if has_lazy {
-        emit_warnings_since(input, pdf, diagnostics_start);
-    }
     for &last_bad in normalization_last_bad {
         emit_content_normalization_warnings(input, last_bad);
     }
@@ -5808,11 +5806,12 @@ fn run_copy_attachments_from(
     let args = parse_copy_attachments_segment(tokens)?;
 
     // Open the source with its own password (independent of the target's).
-    let src_options = PdfOpenOptions {
+    let mut src_options = PdfOpenOptions {
         repair,
         password: args.password.clone(),
         ..PdfOpenOptions::default()
     };
+    configure_document_logger(&mut src_options, &args.file);
     let src_file = File::open(&args.file)
         .map_err(|e| format!("--copy-attachments-from: cannot open {:?}: {e}", args.file))?;
     let mut src = Pdf::open_with_options(BufReader::new(src_file), src_options)

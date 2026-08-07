@@ -200,6 +200,13 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// each of those takes and drops its own borrow, so nothing is held when
     /// the push happens.
     repair_diagnostics: Diagnostics,
+    /// qpdf `m->logger`, shared with callers and replaceable on the live
+    /// document.
+    logger: crate::QPDFLogger,
+    /// qpdf `m->suppress_warnings`; collection remains active while true.
+    suppress_warnings: bool,
+    /// qpdf input-source description used when formatting warning locations.
+    description: String,
     /// qpdf `m->encp` (`include/qpdf/QPDF.hh:1463`), the encryption
     /// parameters `QPDF::pipeStreamData`'s static overload takes as its first
     /// argument and consults before piping a stream
@@ -234,6 +241,26 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// instead would attribute a rejected seek to a byte the reader never
     /// reached.
     last_offset: u64,
+}
+
+pub(crate) struct ResolverWarningOptions {
+    logger: crate::QPDFLogger,
+    suppress_warnings: bool,
+    description: String,
+}
+
+impl ResolverWarningOptions {
+    pub(crate) fn new(
+        logger: crate::QPDFLogger,
+        suppress_warnings: bool,
+        description: String,
+    ) -> Self {
+        Self {
+            logger,
+            suppress_warnings,
+            description,
+        }
+    }
 }
 
 impl<R: Read + Seek> ResolverCore<R> {
@@ -467,7 +494,7 @@ impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R
             self.resolver.push_warning(
                 "unknown encryption filter for strings (check /StrF in /Encrypt dictionary); \
                  strings may be decrypted improperly",
-            );
+            )?;
         }
         Ok(())
     }
@@ -485,8 +512,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
         attempt_recovery: bool,
         repair_diagnostics: Diagnostics,
+        warning_options: ResolverWarningOptions,
         pdf_unique_id: u64,
     ) -> Rc<Self> {
+        let ResolverWarningOptions {
+            logger,
+            suppress_warnings,
+            description,
+        } = warning_options;
         Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
                 reader,
@@ -497,6 +530,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolved_object_streams: BTreeSet::new(),
                 attempt_recovery,
                 repair_diagnostics,
+                logger,
+                suppress_warnings,
+                description,
                 encryption_parameters: Rc::new(RefCell::new(None)),
                 last_offset: 0,
             }),
@@ -601,10 +637,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`libqpdf/QPDF.cc:487-494`). qpdf's does two things: `push_back` onto
     /// `m->warnings`, and — unless `m->suppress_warnings` — write
     /// `"WARNING: " << e.what()` straight to its logger (`:492`). Only the
-    /// first half is here. flpdf accumulates and lets the front end decide;
-    /// `flpdf-cli` walks the collection and writes to stderr itself
-    /// (`crates/flpdf-cli/src/main.rs:5342`), which is why flpdf has no
-    /// `suppress_warnings` counterpart to port.
+    /// append happens before logger delivery, and the core borrow is released
+    /// before the pipeline write so a custom sink can safely call unrelated
+    /// document code. Suppression skips only delivery, never collection.
     ///
     /// Takes `&self`, which is the whole reason the sink moved here: the
     /// resolver reaches its document through a `Weak` and never holds a
@@ -613,11 +648,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Borrow discipline: the `borrow_mut()` is taken and dropped inside this
     /// expression, so it composes with a nested resolution — but it must not
     /// be called while a borrow of the core is already held.
-    pub(crate) fn push_warning(&self, message: impl Into<String>) {
-        self.core
-            .borrow_mut()
-            .repair_diagnostics
-            .push(Diagnostic::warning(message, None));
+    pub(crate) fn push_warning(&self, message: impl Into<String>) -> Result<()> {
+        self.push_warning_with_offset(None, message)
     }
 
     /// [`Self::push_warning`] with the offset qpdf attributes the warning to.
@@ -635,11 +667,65 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().last_offset
     }
 
-    pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) {
-        self.core
-            .borrow_mut()
-            .repair_diagnostics
-            .push(Diagnostic::warning(message, Some(offset)));
+    pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) -> Result<()> {
+        self.push_warning_with_offset(Some(offset), message)
+    }
+
+    fn push_warning_with_offset(
+        &self,
+        offset: Option<u64>,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let message = message.into();
+        let (logger, suppress_warnings, description) = {
+            let mut core = self.core.borrow_mut();
+            core.repair_diagnostics
+                .push(Diagnostic::warning(message.clone(), offset));
+            (
+                core.logger.clone(),
+                core.suppress_warnings,
+                core.description.clone(),
+            )
+        };
+        Self::route_warning(&logger, suppress_warnings, &description, offset, &message)
+    }
+
+    fn route_warning(
+        logger: &crate::QPDFLogger,
+        suppress_warnings: bool,
+        description: &str,
+        offset: Option<u64>,
+        message: &str,
+    ) -> Result<()> {
+        if suppress_warnings {
+            return Ok(());
+        }
+        let location = match offset {
+            Some(offset) => format!("{description} (offset {offset})"),
+            None => description.to_owned(),
+        };
+        logger.warn(format!("WARNING: {location}: {message}\n"))
+    }
+
+    pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
+        let (logger, suppress_warnings, description) = {
+            let core = self.core.borrow();
+            (
+                core.logger.clone(),
+                core.suppress_warnings,
+                core.description.clone(),
+            )
+        };
+        for diagnostic in diagnostics.entries() {
+            Self::route_warning(
+                &logger,
+                suppress_warnings,
+                &description,
+                diagnostic.offset,
+                &diagnostic.message,
+            )?;
+        }
+        Ok(())
     }
 
     /// A snapshot of every warning raised on this document so far.
@@ -663,6 +749,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// else.
     pub(crate) fn repair_diagnostics(&self) -> Diagnostics {
         self.core.borrow().repair_diagnostics.clone()
+    }
+
+    pub(crate) fn logger(&self) -> crate::QPDFLogger {
+        self.core.borrow().logger.clone()
+    }
+
+    pub(crate) fn set_logger(&self, logger: crate::QPDFLogger) {
+        self.core.borrow_mut().logger = logger;
+    }
+
+    pub(crate) fn suppress_warnings(&self) -> bool {
+        self.core.borrow().suppress_warnings
+    }
+
+    pub(crate) fn set_suppress_warnings(&self, suppress: bool) {
+        self.core.borrow_mut().suppress_warnings = suppress;
     }
 
     /// The offset repair chose as qpdf-logical zero. See
@@ -841,28 +943,28 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let encryption_parameters = self.encryption_parameters();
         let encryption_snapshot = encryption_parameters.borrow().as_ref().cloned();
         let Some(encryption_snapshot) = encryption_snapshot else {
-            return Ok(self.pipe_stream_data_to_pipeline(
+            return self.pipe_stream_data_to_pipeline(
                 object_ref,
                 offset,
                 length,
                 pipeline,
                 suppress_warnings,
                 will_retry,
-            ));
+            );
         };
 
         // `decryptStream` rejects cross-reference streams before looking at
         // encryption version or crypt filters (`QPDF_encryption.cc:1055-1061`).
         let inspection = inspect_stream_encryption(&encryption_snapshot, stream_dict)?;
         if inspection.is_xref {
-            return Ok(self.pipe_stream_data_to_pipeline(
+            return self.pipe_stream_data_to_pipeline(
                 object_ref,
                 offset,
                 length,
                 pipeline,
                 suppress_warnings,
                 will_retry,
-            ));
+            );
         }
 
         // `decryptStream` constructs the stage before `pipeStreamData` enters
@@ -889,49 +991,49 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         };
         let Some((decryption, warn_unknown)) = decryption else {
-            return Ok(self.pipe_stream_data_to_pipeline(
+            return self.pipe_stream_data_to_pipeline(
                 object_ref,
                 offset,
                 length,
                 pipeline,
                 suppress_warnings,
                 will_retry,
-            ));
+            );
         };
         if warn_unknown {
-            self.warn_unknown_stream_filter(inspection.method_source);
+            self.warn_unknown_stream_filter(inspection.method_source)?;
         }
 
         match decryption {
-            StreamDecryption::None => Ok(self.pipe_stream_data_to_pipeline(
+            StreamDecryption::None => self.pipe_stream_data_to_pipeline(
                 object_ref,
                 offset,
                 length,
                 pipeline,
                 suppress_warnings,
                 will_retry,
-            )),
+            ),
             StreamDecryption::Rc4(key) => {
                 let mut decrypt = PlRc4::new("RC4 stream decryption", pipeline, &key)?;
-                Ok(self.pipe_stream_data_to_pipeline(
+                self.pipe_stream_data_to_pipeline(
                     object_ref,
                     offset,
                     length,
                     &mut decrypt,
                     suppress_warnings,
                     will_retry,
-                ))
+                )
             }
             StreamDecryption::Aes(key) => {
                 let mut decrypt = PlAesPdf::new_decrypt("AES stream decryption", pipeline, &key)?;
-                Ok(self.pipe_stream_data_to_pipeline(
+                self.pipe_stream_data_to_pipeline(
                     object_ref,
                     offset,
                     length,
                     &mut decrypt,
                     suppress_warnings,
                     will_retry,
-                ))
+                )
             }
         }
     }
@@ -940,14 +1042,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// arm (`libqpdf/QPDF_encryption.cc:1121-1129`). It happens before the
     /// source read, so `getLastOffset()` is sampled here rather than in the
     /// pipe-time catch path below.
-    fn warn_unknown_stream_filter(&self, method_source: &str) {
+    fn warn_unknown_stream_filter(&self, method_source: &str) -> Result<()> {
         self.push_warning_at(
             self.last_offset(),
             format!(
                 "unknown encryption filter for streams (check {method_source}); \
                  streams may be decrypted improperly"
             ),
-        );
+        )
     }
 
     /// qpdf's `pipeStreamData` read/write `try`, catches, and shared finish
@@ -962,7 +1064,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
-    ) -> bool {
+    ) -> Result<bool> {
         // qpdf's shape is one `try` whose every escape lands in a `catch`,
         // followed by a tail common to all of them (`libqpdf/QPDF.cc:2494-2538`).
         // `attempted_finish` is what the tail consults, and it is set
@@ -972,7 +1074,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let Some(failure) =
             self.attempt_pipe_stream_data(offset, length, pipeline, &mut attempted_finish)
         else {
-            return true;
+            return Ok(true);
         };
 
         self.finish_pipe_failure_with_attempt(
@@ -995,7 +1097,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         will_retry: bool,
         failure: PipeFailure,
         attempted_finish: bool,
-    ) -> bool {
+    ) -> Result<bool> {
         if !suppress_warnings {
             match failure {
                 // qpdf `:2498-2500` throws `damagedPDF(file, "", offset +
@@ -1003,7 +1105,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // (`:2505-2509`). The position is where the read stopped, not
                 // where it began.
                 PipeFailure::ShortRead { at } => {
-                    self.push_warning_at(at, "unexpected EOF reading stream data");
+                    self.push_warning_at(at, "unexpected EOF reading stream data")?;
                 }
                 // qpdf `:2510-2530`.
                 PipeFailure::Decoding { at, ref detail } => {
@@ -1011,12 +1113,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     self.push_warning_at(
                         at,
                         format!("error decoding stream data for object {og}: {detail}"),
-                    );
+                    )?;
                     if will_retry {
                         self.push_warning_at(
                             at,
                             "stream will be re-processed without filtering to avoid data loss",
-                        );
+                        )?;
                     }
                 }
             }
@@ -1027,7 +1129,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if !attempted_finish {
             let _ = pipeline.finish();
         }
-        false
+        Ok(false)
     }
 
     /// qpdf's `try` block (`libqpdf/QPDF.cc:2495-2504`). `None` is its
@@ -1398,11 +1500,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         for warning in parsed.diagnostics {
-            self.push_warning_at(warning.relative_offset as u64, warning.message);
+            self.push_warning_at(warning.relative_offset as u64, warning.message)?;
         }
 
         if let Some(empty_offset) = parsed.empty {
-            self.push_warning_at(empty_offset, "empty object treated as null");
+            self.push_warning_at(empty_offset, "empty object treated as null")?;
             let (value, parsed_offset) = parsed
                 .value
                 .into_direct_value()
@@ -1420,7 +1522,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.read_stream(value, parsed_offset)
         } else {
             if !trailing.is_word_value(b"endobj") {
-                self.push_warning("expected endobj");
+                self.push_warning("expected endobj")?;
             }
             Ok((value, parsed_offset))
         }
@@ -1524,7 +1626,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // qpdf `:1350-1354`: `readObject` reads one more token after
         // `readStream` returns and warns if it is not `endobj`.
         if !self.read_token_from_input()?.is_word_value(b"endobj") {
-            self.push_warning("expected endobj");
+            self.push_warning("expected endobj")?;
         }
 
         let dict = ObjectHandle::from_value(dict);
@@ -1559,17 +1661,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     Some(b'\n') | None => {}
                     Some(_) => {
                         self.unread_byte()?;
-                        self.push_warning("stream keyword followed by carriage return only");
+                        self.push_warning("stream keyword followed by carriage return only")?;
                     }
                 }
                 return Ok(());
             }
             if !crate::tokenizer::is_ws(byte) {
                 self.unread_byte()?;
-                self.push_warning("stream keyword not followed by proper line terminator");
+                self.push_warning("stream keyword not followed by proper line terminator")?;
                 return Ok(());
             }
-            self.push_warning("stream keyword followed by extraneous whitespace");
+            self.push_warning("stream keyword followed by extraneous whitespace")?;
         }
     }
 
@@ -2051,7 +2153,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                     self.push_warning(format!(
                         "loop detected resolving object {} {}",
                         object_ref.number, object_ref.generation
-                    ));
+                    ))?;
                     handle.set_missing();
                     return Ok(());
                 };
@@ -2080,6 +2182,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 mod tests {
     use super::ResolveMark;
     use super::ResolverHandle;
+    use super::ResolverWarningOptions;
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
     use crate::reader::{EncryptionMode, EncryptionState};
     use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
@@ -2128,6 +2231,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         )
     }
@@ -2183,6 +2287,26 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        )
+    }
+
+    fn resolver_over_with_failing_warning(
+        bytes: Vec<u8>,
+        fail_at: usize,
+    ) -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(fail_at),
+        )));
+        ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, "stream.pdf".to_owned()),
             0,
         )
     }
@@ -3251,6 +3375,30 @@ mod tests {
         assert!(diagnostics.entries().iter().all(|d| d.offset == Some(9)));
     }
 
+    #[test]
+    fn decoding_warning_sink_failures_propagate_from_each_warning() {
+        for fail_at in [1, 2] {
+            let resolver =
+                resolver_over_with_failing_warning(b"%PDF-1.4\npayload".to_vec(), fail_at);
+            let dict = crate::ObjectHandle::dictionary(vec![]);
+            let mut sink = crate::pipeline::test_support::RecordingSink::new(&[1], &[]);
+
+            assert!(matches!(
+                resolver.pipe_stream_data(
+                    ObjectRef::new(4, 0),
+                    9,
+                    7,
+                    &dict,
+                    &mut sink,
+                    false,
+                    true,
+                ),
+                Err(Error::System(ref message)) if message == &format!("sink write failure {fail_at}")
+            ));
+            assert_eq!(resolver.repair_diagnostics().entries().len(), fail_at);
+        }
+    }
+
     /// qpdf sets `attempted_finish` immediately *before* calling
     /// `pipeline->finish()` (`libqpdf/QPDF.cc:2502-2503`), so the tail that
     /// runs after a failure (`:2531-2537`) only finishes a pipeline that never
@@ -3424,6 +3572,7 @@ mod tests {
                 BTreeMap::<ObjectRef, XrefEntry>::new(),
                 false,
                 Diagnostics::default(),
+                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
                 0,
             );
             let dict = crate::ObjectHandle::dictionary(vec![]);
@@ -3516,6 +3665,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         );
         let dict = crate::ObjectHandle::dictionary(vec![]);
@@ -4038,6 +4188,7 @@ mod tests {
             BTreeMap::from([(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 })]),
             false,
             Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         );
         *resolver.encryption_parameters().borrow_mut() = Some(aes128_encryption_state());
@@ -4098,6 +4249,40 @@ mod tests {
             1,
             "qpdf rewrites the unknown string filter after its first warning"
         );
+    }
+
+    #[test]
+    fn unknown_string_filter_warning_sink_failure_propagates() {
+        let encrypted = encrypted_info_fixture(
+            b"<< /Title (TopSecretTitle) >>",
+            crate::encrypt_setup::EncryptParams::v4_aes128(b"user-pw", b"owner-pw"),
+        );
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(encrypted),
+            crate::PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .unwrap();
+        pdf.resolver
+            .encryption_parameters()
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .cf_string = crate::reader::EncryptionMode::Unknown;
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(logger);
+        let info_ref = pdf.trailer().get_ref("Info").unwrap();
+
+        assert!(matches!(
+            pdf.get_object_handle(info_ref).try_dereference(),
+            Err(Error::System(ref message)) if message == "sink write failure 1"
+        ));
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 
     // This catches a production regression where a cipher-mode dispatch
@@ -4509,6 +4694,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn loop_warning_sink_failure_propagates_after_collection() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).unwrap();
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        pdf.set_logger(logger);
+
+        let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).unwrap();
+        assert!(matches!(
+            handle.try_dereference(),
+            Err(Error::System(ref message)) if message == "sink write failure 1"
+        ));
+        drop(outer);
+        assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+    }
+
     /// A warning raised through the resolver and one raised through
     /// `Pdf::push_warning` land in the same collection, in the order they were
     /// raised — qpdf keeps one `m->warnings` (`include/qpdf/QPDF.hh:1475`) and
@@ -4522,11 +4727,11 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
         let handle = pdf.get_object_handle(object_ref);
 
-        pdf.push_warning("before the loop");
+        pdf.push_warning("before the loop").unwrap();
         let outer = ResolveMark::begin(&pdf.resolver.core, object_ref).expect("first mark");
         handle.try_dereference().expect("a loop is not an error");
         drop(outer);
-        pdf.push_warning("after the loop");
+        pdf.push_warning("after the loop").unwrap();
 
         let diagnostics = pdf.repair_diagnostics();
         let messages = diagnostics

@@ -6,7 +6,7 @@ use crate::cache::ObjectCache;
 // Used by the public factory API's intra-doc links.
 #[allow(unused_imports)]
 use crate::error::EncryptedError;
-use crate::reader::resolver::ResolverHandle;
+use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::PdfOpenOptions;
 use crate::xref::load_xref_state_with_repair;
 #[allow(unused_imports)]
@@ -117,14 +117,25 @@ impl<R: Read + Seek> Pdf<R> {
         // same id: it stamps `pdf_unique_id` onto every canonical handle it
         // mints, which `ObjectHandle::belongs_to_pdf` answers on.
         let unique_id = NEXT_PDF_ID.fetch_add(1, Ordering::Relaxed);
+        let logger = options
+            .logger
+            .clone()
+            .unwrap_or_else(crate::QPDFLogger::default_logger);
+        let initial_diagnostics = loaded.repair_diagnostics.clone();
         let resolver = ResolverHandle::new_shared(
             reader,
             loaded_state.header_offset,
             source_xref_entries,
             options.repair,
             loaded.repair_diagnostics,
+            ResolverWarningOptions::new(
+                logger,
+                options.suppress_warnings,
+                options.description.clone(),
+            ),
             unique_id,
         );
+        resolver.replay_warnings(&initial_diagnostics)?;
         // `Pdf::encryption` is the same `Rc<RefCell<..>>` allocation as
         // `ResolverCore::encryption_parameters` (qpdf's `m->encp`), not a
         // separate copy kept in sync.

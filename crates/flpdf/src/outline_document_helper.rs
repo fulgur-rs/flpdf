@@ -482,20 +482,20 @@ fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Res
         return Ok(String::new());
     };
     let resolved = resolve_scalar(pdf, value)?;
-    Ok(qpdf_title(pdf, resolved))
+    qpdf_title(pdf, resolved)
 }
 
-fn qpdf_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> String {
+fn qpdf_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<String> {
     match value {
         Object::String(bytes) => {
-            String::from_utf8_lossy(&crate::pdf_string::utf8_value(&bytes)).into_owned()
+            Ok(String::from_utf8_lossy(&crate::pdf_string::utf8_value(&bytes)).into_owned())
         }
         other => {
             pdf.push_warning(format!(
                 "operation for string attempted on object of type {}: returning empty string",
                 qpdf_object_type_name(&other)
-            ));
-            String::new()
+            ))?;
+            Ok(String::new())
         }
     }
 }
@@ -506,25 +506,25 @@ fn resolve_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Res
         return Ok(0);
     };
     let resolved = resolve_scalar(pdf, value)?;
-    Ok(qpdf_count(pdf, resolved))
+    qpdf_count(pdf, resolved)
 }
 
-fn qpdf_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> i32 {
+fn qpdf_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<i32> {
     let Object::Integer(value) = value else {
         pdf.push_warning(format!(
             "operation for integer attempted on object of type {}: returning 0",
             qpdf_object_type_name(&value)
-        ));
-        return 0;
+        ))?;
+        return Ok(0);
     };
     if value < i64::from(i32::MIN) {
-        pdf.push_warning("requested value of integer is too small; returning INT_MIN");
-        i32::MIN
+        pdf.push_warning("requested value of integer is too small; returning INT_MIN")?;
+        Ok(i32::MIN)
     } else if value > i64::from(i32::MAX) {
-        pdf.push_warning("requested value of integer is too big; returning INT_MAX");
-        i32::MAX
+        pdf.push_warning("requested value of integer is too big; returning INT_MAX")?;
+        Ok(i32::MAX)
     } else {
-        value as i32
+        Ok(value as i32)
     }
 }
 
@@ -554,7 +554,9 @@ fn qpdf_object_type_name(value: &Object) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::qpdf_object_type_name;
+    use super::{qpdf_count, qpdf_object_type_name, qpdf_title};
+    use crate::pipeline::test_support::NthWriteFailure;
+    use crate::pipeline::PipelineHandle;
     use crate::Object;
 
     #[test]
@@ -567,5 +569,26 @@ mod tests {
             qpdf_object_type_name(&Object::InlineImage(b"data".to_vec())),
             "inline-image"
         );
+    }
+
+    #[test]
+    fn scalar_warning_sink_failures_propagate() {
+        for title in [true, false] {
+            let mut pdf = crate::Pdf::empty().unwrap();
+            let logger = crate::QPDFLogger::create();
+            logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
+            pdf.set_logger(logger);
+
+            let result = if title {
+                qpdf_title(&mut pdf, Object::Integer(42)).map(|_| ())
+            } else {
+                qpdf_count(&mut pdf, Object::String(b"wrong".to_vec())).map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(crate::Error::System(ref message)) if message == "sink write failure 1"
+            ));
+            assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
+        }
     }
 }

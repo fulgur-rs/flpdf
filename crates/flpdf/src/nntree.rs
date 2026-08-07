@@ -998,7 +998,7 @@ impl<K: TreeKey> NNTree<K> {
                     pdf,
                     &root,
                     format!("attempting to repair after error: {message}"),
-                );
+                )?;
                 self.repair(pdf)?;
                 self.find_internal(pdf, key, return_previous_if_missing)
             }
@@ -1506,7 +1506,7 @@ impl<K: TreeKey> NNTree<K> {
                     }
                 }
                 None => {
-                    self.warn(pdf, &node, "unable to determine limits");
+                    self.warn(pdf, &node, "unable to determine limits")?;
                     true
                 }
             };
@@ -1826,7 +1826,7 @@ impl<K: TreeKey> NNTree<K> {
                     pdf,
                     &node,
                     "loop detected while traversing name/number tree",
-                );
+                )?;
                 break;
             }
 
@@ -1837,7 +1837,7 @@ impl<K: TreeKey> NNTree<K> {
                         pdf,
                         &node,
                         "non-dictionary node while traversing name/number tree",
-                    );
+                    )?;
                     break;
                 }
             };
@@ -1884,7 +1884,7 @@ impl<K: TreeKey> NNTree<K> {
                     "name/number tree node has neither non-empty /{} nor /Kids",
                     K::ITEMS_KEY
                 ),
-            );
+            )?;
             break;
         }
 
@@ -1929,7 +1929,7 @@ impl<K: TreeKey> NNTree<K> {
             if let Some(candidate) = candidate {
                 cursor.item_number = Some(candidate);
                 if candidate + 1 >= items.values.len() {
-                    self.warn(pdf, &leaf, "items array doesn't have enough elements");
+                    self.warn(pdf, &leaf, "items array doesn't have enough elements")?;
                     cursor.raw = None;
                     cursor.current = None;
                     continue;
@@ -1938,7 +1938,7 @@ impl<K: TreeKey> NNTree<K> {
                 if cursor.current.is_some() {
                     return Ok(());
                 }
-                self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"));
+                self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"))?;
                 continue;
             }
 
@@ -1970,7 +1970,7 @@ impl<K: TreeKey> NNTree<K> {
                             pdf,
                             &parent,
                             format!("skipping over invalid kid at index {kid_number}"),
-                        );
+                        )?;
                         continue;
                     }
                     cursor.path[last_index].kid_number = kid_number;
@@ -1984,7 +1984,7 @@ impl<K: TreeKey> NNTree<K> {
                                 pdf,
                                 cursor.leaf.as_ref().expect("descended leaf is present"),
                                 format!("item {item_number} has the wrong type"),
-                            );
+                            )?;
                         }
                         descended = true;
                         break;
@@ -2094,7 +2094,7 @@ impl<K: TreeKey> NNTree<K> {
                 pdf,
                 parent,
                 format!("converting kid number {kid_number} to an indirect object"),
-            );
+            )?;
             let object_ref = make_indirect(pdf, &mut self.repair_allocator, kid_object)?;
             let mut dictionary = self.load_node(pdf, parent)?;
             // cov:ignore-start: prepare_kid receives kid_object from this same parent Kids array
@@ -2114,7 +2114,7 @@ impl<K: TreeKey> NNTree<K> {
                 pdf,
                 parent,
                 format!("kid number {kid_number} is not an indirect object"),
-            );
+            )?;
             Ok(parent.direct_kid(kid_number))
         }
     }
@@ -2127,8 +2127,13 @@ impl<K: TreeKey> NNTree<K> {
         Ok(dictionary.get("Kids").is_some() || dictionary.get(K::ITEMS_KEY).is_some())
     }
 
-    fn warn<R: Read + Seek>(&self, pdf: &mut Pdf<R>, node: &NodeHandle, message: impl AsRef<str>) {
-        pdf.push_warning(structural_message(node.diagnostic_ref(), message));
+    fn warn<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        node: &NodeHandle,
+        message: impl AsRef<str>,
+    ) -> Result<()> {
+        pdf.push_warning(structural_message(node.diagnostic_ref(), message))
     }
 
     fn load_node<R: Read + Seek>(
@@ -2508,6 +2513,8 @@ fn build_number_leaf(entries: &[(i64, Object)]) -> Dictionary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::test_support::NthWriteFailure;
+    use crate::pipeline::PipelineHandle;
     use crate::{Dictionary, ObjectRef, Pdf};
     use std::io::Cursor;
 
@@ -2527,6 +2534,19 @@ mod tests {
             .as_bytes(),
         );
         Pdf::open(Cursor::new(bytes)).expect("open")
+    }
+
+    fn fail_warning_delivery(pdf: &mut TestPdf) {
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(PipelineHandle::new(NthWriteFailure::new(1))));
+        pdf.set_logger(logger);
+    }
+
+    fn assert_sink_failure<T>(result: Result<T>) {
+        assert!(matches!(
+            result,
+            Err(crate::Error::System(ref message)) if message == "sink write failure 1"
+        ));
     }
 
     fn name_leaf(entries: &[(&[u8], i64)], limits: Option<(&[u8], &[u8])>) -> Object {
@@ -2953,6 +2973,95 @@ mod tests {
                         if matches!(kids.first(), Some(Object::Dictionary(_)))
                 )
         ));
+    }
+
+    #[test]
+    fn warning_sink_failures_propagate_from_cursor_warning_sites() {
+        let mut pdf = empty_pdf();
+        fail_warning_delivery(&mut pdf);
+        let root = malformed_name_tree_with_missing_limits_and_valid_pairs(&mut pdf);
+        assert_sink_failure(NNTree::<NameKey>::new(root, true).find(
+            &mut pdf,
+            &b"beta".to_vec(),
+            false,
+        ));
+
+        let mut pdf = empty_pdf();
+        fail_warning_delivery(&mut pdf);
+        assert_sink_failure(NNTree::<NameKey>::new(Object::Integer(42), false).begin(&mut pdf));
+
+        let mut pdf = empty_pdf();
+        fail_warning_delivery(&mut pdf);
+        assert_sink_failure(
+            NNTree::<NameKey>::new(Object::Dictionary(Dictionary::new()), false).begin(&mut pdf),
+        );
+
+        let mut pdf = empty_pdf();
+        let cycle_ref = ObjectRef::new(40, 0);
+        let mut cycle = Dictionary::new();
+        cycle.insert("Kids", Object::Array(vec![Object::Reference(cycle_ref)]));
+        pdf.set_object(cycle_ref, Object::Dictionary(cycle));
+        fail_warning_delivery(&mut pdf);
+        assert_sink_failure(
+            NNTree::<NameKey>::new(Object::Reference(cycle_ref), false).begin(&mut pdf),
+        );
+
+        for auto_repair in [false, true] {
+            let mut pdf = empty_pdf();
+            fail_warning_delivery(&mut pdf);
+            assert_sink_failure(
+                NNTree::<NameKey>::new(root_with_one_direct_leaf(), auto_repair).begin(&mut pdf),
+            );
+        }
+
+        let mut pdf = empty_pdf();
+        let first_ref = ObjectRef::new(10, 0);
+        let target_ref = ObjectRef::new(11, 0);
+        pdf.set_object(first_ref, name_leaf(&[(b"a", 1)], Some((b"a", b"a"))));
+        pdf.set_object(target_ref, name_leaf(&[(b"z", 2)], Some((b"z", b"z"))));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(first_ref),
+                Object::Integer(42),
+                Object::Reference(target_ref),
+            ]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+        let mut cursor = tree.begin(&mut pdf).unwrap();
+        fail_warning_delivery(&mut pdf);
+        assert_sink_failure(tree.next(&mut pdf, &mut cursor));
+
+        let mut pdf = empty_pdf();
+        let first_ref = ObjectRef::new(10, 0);
+        let wrong_ref = ObjectRef::new(11, 0);
+        pdf.set_object(first_ref, name_leaf(&[(b"a", 1)], Some((b"a", b"a"))));
+        let mut wrong = Dictionary::new();
+        wrong.insert(
+            "Limits",
+            Object::Array(vec![
+                Object::String(b"z".to_vec()),
+                Object::String(b"z".to_vec()),
+            ]),
+        );
+        wrong.insert(
+            "Names",
+            Object::Array(vec![Object::Integer(42), Object::Integer(2)]),
+        );
+        pdf.set_object(wrong_ref, Object::Dictionary(wrong));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Kids",
+            Object::Array(vec![
+                Object::Reference(first_ref),
+                Object::Reference(wrong_ref),
+            ]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), true);
+        let mut cursor = tree.begin(&mut pdf).unwrap();
+        fail_warning_delivery(&mut pdf);
+        assert_sink_failure(tree.next(&mut pdf, &mut cursor));
     }
 
     #[test]

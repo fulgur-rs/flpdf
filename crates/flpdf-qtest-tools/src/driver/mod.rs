@@ -48,6 +48,9 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
     };
     let options = PdfOpenOptions {
         repair: n != 0,
+        // The compatibility driver owns byte-exact warning formatting and
+        // routes it through the caller-supplied stdout/stderr writers below.
+        suppress_warnings: true,
         ..PdfOpenOptions::default()
     };
     let mut pdf = match Pdf::open_mem_owned_with_options(bytes, options) {

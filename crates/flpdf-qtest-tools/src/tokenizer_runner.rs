@@ -186,6 +186,10 @@ fn process(
     let options = PdfOpenOptions {
         repair: true,
         allow_weak_crypto: true,
+        // This runner formats diagnostics through its explicit output
+        // writers; keep the document logger from duplicating them on the
+        // process stderr.
+        suppress_warnings: true,
         ..PdfOpenOptions::default()
     };
     let mut pdf = match Pdf::open_mem_owned_with_options(file_bytes, options) {
