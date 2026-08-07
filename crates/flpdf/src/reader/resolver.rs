@@ -700,11 +700,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if suppress_warnings {
             return Ok(());
         }
-        let location = match offset {
-            Some(offset) => format!("{description} (offset {offset})"),
-            None => description.to_owned(),
+        let positive_offset = offset.filter(|offset| *offset > 0);
+        let location = match (description.is_empty(), positive_offset) {
+            (false, Some(offset)) => format!("{description} (offset {offset})"),
+            (false, None) => description.to_owned(),
+            (true, Some(offset)) => format!("offset {offset}"),
+            (true, None) => String::new(),
         };
-        logger.warn(format!("WARNING: {location}: {message}\n"))
+        if location.is_empty() {
+            logger.warn(format!("WARNING: {message}\n"))
+        } else {
+            logger.warn(format!("WARNING: {location}: {message}\n"))
+        }
     }
 
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
@@ -2276,6 +2283,62 @@ mod tests {
                 )
             })
             .count()
+    }
+
+    struct WarningRecordingSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl crate::pipeline::Pipeline for WarningRecordingSink {
+        // cov:ignore-start: PipelineHandle does not inspect a custom sink identifier in warning routing
+        fn identifier(&self) -> &str {
+            "warning recording sink"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(())
+        }
+
+        // cov:ignore-start: warning routing deliberately leaves caller-owned custom sinks unfinished
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+        // cov:ignore-end
+    }
+
+    #[test]
+    fn warning_location_omits_empty_description_and_zero_offset_like_qpdf() {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+
+        for (description, offset, message) in [
+            ("", None, "no location"),
+            ("", Some(0), "zero offset"),
+            ("", Some(7), "positive offset"),
+            ("input.pdf", Some(0), "named zero offset"),
+            ("input.pdf", Some(7), "named positive offset"),
+        ] {
+            ResolverHandle::<Cursor<Vec<u8>>>::route_warning(
+                &logger,
+                false,
+                description,
+                offset,
+                message,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: no location\n\
+              WARNING: zero offset\n\
+              WARNING: offset 7: positive offset\n\
+              WARNING: input.pdf: named zero offset\n\
+              WARNING: input.pdf (offset 7): named positive offset\n"
+        );
     }
 
     /// A resolver over `bytes`, so a test can hand `pipe_stream_data` an
