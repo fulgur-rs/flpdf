@@ -20,7 +20,7 @@
 //!
 //! AES-CBC stream/string encryption requires a fresh IV per ciphertext
 //! (IV reuse with the same key under CBC leaks plaintext XORs — a well-
-//! known weakness). The writer fills IVs via [`getrandom::getrandom`]
+//! known weakness). The writer fills IVs via [`getrandom::fill`]
 //! (OS CSPRNG). The deterministic-IV opt-in for byte-identical CI
 //! testing is the separate `--static-aes-iv` flag.
 

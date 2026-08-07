@@ -12,10 +12,10 @@
 //! else.
 #![allow(dead_code)]
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::Aes128;
 use aes::Aes256;
-use cbc::cipher::{BlockDecryptMut, KeyIvInit};
+use cbc::cipher::{BlockModeDecrypt, KeyIvInit};
 use cbc::Decryptor;
 // The `Digest` trait is re-exported by both `md5` and `sha2`; importing once
 // (from `sha2`) makes it available for all four types.
@@ -54,7 +54,7 @@ pub(crate) fn aes128_cbc_decrypt(
     }
     let dec = <Decryptor<Aes128> as KeyIvInit>::new(key.into(), iv.into());
     let pt = dec
-        .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
+        .decrypt_padded::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
         .map_err(|_| PrimitiveError::PaddingError)?;
     let pt_len = pt.len();
     ciphertext.truncate(pt_len);
@@ -77,7 +77,7 @@ pub(crate) fn aes256_cbc_decrypt(
     }
     let dec = <Decryptor<Aes256> as KeyIvInit>::new(key.into(), iv.into());
     let pt = dec
-        .decrypt_padded_mut::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
+        .decrypt_padded::<cbc::cipher::block_padding::Pkcs7>(ciphertext)
         .map_err(|_| PrimitiveError::PaddingError)?;
     let pt_len = pt.len();
     ciphertext.truncate(pt_len);

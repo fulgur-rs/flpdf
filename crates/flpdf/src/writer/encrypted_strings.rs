@@ -19,7 +19,7 @@ pub(crate) struct EncryptedStringEmitter {
 
 impl EncryptedStringEmitter {
     pub(crate) fn from_context(ctx: &EncryptionContext) -> Self {
-        Self::from_context_with_boxed_iv_generator(ctx, Box::new(|iv| getrandom::getrandom(iv)))
+        Self::from_context_with_boxed_iv_generator(ctx, Box::new(|iv| getrandom::fill(iv)))
     }
 
     fn from_context_with_boxed_iv_generator(

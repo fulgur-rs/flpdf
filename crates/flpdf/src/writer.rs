@@ -2467,7 +2467,7 @@ pub(crate) fn build_encryption_context(
 /// than panicking (mirrors the AES-IV generation in the stream pass).
 fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
     let mut buf = [0u8; 68];
-    getrandom::getrandom(&mut buf).map_err(|e| {
+    getrandom::fill(&mut buf).map_err(|e| {
         crate::Error::Unsupported(format!(
             "OS CSPRNG (getrandom) unavailable for V=5 R=6 secret generation: {e}"
         ))
@@ -2831,7 +2831,7 @@ pub(crate) fn encrypt_stream_payload_for_writer(
         [0u8; 16]
     };
     if needs_aes_iv && !ctx.static_aes_iv {
-        getrandom::getrandom(&mut iv).map_err(|e| {
+        getrandom::fill(&mut iv).map_err(|e| {
             crate::Error::Unsupported(format!(
                 "OS CSPRNG (getrandom) unavailable for AES IV generation: {e}"
             ))
