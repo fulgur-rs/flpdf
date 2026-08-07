@@ -29,7 +29,7 @@ use crate::json_inspect::{
 use crate::object::{Object, ObjectRef, Stream};
 use crate::pipeline::stdio_file::StdioBuffer;
 use crate::pipeline::{Pipeline, PlStdioFile};
-use crate::reader::Pdf;
+use crate::Pdf;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 

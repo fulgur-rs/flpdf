@@ -280,8 +280,8 @@ impl CombinedPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::Pdf;
     use crate::ObjectRef;
+    use crate::Pdf;
     use std::io::Cursor;
 
     // -----------------------------------------------------------------------

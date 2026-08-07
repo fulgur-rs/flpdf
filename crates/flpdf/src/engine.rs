@@ -1,6 +1,6 @@
 //! qpdf correspondence: QPDF.cc document-construction entry points (`emptyPDF()` first; `processFile`/`processMemoryFile` remain in `reader.rs` pending the broader split — see `docs/plans/2026-08-07-reader-rs-pdf-engine-resolve-split-design.md`).
 
-use crate::reader::Pdf;
+use crate::Pdf;
 use std::io::Cursor;
 
 // Mirrors qpdf's `EMPTY_PDF` (`libqpdf/QPDF.cc:34-51`) byte for byte: PDF
