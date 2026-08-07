@@ -15,6 +15,8 @@ pub mod base64;
 
 pub mod concatenate;
 
+mod discard;
+
 pub mod ostream;
 
 pub(crate) mod count;
@@ -49,6 +51,7 @@ pub(crate) mod test_support;
 pub use base64::{Base64Action, PlBase64};
 pub mod string;
 pub use concatenate::PlConcatenate;
+pub use discard::Discard;
 pub use ostream::PlOStream;
 pub use stdio_file::PlStdioFile;
 pub use string::PlString;
