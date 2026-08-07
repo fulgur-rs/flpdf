@@ -232,8 +232,10 @@ reader.rs に残ったまま）。
 - `version`, `trailer`, `trailer_handle`, `trailer_key_handle`, `root_ref`,
   `adobe_extension_level`, `ever_called_get_all_pages`,
   `mark_get_all_pages_called`（direct document-state accessor として
-  1グループにまとめる。`adobe_extension_level` が内部で `resolve()`/
-  `lift()` を呼ぶ点は上記モジュール階層節を参照）
+  1グループにまとめる。`adobe_extension_level` は内部で `self.resolve()`
+  と `resolve_object_value`（`lift`/`lift_to_handle_bounded` ではない。
+  `resolve_object_value` 自体も `pdf.rs:292` へ物理的に移動済み）を呼ぶ。
+  詳細は上記モジュール階層節を参照）
 - **未移動（今後の対象）**: `unique_id()` アクセサ（`reader.rs:1703`、
   `self.unique_id` を返すのみ）は `flpdf-0b12` の移動対象に含まれて
   おらず、まだ reader.rs に残っている。**`obj_cache.rs` には含めない**
@@ -415,9 +417,12 @@ reader.rs に残ったまま）。
   （`QPDF.cc:2329-2346`）は多段の間接参照 chain walk を行う実処理で
   `getTrailer()` のような単純な field 返却ではないが、`flpdf-0b12` の
   実装は「direct document-state accessor」という括りでこの3つを他の
-  trivial アクセサと同じ `pdf.rs` にまとめて置いた（呼び出し先の
-  `lift`/`lift_to_handle_bounded` 自体は `pub(crate)` 化のみで
-  reader.rs に残る）。本設計もこれに合わせる
+  trivial アクセサと同じ `pdf.rs` にまとめて置いた（`trailer_handle`/
+  `trailer_key_handle` が呼ぶ `lift`/`lift_to_handle_bounded` 自体は
+  `pub(crate)` 化のみで reader.rs に残るが、`adobe_extension_level` が
+  呼ぶ `resolve_object_value` は `pdf.rs:292` へ物理的に移動済み——
+  3メソッドで移動の種類が異なる点は上記モジュール階層節参照）。
+  本設計もこれに合わせる
 - 既存 `reader/resolver.rs` の `ResolverCore<R>`（`pub(crate)`,
   `object_cache: BTreeMap<ObjectRef, ObjectHandle>` 等）が既にこの領域の
   一部を担っているため、実装時に統合対象を精査する
