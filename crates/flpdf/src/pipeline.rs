@@ -141,8 +141,6 @@ pub trait Pipeline {
 /// inner stage here and the whole chain is returned to the caller. Construction
 /// order, stage count, and output bytes are unchanged; only the owner moves.
 /// CLAUDE.md deviation class (B).
-// Removed once Flate and LzwDecoder store this type.
-#[allow(dead_code)]
 pub(crate) enum PipelineRef<'a> {
     Borrowed(&'a mut dyn Pipeline),
     Owned(Box<dyn Pipeline + 'a>),

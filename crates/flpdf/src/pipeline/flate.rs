@@ -1,6 +1,6 @@
 //! qpdf correspondence: Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -73,7 +73,7 @@ type WarnCallback<'a> = dyn FnMut(&str, i32) -> PipelineResult<()> + 'a;
 
 pub(crate) struct Flate<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     action: FlateAction,
     codec: Option<FlateCodec>,
     inflate_state: InflateState,
@@ -86,7 +86,7 @@ pub(crate) struct Flate<'a> {
 impl<'a> Flate<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
-        next: &'a mut dyn Pipeline,
+        next: impl Into<PipelineRef<'a>>,
         action: FlateAction,
         out_buffer_size: usize,
     ) -> PipelineResult<Self> {
@@ -104,7 +104,7 @@ impl<'a> Flate<'a> {
 
         Ok(Self {
             identifier,
-            next,
+            next: next.into(),
             action,
             codec: None,
             inflate_state: InflateState::new(),
