@@ -209,6 +209,8 @@ impl QPDFLogger {
         error: Option<PipelineHandle>,
     ) {
         let mut state = self.shared.lock();
+        let output = output.filter(|candidate| !candidate.is_same(&state.stdout));
+        let error = error.filter(|candidate| !candidate.is_same(&state.stderr));
         state.info = output.unwrap_or_else(|| {
             if state
                 .save

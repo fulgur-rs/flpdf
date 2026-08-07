@@ -169,6 +169,24 @@ fn null_output_streams_select_defaults_around_stdout_save() {
 }
 
 #[test]
+fn explicit_standard_streams_are_normalized_before_default_route_selection() {
+    let logger = QPDFLogger::create();
+    logger.save_to_standard_output(false).unwrap();
+
+    logger.set_output_streams(
+        Some(logger.standard_output()),
+        Some(logger.standard_error()),
+    );
+
+    assert!(logger.get_info().unwrap().is_same(&logger.standard_error()));
+    assert!(logger
+        .get_error()
+        .unwrap()
+        .is_same(&logger.standard_error()));
+    assert!(logger.get_warn().unwrap().is_same(&logger.standard_error()));
+}
+
+#[test]
 fn save_first_reroutes_and_later_restores_default_info() {
     let logger = QPDFLogger::create();
 
