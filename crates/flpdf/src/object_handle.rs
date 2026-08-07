@@ -3,6 +3,30 @@
 //!
 //! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
 //!
+//! `QPDFObjectHandle` holds `std::shared_ptr<QPDFObject>` and defines object
+//! sameness by that pointer, not by structural equality
+//! (`include/qpdf/QPDFObjectHandle.hh:304-309,1338-1350`,
+//! `libqpdf/QPDFObjectHandle.cc:224-227`). [`ObjectHandle`] maps that one
+//! shared allocation to one uniform `Rc<RefCell<ObjectSlot>>`: direct and
+//! indirect forms therefore share one identity, payload, and metadata slot.
+//!
+//! qpdf's `QPDFObject` owns one shared `QPDFValue`; that value carries the
+//! current `QPDF*`, object generation, and parsed offset
+//! (`libqpdf/qpdf/QPDFObject_private.hh:19-29,60-68,117-150,176-180`,
+//! `libqpdf/qpdf/QPDFValue.hh:60-72,90-110,144-152`). Resolution reads the
+//! current metadata from this same allocation
+//! (`libqpdf/QPDFObject.cc:7-16`). `ObjectSlot` likewise keeps the active
+//! object reference, resolver, parsed offset, and value state together.
+//!
+//! qpdf promotion registers and updates the existing allocation rather than
+//! cloning a direct payload (`libqpdf/QPDF.cc:1835-1839,1882-1897`); this
+//! port's [`ObjectHandle::promote_to_indirect`] mutates its existing slot on
+//! the same boundary. During teardown qpdf disconnects every cached indirect
+//! object, including unresolved entries, and destroys only non-null values
+//! (`libqpdf/QPDF.cc:215-235`); this port's
+//! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
+//! state-sensitive value.
+//!
 //! `QPDFObjectHandle.cc:456-466,759-785,1027-1039` supplies the
 //! name/dictionary/array inspection mirrored by `try_is_name_and_equals`,
 //! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
@@ -186,8 +210,11 @@ mod parse_tests {
 /// A shared, cloneable handle to a PDF object.
 ///
 /// Cloning a handle is O(1) and does not deep-copy the underlying value;
-/// every clone of an indirect handle shares the same canonical identity and
-/// resolution state.
+/// every clone, direct or indirect, shares one canonical identity, payload,
+/// and resolution state. This maps qpdf's shared `QPDFObject` allocation and
+/// pointer-identity `isSameObjectAs` comparison
+/// (`include/qpdf/QPDFObjectHandle.hh:304-309,1338-1350`,
+/// `libqpdf/QPDFObjectHandle.cc:224-227`).
 ///
 /// Lazy dereference stays crate-internal until every document-created handle
 /// is attached to the complete qpdf-native resolver.
@@ -198,52 +225,50 @@ mod parse_tests {
 /// # Ok::<(), flpdf::Error>(())
 /// ```
 #[derive(Clone)]
-pub struct ObjectHandle(Repr);
+pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 
-// Hand-written rather than derived: a resolved indirect value can hold
-// other indirect `ObjectHandle`s sharing this same canonical `Rc` identity
-// (array/dict/stream-dict children — see `Pdf::drop`'s own comment on the
-// same cycle). A self- or reciprocal reference (e.g. a one-object
-// `/Self 1 0 R` dictionary, or a `/Pages`/`/Parent` pair) would make a
-// derived, recursively-expanding `Debug` walk back into the same slot
-// forever, overflowing the stack. Stop at every indirect boundary instead
-// of expanding its resolved value: since only an indirect handle can carry
-// the document's shared identity, no cycle can exist that does not pass
-// through one, so this bound is sufficient to make formatting total.
+// Hand-written rather than derived: a resolved value can hold other
+// `ObjectHandle`s sharing canonical `Rc` identities (array/dict/stream-dict
+// children — see `Pdf::drop`'s own comment on indirect cycles). A self- or
+// reciprocal reference would make a derived, recursively-expanding `Debug`
+// walk back into the same slot forever. Snapshot only metadata and the state
+// name, never the resolved value, so formatting is total for direct and
+// indirect cycles alike.
 impl std::fmt::Debug for ObjectHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            Repr::Direct(slot) => {
-                let slot = slot.borrow();
-                f.debug_struct("ObjectHandle::Direct")
-                    .field("value", &slot.value)
-                    .field("parsed_offset", &slot.parsed_offset)
-                    .finish()
-            }
-            Repr::Indirect(slot) => {
-                let slot = slot.borrow();
-                let state: &str = match &slot.state {
-                    IndirectState::NotYetResolved => "NotYetResolved",
-                    IndirectState::Resolved(_) => "Resolved(..)",
-                    IndirectState::Missing => "Missing",
-                    IndirectState::Destroyed => "Destroyed",
-                };
-                f.debug_struct("ObjectHandle::Indirect")
-                    .field("object_ref", &slot.object_ref)
-                    .field("state", &state)
-                    .field("parsed_offset", &slot.parsed_offset)
-                    .finish()
-            }
-        }
+        let slot = self.0.borrow();
+        let state: &str = match &slot.state {
+            ObjectState::NotYetResolved => "NotYetResolved",
+            ObjectState::Resolved(_) => "Resolved(..)",
+            ObjectState::Missing => "Missing",
+            ObjectState::Destroyed => "Destroyed",
+        };
+        let label = if slot.object_ref.is_some() {
+            "ObjectHandle::Indirect"
+        } else {
+            "ObjectHandle::Direct"
+        };
+        f.debug_struct(label)
+            .field("object_ref", &slot.object_ref)
+            .field("state", &state)
+            .field("parsed_offset", &slot.parsed_offset)
+            .finish()
     }
 }
 
 // Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
-// impl above for why a derived one is unsafe here (indirect-handle cycles).
-#[derive(Clone)]
-enum Repr {
-    Direct(Rc<RefCell<DirectSlot>>),
-    Indirect(Rc<RefCell<IndirectSlot>>),
+// impl above for why a derived one is unsafe here (object-handle cycles).
+// This uniform allocation corresponds to qpdf's QPDFObject/QPDFValue pair:
+// it keeps the current payload and all indirect metadata together rather
+// than placing direct and indirect forms in separate backing storage.
+struct ObjectSlot {
+    state: ObjectState,
+    object_ref: Option<ObjectRef>,
+    active_pdf_unique_id: Option<u64>,
+    resolver: Option<Weak<dyn DocumentResolver>>,
+    parsed_offset: i64,
+    pdf_unique_ids: BTreeSet<u64>,
+    containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
 }
 
 /// The value payload of a direct `ObjectHandle`, mirroring qpdf's
@@ -313,7 +338,7 @@ pub(crate) enum ObjectValue {
     /// because C++ cannot say borrow-or-own in the type system, so `Buffer`
     /// carries a runtime flag for it (`include/qpdf/Buffer.hh:35-46` offers
     /// both an owning and a non-owning constructor). `Rc` rather than `Arc`
-    /// because [`Repr`] itself is `Rc`-based, so this value is `!Send`
+    /// because [`ObjectHandle`] itself is `Rc`-based, so this value is `!Send`
     /// regardless.
     Stream {
         stream_dict: ObjectHandle,
@@ -341,34 +366,13 @@ pub(crate) enum ObjectValue {
     Reference(ObjectRef),
 }
 
-#[derive(Debug)]
-struct DirectSlot {
-    value: ObjectValue,
-    parsed_offset: i64,
-    /// Pdf identities this value has belonged to. This provenance is
-    /// additive, like qpdf's owning `QPDF*`, and deliberately survives
-    /// removal from a container.
-    pdf_unique_ids: BTreeSet<u64>,
-    /// One weak reverse edge for each current forward occurrence in an
-    /// array, dictionary, stream dictionary, or indirect root. qpdf's
-    /// forward membership remains authoritative; this derived index exists
-    /// only so incremental dirty tracking can find live indirect roots.
-    containment_parents: Vec<ContainmentParent>,
-}
-
-#[derive(Debug, Clone)]
-enum ContainmentParent {
-    Root(ContainmentOwner),
-    Direct(Weak<RefCell<DirectSlot>>),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ContainmentOwner {
     pdf_unique_id: Option<u64>,
     object_ref: ObjectRef,
 }
 
-/// The resolution state of an indirect handle's backing slot.
+/// The resolution state of an object handle's uniform backing slot.
 ///
 /// `Missing` and `Resolved(ObjectValue::Null)` are kept as distinct variants
 /// even though both currently present the same externally-observable value
@@ -379,7 +383,7 @@ struct ContainmentOwner {
 /// later task needs it (e.g. to tell a dangling reference apart from a real
 /// null value for diagnostics).
 #[derive(Debug)]
-pub(crate) enum IndirectState {
+pub(crate) enum ObjectState {
     NotYetResolved,
     Resolved(ObjectValue),
     Missing,
@@ -390,14 +394,6 @@ pub(crate) enum IndirectState {
     /// reports `false`, while value accessors without an error channel retain
     /// their null fallback.
     Destroyed,
-}
-
-struct IndirectSlot {
-    object_ref: ObjectRef,
-    pdf_unique_id: Option<u64>,
-    resolver: Option<Weak<dyn DocumentResolver>>,
-    state: IndirectState,
-    parsed_offset: i64,
 }
 
 impl ObjectHandle {
@@ -420,34 +416,29 @@ impl ObjectHandle {
     /// True if this handle wraps a value constructed directly, without an
     /// indirect object number/generation.
     pub fn is_direct(&self) -> bool {
-        matches!(self.0, Repr::Direct(_))
+        self.0.borrow().object_ref.is_none()
     }
 
     /// True if this handle refers to an indirect object.
     pub fn is_indirect(&self) -> bool {
-        matches!(self.0, Repr::Indirect(_))
+        self.0.borrow().object_ref.is_some()
     }
 
     /// The object number/generation for an indirect handle, or `None` for a
     /// direct one.
     pub fn object_ref(&self) -> Option<ObjectRef> {
-        match &self.0 {
-            Repr::Indirect(slot) => Some(slot.borrow().object_ref),
-            Repr::Direct(_) => None,
-        }
+        self.0.borrow().object_ref
     }
 
     /// True if `self` and `other` share the same underlying storage — the
     /// same canonical object, not merely an equal value.
     ///
     /// This is qpdf's `QPDFObjectHandle::isSameObjectAs`: mutations and lazy
-    /// resolution observed through either handle affect the same object.
+    /// resolution observed through either handle affect the same allocation
+    /// (`include/qpdf/QPDFObjectHandle.hh:304-309`,
+    /// `libqpdf/QPDFObjectHandle.cc:224-227`).
     pub fn is_same_object_as(&self, other: &Self) -> bool {
-        match (&self.0, &other.0) {
-            (Repr::Direct(a), Repr::Direct(b)) => Rc::ptr_eq(a, b),
-            (Repr::Indirect(a), Repr::Indirect(b)) => Rc::ptr_eq(a, b),
-            _ => false,
-        }
+        Rc::ptr_eq(&self.0, &other.0)
     }
 
     #[cfg(test)]
@@ -513,19 +504,20 @@ impl ObjectHandle {
     }
 
     /// Construct a canonical unresolved slot attached to a document resolver
-    /// but carrying no document identity tag. The resolver link is weak so a
-    /// surviving handle cannot keep its document alive.
+    /// but initially without active document metadata. The resolver link is
+    /// weak so a surviving handle cannot keep its document alive.
     ///
-    /// Identity-less, so [`Self::belongs_to_pdf`] answers `false` for every
-    /// document, and the root edge [`Self::set_resolved`] records on each
-    /// direct child carries `None` as its document — which makes
-    /// [`Self::containing_object_refs_for_pdf`] empty for every id, since
-    /// `None` matches no `Some`. That makes this the *narrower* of the two
-    /// constructors, not the qpdf-native one — upstream a single `QPDF*`
-    /// carries identity and resolver together, so
-    /// [`Self::new_indirect_for_pdf_with_resolver`] is the shape that
-    /// corresponds to qpdf, and is what a handle vended by a `Pdf` needs.
-    /// This one exists for resolver tests that never consult identity.
+    /// Its resolved direct children keep only weak immediate-parent links.
+    /// [`Self::containing_object_refs_for_pdf`] follows those live links at
+    /// query time and reads the reached indirect slot's *current* object
+    /// reference and active document identity. It neither copies Root
+    /// metadata to children nor records a permanent `None` root. Until this
+    /// slot is promoted, it has no active identity, so
+    /// [`Self::belongs_to_pdf`] is false and owner lookup is empty for every
+    /// document. That makes this the narrower test constructor, not the
+    /// qpdf-native shape: upstream one `QPDF*` carries both identity and the
+    /// resolver, while [`Self::new_indirect_for_pdf_with_resolver`] is what a
+    /// handle vended by a `Pdf` needs.
     #[allow(dead_code)] // production QPDF::Resolver wiring is flpdf-25kg.3.5;
                         // this primitive slice exercises the constructor with
                         // sealed resolver unit tests only
@@ -547,29 +539,70 @@ impl ObjectHandle {
         pdf_unique_id: Option<u64>,
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
-        let _ = offset; // real Unresolved{offset} state lands in a later task
-        Self(Repr::Indirect(Rc::new(RefCell::new(IndirectSlot {
-            object_ref,
-            pdf_unique_id,
+        let _ = offset;
+        Self(Rc::new(RefCell::new(ObjectSlot {
+            state: ObjectState::NotYetResolved,
+            object_ref: Some(object_ref),
+            active_pdf_unique_id: pdf_unique_id,
             resolver,
-            state: IndirectState::NotYetResolved,
             parsed_offset: NO_PARSED_OFFSET,
-        }))))
+            pdf_unique_ids: BTreeSet::new(),
+            containment_parents: Vec::new(),
+        })))
     }
 
     fn new_direct(value: ObjectValue, parsed_offset: i64) -> Self {
-        let handle = Self(Repr::Direct(Rc::new(RefCell::new(DirectSlot {
-            value,
+        let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            state: ObjectState::Resolved(value),
+            object_ref: None,
+            active_pdf_unique_id: None,
+            resolver: None,
             parsed_offset,
-            pdf_unique_ids: Default::default(),
+            pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
-        }))));
+        })));
         handle.with_value(|value| {
             if let Some(value) = value {
                 handle.attach_value_children(value);
             }
         });
         handle
+    }
+
+    /// Promote this existing uniform slot to an indirect object in place.
+    ///
+    /// qpdf registers the existing `QPDFObject` in its cache, then gives that
+    /// same allocation its object generation and owning document
+    /// (`libqpdf/QPDF.cc:1835-1839,1882-1897`); it does not clone a direct
+    /// payload during promotion. This is the corresponding primitive here:
+    /// every alias keeps its `Rc` identity while this slot receives its active
+    /// object reference, document identity, and weak resolver.
+    #[allow(dead_code)] // consumer migration in flpdf-25kg.3.6 will use this primitive
+    pub(crate) fn promote_to_indirect(
+        &self,
+        object_ref: ObjectRef,
+        pdf_unique_id: u64,
+        resolver: Weak<dyn DocumentResolver>,
+    ) -> Self {
+        let children = {
+            let mut slot = self.0.borrow_mut();
+            slot.object_ref = Some(object_ref);
+            slot.active_pdf_unique_id = Some(pdf_unique_id);
+            slot.resolver = Some(resolver);
+            slot.pdf_unique_ids.insert(pdf_unique_id);
+            match &slot.state {
+                ObjectState::Resolved(value) => Self::direct_children(value),
+                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                    Vec::new()
+                }
+            }
+        };
+        let mut visited = BTreeSet::new();
+        visited.insert(Rc::as_ptr(&self.0) as usize);
+        for child in children {
+            child.associate_pdf_identity(pdf_unique_id, &mut visited);
+        }
+        self.clone()
     }
 
     /// Construct a direct handle wrapping an already-built [`ObjectValue`], at
@@ -595,48 +628,46 @@ impl ObjectHandle {
     /// `Rc` is still shared elsewhere (refcount > 1) — the latter cannot
     /// happen for a handle a caller alone constructed and never cloned.
     pub(crate) fn into_direct_value(self) -> Option<(ObjectValue, i64)> {
-        match self.0 {
-            Repr::Direct(rc) => {
-                if Rc::strong_count(&rc) != 1 {
-                    return None;
+        if self.0.borrow().object_ref.is_some() {
+            return None; // cov:ignore: unreachable per the invariant noted above
+        }
+        if Rc::strong_count(&self.0) != 1 {
+            return None;
+        }
+        let parent = Rc::downgrade(&self.0);
+        let children = {
+            let slot = self.0.borrow();
+            match &slot.state {
+                ObjectState::Resolved(value) => Self::direct_children(value),
+                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                    return None
                 }
-                let parent = ContainmentParent::Direct(Rc::downgrade(&rc));
-                let children = Self::direct_children(&rc.borrow().value);
-                for child in children {
-                    Self::detach_child_from_parent(&child, &parent);
-                }
-                let slot = Rc::try_unwrap(rc).ok()?.into_inner();
-                Some((slot.value, slot.parsed_offset))
             }
-            // Unreachable via this module's sole caller
-            // (`parser::parse_qpdf_direct_object_handle`): `top_level_no_reference`
-            // forces every top-level parse to `Integer`, never a reference,
-            // so the handle it builds and consumes here is always direct.
-            Repr::Indirect(_) => None, // cov:ignore: unreachable per the invariant noted above
+        };
+        for child in children {
+            Self::detach_child_from_parent(&child, &parent);
+        }
+        let slot = Rc::try_unwrap(self.0).ok()?.into_inner();
+        match slot.state {
+            ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
         }
     }
 
-    /// This handle's value, cloned, if it is direct — `None` for an
-    /// indirect handle. Unlike [`Self::into_direct_value`], this works
-    /// regardless of how many other clones of this handle are outstanding
-    /// (it clones the value rather than requiring exclusive `Rc`
-    /// ownership). Used by `Pdf::make_indirect_object_handle`, which
-    /// cannot assume its caller holds the only reference to the direct
-    /// handle it passes in.
-    ///
-    /// A `Stream` value's `stream_dict` gets the same `shallow_copy_child`
-    /// treatment [`Self::shallow_copy`] gives it, rather than the plain
-    /// `ObjectValue::clone()` every other variant gets: leaving it Rc-shared
-    /// with `self` would let a later [`Self::replace_stream_data`] on either
-    /// handle rewrite the other's `/Length`/`/Filter`/`/DecodeParms`, since
-    /// that method installs those keys on the dictionary. That is the only
-    /// difference from a plain clone — the payload is shared either way, as
-    /// an `Rc` mirroring qpdf's `std::shared_ptr<Buffer>`
-    /// (`libqpdf/qpdf/QPDF_Stream.hh:104`), and sharing it is harmless
-    /// because nothing writes through it.
+    /// Legacy cloning helper for the unchanged public
+    /// `Pdf::make_indirect_object_handle` allocator: returns a direct value
+    /// copy, or `None` for an indirect handle. It is not the qpdf-native
+    /// promotion primitive — qpdf promotes by registering and updating the
+    /// existing `QPDFObject` allocation (`libqpdf/QPDF.cc:1835-1839,1882-1897`).
+    /// Consumer migration to [`Self::promote_to_indirect`] is scheduled in
+    /// `flpdf-25kg.3.6`.
     pub(crate) fn direct_value_clone(&self) -> Option<ObjectValue> {
-        match &self.0 {
-            Repr::Direct(slot) => Some(match &slot.borrow().value {
+        let slot = self.0.borrow();
+        if slot.object_ref.is_some() {
+            return None;
+        }
+        match &slot.state {
+            ObjectState::Resolved(value) => Some(match value {
                 ObjectValue::Stream {
                     stream_dict,
                     stream_data,
@@ -648,29 +679,23 @@ impl ObjectHandle {
                 },
                 other => other.clone(),
             }),
-            Repr::Indirect(_) => None,
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None,
         }
     }
 
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
-        if let Repr::Indirect(slot) = &self.0 {
+        if self.is_indirect() {
             let new_children = Self::direct_children(&value);
-            let (owner, old_value) = {
-                let mut slot = slot.borrow_mut();
-                let owner = ContainmentOwner {
-                    pdf_unique_id: slot.pdf_unique_id,
-                    object_ref: slot.object_ref,
-                };
-                let old_value =
-                    match std::mem::replace(&mut slot.state, IndirectState::Resolved(value)) {
-                        IndirectState::Resolved(old_value) => Some(old_value),
-                        _ => None,
-                    };
-                (owner, old_value)
+            let old_value = {
+                let mut slot = self.0.borrow_mut();
+                match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
+                    ObjectState::Resolved(old_value) => Some(old_value),
+                    _ => None,
+                }
             };
-            let parent = ContainmentParent::Root(owner);
+            let parent = self.containment_parent();
             if let Some(old_value) = old_value {
                 for child in Self::direct_children(&old_value) {
                     Self::detach_child_from_parent(&child, &parent);
@@ -702,18 +727,17 @@ impl ObjectHandle {
     }
 
     pub(crate) fn belongs_to_pdf(&self, pdf_unique_id: u64) -> bool {
-        match &self.0 {
-            Repr::Indirect(slot) => slot.borrow().pdf_unique_id == Some(pdf_unique_id),
-            Repr::Direct(slot) => {
-                let ids = &slot.borrow().pdf_unique_ids;
-                ids.is_empty() || ids.contains(&pdf_unique_id)
-            }
+        let slot = self.0.borrow();
+        if slot.object_ref.is_some() {
+            slot.active_pdf_unique_id == Some(pdf_unique_id)
+        } else {
+            slot.pdf_unique_ids.is_empty() || slot.pdf_unique_ids.contains(&pdf_unique_id)
         }
     }
 
     /// Mark this indirect handle as resolved-to-null because its reference is
     /// absent from — or broken in — the source cross-reference table (see
-    /// [`IndirectState`]). A no-op for a direct handle, which has no
+    /// [`ObjectState`]). A no-op for a direct handle, which has no
     /// resolution state to update.
     ///
     /// Also resets the parsed offset to the no-offset sentinel: "An absent,
@@ -725,22 +749,18 @@ impl ObjectHandle {
     /// already-resolved handle — would keep reporting its former body's
     /// source position even though the value now reads as null.
     pub(crate) fn set_missing(&self) {
-        if let Repr::Indirect(slot) = &self.0 {
-            let (owner, old_value) = {
-                let mut slot = slot.borrow_mut();
-                let owner = ContainmentOwner {
-                    pdf_unique_id: slot.pdf_unique_id,
-                    object_ref: slot.object_ref,
-                };
-                let old_value = match std::mem::replace(&mut slot.state, IndirectState::Missing) {
-                    IndirectState::Resolved(old_value) => Some(old_value),
+        if self.is_indirect() {
+            let old_value = {
+                let mut slot = self.0.borrow_mut();
+                let old_value = match std::mem::replace(&mut slot.state, ObjectState::Missing) {
+                    ObjectState::Resolved(old_value) => Some(old_value),
                     _ => None,
                 };
                 slot.parsed_offset = NO_PARSED_OFFSET;
-                (owner, old_value)
+                old_value
             };
             if let Some(old_value) = old_value {
-                let parent = ContainmentParent::Root(owner);
+                let parent = self.containment_parent();
                 for child in Self::direct_children(&old_value) {
                     Self::detach_child_from_parent(&child, &parent);
                 }
@@ -759,40 +779,55 @@ impl ObjectHandle {
     /// PDFs) therefore form a strong reference cycle once both are resolved,
     /// which `Rc` alone never collects.
     ///
-    /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache
-    /// and disconnects every resolved object, replacing it with
-    /// `QPDF_Destroyed()`, specifically to break cycles like this one
-    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). The reader's `Pdf::drop` calls
-    /// this for every entry in its handle registry — the sole owner of the
-    /// canonical `Rc`s — before the registry itself is dropped, so no
-    /// lingering cycle keeps a document's object graph (and any reachable
-    /// stream buffers) alive past the `Pdf` that produced it.
+    /// Mirrors qpdf's own teardown: `QPDF::~QPDF()` walks its object cache,
+    /// disconnects every cached indirect object, including unresolved entries,
+    /// and replaces only non-null values with `QPDF_Destroyed()`, specifically
+    /// to break cycles like this one
+    /// (`libqpdf/QPDF.cc`, `QPDF::~QPDF`). Literal null and missing values stay
+    /// null. The reader's `Pdf::drop` calls this for every entry in its handle
+    /// registry — the sole owner of the canonical `Rc`s — before the registry
+    /// itself is dropped, so no lingering cycle keeps a document's object
+    /// graph (and any reachable stream buffers) alive past the `Pdf` that
+    /// produced it.
     ///
-    /// Also resets the parsed offset to the no-offset sentinel, mirroring
-    /// [`Self::set_missing`]'s own reset and the same Parsed-Offset Contract
-    /// clause it cites: a surviving destroyed handle must not keep reporting
-    /// the destroyed value's former source position.
+    /// Resets the parsed offset to the no-offset sentinel only when the value
+    /// is destroyed. Surviving null and missing values retain their existing
+    /// parsed-offset provenance.
     pub(crate) fn disconnect(&self) {
-        if let Repr::Indirect(slot) = &self.0 {
-            let (owner, old_value) = {
-                let mut slot = slot.borrow_mut();
-                let owner = ContainmentOwner {
-                    pdf_unique_id: slot.pdf_unique_id,
-                    object_ref: slot.object_ref,
-                };
-                let old_value = match std::mem::replace(&mut slot.state, IndirectState::Destroyed) {
-                    IndirectState::Resolved(old_value) => Some(old_value),
-                    _ => None,
-                };
-                slot.parsed_offset = NO_PARSED_OFFSET;
-                (owner, old_value)
-            };
-            if let Some(old_value) = old_value {
-                let parent = ContainmentParent::Root(owner);
-                for child in Self::direct_children(&old_value) {
-                    Self::detach_child_from_parent(&child, &parent);
+        let old_value = {
+            let mut slot = self.0.borrow_mut();
+            if slot.object_ref.is_none() {
+                return;
+            }
+            slot.object_ref = None;
+            slot.active_pdf_unique_id = None;
+            slot.resolver = None;
+            let old_state = std::mem::replace(&mut slot.state, ObjectState::Destroyed);
+            match old_state {
+                ObjectState::Resolved(ObjectValue::Null) => {
+                    slot.state = ObjectState::Resolved(ObjectValue::Null);
+                    None
+                }
+                ObjectState::Missing => {
+                    slot.state = ObjectState::Missing;
+                    None
+                }
+                ObjectState::Resolved(value) => {
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    Some(value)
+                }
+                ObjectState::NotYetResolved => {
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    None
+                }
+                ObjectState::Destroyed => {
+                    slot.parsed_offset = NO_PARSED_OFFSET;
+                    None
                 }
             }
+        };
+        if let Some(old_value) = old_value {
+            self.detach_value_children(&old_value);
         }
     }
 
@@ -801,10 +836,7 @@ impl ObjectHandle {
     /// `Rc`s involved, without exposing reference counting as production API.
     #[cfg(test)]
     pub(crate) fn strong_count(&self) -> usize {
-        match &self.0 {
-            Repr::Direct(rc) => Rc::strong_count(rc),
-            Repr::Indirect(rc) => Rc::strong_count(rc),
-        }
+        Rc::strong_count(&self.0)
     }
 
     /// True if this handle's value is known without performing resolution: a
@@ -813,10 +845,7 @@ impl ObjectHandle {
     /// that turned out to be missing from the source, or on a value severed
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
-        match &self.0 {
-            Repr::Direct(_) => true,
-            Repr::Indirect(slot) => !matches!(slot.borrow().state, IndirectState::NotYetResolved),
-        }
+        !matches!(self.0.borrow().state, ObjectState::NotYetResolved)
     }
 
     /// Resolve this handle's own canonical slot in place, mirroring
@@ -825,15 +854,15 @@ impl ObjectHandle {
     /// Direct and already-terminal handles are no-ops. An unresolved handle
     /// whose document has been dropped returns an error and stays unresolved.
     pub(crate) fn try_dereference(&self) -> Result<()> {
-        let (object_ref, resolver) = match &self.0 {
-            Repr::Direct(_) => return Ok(()),
-            Repr::Indirect(slot) => {
-                let slot = slot.borrow();
-                if !matches!(slot.state, IndirectState::NotYetResolved) {
-                    return Ok(());
-                }
-                (slot.object_ref, slot.resolver.clone())
+        let (object_ref, resolver) = {
+            let slot = self.0.borrow();
+            let Some(object_ref) = slot.object_ref else {
+                return Ok(());
+            };
+            if !matches!(slot.state, ObjectState::NotYetResolved) {
+                return Ok(());
             }
+            (object_ref, slot.resolver.clone())
         };
 
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
@@ -1046,10 +1075,7 @@ impl ObjectHandle {
     /// not parsed from a source position (`QPDFObjectHandle::getParsedOffset`,
     /// `include/qpdf/QPDFObjectHandle.hh:415-419`).
     pub fn get_parsed_offset(&self) -> i64 {
-        match &self.0 {
-            Repr::Direct(slot) => slot.borrow().parsed_offset,
-            Repr::Indirect(slot) => slot.borrow().parsed_offset,
-        }
+        self.0.borrow().parsed_offset
     }
 
     // Record `offset` as the parsed offset, but only if none has been set
@@ -1059,14 +1085,9 @@ impl ObjectHandle {
     // the set-once contract without a live parser.
     #[allow(dead_code)]
     pub(crate) fn set_parsed_offset_if_unset(&self, offset: i64) {
-        let set = |current: &mut i64| {
-            if *current < 0 {
-                *current = offset;
-            }
-        };
-        match &self.0 {
-            Repr::Direct(slot) => set(&mut slot.borrow_mut().parsed_offset),
-            Repr::Indirect(slot) => set(&mut slot.borrow_mut().parsed_offset),
+        let mut slot = self.0.borrow_mut();
+        if slot.parsed_offset < 0 {
+            slot.parsed_offset = offset;
         }
     }
 
@@ -1239,13 +1260,10 @@ impl ObjectHandle {
     /// that turned out to be missing from the source. A handle disconnected
     /// when its owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
-        match &self.0 {
-            Repr::Direct(slot) => matches!(&slot.borrow().value, ObjectValue::Null),
-            Repr::Indirect(slot) => matches!(
-                &slot.borrow().state,
-                IndirectState::Resolved(ObjectValue::Null) | IndirectState::Missing
-            ),
-        }
+        matches!(
+            &self.0.borrow().state,
+            ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
+        )
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -1439,7 +1457,7 @@ impl ObjectHandle {
     /// already handled correctly by every recursive walker's
     /// indirect-boundary stop.
     fn is_same_direct_handle(&self, other: &Self) -> bool {
-        matches!((&self.0, &other.0), (Repr::Direct(a), Repr::Direct(b)) if Rc::ptr_eq(a, b))
+        self.is_direct() && other.is_direct() && self.is_same_object_as(other)
     }
 
     fn direct_children(value: &ObjectValue) -> Vec<ObjectHandle> {
@@ -1451,64 +1469,50 @@ impl ObjectHandle {
         }
     }
 
-    fn containment_parent(&self) -> ContainmentParent {
-        match &self.0 {
-            Repr::Direct(slot) => ContainmentParent::Direct(Rc::downgrade(slot)),
-            Repr::Indirect(slot) => {
-                let slot = slot.borrow();
-                ContainmentParent::Root(ContainmentOwner {
-                    pdf_unique_id: slot.pdf_unique_id,
-                    object_ref: slot.object_ref,
-                })
-            }
-        }
+    fn containment_parent(&self) -> Weak<RefCell<ObjectSlot>> {
+        Rc::downgrade(&self.0)
     }
 
-    fn same_containment_parent(left: &ContainmentParent, right: &ContainmentParent) -> bool {
-        match (left, right) {
-            (ContainmentParent::Root(left), ContainmentParent::Root(right)) => left == right,
-            (ContainmentParent::Direct(left), ContainmentParent::Direct(right)) => {
-                Weak::ptr_eq(left, right)
-            }
-            _ => false,
-        }
+    fn same_containment_parent(
+        left: &Weak<RefCell<ObjectSlot>>,
+        right: &Weak<RefCell<ObjectSlot>>,
+    ) -> bool {
+        Weak::ptr_eq(left, right)
     }
 
-    fn attach_child_to_parent(child: &ObjectHandle, parent: &ContainmentParent) {
-        let Repr::Direct(slot) = &child.0 else {
+    fn attach_child_to_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
+        if child.is_indirect() {
             return;
-        };
+        }
         {
-            let mut slot = slot.borrow_mut();
+            let mut slot = child.0.borrow_mut();
             slot.containment_parents
                 .retain(Self::containment_parent_is_live);
             slot.containment_parents.push(parent.clone());
         }
 
-        let pdf_unique_ids: Vec<u64> = match parent {
-            ContainmentParent::Root(owner) => owner.pdf_unique_id.into_iter().collect(),
-            ContainmentParent::Direct(parent) => parent
-                .upgrade()
-                .map(|parent| parent.borrow().pdf_unique_ids.iter().copied().collect())
-                .unwrap_or_default(),
-        };
+        let pdf_unique_ids = parent
+            .upgrade()
+            .map(|parent| {
+                let slot = parent.borrow();
+                slot.pdf_unique_ids
+                    .iter()
+                    .copied()
+                    .chain(slot.active_pdf_unique_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         for pdf_unique_id in pdf_unique_ids {
             child.associate_pdf_identity(pdf_unique_id, &mut BTreeSet::new());
         }
     }
 
-    fn containment_parent_is_live(parent: &ContainmentParent) -> bool {
-        match parent {
-            ContainmentParent::Root(_) => true,
-            ContainmentParent::Direct(parent) => parent.strong_count() != 0,
-        }
+    fn containment_parent_is_live(parent: &Weak<RefCell<ObjectSlot>>) -> bool {
+        Weak::strong_count(parent) != 0
     }
 
-    fn detach_child_from_parent(child: &ObjectHandle, parent: &ContainmentParent) {
-        let Repr::Direct(slot) = &child.0 else {
-            return;
-        };
-        let mut slot = slot.borrow_mut();
+    fn detach_child_from_parent(child: &ObjectHandle, parent: &Weak<RefCell<ObjectSlot>>) {
+        let mut slot = child.0.borrow_mut();
         if let Some(index) = slot
             .containment_parents
             .iter()
@@ -1535,52 +1539,62 @@ impl ObjectHandle {
     fn associate_pdf_identity(&self, pdf_unique_id: u64, visited: &mut BTreeSet<usize>) {
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
-            let Repr::Direct(slot) = &handle.0 else {
+            if handle.is_indirect() {
                 continue;
-            };
-            let identity = Rc::as_ptr(slot) as usize;
+            }
+            let identity = Rc::as_ptr(&handle.0) as usize;
             if !visited.insert(identity) {
                 continue;
             }
             let children = {
-                let mut slot = slot.borrow_mut();
+                let mut slot = handle.0.borrow_mut();
                 slot.pdf_unique_ids.insert(pdf_unique_id);
-                Self::direct_children(&slot.value)
+                match &slot.state {
+                    ObjectState::Resolved(value) => Self::direct_children(value),
+                    ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                        Vec::new()
+                    }
+                }
             };
             pending.extend(children);
         }
     }
 
     fn containment_roots(&self) -> BTreeSet<ContainmentOwner> {
+        if self.is_indirect() {
+            return BTreeSet::new();
+        }
         let mut roots = BTreeSet::new();
         let mut visited = BTreeSet::new();
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
-            let Repr::Direct(slot) = &handle.0 else {
-                continue;
-            };
-            let identity = Rc::as_ptr(slot) as usize;
+            let identity = Rc::as_ptr(&handle.0) as usize;
             if !visited.insert(identity) {
                 continue;
             }
-            let parents = {
-                let mut slot = slot.borrow_mut();
+            let (object_ref, pdf_unique_id, parents) = {
+                let mut slot = handle.0.borrow_mut();
                 slot.containment_parents
                     .retain(Self::containment_parent_is_live);
-                slot.containment_parents.clone()
+                (
+                    slot.object_ref,
+                    slot.active_pdf_unique_id,
+                    slot.containment_parents.clone(),
+                )
             };
-            for parent in parents {
-                match parent {
-                    ContainmentParent::Root(owner) => {
-                        roots.insert(owner);
-                    }
-                    ContainmentParent::Direct(parent) => {
-                        if let Some(parent) = parent.upgrade() {
-                            pending.push(ObjectHandle(Repr::Direct(parent)));
-                        }
-                    }
-                }
+            if let Some(object_ref) = object_ref {
+                roots.insert(ContainmentOwner {
+                    pdf_unique_id,
+                    object_ref,
+                });
+                continue;
             }
+            pending.extend(
+                parents
+                    .into_iter()
+                    .filter_map(|parent| parent.upgrade())
+                    .map(ObjectHandle),
+            );
         }
         roots
     }
@@ -1858,16 +1872,14 @@ impl ObjectHandle {
             ));
         }
 
-        let (object_ref, resolver) = match &self.0 {
-            Repr::Indirect(slot) => {
-                let slot = slot.borrow();
-                (slot.object_ref, slot.resolver.clone())
-            }
-            Repr::Direct(_) => {
+        let (object_ref, resolver) = {
+            let slot = self.0.borrow();
+            let Some(object_ref) = slot.object_ref else {
                 return Err(Error::Internal(
                     "pipeStreamData called for original direct stream".to_owned(),
-                ))
-            }
+                ));
+            };
+            (object_ref, slot.resolver.clone())
         };
         let Some(resolver) = resolver.and_then(|resolver| resolver.upgrade()) else {
             return Err(Error::Internal(format!(
@@ -1938,22 +1950,20 @@ impl ObjectHandle {
     /// (`ot_unresolved`) is reported as a placeholder rather than the
     /// terminal object's real ordinal.
     pub fn type_code(&self) -> u8 {
-        if let Repr::Indirect(slot) = &self.0 {
-            // Bind the borrow to a local first and match on it, mirroring
-            // this file's own `Debug` impl (see above) rather than matching
-            // directly against a temporary. The borrow ends at this block's
-            // closing brace, strictly before `with_value` below takes its
-            // own borrow of the same slot — never nested.
-            let slot_ref = slot.borrow();
+        {
+            // `Destroyed` is a value state, independent of the indirect
+            // metadata that disconnect clears. Bind the borrow to a local
+            // and release it before `with_value` below takes its own borrow.
+            let slot_ref = self.0.borrow();
             match &slot_ref.state {
-                IndirectState::NotYetResolved => return 13,
-                IndirectState::Destroyed => return 14,
-                IndirectState::Missing | IndirectState::Resolved(_) => {}
+                ObjectState::Destroyed => return 14,
+                ObjectState::NotYetResolved if slot_ref.object_ref.is_some() => return 13,
+                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
             }
         }
         self.with_value(|value| {
             match value.expect(
-                "every state reaching here (direct, indirect Missing, indirect Resolved) carries a value",
+                "every reachable state here (direct, indirect Missing, indirect Resolved) carries a value",
             ) {
                 ObjectValue::Null => 2,
                 ObjectValue::Boolean(_) => 3,
@@ -2010,13 +2020,10 @@ impl ObjectHandle {
     // use this helper; state-aware accessors such as `is_null` inspect their
     // slot directly instead.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
-        match &self.0 {
-            Repr::Direct(slot) => f(Some(&slot.borrow().value)),
-            Repr::Indirect(slot) => match &slot.borrow().state {
-                IndirectState::NotYetResolved => f(None),
-                IndirectState::Resolved(value) => f(Some(value)),
-                IndirectState::Missing | IndirectState::Destroyed => f(Some(&ObjectValue::Null)),
-            },
+        match &self.0.borrow().state {
+            ObjectState::NotYetResolved => f(None),
+            ObjectState::Resolved(value) => f(Some(value)),
+            ObjectState::Missing | ObjectState::Destroyed => f(Some(&ObjectValue::Null)),
         }
     }
 
@@ -2027,14 +2034,9 @@ impl ObjectHandle {
     // hand out a `&mut` into — those states only *present* as null, they do
     // not store one).
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
-        match &self.0 {
-            Repr::Direct(slot) => f(Some(&mut slot.borrow_mut().value)),
-            Repr::Indirect(slot) => match &mut slot.borrow_mut().state {
-                IndirectState::Resolved(value) => f(Some(value)),
-                IndirectState::NotYetResolved
-                | IndirectState::Missing
-                | IndirectState::Destroyed => f(None),
-            },
+        match &mut self.0.borrow_mut().state {
+            ObjectState::Resolved(value) => f(Some(value)),
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => f(None),
         }
     }
 
@@ -2170,10 +2172,20 @@ impl ObjectHandle {
     /// dictionary handle's already-recorded `<<`-start parsed offset
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
-        if let Repr::Direct(slot) = &self.0 {
+        if self.is_direct() {
             let new_children = Self::direct_children(&value);
-            let old_value = std::mem::replace(&mut slot.borrow_mut().value, value);
-            self.detach_value_children(&old_value);
+            let old_value = {
+                let mut slot = self.0.borrow_mut();
+                match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
+                    ObjectState::Resolved(old_value) => Some(old_value),
+                    ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                        None
+                    }
+                }
+            };
+            if let Some(old_value) = old_value {
+                self.detach_value_children(&old_value);
+            }
             let parent = self.containment_parent();
             for child in new_children {
                 Self::attach_child_to_parent(&child, &parent);
@@ -2189,10 +2201,7 @@ impl ObjectHandle {
     /// value with a caller-supplied one, any previously recorded source
     /// position no longer describes that value.
     pub(crate) fn reset_parsed_offset(&self) {
-        match &self.0 {
-            Repr::Direct(slot) => slot.borrow_mut().parsed_offset = NO_PARSED_OFFSET,
-            Repr::Indirect(slot) => slot.borrow_mut().parsed_offset = NO_PARSED_OFFSET,
-        }
+        self.0.borrow_mut().parsed_offset = NO_PARSED_OFFSET;
     }
 
     /// This handle's plain (non-QDF) writer-emission form
@@ -4552,6 +4561,423 @@ pub(crate) mod identity_tests {
 }
 
 #[cfg(test)]
+mod uniform_identity_tests {
+    use super::*;
+
+    struct NoopResolver {
+        calls: Rc<std::cell::Cell<usize>>,
+    }
+
+    impl DocumentResolver for NoopResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn resolver() -> Rc<dyn DocumentResolver> {
+        Rc::new(NoopResolver {
+            calls: Rc::new(std::cell::Cell::new(0)),
+        })
+    }
+
+    fn recording_noop_resolver() -> (Rc<dyn DocumentResolver>, Rc<std::cell::Cell<usize>>) {
+        let calls = Rc::new(std::cell::Cell::new(0));
+        (
+            Rc::new(NoopResolver {
+                calls: calls.clone(),
+            }),
+            calls,
+        )
+    }
+
+    struct ReenteringResolver {
+        calls: Rc<RefCell<Vec<ObjectRef>>>,
+    }
+
+    impl DocumentResolver for ReenteringResolver {
+        fn resolve_indirect(
+            &self,
+            object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            self.calls.borrow_mut().push(object_ref);
+            assert_eq!(handle.object_ref(), Some(object_ref));
+            handle.set_resolved(ObjectValue::Dictionary(Default::default()));
+            handle.replace_key(b"Resolved", ObjectHandle::boolean(true));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn promotion_preserves_one_shared_object_identity_and_offset() {
+        let resolver = resolver();
+        let original =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(1))]);
+        let outstanding_clone = original.clone();
+        original.set_parsed_offset_if_unset(37);
+
+        let promoted =
+            original.promote_to_indirect(ObjectRef::new(17, 2), 41, Rc::downgrade(&resolver));
+
+        assert!(original.is_same_object_as(&outstanding_clone));
+        assert!(original.is_same_object_as(&promoted));
+        assert!(original.is_indirect());
+        assert!(outstanding_clone.is_indirect());
+        assert_eq!(promoted.object_ref(), Some(ObjectRef::new(17, 2)));
+        assert_eq!(outstanding_clone.get_parsed_offset(), 37);
+
+        original.replace_key(b"Value", ObjectHandle::integer(2));
+        assert_eq!(promoted.get_key(b"Value").as_integer(), Some(2));
+        promoted.replace_key(b"Value", ObjectHandle::integer(3));
+        assert_eq!(outstanding_clone.get_key(b"Value").as_integer(), Some(3));
+    }
+
+    #[test]
+    fn promotion_does_not_clone_container_or_stream_storage() {
+        let resolver = resolver();
+        let array_child = ObjectHandle::dictionary(vec![]);
+        let stream_dict = ObjectHandle::dictionary(vec![]);
+        let stream_data = Rc::new(b"shared stream data".to_vec());
+        let stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: stream_dict.clone(),
+            stream_data: Some(stream_data.clone()),
+            stream_length: stream_data.len(),
+        });
+        let root = ObjectHandle::array(vec![array_child.clone(), stream.clone()]);
+
+        let promoted =
+            root.promote_to_indirect(ObjectRef::new(19, 0), 51, Rc::downgrade(&resolver));
+
+        let children = promoted.as_array().expect("promoted array");
+        assert!(children[0].is_same_object_as(&array_child));
+        assert!(children[1].is_same_object_as(&stream));
+        let promoted_dict = children[1].as_stream_dict().expect("stream dictionary");
+        assert!(promoted_dict.is_same_object_as(&stream_dict));
+        assert!(children[1].with_value(|value| matches!(value, Some(ObjectValue::Stream { stream_data: Some(actual), .. }) if Rc::ptr_eq(actual, &stream_data))));
+    }
+
+    #[test]
+    fn promotion_delegates_unresolved_access_to_its_installed_resolver() {
+        let (resolver, calls) = recording_noop_resolver();
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(20, 0), -1);
+        handle.promote_to_indirect(ObjectRef::new(20, 0), 52, Rc::downgrade(&resolver));
+
+        handle
+            .try_dereference()
+            .expect("the installed resolver accepts the lookup");
+
+        assert_eq!(calls.get(), 1);
+        assert!(
+            !handle.is_resolved(),
+            "a resolver that installs no value must not fabricate resolution"
+        );
+    }
+
+    #[test]
+    fn contained_children_observe_parent_promotion_without_edge_rewrite() {
+        let resolver = resolver();
+        let child = ObjectHandle::dictionary(vec![]);
+        let parent = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+        assert!(child.containing_object_refs_for_pdf(61).is_empty());
+
+        parent.promote_to_indirect(ObjectRef::new(29, 0), 61, Rc::downgrade(&resolver));
+
+        assert_eq!(
+            child.containing_object_refs_for_pdf(61),
+            vec![ObjectRef::new(29, 0)]
+        );
+    }
+
+    #[test]
+    fn re_promotion_updates_active_root_but_preserves_additive_provenance() {
+        let first = resolver();
+        let second = resolver();
+        let child = ObjectHandle::dictionary(vec![]);
+        let parent = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+
+        let first_alias =
+            parent.promote_to_indirect(ObjectRef::new(31, 0), 71, Rc::downgrade(&first));
+        let second_alias =
+            parent.promote_to_indirect(ObjectRef::new(37, 4), 72, Rc::downgrade(&second));
+
+        assert!(first_alias.is_same_object_as(&second_alias));
+        assert_eq!(parent.object_ref(), Some(ObjectRef::new(37, 4)));
+        assert!(!parent.belongs_to_pdf(71));
+        assert!(parent.belongs_to_pdf(72));
+        assert!(child.belongs_to_pdf(71));
+        assert!(child.belongs_to_pdf(72));
+        assert!(child.containing_object_refs_for_pdf(71).is_empty());
+        assert_eq!(
+            child.containing_object_refs_for_pdf(72),
+            vec![ObjectRef::new(37, 4)]
+        );
+    }
+
+    #[test]
+    fn promoted_child_is_an_indirect_boundary_not_a_direct_owner_path() {
+        let resolver = resolver();
+        let child = ObjectHandle::dictionary(vec![]);
+        let outer = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+        outer.promote_to_indirect(ObjectRef::new(41, 0), 81, Rc::downgrade(&resolver));
+        child.promote_to_indirect(ObjectRef::new(43, 0), 81, Rc::downgrade(&resolver));
+
+        assert!(child.containing_object_refs_for_pdf(81).is_empty());
+        let grandchild = ObjectHandle::integer(1);
+        child.replace_key(b"Grandchild", grandchild.clone());
+        assert_eq!(
+            grandchild.containing_object_refs_for_pdf(81),
+            vec![ObjectRef::new(43, 0)]
+        );
+    }
+
+    #[test]
+    fn dormant_parent_edge_tracks_removal_while_child_is_indirect() {
+        let resolver = resolver();
+        let child = ObjectHandle::dictionary(vec![]);
+        let outer = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+        outer.promote_to_indirect(ObjectRef::new(73, 0), 111, Rc::downgrade(&resolver));
+        child.promote_to_indirect(ObjectRef::new(79, 0), 112, Rc::downgrade(&resolver));
+
+        assert!(child.containing_object_refs_for_pdf(111).is_empty());
+        child.disconnect();
+        assert_eq!(
+            child.containing_object_refs_for_pdf(111),
+            vec![ObjectRef::new(73, 0)]
+        );
+
+        child.promote_to_indirect(ObjectRef::new(83, 0), 112, Rc::downgrade(&resolver));
+        outer.remove_key(b"Child");
+        child.disconnect();
+        assert!(child.containing_object_refs_for_pdf(111).is_empty());
+    }
+
+    #[test]
+    fn disconnect_clears_indirect_metadata_for_every_non_null_alias() {
+        let resolver = resolver();
+        let original = ObjectHandle::integer(9);
+        original.set_parsed_offset_if_unset(44);
+        let promoted =
+            original.promote_to_indirect(ObjectRef::new(47, 0), 91, Rc::downgrade(&resolver));
+
+        promoted.disconnect();
+
+        assert!(original.is_same_object_as(&promoted));
+        assert!(original.is_direct());
+        assert_eq!(original.object_ref(), None);
+        assert!(!original.is_null());
+        assert_eq!(original.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_preserves_literal_null_and_missing_as_null() {
+        let resolver = resolver();
+        let literal_null = ObjectHandle::null();
+        literal_null.set_parsed_offset_if_unset(55);
+        literal_null.promote_to_indirect(ObjectRef::new(49, 0), 92, Rc::downgrade(&resolver));
+        literal_null.disconnect();
+        assert!(literal_null.is_direct());
+        assert!(literal_null.is_null());
+        assert_eq!(literal_null.get_parsed_offset(), 55);
+
+        let missing = ObjectHandle::new_indirect_unresolved(ObjectRef::new(51, 0), -1);
+        missing.set_missing();
+        missing.promote_to_indirect(ObjectRef::new(53, 0), 93, Rc::downgrade(&resolver));
+        missing.disconnect();
+        assert!(missing.is_direct());
+        assert!(missing.is_null());
+        assert_eq!(missing.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_of_an_unresolved_indirect_alias_becomes_destroyed_direct() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(54, 0), -1);
+        let alias = handle.clone();
+        handle.set_parsed_offset_if_unset(66);
+
+        handle.disconnect();
+
+        assert!(alias.is_same_object_as(&handle));
+        assert!(alias.is_direct());
+        assert_eq!(alias.object_ref(), None);
+        assert!(!alias.is_null());
+        assert_eq!(alias.type_code(), 14);
+        assert_eq!(alias.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_of_a_repromoted_destroyed_handle_resets_its_new_offset() {
+        let resolver = resolver();
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(56, 0), -1);
+        handle.disconnect();
+        handle.promote_to_indirect(ObjectRef::new(58, 0), 94, Rc::downgrade(&resolver));
+        handle.set_parsed_offset_if_unset(77);
+        assert!(handle.is_indirect());
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(58, 0)));
+        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.get_parsed_offset(), 77);
+
+        handle.disconnect();
+
+        assert!(handle.is_direct());
+        assert_eq!(handle.object_ref(), None);
+        assert!(!handle.is_null());
+        assert_eq!(handle.type_code(), 14);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn destroyed_direct_handle_has_no_legacy_value_to_clone_or_consume() {
+        let resolver = resolver();
+        let handle = ObjectHandle::integer(1);
+        handle.promote_to_indirect(ObjectRef::new(55, 0), 94, Rc::downgrade(&resolver));
+        handle.disconnect();
+
+        assert!(handle.direct_value_clone().is_none());
+        assert!(!handle.is_null(), "destroyed is distinct from literal null");
+        assert!(handle.into_direct_value().is_none());
+    }
+
+    #[test]
+    fn replace_direct_value_reinstalls_a_destroyed_direct_slot_payload() {
+        let resolver = resolver();
+        let handle = ObjectHandle::integer(1);
+        handle.promote_to_indirect(ObjectRef::new(56, 0), 94, Rc::downgrade(&resolver));
+        handle.disconnect();
+
+        handle.replace_direct_value(ObjectValue::Integer(2));
+
+        assert_eq!(handle.as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replacing_a_destroyed_direct_slot_attaches_nested_children_to_its_indirect_root() {
+        let resolver = resolver();
+        let root_ref = ObjectRef::new(57, 0);
+        let root = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            root_ref,
+            NO_PARSED_OFFSET,
+            95,
+            Rc::downgrade(&resolver),
+        );
+        let terminal = ObjectHandle::integer(1);
+        root.set_resolved(ObjectValue::Dictionary(std::collections::BTreeMap::from([
+            (b"Terminal".to_vec(), terminal.clone()),
+        ])));
+        terminal.promote_to_indirect(ObjectRef::new(58, 0), 96, Rc::downgrade(&resolver));
+        terminal.disconnect();
+
+        let leaf = ObjectHandle::integer(2);
+        terminal.replace_direct_value(ObjectValue::Dictionary(
+            [(b"Nested".to_vec(), ObjectHandle::array(vec![leaf.clone()]))]
+                .into_iter()
+                .collect(),
+        ));
+
+        assert_eq!(leaf.containing_object_refs_for_pdf(95), vec![root_ref]);
+    }
+
+    #[test]
+    fn promotion_records_identity_on_a_destroyed_direct_child_without_descending() {
+        let resolver = resolver();
+        let child = ObjectHandle::integer(1);
+        child.promote_to_indirect(ObjectRef::new(57, 0), 95, Rc::downgrade(&resolver));
+        child.disconnect();
+        let parent = ObjectHandle::dictionary(vec![(b"Child".to_vec(), child.clone())]);
+
+        parent.promote_to_indirect(ObjectRef::new(59, 0), 96, Rc::downgrade(&resolver));
+
+        assert!(child.belongs_to_pdf(96));
+        assert_eq!(
+            child.containing_object_refs_for_pdf(96),
+            vec![ObjectRef::new(59, 0)]
+        );
+    }
+
+    #[test]
+    fn resolution_state_is_shared_by_every_alias() {
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(23, 0), -1);
+        let alias = unresolved.clone();
+        unresolved.set_resolved(ObjectValue::Integer(7));
+        assert!(alias.is_same_object_as(&unresolved));
+        assert!(alias.is_resolved());
+        assert_eq!(alias.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn re_promotion_uses_latest_resolver() {
+        let first_calls = Rc::new(RefCell::new(Vec::new()));
+        let first: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+            calls: first_calls.clone(),
+        });
+        let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(59, 0),
+            NO_PARSED_OFFSET,
+            101,
+            Rc::downgrade(&first),
+        );
+        let latest_calls = Rc::new(RefCell::new(Vec::new()));
+        let latest: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+            calls: latest_calls.clone(),
+        });
+        let alias = handle.promote_to_indirect(ObjectRef::new(61, 7), 102, Rc::downgrade(&latest));
+        drop(first);
+
+        alias.try_dereference().expect("latest resolver resolves");
+
+        assert!(handle.is_same_object_as(&alias));
+        assert_eq!(*first_calls.borrow(), Vec::<ObjectRef>::new());
+        assert_eq!(*latest_calls.borrow(), vec![ObjectRef::new(61, 7)]);
+        assert_eq!(handle.object_ref(), Some(ObjectRef::new(61, 7)));
+        assert_eq!(handle.get_key(b"Resolved").as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn resolver_reentry_uses_latest_metadata_without_borrow_panic() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let latest: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+            calls: calls.clone(),
+        });
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(63, 0), -1);
+        handle.promote_to_indirect(ObjectRef::new(67, 3), 103, Rc::downgrade(&latest));
+
+        handle.try_dereference().expect("reentrant resolver");
+
+        assert_eq!(*calls.borrow(), vec![ObjectRef::new(67, 3)]);
+        assert_eq!(handle.get_key(b"Resolved").as_boolean(), Some(true));
+    }
+
+    #[test]
+    fn dropped_latest_resolver_reports_latest_object_and_stays_unresolved() {
+        let first = resolver();
+        let latest_calls = Rc::new(RefCell::new(Vec::new()));
+        let latest: Rc<dyn DocumentResolver> = Rc::new(ReenteringResolver {
+            calls: latest_calls.clone(),
+        });
+        let handle = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(69, 0),
+            NO_PARSED_OFFSET,
+            104,
+            Rc::downgrade(&first),
+        );
+        handle.promote_to_indirect(ObjectRef::new(71, 5), 105, Rc::downgrade(&latest));
+        drop(latest);
+
+        let error = handle
+            .try_dereference()
+            .expect_err("latest owner was dropped");
+
+        assert_eq!(error.to_string(), "object 71 5 belongs to a dropped PDF");
+        assert!(latest_calls.borrow().is_empty());
+        assert!(!handle.is_resolved());
+    }
+}
+
+#[cfg(test)]
 mod object_value_tests {
     use super::*;
 
@@ -4957,7 +5383,7 @@ mod resolution_state_tests {
         assert_eq!(handle.as_integer(), None);
     }
 
-    /// The two null routes are distinct [`IndirectState`] variants that no
+    /// The two null routes are distinct [`ObjectState`] variants that no
     /// public observation can tell apart.
     ///
     /// Named by `set_missing_marks_the_handle_resolved_to_null`'s comment,
@@ -4998,13 +5424,12 @@ mod resolution_state_tests {
         // a mapping needs arms for the two variants neither handle can be in,
         // and an arm nothing reaches is an uncovered line.
         assert!(
-            matches!(&missing.0, Repr::Indirect(slot)
-                if matches!(slot.borrow().state, IndirectState::Missing)),
+            matches!(&missing.0.borrow().state, ObjectState::Missing),
             "`set_missing` must leave the slot in the `Missing` variant"
         );
+        let state = &null.0.borrow().state;
         assert!(
-            matches!(&null.0, Repr::Indirect(slot)
-                if matches!(slot.borrow().state, IndirectState::Resolved(ObjectValue::Null))),
+            matches!(state, ObjectState::Resolved(ObjectValue::Null)),
             "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
         );
     }
@@ -5333,11 +5758,9 @@ mod materialize_tests {
 
         handle.replace_direct_value(value);
 
-        let Repr::Direct(slot) = &handle.0 else {
-            panic!("test handle must remain direct"); // cov:ignore: test constructor guarantees this variant
-        };
-        let slot = slot.borrow();
-        let ObjectValue::Dictionary(entries) = &slot.value else {
+        assert!(handle.is_direct());
+        let slot = handle.0.borrow();
+        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
             panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
         };
         let replaced_key_allocation = entries
@@ -5551,7 +5974,7 @@ mod type_code_tests {
     }
 
     #[test]
-    fn destroyed_indirect_handle_reports_destroyed() {
+    fn destroyed_handle_reports_destroyed_after_indirect_metadata_is_cleared() {
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(1));
         handle.disconnect();
@@ -5756,22 +6179,17 @@ mod unparse_tests {
     }
 
     #[test]
-    fn destroyed_indirect_handle_unparse_is_unaffected_but_unparse_resolved_falls_back_to_null() {
-        // qpdf's own `unparse()` never dereferences an indirect handle at
-        // all (`libqpdf/QPDFObjectHandle.cc:1574-1584`: the isIndirect()
-        // branch returns "N G R" directly without calling
-        // `unparseResolved()`), so a destroyed handle's `unparse()` does
-        // not throw either -- no divergence there. `unparseResolved()`
-        // does dereference, though, and qpdf's `QPDF_Destroyed::unparse()`
-        // (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`
-        // once it gets there. This method has no exception channel to
-        // mirror that with, so -- as documented on `unparse_resolved`
-        // itself -- it retains a null fallback rather than panicking.
+    fn destroyed_direct_handle_unparse_and_unparse_resolved_fall_back_to_null() {
+        // Disconnect clears the shared slot's indirect metadata, so both
+        // entry points reach the existing infallible fallback for the
+        // `Destroyed` value. qpdf's `QPDF_Destroyed::unparse()`
+        // (`libqpdf/QPDF_Destroyed.cc:24-29`) throws `std::logic_error`, but
+        // neither method has an exception channel to mirror that with.
         let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
         handle.set_resolved(ObjectValue::Integer(7));
         handle.disconnect();
 
-        assert_eq!(handle.unparse(), b"1 0 R");
+        assert_eq!(handle.unparse(), b"null");
         assert_eq!(handle.unparse_resolved(), b"null");
     }
 
@@ -7550,11 +7968,9 @@ mod mutation_tests {
 
         owner.set_resolved(value);
 
-        let Repr::Indirect(slot) = &owner.0 else {
-            panic!("test owner must remain indirect"); // cov:ignore: test constructor guarantees this variant
-        };
-        let slot = slot.borrow();
-        let IndirectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
+        assert!(owner.is_indirect());
+        let slot = owner.0.borrow();
+        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
             panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries
@@ -7568,10 +7984,8 @@ mod mutation_tests {
     #[test]
     fn expired_direct_parent_edges_are_pruned_on_attach_and_query() {
         fn parent_count(handle: &ObjectHandle) -> usize {
-            let Repr::Direct(slot) = &handle.0 else {
-                panic!("test child must be direct"); // cov:ignore: test factory guarantees this variant
-            };
-            slot.borrow().containment_parents.len()
+            assert!(handle.is_direct());
+            handle.0.borrow().containment_parents.len()
         }
 
         let child = ObjectHandle::integer(1);

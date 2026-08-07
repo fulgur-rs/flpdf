@@ -4308,7 +4308,9 @@ mod tests {
         };
 
         // The handle is still alive right here — that is the whole point.
-        assert!(handle.is_indirect());
+        // Disconnect has cleared its document-owned indirect metadata while
+        // preserving the shared slot in the terminal `Destroyed` state.
+        assert!(handle.is_direct());
         assert_eq!(
             Arc::strong_count(&kept),
             1,
