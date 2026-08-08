@@ -2318,6 +2318,16 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                 // ---- phase 2: no borrow is held across this ----
                 match entry {
                     Some(XrefEntry::Uncompressed { offset }) => {
+                        // qpdf's dedicated zero-offset arm
+                        // (`libqpdf/QPDF.cc:1571-1575`) treats a bogus live
+                        // type-1 entry as null before attempting I/O. In
+                        // particular, it must not turn this known sentinel
+                        // into a resolution-time xref-recovery trigger.
+                        if offset == 0 {
+                            self.push_warning_at(0, "object has offset 0")?;
+                            handle.set_missing();
+                            return Ok(());
+                        }
                         match self.read_object_at_offset(offset, object_ref) {
                             Ok((value, parsed_offset)) => {
                                 handle.set_resolved(value);
@@ -7177,6 +7187,31 @@ mod tests {
     }
 
     #[test]
+    fn zero_offset_xref_entry_warns_and_resolves_to_null_without_reconstruction() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 0 });
+
+        let handle = pdf.get_object_handle(object_ref);
+        handle
+            .try_dereference()
+            .expect("qpdf treats an offset-zero object as null");
+
+        assert!(handle.is_null(), "offset zero must resolve to null");
+        assert!(
+            !pdf.reconstructed_xref(),
+            "offset zero must not enter xref reconstruction"
+        );
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+                diagnostic.offset == Some(0) && diagnostic.message == "object has offset 0"
+            }),
+            "offset-zero resolution must emit qpdf's warning"
+        );
+    }
+
+    #[test]
     fn second_reconstruction_attempt_rethrows_error_to_prevent_infinite_loop() {
         let bytes = synthetic_mismatch_pdf(false);
         let options = crate::PdfOpenOptions {
@@ -7282,6 +7317,68 @@ mod tests {
         assert_eq!(
             pdf.resolution_fallbacks_remaining, initial_fallback_budget,
             "recovered boundaries must not consume a stale-window fallback"
+        );
+    }
+
+    #[test]
+    fn reconstruction_reconciles_compressed_parent_provenance() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let changed_type = ObjectRef::new(1, 0);
+        let changed_parent = ObjectRef::new(2, 0);
+        let unchanged = ObjectRef::new(3, 0);
+
+        pdf.compressed_member_parents.insert(
+            changed_type,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: ObjectRef::new(9, 0),
+                parent_index: 1,
+                source_stream: 9,
+                source_index: 1,
+            },
+        );
+        pdf.compressed_member_parents.insert(
+            changed_parent,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: ObjectRef::new(9, 0),
+                parent_index: 1,
+                source_stream: 9,
+                source_index: 1,
+            },
+        );
+        pdf.compressed_member_parents.insert(
+            unchanged,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: ObjectRef::new(9, 0),
+                parent_index: 3,
+                source_stream: 9,
+                source_index: 3,
+            },
+        );
+        pdf.resolver
+            .insert_xref_entry(changed_type, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.insert_xref_entry(
+            changed_parent,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 2,
+            },
+        );
+        pdf.resolver.insert_xref_entry(
+            unchanged,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 3,
+            },
+        );
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        pdf.synchronize_legacy_resolution_state();
+
+        assert_eq!(pdf.compressed_parent(changed_type), None);
+        assert_eq!(pdf.compressed_parent(changed_parent), None);
+        assert_eq!(
+            pdf.compressed_parent(unchanged),
+            Some((ObjectRef::new(9, 0), 3))
         );
     }
 

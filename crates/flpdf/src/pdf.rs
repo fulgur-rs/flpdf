@@ -10,6 +10,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+/// Provenance for a legacy object-stream member that has already been
+/// materialized.
+///
+/// `parent_ref`/`parent_index` identify the actual member stream after an
+/// `/Extends` chain is followed. `source_stream`/`source_index` preserve the
+/// live xref identity that led to that parent, so resolution-time xref
+/// reconstruction can distinguish a still-valid compressed member from a
+/// stale mapping without flattening the chain provenance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompressedMemberProvenance {
+    pub(crate) parent_ref: ObjectRef,
+    pub(crate) parent_index: u32,
+    pub(crate) source_stream: u32,
+    pub(crate) source_index: u32,
+}
+
 /// Lazily parsed PDF document handle.
 ///
 /// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
@@ -101,7 +117,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// [`Pdf::delete_object`] so the next resolve re-derives from the
     /// updated handle.
     pub(crate) legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
-    pub(crate) compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
+    pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
     /// (objects do not overlap in a well-formed PDF), so resolving one object

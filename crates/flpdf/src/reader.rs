@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 static NULL_OBJECT: Object = Object::Null;
 
-use crate::pdf::Pdf;
+use crate::pdf::{CompressedMemberProvenance, Pdf};
 
 pub(crate) struct QpdfPreparedObjects {
     pub(crate) refs: Vec<ObjectRef>,
@@ -1149,7 +1149,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
-        self.compressed_member_parents.get(&object_ref).copied()
+        self.compressed_member_parents
+            .get(&object_ref)
+            .map(|provenance| (provenance.parent_ref, provenance.parent_index))
     }
 
     /// Replace `object_ref` with `object` in the in-memory object cache.
@@ -1172,8 +1174,15 @@ impl<R: Read + Seek> Pdf<R> {
             let (parent_ref, parent_index) = self
                 .compressed_parent_for_entry(stream_ref, index)
                 .unwrap_or((stream_ref, index));
-            self.compressed_member_parents
-                .insert(object_ref, (parent_ref, parent_index));
+            self.compressed_member_parents.insert(
+                object_ref,
+                CompressedMemberProvenance {
+                    parent_ref,
+                    parent_index,
+                    source_stream: stream,
+                    source_index: index,
+                },
+            );
         }
 
         // Write through to the canonical handle graph too (not just
@@ -2668,6 +2677,22 @@ impl<R: Read + Seek> Pdf<R> {
 
         let entries = self.resolver.xref_entries();
         self.cache.synchronize_with_xref(&entries);
+        // Keep the actual `/Extends`-resolved parent for a still-identical
+        // compressed xref entry, but never let a mapping survive a rebuilt
+        // type-1 entry or a changed object-stream/index pair. qpdf's live
+        // xref table is the authority after reconstruction
+        // (`libqpdf/QPDF.cc:532-562`); the extra source identity stored with
+        // each chain parent prevents the legacy writer from treating a
+        // formerly compressed object as an object-stream member.
+        self.compressed_member_parents
+            .retain(|object_ref, provenance| {
+                matches!(
+                    entries.get(object_ref),
+                    Some(XrefEntry::Compressed { stream, index })
+                        if provenance.source_stream == *stream
+                            && provenance.source_index == *index
+                )
+            });
         self.sorted_object_offsets = entries
             .values()
             .filter_map(|entry| match entry {
@@ -2799,8 +2824,15 @@ impl<R: Read + Seek> Pdf<R> {
         } = parsed;
         let (object, _stream_payload_transformed) =
             self.decrypt_resolved_object(object_ref, object, None)?;
-        self.compressed_member_parents
-            .insert(object_ref, (parent_ref, parent_index));
+        self.compressed_member_parents.insert(
+            object_ref,
+            CompressedMemberProvenance {
+                parent_ref,
+                parent_index,
+                source_stream: stream,
+                source_index: index,
+            },
+        );
         self.cache.set_resolved(object_ref, object);
         self.record_object_stream_diagnostics(parent_ref, object_ref, diagnostics)?;
         Ok(true)
