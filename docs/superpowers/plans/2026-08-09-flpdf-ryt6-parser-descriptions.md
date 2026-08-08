@@ -30,15 +30,15 @@
 - Consumes: existing `ObjectHandle::description`, `get_parsed_offset`, `parse_explicit_object_handle`, and canonical `ResolverHandle` test helpers.
 - Produces: failing tests that require the exact qpdf template `input.pdf, object 1 0 at offset $PO`, the dictionary/array offset shifts, scalar offsets, and contextless explicit parse descriptions.
 
-- [ ] **Step 1: Write the canonical-resolver RED test.**
+- [x] **Step 1: Write the canonical-resolver RED test.**
 
-Use a named resolver over `1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> >>\nendobj\n`, resolve object `1 0` through `get_object_handle`, and assert the canonical root description is `input.pdf, object 1 0 at offset 10`. Assert the L1 dictionary, L2 dictionary, and scalar descriptions use the same template with offsets `17`, `24`, and `32`; assert both nested dictionaries and the scalar still emit through the owning resolver.
+Use a named resolver over `\n1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> >>\nendobj\n` with the xref offset set to `1`, resolve object `1 0` through `get_object_handle`, and assert the canonical root description is `input.pdf, object 1 0 at offset 11`. Assert the L1 dictionary, L2 dictionary, and scalar descriptions use the same template with offsets `18`, `25`, and `33`; assert both nested dictionaries and the scalar still emit through the owning resolver.
 
-- [ ] **Step 2: Write the explicit-parse RED test.**
+- [x] **Step 2: Write the explicit-parse RED test.**
 
-Parse `<< /Value 7 >>` through `ObjectHandle::parse`, assert the direct child description is qpdf's contextless template `parsed object,  at offset 10`, and assert `object_warning` still returns the bare contextless error rather than routing through a document sink.
+Parse `<< /Value 7 >>` through `ObjectHandle::parse`, assert the direct child description is qpdf's contextless template `parsed object,  at offset 10`, and assert `object_warning` returns `parsed object,  at offset 10: contextless explicit parse` without routing through a document sink, matching `QPDFExc::createWhat` with a non-empty object description and empty filename.
 
-- [ ] **Step 3: Run only the new tests and verify the failure is the missing description.**
+- [x] **Step 3: Run only the new tests and verify the failure is the missing description.**
 
 Run:
 
@@ -49,7 +49,7 @@ cargo test -p flpdf object_handle::parse_tests::parse_without_context_stamps_the
 
 Expected result: the tests fail because parser-created handles currently have empty descriptions, while existing context and parsed-offset tests remain unrelated and passing.
 
-- [ ] **Step 4: Commit the RED tests.**
+- [x] **Step 4: Commit the RED tests.**
 
 ```bash
 git add crates/flpdf/src/reader/resolver.rs crates/flpdf/src/object_handle.rs
@@ -69,40 +69,36 @@ git commit -m "test: pin qpdf parser object descriptions"
 - Consumes: the RED tests from Task 1 and the existing resolver-bearing direct-handle primitive from `flpdf-25kg.3.33`.
 - Produces: `HandleResolver::description_template() -> Option<String>`, parser stamping at one construction seam, and a resolver path that transfers the root description into the canonical indirect slot without changing public APIs.
 
-- [ ] **Step 1: Add the optional template seam with contextless defaults.**
+- [x] **Step 1: Add the optional template seam with contextless defaults.**
 
 Add a default `description_template` method to `HandleResolver` returning `None`. Make `DetachedHandles` carry an optional template: ObjStm materialization constructs it with `None`, while `parse_explicit_object_handle` constructs it with `Some("parsed object,  at offset $PO".to_owned())`. Existing test resolvers keep the default unless a test adapter overrides it.
 
-- [ ] **Step 2: Snapshot the template once per parser invocation.**
+- [x] **Step 2: Snapshot the template once per parser invocation.**
 
 In `parse_live_file_object_with_context`, call `resolver.description_template()` before building `LiveFileParser`, store the returned `Option<String>` on the parser, and never rebuild it per token or per nesting level.
 
-- [ ] **Step 3: Stamp every non-null direct parser value.**
+- [x] **Step 3: Stamp every non-null direct parser value.**
 
 In `LiveFileParser::direct_at`, construct the handle through `resolver.direct_handle(value)` as today. If a template exists, call `handle.set_description(template.clone(), offset)`; otherwise call `set_parsed_offset_if_unset(offset)`. Leave the `TokenType::Null`, recovery nulls, and `indirect_handle` paths untouched. Keep `finish_array` and `finish_dictionary` offsets unchanged because their existing `start` values are qpdf's `frame.offset - 1` and `frame.offset - 2` pre-shifted coordinates, and `ObjectSlot::get_description` already applies the corresponding render shift.
 
-- [ ] **Step 4: Build the canonical resolver template from qpdf's input/object description.**
+- [x] **Step 4: Build the canonical resolver template from qpdf's input/object description.**
 
-Add a `ResolverHandle` helper that snapshots `ResolverCore::description` and returns:
+Add a `ResolverHandle` helper that snapshots `ResolverCore::description` and returns qpdf's unconditional constructor template:
 
 ```rust
-if input_description.is_empty() {
-    format!("object {} {} at offset $PO", object_ref.number, object_ref.generation)
-} else {
-    format!(
-        "{}, object {} {} at offset $PO",
-        input_description, object_ref.number, object_ref.generation
-    )
-}
+format!(
+    "{}, object {} {} at offset $PO",
+    input_description, object_ref.number, object_ref.generation
+)
 ```
 
 Construct `ChildHandles` with that one string before invoking `parse_live_file_object_with_decrypter`; its `description_template` returns a clone of the stored string. This mirrors `QPDF::setLastObjectDescription` plus `QPDFParser`'s constructor without reusing the warning-only source description route for object warnings.
 
-- [ ] **Step 5: Preserve the top-level parser description during canonical resolution.**
+- [x] **Step 5: Preserve the top-level parser description during canonical resolution.**
 
 Add a private resolver-only parse result path that returns the top-level rendered description in addition to `ObjectValue` and parsed offset. Keep the existing two-value `read_object_at_offset` wrapper for tests and non-canonical callers. In `resolve_indirect` and its xref-recovery retry, after `handle.set_resolved(value)` and `set_parsed_offset_if_unset(parsed_offset)`, apply the returned non-empty description to the same canonical handle with `set_description`. Do not transfer the parser dictionary description through `read_stream`; stream objects have qpdf's separate stream-description responsibility.
 
-- [ ] **Step 6: Run the RED tests GREEN, then refactor only if all remain green.**
+- [x] **Step 6: Run the RED tests GREEN, then refactor only if all remain green.**
 
 Run the three exact test commands from Task 1. Then run:
 
@@ -130,7 +126,7 @@ git commit -m "feat: stamp qpdf parser object descriptions"
 - Consumes: the implementation and focused tests from Task 2.
 - Produces: verified qpdf parity evidence, clean formatting, and a Beads/Git handoff ready for review.
 
-- [ ] **Step 1: Run focused parser and object-description regressions.**
+- [x] **Step 1: Run focused parser and object-description regressions.**
 
 ```bash
 cargo test -p flpdf --lib parser::tests
@@ -138,7 +134,7 @@ cargo test -p flpdf --lib object_handle::parse_tests
 cargo test -p flpdf --lib reader::resolver::tests
 ```
 
-- [ ] **Step 2: Run formatting and workspace quality gates.**
+- [x] **Step 2: Run formatting and workspace quality gates.**
 
 ```bash
 cargo fmt --all -- --check

@@ -648,6 +648,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         ObjectHandle::from_value_with_resolver(value, resolver)
     }
 
+    fn parser_description_template(&self, object_ref: ObjectRef) -> String {
+        let input_description = self.core.borrow().description.clone();
+        format!(
+            "{}, object {} {} at offset $PO",
+            input_description, object_ref.number, object_ref.generation
+        )
+    }
+
     /// The canonical handle for `object_ref` **if one has already been
     /// minted**, without minting one.
     ///
@@ -728,16 +736,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `OffsetInputSource` which presents logical offset 0 to `reconstruct_xref`
     /// (`libqpdf/OffsetInputSource.cc:seek`).  Flips `m->reconstructed_xref` to
     /// `true`, emits repair warnings, and retries reading `object_ref` at the
-    /// rebuilt offset.  Returns `Ok(Some((value, parsed_offset)))` on successful
-    /// retry, `Ok(None)` if the object is absent post-rebuild (to be warned and
-    /// resolved to null), or `Err(err)` if recovery fails, if the trigger is not
-    /// a parse error, or if a second reconstruction attempt is made
-    /// (infinite-loop guard).
+    /// rebuilt offset.  Returns `Ok(Some((value, parsed_offset, description)))`
+    /// on successful retry, `Ok(None)` if the object is absent post-rebuild (to
+    /// be warned and resolved to null), or `Err(err)` if recovery fails, if the
+    /// trigger is not a parse error, or if a second reconstruction attempt is
+    /// made (infinite-loop guard).
     fn reconstruct_xref_and_retry(
         &self,
         trigger_error: Error,
         object_ref: ObjectRef,
-    ) -> Result<Option<(ObjectValue, i64)>> {
+    ) -> Result<Option<(ObjectValue, i64, String)>> {
         if self.core.borrow().reconstructed_xref {
             // Avoid xref reconstruction infinite loops (QPDF.cc:518-522).
             return Err(trigger_error);
@@ -788,7 +796,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Some(XrefEntry::Uncompressed { offset: new_offset }) => {
                 // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
                 // any parse failure propagates as an exception (Err here).
-                self.read_object_at_offset(new_offset, object_ref).map(Some)
+                self.read_object_at_offset_with_description(new_offset, object_ref)
+                    .map(Some)
             }
             Some(XrefEntry::Compressed { .. }) => Err(Error::Unsupported(format!(
                 "canonical resolver cannot yet resolve object {} {}: only uncompressed cross-reference entries are implemented",
@@ -884,9 +893,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// never a file name. [`Self::push_warning`]'s input-source description
     /// is the slot qpdf fills for `damagedPDF` warnings instead
     /// (`libqpdf/QPDFParser.cc:512`, `input->getName()`), so reusing it here
-    /// would emit a file name qpdf does not. Object descriptions themselves
-    /// are not yet propagated, so this location is empty rather than
-    /// `"object N G"`.
+    /// would emit a file name qpdf does not. Live parser direct values and
+    /// canonical handles now carry their qpdf parser descriptions; this sink
+    /// intentionally receives the already-formed message and keeps its
+    /// diagnostic offset empty rather than adding a second location.
     ///
     /// Same borrow discipline as [`Self::push_warning`]: the `borrow_mut()`
     /// is taken and dropped before the logger write.
@@ -1593,11 +1603,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `a_recovered_malformed_body_reports_its_warning_at_the_file_offset`
     /// pins the absolute diagnostic. The mismatch error is likewise anchored
     /// directly at `offset`.
+    #[cfg(test)]
     fn read_object_at_offset(
         &self,
         offset: u64,
         expected: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
+        let (value, parsed_offset, _) =
+            self.read_object_at_offset_with_description(offset, expected)?;
+        Ok((value, parsed_offset))
+    }
+
+    fn read_object_at_offset_with_description(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+    ) -> Result<(ObjectValue, i64, String)> {
         self.seek(offset)?;
         let (found, parsed, trailing) = {
             let mut input = self.live_input();
@@ -1614,7 +1635,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .ok()
                 .zip(u16::try_from(generation).ok())
                 .map(|(number, generation)| ObjectRef::new(number, generation));
-            let mut minter = ChildHandles { resolver: self };
+            let mut minter = ChildHandles {
+                resolver: self,
+                description_template: self.parser_description_template(expected),
+            };
             let encryption_parameters = self.encryption_parameters();
             let has_encryption = encryption_parameters.borrow().is_some();
             let mut decrypter = if has_encryption {
@@ -1667,21 +1691,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .into_direct_value()
                 .expect("live file parser's recovered empty object is always a direct null");
             debug_assert_eq!(parsed_offset, parsed.parsed_offset);
-            return Ok((value, parsed_offset));
+            return Ok((value, parsed_offset, String::new()));
         }
 
+        let description = parsed.value.description();
         let (value, parsed_offset) = parsed.value.into_direct_value().expect(
             "live file parser's top-level bare-reference recovery always returns a direct value",
         );
         debug_assert_eq!(parsed_offset, parsed.parsed_offset);
         let trailing = trailing.expect("non-empty parse must have a framing token");
         if trailing.is_word_value(b"stream") {
-            self.read_stream(value, parsed_offset)
+            let (value, parsed_offset) = self.read_stream(value, parsed_offset)?;
+            Ok((value, parsed_offset, String::new()))
         } else {
             if !trailing.is_word_value(b"endobj") {
                 self.push_warning("expected endobj")?;
             }
-            Ok((value, parsed_offset))
+            Ok((value, parsed_offset, description))
         }
     }
 
@@ -2102,6 +2128,7 @@ fn read_live_header_integer(token: Token) -> Result<i64> {
 /// this hands back is unresolved.
 struct ChildHandles<'a, R: Read + Seek + 'static> {
     resolver: &'a ResolverHandle<R>,
+    description_template: String,
 }
 
 impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
@@ -2111,6 +2138,10 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
         self.resolver.direct_object_handle(value)
+    }
+
+    fn description_template(&self) -> Option<String> {
+        Some(self.description_template.clone())
     }
 }
 
@@ -2337,19 +2368,25 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                             handle.set_missing();
                             return Ok(());
                         }
-                        match self.read_object_at_offset(offset, object_ref) {
-                            Ok((value, parsed_offset)) => {
+                        match self.read_object_at_offset_with_description(offset, object_ref) {
+                            Ok((value, parsed_offset, description)) => {
                                 handle.set_resolved(value);
                                 handle.set_parsed_offset_if_unset(parsed_offset);
+                                if !description.is_empty() {
+                                    handle.set_description(description, parsed_offset);
+                                }
                                 Ok(())
                             }
                             Err(err) => {
                                 let attempt_recovery = self.core.borrow().attempt_recovery;
                                 if attempt_recovery {
                                     match self.reconstruct_xref_and_retry(err, object_ref) {
-                                        Ok(Some((value, parsed_offset))) => {
+                                        Ok(Some((value, parsed_offset, description))) => {
                                             handle.set_resolved(value);
                                             handle.set_parsed_offset_if_unset(parsed_offset);
+                                            if !description.is_empty() {
+                                                handle.set_description(description, parsed_offset);
+                                            }
                                             Ok(())
                                         }
                                         Ok(None) => {
@@ -2661,28 +2698,31 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            ["deep container warning", "deep scalar warning"]
+            [
+                ", object 1 0 at offset 24: deep container warning",
+                ", object 1 0 at offset 32: deep scalar warning",
+            ]
         );
     }
 
     #[test]
     fn canonical_live_parser_stamps_root_and_nested_descriptions() {
         let resolver = resolver_over_named_object(
-            b"1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> >>\nendobj\n".to_vec(),
+            b"\n1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> /Items [8 null] >>\nendobj\n".to_vec(),
             ObjectRef::new(1, 0),
             "input.pdf",
         );
         let root = resolver.get_object_handle(ObjectRef::new(1, 0));
         root.try_dereference().expect("live object should resolve");
 
-        assert_eq!(root.description(), "input.pdf, object 1 0 at offset 10");
+        assert_eq!(root.description(), "input.pdf, object 1 0 at offset 11");
         let level_one = root
             .as_dictionary()
             .and_then(|values| values.get(b"L1".as_slice()).cloned())
             .expect("level one dictionary");
         assert_eq!(
             level_one.description(),
-            "input.pdf, object 1 0 at offset 17"
+            "input.pdf, object 1 0 at offset 18"
         );
 
         let level_two = level_one
@@ -2691,14 +2731,33 @@ mod tests {
             .expect("level two dictionary");
         assert_eq!(
             level_two.description(),
-            "input.pdf, object 1 0 at offset 24"
+            "input.pdf, object 1 0 at offset 25"
         );
 
         let value = level_two
             .as_dictionary()
             .and_then(|values| values.get(b"Value".as_slice()).cloned())
             .expect("deep scalar");
-        assert_eq!(value.description(), "input.pdf, object 1 0 at offset 32");
+        assert_eq!(value.description(), "input.pdf, object 1 0 at offset 33");
+
+        let items = root
+            .as_dictionary()
+            .and_then(|values| values.get(b"Items".as_slice()).cloned())
+            .expect("array value");
+        assert_eq!(items.description(), "input.pdf, object 1 0 at offset 49");
+        let array_scalar = items
+            .as_array()
+            .and_then(|values| values.first().cloned())
+            .expect("array scalar");
+        assert_eq!(
+            array_scalar.description(),
+            "input.pdf, object 1 0 at offset 49"
+        );
+        let array_null = items
+            .as_array()
+            .and_then(|values| values.get(1).cloned())
+            .expect("array null");
+        assert!(array_null.description().is_empty());
 
         level_two
             .object_warning("deep container description")
@@ -2706,6 +2765,18 @@ mod tests {
         value
             .object_warning("deep scalar description")
             .expect("nested scalar keeps the document context");
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "input.pdf, object 1 0 at offset 25: deep container description",
+                "input.pdf, object 1 0 at offset 33: deep scalar description",
+            ]
+        );
     }
 
     #[test]
@@ -2727,7 +2798,10 @@ mod tests {
         let error = value
             .object_warning("dropped document")
             .expect_err("a weak context must be gone with its resolver");
-        assert!(matches!(error, Error::System(message) if message == "dropped document"));
+        assert!(matches!(
+            error,
+            Error::System(message) if message == ", object 1 0 at offset 18: dropped document"
+        ));
     }
 
     #[test]
@@ -2838,7 +2912,7 @@ mod tests {
         ResolverHandle::new_shared(
             Cursor::new(bytes),
             0,
-            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset: 0 })]),
+            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset: 1 })]),
             false,
             false, // already_reconstructed
             Diagnostics::default(),

@@ -78,9 +78,11 @@ pub(crate) trait DocumentResolver {
     /// caller that holds the document.
     ///
     /// The message arrives fully formed, as qpdf's `QPDFExc` is by the time
-    /// it reaches `QPDF::warn`. It carries no location: the emitters fill the
-    /// exception's filename with `""` and its object slot with an object
-    /// description, which is not yet propagated.
+    /// it reaches `QPDF::warn`. The exception filename is `""`; its object
+    /// slot is filled from the handle description before the message reaches
+    /// this sink. Live parser values now carry that description, while
+    /// programmatic handles retain their existing empty/object-reference
+    /// fallback.
     ///
     /// The default reports rather than swallows, matching
     /// [`Self::pipe_stream_data`]'s. Every document-backed resolver overrides
@@ -156,9 +158,11 @@ mod parse_tests {
             .object_warning("contextless explicit parse")
             .expect_err("an explicit parse must not acquire a document context");
 
-        assert!(
-            matches!(error, crate::Error::System(message) if message == "contextless explicit parse")
-        );
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "parsed object,  at offset 14: contextless explicit parse"
+        ));
     }
 
     #[test]
@@ -178,7 +182,8 @@ mod parse_tests {
             .expect_err("an explicit parse must remain contextless");
         assert!(matches!(
             error,
-            crate::Error::System(message) if message == "contextless explicit parse"
+            crate::Error::System(message)
+                if message == "parsed object,  at offset 10: contextless explicit parse"
         ));
     }
 
@@ -1121,9 +1126,11 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFObjectHandle.cc:2385-2396`), whose contextless arm is
     /// `throw e`. `QPDFExc` derives from `std::runtime_error`
     /// (`include/qpdf/QPDFExc.hh:29`), which this crate classifies as
-    /// [`crate::Error::System`]; with an empty filename, object description,
-    /// and offset, `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`) renders
-    /// `what()` as the bare message, which is what that variant displays.
+    /// [`crate::Error::System`]. With an empty filename,
+    /// `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`) prefixes a non-empty
+    /// object description and renders a bare message only when that
+    /// description is empty; this port forms the same prefix before the
+    /// contextless error is returned.
     #[allow(dead_code)] // same deferred consumers as `context`
     fn warn_through_context(&self, message: String) -> Result<()> {
         match self.context() {

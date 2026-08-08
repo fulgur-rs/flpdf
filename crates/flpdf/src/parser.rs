@@ -26,6 +26,13 @@ pub(crate) trait HandleResolver {
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
         ObjectHandle::from_value(value)
     }
+
+    /// Return the one qpdf-style description template shared by this parse
+    /// call, if the caller has an observable object-description context.
+    /// Detached legacy materialization keeps the default `None`.
+    fn description_template(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Decrypts one literal PDF string while the file-object parser still owns
@@ -113,11 +120,18 @@ impl LiveInput for SliceLiveInput<'_> {
 /// to `Object::Reference`. This resolver is deliberately local: object
 /// streams do not mint document-cache entries until their owning compressed-
 /// object resolver consumes the result.
-struct DetachedHandles;
+#[derive(Default)]
+struct DetachedHandles {
+    description_template: Option<String>,
+}
 
 impl HandleResolver for DetachedHandles {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
         ObjectHandle::from_value(ObjectValue::Reference(object_ref))
+    }
+
+    fn description_template(&self) -> Option<String> {
+        self.description_template.clone()
     }
 }
 
@@ -279,7 +293,9 @@ pub(crate) fn parse_live_file_object_with_decrypter<I: LiveInput>(
 /// (`libqpdf/QPDFParser.cc:135-176`).
 pub(crate) fn parse_explicit_object_handle(input: &[u8]) -> Result<ObjectHandle> {
     let mut input_source = SliceLiveInput::new(input);
-    let mut detached_handles = DetachedHandles;
+    let mut detached_handles = DetachedHandles {
+        description_template: Some("parsed object,  at offset $PO".to_owned()),
+    };
     let parsed =
         parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false, None)?;
 
@@ -308,6 +324,7 @@ fn parse_live_file_object_with_context<I: LiveInput>(
     decrypter: Option<&mut dyn StringDecrypter>,
 ) -> Result<LiveParsedObject> {
     let mut tokens = LiveTokenSource::new(input);
+    let description_template = resolver.description_template();
     let mut parser = LiveFileParser {
         tokens: &mut tokens,
         resolver,
@@ -318,6 +335,7 @@ fn parse_live_file_object_with_context<I: LiveInput>(
         give_up: false,
         has_context,
         decrypter,
+        description_template,
     };
     parser.parse()
 }
@@ -334,6 +352,7 @@ struct LiveFileParser<'tokens, 'input, 'decrypter, I: LiveInput> {
     give_up: bool,
     has_context: bool,
     decrypter: Option<&'decrypter mut dyn StringDecrypter>,
+    description_template: Option<String>,
 }
 
 /// qpdf's `QPDFParser::StackFrame` keeps incomplete containers on the heap,
@@ -743,7 +762,11 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 
     fn direct_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
         let handle = self.resolver.direct_handle(value);
-        handle.set_parsed_offset_if_unset(offset);
+        if let Some(description) = &self.description_template {
+            handle.set_description(description.clone(), offset);
+        } else {
+            handle.set_parsed_offset_if_unset(offset);
+        }
         handle
     }
 
@@ -1518,7 +1541,7 @@ pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)>
 /// ObjStm body contains only adjacent direct-object representations.
 pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
     let mut input = SliceLiveInput::new(input);
-    let mut handles = DetachedHandles;
+    let mut handles = DetachedHandles::default();
     let parsed = parse_live_file_object(&mut input, &mut handles)?;
     let object = materialize_live_handle(&parsed.value)?;
     let mut diagnostics = parsed.diagnostics;
