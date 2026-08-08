@@ -1332,12 +1332,15 @@ fn best_effort_line_scan_honours_qpdf_reconstruct_guards() {
     assert_eq!(loaded.entries.len(), 1);
 }
 
-/// When recovery finds objects but no `trailer` keyword exists, `recover_trailer`
-/// must fail with "trailer dictionary not found".
+/// When recovery finds objects but no `trailer` keyword exists and none of the
+/// reconstructed objects is a `/Type /XRef` stream, `reconstruct_xref` must
+/// fail with "unable to find trailer dictionary while recovering damaged
+/// file" (qpdf 11.9.0 `QPDF.cc:615`).
 #[test]
 fn best_effort_errors_when_trailer_missing() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
-    // A recoverable indirect object so `recover_xref_entries` succeeds.
+    // A recoverable indirect object so `recover_xref_entries` succeeds, but not
+    // a stream, so it is not a `/Type /XRef` candidate either.
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     let start_xref = bytes.len();
     // Corrupt xref keyword and rename the `trailer` keyword to `traile_` so the
@@ -1351,7 +1354,7 @@ fn best_effort_errors_when_trailer_missing() {
         .expect_err("missing trailer keyword should fail");
     let message = format!("{err}");
     assert!(
-        message.contains("trailer dictionary not found"),
+        message.contains("unable to find trailer dictionary while recovering damaged file"),
         "got {message}"
     );
     let (source, diagnostics) = err
@@ -1361,12 +1364,17 @@ fn best_effort_errors_when_trailer_missing() {
     assert_eq!(diagnostics.entries().len(), 3);
 }
 
-/// When the `trailer` keyword is present but followed by a non-dictionary token,
-/// `recover_trailer` must fail with "trailer dictionary is not a dictionary".
+/// When the `trailer` keyword is present but followed by a non-dictionary
+/// token, qpdf's own `reconstruct_xref` (`QPDF.cc:564-570`) does not stop the
+/// scan or throw there ("Oh well. It was worth a try.") -- it just leaves the
+/// trailer unset and keeps scanning. With no `/Type /XRef` candidate either,
+/// the terminal error is the same "unable to find trailer dictionary while
+/// recovering damaged file" as a file with no `trailer` keyword at all.
 #[test]
 fn best_effort_errors_when_trailer_not_dictionary() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
-    // A recoverable indirect object so `recover_xref_entries` succeeds.
+    // A recoverable indirect object so `recover_xref_entries` succeeds, but not
+    // a stream, so it is not a `/Type /XRef` candidate either.
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     let start_xref = bytes.len();
     bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
@@ -1377,7 +1385,7 @@ fn best_effort_errors_when_trailer_not_dictionary() {
         .expect_err("non-dictionary trailer should fail");
     let message = format!("{err}");
     assert!(
-        message.contains("trailer dictionary is not a dictionary"),
+        message.contains("unable to find trailer dictionary while recovering damaged file"),
         "got {message}"
     );
     let (source, diagnostics) = err
@@ -2934,7 +2942,7 @@ fn ignore_xref_streams_falls_back_to_reconstruction() {
 }
 
 #[test]
-fn ignore_xref_streams_cannot_reconstruct_a_document_without_a_trailer_keyword() {
+fn ignore_xref_streams_finds_a_candidate_but_cannot_decode_it() {
     let (bytes, xref_stream_offset) = xref_stream_document(false);
 
     let err = open_error(
@@ -2959,16 +2967,50 @@ fn ignore_xref_streams_cannot_reconstruct_a_document_without_a_trailer_keyword()
         ]
     );
 
-    // Known divergence, message only: both implementations fail here, but qpdf
-    // reports "error decoding candidate xref stream while recovering damaged
-    // file". Its reconstruct_xref takes the last candidate /XRef stream's
-    // dictionary as the trailer and re-enters read_xref, which hits the same
-    // gate; flpdf's recover_trailer searches only for the `trailer` keyword.
-    // This assertion changes when that fallback is ported.
+    // qpdf 11.9.0's `reconstruct_xref` (`QPDF.cc:577-608`) finds the
+    // reconstructed `/Type /XRef` stream candidate (the line scan does not
+    // consult `ignore_xref_streams`) and re-enters `read_xref` at its offset;
+    // `read_xrefStream` then honors the option and refuses to read it, so the
+    // terminal error is the candidate-decode failure rather than "no trailer".
     assert_eq!(
         source.to_string(),
-        "parse error at byte 0: trailer dictionary not found"
+        "parse error at byte 0: error decoding candidate xref stream while recovering damaged file"
     );
+}
+
+#[test]
+fn incremental_write_after_candidate_recovery_uses_the_recovered_offset() {
+    // flpdf-specific correctness gate: qpdf's own `QPDFWriter` has no
+    // incremental-update mode at all, so there is no oracle behavior to
+    // match here -- this instead protects flpdf's own incremental writer's
+    // structural contract. After a corrupt-`startxref` document recovers via
+    // the xref-stream-candidate fallback, a subsequent incremental write's
+    // `/Prev` must point at the recovered, verified offset, not the original
+    // corrupt `startxref` value that a strict reopen of the written output
+    // could never follow.
+    let (mut bytes, xref_stream_offset) = xref_stream_document(false);
+    let original_suffix = format!("startxref\n{xref_stream_offset}\n%%EOF\n");
+    assert!(bytes.ends_with(original_suffix.as_bytes()));
+    bytes.truncate(bytes.len() - original_suffix.len());
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    let mut pdf =
+        Pdf::open_with_repair(Cursor::new(bytes)).expect("candidate recovery recovers the trailer");
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).expect("incremental write succeeds");
+    let out_str = String::from_utf8_lossy(&out);
+
+    assert!(
+        out_str.contains(&format!("/Prev {xref_stream_offset}")),
+        "incremental /Prev must point at the recovered offset, got:\n{out_str}"
+    );
+    assert!(
+        !out_str.contains("/Prev 999999"),
+        "incremental /Prev must not carry over the original corrupt startxref, got:\n{out_str}"
+    );
+
+    Pdf::open_mem_owned(out).expect("the incrementally-written output must be strictly reopenable");
 }
 
 #[test]

@@ -45,7 +45,7 @@ fn check_preserves_repair_warnings_before_terminal_open_error() {
     assert_eq!(diagnostics[3].severity, Severity::Error);
     assert_eq!(
         diagnostics[3].message,
-        "parse error at byte 0: trailer dictionary not found"
+        "parse error at byte 0: unable to find trailer dictionary while recovering damaged file"
     );
 }
 

@@ -92,18 +92,29 @@ pub fn run(args: &[OsString], stdout: &mut dyn Write, stderr: &mut dyn Write) ->
 }
 
 fn open_pdf_error_bytes(n: i32, filename: &[u8], error: &Error) -> Vec<u8> {
-    let suffix = match error {
+    let suffix: Option<Cow<str>> = match error {
         Error::Parse { message, .. } if n == 0 && message == "xref not found" => {
-            Some(b": can't find startxref".as_slice())
+            Some(Cow::Borrowed(": can't find startxref"))
         }
-        Error::Parse { message, .. } if n != 0 && message == "trailer dictionary not found" => {
-            Some(b": unable to find trailer dictionary while recovering damaged file".as_slice())
+        // Both of `reconstruct_xref`'s terminal errors throw via the same
+        // `damagedPDF("", 0, message)` (`QPDF.cc:601-604,614`), which
+        // `QPDFExc::createWhat` (`QPDFExc.cc:18-51`) formats identically as
+        // `"<filename>: <message>"`; only flpdf's own "parse error at byte
+        // N: " `Display` prefix -- which qpdf's real test-driver never
+        // prints for either -- needs stripping here.
+        Error::Parse { message, .. }
+            if n != 0
+                && (message == "unable to find trailer dictionary while recovering damaged file"
+                    || message
+                        == "error decoding candidate xref stream while recovering damaged file") =>
+        {
+            Some(Cow::Owned(format!(": {message}")))
         }
         _ => None,
     };
     if let Some(suffix) = suffix {
         let mut output = filename.to_vec();
-        output.extend_from_slice(suffix);
+        output.extend_from_slice(suffix.as_bytes());
         output
     } else {
         error.to_string().into_bytes()
@@ -453,6 +464,39 @@ mod tests {
         assert_eq!(
             open_pdf_error_bytes(1, b"input.pdf", &error),
             b"ordinary open failure"
+        );
+    }
+
+    #[test]
+    fn no_trailer_candidate_error_gets_the_qpdf_filename_prefix() {
+        let error = flpdf::Error::parse(
+            0,
+            "unable to find trailer dictionary while recovering damaged file",
+        );
+
+        assert_eq!(
+            open_pdf_error_bytes(1, b"input.pdf", &error),
+            b"input.pdf: unable to find trailer dictionary while recovering damaged file"
+        );
+    }
+
+    #[test]
+    fn candidate_decode_failure_error_gets_the_qpdf_filename_prefix() {
+        // `QPDFExc::createWhat` (`QPDFExc.cc:18-51`) wraps every
+        // `damagedPDF("", 0, message)` throw -- both `reconstruct_xref`
+        // terminal errors use it (`QPDF.cc:601-604,614`) -- as
+        // `"<filename>: <message>"`. Only the "no candidate at all" branch
+        // had this treatment; the newer "candidate found but undecodable"
+        // message must get the identical prefix, not flpdf's own
+        // "parse error at byte N: " `Display` wording.
+        let error = flpdf::Error::parse(
+            0,
+            "error decoding candidate xref stream while recovering damaged file",
+        );
+
+        assert_eq!(
+            open_pdf_error_bytes(1, b"input.pdf", &error),
+            b"input.pdf: error decoding candidate xref stream while recovering damaged file"
         );
     }
 
