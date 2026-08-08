@@ -569,11 +569,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `Rc::new_cyclic` rather than `Rc::new` because [`Self::self_weak`]
     /// has to point at this very allocation; there is no way to add it
     /// afterwards without making the field mutable.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_shared(
         reader: R,
         header_offset: usize,
         source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
         attempt_recovery: bool,
+        already_reconstructed: bool,
         repair_diagnostics: Diagnostics,
         warning_options: ResolverWarningOptions,
         pdf_unique_id: u64,
@@ -592,7 +594,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
                 attempt_recovery,
-                reconstructed_xref: false,
+                // qpdf `m->reconstructed_xref` (`QPDF.cc:524`): set by
+                // `reconstruct_xref` which runs both at open time (`:464`) and
+                // during resolution (`:1617`). Carry open-time recovery state
+                // so a second full scan is not performed for an object from an
+                // already-recovered table.
+                reconstructed_xref: already_reconstructed,
                 repair_diagnostics,
                 logger,
                 suppress_warnings,
@@ -695,11 +702,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`
     /// recovery retry (`:1614-1637`).
     ///
-    /// Reconstructs the cross-reference table via line-scan, flips `m->reconstructed_xref` to
-    /// `true`, emits repair warnings, and retries reading `object_ref` at the rebuilt offset.
-    /// Returns `Ok(Some((value, parsed_offset)))` on successful retry, `Ok(None)` if the object
-    /// is absent post-rebuild (to be warned and resolved to null), or `Err(err)` if recovery fails
-    /// or if a second reconstruction attempt is made (infinite-loop guard).
+    /// Only `Error::Parse` triggers reconstruction, matching qpdf's
+    /// `catch (QPDFExc&)` guard at `QPDF.cc:1614` (qpdf's `QPDFExc` covers only
+    /// parse-level damage, not I/O or system errors).
+    ///
+    /// Reconstructs the cross-reference table via line-scan of the logical byte
+    /// slice (`bytes[header_offset..]`), matching qpdf's use of
+    /// `OffsetInputSource` which presents logical offset 0 to `reconstruct_xref`
+    /// (`libqpdf/OffsetInputSource.cc:seek`).  Flips `m->reconstructed_xref` to
+    /// `true`, emits repair warnings, and retries reading `object_ref` at the
+    /// rebuilt offset.  Returns `Ok(Some((value, parsed_offset)))` on successful
+    /// retry, `Ok(None)` if the object is absent post-rebuild (to be warned and
+    /// resolved to null), or `Err(err)` if recovery fails, if the trigger is not
+    /// a parse error, or if a second reconstruction attempt is made
+    /// (infinite-loop guard).
     fn reconstruct_xref_and_retry(
         &self,
         trigger_error: Error,
@@ -710,25 +726,32 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Err(trigger_error);
         }
 
+        // qpdf `catch (QPDFExc&)` at QPDF.cc:1614 — only parse damage triggers
+        // reconstruction.  I/O, system, and other errors are propagated
+        // unchanged so that the reconstructed_xref guard is not tripped by an
+        // unrelated failure, and the guard state is not poisoned for a later
+        // genuine xref mismatch.
+        if !matches!(trigger_error, Error::Parse { .. }) {
+            return Err(trigger_error);
+        }
+
         self.core.borrow_mut().reconstructed_xref = true;
 
         // Push repair warnings (QPDF.cc:528-530)
         self.push_warning("file is damaged")?;
 
-        let (err_msg, err_offset) = match &trigger_error {
-            Error::Parse { offset, message } => (message.clone(), Some(*offset as u64)),
-            _ => (trigger_error.to_string(), None),
+        let Error::Parse { offset, message } = &trigger_error else {
+            unreachable!("guard above ensures Parse variant"); // cov:ignore: unreachable after guard
         };
-        if let Some(off) = err_offset {
-            self.push_warning_at(off, err_msg)?;
-        } else {
-            self.push_warning(err_msg)?;
-        }
+        self.push_warning_at(*offset as u64, message.clone())?;
         self.push_warning("Attempting to reconstruct cross-reference table")?;
 
-        // Read physical bytes and reconstruct xref entries
-        let bytes = self.core.borrow_mut().read_underlying_bytes()?;
-        let new_entries = crate::xref::recover_xref_entries(&bytes)?;
+        // Read logical bytes (header_offset already consumed), matching qpdf's
+        // OffsetInputSource which seeks to logical-0 at QPDF.cc:543.
+        let header_offset = self.core.borrow().header_offset;
+        let raw_bytes = self.core.borrow_mut().read_underlying_bytes()?;
+        let logical_bytes = &raw_bytes[header_offset..];
+        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
 
         {
             let mut core = self.core.borrow_mut();
@@ -740,9 +763,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // Lookup object_ref in reconstructed xref table
         let retry_entry = self.xref_entry(object_ref);
         if let Some(XrefEntry::Uncompressed { offset: new_offset }) = retry_entry {
+            // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
+            // any parse failure propagates as an exception (Err here).
             match self.read_object_at_offset(new_offset, object_ref) {
                 Ok(res) => Ok(Some(res)),
-                Err(_) => Ok(None), // cov:ignore: read object fallback
+                Err(err) => Err(err),
             }
         } else {
             Ok(None)
@@ -2305,11 +2330,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                                             self.push_warning(format!(
                                                 "object {} {} not found in file after regenerating cross reference table",
                                                 object_ref.number, object_ref.generation
-                                            ))?; // cov:ignore: defensive error propagation
+                                            ))?;
                                             handle.set_missing();
                                             Ok(())
                                         }
-                                        Err(err) => Err(err), // cov:ignore: defensive error propagation
+                                        Err(err) => Err(err),
                                     }
                                 } else {
                                     Err(err)
@@ -2386,6 +2411,7 @@ mod tests {
             0,
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
+            false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -2530,6 +2556,7 @@ mod tests {
             0,
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
+            false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, "input.pdf".to_owned()),
             0,
@@ -2639,6 +2666,7 @@ mod tests {
             0,
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
+            false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -2658,6 +2686,7 @@ mod tests {
             0,
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
+            false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, "stream.pdf".to_owned()),
             0,
@@ -3924,6 +3953,7 @@ mod tests {
                 0,
                 BTreeMap::<ObjectRef, XrefEntry>::new(),
                 false,
+                false, // already_reconstructed
                 Diagnostics::default(),
                 ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
                 0,
@@ -4017,6 +4047,7 @@ mod tests {
             0,
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
+            false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -4540,6 +4571,7 @@ mod tests {
             0,
             BTreeMap::from([(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 })]),
             false,
+            false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7095,14 +7127,24 @@ mod tests {
             "dummy.pdf",
             std::io::Error::other("custom io error"),
         );
+        // qpdf only triggers reconstruction on QPDFExc (parse errors).
+        // A non-parse trigger propagates unchanged without touching the guard.
         let res = pdf
             .resolver
             .reconstruct_xref_and_retry(err, ObjectRef::new(1, 0));
-        assert!(res.is_ok());
+        assert!(
+            matches!(res, Err(Error::FileIo { .. })),
+            "non-parse error must propagate unchanged: {res:?}"
+        );
     }
 
     #[test]
     fn reconstruct_xref_and_retry_when_read_object_at_offset_fails() {
+        // A PDF where reconstruction finds the object in the xref scan but
+        // the bytes at that offset produce an empty (null) object.
+        // flpdf treats `1 0 obj\nendobj` as null ("empty object treated as null"),
+        // so read_object_at_offset succeeds with Ok((Null, _)).
+        // The retry therefore returns Ok(Some((Null, _))).
         let mut pdf_bytes = Vec::new();
         pdf_bytes.extend_from_slice(b"%PDF-1.7\n");
         let obj1_offset = pdf_bytes.len();
@@ -7124,6 +7166,13 @@ mod tests {
         let res = pdf
             .resolver
             .reconstruct_xref_and_retry(err, ObjectRef::new(1, 0));
-        assert!(res.unwrap().is_none());
+        // Empty object is treated as null by the recovery path; retry succeeds.
+        assert!(
+            matches!(
+                res,
+                Ok(Some((crate::reader::resolver::ObjectValue::Null, _)))
+            ),
+            "empty-object retry must succeed as Ok(Some(Null)): {res:?}"
+        );
     }
 }

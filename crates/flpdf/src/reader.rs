@@ -964,7 +964,18 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
-        self.source_xref_offsets.clone()
+        // qpdf's QPDFWriter derives unchanged-object offsets from `m->xref_table`
+        // which is always the live (post-reconstruction) table.  Return offsets
+        // from the resolver's live entries so that incremental-write output
+        // reflects the reconstructed state rather than the original damaged table.
+        self.resolver
+            .xref_entries()
+            .into_iter()
+            .filter_map(|(object_ref, entry)| match entry {
+                crate::XrefEntry::Uncompressed { offset } => Some((object_ref, offset)),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {

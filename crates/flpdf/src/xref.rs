@@ -27,6 +27,15 @@ pub(crate) struct LoadedXrefState {
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
     pub(crate) header_offset: usize,
+    /// True when open-time xref recovery via linear scan already ran.
+    ///
+    /// qpdf `m->reconstructed_xref` (`QPDF.cc:524`) is set inside
+    /// `reconstruct_xref` which runs both at open time (`:464`) and during
+    /// object resolution (`:1617`). Carrying this into the resolver lets it
+    /// initialize `ResolverCore::reconstructed_xref` correctly so that a second
+    /// full reconstruction scan is not performed when an object from an
+    /// already-recovered table later fails to parse.
+    pub(crate) already_reconstructed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +228,7 @@ fn parse_xref_from_start(
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
+            already_reconstructed: false,
         };
         merge_xref_stream_from_classic_trailer(bytes, xref_pos, &mut loaded, options)?;
         return Ok(loaded);
@@ -398,6 +408,7 @@ fn recover_xref_from_linear_scan(
         trailer_references,
         parsed_xref_streams: BTreeMap::new(),
         header_offset: 0,
+        already_reconstructed: true,
     })
 }
 
@@ -894,6 +905,7 @@ fn parse_xref_stream(
         trailer_references,
         parsed_xref_streams,
         header_offset: 0,
+        already_reconstructed: false,
     })
 }
 

@@ -115,7 +115,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// boundaries in an otherwise valid file still resolve, but a document full
     /// of objects whose bodies run to EOF cannot revive the quadratic cost.
     pub(crate) resolution_fallbacks_remaining: u32,
-    pub(crate) source_xref_offsets: Vec<(ObjectRef, u64)>,
     pub(crate) dirty_object_refs: BTreeSet<ObjectRef>,
     /// Dirty objects whose live ObjectHandle graph was changed directly, so
     /// the legacy object cache may no longer agree with it. `set_object`

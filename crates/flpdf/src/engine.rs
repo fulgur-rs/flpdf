@@ -115,15 +115,6 @@ impl<R: Read + Seek> Pdf<R> {
         };
         let loaded = loaded_state.loaded;
         let source_xref_entries = loaded.entries.clone();
-        let source_xref_offsets = loaded
-            .entries
-            .iter()
-            .filter_map(|(object_ref, offset)| match offset {
-                crate::XrefEntry::Free { .. } => None,
-                crate::XrefEntry::Uncompressed { offset } => Some((*object_ref, *offset)),
-                crate::XrefEntry::Compressed { .. } => None,
-            })
-            .collect();
         let mut sorted_object_offsets: Vec<u64> = loaded
             .entries
             .values()
@@ -145,6 +136,7 @@ impl<R: Read + Seek> Pdf<R> {
             loaded_state.header_offset,
             source_xref_entries,
             options.repair,
+            loaded_state.already_reconstructed,
             loaded.repair_diagnostics,
             warning_options,
             unique_id,
@@ -168,7 +160,6 @@ impl<R: Read + Seek> Pdf<R> {
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
-            source_xref_offsets,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),
             recovered_stream_eols: BTreeMap::new(),
