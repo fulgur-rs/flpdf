@@ -140,6 +140,28 @@ mod parse_tests {
     }
 
     #[test]
+    fn parse_without_context_keeps_nested_direct_values_contextless() {
+        let parsed = ObjectHandle::parse(b"<< /L1 << /L2 7 >> >>")
+            .expect("direct values do not need a parse context");
+        let level_one = parsed
+            .as_dictionary()
+            .and_then(|values| values.get(b"L1".as_slice()).cloned())
+            .expect("level one dictionary");
+        let level_two = level_one
+            .as_dictionary()
+            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .expect("level two scalar");
+
+        let error = level_two
+            .object_warning("contextless explicit parse")
+            .expect_err("an explicit parse must not acquire a document context");
+
+        assert!(
+            matches!(error, crate::Error::System(message) if message == "contextless explicit parse")
+        );
+    }
+
+    #[test]
     fn parse_without_context_turns_recovery_warnings_into_errors() {
         let error = ObjectHandle::parse(b"{").expect_err("qpdf warning must fail explicit parse");
 
@@ -658,11 +680,19 @@ impl ObjectHandle {
     }
 
     fn new_direct(value: ObjectValue, parsed_offset: i64) -> Self {
+        Self::new_direct_with_resolver(value, parsed_offset, None)
+    }
+
+    fn new_direct_with_resolver(
+        value: ObjectValue,
+        parsed_offset: i64,
+        resolver: Option<Weak<dyn DocumentResolver>>,
+    ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
             state: ObjectState::Resolved(value),
             object_ref: None,
             active_pdf_unique_id: None,
-            resolver: None,
+            resolver,
             parsed_offset,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
@@ -719,6 +749,17 @@ impl ObjectHandle {
     /// factories above.
     pub(crate) fn from_value(value: ObjectValue) -> Self {
         Self::new_direct(value, NO_PARSED_OFFSET)
+    }
+
+    /// Construct a parser-created direct value with the owning document's
+    /// weak resolver, matching qpdf's per-value `QPDF*` association. The
+    /// resolver is intentionally weak so direct values do not keep the
+    /// document alive after parsing (`QPDFValue.hh:60-66,149-152`).
+    pub(crate) fn from_value_with_resolver(
+        value: ObjectValue,
+        resolver: Weak<dyn DocumentResolver>,
+    ) -> Self {
+        Self::new_direct_with_resolver(value, NO_PARSED_OFFSET, Some(resolver))
     }
 
     /// Consume a directly-constructed, exclusively-owned handle and return
@@ -1008,10 +1049,10 @@ impl ObjectHandle {
     /// `QPDFValue::qpdf` is set by the description machinery
     /// (`libqpdf/qpdf/QPDFValue.hh:60-83`), so upstream a direct object
     /// parsed out of a file carries a context as well as an indirect one.
-    /// Here only a canonical indirect slot does, and a direct handle takes
-    /// the no-context branch — which is qpdf's own behavior for an object
-    /// built without a document, as `QPDFObjectHandle::parse` from a string
-    /// produces.
+    /// Live parser direct values and canonical indirect slots carry that
+    /// weak resolver here; programmatic direct handles and
+    /// `QPDFObjectHandle::parse`-equivalent explicit parses remain
+    /// contextless.
     #[allow(dead_code)] // reached through the try_* accessors, whose own
                         // production consumers land with flpdf-25kg.3.6
     fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
@@ -1222,8 +1263,9 @@ impl ObjectHandle {
     ///
     /// A non-dictionary receiver yields an empty set. qpdf additionally
     /// raises `typeWarning("dictionary", "treating as empty")` at `:1000`;
-    /// reproducing that here needs the receiver to reach its owning document,
-    /// which a direct child cannot yet do — see [`Self::type_warning`].
+    /// this accessor remains silent until its consumer migration calls
+    /// [`Self::type_warning`]. Live parser direct values now reach their
+    /// owning document; explicit and programmatic direct values do not.
     ///
     /// # Errors
     ///
@@ -1459,9 +1501,9 @@ impl ObjectHandle {
     /// yields null. qpdf additionally raises
     /// `typeWarning("dictionary", "returning null for attempted key
     /// retrieval")` at `:984`, and gives its null a child description naming
-    /// the key; reproducing either needs the receiver to reach its owning
-    /// document, which a direct child cannot yet do — see
-    /// [`Self::type_warning`].
+    /// the key; this accessor remains silent until its consumer migration
+    /// calls [`Self::type_warning`]. Live parser direct values now reach
+    /// their owning document; explicit and programmatic direct values do not.
     ///
     /// # Errors
     ///
@@ -1517,9 +1559,9 @@ impl ObjectHandle {
 
     // Record `offset` as the parsed offset, but only if none has been set
     // yet (matches qpdf: "set only while still negative",
-    // `libqpdf/qpdf/QPDFValue.hh:90-100`). The parser wires up real callers
-    // in a later task; exposed here so this module's own tests can exercise
-    // the set-once contract without a live parser.
+    // `libqpdf/qpdf/QPDFValue.hh:90-100`). The live parser wires up callers;
+    // this remains exposed so this module's own tests can exercise the
+    // set-once contract independently.
     #[allow(dead_code)]
     pub(crate) fn set_parsed_offset_if_unset(&self, offset: i64) {
         let mut slot = self.0.borrow_mut();
@@ -9741,11 +9783,11 @@ mod warning_emission_tests {
         // attempted key retrieval")` here (`libqpdf/QPDFObjectHandle.cc:984`)
         // and its receiver always has a context, because `QPDFParser` stamps
         // the owning document on every value it creates
-        // (`libqpdf/QPDFParser.cc:416-442`). A direct child here has none, so
-        // emitting would report an error on a path qpdf warns and continues
-        // on — the consuming `/DecodeParms` read reaches exactly that. The
-        // silent null is therefore the current behavior, pinned so the change
-        // is deliberate when contexts reach direct children.
+        // (`libqpdf/QPDFParser.cc:416-442`). This accessor does not yet call
+        // `type_warning`, so emitting is still deferred even though live
+        // parser direct children now carry the context qpdf supplies. The
+        // consuming `/DecodeParms` read reaches exactly that future consumer;
+        // keep the silent result pinned until its separate migration lands.
         let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
 
         assert!(handle.try_get_key(b"Type").unwrap().is_null());
