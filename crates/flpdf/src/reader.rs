@@ -1819,13 +1819,14 @@ impl<R: Read + Seek> Pdf<R> {
             match handle.try_dereference() {
                 Ok(()) => {
                     self.synchronize_legacy_resolution_state();
-                    if matches!(
-                        self.resolver.xref_entry(object_ref),
-                        Some(XrefEntry::Uncompressed { .. }) | Some(XrefEntry::Compressed { .. })
-                    ) {
-                        self.cache.set_resolved(object_ref, handle.materialize()?);
-                    } else {
-                        self.cache.set_missing(object_ref);
+                    match self.resolver.xref_entry(object_ref) {
+                        Some(XrefEntry::Uncompressed { .. })
+                        | Some(XrefEntry::Compressed { .. }) => {
+                            self.cache.set_resolved(object_ref, handle.materialize()?);
+                        }
+                        _ => {
+                            self.cache.set_missing(object_ref);
+                        }
                     }
                 }
                 Err(error) if matches!(&error, Error::Unsupported(_)) => {

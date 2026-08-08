@@ -6996,6 +6996,26 @@ mod tests {
         pdf
     }
 
+    fn synthetic_malformed_recovery_mismatch_pdf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let obj2_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\ntrue\nendobj\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Length /Broken >>\nstream\nabc\nendstream\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{obj2_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     /// A recovered stream whose original xref entries both point into the
     /// first object's dictionary.  The stale second offset is intentionally
     /// between the real object boundaries so it can truncate a legacy read
@@ -7149,6 +7169,69 @@ mod tests {
                 .resolve_borrowed(ObjectRef::new(1, 0))
                 .expect("public borrowed resolver must use the reconstructed xref"),
             &crate::Object::String(b"recovered".to_vec())
+        );
+    }
+
+    #[test]
+    fn public_resolve_preserves_absent_recovery_as_null() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_pdf(false),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open absent-recovery fixture");
+
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(1, 0))
+                .expect("absent recovered object must resolve to null"),
+            crate::Object::Null
+        );
+        assert!(pdf.reconstructed_xref());
+        assert!(matches!(
+            pdf.cache.entry(ObjectRef::new(1, 0)),
+            Some(crate::cache::CacheEntry::Missing)
+        ));
+    }
+
+    #[test]
+    fn public_resolve_falls_back_to_legacy_for_recovered_compressed_entries() {
+        let object_ref = ObjectRef::new(7, 0);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            recovered_objstm_member_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open");
+
+        assert!(matches!(
+            pdf.resolve(object_ref)
+                .expect("unsupported canonical class must fall back to legacy ObjStm resolution"),
+            crate::Object::Dictionary(_)
+        ));
+        assert!(pdf.reconstructed_xref());
+    }
+
+    #[test]
+    fn public_resolve_propagates_a_recovered_parse_error() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_malformed_recovery_mismatch_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open malformed-recovery fixture");
+
+        let error = pdf
+            .resolve(ObjectRef::new(1, 0))
+            .expect_err("the canonical recovery parse error must be propagated");
+        assert!(
+            matches!(error, Error::Parse { .. }),
+            "recovered parse errors must not be converted into null: {error:?}"
         );
     }
 
@@ -7469,10 +7552,12 @@ mod tests {
         let object_ref = ObjectRef::new(7, 0);
         let stream_ref = ObjectRef::new(5, 0);
         let mut pdf = Pdf::open_mem_owned(recovered_objstm_member_pdf()).expect("open fixture");
-        let stream_offset = match pdf.resolver.xref_entry(stream_ref) {
-            Some(XrefEntry::Uncompressed { offset }) => offset,
-            entry => panic!("object stream must have a type-1 xref entry, got {entry:?}"),
-        };
+        let stream_offset = pdf
+            .source_xref_offsets()
+            .into_iter()
+            .find(|(object_ref, _)| *object_ref == stream_ref)
+            .map(|(_, offset)| offset)
+            .expect("object stream must have a type-1 xref entry");
 
         // This is the state immediately after editing a member that was
         // originally in an object stream: `set_object` records the dirty
