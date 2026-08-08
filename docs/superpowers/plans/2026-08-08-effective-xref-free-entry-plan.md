@@ -289,4 +289,3 @@ Verify that only the design/plan records and implementation files are present, t
     bd dolt push
 
 Do not close the Bead until every acceptance criterion has evidence. At handoff, report the worktree path, branch, commits, test results, qpdf differential result, coverage result, and any remaining dependency boundary.
-
