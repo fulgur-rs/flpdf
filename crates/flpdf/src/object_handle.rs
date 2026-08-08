@@ -1259,8 +1259,12 @@ impl ObjectHandle {
     ///
     /// # Errors
     ///
-    /// As [`Self::try_get_int_value`]. The clamp warnings themselves go
-    /// through [`Self::warn_if_possible`], which reports no error of its own.
+    /// As [`Self::try_get_int_value`]. A clamp warning also goes through
+    /// [`Self::warn_if_possible`], which — unlike [`Self::type_warning`] —
+    /// usually reports no error of its own; but a *reachable* document whose
+    /// warning sink itself fails (no default logger sink, a resolver with no
+    /// warn receiver) still propagates that failure here, and the saturated
+    /// value is not returned in that case.
     #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn try_get_int_value_as_int(&self) -> Result<i32> {
         let value = self.try_get_int_value()?;
@@ -9640,6 +9644,29 @@ mod warning_emission_tests {
             assert_eq!(handle.try_get_int_value().unwrap(), i64::from(value));
             assert!(warnings(&recorder).is_empty(), "{value} warned");
         }
+    }
+
+    #[test]
+    fn a_clamp_warnings_sink_failure_propagates_instead_of_the_saturated_value() {
+        // warn_if_possible's context branch calls through to the resolver's
+        // own `warn`, which can fail — the trait default does, exactly the
+        // case `a_resolver_without_a_warning_sink_reports_rather_than_swallows`
+        // pins for type_warning. try_get_int_value_as_int must not swallow
+        // that failure and hand back a saturated value as if nothing warned.
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        let handle = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            Rc::downgrade(&resolver),
+        );
+        handle.set_resolved(ObjectValue::Integer(i64::from(i32::MAX) + 1));
+
+        let error = handle.try_get_int_value_as_int().unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::Error::Internal(ref message)
+                if message.contains("returning INT_MAX")
+        ));
     }
 
     #[test]

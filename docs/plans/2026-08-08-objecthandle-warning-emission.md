@@ -232,7 +232,29 @@ and implement it on `ResolverHandle<R>` (`crates/flpdf/src/reader/resolver.rs:18
     }
 ```
 
-Every other `impl DocumentResolver` in the tree is a test double (`object_handle.rs:3785,3802,3884,3897,3918,4750,4781`; `resolver.rs:2281`). Because `warn` has no sensible default, give each a body. For the doubles that do not assert on warnings, `Ok(())` is right; give `RecordingResolver` and `LoggedErrorResolver` a recording body if their existing shape makes that natural.
+Give the trait method a default rather than requiring every implementer to
+supply one:
+
+```rust
+    /// The default reports rather than swallows: qpdf has no resolver that
+    /// cannot warn, so reaching this default is the same condition as
+    /// qpdf's null context, which `QPDFObjectHandle::warn` also turns into a
+    /// thrown exception.
+    fn warn(&self, message: String) -> Result<()> {
+        Err(Error::Internal(format!(
+            "warning raised through a resolver with no document warning sink: {message}"
+        )))
+    }
+```
+
+**Do not give every test double an `Ok(())` override.** A resolver whose test is
+specifically about the missing-sink case — a `SinklessResolver` that implements only
+`resolve_indirect` — must inherit this default so the regression it pins
+(`a_resolver_without_a_warning_sink_reports_rather_than_swallows`) stays meaningful. Override `warn` only on the doubles that actually assert on
+captured warnings, such as `RecordingResolver` and `LoggedErrorResolver`; every other
+existing `impl DocumentResolver`
+(`object_handle.rs:3785,3802,3884,3897,3918,4750,4781`; `resolver.rs:2281`) can keep
+relying on the default too, since none of them asserts on warning content.
 
 **Step 4: Run test to verify it passes**
 
@@ -859,4 +881,4 @@ Declared non-goals, carried verbatim from flpdf-25kg.3.27:
 
 `flpdf-25kg.3.5` is in progress on `ResolverCore` / `ResolverHandle`. This plan adds one method to `resolver.rs` and one trait impl line; check for conflicts before pushing rather than assuming that file is quiescent.
 
-This branch sits on an unmerged three-PR stack (#669 → #672 → #677). It cannot merge until those do.
+This branch sat on an unmerged three-PR stack (#669 → #672 → #677) when this plan was written. All three have since merged to `main`, which is why Task 6's coverage step and the header above target `main` rather than the old feature-branch base.
