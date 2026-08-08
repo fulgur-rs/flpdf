@@ -80,7 +80,7 @@
 //! The warning sink stays the easiest way to get this wrong, because
 //! `push_warning` needs `borrow_mut` and the code that warns is the code that
 //! has just finished reading something. The live file-object parser returns
-//! diagnostics to [`ResolverHandle::read_object_at_offset`] after it has
+//! diagnostics to [`ResolverHandle::read_object_at_offset_with_description`] after it has
 //! released its input adapter, so each source token contributes at most one
 //! document warning.
 
@@ -202,7 +202,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// `borrow()`, so neither may be called while a borrow of this core is
     /// already held. That constraint binds the read-and-parse phase, which
     /// warns from [`ResolverHandle::validate_stream_line_end`] and from
-    /// [`ResolverHandle::read_object_at_offset`] in between input operations;
+    /// [`ResolverHandle::read_object_at_offset_with_description`] in between input operations;
     /// each of those takes and drops its own borrow, so nothing is held when
     /// the push happens.
     repair_diagnostics: Diagnostics,
@@ -648,6 +648,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
         ObjectHandle::from_value_with_resolver(value, resolver)
     }
 
+    pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> String {
+        let input_description =
+            crate::object_handle::escape_description_input(&self.core.borrow().description);
+        format!(
+            "{}, object {} {} at offset $PO",
+            input_description, object_ref.number, object_ref.generation
+        )
+    }
+
+    pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> String {
+        let input_description =
+            crate::object_handle::escape_description_input(&self.core.borrow().description);
+        format!(
+            "{}, stream object {} {}",
+            input_description, object_ref.number, object_ref.generation
+        )
+    }
+
     /// The canonical handle for `object_ref` **if one has already been
     /// minted**, without minting one.
     ///
@@ -728,16 +746,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `OffsetInputSource` which presents logical offset 0 to `reconstruct_xref`
     /// (`libqpdf/OffsetInputSource.cc:seek`).  Flips `m->reconstructed_xref` to
     /// `true`, emits repair warnings, and retries reading `object_ref` at the
-    /// rebuilt offset.  Returns `Ok(Some((value, parsed_offset)))` on successful
-    /// retry, `Ok(None)` if the object is absent post-rebuild (to be warned and
-    /// resolved to null), or `Err(err)` if recovery fails, if the trigger is not
-    /// a parse error, or if a second reconstruction attempt is made
-    /// (infinite-loop guard).
+    /// rebuilt offset.  Returns `Ok(Some((value, parsed_offset, description)))`
+    /// on successful retry, `Ok(None)` if the object is absent post-rebuild (to
+    /// be warned and resolved to null), or `Err(err)` if recovery fails, if the
+    /// trigger is not a parse error, or if a second reconstruction attempt is
+    /// made (infinite-loop guard).
     fn reconstruct_xref_and_retry(
         &self,
         trigger_error: Error,
         object_ref: ObjectRef,
-    ) -> Result<Option<(ObjectValue, i64)>> {
+    ) -> Result<Option<(ObjectValue, i64, String)>> {
         if self.core.borrow().reconstructed_xref {
             // Avoid xref reconstruction infinite loops (QPDF.cc:518-522).
             return Err(trigger_error);
@@ -788,7 +806,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Some(XrefEntry::Uncompressed { offset: new_offset }) => {
                 // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
                 // any parse failure propagates as an exception (Err here).
-                self.read_object_at_offset(new_offset, object_ref).map(Some)
+                self.read_object_at_offset_with_description(new_offset, object_ref)
+                    .map(Some)
             }
             Some(XrefEntry::Compressed { .. }) => Err(Error::Unsupported(format!(
                 "canonical resolver cannot yet resolve object {} {}: only uncompressed cross-reference entries are implemented",
@@ -884,9 +903,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// never a file name. [`Self::push_warning`]'s input-source description
     /// is the slot qpdf fills for `damagedPDF` warnings instead
     /// (`libqpdf/QPDFParser.cc:512`, `input->getName()`), so reusing it here
-    /// would emit a file name qpdf does not. Object descriptions themselves
-    /// are not yet propagated, so this location is empty rather than
-    /// `"object N G"`.
+    /// would emit a file name qpdf does not. Live parser direct values and
+    /// canonical handles now carry their qpdf parser descriptions; this sink
+    /// intentionally receives the already-formed message and keeps its
+    /// diagnostic offset empty rather than adding a second location.
     ///
     /// Same borrow discipline as [`Self::push_warning`]: the `borrow_mut()`
     /// is taken and dropped before the logger write.
@@ -1593,11 +1613,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `a_recovered_malformed_body_reports_its_warning_at_the_file_offset`
     /// pins the absolute diagnostic. The mismatch error is likewise anchored
     /// directly at `offset`.
+    #[cfg(test)]
     fn read_object_at_offset(
         &self,
         offset: u64,
         expected: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
+        let (value, parsed_offset, _) =
+            self.read_object_at_offset_with_description(offset, expected)?;
+        Ok((value, parsed_offset))
+    }
+
+    fn read_object_at_offset_with_description(
+        &self,
+        offset: u64,
+        expected: ObjectRef,
+    ) -> Result<(ObjectValue, i64, String)> {
         self.seek(offset)?;
         let (found, parsed, trailing) = {
             let mut input = self.live_input();
@@ -1614,7 +1645,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .ok()
                 .zip(u16::try_from(generation).ok())
                 .map(|(number, generation)| ObjectRef::new(number, generation));
-            let mut minter = ChildHandles { resolver: self };
+            let mut minter = ChildHandles {
+                resolver: self,
+                description_template: self.parser_description_template(expected),
+            };
             let encryption_parameters = self.encryption_parameters();
             let has_encryption = encryption_parameters.borrow().is_some();
             let mut decrypter = if has_encryption {
@@ -1667,21 +1701,24 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 .into_direct_value()
                 .expect("live file parser's recovered empty object is always a direct null");
             debug_assert_eq!(parsed_offset, parsed.parsed_offset);
-            return Ok((value, parsed_offset));
+            return Ok((value, parsed_offset, String::new()));
         }
 
+        let description = parsed.value.description();
         let (value, parsed_offset) = parsed.value.into_direct_value().expect(
             "live file parser's top-level bare-reference recovery always returns a direct value",
         );
         debug_assert_eq!(parsed_offset, parsed.parsed_offset);
         let trailing = trailing.expect("non-empty parse must have a framing token");
         if trailing.is_word_value(b"stream") {
-            self.read_stream(value, parsed_offset)
+            let stream_description = self.stream_description(expected);
+            let (value, parsed_offset) = self.read_stream(value, parsed_offset, description)?;
+            Ok((value, parsed_offset, stream_description))
         } else {
             if !trailing.is_word_value(b"endobj") {
                 self.push_warning("expected endobj")?;
             }
-            Ok((value, parsed_offset))
+            Ok((value, parsed_offset, description))
         }
     }
 
@@ -1754,8 +1791,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///   to resolve to null (`:1745-1748`). Observed: `object 4/0: error
     ///   reading object: seek to …, offset 9223372036854775000 (1): Invalid
     ///   argument`, exit 3, 8.9 MB peak RSS. The resolve-to-null fallback is
-    ///   not ported either — see [`Self::read_object_at_offset`].
-    fn read_stream(&self, dict: ObjectValue, dict_offset: i64) -> Result<(ObjectValue, i64)> {
+    ///   not ported either — see [`Self::read_object_at_offset_with_description`].
+    fn read_stream(
+        &self,
+        dict: ObjectValue,
+        dict_offset: i64,
+        dict_description: String,
+    ) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
 
         // qpdf `:1365-1367`: "Must get offset before accessing any additional
@@ -1788,6 +1830,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let dict = self.direct_object_handle(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
+        if !dict_description.is_empty() {
+            // QPDF_Stream::setDescription leaves an already-described stream
+            // dictionary untouched (`QPDF_Stream.cc:299-312`). The parser's
+            // dictionary description was rendered before the value was
+            // unwrapped, so restore that metadata on the rewrapped handle.
+            dict.set_description(dict_description, dict_offset);
+        }
         Ok((
             ObjectValue::Stream {
                 stream_dict: dict,
@@ -2102,6 +2151,7 @@ fn read_live_header_integer(token: Token) -> Result<i64> {
 /// this hands back is unresolved.
 struct ChildHandles<'a, R: Read + Seek + 'static> {
     resolver: &'a ResolverHandle<R>,
+    description_template: String,
 }
 
 impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
@@ -2111,6 +2161,10 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
         self.resolver.direct_object_handle(value)
+    }
+
+    fn description_template(&self) -> Option<String> {
+        Some(self.description_template.clone())
     }
 }
 
@@ -2233,7 +2287,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     ///
     /// qpdf's `case 1:` (`libqpdf/QPDF.cc:1720-1727`) calls
     /// `readObjectAtOffset`, which caches the object it read.
-    /// [`Self::read_object_at_offset`] is that call; the value it returns is
+    /// [`Self::read_object_at_offset_with_description`] is that call; the value it returns is
     /// written into `handle`'s slot, which *is* the
     /// [`ResolverCore::object_cache`] entry (see the loop branch above).
     ///
@@ -2242,7 +2296,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// 1. *Short borrows.* [`ResolveMark::begin`] takes one to test and set
     ///    `resolving`; [`Self::xref_entry`] takes one to read the entry. Both
     ///    end inside their own call.
-    /// 2. *No borrow at all.* `read_object_at_offset` runs here. It reads and
+    /// 2. *No borrow at all.* `read_object_at_offset_with_description` runs here. It reads and
     ///    parses through [`Self::scan_forward`], every step of which takes and
     ///    drops its own borrow, so the `/Length` dereference inside
     ///    [`Self::read_stream`] is free to re-enter this very method.
@@ -2272,7 +2326,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// **This method is re-entrant, and nothing bounds how deep.** A stream
     /// whose `/Length` is an indirect reference to another stream whose
     /// `/Length` is an indirect reference to another … recurses
-    /// `resolve_indirect` → [`Self::read_object_at_offset`] →
+    /// `resolve_indirect` → [`Self::read_object_at_offset_with_description`] →
     /// [`Self::read_stream`] → [`Self::stream_length`] →
     /// [`ObjectHandle::try_dereference`] → `resolve_indirect` once per link.
     /// The loop branch above cannot stop it: `resolving` holds *references*,
@@ -2337,19 +2391,25 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                             handle.set_missing();
                             return Ok(());
                         }
-                        match self.read_object_at_offset(offset, object_ref) {
-                            Ok((value, parsed_offset)) => {
+                        match self.read_object_at_offset_with_description(offset, object_ref) {
+                            Ok((value, parsed_offset, description)) => {
                                 handle.set_resolved(value);
                                 handle.set_parsed_offset_if_unset(parsed_offset);
+                                if !description.is_empty() {
+                                    handle.set_description(description, parsed_offset);
+                                }
                                 Ok(())
                             }
                             Err(err) => {
                                 let attempt_recovery = self.core.borrow().attempt_recovery;
                                 if attempt_recovery {
                                     match self.reconstruct_xref_and_retry(err, object_ref) {
-                                        Ok(Some((value, parsed_offset))) => {
+                                        Ok(Some((value, parsed_offset, description))) => {
                                             handle.set_resolved(value);
                                             handle.set_parsed_offset_if_unset(parsed_offset);
+                                            if !description.is_empty() {
+                                                handle.set_description(description, parsed_offset);
+                                            }
                                             Ok(())
                                         }
                                         Ok(None) => {
@@ -2661,7 +2721,84 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            ["deep container warning", "deep scalar warning"]
+            [
+                ", object 1 0 at offset 24: deep container warning",
+                ", object 1 0 at offset 32: deep scalar warning",
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_live_parser_stamps_root_and_nested_descriptions() {
+        let resolver = resolver_over_named_object(
+            b"\n1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> /Items [8 null] >>\nendobj\n".to_vec(),
+            ObjectRef::new(1, 0),
+            "input.pdf",
+        );
+        let root = resolver.get_object_handle(ObjectRef::new(1, 0));
+        root.try_dereference().expect("live object should resolve");
+
+        assert_eq!(root.description(), "input.pdf, object 1 0 at offset 11");
+        let level_one = root
+            .as_dictionary()
+            .and_then(|values| values.get(b"L1".as_slice()).cloned())
+            .expect("level one dictionary");
+        assert_eq!(
+            level_one.description(),
+            "input.pdf, object 1 0 at offset 18"
+        );
+
+        let level_two = level_one
+            .as_dictionary()
+            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .expect("level two dictionary");
+        assert_eq!(
+            level_two.description(),
+            "input.pdf, object 1 0 at offset 25"
+        );
+
+        let value = level_two
+            .as_dictionary()
+            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .expect("deep scalar");
+        assert_eq!(value.description(), "input.pdf, object 1 0 at offset 33");
+
+        let items = root
+            .as_dictionary()
+            .and_then(|values| values.get(b"Items".as_slice()).cloned())
+            .expect("array value");
+        assert_eq!(items.description(), "input.pdf, object 1 0 at offset 49");
+        let array_scalar = items
+            .as_array()
+            .and_then(|values| values.first().cloned())
+            .expect("array scalar");
+        assert_eq!(
+            array_scalar.description(),
+            "input.pdf, object 1 0 at offset 49"
+        );
+        let array_null = items
+            .as_array()
+            .and_then(|values| values.get(1).cloned())
+            .expect("array null");
+        assert!(array_null.description().is_empty());
+
+        level_two
+            .object_warning("deep container description")
+            .expect("nested dictionary keeps the document context");
+        value
+            .object_warning("deep scalar description")
+            .expect("nested scalar keeps the document context");
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "input.pdf, object 1 0 at offset 25: deep container description",
+                "input.pdf, object 1 0 at offset 33: deep scalar description",
+            ]
         );
     }
 
@@ -2684,7 +2821,10 @@ mod tests {
         let error = value
             .object_warning("dropped document")
             .expect_err("a weak context must be gone with its resolver");
-        assert!(matches!(error, Error::System(message) if message == "dropped document"));
+        assert!(matches!(
+            error,
+            Error::System(message) if message == ", object 1 0 at offset 18: dropped document"
+        ));
     }
 
     #[test]
@@ -2707,7 +2847,54 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            ["stream dictionary warning"]
+            [", object 1 0 at offset 10: stream dictionary warning"]
+        );
+    }
+
+    #[test]
+    fn canonical_live_parser_stream_stamps_root_and_dictionary_descriptions() {
+        let object_ref = ObjectRef::new(1, 0);
+        let resolver = resolver_over_named_object(
+            b"\n1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+            object_ref,
+            "input.pdf",
+        );
+        let stream = resolver.get_object_handle(object_ref);
+        stream
+            .try_dereference()
+            .expect("live stream should resolve");
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+
+        assert_eq!(stream.description(), "input.pdf, stream object 1 0");
+        assert!(
+            stream.get_parsed_offset() > stream_dict.get_parsed_offset(),
+            "the stream description must retain the stream-data offset"
+        );
+        let dictionary_description = stream_dict.description();
+        assert!(
+            dictionary_description.starts_with("input.pdf, object 1 0 at offset "),
+            "the stream dictionary must retain its parser description, got {dictionary_description:?}"
+        );
+
+        stream
+            .object_warning("stream root warning")
+            .expect("stream root warning should reach the resolver");
+        stream_dict
+            .object_warning("stream dictionary warning")
+            .expect("stream dictionary warning should reach the resolver");
+        let expected_dictionary_warning =
+            format!("{dictionary_description}: stream dictionary warning");
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "input.pdf, stream object 1 0: stream root warning".to_owned(),
+                expected_dictionary_warning,
+            ]
         );
     }
 
@@ -2783,6 +2970,23 @@ mod tests {
             false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        )
+    }
+
+    fn resolver_over_named_object(
+        bytes: Vec<u8>,
+        object_ref: ObjectRef,
+        description: &str,
+    ) -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
+        ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset: 1 })]),
+            false,
+            false, // already_reconstructed
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, description.to_owned()),
             0,
         )
     }

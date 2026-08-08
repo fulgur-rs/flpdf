@@ -78,9 +78,11 @@ pub(crate) trait DocumentResolver {
     /// caller that holds the document.
     ///
     /// The message arrives fully formed, as qpdf's `QPDFExc` is by the time
-    /// it reaches `QPDF::warn`. It carries no location: the emitters fill the
-    /// exception's filename with `""` and its object slot with an object
-    /// description, which is not yet propagated.
+    /// it reaches `QPDF::warn`. The exception filename is `""`; its object
+    /// slot is filled from the handle description before the message reaches
+    /// this sink. Live parser values now carry that description, while
+    /// programmatic handles retain their existing empty/object-reference
+    /// fallback.
     ///
     /// The default reports rather than swallows, matching
     /// [`Self::pipe_stream_data`]'s. Every document-backed resolver overrides
@@ -156,9 +158,33 @@ mod parse_tests {
             .object_warning("contextless explicit parse")
             .expect_err("an explicit parse must not acquire a document context");
 
-        assert!(
-            matches!(error, crate::Error::System(message) if message == "contextless explicit parse")
-        );
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "parsed object,  at offset 14: contextless explicit parse"
+        ));
+    }
+
+    #[test]
+    fn parse_without_context_stamps_the_qpdf_parsed_object_description() {
+        let parsed = ObjectHandle::parse(b"<< /Value 7 >>")
+            .expect("direct values do not need a parse context");
+
+        assert_eq!(parsed.description(), "parsed object,  at offset 2");
+        let value = parsed
+            .as_dictionary()
+            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .expect("parsed scalar");
+        assert_eq!(value.description(), "parsed object,  at offset 10");
+
+        let error = value
+            .object_warning("contextless explicit parse")
+            .expect_err("an explicit parse must remain contextless");
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "parsed object,  at offset 10: contextless explicit parse"
+        ));
     }
 
     #[test]
@@ -323,6 +349,80 @@ pub(crate) enum ObjectDescription {
     Child(ChildDescription),
 }
 
+/// Escape literal dollar signs before an input description is embedded in a
+/// qpdf-style template. `$$` is decoded back to `$` by
+/// [`expand_description_template`], while unescaped `$PO`/`$OG` remain the
+/// parser-owned placeholders.
+pub(crate) fn escape_description_input(input: &str) -> String {
+    input.replace('$', "$$")
+}
+
+fn expand_description_template(
+    template: &str,
+    object_ref: Option<ObjectRef>,
+    state: &ObjectState,
+    parsed_offset: i64,
+) -> String {
+    let og = object_ref
+        .map(|object_ref| format!("{} {}", object_ref.number, object_ref.generation))
+        .unwrap_or_default();
+    let shift = match state {
+        ObjectState::Resolved(value) => match value {
+            ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
+            ObjectValue::Array(_) => 1,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    let offset = if parsed_offset >= 0 {
+        (parsed_offset + shift).to_string()
+    } else {
+        parsed_offset.to_string()
+    };
+
+    let mut result = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            result.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('$') => result.push('$'),
+            Some('P') => match chars.next() {
+                Some('O') => result.push_str(&offset),
+                Some(next) => {
+                    result.push('$');
+                    result.push('P');
+                    result.push(next);
+                }
+                None => {
+                    result.push('$');
+                    result.push('P');
+                }
+            },
+            Some('O') => match chars.next() {
+                Some('G') => result.push_str(&og),
+                Some(next) => {
+                    result.push('$');
+                    result.push('O');
+                    result.push(next);
+                }
+                None => {
+                    result.push('$');
+                    result.push('O');
+                }
+            },
+            Some(next) => {
+                result.push('$');
+                result.push(next);
+            }
+            None => result.push('$'),
+        }
+    }
+    result
+}
+
 // Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
 // impl above for why a derived one is unsafe here (object-handle cycles).
 // This uniform allocation corresponds to qpdf's QPDFObject/QPDFValue pair:
@@ -343,33 +443,12 @@ impl ObjectSlot {
     fn get_description(&self) -> String {
         if let Some(desc) = &self.description {
             match desc {
-                ObjectDescription::Template(tmpl) => {
-                    let mut result = tmpl.clone();
-                    if result.contains("$OG") {
-                        let og_str = self
-                            .object_ref
-                            .map(|r| format!("{} {}", r.number, r.generation))
-                            .unwrap_or_default();
-                        result = result.replace("$OG", &og_str);
-                    }
-                    if result.contains("$PO") {
-                        let shift = match &self.state {
-                            ObjectState::Resolved(val) => match val {
-                                ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
-                                ObjectValue::Array(_) => 1,
-                                _ => 0,
-                            },
-                            _ => 0,
-                        };
-                        let offset_val = if self.parsed_offset >= 0 {
-                            self.parsed_offset + shift
-                        } else {
-                            self.parsed_offset
-                        };
-                        result = result.replace("$PO", &offset_val.to_string());
-                    }
-                    result
-                }
+                ObjectDescription::Template(tmpl) => expand_description_template(
+                    tmpl,
+                    self.object_ref,
+                    &self.state,
+                    self.parsed_offset,
+                ),
                 ObjectDescription::Json(j) => {
                     let obj_part = if j.object.is_empty() {
                         String::new()
@@ -853,6 +932,23 @@ impl ObjectHandle {
         }
     }
 
+    /// Copy the source description and parsed offset that belong to this
+    /// direct slot onto a freshly allocated indirect slot. qpdf promotion
+    /// registers the existing `QPDFObject` allocation, so these metadata
+    /// fields remain attached to the promoted value
+    /// (`libqpdf/QPDF.cc:1882-1898`).
+    pub(crate) fn copy_description_and_parsed_offset_to(&self, target: &Self) {
+        let (description, parsed_offset) = {
+            let slot = self.0.borrow();
+            (slot.description.clone(), slot.parsed_offset)
+        };
+        let mut target_slot = target.0.borrow_mut();
+        target_slot.description = description;
+        if target_slot.parsed_offset < 0 {
+            target_slot.parsed_offset = parsed_offset;
+        }
+    }
+
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
@@ -918,6 +1014,9 @@ impl ObjectHandle {
     /// and later marked missing — [`crate::Pdf::delete_object`] on an
     /// already-resolved handle — would keep reporting its former body's
     /// source position even though the value now reads as null.
+    /// The parsed description is discarded with the same transition, so an
+    /// outstanding handle cannot keep attributing warnings to the deleted
+    /// value's source location.
     pub(crate) fn set_missing(&self) {
         if self.is_indirect() {
             let old_value = {
@@ -927,6 +1026,7 @@ impl ObjectHandle {
                     _ => None,
                 };
                 slot.parsed_offset = NO_PARSED_OFFSET;
+                slot.description = None;
                 old_value
             };
             if let Some(old_value) = old_value {
@@ -983,14 +1083,17 @@ impl ObjectHandle {
                     None
                 }
                 ObjectState::Resolved(value) => {
+                    slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
                     Some(value)
                 }
                 ObjectState::NotYetResolved => {
+                    slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
                     None
                 }
                 ObjectState::Destroyed => {
+                    slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
                     None
                 }
@@ -1100,9 +1203,11 @@ impl ObjectHandle {
     /// (`libqpdf/QPDFObjectHandle.cc:2385-2396`), whose contextless arm is
     /// `throw e`. `QPDFExc` derives from `std::runtime_error`
     /// (`include/qpdf/QPDFExc.hh:29`), which this crate classifies as
-    /// [`crate::Error::System`]; with an empty filename, object description,
-    /// and offset, `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`) renders
-    /// `what()` as the bare message, which is what that variant displays.
+    /// [`crate::Error::System`]. With an empty filename,
+    /// `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`) prefixes a non-empty
+    /// object description and renders a bare message only when that
+    /// description is empty; this port forms the same prefix before the
+    /// contextless error is returned.
     #[allow(dead_code)] // same deferred consumers as `context`
     fn warn_through_context(&self, message: String) -> Result<()> {
         match self.context() {
@@ -1129,6 +1234,14 @@ impl ObjectHandle {
         if slot.parsed_offset < 0 {
             slot.parsed_offset = offset;
         }
+    }
+
+    /// Clear source-description metadata when the handle's value is replaced
+    /// by caller-supplied data. The replacement no longer belongs to the
+    /// source location that produced the old description, so the indirect
+    /// object fallback (`object N G`) must be used instead.
+    pub(crate) fn clear_description(&self) {
+        self.0.borrow_mut().description = None;
     }
 
     #[allow(dead_code)]
@@ -6235,6 +6348,18 @@ mod resolution_state_tests {
         handle.disconnect();
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_clears_a_previously_recorded_description() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.set_description("input.pdf, object 1 0 at offset $PO".to_owned(), 100);
+        assert!(handle.description().contains("offset"));
+
+        handle.disconnect();
+
+        assert_eq!(handle.description(), "");
     }
 
     #[test]
