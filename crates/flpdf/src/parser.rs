@@ -1499,6 +1499,7 @@ impl RecoveredStreamEol {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_indirect_object(
     input: &[u8],
     policy: crate::reader::file_object::RecoveryPolicy,

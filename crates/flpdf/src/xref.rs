@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDF.cc xref loading and repair.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_indirect_object, parse_indirect_object_with_diagnostics, Parser};
+use crate::parser::{parse_indirect_object_with_diagnostics, Parser};
 use crate::reader::file_object::{
     finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, RecoveryPolicy,
     ResolvedStreamLength,
@@ -509,7 +509,6 @@ fn recover_xref_from_linear_scan(
         .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
     let mut parsed_xref_streams = BTreeMap::new();
     let mut extra_trailer_references = BTreeSet::new();
-    let mut deleted_object_numbers = BTreeSet::new();
 
     // qpdf's `reconstruct_xref` (`QPDF.cc:564-616`) gates BOTH its `trailer`
     // keyword scan (`!m->trailer.isInitialized() && t1.isWord("trailer")`)
@@ -541,7 +540,6 @@ fn recover_xref_from_linear_scan(
                 &mut parsed_xref_streams,
                 &mut repair_diagnostics,
                 &mut extra_trailer_references,
-                &mut deleted_object_numbers,
             ) {
                 Ok((trailer, max_offset, form)) => (trailer, max_offset, form),
                 Err(candidate_error) => {
@@ -553,11 +551,6 @@ fn recover_xref_from_linear_scan(
             },
         }
     };
-
-    // The ObjStm gap-filler runs last so that entries recovered from a real
-    // xref-stream re-entry above (authoritative) are not blocked by flpdf's own
-    // invented compressed-entry guesses (see `recover_objstm_compressed_entries`).
-    recover_objstm_compressed_entries(bytes, &mut entries, &deleted_object_numbers);
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
@@ -648,11 +641,8 @@ pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Resu
 ///
 /// qpdf records only uncompressed (type-1) entries during reconstruction and
 /// declines to look inside object streams (`reconstruct_xref` trailing comment in
-/// QPDF.cc). The caller runs flpdf's own `/Type /ObjStm` gap-filler
-/// ([`recover_objstm_compressed_entries`]) and the qpdf-native xref-stream
-/// candidate re-entry ([`recover_trailer_from_xref_stream_candidate`]) against
-/// this function's result afterward, in that order — see
-/// [`recover_xref_from_linear_scan`].
+/// `QPDF.cc:532-575, 618-623`). A real xref-stream candidate is still re-entered separately by
+/// [`recover_trailer_from_xref_stream_candidate`].
 pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
     let mut entries = BTreeMap::new();
     let mut line_start = 0usize;
@@ -696,12 +686,7 @@ const XREF_CANDIDATE_FALLBACK_SPAN: usize = 64;
 /// both key priority off the number alone). A candidate that fails to decode
 /// becomes "error decoding candidate xref stream while recovering damaged
 /// file"; no candidate at all becomes "unable to find trailer dictionary while
-/// recovering damaged file". `deleted_object_numbers` collects every object
-/// number the candidate's own revision chain marks free (via its own
-/// `XrefRegistration`, which -- like `entries` -- no longer stores `Free`
-/// rows directly): the caller folds these into the ObjStm gap-filler's
-/// occupied-number set so a real free entry still blocks resurrection even
-/// though it has no map presence of its own.
+/// recovering damaged file".
 #[allow(clippy::too_many_arguments)]
 fn recover_trailer_from_xref_stream_candidate(
     bytes: &[u8],
@@ -711,7 +696,6 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
-    deleted_object_numbers: &mut BTreeSet<u32>,
 ) -> Result<(Dictionary, u64, XrefForm)> {
     let (candidate, discovery_diagnostics) = find_xref_stream_trailer_candidate(bytes, entries);
     // qpdf's candidate search resolves every type-1 entry unconditionally
@@ -808,20 +792,11 @@ fn recover_trailer_from_xref_stream_candidate(
     // populated that *same* (number, generation) pair -- an obsolete
     // generation's own leftover entry from the line scan must not suppress
     // the candidate's entry for a distinct generation of the same object
-    // number (only `insertFreeXrefEntry`'s `m->deleted_objects`,
-    // `QPDF.cc:1187-1190`, is number-wide; that path is `deleted_object_numbers`
-    // below, not this one).
+    // number. Free rows remain local tombstones in the candidate's own
+    // `XrefRegistration`, matching `insertFreeXrefEntry`.
     for (object_ref, xref_entry) in reentry.loaded.entries {
         entries.entry(object_ref).or_insert(xref_entry);
     }
-    // The candidate/its `/Prev` chain's own free rows have no map presence
-    // to block the ObjStm gap-filler with (`reentry_registration.entries`
-    // never holds them either); surface the object numbers directly so the
-    // caller can seed the gap-filler's occupied-number set with them,
-    // mirroring qpdf's `m->deleted_objects` (`std::set<int>`, `QPDF.hh:1466`)
-    // discarding a type-0 row's own generation field
-    // (`QPDF.cc:1120-1124`, "Ignore fields[2]").
-    deleted_object_numbers.extend(reentry_registration.deleted_objects);
     parsed_xref_streams.extend(reentry.parsed_xref_streams);
     trailer_references.extend(reentry.trailer_references);
     // The candidate re-entry (and any `/Prev` chain it follows) can itself
@@ -869,8 +844,7 @@ struct XrefStreamCandidate {
 /// when that truncates a real object (a header-like line recorded inside an
 /// object's own payload can become a bogus next offset). That retry extends
 /// by [`XREF_CANDIDATE_FALLBACK_SPAN`] further offset-*positions* rather
-/// than sharing one global attempt-count budget across the whole scan
-/// (mirroring [`recover_objstm_compressed_entries`]'s windowing otherwise):
+/// than sharing one global attempt-count budget across the whole scan:
 /// a shared budget lets enough earlier, unrelated truncated entries deny a
 /// later, genuine candidate its own retry, which qpdf's per-object recovery
 /// has no equivalent of.
@@ -961,184 +935,6 @@ fn find_xref_stream_trailer_candidate(
 
 fn is_xref_stream_dict(dict: &Dictionary) -> bool {
     matches!(dict.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"XRef")
-}
-
-/// Upper bound on read-to-end fallbacks during ObjStm recovery (see
-/// [`recover_objstm_compressed_entries`]). Each fallback may parse to end of
-/// file, so the count is capped to keep the total work O(file size) while still
-/// recovering a handful of object streams whose payloads happen to contain a
-/// header-like line.
-const MAX_OBJSTM_RECOVERY_FALLBACKS: u32 = 64;
-
-/// Recover the compressed objects packed in any recovered `/Type /ObjStm`,
-/// emitting `XrefEntry::Compressed` entries that point back at the stream.
-///
-/// Each recovered object is parsed within the window that ends at the next
-/// recovered object's offset (or end-of-file for the last). The windows are
-/// disjoint, so the common case is bounded by the file size — a malformed object
-/// cannot drive the parse to end-of-file once per candidate. When a window does
-/// not hold a complete object — a header-like line (`int int obj`) recorded
-/// inside an object stream's payload became the next offset and truncated it —
-/// it retries against the rest of the file so the stream's own `/Length`
-/// delimits it. Those retries are capped by [`MAX_OBJSTM_RECOVERY_FALLBACKS`] so
-/// a flood of stream-like candidates cannot reintroduce quadratic cost.
-///
-/// `recover_xref_entries` itself only performs qpdf's own line scan (see its
-/// doc); this pass is flpdf's own addition and does not run automatically, so
-/// every caller of `recover_xref_entries` that wants its objects resolvable
-/// must call this afterward (`recover_xref_from_linear_scan` runs it after
-/// candidate re-entry so authoritative real entries are not blocked by these
-/// invented guesses; `ResolverCore`'s own resolve-time reconstruction retry
-/// in `reader/resolver.rs`, which has no candidate re-entry of its own, runs
-/// it immediately after).
-pub(crate) fn recover_objstm_compressed_entries(
-    bytes: &[u8],
-    entries: &mut BTreeMap<ObjectRef, XrefEntry>,
-    extra_occupied_numbers: &BTreeSet<u32>,
-) {
-    // The line scan only ever inserts `XrefEntry::Uncompressed`, so every entry here is
-    // an uncompressed object whose offset bounds a window. Candidate re-entry can also
-    // merge in entries decoded straight from a (possibly corrupt or malicious) xref
-    // stream's own byte data, which -- unlike a line-scanned offset -- is never
-    // validated against the file's real length; excluding an out-of-range offset here
-    // keeps every later `start`/`window_end` a valid `bytes` index (qpdf's own
-    // `insertXrefEntry` does not validate offsets either, so the entry itself stays in
-    // `entries` for a later resolve attempt to reject on its own terms).
-    let bytes_len = bytes.len() as u64;
-    let mut offsets: Vec<u64> = Vec::new();
-    for entry in entries.values() {
-        if let XrefEntry::Uncompressed { offset } = entry {
-            if *offset <= bytes_len {
-                offsets.push(*offset);
-            }
-        }
-    }
-    offsets.sort_unstable();
-
-    // Mirrors `entries`' own object numbers so the number-based priority
-    // check in `recover_compressed_offsets_from_objstm` stays O(1) instead
-    // of rescanning every existing key per packed object -- a damaged but
-    // otherwise large PDF can pack tens of thousands of objects here.
-    // `extra_occupied_numbers` folds in object numbers a candidate xref
-    // stream's own revision chain marked free (`XrefRegistration` no longer
-    // gives those a map entry to be picked up by `entries.keys()` above; see
-    // `recover_trailer_from_xref_stream_candidate`'s `deleted_object_numbers`
-    // out-param).
-    let mut occupied_numbers: HashSet<u32> = entries
-        .keys()
-        .map(|object_ref| object_ref.number)
-        .chain(extra_occupied_numbers.iter().copied())
-        .collect();
-
-    let mut fallbacks = MAX_OBJSTM_RECOVERY_FALLBACKS;
-    for (index, &offset) in offsets.iter().enumerate() {
-        let start = offset as usize;
-        let window_end = offsets
-            .get(index + 1)
-            .map_or(bytes.len(), |next| *next as usize);
-        if try_recover_objstm_in(entries, &mut occupied_numbers, &bytes[start..window_end]) {
-            continue;
-        }
-        // The bounded window stopped short of a complete object. Retry against
-        // the rest of the file so a real ObjStm truncated by a header-like line
-        // in its payload is still recovered, capped so it stays linear.
-        if window_end < bytes.len() && fallbacks > 0 {
-            fallbacks -= 1;
-            try_recover_objstm_in(entries, &mut occupied_numbers, &bytes[start..]);
-        }
-    }
-}
-
-/// Parse the indirect object in `slice`; if it is a `/Type /ObjStm`, insert its
-/// packed objects' compressed entries. Returns `false` only when `slice` did not
-/// contain a complete object (a parse error) — the signal that a bounded window
-/// may have truncated a real stream and a wider retry is worthwhile.
-fn try_recover_objstm_in(
-    entries: &mut BTreeMap<ObjectRef, XrefEntry>,
-    occupied_numbers: &mut HashSet<u32>,
-    slice: &[u8],
-) -> bool {
-    match parse_indirect_object(slice, RecoveryPolicy::RequireTerminator) {
-        Ok((object_ref, Object::Stream(stream))) => {
-            if let Some(Object::Name(type_name)) = stream.dict.get("Type") {
-                if type_name.as_slice() == b"ObjStm" {
-                    recover_compressed_offsets_from_objstm(
-                        entries,
-                        occupied_numbers,
-                        object_ref,
-                        &stream,
-                    );
-                }
-            }
-            true
-        }
-        Ok(_) => true,
-        Err(_) => false,
-    }
-}
-
-fn recover_compressed_offsets_from_objstm(
-    entries: &mut BTreeMap<ObjectRef, XrefEntry>,
-    occupied_numbers: &mut HashSet<u32>,
-    stream_ref: ObjectRef,
-    stream: &crate::Stream,
-) {
-    let Ok(decoded_data) = crate::filters::decode_stream_data(&stream.dict, &stream.data) else {
-        return;
-    };
-
-    let object_count =
-        match parse_non_negative_u64(stream.dict.get("N").unwrap_or(&Object::Integer(0)), "/N") {
-            Ok(count) => match usize::try_from(count) {
-                Ok(count) => count,
-                Err(_) => return,
-            },
-            Err(_) => return,
-        };
-
-    let mut tokenizer = Tokenizer::new(&decoded_data);
-    for index in 0..object_count {
-        let number = match tokenizer.next_integer() {
-            Ok(number) => match parse_non_negative_i64(number, "ObjStm object number") {
-                Ok(number) => number,
-                Err(_) => return,
-            },
-            Err(_) => return,
-        };
-        let object_ref = match u32::try_from(number) {
-            Ok(object_ref) => ObjectRef::new(object_ref, 0),
-            Err(_) => return,
-        };
-
-        match tokenizer.next_integer() {
-            Ok(offset) => {
-                if parse_non_negative_i64(offset, "ObjStm object offset").is_err() {
-                    return;
-                }
-                // Block by object number, not the exact `(number, 0)` key:
-                // a `Free` tombstone recorded at a nonzero generation (see
-                // `recover_trailer_from_xref_stream_candidate`) must still
-                // stop this invented entry from resurrecting the object.
-                if occupied_numbers.insert(object_ref.number) {
-                    entries.insert(
-                        object_ref,
-                        XrefEntry::Compressed {
-                            stream: stream_ref.number,
-                            index: u32::try_from(index).unwrap_or(u32::MAX),
-                        },
-                    );
-                }
-            }
-            Err(_) => return,
-        }
-    }
-}
-
-fn parse_non_negative_i64(value: i64, name: &str) -> Result<u64> {
-    if value < 0 {
-        return Err(Error::parse(0, format!("{name} is negative")));
-    }
-    Ok(value as u64)
 }
 
 /// Push the qpdf-compatible repair warning sequence onto `diagnostics`.
@@ -2690,16 +2486,12 @@ mod tests {
     }
 
     #[test]
-    fn xref_stream_candidate_free_entry_blocks_objstm_gap_filler_resurrection() {
-        // `recover_objstm_compressed_entries` has no qpdf counterpart at all
-        // (`QPDF.cc:611-614` explicitly declines to scan ObjStm contents
-        // during reconstruction: "probably not worth the trouble"); it runs
-        // unconditionally, after the candidate re-entry, over every
-        // `Uncompressed` entry currently in `entries`. If the candidate
-        // re-entry's own `Free` rows were dropped instead of recorded as
-        // tombstones, that gap-filler would find object 8's real offset,
-        // decode it as an `/Type /ObjStm`, and wrongly resurrect object 7 --
-        // even though the candidate's own revision chain explicitly frees it.
+    fn xref_stream_candidate_free_entry_remains_absent() {
+        // qpdf's candidate re-entry records free rows as number-wide
+        // tombstones, not live entries. Object 7 is explicitly free in the
+        // newest revision and must therefore remain absent from the recovered
+        // live table, even though an older revision contains it as a packed
+        // object in ObjStm 8.
         //
         // Revision 1 (xref stream 3): object 7 packed compressed in ObjStm 8.
         // Revision 2 (xref stream 4, `/Prev` -> revision 1, the recovery
@@ -2778,10 +2570,9 @@ mod tests {
         assert_eq!(
             loaded.entries.get(&crate::ObjectRef::new(7, 0)),
             None,
-            "a real free entry from the candidate's own revision chain must block the \
-             ObjStm gap-filler, matching qpdf leaving object 7 unresolvable -- `entries` only \
-             ever holds live rows (`XrefRegistration` never gives a free row a map entry), so \
-             a blocked object is simply absent, not a stored `Free` tombstone"
+            "a real free entry from the candidate's own revision chain leaves object 7 \
+             absent from the live table, matching qpdf -- `entries` only ever holds live rows \
+             (`XrefRegistration` never gives a free row a map entry)"
         );
         assert_eq!(
             loaded.entries.get(&crate::ObjectRef::new(8, 0)),
@@ -2792,7 +2583,7 @@ mod tests {
     }
 
     #[test]
-    fn xref_stream_candidate_free_entry_blocks_by_object_number_not_exact_generation() {
+    fn xref_stream_candidate_free_entry_is_number_wide() {
         // qpdf's `processXRefStream` (`QPDF.cc:1120-1124`) hardcodes
         // `QPDFObjGen(obj, 0)` for a type-0 row and explicitly discards
         // field 2 ("Ignore fields[2], which we don't care about in this
@@ -2802,11 +2593,11 @@ mod tests {
         // qpdf's free/deleted bookkeeping. A real xref stream commonly
         // writes a nonzero field 2 for a freed object (the generation to
         // use *if the number is reused*), so this fixture -- identical to
-        // `xref_stream_candidate_free_entry_blocks_objstm_gap_filler_resurrection`
-        // except object 7's free row now carries generation 1 -- must
-        // still block the ObjStm gap-filler, which always probes generation
-        // 0. Blocking only the exact `(7, 1)` key (as a naive tombstone
-        // merge would) leaves `(7, 0)` open to resurrection.
+        // `xref_stream_candidate_free_entry_remains_absent` except object
+        // 7's free row now carries generation 1 -- object number, rather than
+        // the row's generation, determines the tombstone. Blocking only the
+        // exact `(7, 1)` key (as a naive tombstone merge would) leaves `(7, 0)`
+        // live.
         fn entry(entry_type: u8, f1: u32, f2: u8) -> [u8; 4] {
             let f1_bytes = f1.to_be_bytes();
             [entry_type, f1_bytes[2], f1_bytes[3], f2]
@@ -2982,19 +2773,13 @@ mod tests {
     }
 
     #[test]
-    fn recover_objstm_compressed_entries_skips_candidate_offsets_past_eof() {
+    fn xref_stream_candidate_preserves_out_of_range_offsets() {
         // A candidate's own re-entry decodes xref-stream *data* -- arbitrary
         // bytes from the file, not offsets rediscovered by re-scanning it --
         // so a corrupt or malicious xref stream can declare an offset that
-        // does not exist in the file at all. The original line-scan
-        // entries this function was designed around could never do that
-        // (`recover_xref_entries` only ever records the offset of a token it
-        // actually found inside `bytes`), so this is a new path onto
-        // `recover_objstm_compressed_entries` opened up specifically by
-        // candidate recovery. Object 5's declared offset (1,000,000) is far
-        // past this fixture's real length; the ObjStm gap-filler's own byte
-        // slicing over it must not panic, regardless of whether the entry
-        // itself is left in `entries` for a later resolve attempt to reject.
+        // does not exist in the file at all. Object 5's declared offset
+        // (1,000,000) is far past this fixture's real length; qpdf preserves
+        // the entry and leaves offset validation to the later object read.
         let mut bytes = b"%PDF-1.5\n".to_vec();
         let bogus_offset: u32 = 1_000_000;
         let mut stream1 = Vec::new();
@@ -3025,8 +2810,7 @@ mod tests {
                 offset: bogus_offset as u64
             }),
             "the out-of-range entry is still recorded as-is (qpdf's own \
-             insertXrefEntry does not validate offsets either); only the \
-             ObjStm gap-filler's own byte slicing must not panic on it"
+             insertXrefEntry does not validate offsets; later object reads validate use)"
         );
     }
 
@@ -3067,7 +2851,6 @@ mod tests {
         let mut parsed_xref_streams = BTreeMap::new();
         let mut repair_diagnostics = Diagnostics::default();
         let mut trailer_references = BTreeSet::new();
-        let mut deleted_object_numbers = BTreeSet::new();
         let options = XrefLoadOptions {
             allow_repair: true,
             ..XrefLoadOptions::default()
@@ -3081,7 +2864,6 @@ mod tests {
             &mut parsed_xref_streams,
             &mut repair_diagnostics,
             &mut trailer_references,
-            &mut deleted_object_numbers,
         )
         .expect("candidate re-enters and follows its own /Prev chain");
 

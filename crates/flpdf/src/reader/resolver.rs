@@ -773,16 +773,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "input ended before the detected PDF header offset",
             )
         })?;
-        let mut new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
-        // `recover_xref_entries` only performs qpdf's own line scan; this
-        // resolve-time retry has no candidate-xref-stream re-entry of its
-        // own to prioritize over (unlike `recover_xref_from_linear_scan`),
-        // so it can gap-fill immediately (see `recover_objstm_compressed_entries`'s doc).
-        crate::xref::recover_objstm_compressed_entries(
-            logical_bytes,
-            &mut new_entries,
-            &std::collections::BTreeSet::new(),
-        );
+        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
 
         {
             let mut core = self.core.borrow_mut();
@@ -7314,7 +7305,7 @@ mod tests {
     }
 
     #[test]
-    fn public_resolve_falls_back_to_legacy_for_recovered_compressed_entries() {
+    fn public_resolve_returns_null_for_unindexed_objstm_member() {
         let object_ref = ObjectRef::new(7, 0);
         let mut pdf = Pdf::open_mem_owned_with_options(
             recovered_objstm_member_pdf(),
@@ -7325,11 +7316,11 @@ mod tests {
         )
         .expect("open");
 
-        assert!(matches!(
+        assert_eq!(
             pdf.resolve(object_ref)
-                .expect("unsupported canonical class must fall back to legacy ObjStm resolution"),
-            crate::Object::Dictionary(_)
-        ));
+                .expect("an unindexed packed member must resolve to null"),
+            crate::Object::Null
+        );
         assert!(pdf.reconstructed_xref());
     }
 
@@ -7749,7 +7740,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_returns_unsupported_for_recovered_compressed_target() {
+    fn reconstruction_returns_null_for_unindexed_objstm_member() {
         let options = crate::PdfOpenOptions {
             repair: true,
             ..Default::default()
@@ -7757,13 +7748,14 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned_with_options(recovered_objstm_member_pdf(), options)
             .expect("open object-stream recovery fixture");
 
-        let error = pdf
-            .get_object_handle(ObjectRef::new(7, 0))
+        let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
+        handle
             .try_dereference()
-            .expect_err("compressed canonical resolution is not implemented");
-        assert!(
-            matches!(&error, Error::Unsupported(message) if message.contains("object 7 0")),
-            "a recovered type-2 entry must remain distinguishable from an absent object: {error:?}"
+            .expect("an unindexed packed member must resolve to null");
+        assert_eq!(
+            handle.unparse_resolved(),
+            b"null",
+            "reconstruction must not manufacture a type-2 entry for the packed member"
         );
     }
 
