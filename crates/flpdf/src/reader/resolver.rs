@@ -736,6 +736,39 @@ impl<R: Read + Seek> ResolverHandle<R> {
         route_warning(&logger, suppress_warnings, &description, offset, &message)
     }
 
+    /// [`Self::push_warning`] for a warning an object raised about itself.
+    ///
+    /// Three qpdf emitters reach this sink through `DocumentResolver::warn`,
+    /// and they build different exceptions. `typeWarning` and `objectWarning`
+    /// use `QPDFExc(qpdf_e_object, "", description, 0, message)`
+    /// (`libqpdf/QPDFObjectHandle.cc:2180-2188,2210`); `warnIfPossible`'s
+    /// context branch instead uses `qpdf_e_damaged_pdf` (`:2202`). All three
+    /// build their exception with an empty filename, so the object
+    /// description is the only location `QPDFExc::createWhat`
+    /// (`libqpdf/QPDFExc.cc:19-49`) can interpose — that part of the routing
+    /// is uniform even though the error code is not. `QPDF::resolve` reads
+    /// with an empty description (`libqpdf/QPDF.cc:1725`), which makes
+    /// `setLastObjectDescription` (`:1297-1309`) yield `"object N G"` and
+    /// never a file name. [`Self::push_warning`]'s input-source description
+    /// is the slot qpdf fills for `damagedPDF` warnings instead
+    /// (`libqpdf/QPDFParser.cc:512`, `input->getName()`), so reusing it here
+    /// would emit a file name qpdf does not. Object descriptions themselves
+    /// are not yet propagated, so this location is empty rather than
+    /// `"object N G"`.
+    ///
+    /// Same borrow discipline as [`Self::push_warning`]: the `borrow_mut()`
+    /// is taken and dropped before the logger write.
+    pub(crate) fn push_object_warning(&self, message: impl Into<String>) -> Result<()> {
+        let message = message.into();
+        let (logger, suppress_warnings) = {
+            let mut core = self.core.borrow_mut();
+            core.repair_diagnostics
+                .push(Diagnostic::warning(message.clone(), None));
+            (core.logger.clone(), core.suppress_warnings)
+        };
+        route_warning(&logger, suppress_warnings, "", None, &message)
+    }
+
     pub(crate) fn replay_warnings(&self, diagnostics: &Diagnostics) -> Result<()> {
         let (logger, suppress_warnings, description) = {
             let core = self.core.borrow();
@@ -1983,6 +2016,10 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
+    fn warn(&self, message: String) -> Result<()> {
+        self.push_object_warning(message)
+    }
+
     fn pipe_stream_data(
         &self,
         object_ref: ObjectRef,
@@ -2382,6 +2419,125 @@ mod tests {
         assert_eq!(
             output.lock().unwrap().as_slice(),
             b"WARNING: input.pdf (object 5 0, offset 123): expected endobj\n"
+        );
+    }
+
+    type CapturedWarnings = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+    /// A named resolver whose warnings are delivered rather than suppressed,
+    /// paired with the buffer its logger writes to.
+    fn named_resolver_with_captured_warnings() -> (
+        std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>>,
+        CapturedWarnings,
+    ) {
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, "input.pdf".to_owned()),
+            0,
+        );
+        (resolver, output)
+    }
+
+    #[test]
+    fn a_handle_warns_through_the_live_resolver_it_was_minted_from() {
+        // The end-to-end route acceptance asks for: an object emits through
+        // its own context and lands in the collection `Pdf::repair_diagnostics`
+        // hands back, without the caller holding a `&mut Pdf`.
+        let (resolver, output) = named_resolver_with_captured_warnings();
+        let erased: std::rc::Rc<dyn DocumentResolver> = resolver.clone();
+        let handle = crate::object_handle::ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            std::rc::Rc::downgrade(&erased),
+        );
+        handle.set_resolved(ObjectValue::Integer(7));
+
+        handle
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
+
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: operation for dictionary attempted on object of type integer: \
+              treating as empty\n"
+        );
+    }
+
+    #[test]
+    fn an_object_warning_carries_no_location_even_when_the_document_is_named() {
+        let (resolver, output) = named_resolver_with_captured_warnings();
+
+        resolver
+            .push_object_warning(
+                "operation for dictionary attempted on object of type integer: treating as empty",
+            )
+            .unwrap();
+
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: operation for dictionary attempted on object of type integer: \
+              treating as empty\n"
+        );
+    }
+
+    #[test]
+    fn an_object_warning_is_collected_with_document_warnings_in_emission_order() {
+        let (resolver, output) = named_resolver_with_captured_warnings();
+
+        resolver.push_warning("from the document").unwrap();
+        resolver.push_object_warning("from the object").unwrap();
+
+        let collected: Vec<_> = resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| (entry.message.clone(), entry.offset))
+            .collect();
+        assert_eq!(
+            collected,
+            vec![
+                ("from the document".to_owned(), None),
+                ("from the object".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: input.pdf: from the document\n\
+              WARNING: from the object\n"
+        );
+    }
+
+    #[test]
+    fn a_suppressed_object_warning_is_still_collected() {
+        let resolver = resolver_over(Vec::new());
+
+        resolver.push_object_warning("from the object").unwrap();
+
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["from the object"]
         );
     }
 
