@@ -10189,6 +10189,20 @@ mod warning_emission_tests {
     }
 
     #[test]
+    fn warn_if_possible_through_a_context_with_no_description_omits_the_prefix() {
+        // A live context found only via containment (no description of its
+        // own) must still emit the bare warning, matching `desc.is_empty()`
+        // in `warnIfPossible`'s own branch (`libqpdf/QPDFObjectHandle.cc:2196-2199`).
+        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let child = ObjectHandle::integer(10);
+        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
+
+        child.warn_if_possible("treating as empty").unwrap();
+
+        assert_eq!(warnings(&recorder), ["treating as empty"]);
+    }
+
+    #[test]
     fn try_get_key_without_leading_slash_formats_key() {
         let parent = ObjectHandle::dictionary(vec![]);
         let child = parent.try_get_key(b"NoSlash").unwrap();
