@@ -801,19 +801,18 @@ fn recover_trailer_from_xref_stream_candidate(
 
     // `reentry.loaded.entries` is already the live-only snapshot of
     // `reentry_registration` (free rows never get a map entry, matching
-    // `XrefRegistration::insert_free_xref_entry`). Insert its live entries,
-    // but block by object *number* rather than the exact `ObjectRef` --
-    // `occupied_numbers` mirrors `entries`' own object numbers so this
-    // priority check is O(1) instead of rescanning every existing key per
-    // recovered entry, and matches qpdf's `insertXrefEntry`/
-    // `insertFreeXrefEntry` (`QPDF.cc:1149-1206`) both keying priority off
-    // the number alone.
-    let mut occupied_numbers: HashSet<u32> =
-        entries.keys().map(|object_ref| object_ref.number).collect();
+    // `XrefRegistration::insert_free_xref_entry`). Live-entry priority is
+    // exact-`ObjectRef` keyed, matching qpdf's `insertXrefEntry`
+    // (`QPDF.cc:1149-1181`): `m->xref_table.try_emplace(QPDFObjGen(obj, f2))`
+    // only disregards the candidate's entry when the line scan already
+    // populated that *same* (number, generation) pair -- an obsolete
+    // generation's own leftover entry from the line scan must not suppress
+    // the candidate's entry for a distinct generation of the same object
+    // number (only `insertFreeXrefEntry`'s `m->deleted_objects`,
+    // `QPDF.cc:1187-1190`, is number-wide; that path is `deleted_object_numbers`
+    // below, not this one).
     for (object_ref, xref_entry) in reentry.loaded.entries {
-        if occupied_numbers.insert(object_ref.number) {
-            entries.insert(object_ref, xref_entry);
-        }
+        entries.entry(object_ref).or_insert(xref_entry);
     }
     // The candidate/its `/Prev` chain's own free rows have no map presence
     // to block the ObjStm gap-filler with (`reentry_registration.entries`
@@ -2709,7 +2708,7 @@ mod tests {
         // the reconstructed table (objects 1, 3, 4, 8 recovered).
         fn entry(entry_type: u8, f1: u32, f2: u8) -> [u8; 4] {
             let f1_bytes = f1.to_be_bytes();
-            [entry_type, f1_bytes[1], f1_bytes[2], f2]
+            [entry_type, f1_bytes[2], f1_bytes[3], f2]
         }
 
         let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -2810,7 +2809,7 @@ mod tests {
         // merge would) leaves `(7, 0)` open to resurrection.
         fn entry(entry_type: u8, f1: u32, f2: u8) -> [u8; 4] {
             let f1_bytes = f1.to_be_bytes();
-            [entry_type, f1_bytes[1], f1_bytes[2], f2]
+            [entry_type, f1_bytes[2], f1_bytes[3], f2]
         }
 
         let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -2890,6 +2889,95 @@ mod tests {
                 Some(crate::XrefEntry::Compressed { .. })
             ),
             "object 7 must not be resurrected as compressed at any generation"
+        );
+    }
+
+    #[test]
+    fn xref_stream_candidate_live_entry_merge_keeps_distinct_generations() {
+        // qpdf's `insertXrefEntry` (`QPDF.cc:1149-1181`) keys live-entry
+        // priority off the *exact* `QPDFObjGen(obj, f2)` via
+        // `m->xref_table.try_emplace(...)` -- only an entry for that same
+        // (number, generation) pair blocks a later one. Only
+        // `insertFreeXrefEntry`'s own `m->deleted_objects` (`QPDF.cc:1187-1190`)
+        // is number-wide. Object number alone is therefore too coarse a key
+        // for the live-entry merge below: the line scan can discover an
+        // obsolete generation's own leftover body text (`7 1 obj`, still
+        // physically present even though a later revision superseded it)
+        // while the candidate xref stream's own current revision supplies a
+        // *different* generation (`7 0`, packed into an ObjStm) -- these are
+        // two distinct, independently valid `ObjectRef`s that must both
+        // survive, not a collision.
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+
+        let off1 = bytes.len() as u32;
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let off7g1 = bytes.len() as u32;
+        bytes.extend_from_slice(b"7 1 obj\n<< /Foo /Stale >>\nendobj\n");
+
+        let off9 = bytes.len() as u32;
+        let objstm_header = b"7 0\n";
+        let objstm_body = b"<< /Foo /Current >>\n";
+        let mut objstm_payload = objstm_header.to_vec();
+        objstm_payload.extend_from_slice(objstm_body);
+        bytes.extend_from_slice(b"9 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /ObjStm /N 1 /First {} /Length {} >>\n",
+                objstm_header.len(),
+                objstm_payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"stream\n");
+        bytes.extend_from_slice(&objstm_payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        fn entry(entry_type: u8, f1: u32, f2: u8) -> [u8; 4] {
+            let f1_bytes = f1.to_be_bytes();
+            [entry_type, f1_bytes[2], f1_bytes[3], f2]
+        }
+
+        let off3 = bytes.len() as u32;
+        let mut xref_entries = Vec::new();
+        xref_entries.extend(entry(0, 0, 0)); // 0 free
+        xref_entries.extend(entry(1, off1, 0)); // 1
+        xref_entries.extend(entry(1, off3, 0)); // 3 = this stream
+        xref_entries.extend(entry(2, 9, 0)); // 7 gen 0, compressed in objstm 9, index 0
+        xref_entries.extend(entry(1, off9, 0)); // 9 = the objstm
+        bytes.extend_from_slice(b"3 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /W [1 2 1] /Size 10 /Index [0 1 1 1 3 1 7 1 9 1] /Length {} >>\n",
+                xref_entries.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(b"stream\n");
+        bytes.extend_from_slice(&xref_entries);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+        assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+
+        let mut input = Cursor::new(bytes);
+        let loaded = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect("qpdf recovers the trailer from the reconstructed /XRef stream candidate");
+
+        assert_eq!(
+            loaded.entries.get(&crate::ObjectRef::new(7, 1)),
+            Some(&crate::XrefEntry::Uncompressed {
+                offset: off7g1 as u64
+            }),
+            "the line scan's own obsolete-generation entry must survive the merge"
+        );
+        assert_eq!(
+            loaded.entries.get(&crate::ObjectRef::new(7, 0)),
+            Some(&crate::XrefEntry::Compressed {
+                stream: 9,
+                index: 0
+            }),
+            "the candidate xref stream's current-generation entry must not be suppressed \
+             just because object number 7 already has an entry at a different generation"
         );
     }
 
