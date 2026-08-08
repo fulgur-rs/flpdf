@@ -2666,6 +2666,49 @@ mod tests {
     }
 
     #[test]
+    fn canonical_live_parser_stamps_root_and_nested_descriptions() {
+        let resolver = resolver_over_named_object(
+            b"1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> >>\nendobj\n".to_vec(),
+            ObjectRef::new(1, 0),
+            "input.pdf",
+        );
+        let root = resolver.get_object_handle(ObjectRef::new(1, 0));
+        root.try_dereference().expect("live object should resolve");
+
+        assert_eq!(root.description(), "input.pdf, object 1 0 at offset 10");
+        let level_one = root
+            .as_dictionary()
+            .and_then(|values| values.get(b"L1".as_slice()).cloned())
+            .expect("level one dictionary");
+        assert_eq!(
+            level_one.description(),
+            "input.pdf, object 1 0 at offset 17"
+        );
+
+        let level_two = level_one
+            .as_dictionary()
+            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .expect("level two dictionary");
+        assert_eq!(
+            level_two.description(),
+            "input.pdf, object 1 0 at offset 24"
+        );
+
+        let value = level_two
+            .as_dictionary()
+            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .expect("deep scalar");
+        assert_eq!(value.description(), "input.pdf, object 1 0 at offset 32");
+
+        level_two
+            .object_warning("deep container description")
+            .expect("nested dictionary keeps the document context");
+        value
+            .object_warning("deep scalar description")
+            .expect("nested scalar keeps the document context");
+    }
+
+    #[test]
     fn parser_created_direct_values_do_not_keep_a_dropped_resolver_alive() {
         let value = {
             let resolver = resolver_over(b"1 0 obj\n<< /Value 7 >>\nendobj\n".to_vec());
@@ -2783,6 +2826,23 @@ mod tests {
             false, // already_reconstructed
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        )
+    }
+
+    fn resolver_over_named_object(
+        bytes: Vec<u8>,
+        object_ref: ObjectRef,
+        description: &str,
+    ) -> std::rc::Rc<ResolverHandle<Cursor<Vec<u8>>>> {
+        ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset: 0 })]),
+            false,
+            false, // already_reconstructed
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, description.to_owned()),
             0,
         )
     }

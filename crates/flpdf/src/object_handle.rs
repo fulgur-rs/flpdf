@@ -162,6 +162,27 @@ mod parse_tests {
     }
 
     #[test]
+    fn parse_without_context_stamps_the_qpdf_parsed_object_description() {
+        let parsed = ObjectHandle::parse(b"<< /Value 7 >>")
+            .expect("direct values do not need a parse context");
+
+        assert_eq!(parsed.description(), "parsed object,  at offset 2");
+        let value = parsed
+            .as_dictionary()
+            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .expect("parsed scalar");
+        assert_eq!(value.description(), "parsed object,  at offset 10");
+
+        let error = value
+            .object_warning("contextless explicit parse")
+            .expect_err("an explicit parse must remain contextless");
+        assert!(matches!(
+            error,
+            crate::Error::System(message) if message == "contextless explicit parse"
+        ));
+    }
+
+    #[test]
     fn parse_without_context_turns_recovery_warnings_into_errors() {
         let error = ObjectHandle::parse(b"{").expect_err("qpdf warning must fail explicit parse");
 
