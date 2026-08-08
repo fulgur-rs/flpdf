@@ -7016,6 +7016,27 @@ mod tests {
         pdf
     }
 
+    fn synthetic_mismatch_discovers_unindexed_object_pdf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let object_two_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\ntrue\nendobj\n");
+        pdf.extend_from_slice(b"1 0 obj\n(recovered)\nendobj\n");
+        pdf.extend_from_slice(b"3 0 obj\n99\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{object_two_offset:010} 00000 n \n{object_two_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     /// A recovered stream whose original xref entries both point into the
     /// first object's dictionary.  The stale second offset is intentionally
     /// between the real object boundaries so it can truncate a legacy read
@@ -7598,6 +7619,37 @@ mod tests {
                 .expect("resolve rewritten object"),
             crate::Object::Integer(42),
             "a recovered standalone object must be emitted outside the obsolete ObjStm"
+        );
+    }
+
+    #[test]
+    fn handle_recovery_updates_public_object_enumeration() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_discovers_unindexed_object_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open enumeration recovery fixture");
+        let recovered_ref = ObjectRef::new(1, 0);
+        let discovered_ref = ObjectRef::new(3, 0);
+
+        assert!(!pdf.object_refs().contains(&discovered_ref));
+        assert!(!pdf.live_object_refs().contains(&discovered_ref));
+
+        pdf.get_object_handle(recovered_ref)
+            .try_dereference()
+            .expect("handle resolution must reconstruct the xref");
+
+        assert!(pdf.reconstructed_xref());
+        assert!(
+            pdf.object_refs().contains(&discovered_ref),
+            "object_refs must include objects discovered by handle-driven recovery"
+        );
+        assert!(
+            pdf.live_object_refs().contains(&discovered_ref),
+            "live_object_refs must follow the reconstructed live xref"
         );
     }
 

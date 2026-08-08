@@ -76,6 +76,65 @@ impl ObjectCache {
         self.entries = entries;
     }
 
+    /// Return refs as if the cache had been reconciled with a resolver xref,
+    /// without mutating the cache. Direct [`ObjectHandle`] resolution can
+    /// reconstruct the canonical xref without holding `&mut Pdf`, so the
+    /// read-only enumeration APIs need this view until a later mutable path
+    /// performs the eager synchronization.
+    pub(crate) fn refs_after_xref_recovery(
+        &self,
+        xref: &BTreeMap<ObjectRef, XrefEntry>,
+        live_only: bool,
+    ) -> Vec<ObjectRef> {
+        let mut refs = BTreeSet::new();
+
+        for (object_ref, previous_entry) in &self.entries {
+            let include = if self.deleted_refs.contains(object_ref) {
+                Self::include_in_ref_view(&CacheEntry::Deleted, live_only)
+            } else {
+                match previous_entry {
+                    CacheEntry::Resolved(_) | CacheEntry::Reserved => {
+                        Self::include_in_ref_view(previous_entry, live_only)
+                    }
+                    CacheEntry::Unresolved { .. }
+                    | CacheEntry::Compressed { .. }
+                    | CacheEntry::Missing
+                    | CacheEntry::Deleted => xref
+                        .get(object_ref)
+                        .copied()
+                        .map(Self::entry_from_xref)
+                        .is_some_and(|entry| Self::include_in_ref_view(&entry, live_only)),
+                }
+            };
+
+            if include {
+                refs.insert(*object_ref);
+            }
+        }
+
+        for (object_ref, xref_entry) in xref {
+            if !self.entries.contains_key(object_ref)
+                && !self.deleted_refs.contains(object_ref)
+                && Self::include_in_ref_view(&Self::entry_from_xref(*xref_entry), live_only)
+            {
+                refs.insert(*object_ref);
+            }
+        }
+
+        refs.into_iter().collect()
+    }
+
+    fn include_in_ref_view(entry: &CacheEntry, live_only: bool) -> bool {
+        if live_only {
+            !matches!(
+                entry,
+                CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved
+            )
+        } else {
+            !matches!(entry, CacheEntry::Missing)
+        }
+    }
+
     pub fn entry(&self, object_ref: ObjectRef) -> Option<&CacheEntry> {
         self.entries.get(&object_ref)
     }
@@ -227,5 +286,11 @@ mod tests {
             cache.entry(new_ref),
             Some(CacheEntry::Unresolved { offset: 707 })
         ));
+        assert_eq!(
+            cache.object_refs(),
+            (1..=7)
+                .map(|number| ObjectRef::new(number, 0))
+                .collect::<Vec<_>>()
+        );
     }
 }

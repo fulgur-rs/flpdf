@@ -1345,6 +1345,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// Every object reference known from the cross-reference table, including objects
     /// that have not yet been parsed.
     pub fn object_refs(&self) -> Vec<ObjectRef> {
+        if self.resolver.reconstructed_xref() {
+            return self
+                .cache
+                .refs_after_xref_recovery(&self.resolver.xref_entries(), false);
+        }
+
         self.cache
             .entries()
             .iter()
@@ -1368,6 +1374,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// is a real null indirect object (e.g. `1 0 obj null endobj`), not an
     /// absent one.
     pub fn live_object_refs(&self) -> Vec<ObjectRef> {
+        if self.resolver.reconstructed_xref() {
+            return self
+                .cache
+                .refs_after_xref_recovery(&self.resolver.xref_entries(), true);
+        }
+
         self.cache
             .entries()
             .iter()
