@@ -848,14 +848,6 @@ fn recover_trailer_from_xref_stream_candidate(
         &reentry_registration.deleted_objects,
         repair_diagnostics,
     );
-    // The candidate/its `/Prev` chain's own free rows have no map presence
-    // to block the ObjStm gap-filler with (`reentry_registration.entries`
-    // never holds them either); surface the object numbers directly so the
-    // caller can seed the gap-filler's occupied-number set with them,
-    // mirroring qpdf's `m->deleted_objects` (`std::set<int>`, `QPDF.hh:1466`)
-    // discarding a type-0 row's own generation field
-    // (`QPDF.cc:1120-1124`, "Ignore fields[2]").
-    deleted_object_numbers.extend(reentry_registration.deleted_objects);
 
     Ok((candidate.trailer, max_offset, reentry.loaded.last_xref_form))
 }
