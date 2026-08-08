@@ -292,5 +292,19 @@ mod tests {
                 .map(|number| ObjectRef::new(number, 0))
                 .collect::<Vec<_>>()
         );
+        assert_eq!(
+            cache.refs_after_xref_recovery(&live, false),
+            (1..=5)
+                .chain(std::iter::once(7))
+                .map(|number| ObjectRef::new(number, 0))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            cache.refs_after_xref_recovery(&live, true),
+            [1, 4, 5, 7]
+                .into_iter()
+                .map(|number| ObjectRef::new(number, 0))
+                .collect::<Vec<_>>()
+        );
     }
 }
