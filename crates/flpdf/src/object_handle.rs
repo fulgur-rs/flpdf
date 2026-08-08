@@ -1013,14 +1013,17 @@ impl ObjectHandle {
                     None
                 }
                 ObjectState::Resolved(value) => {
+                    slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
                     Some(value)
                 }
                 ObjectState::NotYetResolved => {
+                    slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
                     None
                 }
                 ObjectState::Destroyed => {
+                    slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
                     None
                 }
@@ -6275,6 +6278,18 @@ mod resolution_state_tests {
         handle.disconnect();
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
+    #[test]
+    fn disconnect_clears_a_previously_recorded_description() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Integer(7));
+        handle.set_description("input.pdf, object 1 0 at offset $PO".to_owned(), 100);
+        assert!(handle.description().contains("offset"));
+
+        handle.disconnect();
+
+        assert_eq!(handle.description(), "");
     }
 
     #[test]

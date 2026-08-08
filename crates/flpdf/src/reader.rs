@@ -1256,6 +1256,7 @@ impl<R: Read + Seek> Pdf<R> {
         {
             let dict_value = ObjectValue::Dictionary(self.lift_dictionary(&stream.dict, 0)?);
             existing_dict.replace_direct_value(dict_value);
+            existing_dict.clear_description();
             return Ok(ObjectValue::Stream {
                 stream_dict: existing_dict,
                 stream_data: Some(Rc::new(stream.data.clone())),
@@ -1934,7 +1935,7 @@ impl<R: Read + Seek> Pdf<R> {
             Some(XrefEntry::Uncompressed { offset })
                 if !self.transformed_stream_refs.contains(&object_ref) =>
             {
-                match self.native_parse_uncompressed_value(offset, &object) {
+                match self.native_parse_uncompressed_value(object_ref, offset, &object) {
                     Ok(native) => {
                         native_parsed = true;
                         native
@@ -1976,6 +1977,14 @@ impl<R: Read + Seek> Pdf<R> {
         }
         handle.set_resolved(value);
         handle.set_parsed_offset_if_unset(parsed_offset);
+        if native_parsed && !handle.is_null() {
+            let description = if handle.as_stream_dict().is_some() {
+                self.resolver.stream_description(object_ref)
+            } else {
+                self.resolver.parser_description_template(object_ref)
+            };
+            handle.set_description(description, parsed_offset);
+        }
         Ok(())
     }
 
@@ -2163,6 +2172,7 @@ impl<R: Read + Seek> Pdf<R> {
     // to `lift`", never as a hard failure.
     fn native_parse_uncompressed_value(
         &mut self,
+        object_ref: ObjectRef,
         offset: u64,
         object: &Object,
     ) -> Result<(ObjectValue, i64)> {
@@ -2176,9 +2186,14 @@ impl<R: Read + Seek> Pdf<R> {
 
         let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
         let base_offset = file_origin + body_start as i64;
-        let (value, value_offset) =
-            crate::parser::parse_qpdf_direct_object_handle(&bytes[body_start..], base_offset, self)
-                .map_err(|error| error.rebase_offset(body_start))?;
+        let description_template = self.resolver.parser_description_template(object_ref);
+        let (value, value_offset) = crate::parser::parse_qpdf_direct_object_handle(
+            &bytes[body_start..],
+            base_offset,
+            Some(description_template.clone()),
+            self,
+        )
+        .map_err(|error| error.rebase_offset(body_start))?;
 
         let Object::Stream(stream) = object else {
             return Ok((value, value_offset));
@@ -2223,6 +2238,7 @@ impl<R: Read + Seek> Pdf<R> {
         };
         let dict_handle = ObjectHandle::from_value(value);
         dict_handle.set_parsed_offset_if_unset(value_offset);
+        dict_handle.set_description(description_template, value_offset);
         let stream_offset = file_origin + data_start as i64;
         Ok((
             ObjectValue::Stream {
@@ -8481,6 +8497,65 @@ mod tests {
                 .expect("replacement warning is recorded")
                 .message,
             "object 1 0: replacement warning"
+        );
+    }
+
+    #[test]
+    fn set_object_drops_the_reused_stream_dictionary_source_description() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 5 >>\nstream\nHello\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve stream");
+        let dictionary = handle.as_stream_dict().expect("stream dictionary");
+        assert!(
+            dictionary.description().contains("offset"),
+            "the fixture must establish a source description before replacement"
+        );
+
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("Length", Object::Integer(3));
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, b"Bye".to_vec())),
+        );
+
+        assert_eq!(
+            handle
+                .as_stream_dict()
+                .expect("stream dictionary after replacement")
+                .description(),
+            "",
+            "the reused dictionary must no longer identify the replaced source bytes"
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_stamps_the_public_native_root_and_nested_handles() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Nested << /Value 7 >> >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve through the public native bridge");
+
+        assert!(
+            handle.description().contains("object 1 0 at offset"),
+            "the canonical root must retain its source description"
+        );
+        let nested = handle
+            .as_dictionary()
+            .and_then(|entries| entries.get(b"Nested".as_slice()).cloned())
+            .expect("nested dictionary");
+        assert!(
+            nested.description().contains("object 1 0 at offset"),
+            "the nested direct handle must retain its source description"
         );
     }
 

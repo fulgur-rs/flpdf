@@ -648,7 +648,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         ObjectHandle::from_value_with_resolver(value, resolver)
     }
 
-    fn parser_description_template(&self, object_ref: ObjectRef) -> String {
+    pub(crate) fn parser_description_template(&self, object_ref: ObjectRef) -> String {
         let input_description = self.core.borrow().description.clone();
         format!(
             "{}, object {} {} at offset $PO",
@@ -656,7 +656,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
-    fn stream_description(&self, object_ref: ObjectRef) -> String {
+    pub(crate) fn stream_description(&self, object_ref: ObjectRef) -> String {
         let input_description = self.core.borrow().description.clone();
         format!(
             "{}, stream object {} {}",

@@ -1627,10 +1627,12 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
 pub(crate) fn parse_qpdf_direct_object_handle(
     input: &[u8],
     base_offset: i64,
+    description_template: Option<String>,
     resolver: &mut dyn HandleResolver,
 ) -> Result<(ObjectValue, i64)> {
     let mut tokenizer = Tokenizer::new(input);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
+    parser.description_template = description_template;
     parser.top_level_no_reference = true;
     let token = parser.peek_token()?;
     if token.is_word_value(b"endobj") {
@@ -1759,6 +1761,11 @@ pub(crate) struct Parser<'tokenizer, 'input> {
     content_good_count: usize,
     content_bad_count: usize,
     content_give_up: bool,
+    /// Description template supplied by the owning document for the
+    /// handle-producing bridge. The live parser has its own copy of this
+    /// state; this field covers the older `Parser::object_handle` route used
+    /// by `parse_qpdf_direct_object_handle`.
+    description_template: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1813,6 +1820,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             content_good_count: 0,
             content_bad_count: 0,
             content_give_up: false,
+            description_template: None,
         }
     }
 
@@ -2225,22 +2233,22 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             TokenType::DictOpen => {
                 let offset = base_offset + token.start as i64;
                 let value = self.dictionary_handle(base_offset, resolver)?;
-                Ok(Self::wrap_direct(value, offset))
+                Ok(self.wrap_direct(value, offset))
             }
             TokenType::ArrayOpen => {
                 let offset = base_offset + token.start as i64;
                 let value = self.array_handle(base_offset, resolver)?;
-                Ok(Self::wrap_direct(value, offset))
+                Ok(self.wrap_direct(value, offset))
             }
-            TokenType::Name => Ok(Self::wrap_direct(
+            TokenType::Name => Ok(self.wrap_direct(
                 ObjectValue::Name(token.value[1..].to_vec()),
                 base_offset + token.start as i64,
             )),
-            TokenType::String => Ok(Self::wrap_direct(
+            TokenType::String => Ok(self.wrap_direct(
                 ObjectValue::String(token.value),
                 base_offset + token.start as i64,
             )),
-            TokenType::Bool => Ok(Self::wrap_direct(
+            TokenType::Bool => Ok(self.wrap_direct(
                 ObjectValue::Boolean(token.value == b"true"),
                 base_offset + token.start as i64,
             )),
@@ -2310,7 +2318,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         let offset = base_offset + first_token.start as i64;
         match self.integer_or_ref_decision(&first_token)? {
             IntegerOrRefDecision::Integer(n) => {
-                Ok(Self::wrap_direct(ObjectValue::Integer(n), offset))
+                Ok(self.wrap_direct(ObjectValue::Integer(n), offset))
             }
             // The referenced handle's own offset is populated only when (if
             // ever) it is itself parsed as a top-level object — a reference
@@ -2329,12 +2337,16 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
                 ObjectValue::RealLiteral { value, literal }
             }
         };
-        Ok(Self::wrap_direct(value, offset))
+        Ok(self.wrap_direct(value, offset))
     }
 
-    fn wrap_direct(value: ObjectValue, offset: i64) -> ObjectHandle {
+    fn wrap_direct(&self, value: ObjectValue, offset: i64) -> ObjectHandle {
         let handle = ObjectHandle::from_value(value);
-        handle.set_parsed_offset_if_unset(offset);
+        if let Some(description) = &self.description_template {
+            handle.set_description(description.clone(), offset);
+        } else {
+            handle.set_parsed_offset_if_unset(offset);
+        }
         handle
     }
 }
@@ -3167,8 +3179,9 @@ mod handle_path_parity_tests {
     fn parse_qpdf_direct_object_handle_recovers_empty_body_as_null() {
         let input = b" \nendobj\n";
         let mut resolver = NullResolver;
-        let (value, offset) = super::parse_qpdf_direct_object_handle(input, 100, &mut resolver)
-            .expect("empty body recovers as null");
+        let (value, offset) =
+            super::parse_qpdf_direct_object_handle(input, 100, None, &mut resolver)
+                .expect("empty body recovers as null");
         assert!(matches!(value, crate::object_handle::ObjectValue::Null));
         assert_eq!(offset, -1);
     }
