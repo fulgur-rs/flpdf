@@ -1042,7 +1042,14 @@ impl ObjectHandle {
     pub(crate) fn set_description_json(&self, input: String, object: String, offset: i64) {
         let mut slot = self.0.borrow_mut();
         slot.description = Some(ObjectDescription::Json(JsonDescription { input, object }));
-        slot.parsed_offset = offset;
+        // qpdf writes the description offset through the same set-once guard
+        // as any other parsed offset (`QPDFValue::setDescription` calls
+        // `setParsedOffset`, `libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so a
+        // value that already carries an operational offset (e.g. a stream's
+        // encoded-data start) keeps it.
+        if slot.parsed_offset < 0 {
+            slot.parsed_offset = offset;
+        }
     }
 
     /// Emit `message` through this handle's context, or report it as the
@@ -1071,13 +1078,16 @@ impl ObjectHandle {
     pub(crate) fn set_description(&self, description: String, offset: i64) {
         let mut slot = self.0.borrow_mut();
         slot.description = Some(ObjectDescription::Template(description));
-        slot.parsed_offset = offset;
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn set_default_description(&self, object_ref: ObjectRef) {
-        let mut slot = self.0.borrow_mut();
-        slot.object_ref = Some(object_ref);
+        // Set-once, matching qpdf's `setParsedOffset` guard that
+        // `QPDFValue::setDescription` calls through
+        // (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`). `QPDF_Stream::setDescription`
+        // delegates to the same guarded setter (`QPDF_Stream.cc:299-302`), so a
+        // stream's already-recorded encoded-data start survives a later
+        // description assignment rather than being overwritten by the
+        // description's own offset.
+        if slot.parsed_offset < 0 {
+            slot.parsed_offset = offset;
+        }
     }
 
     #[allow(dead_code)]
@@ -10057,7 +10067,13 @@ mod warning_emission_tests {
     fn object_description_template_placeholders_and_offset_shifts() {
         let dict = ObjectHandle::dictionary(vec![]);
         dict.set_description("object $OG at offset $PO".to_owned(), 100);
-        dict.set_default_description(ObjectRef::new(5, 0));
+        // `$OG` needs indirect identity; qpdf only ever installs that
+        // together with the owning document (`QPDFValue::setDefaultDescription`,
+        // `libqpdf/qpdf/QPDFValue.hh:66-71`), so promote through the same
+        // atomic primitive flpdf already uses for that pairing rather than
+        // writing `object_ref` alone.
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        dict.promote_to_indirect(ObjectRef::new(5, 0), 1, Rc::downgrade(&resolver));
         assert_eq!(dict.description(), "object 5 0 at offset 102");
 
         let arr = ObjectHandle::array(vec![]);
@@ -10067,6 +10083,34 @@ mod warning_emission_tests {
         let scalar = ObjectHandle::integer(42);
         scalar.set_description("scalar at offset $PO".to_owned(), 300);
         assert_eq!(scalar.description(), "scalar at offset 300");
+    }
+
+    #[test]
+    fn set_description_does_not_overwrite_an_already_recorded_parsed_offset() {
+        // Mirrors a parsed stream: `ObjectSlot::parsed_offset` already holds
+        // the encoded stream-data start `pipe_stream_data` reads from before
+        // any description is attached. `QPDFValue::setDescription` routes
+        // through the same set-once `setParsedOffset` guard every other
+        // caller uses (`libqpdf/qpdf/QPDFValue.hh:60-65,90-100`), so the
+        // operational offset must survive.
+        let stream = ObjectHandle::integer(7);
+        stream.set_parsed_offset_if_unset(500);
+
+        stream.set_description("stream object $OG at offset $PO".to_owned(), 999);
+
+        assert_eq!(stream.get_parsed_offset(), 500);
+        assert_eq!(stream.description(), "stream object  at offset 500");
+    }
+
+    #[test]
+    fn set_description_json_does_not_overwrite_an_already_recorded_parsed_offset() {
+        let stream = ObjectHandle::integer(7);
+        stream.set_parsed_offset_if_unset(500);
+
+        stream.set_description_json("input.pdf".to_owned(), "object 1 0".to_owned(), 999);
+
+        assert_eq!(stream.get_parsed_offset(), 500);
+        assert_eq!(stream.description(), "input.pdf, object 1 0 at offset 500");
     }
 
     #[test]
@@ -10085,8 +10129,7 @@ mod warning_emission_tests {
 
     #[test]
     fn object_description_indirect_fallback() {
-        let handle = ObjectHandle::null();
-        handle.set_default_description(ObjectRef::new(12, 0));
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(12, 0), NO_PARSED_OFFSET);
         assert_eq!(handle.description(), "object 12 0");
     }
 
