@@ -2472,6 +2472,44 @@ fn ignore_xref_streams_falls_back_to_reconstruction() {
 }
 
 #[test]
+fn ignore_xref_streams_cannot_reconstruct_a_document_without_a_trailer_keyword() {
+    let (bytes, xref_stream_offset) = xref_stream_document(false);
+
+    let err = open_error(
+        bytes,
+        ignore_xref_streams_options(true),
+        "a document with no trailer keyword cannot be reconstructed",
+    );
+    let (source, diagnostics) = err.open_failure().expect("open failure diagnostics");
+
+    // The warnings preceding the failure match qpdf 11.9.0 exactly, observed on
+    // this document shape with `--ignore-xref-streams`.
+    assert_eq!(
+        diagnostics
+            .entries()
+            .iter()
+            .map(|entry| (entry.message.as_str(), entry.offset))
+            .collect::<Vec<_>>(),
+        [
+            ("file is damaged", None),
+            ("xref not found", Some(xref_stream_offset)),
+            ("Attempting to reconstruct cross-reference table", None),
+        ]
+    );
+
+    // Known divergence, message only: both implementations fail here, but qpdf
+    // reports "error decoding candidate xref stream while recovering damaged
+    // file". Its reconstruct_xref takes the last candidate /XRef stream's
+    // dictionary as the trailer and re-enters read_xref, which hits the same
+    // gate; flpdf's recover_trailer searches only for the `trailer` keyword.
+    // This assertion changes when that fallback is ported.
+    assert_eq!(
+        source.to_string(),
+        "parse error at byte 0: trailer dictionary not found"
+    );
+}
+
+#[test]
 fn ignore_xref_streams_applies_to_previous_xref_sections() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
