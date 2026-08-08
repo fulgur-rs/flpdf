@@ -677,8 +677,10 @@ fn write_pdf_deletes_object_with_free_incremental_xref_entry() {
     write_pdf(&mut pdf, &mut output).unwrap();
 
     let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(latest_entries.get(&0), Some(&b'f'));
     assert_eq!(latest_entries.get(&3), Some(&b'f'));
     let latest_generations = parse_last_xref_generations(&output);
+    assert_eq!(latest_generations.get(&0), Some(&65535));
     assert_eq!(latest_generations.get(&3), Some(&1));
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
@@ -686,14 +688,8 @@ fn write_pdf_deletes_object_with_free_incremental_xref_entry() {
 
     let mut output_reader = Cursor::new(&output);
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
-    assert_eq!(
-        loaded.entries.get(&ObjectRef::new(0, 65535)),
-        Some(&XrefEntry::Free { next: 3 })
-    );
-    assert_eq!(
-        loaded.entries.get(&ObjectRef::new(3, 1)),
-        Some(&XrefEntry::Free { next: 0 })
-    );
+    assert_eq!(loaded.entries.get(&ObjectRef::new(0, 65535)), None);
+    assert_eq!(loaded.entries.get(&ObjectRef::new(3, 1)), None);
 
     if is_qpdf_available() {
         let path =
@@ -777,7 +773,7 @@ fn set_object_after_delete_keeps_object_live() {
 }
 
 #[test]
-fn delete_object_ignores_existing_free_tombstone() {
+fn delete_object_emits_a_new_tombstone_for_a_source_free_ref() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut object_offsets = Vec::new();
 
@@ -813,12 +809,15 @@ fn delete_object_ignores_existing_free_tombstone() {
     let mut output = Vec::new();
     write_pdf(&mut pdf, &mut output).unwrap();
 
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(latest_entries.get(&2), Some(&b'f'));
+    let latest_generations = parse_last_xref_generations(&output);
+    assert_eq!(latest_generations.get(&2), Some(&2));
+
     let mut output_reader = Cursor::new(&output);
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
-    assert_eq!(
-        loaded.entries.get(&ObjectRef::new(2, 1)),
-        Some(&XrefEntry::Free { next: 0 })
-    );
+    assert_eq!(loaded.entries.get(&ObjectRef::new(2, 1)), None);
+    assert_eq!(loaded.entries.get(&ObjectRef::new(2, 2)), None);
 }
 
 #[test]
@@ -1190,7 +1189,7 @@ fn write_pdf_preserves_large_compressed_xref_stream_index() {
 }
 
 #[test]
-fn write_pdf_preserves_xref_stream_free_tombstones() {
+fn write_pdf_does_not_reemit_source_xref_stream_free_tombstones() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut object_offsets = Vec::new();
 
@@ -1259,14 +1258,12 @@ fn write_pdf_preserves_xref_stream_free_tombstones() {
     write_pdf(&mut pdf, &mut output).unwrap();
 
     let latest_entries = parse_last_xref_entries(&output);
-    assert_eq!(latest_entries.get(&2), Some(&b'f'));
+    assert_eq!(latest_entries.get(&2), None);
 
     let mut output_reader = Cursor::new(&output);
     let loaded = load_xref_and_trailer(&mut output_reader).unwrap();
-    assert_eq!(
-        loaded.entries.get(&ObjectRef::new(2, 1)),
-        Some(&XrefEntry::Free { next: 0 })
-    );
+    assert_eq!(loaded.entries.get(&ObjectRef::new(2, 0)), None);
+    assert_eq!(loaded.entries.get(&ObjectRef::new(2, 1)), None);
 }
 
 #[test]
@@ -4252,12 +4249,17 @@ fn incremental_generate_combined_paths_packs_deletes_and_touches_existing_member
     // generation by 1 (incremented_generation), so the new free entry lives at
     // ObjectRef{ number: 4, generation: 1 } in the appended xref stream.
     let deleted_free_key = ObjectRef::new(deleted_ref.number, 1);
-    match loaded.entries.get(&deleted_free_key) {
-        Some(XrefEntry::Free { .. }) => {}
-        other => panic!(
-            "(b) deleted object {deleted_ref:?} must produce a Free xref entry at gen 1, got {other:?}"
-        ),
-    }
+    let latest_entries = parse_last_xref_entries(&output);
+    assert_eq!(
+        latest_entries.get(&deleted_ref.number),
+        Some(&b'f'),
+        "(b) deleted object {deleted_ref:?} must produce a type-0 xref entry"
+    );
+    assert_eq!(
+        loaded.entries.get(&deleted_free_key),
+        None,
+        "reader effective xref must not expose the writer's type-0 entry"
+    );
 
     // (c) existing-ObjStm member — IN-PLACE patch. The defining property of
     // this regression test: `stream` must remain the SOURCE container (3),

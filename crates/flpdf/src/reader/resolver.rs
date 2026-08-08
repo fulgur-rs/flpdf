@@ -977,32 +977,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .copied()
     }
 
-    /// A snapshot of the whole cross-reference table.
-    ///
-    /// Prefer [`Self::xref_refs_matching`] when only a selection of refs is
-    /// wanted: this clones every entry, and moving the table behind a
-    /// `RefCell` would otherwise make that the only option for all ten
-    /// existing consumers.
+    /// A snapshot of the whole effective cross-reference table. Free entries
+    /// are not present in the reader table; explicit cache deletion is a
+    /// separate mutable-document concern.
     pub(crate) fn xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.core.borrow().source_xref_entries.clone()
     }
 
-    /// The refs the source cross-reference table declares whose entry
-    /// satisfies `keep`, collected under a single short borrow.
-    ///
-    /// The escape hatch from [`Self::xref_entries`]: a caller that wants a
-    /// filtered list of refs gets one without cloning the table to filter it
-    /// and drop it again.
-    ///
-    /// `keep` runs while the borrow is held, so it inherits the module-level
-    /// hazard: a predicate that resolved something would re-enter. Every
-    /// in-tree predicate is a `matches!` over the entry it is handed.
-    pub(crate) fn xref_refs_matching(&self, keep: impl Fn(&XrefEntry) -> bool) -> Vec<ObjectRef> {
+    /// The refs declared by the effective source cross-reference table,
+    /// collected under a single short borrow.
+    pub(crate) fn xref_refs(&self) -> Vec<ObjectRef> {
         self.core
             .borrow()
             .source_xref_entries
             .iter()
-            .filter(|(_, entry)| keep(entry))
             .map(|(object_ref, _)| *object_ref)
             .collect()
     }

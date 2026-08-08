@@ -32,9 +32,11 @@ impl ObjectCache {
 
     fn entry_from_xref(xref_entry: XrefEntry) -> CacheEntry {
         match xref_entry {
-            XrefEntry::Free { .. } => CacheEntry::Deleted,
             XrefEntry::Uncompressed { offset } => CacheEntry::Unresolved { offset },
             XrefEntry::Compressed { stream, index } => CacheEntry::Compressed { stream, index },
+            XrefEntry::Free { .. } => {
+                unreachable!("reader effective xref cannot contain free entries")
+            }
         }
     }
 
