@@ -699,6 +699,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().reconstructed_xref
     }
 
+    /// Whether resolution-time damage recovery is enabled.
+    ///
+    /// qpdf's `m->attempt_recovery` (`include/qpdf/QPDF.hh:1461`) controls
+    /// whether a failed object read may trigger `reconstruct_xref`.
+    pub(crate) fn attempt_recovery(&self) -> bool {
+        self.core.borrow().attempt_recovery
+    }
+
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`
     /// recovery retry (`:1614-1637`).
     ///
@@ -7112,6 +7120,39 @@ mod tests {
     }
 
     #[test]
+    fn public_resolve_retries_a_recovered_header_mismatch() {
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(synthetic_mismatch_pdf(true), options).expect("open");
+
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(1, 0))
+                .expect("public resolve must use the reconstructed xref"),
+            crate::Object::String(b"recovered".to_vec()),
+            "the legacy public resolver must not turn a recoverable object into null"
+        );
+        assert!(pdf.reconstructed_xref());
+
+        let mut borrowed_pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_pdf(true),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open borrowed-resolve fixture");
+        assert_eq!(
+            borrowed_pdf
+                .resolve_borrowed(ObjectRef::new(1, 0))
+                .expect("public borrowed resolver must use the reconstructed xref"),
+            &crate::Object::String(b"recovered".to_vec())
+        );
+    }
+
+    #[test]
     fn mismatch_without_recovery_remains_error() {
         let bytes = synthetic_mismatch_pdf(true);
         let options = crate::PdfOpenOptions {
@@ -7420,6 +7461,58 @@ mod tests {
             pdf.compressed_parent(object_ref),
             None,
             "set_object must not preserve object-stream provenance from a stale pre-recovery cache entry"
+        );
+    }
+
+    #[test]
+    fn incremental_write_synchronizes_recovered_compressed_parent_provenance() {
+        let object_ref = ObjectRef::new(7, 0);
+        let stream_ref = ObjectRef::new(5, 0);
+        let mut pdf = Pdf::open_mem_owned(recovered_objstm_member_pdf()).expect("open fixture");
+        let stream_offset = match pdf.resolver.xref_entry(stream_ref) {
+            Some(XrefEntry::Uncompressed { offset }) => offset,
+            entry => panic!("object stream must have a type-1 xref entry, got {entry:?}"),
+        };
+
+        // This is the state immediately after editing a member that was
+        // originally in an object stream: `set_object` records the dirty
+        // value and its old compressed-parent provenance.
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        pdf.cache.set_compressed(object_ref, stream_ref.number, 0);
+        pdf.set_object(object_ref, crate::Object::Integer(42));
+        assert_eq!(
+            pdf.compressed_parent(object_ref),
+            Some((stream_ref, 0)),
+            "the pre-recovery edit must retain its original object-stream provenance"
+        );
+
+        // A later canonical recovery discovers that the same object is a
+        // standalone type-1 object. The writer must observe this live xref
+        // before classifying the dirty ref.
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        let mut output = Vec::new();
+        crate::write_pdf(&mut pdf, &mut output).expect("incremental write");
+
+        let mut reopened = Pdf::open_mem_owned(output).expect("reopen incremental output");
+        assert_eq!(
+            reopened
+                .resolve(object_ref)
+                .expect("resolve rewritten object"),
+            crate::Object::Integer(42),
+            "a recovered standalone object must be emitted outside the obsolete ObjStm"
         );
     }
 

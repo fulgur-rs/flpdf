@@ -1801,7 +1801,50 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(());
         }
 
-        self.resolve_to_cache(object_ref)?;
+        let legacy_resolved = self.resolve_to_cache(object_ref)?;
+        if !legacy_resolved
+            && matches!(
+                self.cache.entry(object_ref),
+                Some(CacheEntry::Unresolved { .. })
+            )
+        {
+            // qpdf's `QPDF::readObjectAtOffset` retries a header mismatch
+            // through `reconstruct_xref` (`libqpdf/QPDF.cc:1614-1637`). The
+            // legacy parser above deliberately returns `false` when it sees
+            // the wrong object header, so without this bridge a public
+            // `Pdf::resolve` would turn the same recoverable object into
+            // null before the canonical resolver gets a chance to retry it.
+            // Keep compressed/free entries on the legacy path: the canonical
+            // resolver has not implemented those source classes yet.
+            match handle.try_dereference() {
+                Ok(()) => {
+                    self.synchronize_legacy_resolution_state();
+                    if matches!(
+                        self.resolver.xref_entry(object_ref),
+                        Some(XrefEntry::Uncompressed { .. }) | Some(XrefEntry::Compressed { .. })
+                    ) {
+                        self.cache.set_resolved(object_ref, handle.materialize()?);
+                    } else {
+                        self.cache.set_missing(object_ref);
+                    }
+                }
+                Err(error) if matches!(&error, Error::Unsupported(_)) => {
+                    self.synchronize_legacy_resolution_state();
+                    self.resolve_to_cache(object_ref)?;
+                }
+                Err(error)
+                    if !self.resolver.attempt_recovery()
+                        && matches!(&error, Error::Parse { .. }) =>
+                {
+                    // With repair disabled, qpdf warns about the mismatch
+                    // and leaves the requested object unresolved; preserve
+                    // the legacy null result rather than exposing the
+                    // canonical resolver's internal parse error.
+                    handle.set_missing();
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let object = match self.cache.entry(object_ref) {
             Some(CacheEntry::Resolved(object)) => object.clone(),
             // A cyclic/self-referential resolution already in progress
@@ -2681,7 +2724,7 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Bring the legacy cache and bounded-read offsets in line with the
     /// canonical resolver after a resolution-time xref reconstruction.
-    fn synchronize_legacy_resolution_state(&mut self) {
+    pub(crate) fn synchronize_legacy_resolution_state(&mut self) {
         if self.legacy_resolution_state_synced || !self.resolver.reconstructed_xref() {
             return;
         }
