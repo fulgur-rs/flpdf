@@ -5,9 +5,9 @@ use crate::object_handle::{ObjectHandle, ObjectValue, NO_PARSED_OFFSET};
 use crate::tokenizer::{is_delimiter, is_ws, Token, TokenType, Tokenizer};
 use crate::{Dictionary, Error, Object, ObjectRef, Result};
 
-/// Supplies the canonical indirect [`ObjectHandle`] for an `N G R` reference
-/// encountered while building the handle graph (parser.rs's object-mode-only
-/// handle-producing path, see [`Parser::object_handle`]).
+/// Supplies handles created while building the parser's object graph: the
+/// canonical indirect [`ObjectHandle`] for an `N G R` reference and, for a
+/// live document parser, the owning context for direct values.
 ///
 /// This lets `Parser` reach `Pdf::get_object_handle` without depending on
 /// `Pdf<R>`'s reader-generic type (which would create a dependency cycle
@@ -15,6 +15,17 @@ use crate::{Dictionary, Error, Object, ObjectRef, Result};
 /// delegating to its own inherent `get_object_handle` method.
 pub(crate) trait HandleResolver {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle;
+
+    /// Construct a direct value with the parser's owning document context.
+    ///
+    /// The default is deliberately contextless for explicit parsing and other
+    /// detached consumers. The live document adapter overrides it with the
+    /// same weak resolver carried by canonical indirect handles, matching
+    /// qpdf's `QPDFParser` passing its `QPDF*` to every non-null value it
+    /// creates (`libqpdf/QPDFParser.cc:394-444`).
+    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+        ObjectHandle::from_value(value)
+    }
 }
 
 /// Decrypts one literal PDF string while the file-object parser still owns
@@ -395,7 +406,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                 }
                 TokenType::ArrayClose if matches!(frames.last(), Some(LiveFrame::Array { .. })) => {
                     let frame = frames.pop().expect("array frame is present");
-                    let value = Self::finish_array(frame);
+                    let value = self.finish_array(frame);
                     if frames.is_empty() {
                         return Ok(value);
                     }
@@ -512,11 +523,11 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         Ok(())
     }
 
-    fn finish_array(frame: LiveFrame) -> ObjectHandle {
+    fn finish_array(&mut self, frame: LiveFrame) -> ObjectHandle {
         let LiveFrame::Array { values, start } = frame else {
             unreachable!("array close can only complete an array frame"); // cov:ignore: close dispatch checked the frame variant
         };
-        Self::direct(ObjectValue::Array(values), start)
+        self.direct(ObjectValue::Array(values), start)
     }
 
     fn finish_dictionary(&mut self, frame: LiveFrame) -> Result<ObjectHandle> {
@@ -583,7 +594,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             }
         }
 
-        Ok(Self::direct(ObjectValue::Dictionary(values), start))
+        Ok(self.direct(ObjectValue::Dictionary(values), start))
     }
 
     fn parse_scalar_token(
@@ -593,21 +604,19 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         top_level: bool,
     ) -> Result<ObjectHandle> {
         match token.token_type {
-            TokenType::Name => Ok(Self::direct_at(
-                ObjectValue::Name(token.value[1..].to_vec()),
-                scalar_offset,
-            )),
+            TokenType::Name => {
+                Ok(self.direct_at(ObjectValue::Name(token.value[1..].to_vec()), scalar_offset))
+            }
             TokenType::String => {
                 let mut value = token.value;
                 if let Some(decrypter) = self.decrypter.as_deref_mut() {
                     decrypter.decrypt_string(&mut value)?;
                 }
-                Ok(Self::direct_at(ObjectValue::String(value), scalar_offset))
+                Ok(self.direct_at(ObjectValue::String(value), scalar_offset))
             }
-            TokenType::Bool => Ok(Self::direct_at(
-                ObjectValue::Boolean(token.value == b"true"),
-                scalar_offset,
-            )),
+            TokenType::Bool => {
+                Ok(self.direct_at(ObjectValue::Boolean(token.value == b"true"), scalar_offset))
+            }
             // qpdf gives parsed null no description, so its parsed offset is
             // always -1 (`QPDFParser.cc:81-82,308-310`).
             TokenType::Null => Ok(ObjectHandle::null()),
@@ -619,10 +628,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                     "unknown token while reading object; treating as string",
                 )?;
                 self.too_many_bad_tokens(token.start)?;
-                Ok(Self::direct_at(
-                    ObjectValue::String(token.value),
-                    scalar_offset,
-                ))
+                Ok(self.direct_at(ObjectValue::String(token.value), scalar_offset))
             }
             TokenType::Bad => {
                 self.too_many_bad_tokens(token.start)?;
@@ -687,13 +693,13 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
     ) -> Result<ObjectHandle> {
         let first = parse_integer_token(&token)?;
         if top_level {
-            return Ok(Self::direct_at(ObjectValue::Integer(first), offset));
+            return Ok(self.direct_at(ObjectValue::Integer(first), offset));
         }
 
         let second_token = self.next_token()?;
         if second_token.token_type != TokenType::Integer {
             self.unread_token(second_token);
-            return Ok(Self::direct_at(ObjectValue::Integer(first), offset));
+            return Ok(self.direct_at(ObjectValue::Integer(first), offset));
         }
         let second = parse_integer_token(&second_token)?;
         let third = self.next_token()?;
@@ -719,25 +725,25 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         }
         self.unread_token(third);
         self.unread_token(second_token);
-        Ok(Self::direct_at(ObjectValue::Integer(first), offset))
+        Ok(self.direct_at(ObjectValue::Integer(first), offset))
     }
 
-    fn real(&self, token: Token, offset: i64) -> Result<ObjectHandle> {
+    fn real(&mut self, token: Token, offset: i64) -> Result<ObjectHandle> {
         let value = match classify_real(token)? {
             RealClassification::Canonical(value) => ObjectValue::Real(value),
             RealClassification::Literal { value, literal } => {
                 ObjectValue::RealLiteral { value, literal }
             }
         };
-        Ok(Self::direct_at(value, offset))
+        Ok(self.direct_at(value, offset))
     }
 
-    fn direct(value: ObjectValue, offset: usize) -> ObjectHandle {
-        Self::direct_at(value, i64::try_from(offset).unwrap_or(i64::MAX))
+    fn direct(&mut self, value: ObjectValue, offset: usize) -> ObjectHandle {
+        self.direct_at(value, i64::try_from(offset).unwrap_or(i64::MAX))
     }
 
-    fn direct_at(value: ObjectValue, offset: i64) -> ObjectHandle {
-        let handle = ObjectHandle::from_value(value);
+    fn direct_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+        let handle = self.resolver.direct_handle(value);
         handle.set_parsed_offset_if_unset(offset);
         handle
     }

@@ -639,6 +639,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .clone()
     }
 
+    /// Construct a direct value with this document's weak context, matching
+    /// the resolver-bearing handles minted by [`Self::get_object_handle`].
+    /// qpdf stores the same owning `QPDF*` on every non-null value created by
+    /// its file parser (`libqpdf/QPDFParser.cc:394-444`).
+    pub(crate) fn direct_object_handle(&self, value: ObjectValue) -> ObjectHandle {
+        let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
+        ObjectHandle::from_value_with_resolver(value, resolver)
+    }
+
     /// The canonical handle for `object_ref` **if one has already been
     /// minted**, without minting one.
     ///
@@ -2103,6 +2112,10 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
         self.resolver.get_object_handle(object_ref)
     }
+
+    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+        self.resolver.direct_object_handle(value)
+    }
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
@@ -2603,6 +2616,69 @@ mod tests {
             b"WARNING: operation for dictionary attempted on object of type integer: \
               treating as empty\n"
         );
+    }
+
+    #[test]
+    fn live_parser_binds_deep_direct_values_to_the_owning_resolver() {
+        let resolver =
+            resolver_over(b"1 0 obj\n<< /L1 << /L2 << /Value 7 >> >> >>\nendobj\n".to_vec());
+        let (object, _) = resolver
+            .read_object_at_offset(0, ObjectRef::new(1, 0))
+            .expect("live object should parse");
+        let values = ObjectHandle::from_value(object)
+            .as_dictionary()
+            .expect("expected a dictionary object");
+        let level_one = values
+            .get(b"L1".as_slice())
+            .and_then(ObjectHandle::as_dictionary)
+            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .expect("level two dictionary");
+        let value = level_one
+            .as_dictionary()
+            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .expect("deep scalar");
+
+        assert_eq!(level_one.get_parsed_offset(), 22);
+        assert_eq!(value.get_parsed_offset(), 32);
+
+        level_one
+            .object_warning("deep container warning")
+            .expect("deep container keeps the document context");
+        value
+            .object_warning("deep scalar warning")
+            .expect("deep scalar keeps the document context");
+
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["deep container warning", "deep scalar warning"]
+        );
+    }
+
+    #[test]
+    fn parser_created_direct_values_do_not_keep_a_dropped_resolver_alive() {
+        let value = {
+            let resolver = resolver_over(b"1 0 obj\n<< /Value 7 >>\nendobj\n".to_vec());
+            let (object, _) = resolver
+                .read_object_at_offset(0, ObjectRef::new(1, 0))
+                .expect("live object should parse");
+            let values = ObjectHandle::from_value(object)
+                .as_dictionary()
+                .expect("expected a dictionary object");
+            values
+                .get(b"Value".as_slice())
+                .cloned()
+                .expect("direct value")
+        };
+
+        let error = value
+            .object_warning("dropped document")
+            .expect_err("a weak context must be gone with its resolver");
+        assert!(matches!(error, Error::System(message) if message == "dropped document"));
     }
 
     #[test]
