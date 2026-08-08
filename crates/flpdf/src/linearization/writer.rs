@@ -40,18 +40,15 @@
 //!
 //! # 2-pass algorithm
 //!
-//! Because the hint stream itself occupies bytes (and shifts every offset that
-//! follows it), we use a convergence loop:
+//! qpdf writes the hint object once between two layout passes:
 //!
-//! 1. **Probe pass**: write the file with a placeholder hint stream of a given
-//!    byte length.  Collect per-object offsets and byte lengths.
-//! 2. **Patch hint tables**: use the probed lengths to fill in
-//!    `page_length_minus_least`, `least_page_length`, `location_of_first_page`,
-//!    shared object lengths, and `location`.
-//! 3. **Encode** the hint stream with the patched tables. If the selected
-//!    payload length is the same as the placeholder, convergence is reached. Otherwise
-//!    repeat from step 1 with the new length.
-//! 4. **Final pass**: write the file using the converged hint stream.
+//! 1. **Pass 1**: omit the reserved hint object and collect the virtual offsets
+//!    and byte lengths for the rest of the file.
+//! 2. **Build the hint object**: fill all hint tables from those pass-1 values,
+//!    encode the payload, and frame/encrypt the complete indirect object once.
+//! 3. **Pass 2**: write the final file and splice that exact hint-object buffer
+//!    into the reserved slot. Fixed-width Part 1 padding keeps the downstream
+//!    offsets aligned with the values encoded in the hint tables.
 //!
 //! # Scope
 //!
@@ -108,10 +105,10 @@ struct ObjStmContainer {
 
 /// Resolved ObjStm layout for a linearized write.
 ///
-/// Built once, before the convergence loop, from the Part-tagged
+/// Built once, before the two layout passes, from the Part-tagged
 /// [`crate::linearization::plan::ObjStmBatchPlan`].  The contained-object set
-/// and per-container membership are **stable across iterations** (only the
-/// surrounding byte offsets shift), which keeps the convergence loop bounded.
+/// and per-container membership are **stable across the two passes** (only the
+/// surrounding byte offsets shift), which keeps both passes on the same layout.
 #[derive(Debug, Clone, Default)]
 struct ObjStmLayout {
     /// Containers emitted in the open-document region (qpdf part4) — physically
@@ -389,7 +386,7 @@ pub struct LinearizedOffsets {
     pub end_of_first_page_offset: usize,
 
     /// Byte offset of the Part 6 cross-reference table (`xref` keyword).
-    /// Used internally for convergence checks.
+    /// Used internally for layout diagnostics.
     pub last_xref_keyword_offset: usize,
 
     /// Byte offset of the first entry in the Part 6 cross-reference table
@@ -736,9 +733,9 @@ struct Part1XrefPatch {
 /// Only the param-dict object's offset is known when this runs; the rest are
 /// forward references.  The entry block is therefore emitted as a fixed-width
 /// placeholder (`count × `[`CLASSIC_XREF_ENTRY_WIDTH`]) and back-patched in
-/// place by [`patch_part1_xref`] once the final pass has every offset.  Because
-/// the block byte length is invariant, no downstream offset shifts and the hint
-/// stream remains the sole convergence variable.
+/// place by [`patch_part1_xref`] once the final pass has every offset. Because
+/// the block byte length is invariant, no downstream offset shifts when the
+/// complete hint object is spliced between the two passes.
 ///
 /// The first-page trailer includes `/Info` (when present), `/Root`, `/Size`,
 /// `/Prev`, and `/ID` — matching qpdf's key order and content for linearized
@@ -895,7 +892,7 @@ fn write_part1_xref_and_trailer(
 /// first-page section — all of which are plain indirects on the classic path,
 /// so the encoder needs only the final `xref_offsets` map.  Because the block
 /// was emitted at its final byte length, this is a pure in-place patch: no
-/// offset shifts and the hint-stream convergence loop is untouched.
+/// offset shifts occur when the complete hint object is spliced.
 ///
 /// # Errors
 ///
@@ -1032,7 +1029,7 @@ struct FirstPageXrefPatch {
     /// and the file's trailing `startxref` point at. [`patch_first_page_xref`]
     /// overwrites the whole region with the real encoded object plus trailing
     /// space padding, so the next object's offset is independent of the payload
-    /// length and the hint-stream convergence loop is unaffected.
+    /// length and the later hint-object splice is unaffected.
     region: std::ops::Range<usize>,
     /// `/Root` reference for the rebuilt dict.
     catalog_new_ref: ObjectRef,
@@ -1062,8 +1059,8 @@ struct FirstPageXrefPatch {
 ///
 /// Policy mirrors `crate::writer`:
 ///   - `--deterministic-id`: a fixed-width all-zero placeholder
-///     `[<0×32><0×32>]` installed here so the probe passes (which only measure
-///     object byte lengths) emit a fixed-width `/ID`. The real two-level
+///     `[<0×32><0×32>]` installed here so pass 1 (which only measures object
+///     byte lengths) emits a fixed-width `/ID`. The real two-level
 ///     identifier cannot be known until the bytes exist, so it is computed from
 ///     a digest over a reconstruction of qpdf's first write pass. The classic
 ///     (stream-free) path then **direct-writes** that identifier at every `/ID`
@@ -1086,7 +1083,7 @@ fn finalize_linearized_id(
     if options.deterministic_id {
         // Size the all-zero permanent-identifier placeholder to the source
         // `/ID[0]` length so the serialized `/ID` array reaches its FINAL width
-        // here, before the convergence loop. qpdf preserves `/ID[0]` verbatim
+        // here, before the two layout passes. qpdf preserves `/ID[0]` verbatim
         // regardless of length; both the pass-1 digest buffer and the probe
         // passes that measure `/L`, `/H`, the hint stream, and the xref offsets
         // serialize this placeholder, so any width other than the final one
@@ -1229,8 +1226,8 @@ fn patch_linearized_deterministic_id(
 /// the byte length of an uncompressed, wide-field xref object plus
 /// [`xref_stream::calculate_xref_stream_padding`]. Because the wide field is
 /// forced (`1 << 25`), the region is independent of the hint length, so it stays
-/// constant across the convergence loop and the hint stream remains the sole
-/// degree of freedom. A space placeholder of exactly that length is written here;
+/// constant across both layout passes. A space placeholder of exactly that
+/// length is written here;
 /// [`patch_first_page_xref`] overwrites it with the real encoded object (qpdf
 /// `/W [1 2 1]`, with `/Predictor 12` when filtered) plus trailing space padding once every
 /// downstream offset (and the main xref offset for `/Prev`) is known — the region
@@ -1298,8 +1295,8 @@ fn write_first_page_xref_stream(
 
     // Reserve the fixed pass-1 region (qpdf's writePad length-stabilisation):
     // the forced wide field-2 (`1 << 25`) makes the region independent of the
-    // hint length, so it is constant across the convergence loop and the hint
-    // stream stays the sole degree of freedom. The real compressed object plus
+    // hint length, so it is constant across both layout passes. The real
+    // compressed object plus
     // trailing padding is written into the region by `patch_first_page_xref`
     // once every downstream offset (and the main xref offset for `/Prev`) is
     // known — so the region's byte length never changes and no later offset
@@ -1369,8 +1366,8 @@ fn xref_id_bytes(source_trailer: &Dictionary) -> Option<(Vec<u8>, Vec<u8>)> {
 /// PNG-`/Predictor 12` + Flate payload,
 /// `/Prev → main xref` — then space-padded to the region's fixed byte length
 /// ([`xref_stream::write_padded_region`]). Because the region length is fixed
-/// (qpdf's pass-1 sizing), this shifts no later offset and the hint-stream
-/// convergence loop is untouched. The rebuilt dict carries the all-zero `/ID`
+/// (qpdf's pass-1 sizing), this shifts no later offset while the hint object is
+/// spliced. The rebuilt dict carries the all-zero `/ID`
 /// placeholder, which [`patch_linearized_deterministic_id`] overwrites later.
 fn patch_first_page_xref(
     bytes: &mut [u8],
@@ -1569,10 +1566,10 @@ fn write_main_xref_stream_and_trailer(
     bytes.extend_from_slice(format!("startxref\n{first_page_obj_offset}\n%%EOF\n").as_bytes());
 
     // `/T` rule for the split linearized file is the byte just before the
-    // **main** cross-reference stream (qpdf's `xref_zero_offset`).  The caller
+    // **main** cross-reference stream (qpdf's `xref_zero_offset`). The caller
     // computes `/T = second_return.saturating_sub(1)`, so return
-    // `main_xref_offset` as the second element.  The first element is also the
-    // main xref offset (used for convergence diagnostics / `last_xref`).
+    // `main_xref_offset` as the second element. The first element is also the
+    // main xref offset (used for layout diagnostics / `last_xref`).
     Ok((main_xref_offset, main_xref_offset))
 }
 
@@ -1584,9 +1581,8 @@ fn write_main_xref_stream_and_trailer(
 /// section offset, `/O` the outlines section offset (both within the
 /// uncompressed hint stream).
 ///
-/// Shared by [`append_hint_stream_object`] (the emitter) and
-/// [`hint_stream_convergence_len`] (the convergence-length proxy) so the two
-/// cannot drift — a digit-width change in any dict value must move both.
+/// Used by [`append_hint_stream_object`] so the hand-written dictionary keeps
+/// qpdf's key order and framing.
 fn hint_stream_dict_prefix(
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
@@ -1605,64 +1601,6 @@ fn hint_stream_dict_prefix(
     format!(
         "<< {filter_key}/S {shared_section_offset}{outline_key} /Length {payload_len} >>\nstream\n"
     )
-}
-
-/// Real, physical byte length of the hint-stream object across convergence
-/// passes: delegates to [`append_hint_stream_object`] itself (into a scratch
-/// buffer) rather than re-deriving the dict-prefix/newline/framing math
-/// separately, so the convergence key can never drift from what the emitter
-/// actually writes. Used as the convergence key so a digit-width change in
-/// any dict value, or a change in the *emitted* (post-encryption when
-/// `encrypt_ctx` is `Some`) payload's trailing byte, is detected before the
-/// final pass bakes `/H[1]`-relative offsets against it.
-///
-/// # Why this must measure the emitted bytes, not the plaintext payload
-///
-/// Earlier revisions computed this length from the plaintext `payload`
-/// (pre-encryption) directly, including its own `payload.last() != b'\n'`
-/// check for the newline-before-`endstream` decision. That is the wrong
-/// question when `encrypt_ctx` is `Some`: [`append_hint_stream_object`]
-/// makes that same decision on the *ciphertext*'s last byte
-/// (QPDFWriter.cc:2319-2329), and an AES-CBC ciphertext's last byte is an
-/// effectively independent function of the full plaintext content (not just
-/// its length) — two plaintexts of equal length, differing only in the
-/// offset values a later iteration back-patched, generally encrypt to
-/// ciphertexts whose last byte disagrees. A plaintext-only proxy can
-/// therefore report "converged" (predicted lengths match) while the real
-/// emitted object length differs from what the just-computed hint-table
-/// offsets assumed — or can fail to detect a genuine oscillation between two
-/// real lengths. Delegating to the real emitter removes that gap by
-/// construction.
-fn hint_stream_convergence_len(
-    measure: &HintStreamMeasure<'_>,
-    payload: &[u8],
-    shared_section_offset: usize,
-    outline_section_offset: Option<usize>,
-) -> Result<usize> {
-    let mut scratch = Vec::new();
-    let write = append_hint_stream_object(
-        &mut scratch,
-        measure.hint_ref,
-        payload,
-        shared_section_offset,
-        outline_section_offset,
-        measure.filtered,
-        measure.encrypt_ctx,
-        measure.hint_stream_aes_iv,
-    );
-    write.map(|_| scratch.len())
-}
-
-/// Loop-invariant inputs to [`hint_stream_convergence_len`], shared by both
-/// the "new" and "current" measurements the convergence loop takes on every
-/// iteration. Bundled into one struct (rather than threaded as separate
-/// arguments) purely to keep call sites short — no behavior beyond
-/// [`append_hint_stream_object`]'s own.
-struct HintStreamMeasure<'a> {
-    hint_ref: ObjectRef,
-    filtered: bool,
-    encrypt_ctx: Option<&'a crate::writer::EncryptionContext>,
-    hint_stream_aes_iv: [u8; 16],
 }
 
 /// Emit the primary hint-stream object and return its start byte offset.
@@ -1688,52 +1626,12 @@ struct HintStreamMeasure<'a> {
 /// — so no self-skip check is needed here, unlike [`append_object`] and
 /// [`append_body_object`].
 ///
-/// `hint_stream_aes_iv` is the single AES IV [`write_linearized`] draws once
-/// per invocation and passes to every call this function makes across the
-/// whole convergence loop (probe passes and the final pass alike), via
-/// [`crate::writer::encrypt_stream_payload_with_iv`] rather than
-/// [`crate::writer::encrypt_stream_payload_for_writer`] (which would draw a
-/// fresh IV on every call). This mirrors qpdf's own architecture: qpdf
-/// encrypts the hint stream exactly once, on its internal linearization
-/// "pass 1", and replays those exact bytes (`writeBuffer(hint_buffer)`) on
-/// "pass 2" without re-invoking `writeHintStream` (QPDFWriter.cc:2860-2884,
-/// the `pass == 1`/`else { writeBuffer(hint_buffer) }` split) — one IV per
-/// file for the hint stream, same as every other encrypted object gets one
-/// IV per file. `hint_stream_aes_iv` is unused when `encrypt_ctx` is `None`
-/// or the cipher is RC4 (no IV concept); callers may pass any value in
-/// those cases.
-///
-/// # Why pinning the IV is necessary, not just a defensive alignment with qpdf
-///
-/// Every downstream hint-table field this writer patches from a probed pass
-/// (`so_table.header.location`, [`build_outline_hint_table`]'s
-/// `first_object_offset`, and every per-object/per-page length in
-/// [`compute_byte_lengths`]) is computed as either (a) a same-pass offset
-/// *after* the hint stream minus that same pass's `hint_stream_obj_total_len`,
-/// or (b) the difference between two same-pass offsets both after the hint
-/// stream. Both forms cancel the hint stream's own byte length out of the
-/// stored value entirely, so they are safe against a hint stream whose
-/// length varies from pass to pass — **provided** every OTHER object's own
-/// serialized length is pass-invariant, i.e. does not itself depend on that
-/// pass's random IV draws. That precondition holds here: AES-CBC ciphertext
-/// length depends only on plaintext length (PKCS#7 padding, not the IV),
-/// non-hint-stream stream objects use `NewlineBeforeEndstream::Never` (no
-/// IV-dependent framing decision), and every AES-encrypted string is
-/// unconditionally hex encoded like qpdf's `QPDF_String::unparse(true)`
-/// (`QPDFWriter.cc:1567-1599`).
-///
-/// Pinning the hint stream's own IV removes re-drawing a *fresh* random IV
-/// on every probe/final call as an independent source of pass-to-pass
-/// variance, matching qpdf's own "encrypt once, reuse the bytes"
-/// architecture. It does **not**, by itself, make the emitted hint object's
-/// length pass-invariant: even with a fixed IV, AES-CBC ciphertext is a
-/// function of the *full plaintext content*, not just its length, so two
-/// iterations whose patched tables encode different offset values (equal
-/// plaintext length, different content) can still land on either side of
-/// the conditional newline-before-`endstream` boundary. The convergence
-/// loop's `hint_stream_convergence_len` check exists to catch exactly that
-/// residual case by measuring the real, encrypted, emitted object on every
-/// iteration rather than assuming pinning alone suffices.
+/// `hint_stream_aes_iv` is used only while constructing this one complete
+/// buffer. qpdf encrypts the hint stream once and replays the exact framed
+/// bytes on its second layout pass (`QPDFWriter.cc:2860-2884`); the caller
+/// follows the same boundary by passing the resulting buffer to
+/// [`do_write_pass`] unchanged. It is unused when `encrypt_ctx` is `None` or
+/// the cipher is RC4 (no IV concept).
 #[allow(clippy::too_many_arguments)]
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
@@ -1793,9 +1691,8 @@ fn append_hint_stream_object(
 
 /// Loop-invariant inputs for the Outlines Hint Table (qpdf's `c_outline_data`).
 ///
-/// `first_object` and `nobjects` depend only on membership + renumbering (stable
-/// across convergence iterations); the per-iteration offset/length are filled in
-/// from each probe pass to build the [`OutlineHintTable`].
+/// `first_object` and `nobjects` depend only on membership + renumbering; the
+/// pass-1 offset/length are filled in to build the [`OutlineHintTable`].
 struct OutlineHintInfo {
     /// Renumbered number of the first outline output unit (the ObjStm container —
     /// or plain object — holding the `/Outlines` dictionary).
@@ -1862,26 +1759,24 @@ fn compute_outline_hint_info<R: Read + Seek>(
     }))
 }
 
-/// Build the per-pass Outlines Hint Table (qpdf's `calculateHOutline`).
+/// Build the Outlines Hint Table from qpdf's pass-1 measurements
+/// (`calculateHOutline`).
 ///
-/// `first_object_offset` is the first outline unit's probe offset MINUS the hint
-/// stream object length — the same `adjusted_offset` convention as the Shared
-/// Object table `location` (qpdf adds `/H[1]` back for offsets at or after the
-/// hint stream). `group_length` is the summed byte length of the `nobjects`
-/// consecutive output units starting at `first_object` (qpdf's
-/// `outputLengthNextN`).
+/// `first_object_offset` is already the pass-1 virtual offset: pass 1 omits
+/// the reserved hint object, so qpdf's final `adjusted_offset` adds the exact
+/// saved hint-object length back when validating pass 2. `group_length` is the
+/// summed byte length of the `nobjects` consecutive output units starting at
+/// `first_object` (qpdf's `outputLengthNextN`).
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Unsupported`] if the first outline unit has no probed
-/// offset in `xref_offsets`, or if that offset is smaller than
-/// `hint_stream_obj_total_len` (either indicates an inconsistent layout, never
-/// produced for a well-formed plan).
+/// Returns [`crate::Error::Unsupported`] if the first outline unit has no
+/// offset in `xref_offsets` or if the virtual offset exceeds the fixed
+/// 32-bit hint-table field.
 fn build_outline_hint_table(
     info: &OutlineHintInfo,
     xref_offsets: &BTreeMap<u32, usize>,
     byte_lengths: &BTreeMap<u32, usize>,
-    hint_stream_obj_total_len: usize,
 ) -> Result<OutlineHintTable> {
     let first_off = xref_offsets
         .get(&info.first_object)
@@ -1892,21 +1787,13 @@ fn build_outline_hint_table(
                 info.first_object
             ))
         })?;
-    let adjusted_offset = first_off
-        .checked_sub(hint_stream_obj_total_len)
-        .ok_or_else(|| {
-            crate::Error::Unsupported(format!(
-                "outline hint: first unit offset ({first_off}) is less than the hint \
-             stream length ({hint_stream_obj_total_len})"
-            ))
-        })?;
     // The HGeneric `first_object_offset` is a fixed 32-bit field (qpdf
     // writeHGeneric). Reject (rather than silently truncate) an offset past
     // 4 GiB, matching how the other fixed-width hint fields fail via
     // `write_bits_checked`.
-    let first_object_offset = u32::try_from(adjusted_offset).map_err(|_| {
+    let first_object_offset = u32::try_from(first_off).map_err(|_| {
         crate::Error::Unsupported(format!(
-            "outline hint: adjusted first unit offset ({adjusted_offset}) exceeds the \
+            "outline hint: pass-1 first unit offset ({first_off}) exceeds the \
              32-bit Outlines Hint Table field"
         ))
     })?;
@@ -1957,16 +1844,30 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
     pass1
 }
 
+/// Result of one complete linearized layout pass.
+///
+/// Pass 1 omits the reserved hint object, so its offsets are qpdf's virtual
+/// coordinates. The final pass contains the exact hint-object buffer generated
+/// from this result.
+struct LinearizedPassOutput {
+    bytes: Vec<u8>,
+    xref_offsets: BTreeMap<u32, usize>,
+    hint_stream_offset: usize,
+    hint_stream_obj_total_len: usize,
+    end_of_first_page_offset: usize,
+    last_xref_offset: usize,
+    last_xref_first_entry_offset: usize,
+    first_trailer_prev_range: std::ops::Range<usize>,
+    id_ranges: Vec<std::ops::Range<usize>>,
+}
+
 /// Perform a complete single-pass write of the linearized PDF body.
 ///
-/// Returns `(bytes, xref_offsets, hint_stream_offset, hint_stream_obj_total_len,
-///           end_of_first_page_offset, last_xref_offset, last_xref_first_entry_offset,
-///           first_trailer_prev_range)`.
-///
-/// `hint_payload` is the raw or compressed payload to use for the hint stream
-/// object; `structural_streams_filtered` controls the hint, ObjStm, and xref
+/// `hint_stream_object` is the complete qpdf-shaped indirect hint object. `None`
+/// is qpdf pass 1: the reserved slot is omitted and all objects after it use
+/// virtual offsets. `Some` splices the already-encrypted/framed object without
+/// re-encoding it. `structural_streams_filtered` controls ObjStm and xref
 /// stream filters and payload encodings.
-/// `hint_shared_section_offset` is the `/S` value (offset within the uncompressed stream).
 ///
 /// When `pass1_digest` is set, the buffer reproduces qpdf's *first* write pass —
 /// the throwaway buffer qpdf MD5-hashes to seed a linearized `--deterministic-id`
@@ -1997,10 +1898,8 @@ fn do_write_pass<R: Read + Seek>(
     total_count: u32,
     info_new_ref: Option<ObjectRef>,
     _first_page_object_new_num: u32,
-    hint_payload: &[u8],
+    hint_stream_object: Option<&[u8]>,
     structural_streams_filtered: bool,
-    hint_shared_section_offset: usize,
-    hint_outline_section_offset: Option<usize>,
     source_trailer: &Dictionary,
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
@@ -2009,18 +1908,7 @@ fn do_write_pass<R: Read + Seek>(
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
-    hint_stream_aes_iv: [u8; 16],
-) -> Result<(
-    Vec<u8>,
-    BTreeMap<u32, usize>,
-    usize,                       // hint_stream_offset
-    usize,                       // hint_stream_obj_total_len
-    usize,                       // end_of_first_page_offset
-    usize,                       // last_xref_offset (xref keyword position)
-    usize,                       // last_xref_first_entry_offset (= /T value per qpdf's convention)
-    std::ops::Range<usize>,      // first_trailer_prev_range
-    Vec<std::ops::Range<usize>>, // id_ranges: absolute spans of every /ID-bearing section
-)> {
+) -> Result<LinearizedPassOutput> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
 
@@ -2066,8 +1954,8 @@ fn do_write_pass<R: Read + Seek>(
     // reader can resolve page 1 from the leading bytes.  It is written with a
     // deterministic byte length (uncompressed payload + fixed-width /Prev) and
     // back-patched in place once the downstream offsets and the main (Part-6)
-    // xref offset are known (see `patch_first_page_xref` below) — so the
-    // hint-stream convergence loop stays single-variable.  Returning an empty
+    // xref offset are known (see `patch_first_page_xref` below) — so this shifts
+    // no bytes between the two layout passes. Returning an empty
     // `/Prev` range tells the back-patcher there is no classic Part-1 trailer
     // `/Prev` to patch.
     let mut first_page_xref_patch: Option<FirstPageXrefPatch> = None;
@@ -2274,22 +2162,10 @@ fn do_write_pass<R: Read + Seek>(
     // that shift incrementally — no offset arithmetic.  The slot is also kept
     // out of `xref_offsets`: the first-page xref that covers it is written as
     // formatted zero-offset entries below, so the slot needs no real offset.
-    let hint_new_ref = ObjectRef::new(hint_stream_new_num, 0);
     let hint_stream_offset = bytes.len();
-    if !pass1_digest {
-        let appended = append_hint_stream_object(
-            &mut bytes,
-            hint_new_ref,
-            hint_payload,
-            hint_shared_section_offset,
-            hint_outline_section_offset,
-            structural_streams_filtered,
-            encrypt_ctx,
-            hint_stream_aes_iv,
-        );
-        let emitted_offset = appended?;
-        debug_assert_eq!(emitted_offset, hint_stream_offset);
-        xref_offsets.insert(hint_stream_new_num, emitted_offset);
+    if let Some(hint_stream_object) = hint_stream_object {
+        bytes.extend_from_slice(hint_stream_object);
+        xref_offsets.insert(hint_stream_new_num, hint_stream_offset);
     }
     let hint_stream_obj_total_len = bytes.len() - hint_stream_offset;
 
@@ -2545,9 +2421,8 @@ fn do_write_pass<R: Read + Seek>(
         id_ranges.push(main_section_start..bytes.len());
 
         // Every first-page object offset is now known, so back-patch the
-        // Part-1 first-page xref's placeholder entry block in place.  The block
-        // length was reserved exactly, so this shifts no bytes and the
-        // hint-stream convergence loop is unaffected.
+        // Part-1 first-page xref's placeholder entry block in place. The block
+        // length was reserved exactly, so this shifts no bytes between passes.
         let patch = part1_xref_patch
             .as_ref()
             // cov:ignore-start: unreachable internal invariant — this is the
@@ -2623,8 +2498,8 @@ fn do_write_pass<R: Read + Seek>(
         // Every downstream object offset is now known, so rebuild the first-page
         // xref's reserved region with the real encoded object and `/Prev →
         // main xref`. The region's byte length is fixed (qpdf's pass-1 sizing),
-        // so this shifts no bytes and the hint-stream convergence loop is
-        // unaffected.  `result.0` is the main xref offset.
+        // so this shifts no bytes between the two layout passes. `result.0` is
+        // the main xref offset.
         patch_first_page_xref(
             &mut bytes,
             patch,
@@ -2638,7 +2513,7 @@ fn do_write_pass<R: Read + Seek>(
         result
     };
 
-    Ok((
+    Ok(LinearizedPassOutput {
         bytes,
         xref_offsets,
         hint_stream_offset,
@@ -2648,7 +2523,7 @@ fn do_write_pass<R: Read + Seek>(
         last_xref_first_entry_offset,
         first_trailer_prev_range,
         id_ranges,
-    ))
+    })
 }
 
 /// Compute per-object byte lengths from a written-out `xref_offsets` map.
@@ -2690,24 +2565,6 @@ fn compute_byte_lengths(
         lengths.insert(num, next_off.saturating_sub(off));
     }
     lengths
-}
-
-/// Compute `adjusted_offset`: if `off >= hint_offset`, add `hint_length` to
-/// account for the fact that the hint stream object is inserted between Part 1
-/// and the body objects.
-///
-/// Probed offsets do NOT include the real hint stream; final offsets DO.
-/// The difference is exactly `hint_length` (the hint stream object byte length).
-///
-/// Currently unused — the writer uses `do_write_pass` returns directly — but
-/// kept here as a reference for future probe/final-pass refactoring.
-#[allow(dead_code)]
-fn adjusted_offset(off: usize, hint_offset: usize, hint_length: usize) -> usize {
-    if off >= hint_offset {
-        off + hint_length
-    } else {
-        off
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2998,8 +2855,9 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 /// 5. Emits the remaining body objects (`Plan.part4_objects()` — Annex F Part 5).
 /// 6. Emits the main cross-reference table and trailer (Annex F Part 6).
 ///
-/// Uses a convergence loop (max 3 iterations) to ensure the hint stream's
-/// compressed byte length is stable before the final write.
+/// Uses qpdf's two-pass layout: pass 1 omits the hint object and supplies the
+/// virtual offsets for one-shot hint-table generation; pass 2 splices the
+/// complete framed hint object at the reserved slot.
 ///
 /// Returns [`LinearizedDocument`] containing both the bytes and the
 /// [`LinearizedOffsets`] needed for back-patching.
@@ -3057,8 +2915,8 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 /// object (catalog, page, shared, or body object) has no entry in the
 /// [`RenumberMap`], the plan has no page hints or a `per_page_private_objects`
 /// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
-/// object lacks a probed byte length, or the hint-stream compressed length
-/// fails to converge within the iteration budget.
+/// object lacks a pass-1 byte length, or a hint-table field cannot represent its
+/// pass-1 value.
 pub fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -3153,12 +3011,12 @@ fn write_linearized_impl<R: Read + Seek>(
 
     // Finalize the file identifier exactly once here — before the plan/
     // renumber-map rebuild below, before `Optimization::prepare_for_linearized_write`,
-    // and before the convergence loop — and store it back on the working
+    // and before the two layout passes — and store it back on the working
     // trailer. The Part-1 trailer and every split xref/trailer then read this
-    // single value, so one linearized output carries one consistent /ID, and
-    // it stays stable across the up-to-3 convergence iterations.
+    // single value, so one linearized output carries one consistent /ID across
+    // both passes.
     //
-    // Computed this early (rather than just before the convergence loop,
+    // Computed this early (rather than just before the layout passes,
     // where this block used to sit) so `/ID[0]` is available before the
     // renumber map is consumed: the file encryption key derives from
     // `/ID[0]` (PDF 1.7 §7.6.3.3 Algorithm 2), and qpdf itself computes
@@ -3331,7 +3189,7 @@ fn write_linearized_impl<R: Read + Seek>(
     reject_multiple_generations(plan)?;
 
     // ------------------------------------------------------------------
-    // Pre-compute values that do not change across iterations.
+    // Pre-compute values that do not change across the two layout passes.
     // ------------------------------------------------------------------
     // ------------------------------------------------------------------
     // ObjStm per-half compressed-last placement.
@@ -3559,10 +3417,9 @@ fn write_linearized_impl<R: Read + Seek>(
         .as_ref()
         .map(EncryptedStringEmitter::from_context);
 
-    // Draw the hint stream's AES IV once for this whole invocation, reused
-    // for every `append_hint_stream_object` call the convergence loop below
-    // makes (probe passes and the final pass alike) — see that function's
-    // doc for why a fresh-per-call draw would be unsafe. `--static-aes-iv`
+    // Draw the hint stream's AES IV once for this whole invocation and use it
+    // while constructing the one complete hint object — see that function's
+    // doc for qpdf's encrypt-once/replay boundary. `--static-aes-iv`
     // keeps using the same fixed test vector every other AES call in this
     // writer already uses, so that path is byte-for-byte unchanged. When no
     // AES cipher is in play (RC4, or `encrypt_ctx` is `None`) the value is
@@ -3656,10 +3513,10 @@ fn write_linearized_impl<R: Read + Seek>(
     let hint_stream_new_num: u32 = renumber.hint_stream_slot();
 
     // ------------------------------------------------------------------
-    // Build the ObjStm layout from the relocated map (stable across the
-    // convergence loop).  Container + member numbers now live INSIDE the
+    // Build the ObjStm layout from the relocated map (stable across both
+    // layout passes). Container + member numbers now live INSIDE the
     // renumber map (relocation appended them), so the pair tables never
-    // shift between iterations — only the surrounding byte offsets do.
+    // shift between passes — only the surrounding byte offsets do.
     // ------------------------------------------------------------------
     let objstm_layout =
         ObjStmLayout::build_from_batches(&resolved_batch_plan, &container_numbers, renumber)?;
@@ -3762,9 +3619,6 @@ fn write_linearized_impl<R: Read + Seek>(
             .number
     };
 
-    // ------------------------------------------------------------------
-    // Build initial placeholder hint tables (all lengths = 0).
-    // ------------------------------------------------------------------
     let second_half_container_nums: std::collections::BTreeSet<u32> = objstm_layout
         .part4
         .iter()
@@ -3775,70 +3629,33 @@ fn write_linearized_impl<R: Read + Seek>(
         .iter()
         .map(|c| c.container_new_num)
         .collect();
-    let po_table_initial = PageOffsetHintTable::from_plan(
-        plan,
-        renumber,
-        &objstm_layout.member_to_container,
-        &container_shared_sort_key,
-        &second_half_container_nums,
-        &open_document_container_nums,
-    );
-    let so_table_initial = SharedObjectHintTable::from_plan(
-        plan,
-        renumber,
-        &objstm_layout.member_to_container,
-        &second_half_container_nums,
-        &open_document_container_nums,
-    );
-    // Outlines Hint Table inputs (qpdf in_outlines / calculateHOutline). Loop-
-    // invariant; `None` when the document has no outlines, in which case no `/O`
-    // key or outline table is emitted (byte-identical to the no-outline path).
+    // Outlines Hint Table inputs (qpdf in_outlines / calculateHOutline).
+    // `None` when the document has no outlines, in which case no `/O` key or
+    // outline table is emitted (byte-identical to the no-outline path).
     let outlines = plan
         .optimization
         .as_ref()
         .map(|optimization| optimization.objects_for_root_key(b"Outlines"))
         .unwrap_or_default();
     let outline_info = compute_outline_hint_info(&outlines, pdf, renumber, &objstm_layout)?;
-    // Initial placeholder outline table (offset/length zero): emitting it from
-    // iteration 0 means the hint stream already carries the outline section, so
-    // the convergence loop only has to settle the back-patched offset/length
-    // values (the compressed contribution still varies with them, so it is the
-    // loop — not byte-size stability — that absorbs the difference).
-    let outline_initial = outline_info.as_ref().map(|i| OutlineHintTable {
-        first_object: i.first_object,
-        first_object_offset: 0,
-        nobjects: i.nobjects,
-        group_length: 0,
-    });
-    // Bind `oi` so the call (with `?`) stays on one line — a multi-line `)?;`
-    // would leave the error-propagation region uncovered (the `?` never errs).
-    let oi = outline_initial.as_ref();
-    let hint_bytes_initial = encode_hint_stream(&po_table_initial, &so_table_initial, oi)?;
     // qpdf routes the primary hint stream through its global stream-compression
     // setting as well: Preserve and Uncompress emit the raw bit-packed table
     // without `/Filter`; Compress emits `/FlateDecode`.
     let structural_streams_filtered =
         matches!(effective_stream_policy(options), Some(CompressStreams::Yes));
-    let mut current_hint_payload = if structural_streams_filtered {
-        hint_bytes_initial.compressed
-    } else {
-        hint_bytes_initial.uncompressed
-    };
-    let mut current_hint_shared_s = hint_bytes_initial.shared_section_offset_in_uncompressed;
-    let mut current_hint_outline_o = hint_bytes_initial.outline_section_offset_in_uncompressed;
-
     // ------------------------------------------------------------------
-    // Build qpdf's first-pass representation when deterministic-ID hashing or
-    // explicit pass-1 output needs it. For deterministic IDs, compute qpdf's
-    // content-derived identifier up front, then direct-write it in the final
-    // pass on the classic path (qpdf's 2-pass scheme).
+    // Build qpdf's first-pass representation unconditionally. It is the source
+    // for hint-table offsets and lengths, and is also reused for deterministic
+    // ID hashing and explicit pass-1 output. For deterministic IDs, compute
+    // qpdf's content-derived identifier up front, then direct-write it in the
+    // final pass on the classic path (qpdf's 2-pass scheme).
     //
     // qpdf seeds the linearized `--deterministic-id` from its *first* write pass
     // — a throwaway buffer with an empty parameter dict, no hint stream, and an
     // unresolved first-page xref (`QPDFWriter::writeLinearized` →
     // `computeDeterministicIDData`, qpdf 11.9.0; the hint stream is written only
     // afterwards). That pass-1 buffer is loop-invariant (it carries no hint
-    // stream, so it never depends on hint convergence), so build it once here and
+    // stream, so it never depends on a later hint-object splice), so build it once here and
     // digest it. This pass-1 digest is now computed for *both* paths whenever
     // `--deterministic-id` is set. The classic (stream-free) path emits it
     // directly at both `/ID` sites in the final pass — no placeholder, no
@@ -3849,61 +3666,31 @@ fn write_linearized_impl<R: Read + Seek>(
     // keeps the all-zero `/ID` placeholder (its trailer writers get
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
-    let pass1_output: Option<(Vec<u8>, usize, usize)> =
-        if options.deterministic_id || pass1_path.is_some() {
-            let pass1_part1 = build_pass1_part1(&part1);
-            let (pass1_bytes, _, pass1_hint_stream_offset, _, _, pass1_main_xref_offset, ..) =
-                do_write_pass(
-                    plan,
-                    renumber,
-                    pdf,
-                    &pass1_part1,
-                    catalog_new_ref,
-                    hint_stream_new_num,
-                    total_count,
-                    info_new_ref,
-                    first_page_object_new_num,
-                    // The hint stream is absent in pass 1, so its payload / `/S` / `/O`
-                    // offsets are never emitted; pass empty / zero / none placeholders.
-                    &[],
-                    structural_streams_filtered,
-                    0,
-                    None,
-                    &pass1_source_trailer,
-                    &objstm_layout,
-                    &relocation,
-                    options,
-                    true,
-                    None,
-                    // `deterministic_id && encrypting` is rejected earlier in this
-                    // function (see the guard right after `/ID` is finalized above),
-                    // so this branch (`options.deterministic_id`) and `encrypt_ctx`
-                    // being `Some` are mutually exclusive — `encrypt_ctx` is always
-                    // `None` here in practice. Threaded through anyway rather than
-                    // hardcoding `None`, so this pass-1 buffer stays byte-consistent
-                    // with the probe/final passes below if that guard is ever
-                    // relaxed.
-                    encrypt_ctx.as_ref(),
-                    encrypted_string_emitter.as_mut(),
-                    // Pass-1 digest mode never emits the hint stream (`pass1_digest =
-                    // true` above), so this value is never read; threaded through
-                    // for signature uniformity with the probe/final calls below.
-                    hint_stream_aes_iv,
-                )?; // cov:ignore: error arm unreachable — pass-1 mode only omits emission (empty param dict, no hint stream) relative to the probe/final passes that already succeed on these same inputs, so it cannot introduce a new Err.
-            Some((
-                pass1_bytes,
-                pass1_hint_stream_offset,
-                pass1_main_xref_offset,
-            ))
-        } else {
-            None
-        };
+    let pass1_part1 = build_pass1_part1(&part1);
+    let pass1_output = do_write_pass(
+        plan,
+        renumber,
+        pdf,
+        &pass1_part1,
+        catalog_new_ref,
+        hint_stream_new_num,
+        total_count,
+        info_new_ref,
+        first_page_object_new_num,
+        None,
+        structural_streams_filtered,
+        &pass1_source_trailer,
+        &objstm_layout,
+        &relocation,
+        options,
+        true,
+        None,
+        encrypt_ctx.as_ref(),
+        encrypted_string_emitter.as_mut(),
+    )?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
 
     let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if options.deterministic_id {
-        let pass1_bytes = &pass1_output
-            .as_ref()
-            .expect("deterministic ID always builds pass-1 output")
-            .0;
+        let pass1_bytes = &pass1_output.bytes;
         // Whole-buffer digest: a linearized file repeats `/ID` at several
         // sites, so there is no single `[` cutoff; pass the last index as the
         // inclusive end (matching the prior patch step's digest range).
@@ -3918,567 +3705,413 @@ fn write_linearized_impl<R: Read + Seek>(
     };
 
     // ------------------------------------------------------------------
-    // Convergence loop (max 3 iterations).
+    // Build every hint table once from qpdf's pass-1 output. Pass 1 omits the
+    // hint object, so these offsets are already the virtual coordinates that
+    // qpdf stores in the hint tables.
     // ------------------------------------------------------------------
-    let max_iters = 3;
-    let mut final_bytes: Vec<u8> = Vec::new();
-    let mut final_xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut final_hint_stream_offset: usize = 0;
-    let mut final_hint_stream_obj_total_len: usize = 0;
-    let mut final_end_of_first_page_offset: usize = 0;
-    let mut final_last_xref_keyword_offset: usize = 0;
-    let mut final_last_xref_first_entry_offset: usize = 0;
-    let mut final_first_trailer_prev_range: std::ops::Range<usize> = 0..0;
-    let mut final_id_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let xref_offsets = &pass1_output.xref_offsets;
+    let hint_stream_offset = pass1_output.hint_stream_offset;
+    let last_xref_offset = pass1_output.last_xref_offset;
+    // ------------------------------------------------------------------
+    // Compute per-object byte lengths from pass 1.
+    // Use the xref keyword offset (not first_entry_offset) for length computation.
+    // ------------------------------------------------------------------
+    let byte_lengths = compute_byte_lengths(
+        &xref_offsets,
+        last_xref_offset,
+        hint_stream_new_num,
+        renumber.param_dict_ref().number,
+    );
 
-    for iter in 0..max_iters {
-        let (
-            bytes,
-            xref_offsets,
-            hint_stream_offset,
-            hint_stream_obj_total_len,
-            end_of_first_page_offset,
-            last_xref_offset,
-            last_xref_first_entry_offset,
-            _probe_prev_range,
-            _probe_id_ranges,
-        ) = do_write_pass(
-            plan,
-            renumber,
-            pdf,
-            &part1,
-            catalog_new_ref,
-            hint_stream_new_num,
-            total_count,
-            info_new_ref,
-            first_page_object_new_num,
-            &current_hint_payload,
-            structural_streams_filtered,
-            current_hint_shared_s,
-            current_hint_outline_o,
-            &source_trailer,
-            &objstm_layout,
-            &relocation,
-            options,
-            false,
-            // Probe passes write the `/ID` placeholder (via `source_trailer`):
-            // they only measure object byte lengths for hint convergence. The
-            // placeholder is the same fixed width as the final direct-written
-            // identifier, so probe offsets match the final pass regardless.
-            None,
-            // The `/Encrypt` dict's bytes are fixed (plaintext, no data key)
-            // and identical in every pass, so the probe passes emit it too —
-            // both to get its object's offset/length right for hint
-            // convergence, and because omitting it here would shift every
-            // downstream object's measured offset relative to the final pass.
-            encrypt_ctx.as_ref(),
-            encrypted_string_emitter.as_mut(),
-            // Reused across every probe pass AND the final pass below — see
-            // `append_hint_stream_object`'s doc for why a fresh-per-call IV
-            // would be unsafe.
-            hint_stream_aes_iv,
-        )?;
-
-        // ------------------------------------------------------------------
-        // Compute per-object byte lengths from this probe pass.
-        // Use the xref keyword offset (not first_entry_offset) for length computation.
-        // ------------------------------------------------------------------
-        let byte_lengths = compute_byte_lengths(
-            &xref_offsets,
-            last_xref_offset,
-            hint_stream_new_num,
-            renumber.param_dict_ref().number,
-        );
-
-        // ------------------------------------------------------------------
-        // Per-page byte lengths.
-        //
-        // Page 0 owns the shared objects physically (they sit before /E),
-        // so its byte_length includes Part 2 + Part 3.  Pages 1..N use only
-        // their own private objects.
-        // ------------------------------------------------------------------
-        // Members routed into a Part-3 ObjStm have no standalone bytes (they
-        // live inside the container); their physical contribution is the
-        // container object itself, which IS in `byte_lengths`.  Sum the
-        // still-plain part3 objects, then add every Part-3 container's bytes.
-        let part3_plain_len: u64 = plan
-            .part3_objects
-            .iter()
-            .filter(|orig| !objstm_layout.member_to_container.contains_key(orig))
-            .map(|orig| {
-                renumber
-                    .new_for_original(*orig)
-                    .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
-                    .unwrap_or(0) as u64
-            })
-            .sum();
-        let part3_container_len: u64 = objstm_layout
-            .part3
-            .iter()
-            .map(|c| byte_lengths.get(&c.container_new_num).copied().unwrap_or(0) as u64)
-            .sum();
-        let part3_byte_len: u64 = part3_plain_len + part3_container_len;
-
-        // Manually-constructed plans must keep `per_page_private_objects`
-        // aligned with `page_hints` (one entry per page).  A shorter list
-        // would silently leave some page-length hint fields unpatched —
-        // fail fast instead.
-        if plan.per_page_private_objects.len() != plan.page_hints.len() {
-            return Err(crate::Error::Unsupported(format!(
-                "linearization writer: per_page_private_objects length ({}) does not \
-                 match page_hints length ({}) — plan invariant violated",
-                plan.per_page_private_objects.len(),
-                plan.page_hints.len()
-            )));
-        }
-
-        // Containers a non-first page must not add to its byte length: only a
-        // part7 container owned entirely by this one page is a section object.
-        // A page-private object that the even split placed in the first-page
-        // (part6) container or in a part8 (multi-page-shared) container is
-        // physically outside this page's section, so its container's bytes belong
-        // elsewhere. Same classification as the per-page object-count fold.
-        let non_page_owned = crate::linearization::hint_page::non_page_owned_containers(
-            plan,
-            &objstm_layout.member_to_container,
-        );
-        let plain_byte_len = |orig: &ObjectRef| -> u64 {
+    // ------------------------------------------------------------------
+    // Per-page byte lengths.
+    //
+    // Page 0 owns the shared objects physically (they sit before /E),
+    // so its byte_length includes Part 2 + Part 3.  Pages 1..N use only
+    // their own private objects.
+    // ------------------------------------------------------------------
+    // Members routed into a Part-3 ObjStm have no standalone bytes (they
+    // live inside the container); their physical contribution is the
+    // container object itself, which IS in `byte_lengths`.  Sum the
+    // still-plain part3 objects, then add every Part-3 container's bytes.
+    let part3_plain_len: u64 = plan
+        .part3_objects
+        .iter()
+        .filter(|orig| !objstm_layout.member_to_container.contains_key(orig))
+        .map(|orig| {
             renumber
                 .new_for_original(*orig)
                 .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
                 .unwrap_or(0) as u64
-        };
-        let per_page_byte_lengths: Vec<u64> = plan
-            .per_page_private_objects
-            .iter()
-            .enumerate()
-            .map(|(page_idx, privates)| {
-                if page_idx == 0 {
-                    // Page 0: Part 2 (always plain) + Part 3 (plain + containers)
-                    // + Part 6 outline plain objects (UseOutlines, classic path).
-                    // ObjStm outline members are already counted inside Part-3
-                    // containers (part3_container_len), so only plain ones are added.
-                    let part2_len: u64 = privates.iter().map(plain_byte_len).sum();
-                    let part6_plain_len: u64 = plan
-                        .part6_outline_objects
-                        .iter()
-                        .filter(|orig| !objstm_layout.member_to_container.contains_key(*orig))
-                        .map(plain_byte_len)
-                        .sum();
-                    part2_len + part3_byte_len + part6_plain_len
-                } else {
-                    // Pages 1..N: a private compressed into this page's own part7
-                    // ObjStm has no standalone bytes — its physical contribution is
-                    // the container object, counted ONCE. Containers not owned by
-                    // this single page (first-page part6, or multi-page part8) are
-                    // excluded; their bytes live in another section.
-                    let mut len = 0u64;
-                    let mut containers: std::collections::BTreeSet<u32> =
-                        std::collections::BTreeSet::new();
-                    for orig in privates {
-                        match objstm_layout.member_to_container.get(orig) {
-                            Some(&(container_num, _)) => {
-                                if !non_page_owned.contains(&container_num) {
-                                    containers.insert(container_num);
-                                }
-                            }
-                            None => len += plain_byte_len(orig),
-                        }
-                    }
-                    len + containers
-                        .iter()
-                        .map(|c| byte_lengths.get(c).copied().unwrap_or(0) as u64)
-                        .sum::<u64>()
-                }
-            })
-            .collect();
+        })
+        .sum();
+    let part3_container_len: u64 = objstm_layout
+        .part3
+        .iter()
+        .map(|c| byte_lengths.get(&c.container_new_num).copied().unwrap_or(0) as u64)
+        .sum();
+    let part3_byte_len: u64 = part3_plain_len + part3_container_len;
 
-        // ------------------------------------------------------------------
-        // Patch hint tables.
-        // ------------------------------------------------------------------
-        let mut po_table = PageOffsetHintTable::from_plan(
-            plan,
-            renumber,
-            &objstm_layout.member_to_container,
-            &container_shared_sort_key,
-            &second_half_container_nums,
-            &open_document_container_nums,
-        );
-        let mut so_table = SharedObjectHintTable::from_plan(
-            plan,
-            renumber,
-            &objstm_layout.member_to_container,
-            &second_half_container_nums,
-            &open_document_container_nums,
-        );
+    // Manually-constructed plans must keep `per_page_private_objects`
+    // aligned with `page_hints` (one entry per page).  A shorter list
+    // would silently leave some page-length hint fields unpatched —
+    // fail fast instead.
+    if plan.per_page_private_objects.len() != plan.page_hints.len() {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization writer: per_page_private_objects length ({}) does not \
+                 match page_hints length ({}) — plan invariant violated",
+            plan.per_page_private_objects.len(),
+            plan.page_hints.len()
+        )));
+    }
 
-        // location_of_first_page = byte offset of the hint stream object itself.
-        //
-        // Per PDF Annex F and qpdf's implementation, this field stores the absolute
-        // byte offset of the hint stream object (the start of the first-page section).
-        // qpdf interprets it as: actual_page_object_offset = location_of_first_page + H_length,
-        // where H_length is the full byte span of the hint stream object (stored as /H[1]).
-        //
-        // Since the hint stream always starts immediately after Part 1, and Part 1 length
-        // is constant across all convergence iterations, hint_stream_offset is stable.
-        po_table.header.location_of_first_page = hint_stream_offset as u64;
-
-        // Page length fields.
-        //
-        // Content-stream fields (items 6-9 of header, items 6-7 of each per-page
-        // entry) follow qpdf's heuristic from QPDF_linearization.cc:1786-1808:
-        // since the page objects are not interleaved with the content stream,
-        // qpdf reuses the page-length values for the content-length fields and
-        // leaves the content-offset fields at 0 (matching Adobe implementation
-        // note 127).  Mirroring this gives readers a usable initial-rendering
-        // hint and keeps us on the path toward bytes-identical hint streams.
-        if !per_page_byte_lengths.is_empty() {
-            let least_pl = per_page_byte_lengths.iter().copied().min().unwrap_or(0);
-            let max_pl = per_page_byte_lengths.iter().copied().max().unwrap_or(0);
-            let bits_delta_pl = bits_needed(max_pl.saturating_sub(least_pl));
-            po_table.header.least_page_length = least_pl;
-            po_table.header.bits_page_length_delta = bits_delta_pl;
-            po_table.header.least_content_length = least_pl;
-            po_table.header.bits_content_length_delta = bits_delta_pl;
-            // `per_page_byte_lengths.len() == page_hints.len() ==
-            // po_table.entries.len()` is enforced by the length check at the
-            // top of this block, so zip is bounds-check-free.
-            for (entry, &bl) in po_table
-                .entries
-                .iter_mut()
-                .zip(per_page_byte_lengths.iter())
-            {
-                let delta = bl.saturating_sub(least_pl);
-                entry.page_length_minus_least = delta;
-                entry.content_stream_length = delta;
-            }
-        }
-
-        // Shared object table fields.
-        //
-        // The shared hint table covers all plan.shared_hints entries (part2
-        // entries first, then part3 entries).  Per qpdf's checkHSharedObject,
-        // the table starts at the first-page section's first object (part2[0] =
-        // page dict), so we use shared_hints[0] for the location field.
-        if !plan.shared_hints.is_empty() {
-            // Collect byte lengths for all shared hint entries in plan order.
-            //
-            // Resolve renumber + probe-pass byte-length lookups strictly:
-            // a missing entry indicates a planner / renumber inconsistency or
-            // a probe-pass coverage bug, both of which would silently produce
-            // a hint table with `least_length = 0` / `header.location = 0` if
-            // we substituted zeros.  Bubble Err so the writer fails loudly
-            // and the caller can surface the broken plan.
-            // Iterate the FOLDED shared list (the same list the hint tables are
-            // built from): first-page ObjStm members are folded into a single
-            // container entry whose byte length is the container object's own
-            // length.  A folded container entry carries the container's *new*
-            // object number with the sentinel generation `u16::MAX` (see
-            // `LinearizationPlan::canonical_shared_hints`); every other entry
-            // carries a real original ref (generation 0).  We discriminate by
-            // that sentinel — no live object uses generation `u16::MAX` — so a
-            // real original ref whose number happens to coincide with a
-            // container's new number can never be mistaken for a container (and
-            // vice versa).
-            let folded_shared = plan.canonical_shared_hints(
-                &objstm_layout.member_to_container,
-                renumber,
-                &second_half_container_nums,
-                &open_document_container_nums,
-            );
-            let shared_section_lens: Vec<u64> =
-                folded_shared
+    // Containers a non-first page must not add to its byte length: only a
+    // part7 container owned entirely by this one page is a section object.
+    // A page-private object that the even split placed in the first-page
+    // (part6) container or in a part8 (multi-page-shared) container is
+    // physically outside this page's section, so its container's bytes belong
+    // elsewhere. Same classification as the per-page object-count fold.
+    let non_page_owned = crate::linearization::hint_page::non_page_owned_containers(
+        plan,
+        &objstm_layout.member_to_container,
+    );
+    let plain_byte_len = |orig: &ObjectRef| -> u64 {
+        renumber
+            .new_for_original(*orig)
+            .and_then(|new_ref| byte_lengths.get(&new_ref.number).copied())
+            .unwrap_or(0) as u64
+    };
+    let per_page_byte_lengths: Vec<u64> = plan
+        .per_page_private_objects
+        .iter()
+        .enumerate()
+        .map(|(page_idx, privates)| {
+            if page_idx == 0 {
+                // Page 0: Part 2 (always plain) + Part 3 (plain + containers)
+                // + Part 6 outline plain objects (UseOutlines, classic path).
+                // ObjStm outline members are already counted inside Part-3
+                // containers (part3_container_len), so only plain ones are added.
+                let part2_len: u64 = privates.iter().map(plain_byte_len).sum();
+                let part6_plain_len: u64 = plan
+                    .part6_outline_objects
                     .iter()
-                    .map(|h| -> Result<u64> {
-                        // Folded container entry: the synthetic ref's sentinel
-                        // generation identifies it. Use the container object's
-                        // own byte length.
-                        if h.object_ref.generation == u16::MAX {
-                            // cov:ignore-start: unreachable — a first-half
-                            // container is always emitted (and probed) before
-                            // this back-patch, so its byte length is present; the
-                            // guard defends against a layout/probe mismatch.
-                            let len = byte_lengths.get(&h.object_ref.number).copied().ok_or_else(
-                                || {
-                                    crate::Error::Unsupported(format!(
-                                        "shared hint container (new #{}) has no probed byte length",
-                                        h.object_ref.number
-                                    ))
-                                },
-                            )?;
-                            // cov:ignore-end
-                            return Ok(len as u64);
+                    .filter(|orig| !objstm_layout.member_to_container.contains_key(*orig))
+                    .map(plain_byte_len)
+                    .sum();
+                part2_len + part3_byte_len + part6_plain_len
+            } else {
+                // Pages 1..N: a private compressed into this page's own part7
+                // ObjStm has no standalone bytes — its physical contribution is
+                // the container object, counted ONCE. Containers not owned by
+                // this single page (first-page part6, or multi-page part8) are
+                // excluded; their bytes live in another section.
+                let mut len = 0u64;
+                let mut containers: std::collections::BTreeSet<u32> =
+                    std::collections::BTreeSet::new();
+                for orig in privates {
+                    match objstm_layout.member_to_container.get(orig) {
+                        Some(&(container_num, _)) => {
+                            if !non_page_owned.contains(&container_num) {
+                                containers.insert(container_num);
+                            }
                         }
-                        // cov:ignore-start: unreachable — non-container shared
-                        // hints are plan objects with a renumber entry, and every
-                        // plain shared object is emitted (and probed) before this
-                        // back-patch; absence signals a planner/renumber/probe
-                        // inconsistency.
-                        let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
-                            crate::Error::Unsupported(format!(
-                                "shared hint object {} has no renumber entry",
-                                h.object_ref
-                            ))
-                        })?;
-                        let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
-                            crate::Error::Unsupported(format!(
-                                "shared hint object {} (new #{}) has no probed byte length",
-                                h.object_ref, new_ref.number
-                            ))
-                        })?;
-                        // cov:ignore-end
-                        Ok(len as u64)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-            let least = shared_section_lens.iter().copied().min().unwrap_or(0);
-            let max = shared_section_lens.iter().copied().max().unwrap_or(0);
-            so_table.header.least_length = least;
-            so_table.header.bits_length_delta = bits_needed(max.saturating_sub(least));
-
-            // Location (item 2): "virtual" byte offset of the first Part-8
-            // shared object, WITHOUT the hint stream object bytes.
-            //
-            // Per qpdf's checkHSharedObject (QPDF_linearization.cc lines 782-788),
-            // the stored value `so.first_shared_offset` is fed through
-            // `adjusted_offset(x)` which adds `H_length` (= /H[1] = full hint
-            // stream object byte length) to any offset that is >= H_offset.
-            // The resulting value is compared to the actual file offset.
-            //
-            // Since all offsets in our probe-pass xref_offsets ALREADY include
-            // the hint stream object (it is written inline in do_write_pass),
-            // we must subtract `hint_stream_obj_total_len` from the probe
-            // offset so that `adjusted_offset(location) == actual_offset`.
-            //
-            //   adjusted_offset(location)
-            //     = location + H_length             (since location >= H_offset)
-            //     = (actual - H_length) + H_length
-            //     = actual                           ✓
-            //
-            // This is only meaningful when nshared_total > nshared_first_page
-            // (i.e., there are Part-8 objects).  When part4_other_pages_shared
-            // is empty the location value is ignored (qpdf Implementation Note 131).
-            // `from_plan` already set `first_object_number` to the FIRST
-            // SECOND-HALF (Part-8) shared entry — the container number when that
-            // entry is an ObjStm container, or the object's own number when it is
-            // plain — and crucially EXCLUDES part4-shared objects that the global
-            // even split placed in a first-page (part6) container (those are
-            // before /E, not Part-8). It is 0 when there are no Part-8 entries
-            // (location is then ignored per Implementation Note 131). Look up that
-            // object's probe offset for the `location` field; the object number
-            // itself is already correct, so it is not overwritten here.
-            let first_part8_lookup_num = so_table.header.first_object_number;
-            if first_part8_lookup_num != 0 {
-                let first_part8_off = xref_offsets
-                    .get(&first_part8_lookup_num)
-                    .copied()
-                    // cov:ignore-start: the first Part-8 entry (a container or a
-                    // plain Part-8 object) is always probed in the same pass that
-                    // fills `xref_offsets`, so this lookup never misses for a
-                    // well-formed plan.
-                    .ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
-                             has no probed offset"
-                        ))
-                    })?;
-                // cov:ignore-end
-                // Subtract hint stream total length so that qpdf's
-                // adjusted_offset() reconstructs the correct file offset.
-                so_table.header.location = first_part8_off
-                    .checked_sub(hint_stream_obj_total_len)
-                    .ok_or_else(|| {
-                        crate::Error::Unsupported(format!(
-                            "linearization layout mismatch: first Part-8 shared object offset \
-                             ({first_part8_off}) is less than hint stream length \
-                             ({hint_stream_obj_total_len}); cannot compute shared-hint location"
-                        ))
-                    })? as u64;
-            }
-
-            // Per-object length_minus_least.  group_offset is no longer a
-            // per-entry field (see hint_stream::encode_shared_object_entries:
-            // it does not match Annex F.4.5 / qpdf's HSharedObjectEntry layout
-            // and was previously emitting an extra 32 bits per entry that
-            // qpdf misinterpreted as the next entry's length delta).
-            // `nobjects_minus_one` stays at 0 from `from_plan`.  `so_table.objects`
-            // and `shared_section_lens` are both built from the folded shared
-            // list, so zipping keeps the per-object length deltas aligned.
-            for (obj, &len) in so_table.objects.iter_mut().zip(&shared_section_lens) {
-                obj.length_minus_least = (len.saturating_sub(least)) as u32;
-            }
-        }
-
-        // Patch the Outlines Hint Table (qpdf calculateHOutline): fill the
-        // per-pass offset/length for the first outline unit (see
-        // `build_outline_hint_table`).
-        let outline_table = outline_info
-            .as_ref()
-            .map(|info| {
-                build_outline_hint_table(
-                    info,
-                    &xref_offsets,
-                    &byte_lengths,
-                    hint_stream_obj_total_len,
-                )
-            })
-            .transpose()?;
-
-        // Re-encode hint stream with patched tables.
-        let new_hint_bytes = encode_hint_stream(&po_table, &so_table, outline_table.as_ref())?;
-        let new_hint_payload = if structural_streams_filtered {
-            new_hint_bytes.compressed
-        } else {
-            new_hint_bytes.uncompressed
-        };
-        let new_shared_s = new_hint_bytes.shared_section_offset_in_uncompressed;
-        let new_outline_o = new_hint_bytes.outline_section_offset_in_uncompressed;
-
-        // Save this pass's structural metadata (offsets, byte length).  The
-        // bytes themselves are *not* yet final — they were written using the
-        // previous iteration's hint stream.  We always do one more pass
-        // below with the freshly-patched stream so the saved bytes contain
-        // it; this is required even when the encoded length is identical
-        // (the bit content still changes per-iteration).
-        final_xref_offsets = xref_offsets.clone();
-        final_hint_stream_offset = hint_stream_offset;
-        final_hint_stream_obj_total_len = hint_stream_obj_total_len;
-        final_end_of_first_page_offset = end_of_first_page_offset;
-        final_last_xref_keyword_offset = last_xref_offset;
-        final_last_xref_first_entry_offset = last_xref_first_entry_offset;
-        final_bytes = bytes; // overwritten below if we do a final pass
-
-        // Converge on the full *hint-object* length, not just the compressed
-        // payload length. Two payloads of equal length can still frame into hint
-        // objects of different byte length: the conditional newline before
-        // `endstream` (qpdf, QPDFWriter.cc:2327) and the decimal widths of the
-        // dict values `/S`, `/O`, `/Length` (offsets into the uncompressed hint
-        // stream, which shift independently of payload length) both contribute.
-        // `hint_stream_convergence_len` measures the real *emitted* object
-        // (post-encryption when `encrypt_ctx` is `Some`, via
-        // `append_hint_stream_object`), so convergence forces ΔL=0 against
-        // what will actually be written — the final pass's `/H[1]` exactly
-        // matches the offsets baked into the payload (the constant
-        // scaffolding cancels).
-        let measure = HintStreamMeasure {
-            hint_ref: ObjectRef::new(hint_stream_new_num, 0),
-            filtered: structural_streams_filtered,
-            encrypt_ctx: encrypt_ctx.as_ref(),
-            hint_stream_aes_iv,
-        };
-        let measured_len = |payload: &[u8], s: usize, o: Option<usize>| {
-            hint_stream_convergence_len(&measure, payload, s, o)
-        };
-        let new_len = measured_len(&new_hint_payload, new_shared_s, new_outline_o)?;
-        let (cur, cur_s, cur_o) = (
-            &current_hint_payload,
-            current_hint_shared_s,
-            current_hint_outline_o,
-        );
-        let current_len = measured_len(cur, cur_s, cur_o)?;
-        let converged = new_len == current_len;
-
-        // Promote the freshly-patched stream as the next iteration input.
-        current_hint_payload = new_hint_payload;
-        current_hint_shared_s = new_shared_s;
-        current_hint_outline_o = new_outline_o;
-
-        // Risk 1 (convergence): the ObjStm container payload lengths are
-        // *stable* across iterations (the contained, renumbered objects do
-        // not change and the container numbers are pre-allocated), so only
-        // the hint stream's own selected payload length can still oscillate — the
-        // same single degree of freedom the non-ObjStm path already had.  If
-        // it has not stabilised by the final iteration we must not silently
-        // emit a file whose Page-Offset Hint Table was computed against a
-        // different layout: fail loudly instead of looping forever or
-        // shipping a subtly wrong hint table.
-        if !converged && iter == max_iters - 1 {
-            return Err(crate::Error::Unsupported(format!(
-                "linearization writer: hint stream length did not converge \
-                 within {max_iters} iterations (ObjStm-bearing layout = {}); \
-                 refusing to emit a file with an inconsistent Page Offset \
-                 Hint Table",
-                !objstm_layout.is_empty()
-            )));
-        }
-
-        if converged || iter == max_iters - 1 {
-            // One last pass so the emitted hint stream object actually
-            // contains the patched bit-stream (not the previous iteration's).
-            //
-            // On the classic deterministic-`/ID` path, direct-write the
-            // identifier computed above at both `/ID` sites (qpdf's 2-pass
-            // scheme): the closure emits the fixed-width hex form, the same
-            // width as the placeholder, so every downstream offset is
-            // unchanged. When `--deterministic-id` is off, `classic_det_id` is
-            // `None`, so `id_writer` is `None` and the stored value is emitted.
-            // On the ObjStm deterministic path `id_writer` is `Some` here too,
-            // but only the classic trailer writers consume it (the xref-stream
-            // writers ignore it), so that path's `/ID` stays an all-zero
-            // placeholder and is patched afterwards.
-            let mut det_id_closure;
-            let id_writer: Option<crate::object::TrailerIdWriter> = match &classic_det_id {
-                Some((id0, id1)) => {
-                    // Clone the identifier into the `move` closure so
-                    // `classic_det_id` stays available for the ObjStm patch below
-                    // (the permanent id0 is now an owned `Vec`, not `Copy`).
-                    let id0 = id0.clone();
-                    let id1 = *id1;
-                    det_id_closure = move |out: &mut Vec<u8>| {
-                        crate::writer::write_deterministic_id_array(out, &id0, &id1)
-                    };
-                    Some(&mut det_id_closure)
+                        None => len += plain_byte_len(orig),
+                    }
                 }
-                None => None,
-            };
-            let (
-                bytes_final,
-                xref_offsets_final,
-                hint_off_final,
-                hint_len_final,
-                efp_final,
-                lxr_final,
-                lxr_first_final,
-                prev_range_final,
-                id_ranges_final,
-            ) = do_write_pass(
-                plan,
-                renumber,
-                pdf,
-                &part1,
-                catalog_new_ref,
-                hint_stream_new_num,
-                total_count,
-                info_new_ref,
-                first_page_object_new_num,
-                &current_hint_payload,
-                structural_streams_filtered,
-                current_hint_shared_s,
-                current_hint_outline_o,
-                &source_trailer,
-                &objstm_layout,
-                &relocation,
-                options,
-                false,
-                id_writer,
-                encrypt_ctx.as_ref(),
-                encrypted_string_emitter.as_mut(),
-                // Same IV as every probe pass above — see
-                // `append_hint_stream_object`'s doc.
-                hint_stream_aes_iv,
-            )?;
-            final_bytes = bytes_final;
-            final_xref_offsets = xref_offsets_final;
-            final_hint_stream_offset = hint_off_final;
-            final_hint_stream_obj_total_len = hint_len_final;
-            final_end_of_first_page_offset = efp_final;
-            final_last_xref_keyword_offset = lxr_final;
-            final_last_xref_first_entry_offset = lxr_first_final;
-            final_first_trailer_prev_range = prev_range_final;
-            final_id_ranges = id_ranges_final;
-            break;
+                len + containers
+                    .iter()
+                    .map(|c| byte_lengths.get(c).copied().unwrap_or(0) as u64)
+                    .sum::<u64>()
+            }
+        })
+        .collect();
+
+    // ------------------------------------------------------------------
+    // Patch hint tables.
+    // ------------------------------------------------------------------
+    let mut po_table = PageOffsetHintTable::from_plan(
+        plan,
+        renumber,
+        &objstm_layout.member_to_container,
+        &container_shared_sort_key,
+        &second_half_container_nums,
+        &open_document_container_nums,
+    );
+    let mut so_table = SharedObjectHintTable::from_plan(
+        plan,
+        renumber,
+        &objstm_layout.member_to_container,
+        &second_half_container_nums,
+        &open_document_container_nums,
+    );
+
+    // location_of_first_page = byte offset of the hint stream object itself.
+    //
+    // Per PDF Annex F and qpdf's implementation, this field stores the absolute
+    // byte offset of the hint stream object (the start of the first-page section).
+    // qpdf interprets it as: actual_page_object_offset = location_of_first_page + H_length,
+    // where H_length is the full byte span of the hint stream object (stored as /H[1]).
+    //
+    // Since the hint stream always starts immediately after Part 1, and Part 1 length
+    // is constant across both passes, hint_stream_offset is stable.
+    po_table.header.location_of_first_page = hint_stream_offset as u64;
+
+    // Page length fields.
+    //
+    // Content-stream fields (items 6-9 of header, items 6-7 of each per-page
+    // entry) follow qpdf's heuristic from QPDF_linearization.cc:1786-1808:
+    // since the page objects are not interleaved with the content stream,
+    // qpdf reuses the page-length values for the content-length fields and
+    // leaves the content-offset fields at 0 (matching Adobe implementation
+    // note 127).  Mirroring this gives readers a usable initial-rendering
+    // hint and keeps us on the path toward bytes-identical hint streams.
+    if !per_page_byte_lengths.is_empty() {
+        let least_pl = per_page_byte_lengths.iter().copied().min().unwrap_or(0);
+        let max_pl = per_page_byte_lengths.iter().copied().max().unwrap_or(0);
+        let bits_delta_pl = bits_needed(max_pl.saturating_sub(least_pl));
+        po_table.header.least_page_length = least_pl;
+        po_table.header.bits_page_length_delta = bits_delta_pl;
+        po_table.header.least_content_length = least_pl;
+        po_table.header.bits_content_length_delta = bits_delta_pl;
+        // `per_page_byte_lengths.len() == page_hints.len() ==
+        // po_table.entries.len()` is enforced by the length check at the
+        // top of this block, so zip is bounds-check-free.
+        for (entry, &bl) in po_table
+            .entries
+            .iter_mut()
+            .zip(per_page_byte_lengths.iter())
+        {
+            let delta = bl.saturating_sub(least_pl);
+            entry.page_length_minus_least = delta;
+            entry.content_stream_length = delta;
         }
     }
+
+    // Shared object table fields.
+    //
+    // The shared hint table covers all plan.shared_hints entries (part2
+    // entries first, then part3 entries).  Per qpdf's checkHSharedObject,
+    // the table starts at the first-page section's first object (part2[0] =
+    // page dict), so we use shared_hints[0] for the location field.
+    if !plan.shared_hints.is_empty() {
+        // Collect byte lengths for all shared hint entries in plan order.
+        //
+        // Resolve renumber + pass-1 byte-length lookups strictly:
+        // a missing entry indicates a planner / renumber inconsistency or
+        // a pass-1 coverage bug, both of which would silently produce
+        // a hint table with `least_length = 0` / `header.location = 0` if
+        // we substituted zeros.  Bubble Err so the writer fails loudly
+        // and the caller can surface the broken plan.
+        // Iterate the FOLDED shared list (the same list the hint tables are
+        // built from): first-page ObjStm members are folded into a single
+        // container entry whose byte length is the container object's own
+        // length.  A folded container entry carries the container's *new*
+        // object number with the sentinel generation `u16::MAX` (see
+        // `LinearizationPlan::canonical_shared_hints`); every other entry
+        // carries a real original ref (generation 0).  We discriminate by
+        // that sentinel — no live object uses generation `u16::MAX` — so a
+        // real original ref whose number happens to coincide with a
+        // container's new number can never be mistaken for a container (and
+        // vice versa).
+        let folded_shared = plan.canonical_shared_hints(
+            &objstm_layout.member_to_container,
+            renumber,
+            &second_half_container_nums,
+            &open_document_container_nums,
+        );
+        let shared_section_lens: Vec<u64> = folded_shared
+            .iter()
+            .map(|h| -> Result<u64> {
+                // Folded container entry: the synthetic ref's sentinel
+                // generation identifies it. Use the container object's
+                // own byte length.
+                if h.object_ref.generation == u16::MAX {
+                    // cov:ignore-start: unreachable — a first-half
+                    // container is always emitted (and probed) before
+                    // this back-patch, so its byte length is present; the
+                    // guard defends against a layout/probe mismatch.
+                    let len = byte_lengths
+                        .get(&h.object_ref.number)
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::Error::Unsupported(format!(
+                                "shared hint container (new #{}) has no probed byte length",
+                                h.object_ref.number
+                            ))
+                        })?;
+                    // cov:ignore-end
+                    return Ok(len as u64);
+                }
+                // cov:ignore-start: unreachable — non-container shared
+                // hints are plan objects with a renumber entry, and every
+                // plain shared object is emitted (and probed) before this
+                // back-patch; absence signals a planner/renumber/probe
+                // inconsistency.
+                let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "shared hint object {} has no renumber entry",
+                        h.object_ref
+                    ))
+                })?;
+                let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "shared hint object {} (new #{}) has no probed byte length",
+                        h.object_ref, new_ref.number
+                    ))
+                })?;
+                // cov:ignore-end
+                Ok(len as u64)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let least = shared_section_lens.iter().copied().min().unwrap_or(0);
+        let max = shared_section_lens.iter().copied().max().unwrap_or(0);
+        so_table.header.least_length = least;
+        so_table.header.bits_length_delta = bits_needed(max.saturating_sub(least));
+
+        // Location (item 2): qpdf's pass-1 virtual byte offset of the first
+        // Part-8 shared object. In the final file qpdf's
+        // `adjusted_offset(location)` adds the exact `/H[1]` bytes that are
+        // spliced between Part 1 and this object.
+        //
+        // This is only meaningful when nshared_total > nshared_first_page
+        // (i.e., there are Part-8 objects).  When part4_other_pages_shared
+        // is empty the location value is ignored (qpdf Implementation Note 131).
+        // `from_plan` already set `first_object_number` to the FIRST
+        // SECOND-HALF (Part-8) shared entry — the container number when that
+        // entry is an ObjStm container, or the object's own number when it is
+        // plain — and crucially EXCLUDES part4-shared objects that the global
+        // even split placed in a first-page (part6) container (those are
+        // before /E, not Part-8). It is 0 when there are no Part-8 entries
+        // (location is then ignored per Implementation Note 131). Look up that
+        // object's probe offset for the `location` field; the object number
+        // itself is already correct, so it is not overwritten here.
+        let first_part8_lookup_num = so_table.header.first_object_number;
+        if first_part8_lookup_num != 0 {
+            let first_part8_off = xref_offsets
+                .get(&first_part8_lookup_num)
+                .copied()
+                // cov:ignore-start: the first Part-8 entry (a container or a
+                // plain Part-8 object) is always probed in the same pass that
+                // fills `xref_offsets`, so this lookup never misses for a
+                // well-formed plan.
+                .ok_or_else(|| {
+                    crate::Error::Unsupported(format!(
+                        "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
+                             has no probed offset"
+                    ))
+                })?;
+            // cov:ignore-end
+            so_table.header.location = first_part8_off as u64;
+        }
+
+        // Per-object length_minus_least.  group_offset is no longer a
+        // per-entry field (see hint_stream::encode_shared_object_entries:
+        // it does not match Annex F.4.5 / qpdf's HSharedObjectEntry layout
+        // and was previously emitting an extra 32 bits per entry that
+        // qpdf misinterpreted as the next entry's length delta).
+        // `nobjects_minus_one` stays at 0 from `from_plan`.  `so_table.objects`
+        // and `shared_section_lens` are both built from the folded shared
+        // list, so zipping keeps the per-object length deltas aligned.
+        for (obj, &len) in so_table.objects.iter_mut().zip(&shared_section_lens) {
+            obj.length_minus_least = (len.saturating_sub(least)) as u32;
+        }
+    }
+
+    // Patch the Outlines Hint Table (qpdf calculateHOutline): fill the
+    // per-pass offset/length for the first outline unit (see
+    // `build_outline_hint_table`).
+    let outline_table = outline_info
+        .as_ref()
+        .map(|info| build_outline_hint_table(info, &xref_offsets, &byte_lengths))
+        .transpose()?;
+
+    // Re-encode hint stream with patched tables.
+    let new_hint_bytes = encode_hint_stream(&po_table, &so_table, outline_table.as_ref())?;
+    let new_hint_payload = if structural_streams_filtered {
+        new_hint_bytes.compressed
+    } else {
+        new_hint_bytes.uncompressed
+    };
+    let new_shared_s = new_hint_bytes.shared_section_offset_in_uncompressed;
+    let new_outline_o = new_hint_bytes.outline_section_offset_in_uncompressed;
+
+    // qpdf frames and encrypts the complete hint object once after pass 1.
+    // Pass 2 receives this exact buffer and splices it without re-encoding
+    // the payload or drawing another IV.
+    let mut hint_stream_object = Vec::new();
+    append_hint_stream_object(
+        &mut hint_stream_object,
+        ObjectRef::new(hint_stream_new_num, 0),
+        &new_hint_payload,
+        new_shared_s,
+        new_outline_o,
+        structural_streams_filtered,
+        encrypt_ctx.as_ref(),
+        hint_stream_aes_iv,
+    )?;
+
+    // Final pass: write the layout with the exact hint object generated
+    // above. The pass-1 virtual offsets and the spliced object length are
+    // therefore related by qpdf's adjusted-offset rule.
+    //
+    // On the classic deterministic-`/ID` path, direct-write the
+    // identifier computed above at both `/ID` sites (qpdf's 2-pass
+    // scheme): the closure emits the fixed-width hex form, the same
+    // width as the placeholder, so every downstream offset is
+    // unchanged. When `--deterministic-id` is off, `classic_det_id` is
+    // `None`, so `id_writer` is `None` and the stored value is emitted.
+    // On the ObjStm deterministic path `id_writer` is `Some` here too,
+    // but only the classic trailer writers consume it (the xref-stream
+    // writers ignore it), so that path's `/ID` stays an all-zero
+    // placeholder and is patched afterwards.
+    let mut det_id_closure;
+    let id_writer: Option<crate::object::TrailerIdWriter> = match &classic_det_id {
+        Some((id0, id1)) => {
+            // Clone the identifier into the `move` closure so
+            // `classic_det_id` stays available for the ObjStm patch below
+            // (the permanent id0 is now an owned `Vec`, not `Copy`).
+            let id0 = id0.clone();
+            let id1 = *id1;
+            det_id_closure = move |out: &mut Vec<u8>| {
+                crate::writer::write_deterministic_id_array(out, &id0, &id1)
+            };
+            Some(&mut det_id_closure)
+        }
+        None => None,
+    };
+    let final_output = do_write_pass(
+        plan,
+        renumber,
+        pdf,
+        &part1,
+        catalog_new_ref,
+        hint_stream_new_num,
+        total_count,
+        info_new_ref,
+        first_page_object_new_num,
+        Some(&hint_stream_object),
+        structural_streams_filtered,
+        &source_trailer,
+        &objstm_layout,
+        &relocation,
+        options,
+        false,
+        id_writer,
+        encrypt_ctx.as_ref(),
+        encrypted_string_emitter.as_mut(),
+    )?;
+    let LinearizedPassOutput {
+        bytes: mut final_bytes,
+        xref_offsets: final_xref_offsets,
+        hint_stream_offset: final_hint_stream_offset,
+        hint_stream_obj_total_len: final_hint_stream_obj_total_len,
+        end_of_first_page_offset: final_end_of_first_page_offset,
+        last_xref_offset: final_last_xref_keyword_offset,
+        last_xref_first_entry_offset: final_last_xref_first_entry_offset,
+        first_trailer_prev_range: final_first_trailer_prev_range,
+        id_ranges: final_id_ranges,
+    } = final_output;
 
     // ------------------------------------------------------------------
     // Deterministic /ID, ObjStm / xref-stream path: back-patch the all-zero
@@ -4503,8 +4136,9 @@ fn write_linearized_impl<R: Read + Seek>(
     }
 
     if let Some(pass1_path) = pass1_path {
-        let (pass1_bytes, pass1_hint_stream_offset, pass1_main_xref_offset) =
-            pass1_output.expect("requesting a pass-1 file always builds pass-1 output");
+        let pass1_bytes = &pass1_output.bytes;
+        let pass1_hint_stream_offset = pass1_output.hint_stream_offset;
+        let pass1_main_xref_offset = pass1_output.last_xref_offset;
         let second_xref_end = if objstm_layout.is_empty() {
             0
         } else {
@@ -8821,149 +8455,25 @@ mod tests {
         );
     }
 
-    /// Regression test for the convergence-loop predicate bug (flaky
-    /// `linearized_encrypted_outline_and_part8_shared_hint_tables_stay_consistent_across_many_random_iv_runs`
-    /// below): `hint_stream_convergence_len` must measure the REAL, emitted
-    /// (post-encryption) hint-stream object, not a plaintext proxy. Before
-    /// the fix, it computed `dict_prefix.len() + payload.len() +
-    /// usize::from(payload.last() != Some(&b'\n'))` directly on the
-    /// PLAINTEXT `payload` — but [`append_hint_stream_object`] decides the
-    /// newline-before-`endstream` byte from the CIPHERTEXT's last byte
-    /// (QPDFWriter.cc:2327), which is an effectively independent function of
-    /// the full plaintext content under a fixed key+IV (CBC chaining), not
-    /// just of the plaintext's own last byte or length. So two plaintexts
-    /// that a plaintext-only proxy scores as identical (same length, same
-    /// "ends in `\n`?" verdict) can still emit real objects of different
-    /// length — which is exactly the sibling mechanism to
-    /// `identical_plaintext_different_iv_can_change_hint_stream_object_length`
-    /// (that test varies the IV for one fixed plaintext; this one varies the
-    /// plaintext for one fixed IV).
-    ///
-    /// Sweeps 3000 same-length candidates that all share the same fixed,
-    /// non-`\n` LAST byte (so a plaintext-only proxy would score every one
-    /// of them identically) under a fixed key + IV, and asserts the real
-    /// measured lengths are not all equal — i.e. the predicate is actually
-    /// sensitive to content a plaintext-only formula could not see. 3000
-    /// keeps the probability of missing the ~1/256-per-candidate
-    /// newline-ciphertext boundary below 1e-5 (same sizing rationale as the
-    /// random-IV end-to-end test below), and — unlike that test — every
-    /// candidate here is a fixed, reproducible byte sequence, so this test
-    /// is deterministic, not flaky.
+    /// qpdf's hint tables are calculated from the first write pass, where the
+    /// hint object slot is reserved but emits no bytes.  The resulting offsets
+    /// are already the virtual values that qpdf's `adjusted_offset` restores
+    /// after the exact hint object is spliced into pass 2; they must not be
+    /// corrected by subtracting a guessed hint-object length here.
     #[test]
-    fn hint_stream_convergence_len_is_sensitive_to_ciphertext_not_just_plaintext_length() {
-        use crate::writer::{EncryptionContext, WriteCipher};
-
-        let ctx = EncryptionContext {
-            encrypt_dict: Dictionary::new(),
-            file_key: vec![0x11; 16],
-            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
-            encryption_v: 4,
-            encryption_r: 4,
-            encrypt_ref: ObjectRef::new(2, 0),
-            id0: Vec::new(),
-            static_aes_iv: true,
-            encrypt_metadata: true,
-            metadata_ref: None,
-        };
-        let measure = HintStreamMeasure {
-            hint_ref: ObjectRef::new(9, 0),
-            filtered: false,
-            encrypt_ctx: Some(&ctx),
-            hint_stream_aes_iv: crate::pipeline::aes::static_initialization_vector(),
-        };
-        let base = b"page offset hint table + shared object hint table payload".to_vec();
-        let n = base.len();
-
-        let mut lengths = std::collections::BTreeSet::new();
-        for counter in 0u32..3000 {
-            let mut payload = base.clone();
-            // Vary two bytes ahead of the final byte (65536 distinct values,
-            // 3000 sampled) so each candidate's ciphertext is an
-            // independent draw under CBC chaining, while the LAST byte
-            // stays fixed at a non-`\n` constant — every candidate shares
-            // the same plaintext length and the same plaintext-based
-            // "needs newline" verdict.
-            payload[n - 3] = (counter & 0xff) as u8;
-            payload[n - 2] = ((counter >> 8) & 0xff) as u8;
-            payload[n - 1] = b'X';
-
-            let real_len = hint_stream_convergence_len(&measure, &payload, 46, None)
-                .expect("measure real emitted length");
-            lengths.insert(real_len);
-        }
-
-        assert!(
-            lengths.len() > 1,
-            "3000 same-length candidates sharing one plaintext-based newline \
-             verdict must not all emit the same REAL length — otherwise this \
-             test never exercises the ciphertext-vs-plaintext gap it targets \
-             (observed lengths: {lengths:?})"
-        );
-    }
-
-    /// Proves the fix actually closes the gap `identical_plaintext_different_iv_can_change_hint_stream_object_length`
-    /// opens: even though the hint stream's OWN emitted length can differ
-    /// between two IVs for the same plaintext, every downstream hint-table
-    /// field this writer derives from a probed pass stays IDENTICAL when
-    /// [`build_outline_hint_table`] (real production code, unmodified for
-    /// this test) is fed two scenarios that model "probe pass used
-    /// `hint_stream_obj_total_len = L`, the pass that actually ships the
-    /// bytes used `L + delta`" — the exact cross-pass situation the old
-    /// (fresh-IV-per-call) code could produce and the fix now prevents from
-    /// ever occurring in the first place.
-    ///
-    /// The mechanism: every object physically AFTER the hint stream shifts by
-    /// the same `delta` the hint stream's own length changed by (nothing else
-    /// in the file depends on the hint stream's length), so a probed offset
-    /// for such an object is always `hint_stream_offset + L + gap` for a
-    /// pass-invariant `gap`. Subtracting that same pass's `L` cancels it,
-    /// leaving `hint_stream_offset + gap` — independent of `L` entirely. This
-    /// is the invariant `append_hint_stream_object`'s doc names explicitly.
-    #[test]
-    fn hint_stream_length_is_stable_across_a_forced_iv_change() {
+    fn build_outline_hint_table_uses_pass1_virtual_offset() {
         let info = OutlineHintInfo {
             first_object: 3,
             nobjects: 2,
         };
         let byte_lengths = BTreeMap::from([(3u32, 60usize), (4u32, 70usize)]);
 
-        // Scenario A: "probe pass" measured hint_stream_obj_total_len = 144,
-        // and object 3 (the first outline unit) physically landed at offset
-        // 500 in THAT pass's bytes (500 = hint_stream_offset + 144 + gap for
-        // some fixed hint_stream_offset/gap).
-        let table_a = build_outline_hint_table(
-            &info,
-            &BTreeMap::from([(3u32, 500usize)]),
-            &byte_lengths,
-            144,
-        )
-        .unwrap();
+        let table =
+            build_outline_hint_table(&info, &BTreeMap::from([(3u32, 500usize)]), &byte_lengths)
+                .expect("pass-1 outline offset is already virtual");
 
-        // Scenario B: same physical document, but the hint stream's OWN
-        // ciphertext was one byte longer this time (delta = +1, e.g. a
-        // different IV flipped the newline-before-endstream decision) — every
-        // object after it, including object 3, shifts by that same delta.
-        let delta: usize = 1;
-        let table_b = build_outline_hint_table(
-            &info,
-            &BTreeMap::from([(3u32, 500usize + delta)]),
-            &byte_lengths,
-            144 + delta,
-        )
-        .unwrap();
-
-        assert_eq!(
-            table_a.first_object_offset, table_b.first_object_offset,
-            "the stored (adjusted) offset must be independent of which \
-             pass's hint-stream length measured it, as long as every \
-             object after the hint stream shifted by the same delta"
-        );
-        // Negative control: this is not vacuously true for every field —
-        // group_length is an ABSOLUTE sum of other objects' own byte
-        // lengths (not an offset the hint stream's length was ever
-        // subtracted from), so it stays unaffected by delta and unequal
-        // scenarios would show up here instead if the byte_lengths differed.
-        assert_eq!(table_a.group_length, table_b.group_length);
+        assert_eq!(table.first_object_offset, 500);
+        assert_eq!(table.group_length, 130);
     }
 
     /// Read a `"{key}: "`-prefixed decimal field out of a
@@ -9222,7 +8732,7 @@ mod tests {
     /// Task 11 qualitative check (`bd show flpdf-txag` acceptance criteria
     /// item 6): confirms the hint stream is genuinely ciphertext THROUGH THE
     /// FULL `linearize_with` pipeline — renumbering, plan, and the
-    /// probe/convergence loop all included — not merely at the level of
+    /// two-pass layout all included — not merely at the level of
     /// `append_hint_stream_object` called in isolation with a hand-built
     /// `EncryptionContext`, which
     /// [`append_hint_stream_object_encrypts_payload_when_ctx_present`]
@@ -9513,7 +9023,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_outline_hint_table_uses_adjusted_offset_and_consecutive_lengths() {
+    fn build_outline_hint_table_uses_virtual_offset_and_consecutive_lengths() {
         // first_object = 3, nobjects = 2 → group_length sums units 3 and 4.
         let info = OutlineHintInfo {
             first_object: 3,
@@ -9521,10 +9031,10 @@ mod tests {
         };
         let xref_offsets = BTreeMap::from([(3u32, 500usize), (4u32, 560usize)]);
         let byte_lengths = BTreeMap::from([(3u32, 60usize), (4u32, 70usize), (5u32, 999usize)]);
-        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths, 144).unwrap();
+        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths).unwrap();
         assert_eq!(table.first_object, 3);
-        // adjusted_offset convention: probe offset MINUS hint stream length.
-        assert_eq!(table.first_object_offset, 500 - 144);
+        // Pass-1 offsets already omit the exact hint object that pass 2 splices.
+        assert_eq!(table.first_object_offset, 500);
         assert_eq!(table.nobjects, 2);
         // outputLengthNextN: units 3 and 4 only (unit 5 excluded by nobjects).
         assert_eq!(table.group_length, 60 + 70);
@@ -9537,8 +9047,7 @@ mod tests {
             nobjects: 1,
         };
         // `first_object` absent from xref_offsets → layout guard fires.
-        let err =
-            build_outline_hint_table(&info, &BTreeMap::new(), &BTreeMap::new(), 144).unwrap_err();
+        let err = build_outline_hint_table(&info, &BTreeMap::new(), &BTreeMap::new()).unwrap_err();
         assert!(
             matches!(err, crate::Error::Unsupported(ref m) if m.contains("no probed offset")),
             "expected 'no probed offset' Unsupported error, got {err:?}"
@@ -9546,19 +9055,16 @@ mod tests {
     }
 
     #[test]
-    fn build_outline_hint_table_errors_when_offset_below_hint_stream_length() {
+    fn build_outline_hint_table_accepts_small_virtual_offset() {
         let info = OutlineHintInfo {
             first_object: 3,
             nobjects: 1,
         };
-        // Offset (100) < hint stream length (144) → adjusted_offset underflow guard.
+        // A pass-1 virtual offset may be smaller than the final hint object;
+        // pass 2's qpdf adjusted_offset adds that object back later.
         let xref_offsets = BTreeMap::from([(3u32, 100usize)]);
-        let err =
-            build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new(), 144).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m) if m.contains("less than the hint")),
-            "expected 'less than the hint stream length' Unsupported error, got {err:?}"
-        );
+        let table = build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new()).unwrap();
+        assert_eq!(table.first_object_offset, 100);
     }
 
     #[test]
@@ -9572,8 +9078,8 @@ mod tests {
         };
         let xref_offsets = BTreeMap::from([(10u32, 1000usize)]);
         let byte_lengths = BTreeMap::from([(10u32, 40usize), (12u32, 5usize)]); // 11 missing
-        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths, 200).unwrap();
-        assert_eq!(table.first_object_offset, 1000 - 200);
+        let table = build_outline_hint_table(&info, &xref_offsets, &byte_lengths).unwrap();
+        assert_eq!(table.first_object_offset, 1000);
         // 40 (unit 10) + 0 (unit 11 missing → unwrap_or(0)) + 5 (unit 12).
         assert_eq!(table.group_length, 45);
     }
@@ -9589,7 +9095,7 @@ mod tests {
         };
         let huge = (u32::MAX as usize) + 100; // adjusted offset = huge - 0 = huge
         let xref_offsets = BTreeMap::from([(3u32, huge)]);
-        let err = build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new(), 0).unwrap_err();
+        let err = build_outline_hint_table(&info, &xref_offsets, &BTreeMap::new()).unwrap_err();
         assert!(
             matches!(err, crate::Error::Unsupported(ref m) if m.contains("exceeds the")),
             "expected 'exceeds the 32-bit ...' Unsupported error, got {err:?}"
