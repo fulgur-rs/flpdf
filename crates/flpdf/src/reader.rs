@@ -1488,6 +1488,14 @@ impl<R: Read + Seek> Pdf<R> {
         Rc::strong_count(&self.resolver) == 1
     }
 
+    /// Whether cross-reference table reconstruction has occurred for this document.
+    ///
+    /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
+    #[allow(dead_code)]
+    pub(crate) fn reconstructed_xref(&self) -> bool {
+        self.resolver.reconstructed_xref()
+    }
+
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.object_ref().is_some_and(|object_ref| {
             self.resolver

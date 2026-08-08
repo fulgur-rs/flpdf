@@ -462,7 +462,7 @@ pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Resu
 /// tokens per line — never re-parsing a body to end-of-file — makes the scan
 /// linear in the file size, unlike a per-candidate full-object parse which an
 /// unterminated literal string can drive to quadratic cost.
-fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
+pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
     let mut entries = BTreeMap::new();
     let mut line_start = 0usize;
     while line_start < bytes.len() {
