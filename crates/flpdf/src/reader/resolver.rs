@@ -656,6 +656,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    fn stream_description(&self, object_ref: ObjectRef) -> String {
+        let input_description = self.core.borrow().description.clone();
+        format!(
+            "{}, stream object {} {}",
+            input_description, object_ref.number, object_ref.generation
+        )
+    }
+
     /// The canonical handle for `object_ref` **if one has already been
     /// minted**, without minting one.
     ///
@@ -1701,8 +1709,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         debug_assert_eq!(parsed_offset, parsed.parsed_offset);
         let trailing = trailing.expect("non-empty parse must have a framing token");
         if trailing.is_word_value(b"stream") {
-            let (value, parsed_offset) = self.read_stream(value, parsed_offset)?;
-            Ok((value, parsed_offset, String::new()))
+            let stream_description = self.stream_description(expected);
+            let (value, parsed_offset) = self.read_stream(value, parsed_offset, description)?;
+            Ok((value, parsed_offset, stream_description))
         } else {
             if !trailing.is_word_value(b"endobj") {
                 self.push_warning("expected endobj")?;
@@ -1781,7 +1790,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///   reading object: seek to …, offset 9223372036854775000 (1): Invalid
     ///   argument`, exit 3, 8.9 MB peak RSS. The resolve-to-null fallback is
     ///   not ported either — see [`Self::read_object_at_offset_with_description`].
-    fn read_stream(&self, dict: ObjectValue, dict_offset: i64) -> Result<(ObjectValue, i64)> {
+    fn read_stream(
+        &self,
+        dict: ObjectValue,
+        dict_offset: i64,
+        dict_description: String,
+    ) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
 
         // qpdf `:1365-1367`: "Must get offset before accessing any additional
@@ -1814,6 +1828,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let dict = self.direct_object_handle(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
+        if !dict_description.is_empty() {
+            // QPDF_Stream::setDescription leaves an already-described stream
+            // dictionary untouched (`QPDF_Stream.cc:299-312`). The parser's
+            // dictionary description was rendered before the value was
+            // unwrapped, so restore that metadata on the rewrapped handle.
+            dict.set_description(dict_description, dict_offset);
+        }
         Ok((
             ObjectValue::Stream {
                 stream_dict: dict,
@@ -2824,7 +2845,54 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            ["stream dictionary warning"]
+            [", object 1 0 at offset 10: stream dictionary warning"]
+        );
+    }
+
+    #[test]
+    fn canonical_live_parser_stream_stamps_root_and_dictionary_descriptions() {
+        let object_ref = ObjectRef::new(1, 0);
+        let resolver = resolver_over_named_object(
+            b"\n1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+            object_ref,
+            "input.pdf",
+        );
+        let stream = resolver.get_object_handle(object_ref);
+        stream
+            .try_dereference()
+            .expect("live stream should resolve");
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+
+        assert_eq!(stream.description(), "input.pdf, stream object 1 0");
+        assert!(
+            stream.get_parsed_offset() > stream_dict.get_parsed_offset(),
+            "the stream description must retain the stream-data offset"
+        );
+        let dictionary_description = stream_dict.description();
+        assert!(
+            dictionary_description.starts_with("input.pdf, object 1 0 at offset "),
+            "the stream dictionary must retain its parser description, got {dictionary_description:?}"
+        );
+
+        stream
+            .object_warning("stream root warning")
+            .expect("stream root warning should reach the resolver");
+        stream_dict
+            .object_warning("stream dictionary warning")
+            .expect("stream dictionary warning should reach the resolver");
+        let expected_dictionary_warning =
+            format!("{dictionary_description}: stream dictionary warning");
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "input.pdf, stream object 1 0: stream root warning".to_owned(),
+                expected_dictionary_warning,
+            ]
         );
     }
 

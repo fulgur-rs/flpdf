@@ -944,6 +944,9 @@ impl ObjectHandle {
     /// and later marked missing — [`crate::Pdf::delete_object`] on an
     /// already-resolved handle — would keep reporting its former body's
     /// source position even though the value now reads as null.
+    /// The parsed description is discarded with the same transition, so an
+    /// outstanding handle cannot keep attributing warnings to the deleted
+    /// value's source location.
     pub(crate) fn set_missing(&self) {
         if self.is_indirect() {
             let old_value = {
@@ -953,6 +956,7 @@ impl ObjectHandle {
                     _ => None,
                 };
                 slot.parsed_offset = NO_PARSED_OFFSET;
+                slot.description = None;
                 old_value
             };
             if let Some(old_value) = old_value {

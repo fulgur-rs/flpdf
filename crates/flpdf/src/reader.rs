@@ -1198,14 +1198,14 @@ impl<R: Read + Seek> Pdf<R> {
         self.legacy_materialized_memo.remove(&object_ref);
         let handle = self.get_object_handle(object_ref);
         let lifted = self.lift_for_set_object(&object, &handle);
-        // A caller-supplied replacement no longer describes the source bytes
-        // that populated this handle. Clear both pieces of parsed provenance;
-        // otherwise a rendered description retains the old `$PO` value even
-        // after `reset_parsed_offset()` has removed the old offset.
-        handle.clear_description();
         match lifted {
             Ok(value) => {
                 handle.set_resolved(value);
+                // A caller-supplied replacement no longer describes the
+                // source bytes that populated this handle. Clear the parsed
+                // description only after the replacement has been lifted and
+                // installed; a failed lift leaves the canonical value intact.
+                handle.clear_description();
                 // The value is now caller-supplied, in-memory-constructed
                 // data, not something parsed from a source position; any
                 // previously recorded offset no longer describes it.
@@ -8420,6 +8420,39 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_drops_the_source_description_of_an_already_resolved_handle() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve");
+        let source_description = handle.description();
+        assert!(
+            source_description.contains("offset"),
+            "the fixture must establish a source description before deletion"
+        );
+
+        pdf.delete_object(object_ref);
+
+        assert_eq!(handle.description(), "object 1 0");
+        handle
+            .object_warning("deleted object warning")
+            .expect("deleted handle warning should use the fallback description");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .last()
+                .expect("deleted warning is recorded")
+                .message,
+            "object 1 0: deleted object warning"
+        );
+        assert_ne!(handle.description(), source_description);
+    }
+
+    #[test]
     fn set_object_drops_the_replaced_handle_source_description() {
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
@@ -8448,6 +8481,46 @@ mod tests {
                 .expect("replacement warning is recorded")
                 .message,
             "object 1 0: replacement warning"
+        );
+    }
+
+    #[test]
+    fn set_object_keeps_the_source_description_when_handle_lift_fails() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve");
+        let source_description = handle.description();
+        assert!(
+            source_description.contains("offset"),
+            "the fixture must establish a source description before replacement"
+        );
+
+        let mut replacement = Object::Null;
+        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement);
+
+        assert_eq!(
+            handle.description(),
+            source_description,
+            "a failed handle lift must leave the canonical value and provenance untouched"
+        );
+        handle
+            .object_warning("failed replacement warning")
+            .expect("unchanged handle warning should keep its source description");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .last()
+                .expect("failed replacement warning is recorded")
+                .message,
+            format!("{source_description}: failed replacement warning")
         );
     }
 
