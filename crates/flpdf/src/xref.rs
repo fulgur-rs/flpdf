@@ -854,6 +854,15 @@ fn parse_xref_stream(
         Object::Stream(stream) => stream,
         _ => return Err(Error::parse(xref_pos, "xref not found")),
     };
+    // QPDF::read_xrefStream accepts an xref stream only when
+    // `isStreamOfType("/XRef")` succeeds. The shared parser owns this check
+    // for both direct startxref streams and classic-trailer `/XRefStm` targets.
+    if !matches!(
+        stream.dict.get("Type"),
+        Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef"
+    ) {
+        return Err(Error::parse(xref_pos, "xref not found"));
+    }
 
     let trailer = stream.dict.clone();
     let size = parse_non_negative_u64(

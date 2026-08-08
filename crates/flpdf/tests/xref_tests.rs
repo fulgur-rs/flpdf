@@ -2498,6 +2498,29 @@ fn classic_xref_table_reads_entries_from_its_xrefstm() {
     );
 }
 
+/// qpdf's `read_xrefStream` accepts a stream only when it has `/Type /XRef`.
+/// An otherwise valid hybrid stream without that type must therefore be
+/// rejected rather than contributing entries from a classic trailer's
+/// `/XRefStm`.
+#[test]
+fn rejects_hybrid_xref_stream_without_xref_type() {
+    let (mut bytes, _) = classic_xref_with_hybrid_only_entry();
+    let type_marker = b"/Type /XRef";
+    let type_pos = bytes
+        .windows(type_marker.len())
+        .position(|window| window == type_marker)
+        .expect("hybrid fixture contains an xref type");
+    // Keep the fixture's stored xref offsets valid while removing its `/Type`
+    // key: `/Bogus /Yep` has the same length as `/Type /XRef`.
+    bytes[type_pos..type_pos + type_marker.len()].copy_from_slice(b"/Bogus /Yep");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("untyped hybrid stream must not be accepted as xref");
+    let message = format!("{err}");
+    assert!(message.contains("xref not found"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
 #[test]
 fn classic_xref_table_hybrid_entries_match_pinned_qpdf_show_xref() {
     // cov:ignore-start: CI provides qpdf; this fallback is for developer hosts only.
