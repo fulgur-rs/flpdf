@@ -279,6 +279,28 @@ impl std::fmt::Debug for ObjectHandle {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ChildDescription {
+    parent: Weak<RefCell<ObjectSlot>>,
+    static_descr: String,
+    var_descr: String,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(crate) struct JsonDescription {
+    pub(crate) input: String,
+    pub(crate) object: String,
+}
+
+#[derive(Clone)]
+pub(crate) enum ObjectDescription {
+    Template(String),
+    #[allow(dead_code)]
+    Json(JsonDescription),
+    Child(ChildDescription),
+}
+
 // Deliberately not `Debug`: see `ObjectHandle`'s own hand-written `Debug`
 // impl above for why a derived one is unsafe here (object-handle cycles).
 // This uniform allocation corresponds to qpdf's QPDFObject/QPDFValue pair:
@@ -292,6 +314,66 @@ struct ObjectSlot {
     parsed_offset: i64,
     pdf_unique_ids: BTreeSet<u64>,
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
+    description: Option<ObjectDescription>,
+}
+
+impl ObjectSlot {
+    fn get_description(&self) -> String {
+        if let Some(desc) = &self.description {
+            match desc {
+                ObjectDescription::Template(tmpl) => {
+                    let mut result = tmpl.clone();
+                    if result.contains("$OG") {
+                        let og_str = self
+                            .object_ref
+                            .map(|r| format!("{} {}", r.number, r.generation))
+                            .unwrap_or_default();
+                        result = result.replace("$OG", &og_str);
+                    }
+                    if result.contains("$PO") {
+                        let shift = match &self.state {
+                            ObjectState::Resolved(val) => match val {
+                                ObjectValue::Dictionary(_) | ObjectValue::Stream { .. } => 2,
+                                ObjectValue::Array(_) => 1,
+                                _ => 0,
+                            },
+                            _ => 0,
+                        };
+                        let offset_val = if self.parsed_offset >= 0 {
+                            self.parsed_offset + shift
+                        } else {
+                            self.parsed_offset
+                        };
+                        result = result.replace("$PO", &offset_val.to_string());
+                    }
+                    result
+                }
+                ObjectDescription::Json(j) => {
+                    let obj_part = if j.object.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", {}", j.object)
+                    };
+                    format!("{}{obj_part} at offset {}", j.input, self.parsed_offset)
+                }
+                ObjectDescription::Child(child) => {
+                    let mut result = String::new();
+                    if let Some(parent_slot) = child.parent.upgrade() {
+                        result = parent_slot.borrow().get_description();
+                    }
+                    result.push_str(&child.static_descr);
+                    if result.contains("$VD") {
+                        result = result.replace("$VD", &child.var_descr);
+                    }
+                    result
+                }
+            }
+        } else if let Some(object_ref) = self.object_ref {
+            format!("object {} {}", object_ref.number, object_ref.generation)
+        } else {
+            String::new()
+        }
+    }
 }
 
 /// The value payload of a direct `ObjectHandle`, mirroring qpdf's
@@ -571,6 +653,7 @@ impl ObjectHandle {
             parsed_offset: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
+            description: None,
         })))
     }
 
@@ -583,6 +666,7 @@ impl ObjectHandle {
             parsed_offset,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
+            description: None,
         })));
         handle.with_value(|value| {
             if let Some(value) = value {
@@ -931,7 +1015,34 @@ impl ObjectHandle {
     #[allow(dead_code)] // reached through the try_* accessors, whose own
                         // production consumers land with flpdf-25kg.3.6
     fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
-        self.0.borrow().resolver.as_ref().and_then(Weak::upgrade)
+        let slot = self.0.borrow();
+        slot.resolver
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .or_else(|| {
+                if let Some(ObjectDescription::Child(child)) = &slot.description {
+                    child
+                        .parent
+                        .upgrade()
+                        .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                slot.containment_parents.iter().find_map(|parent| {
+                    parent
+                        .upgrade()
+                        .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
+                })
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_description_json(&self, input: String, object: String, offset: i64) {
+        let mut slot = self.0.borrow_mut();
+        slot.description = Some(ObjectDescription::Json(JsonDescription { input, object }));
+        slot.parsed_offset = offset;
     }
 
     /// Emit `message` through this handle's context, or report it as the
@@ -952,6 +1063,38 @@ impl ObjectHandle {
         }
     }
 
+    pub(crate) fn description(&self) -> String {
+        self.0.borrow().get_description()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_description(&self, description: String, offset: i64) {
+        let mut slot = self.0.borrow_mut();
+        slot.description = Some(ObjectDescription::Template(description));
+        slot.parsed_offset = offset;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_default_description(&self, object_ref: ObjectRef) {
+        let mut slot = self.0.borrow_mut();
+        slot.object_ref = Some(object_ref);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_child_description(
+        &self,
+        parent: &ObjectHandle,
+        static_descr: &str,
+        var_descr: &str,
+    ) {
+        let mut slot = self.0.borrow_mut();
+        slot.description = Some(ObjectDescription::Child(ChildDescription {
+            parent: Rc::downgrade(&parent.0),
+            static_descr: static_descr.to_owned(),
+            var_descr: var_descr.to_owned(),
+        }));
+    }
+
     /// Report that an accessor expecting `expected_type` ran on this handle.
     ///
     /// Ports `QPDFObjectHandle::typeWarning`
@@ -967,8 +1110,14 @@ impl ObjectHandle {
     #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn type_warning(&self, expected_type: &str, warning: &str) -> Result<()> {
         self.try_dereference()?;
+        let desc = self.description();
+        let prefix = if desc.is_empty() {
+            String::new()
+        } else {
+            format!("{desc}: ")
+        };
         self.warn_through_context(format!(
-            "operation for {expected_type} attempted on object of type {}: {warning}",
+            "{prefix}operation for {expected_type} attempted on object of type {}: {warning}",
             self.type_name()
         ))
     }
@@ -996,11 +1145,18 @@ impl ObjectHandle {
     /// reachable, and reports a sink that refuses the message.
     #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn warn_if_possible(&self, warning: &str) -> Result<()> {
-        let Some(context) = self.context() else {
-            return crate::QPDFLogger::default_logger().error(format!("{warning}\n"));
-        };
-        self.try_dereference()?;
-        context.warn(warning.to_owned())
+        if let Some(context) = self.context() {
+            self.try_dereference()?;
+            let desc = self.description();
+            let prefix = if desc.is_empty() {
+                String::new()
+            } else {
+                format!("{desc}: ")
+            };
+            context.warn(format!("{prefix}{warning}"))
+        } else {
+            crate::QPDFLogger::default_logger().error(format!("{warning}\n"))
+        }
     }
 
     /// Report an object-level problem whose message qpdf passes through
@@ -1017,7 +1173,13 @@ impl ObjectHandle {
     /// mirroring the exception qpdf throws instead of warning.
     #[allow(dead_code)] // same deferred consumers as `context`
     pub(crate) fn object_warning(&self, warning: &str) -> Result<()> {
-        self.warn_through_context(warning.to_owned())
+        let desc = self.description();
+        let prefix = if desc.is_empty() {
+            String::new()
+        } else {
+            format!("{desc}: ")
+        };
+        self.warn_through_context(format!("{prefix}{warning}"))
     }
 
     /// qpdf-compatible null inspection with lazy dereference.
@@ -1297,15 +1459,23 @@ impl ObjectHandle {
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
-        // One `with_value` both type-tests and fetches, so a non-dictionary
-        // stays distinguishable from a missing key without the whole entry
-        // map being cloned to answer either question.
-        Ok(self
-            .with_value(|value| match value {
-                Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
-                _ => None,
-            })
-            .unwrap_or_else(ObjectHandle::null))
+        let child = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+            _ => None,
+        });
+        if let Some(child) = child {
+            Ok(child)
+        } else {
+            let key_str = String::from_utf8_lossy(key);
+            let null = ObjectHandle::null();
+            let var_descr = if key_str.starts_with('/') {
+                key_str.into_owned()
+            } else {
+                format!("/{key_str}")
+            };
+            null.set_child_description(self, " -> dictionary key $VD", &var_descr);
+            Ok(null)
+        }
     }
 
     /// qpdf-compatible visible-key test. A present value that resolves to
@@ -9460,7 +9630,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
+            ["object 3 0: operation for dictionary attempted on object of type integer: treating as empty"]
         );
     }
 
@@ -9472,7 +9642,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["operation for integer attempted on object of type name: returning 0"]
+            ["object 3 0: operation for integer attempted on object of type name: returning 0"]
         );
     }
 
@@ -9603,7 +9773,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["operation for integer attempted on object of type name: returning 0"]
+            ["object 3 0: operation for integer attempted on object of type name: returning 0"]
         );
     }
 
@@ -9616,7 +9786,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["requested value of integer is too small; returning INT_MIN"]
+            ["object 3 0: requested value of integer is too small; returning INT_MIN"]
         );
     }
 
@@ -9629,7 +9799,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["requested value of integer is too big; returning INT_MAX"]
+            ["object 3 0: requested value of integer is too big; returning INT_MAX"]
         );
     }
 
@@ -9679,7 +9849,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["operation for integer attempted on object of type name: returning 0"]
+            ["object 3 0: operation for integer attempted on object of type name: returning 0"]
         );
     }
 
@@ -9750,7 +9920,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["operation for dictionary attempted on object of type stream: treating as empty"]
+            ["object 3 0: operation for dictionary attempted on object of type stream: treating as empty"]
         );
     }
 
@@ -9771,7 +9941,7 @@ mod warning_emission_tests {
             crate::Error::Internal(ref message)
                 if message
                     == "warning raised through a resolver with no document warning sink: \
-                        operation for dictionary attempted on object of type integer: \
+                        object 3 0: operation for dictionary attempted on object of type integer: \
                         treating as empty"
         ));
     }
@@ -9805,9 +9975,12 @@ mod warning_emission_tests {
         // The else-branch of `warnIfPossible` writes the bare message to
         // `QPDFLogger::defaultLogger()->getError()` and returns normally
         // (`libqpdf/QPDFObjectHandle.cc:2196-2200`).
+        let handle = {
+            let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+            ObjectHandle::new_indirect_with_resolver(ObjectRef::new(3, 0), Rc::downgrade(&resolver))
+        };
         let (result, captured) = with_captured_default_error(|| {
-            ObjectHandle::integer(7)
-                .warn_if_possible("requested value of integer is too big; returning INT_MAX")
+            handle.warn_if_possible("requested value of integer is too big; returning INT_MAX")
         });
 
         result.unwrap();
@@ -9816,6 +9989,10 @@ mod warning_emission_tests {
         assert!(
             captured.contains("requested value of integer is too big; returning INT_MAX\n"),
             "default error stream captured {captured:?}"
+        );
+        assert!(
+            !captured.contains("object 3 0:"),
+            "contextless warn_if_possible must log bare warning without object description prefix"
         );
     }
 
@@ -9829,7 +10006,7 @@ mod warning_emission_tests {
 
         assert_eq!(
             warnings(&recorder),
-            ["requested value of integer is too small; returning INT_MIN"]
+            ["object 3 0: requested value of integer is too small; returning INT_MIN"]
         );
     }
 
@@ -9839,7 +10016,7 @@ mod warning_emission_tests {
 
         handle.object_warning("unresolved name object").unwrap();
 
-        assert_eq!(warnings(&recorder), ["unresolved name object"]);
+        assert_eq!(warnings(&recorder), ["object 3 0: unresolved name object"]);
         assert!(
             !handle.is_resolved(),
             "objectWarning does not dereference its receiver"
@@ -9870,9 +10047,115 @@ mod warning_emission_tests {
         assert_eq!(
             warnings(&recorder),
             [
-                "operation for dictionary attempted on object of type integer: treating as empty",
-                "operation for array attempted on object of type integer: treating as empty",
+                "object 3 0: operation for dictionary attempted on object of type integer: treating as empty",
+                "object 3 0: operation for array attempted on object of type integer: treating as empty",
             ]
         );
+    }
+
+    #[test]
+    fn object_description_template_placeholders_and_offset_shifts() {
+        let dict = ObjectHandle::dictionary(vec![]);
+        dict.set_description("object $OG at offset $PO".to_owned(), 100);
+        dict.set_default_description(ObjectRef::new(5, 0));
+        assert_eq!(dict.description(), "object 5 0 at offset 102");
+
+        let arr = ObjectHandle::array(vec![]);
+        arr.set_description("array at offset $PO".to_owned(), 200);
+        assert_eq!(arr.description(), "array at offset 201");
+
+        let scalar = ObjectHandle::integer(42);
+        scalar.set_description("scalar at offset $PO".to_owned(), 300);
+        assert_eq!(scalar.description(), "scalar at offset 300");
+    }
+
+    #[test]
+    fn object_description_child_chaining_and_var_descr() {
+        let parent = ObjectHandle::dictionary(vec![]);
+        parent.set_description("object 5 0 at offset 253".to_owned(), 253);
+
+        let child = ObjectHandle::null();
+        child.set_child_description(&parent, " -> dictionary key $VD", "/EF");
+
+        assert_eq!(
+            child.description(),
+            "object 5 0 at offset 253 -> dictionary key /EF"
+        );
+    }
+
+    #[test]
+    fn object_description_indirect_fallback() {
+        let handle = ObjectHandle::null();
+        handle.set_default_description(ObjectRef::new(12, 0));
+        assert_eq!(handle.description(), "object 12 0");
+    }
+
+    #[test]
+    fn object_description_type_warning_includes_parent_and_object_path() {
+        let (parent, recorder) =
+            handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
+        parent.set_description("object 5 0 at offset 253".to_owned(), 253);
+
+        let child = parent.try_get_key(b"EF").unwrap();
+        child
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
+
+        assert_eq!(
+            warnings(&recorder),
+            ["object 5 0 at offset 253 -> dictionary key /EF: operation for dictionary attempted on object of type null: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn object_description_json_and_negative_offset_and_unresolved() {
+        let handle1 = ObjectHandle::null();
+        handle1.set_description_json("input.pdf".to_owned(), "".to_owned(), 123);
+        assert_eq!(handle1.description(), "input.pdf at offset 123");
+
+        let handle2 = ObjectHandle::null();
+        handle2.set_description_json("input.pdf".to_owned(), "object 1 0".to_owned(), 456);
+        assert_eq!(handle2.description(), "input.pdf, object 1 0 at offset 456");
+
+        let handle3 = ObjectHandle::null();
+        handle3.set_description("item at offset $PO".to_owned(), -1);
+        assert_eq!(handle3.description(), "item at offset -1");
+
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        let handle4 = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(3, 0),
+            Rc::downgrade(&resolver),
+        );
+        handle4.set_description("unresolved at offset $PO".to_owned(), 50);
+        assert_eq!(handle4.description(), "unresolved at offset 50");
+    }
+
+    #[test]
+    fn object_context_traverses_containment_parents() {
+        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let child = ObjectHandle::integer(10);
+        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
+
+        child
+            .type_warning("dictionary", "treating as empty")
+            .unwrap();
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn try_get_key_without_leading_slash_formats_key() {
+        let parent = ObjectHandle::dictionary(vec![]);
+        let child = parent.try_get_key(b"NoSlash").unwrap();
+        assert_eq!(child.description(), " -> dictionary key /NoSlash");
+    }
+
+    #[test]
+    fn try_get_key_with_leading_slash_formats_key() {
+        let parent = ObjectHandle::dictionary(vec![]);
+        let child = parent.try_get_key(b"/EF").unwrap();
+        assert_eq!(child.description(), " -> dictionary key /EF");
     }
 }
