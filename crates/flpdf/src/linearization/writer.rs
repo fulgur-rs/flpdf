@@ -1607,29 +1607,62 @@ fn hint_stream_dict_prefix(
     )
 }
 
-/// Variable byte length of the hint-stream object across convergence passes:
-/// the dict prefix (whose `/S`, `/O`, `/Length` decimal widths track the
-/// back-patched offsets), the selected payload, and the conditional newline
-/// before `endstream`. The fixed scaffolding (`N G obj\n`, `endstream\nendobj\n`)
-/// is constant — the object number is pre-allocated — so it cancels in an
-/// equality and is omitted. Used as the convergence key so a digit-width change
-/// in any dict value (not just the payload length) is detected before the final
-/// pass bakes `/H[1]`-relative offsets against it.
+/// Real, physical byte length of the hint-stream object across convergence
+/// passes: delegates to [`append_hint_stream_object`] itself (into a scratch
+/// buffer) rather than re-deriving the dict-prefix/newline/framing math
+/// separately, so the convergence key can never drift from what the emitter
+/// actually writes. Used as the convergence key so a digit-width change in
+/// any dict value, or a change in the *emitted* (post-encryption when
+/// `encrypt_ctx` is `Some`) payload's trailing byte, is detected before the
+/// final pass bakes `/H[1]`-relative offsets against it.
+///
+/// # Why this must measure the emitted bytes, not the plaintext payload
+///
+/// Earlier revisions computed this length from the plaintext `payload`
+/// (pre-encryption) directly, including its own `payload.last() != b'\n'`
+/// check for the newline-before-`endstream` decision. That is the wrong
+/// question when `encrypt_ctx` is `Some`: [`append_hint_stream_object`]
+/// makes that same decision on the *ciphertext*'s last byte
+/// (QPDFWriter.cc:2319-2329), and an AES-CBC ciphertext's last byte is an
+/// effectively independent function of the full plaintext content (not just
+/// its length) — two plaintexts of equal length, differing only in the
+/// offset values a later iteration back-patched, generally encrypt to
+/// ciphertexts whose last byte disagrees. A plaintext-only proxy can
+/// therefore report "converged" (predicted lengths match) while the real
+/// emitted object length differs from what the just-computed hint-table
+/// offsets assumed — or can fail to detect a genuine oscillation between two
+/// real lengths. Delegating to the real emitter removes that gap by
+/// construction.
 fn hint_stream_convergence_len(
+    measure: &HintStreamMeasure<'_>,
     payload: &[u8],
     shared_section_offset: usize,
     outline_section_offset: Option<usize>,
-    filtered: bool,
-) -> usize {
-    hint_stream_dict_prefix(
+) -> Result<usize> {
+    let mut scratch = Vec::new();
+    let write = append_hint_stream_object(
+        &mut scratch,
+        measure.hint_ref,
+        payload,
         shared_section_offset,
         outline_section_offset,
-        payload.len(),
-        filtered,
-    )
-    .len()
-        + payload.len()
-        + usize::from(payload.last() != Some(&b'\n'))
+        measure.filtered,
+        measure.encrypt_ctx,
+        measure.hint_stream_aes_iv,
+    );
+    write.map(|_| scratch.len())
+}
+
+/// Loop-invariant inputs to [`hint_stream_convergence_len`], shared by both
+/// the "new" and "current" measurements the convergence loop takes on every
+/// iteration. Bundled into one struct (rather than threaded as separate
+/// arguments) purely to keep call sites short — no behavior beyond
+/// [`append_hint_stream_object`]'s own.
+struct HintStreamMeasure<'a> {
+    hint_ref: ObjectRef,
+    filtered: bool,
+    encrypt_ctx: Option<&'a crate::writer::EncryptionContext>,
+    hint_stream_aes_iv: [u8; 16],
 }
 
 /// Emit the primary hint-stream object and return its start byte offset.
@@ -1670,7 +1703,7 @@ fn hint_stream_convergence_len(
 /// or the cipher is RC4 (no IV concept); callers may pass any value in
 /// those cases.
 ///
-/// # Why pinning the IV is a defensive alignment with qpdf, not a proven-necessary fix
+/// # Why pinning the IV is necessary, not just a defensive alignment with qpdf
 ///
 /// Every downstream hint-table field this writer patches from a probed pass
 /// (`so_table.header.location`, [`build_outline_hint_table`]'s
@@ -1687,17 +1720,20 @@ fn hint_stream_convergence_len(
 /// non-hint-stream stream objects use `NewlineBeforeEndstream::Never` (no
 /// IV-dependent framing decision), and every AES-encrypted string is
 /// unconditionally hex encoded like qpdf's `QPDF_String::unparse(true)`
-/// (`QPDFWriter.cc:1567-1599`). Pinning the hint stream's own IV removes the
-/// ONE source of
-/// pass-to-pass variance this writer's algebraic cancellation does NOT
-/// already absorb regardless of that gap — the hint stream's own conditional
-/// newline-before-`endstream` — and matches qpdf's own "encrypt once, reuse
-/// the bytes" architecture. Note: mutation testing during review found the
-/// accompanying regression tests do not distinguish pinned from unpinned IVs
-/// (the cancellation already holds either way for every fixture tried), so
-/// treat this pinning as a defensive alignment with qpdf's real behavior
-/// rather than as a fix empirically proven necessary for a reproduced
-/// failure.
+/// (`QPDFWriter.cc:1567-1599`).
+///
+/// Pinning the hint stream's own IV removes re-drawing a *fresh* random IV
+/// on every probe/final call as an independent source of pass-to-pass
+/// variance, matching qpdf's own "encrypt once, reuse the bytes"
+/// architecture. It does **not**, by itself, make the emitted hint object's
+/// length pass-invariant: even with a fixed IV, AES-CBC ciphertext is a
+/// function of the *full plaintext content*, not just its length, so two
+/// iterations whose patched tables encode different offset values (equal
+/// plaintext length, different content) can still land on either side of
+/// the conditional newline-before-`endstream` boundary. The convergence
+/// loop's `hint_stream_convergence_len` check exists to catch exactly that
+/// residual case by measuring the real, encrypted, emitted object on every
+/// iteration rather than assuming pinning alone suffices.
 #[allow(clippy::too_many_arguments)]
 fn append_hint_stream_object(
     bytes: &mut Vec<u8>,
@@ -4318,20 +4354,29 @@ fn write_linearized_impl<R: Read + Seek>(
         // `endstream` (qpdf, QPDFWriter.cc:2327) and the decimal widths of the
         // dict values `/S`, `/O`, `/Length` (offsets into the uncompressed hint
         // stream, which shift independently of payload length) both contribute.
-        // `hint_stream_convergence_len` captures every variable component, so
-        // convergence forces ΔL=0 — the final pass's `/H[1]` exactly matches the
-        // offsets baked into the payload (the constant scaffolding cancels).
-        let converged = hint_stream_convergence_len(
-            &new_hint_payload,
-            new_shared_s,
-            new_outline_o,
-            structural_streams_filtered,
-        ) == hint_stream_convergence_len(
+        // `hint_stream_convergence_len` measures the real *emitted* object
+        // (post-encryption when `encrypt_ctx` is `Some`, via
+        // `append_hint_stream_object`), so convergence forces ΔL=0 against
+        // what will actually be written — the final pass's `/H[1]` exactly
+        // matches the offsets baked into the payload (the constant
+        // scaffolding cancels).
+        let measure = HintStreamMeasure {
+            hint_ref: ObjectRef::new(hint_stream_new_num, 0),
+            filtered: structural_streams_filtered,
+            encrypt_ctx: encrypt_ctx.as_ref(),
+            hint_stream_aes_iv,
+        };
+        let measured_len = |payload: &[u8], s: usize, o: Option<usize>| {
+            hint_stream_convergence_len(&measure, payload, s, o)
+        };
+        let new_len = measured_len(&new_hint_payload, new_shared_s, new_outline_o)?;
+        let (cur, cur_s, cur_o) = (
             &current_hint_payload,
             current_hint_shared_s,
             current_hint_outline_o,
-            structural_streams_filtered,
         );
+        let current_len = measured_len(cur, cur_s, cur_o)?;
+        let converged = new_len == current_len;
 
         // Promote the freshly-patched stream as the next iteration input.
         current_hint_payload = new_hint_payload;
@@ -8773,6 +8818,86 @@ mod tests {
             "identical plaintext through two different IVs must be able to \
              produce hint-stream OBJECTS of different total byte length \
              (this is the exact premise the reviewer-flagged bug depends on)"
+        );
+    }
+
+    /// Regression test for the convergence-loop predicate bug (flaky
+    /// `linearized_encrypted_outline_and_part8_shared_hint_tables_stay_consistent_across_many_random_iv_runs`
+    /// below): `hint_stream_convergence_len` must measure the REAL, emitted
+    /// (post-encryption) hint-stream object, not a plaintext proxy. Before
+    /// the fix, it computed `dict_prefix.len() + payload.len() +
+    /// usize::from(payload.last() != Some(&b'\n'))` directly on the
+    /// PLAINTEXT `payload` — but [`append_hint_stream_object`] decides the
+    /// newline-before-`endstream` byte from the CIPHERTEXT's last byte
+    /// (QPDFWriter.cc:2327), which is an effectively independent function of
+    /// the full plaintext content under a fixed key+IV (CBC chaining), not
+    /// just of the plaintext's own last byte or length. So two plaintexts
+    /// that a plaintext-only proxy scores as identical (same length, same
+    /// "ends in `\n`?" verdict) can still emit real objects of different
+    /// length — which is exactly the sibling mechanism to
+    /// `identical_plaintext_different_iv_can_change_hint_stream_object_length`
+    /// (that test varies the IV for one fixed plaintext; this one varies the
+    /// plaintext for one fixed IV).
+    ///
+    /// Sweeps 3000 same-length candidates that all share the same fixed,
+    /// non-`\n` LAST byte (so a plaintext-only proxy would score every one
+    /// of them identically) under a fixed key + IV, and asserts the real
+    /// measured lengths are not all equal — i.e. the predicate is actually
+    /// sensitive to content a plaintext-only formula could not see. 3000
+    /// keeps the probability of missing the ~1/256-per-candidate
+    /// newline-ciphertext boundary below 1e-5 (same sizing rationale as the
+    /// random-IV end-to-end test below), and — unlike that test — every
+    /// candidate here is a fixed, reproducible byte sequence, so this test
+    /// is deterministic, not flaky.
+    #[test]
+    fn hint_stream_convergence_len_is_sensitive_to_ciphertext_not_just_plaintext_length() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encryption_v: 4,
+            encryption_r: 4,
+            encrypt_ref: ObjectRef::new(2, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let measure = HintStreamMeasure {
+            hint_ref: ObjectRef::new(9, 0),
+            filtered: false,
+            encrypt_ctx: Some(&ctx),
+            hint_stream_aes_iv: crate::pipeline::aes::static_initialization_vector(),
+        };
+        let base = b"page offset hint table + shared object hint table payload".to_vec();
+        let n = base.len();
+
+        let mut lengths = std::collections::BTreeSet::new();
+        for counter in 0u32..3000 {
+            let mut payload = base.clone();
+            // Vary two bytes ahead of the final byte (65536 distinct values,
+            // 3000 sampled) so each candidate's ciphertext is an
+            // independent draw under CBC chaining, while the LAST byte
+            // stays fixed at a non-`\n` constant — every candidate shares
+            // the same plaintext length and the same plaintext-based
+            // "needs newline" verdict.
+            payload[n - 3] = (counter & 0xff) as u8;
+            payload[n - 2] = ((counter >> 8) & 0xff) as u8;
+            payload[n - 1] = b'X';
+
+            let real_len = hint_stream_convergence_len(&measure, &payload, 46, None)
+                .expect("measure real emitted length");
+            lengths.insert(real_len);
+        }
+
+        assert!(
+            lengths.len() > 1,
+            "3000 same-length candidates sharing one plaintext-based newline \
+             verdict must not all emit the same REAL length — otherwise this \
+             test never exercises the ciphertext-vs-plaintext gap it targets \
+             (observed lengths: {lengths:?})"
         );
     }
 
