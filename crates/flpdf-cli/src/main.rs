@@ -2421,10 +2421,8 @@ fn run_check(
                 } else {
                     ": "
                 };
-                cli_logger().warn(format!(
-                    "WARNING: {location}{separator}{}\n",
-                    diagnostic.message
-                ))?
+                let warning = format!("WARNING: {location}{separator}{}\n", diagnostic.message);
+                cli_logger().warn(warning)?
             }
             Severity::Error => {
                 eprintln!("{}: {location}: {}", progname(), diagnostic.message)
