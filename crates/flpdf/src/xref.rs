@@ -771,23 +771,40 @@ fn recover_trailer_from_xref_stream_candidate(
             ));
         }
     };
+    // qpdf appends the candidate's warning when its re-entry reads the
+    // candidate object, before `read_xref` follows `/Prev`. Preserve that
+    // order even when a later `/Prev` section fails. Keep the count so the
+    // successful path does not append the candidate diagnostics twice.
+    let candidate_diagnostic_count = reentry.loaded.repair_diagnostics.entries().len();
+    for diagnostic in reentry.loaded.repair_diagnostics.entries() {
+        repair_diagnostics.push(diagnostic.clone());
+    }
+    // Buffer diagnostics from a failing `/Prev` section. The merge helper
+    // otherwise writes them directly to the outer accumulator before it
+    // returns, which would place them ahead of the candidate diagnostics.
+    let mut previous_failure_diagnostics = Diagnostics::default();
     if merge_previous_xref_sections(
         bytes,
         version,
         &mut reentry,
         options,
         &mut reentry_registration,
-        Some(&mut *repair_diagnostics),
+        Some(&mut previous_failure_diagnostics),
     )
     .is_err()
     {
-        // The candidate's own initial parse succeeded and may have already
-        // recorded repair diagnostics (e.g. stream-length recovery); qpdf's
-        // warnings accumulate as they are emitted and are never rolled back
-        // by a later exception in the same `read_xref` call
-        // (`QPDF.cc:496-497`'s `warn()` appends immediately), so propagate
-        // them before reporting the terminal error.
-        for diagnostic in reentry.loaded.repair_diagnostics.entries() {
+        // Preserve diagnostics from any earlier `/Prev` sections that merged
+        // successfully, then the diagnostics from the section that failed.
+        for diagnostic in reentry
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .skip(candidate_diagnostic_count)
+        {
+            repair_diagnostics.push(diagnostic.clone());
+        }
+        for diagnostic in previous_failure_diagnostics.entries() {
             repair_diagnostics.push(diagnostic.clone());
         }
         return Err(Error::parse(
@@ -813,10 +830,16 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams.extend(reentry.parsed_xref_streams);
     trailer_references.extend(reentry.trailer_references);
     // The candidate re-entry (and any `/Prev` chain it follows) can itself
-    // emit repair warnings (e.g. stream-length recovery); propagate them the
-    // same way `merge_previous_xref_sections` already does for its own
-    // `/Prev` reentries, instead of silently discarding them.
-    for diagnostic in reentry.loaded.repair_diagnostics.entries() {
+    // emit repair warnings (e.g. stream-length recovery); propagate the
+    // successfully merged `/Prev` diagnostics here. The candidate's own
+    // diagnostics were appended before the merge above.
+    for diagnostic in reentry
+        .loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .skip(candidate_diagnostic_count)
+    {
         repair_diagnostics.push(diagnostic.clone());
     }
     append_xref_size_warning_for(
@@ -2258,13 +2281,13 @@ mod tests {
         // `merge_previous_xref_sections`'s own nested `parse_xref_from_start`
         // call must therefore get the same failure-path diagnostics sink the
         // top-level candidate re-entry call already gets. Empirically
-        // verified against qpdf 11.9.0 `--check` on this exact shape: object
-        // 2's "recovered stream length" warning appears twice -- once plain
-        // (discovery, `getObjectByObjGen` resolves every type-1 entry
-        // including object 2 itself) and once "xref stream:"-labeled
-        // (re-entry, reached by following object 1's own `/Prev`) -- both
-        // before the terminal "error decoding candidate xref stream..."
-        // message.
+        // verified against qpdf 11.9.0 `--check` on this exact shape: each
+        // object's "recovered stream length" warning appears twice -- once
+        // during discovery (`getObjectByObjGen` resolves every type-1 entry)
+        // and once during re-entry (object 1 directly, object 2 through
+        // object 1's `/Prev`) -- before the terminal "error decoding
+        // candidate xref stream..." message, with object 1's re-entry warning
+        // preceding object 2's failing `/Prev` warning.
         let mut bytes = b"%PDF-1.5\n".to_vec();
 
         // Object 2 (the /Prev target): needs stream-length repair, and its
@@ -2276,13 +2299,13 @@ mod tests {
         bytes.extend_from_slice(&stream2);
         bytes.extend_from_slice(b"\nendstream\nendobj\n");
 
-        // Object 1 (the winning candidate): decodes cleanly on its own, and
-        // its /Prev points at object 2.
+        // Object 1 (the winning candidate): needs its own stream-length repair,
+        // and its /Prev points at object 2.
         let off1 = bytes.len() as u64;
         let stream1 = [1u8, 0, 0, 1, off1 as u8, 0];
         bytes.extend_from_slice(b"1 0 obj\n");
         bytes.extend_from_slice(
-            format!("<< /Type /XRef /W [1 1 1] /Size 2 /Prev {off2} /Index [0 2] /Length 6 >>\nstream\n").as_bytes(),
+            format!("<< /Type /XRef /W [1 1 1] /Size 2 /Prev {off2} /Index [0 2] /Length 3 >>\nstream\n").as_bytes(),
         );
         bytes.extend_from_slice(&stream1);
         bytes.extend_from_slice(b"\nendstream\nendobj\n");
@@ -2299,16 +2322,25 @@ mod tests {
         assert!(source
             .to_string()
             .contains("error decoding candidate xref stream while recovering damaged file"));
-        let recovered_length_warnings = diagnostics
+        let recovered_length_warnings: Vec<&str> = diagnostics
             .entries()
             .iter()
             .filter(|diagnostic| diagnostic.message.contains("recovered stream length"))
-            .count();
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
         assert_eq!(
-            recovered_length_warnings, 2,
-            "object 2 warns once at discovery and once at /Prev re-entry, matching real \
-             qpdf's own double warning for this shape"
+            recovered_length_warnings.len(),
+            4,
+            "each repaired stream warns once at discovery and once at re-entry"
         );
+        assert!(recovered_length_warnings[0].contains("object 1"));
+        assert!(recovered_length_warnings[1].contains("object 2"));
+        assert!(
+            recovered_length_warnings[2].contains("object 1"),
+            "the candidate's own re-entry warning must precede the failing /Prev warning; \
+             got {recovered_length_warnings:?}"
+        );
+        assert!(recovered_length_warnings[3].contains("object 2"));
     }
 
     #[test]
