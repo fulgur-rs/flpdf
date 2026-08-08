@@ -10,6 +10,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+/// Provenance for a legacy object-stream member that has already been
+/// materialized.
+///
+/// `parent_ref`/`parent_index` identify the actual member stream after an
+/// `/Extends` chain is followed. `source_stream`/`source_index` preserve the
+/// live xref identity that led to that parent, so resolution-time xref
+/// reconstruction can distinguish a still-valid compressed member from a
+/// stale mapping without flattening the chain provenance.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CompressedMemberProvenance {
+    pub(crate) parent_ref: ObjectRef,
+    pub(crate) parent_index: u32,
+    pub(crate) source_stream: u32,
+    pub(crate) source_index: u32,
+}
+
 /// Lazily parsed PDF document handle.
 ///
 /// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
@@ -101,13 +117,18 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// [`Pdf::delete_object`] so the next resolve re-derives from the
     /// updated handle.
     pub(crate) legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
-    pub(crate) compressed_member_parents: BTreeMap<ObjectRef, (ObjectRef, u32)>,
+    pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
     /// (objects do not overlap in a well-formed PDF), so resolving one object
     /// cannot read/parse the whole remaining file — which would make resolving
     /// many objects quadratic, a CPU DoS on a crafted (e.g. repaired) document.
     pub(crate) sorted_object_offsets: Vec<u64>,
+    /// Whether the legacy cache and object-boundary snapshot already reflect
+    /// the resolver's reconstructed xref. Open-time recovery initializes all
+    /// three from the same recovered table; resolution-time recovery flips
+    /// this lazily before the next legacy read.
+    pub(crate) legacy_resolution_state_synced: bool,
     /// Remaining read-to-end fallbacks allowed when a bounded object window does
     /// not contain a complete object (a corrupt offset pointing inside another
     /// object, or a header-like line recorded inside stream data during repair).
@@ -115,7 +136,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// boundaries in an otherwise valid file still resolve, but a document full
     /// of objects whose bodies run to EOF cannot revive the quadratic cost.
     pub(crate) resolution_fallbacks_remaining: u32,
-    pub(crate) source_xref_offsets: Vec<(ObjectRef, u64)>,
     pub(crate) dirty_object_refs: BTreeSet<ObjectRef>,
     /// Dirty objects whose live ObjectHandle graph was changed directly, so
     /// the legacy object cache may no longer agree with it. `set_object`

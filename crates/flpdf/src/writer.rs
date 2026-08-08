@@ -1001,6 +1001,11 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
         bytes.push(b'\n');
     }
 
+    // qpdf's writer classifies dirty objects from the live xref table. A
+    // canonical resolution-time reconstruction can change a member from
+    // type-2 to type-1 after its old object-stream provenance was recorded;
+    // refresh the legacy cache and provenance before collecting touched refs.
+    pdf.synchronize_legacy_resolution_state();
     let source_offsets = build_source_offsets(pdf.source_xref_offsets());
     let source_xref_offsets = build_source_xref_offsets(pdf.source_xref_entries());
     let (touched_object_refs, deleted_object_refs, touched_objstm_members) =
