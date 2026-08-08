@@ -1162,6 +1162,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`Pdf::resolve_borrowed`] calls for `object_ref` observe `object`
     /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
+        // qpdf discards stale uncompressed xref entries and repopulates the live
+        // table during reconstruction (`libqpdf/QPDF.cc:532-562`). Refresh the
+        // legacy cache before using it to classify the replacement, or an old
+        // object-stream entry can incorrectly retain provenance.
+        self.synchronize_legacy_resolution_state();
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1260,6 +1265,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// `object_ref` observe [`Object::Null`], matching the behavior for any
     /// other unknown or freed reference.
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        if object_ref.number != 0 {
+            // The cache early return below must see the reconstructed live xref;
+            // qpdf removes the corresponding cached object when a mutation
+            // removes it (`libqpdf/QPDF.cc:1996-2004`).
+            self.synchronize_legacy_resolution_state();
+        }
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
         }

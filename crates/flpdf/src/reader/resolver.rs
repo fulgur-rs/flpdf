@@ -7383,6 +7383,47 @@ mod tests {
     }
 
     #[test]
+    fn reconstruction_synchronizes_before_delete_object() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let mut stale_xref = BTreeMap::new();
+        stale_xref.insert(object_ref, XrefEntry::Free { next: 0 });
+        pdf.cache = crate::cache::ObjectCache::from_offsets(&stale_xref);
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        pdf.delete_object(object_ref);
+
+        assert!(matches!(
+            pdf.cache.entry(object_ref),
+            Some(crate::cache::CacheEntry::Deleted)
+        ));
+        assert!(
+            pdf.dirty_object_refs.contains(&object_ref),
+            "delete_object must record a deletion after reconstruction refreshes a stale free entry"
+        );
+    }
+
+    #[test]
+    fn reconstruction_synchronizes_before_recording_set_object_provenance() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.cache.set_compressed(object_ref, 9, 2);
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        pdf.set_object(object_ref, crate::Object::Integer(42));
+
+        assert_eq!(
+            pdf.compressed_parent(object_ref),
+            None,
+            "set_object must not preserve object-stream provenance from a stale pre-recovery cache entry"
+        );
+    }
+
+    #[test]
     fn reconstruction_returns_unsupported_for_recovered_compressed_target() {
         let options = crate::PdfOpenOptions {
             repair: true,
