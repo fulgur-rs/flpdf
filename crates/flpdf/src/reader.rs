@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 static NULL_OBJECT: Object = Object::Null;
 
-use crate::pdf::Pdf;
+use crate::pdf::{CompressedMemberProvenance, Pdf};
 
 pub(crate) struct QpdfPreparedObjects {
     pub(crate) refs: Vec<ObjectRef>,
@@ -1149,7 +1149,9 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn compressed_parent(&self, object_ref: ObjectRef) -> Option<(ObjectRef, u32)> {
-        self.compressed_member_parents.get(&object_ref).copied()
+        self.compressed_member_parents
+            .get(&object_ref)
+            .map(|provenance| (provenance.parent_ref, provenance.parent_index))
     }
 
     /// Replace `object_ref` with `object` in the in-memory object cache.
@@ -1160,6 +1162,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// [`Pdf::resolve_borrowed`] calls for `object_ref` observe `object`
     /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
+        // qpdf discards stale uncompressed xref entries and repopulates the live
+        // table during reconstruction (`libqpdf/QPDF.cc:532-562`). Refresh the
+        // legacy cache before using it to classify the replacement, or an old
+        // object-stream entry can incorrectly retain provenance.
+        self.synchronize_legacy_resolution_state();
         self.qpdf_removed_refs.remove(&object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -1172,8 +1179,15 @@ impl<R: Read + Seek> Pdf<R> {
             let (parent_ref, parent_index) = self
                 .compressed_parent_for_entry(stream_ref, index)
                 .unwrap_or((stream_ref, index));
-            self.compressed_member_parents
-                .insert(object_ref, (parent_ref, parent_index));
+            self.compressed_member_parents.insert(
+                object_ref,
+                CompressedMemberProvenance {
+                    parent_ref,
+                    parent_index,
+                    source_stream: stream,
+                    source_index: index,
+                },
+            );
         }
 
         // Write through to the canonical handle graph too (not just
@@ -1251,6 +1265,12 @@ impl<R: Read + Seek> Pdf<R> {
     /// `object_ref` observe [`Object::Null`], matching the behavior for any
     /// other unknown or freed reference.
     pub fn delete_object(&mut self, object_ref: ObjectRef) {
+        if object_ref.number != 0 {
+            // The cache early return below must see the reconstructed live xref;
+            // qpdf removes the corresponding cached object when a mutation
+            // removes it (`libqpdf/QPDF.cc:1996-2004`).
+            self.synchronize_legacy_resolution_state();
+        }
         if object_ref.number != 0 {
             self.qpdf_removed_refs.insert(object_ref);
         }
@@ -1776,7 +1796,51 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(());
         }
 
-        self.resolve_to_cache(object_ref)?;
+        let legacy_resolved = self.resolve_to_cache(object_ref)?;
+        if !legacy_resolved
+            && matches!(
+                self.cache.entry(object_ref),
+                Some(CacheEntry::Unresolved { .. })
+            )
+        {
+            // qpdf's `QPDF::readObjectAtOffset` retries a header mismatch
+            // through `reconstruct_xref` (`libqpdf/QPDF.cc:1614-1637`). The
+            // legacy parser above deliberately returns `false` when it sees
+            // the wrong object header, so without this bridge a public
+            // `Pdf::resolve` would turn the same recoverable object into
+            // null before the canonical resolver gets a chance to retry it.
+            // Keep compressed/free entries on the legacy path: the canonical
+            // resolver has not implemented those source classes yet.
+            match handle.try_dereference() {
+                Ok(()) => {
+                    self.synchronize_legacy_resolution_state();
+                    match self.resolver.xref_entry(object_ref) {
+                        Some(XrefEntry::Uncompressed { .. })
+                        | Some(XrefEntry::Compressed { .. }) => {
+                            self.cache.set_resolved(object_ref, handle.materialize()?);
+                        }
+                        _ => {
+                            self.cache.set_missing(object_ref);
+                        }
+                    }
+                }
+                Err(error) if matches!(&error, Error::Unsupported(_)) => {
+                    self.synchronize_legacy_resolution_state();
+                    self.resolve_to_cache(object_ref)?;
+                }
+                Err(error)
+                    if !self.resolver.attempt_recovery()
+                        && matches!(&error, Error::Parse { .. }) =>
+                {
+                    // With repair disabled, qpdf warns about the mismatch
+                    // and leaves the requested object unresolved; preserve
+                    // the legacy null result rather than exposing the
+                    // canonical resolver's internal parse error.
+                    handle.set_missing();
+                }
+                Err(error) => return Err(error),
+            }
+        }
         let object = match self.cache.entry(object_ref) {
             Some(CacheEntry::Resolved(object)) => object.clone(),
             // A cyclic/self-referential resolution already in progress
@@ -2656,13 +2720,29 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Bring the legacy cache and bounded-read offsets in line with the
     /// canonical resolver after a resolution-time xref reconstruction.
-    fn synchronize_legacy_resolution_state(&mut self) {
+    pub(crate) fn synchronize_legacy_resolution_state(&mut self) {
         if self.legacy_resolution_state_synced || !self.resolver.reconstructed_xref() {
             return;
         }
 
         let entries = self.resolver.xref_entries();
         self.cache.synchronize_with_xref(&entries);
+        // Keep the actual `/Extends`-resolved parent for a still-identical
+        // compressed xref entry, but never let a mapping survive a rebuilt
+        // type-1 entry or a changed object-stream/index pair. qpdf's live
+        // xref table is the authority after reconstruction
+        // (`libqpdf/QPDF.cc:532-562`); the extra source identity stored with
+        // each chain parent prevents the legacy writer from treating a
+        // formerly compressed object as an object-stream member.
+        self.compressed_member_parents
+            .retain(|object_ref, provenance| {
+                matches!(
+                    entries.get(object_ref),
+                    Some(XrefEntry::Compressed { stream, index })
+                        if provenance.source_stream == *stream
+                            && provenance.source_index == *index
+                )
+            });
         self.sorted_object_offsets = entries
             .values()
             .filter_map(|entry| match entry {
@@ -2794,8 +2874,15 @@ impl<R: Read + Seek> Pdf<R> {
         } = parsed;
         let (object, _stream_payload_transformed) =
             self.decrypt_resolved_object(object_ref, object, None)?;
-        self.compressed_member_parents
-            .insert(object_ref, (parent_ref, parent_index));
+        self.compressed_member_parents.insert(
+            object_ref,
+            CompressedMemberProvenance {
+                parent_ref,
+                parent_index,
+                source_stream: stream,
+                source_index: index,
+            },
+        );
         self.cache.set_resolved(object_ref, object);
         self.record_object_stream_diagnostics(parent_ref, object_ref, diagnostics)?;
         Ok(true)

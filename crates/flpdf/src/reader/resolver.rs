@@ -699,6 +699,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().reconstructed_xref
     }
 
+    /// Whether resolution-time damage recovery is enabled.
+    ///
+    /// qpdf's `m->attempt_recovery` (`include/qpdf/QPDF.hh:1461`) controls
+    /// whether a failed object read may trigger `reconstruct_xref`.
+    pub(crate) fn attempt_recovery(&self) -> bool {
+        self.core.borrow().attempt_recovery
+    }
+
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`
     /// recovery retry (`:1614-1637`).
     ///
@@ -2306,6 +2314,16 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                 // ---- phase 2: no borrow is held across this ----
                 match entry {
                     Some(XrefEntry::Uncompressed { offset }) => {
+                        // qpdf's dedicated zero-offset arm
+                        // (`libqpdf/QPDF.cc:1571-1575`) treats a bogus live
+                        // type-1 entry as null before attempting I/O. In
+                        // particular, it must not turn this known sentinel
+                        // into a resolution-time xref-recovery trigger.
+                        if offset == 0 {
+                            self.push_warning_at(0, "object has offset 0")?;
+                            handle.set_missing();
+                            return Ok(());
+                        }
                         match self.read_object_at_offset(offset, object_ref) {
                             Ok((value, parsed_offset)) => {
                                 handle.set_resolved(value);
@@ -6966,6 +6984,26 @@ mod tests {
         pdf
     }
 
+    fn synthetic_malformed_recovery_mismatch_pdf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let obj2_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\ntrue\nendobj\n");
+        pdf.extend_from_slice(b"1 0 obj\n<< /Length /Broken >>\nstream\nabc\nendstream\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{obj2_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     /// A recovered stream whose original xref entries both point into the
     /// first object's dictionary.  The stale second offset is intentionally
     /// between the real object boundaries so it can truncate a legacy read
@@ -7090,6 +7128,102 @@ mod tests {
     }
 
     #[test]
+    fn public_resolve_retries_a_recovered_header_mismatch() {
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let mut pdf =
+            Pdf::open_mem_owned_with_options(synthetic_mismatch_pdf(true), options).expect("open");
+
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(1, 0))
+                .expect("public resolve must use the reconstructed xref"),
+            crate::Object::String(b"recovered".to_vec()),
+            "the legacy public resolver must not turn a recoverable object into null"
+        );
+        assert!(pdf.reconstructed_xref());
+
+        let mut borrowed_pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_pdf(true),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open borrowed-resolve fixture");
+        assert_eq!(
+            borrowed_pdf
+                .resolve_borrowed(ObjectRef::new(1, 0))
+                .expect("public borrowed resolver must use the reconstructed xref"),
+            &crate::Object::String(b"recovered".to_vec())
+        );
+    }
+
+    #[test]
+    fn public_resolve_preserves_absent_recovery_as_null() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_pdf(false),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open absent-recovery fixture");
+
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(1, 0))
+                .expect("absent recovered object must resolve to null"),
+            crate::Object::Null
+        );
+        assert!(pdf.reconstructed_xref());
+        assert!(matches!(
+            pdf.cache.entry(ObjectRef::new(1, 0)),
+            Some(crate::cache::CacheEntry::Missing)
+        ));
+    }
+
+    #[test]
+    fn public_resolve_falls_back_to_legacy_for_recovered_compressed_entries() {
+        let object_ref = ObjectRef::new(7, 0);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            recovered_objstm_member_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open");
+
+        assert!(matches!(
+            pdf.resolve(object_ref)
+                .expect("unsupported canonical class must fall back to legacy ObjStm resolution"),
+            crate::Object::Dictionary(_)
+        ));
+        assert!(pdf.reconstructed_xref());
+    }
+
+    #[test]
+    fn public_resolve_propagates_a_recovered_parse_error() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_malformed_recovery_mismatch_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open malformed-recovery fixture");
+
+        let error = pdf
+            .resolve(ObjectRef::new(1, 0))
+            .expect_err("the canonical recovery parse error must be propagated");
+        assert!(
+            matches!(error, Error::Parse { .. }),
+            "recovered parse errors must not be converted into null: {error:?}"
+        );
+    }
+
+    #[test]
     fn mismatch_without_recovery_remains_error() {
         let bytes = synthetic_mismatch_pdf(true);
         let options = crate::PdfOpenOptions {
@@ -7161,6 +7295,31 @@ mod tests {
         assert!(
             !pdf.reconstructed_xref(),
             "absent entry must not trigger xref reconstruction"
+        );
+    }
+
+    #[test]
+    fn zero_offset_xref_entry_warns_and_resolves_to_null_without_reconstruction() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 0 });
+
+        let handle = pdf.get_object_handle(object_ref);
+        handle
+            .try_dereference()
+            .expect("qpdf treats an offset-zero object as null");
+
+        assert!(handle.is_null(), "offset zero must resolve to null");
+        assert!(
+            !pdf.reconstructed_xref(),
+            "offset zero must not enter xref reconstruction"
+        );
+        assert!(
+            pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+                diagnostic.offset == Some(0) && diagnostic.message == "object has offset 0"
+            }),
+            "offset-zero resolution must emit qpdf's warning"
         );
     }
 
@@ -7270,6 +7429,163 @@ mod tests {
         assert_eq!(
             pdf.resolution_fallbacks_remaining, initial_fallback_budget,
             "recovered boundaries must not consume a stale-window fallback"
+        );
+    }
+
+    #[test]
+    fn reconstruction_reconciles_compressed_parent_provenance() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let changed_type = ObjectRef::new(1, 0);
+        let changed_parent = ObjectRef::new(2, 0);
+        let unchanged = ObjectRef::new(3, 0);
+
+        pdf.compressed_member_parents.insert(
+            changed_type,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: ObjectRef::new(9, 0),
+                parent_index: 1,
+                source_stream: 9,
+                source_index: 1,
+            },
+        );
+        pdf.compressed_member_parents.insert(
+            changed_parent,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: ObjectRef::new(9, 0),
+                parent_index: 1,
+                source_stream: 9,
+                source_index: 1,
+            },
+        );
+        pdf.compressed_member_parents.insert(
+            unchanged,
+            crate::pdf::CompressedMemberProvenance {
+                parent_ref: ObjectRef::new(9, 0),
+                parent_index: 3,
+                source_stream: 9,
+                source_index: 3,
+            },
+        );
+        pdf.resolver
+            .insert_xref_entry(changed_type, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.insert_xref_entry(
+            changed_parent,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 2,
+            },
+        );
+        pdf.resolver.insert_xref_entry(
+            unchanged,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 3,
+            },
+        );
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        pdf.synchronize_legacy_resolution_state();
+
+        assert_eq!(pdf.compressed_parent(changed_type), None);
+        assert_eq!(pdf.compressed_parent(changed_parent), None);
+        assert_eq!(
+            pdf.compressed_parent(unchanged),
+            Some((ObjectRef::new(9, 0), 3))
+        );
+    }
+
+    #[test]
+    fn reconstruction_synchronizes_before_delete_object() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let mut stale_xref = BTreeMap::new();
+        stale_xref.insert(object_ref, XrefEntry::Free { next: 0 });
+        pdf.cache = crate::cache::ObjectCache::from_offsets(&stale_xref);
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        pdf.delete_object(object_ref);
+
+        assert!(matches!(
+            pdf.cache.entry(object_ref),
+            Some(crate::cache::CacheEntry::Deleted)
+        ));
+        assert!(
+            pdf.dirty_object_refs.contains(&object_ref),
+            "delete_object must record a deletion after reconstruction refreshes a stale free entry"
+        );
+    }
+
+    #[test]
+    fn reconstruction_synchronizes_before_recording_set_object_provenance() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.cache.set_compressed(object_ref, 9, 2);
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        pdf.set_object(object_ref, crate::Object::Integer(42));
+
+        assert_eq!(
+            pdf.compressed_parent(object_ref),
+            None,
+            "set_object must not preserve object-stream provenance from a stale pre-recovery cache entry"
+        );
+    }
+
+    #[test]
+    fn incremental_write_synchronizes_recovered_compressed_parent_provenance() {
+        let object_ref = ObjectRef::new(7, 0);
+        let stream_ref = ObjectRef::new(5, 0);
+        let mut pdf = Pdf::open_mem_owned(recovered_objstm_member_pdf()).expect("open fixture");
+        let stream_offset = pdf
+            .source_xref_offsets()
+            .into_iter()
+            .find(|(object_ref, _)| *object_ref == stream_ref)
+            .map(|(_, offset)| offset)
+            .expect("object stream must have a type-1 xref entry");
+
+        // This is the state immediately after editing a member that was
+        // originally in an object stream: `set_object` records the dirty
+        // value and its old compressed-parent provenance.
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        pdf.cache.set_compressed(object_ref, stream_ref.number, 0);
+        pdf.set_object(object_ref, crate::Object::Integer(42));
+        assert_eq!(
+            pdf.compressed_parent(object_ref),
+            Some((stream_ref, 0)),
+            "the pre-recovery edit must retain its original object-stream provenance"
+        );
+
+        // A later canonical recovery discovers that the same object is a
+        // standalone type-1 object. The writer must observe this live xref
+        // before classifying the dirty ref.
+        pdf.resolver.insert_xref_entry(
+            object_ref,
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        pdf.resolver.core.borrow_mut().reconstructed_xref = true;
+
+        let mut output = Vec::new();
+        crate::write_pdf(&mut pdf, &mut output).expect("incremental write");
+
+        let mut reopened = Pdf::open_mem_owned(output).expect("reopen incremental output");
+        assert_eq!(
+            reopened
+                .resolve(object_ref)
+                .expect("resolve rewritten object"),
+            crate::Object::Integer(42),
+            "a recovered standalone object must be emitted outside the obsolete ObjStm"
         );
     }
 
