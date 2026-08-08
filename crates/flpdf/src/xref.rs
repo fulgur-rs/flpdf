@@ -227,9 +227,14 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
-    if let Err(error) =
-        merge_previous_xref_sections(bytes, &version, &mut loaded, options, &mut registration)
-    {
+    if let Err(error) = merge_previous_xref_sections(
+        bytes,
+        &version,
+        &mut loaded,
+        options,
+        &mut registration,
+        None,
+    ) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
@@ -385,12 +390,24 @@ fn merge_xref_stream_from_classic_trailer(
     Ok(())
 }
 
+/// `error_diagnostics_sink` is forwarded to each `/Prev` section's own
+/// `parse_xref_from_start` call so a section that needs repair (e.g.
+/// stream-length recovery) but then fails its own later validation still
+/// hands that already-recorded warning to the sink before this function's
+/// `?` propagates the error -- qpdf's `read_xref`'s `/Prev` walk
+/// (`QPDF.cc:678`) calls the same `read_xrefStream` for every section in the
+/// chain, top-level or not, so a section's own read warns unconditionally
+/// regardless of position in the chain (empirically confirmed against qpdf
+/// 11.9.0: a `/Prev` target needing repair whose own `/W` then fails
+/// validation still shows the repair warning, twice -- discovery and
+/// re-entry -- before the terminal error).
 fn merge_previous_xref_sections(
     bytes: &[u8],
     version: &str,
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    mut error_diagnostics_sink: Option<&mut Diagnostics>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut previous_offset = parse_previous_xref_offset(&loaded.loaded.trailer);
@@ -410,7 +427,7 @@ fn merge_previous_xref_sections(
             version,
             options,
             registration,
-            None,
+            error_diagnostics_sink.as_deref_mut(),
         )?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -763,6 +780,7 @@ fn recover_trailer_from_xref_stream_candidate(
         &mut reentry,
         options,
         &mut reentry_registration,
+        Some(&mut *repair_diagnostics),
     )
     .is_err()
     {
@@ -980,11 +998,20 @@ pub(crate) fn recover_objstm_compressed_entries(
     extra_occupied_numbers: &BTreeSet<u32>,
 ) {
     // The line scan only ever inserts `XrefEntry::Uncompressed`, so every entry here is
-    // an uncompressed object whose offset bounds a window.
+    // an uncompressed object whose offset bounds a window. Candidate re-entry can also
+    // merge in entries decoded straight from a (possibly corrupt or malicious) xref
+    // stream's own byte data, which -- unlike a line-scanned offset -- is never
+    // validated against the file's real length; excluding an out-of-range offset here
+    // keeps every later `start`/`window_end` a valid `bytes` index (qpdf's own
+    // `insertXrefEntry` does not validate offsets either, so the entry itself stays in
+    // `entries` for a later resolve attempt to reject on its own terms).
+    let bytes_len = bytes.len() as u64;
     let mut offsets: Vec<u64> = Vec::new();
     for entry in entries.values() {
         if let XrefEntry::Uncompressed { offset } = entry {
-            offsets.push(*offset);
+            if *offset <= bytes_len {
+                offsets.push(*offset);
+            }
         }
     }
     offsets.sort_unstable();
@@ -2400,6 +2427,69 @@ mod tests {
     }
 
     #[test]
+    fn xref_stream_candidate_prev_section_repair_warning_survives_its_own_later_failure() {
+        // A different failure shape from the companion test above: there,
+        // the candidate's own /Prev target never even decodes. Here, the
+        // /Prev target (object 2) needs its own stream-length repair (its
+        // `/Length 3` is directly-usable-but-mismatched) and *then* fails
+        // its own `/W` validation (only 2 elements, needs 3) --
+        // `merge_previous_xref_sections`'s own nested `parse_xref_from_start`
+        // call must therefore get the same failure-path diagnostics sink the
+        // top-level candidate re-entry call already gets. Empirically
+        // verified against qpdf 11.9.0 `--check` on this exact shape: object
+        // 2's "recovered stream length" warning appears twice -- once plain
+        // (discovery, `getObjectByObjGen` resolves every type-1 entry
+        // including object 2 itself) and once "xref stream:"-labeled
+        // (re-entry, reached by following object 1's own `/Prev`) -- both
+        // before the terminal "error decoding candidate xref stream..."
+        // message.
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        // Object 2 (the /Prev target): needs stream-length repair, and its
+        // own /W is malformed (2 elements, not 3).
+        let off2 = bytes.len() as u64;
+        let stream2 = [0u8, 0, 0, 1, off2 as u8, 0];
+        bytes.extend_from_slice(b"2 0 obj\n");
+        bytes.extend_from_slice(b"<< /Type /XRef /W [1 1] /Size 2 /Length 3 >>\nstream\n");
+        bytes.extend_from_slice(&stream2);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // Object 1 (the winning candidate): decodes cleanly on its own, and
+        // its /Prev points at object 2.
+        let off1 = bytes.len() as u64;
+        let stream1 = [1u8, 0, 0, 1, off1 as u8, 0];
+        bytes.extend_from_slice(b"1 0 obj\n");
+        bytes.extend_from_slice(
+            format!("<< /Type /XRef /W [1 1 1] /Size 2 /Prev {off2} /Index [0 2] /Length 6 >>\nstream\n").as_bytes(),
+        );
+        bytes.extend_from_slice(&stream1);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+        assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+
+        let mut input = Cursor::new(bytes);
+        let error = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect_err("object 2's own /W then fails validation");
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("repair failure carries diagnostics");
+
+        assert!(source
+            .to_string()
+            .contains("error decoding candidate xref stream while recovering damaged file"));
+        let recovered_length_warnings = diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("recovered stream length"))
+            .count();
+        assert_eq!(
+            recovered_length_warnings, 2,
+            "object 2 warns once at discovery and once at /Prev re-entry, matching real \
+             qpdf's own double warning for this shape"
+        );
+    }
+
+    #[test]
     fn xref_stream_candidate_trailer_prefers_lowest_objgen_over_highest_offset() {
         // qpdf 11.9.0 `reconstruct_xref` (`QPDF.cc:592-597`): `setTrailer`
         // only ever takes effect once, so the placeholder trailer set inside
@@ -2800,6 +2890,55 @@ mod tests {
                 Some(crate::XrefEntry::Compressed { .. })
             ),
             "object 7 must not be resurrected as compressed at any generation"
+        );
+    }
+
+    #[test]
+    fn recover_objstm_compressed_entries_skips_candidate_offsets_past_eof() {
+        // A candidate's own re-entry decodes xref-stream *data* -- arbitrary
+        // bytes from the file, not offsets rediscovered by re-scanning it --
+        // so a corrupt or malicious xref stream can declare an offset that
+        // does not exist in the file at all. The original line-scan
+        // entries this function was designed around could never do that
+        // (`recover_xref_entries` only ever records the offset of a token it
+        // actually found inside `bytes`), so this is a new path onto
+        // `recover_objstm_compressed_entries` opened up specifically by
+        // candidate recovery. Object 5's declared offset (1,000,000) is far
+        // past this fixture's real length; the ObjStm gap-filler's own byte
+        // slicing over it must not panic, regardless of whether the entry
+        // itself is left in `entries` for a later resolve attempt to reject.
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let bogus_offset: u32 = 1_000_000;
+        let mut stream1 = Vec::new();
+        stream1.push(1u8); // type 1 (uncompressed)
+        stream1.extend_from_slice(&bogus_offset.to_be_bytes()); // 4-byte offset
+        stream1.push(0u8); // generation
+        bytes.extend_from_slice(b"1 0 obj\n");
+        bytes.extend_from_slice(
+            format!(
+                "<< /Type /XRef /W [1 4 1] /Size 6 /Index [5 1] /Length {} >>\nstream\n",
+                stream1.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream1);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+        assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+        assert!((bogus_offset as usize) > bytes.len());
+
+        let mut input = Cursor::new(bytes);
+        let loaded = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect("object 1's own candidate xref stream still decodes cleanly");
+
+        assert_eq!(
+            loaded.entries.get(&crate::ObjectRef::new(5, 0)),
+            Some(&crate::XrefEntry::Uncompressed {
+                offset: bogus_offset as u64
+            }),
+            "the out-of-range entry is still recorded as-is (qpdf's own \
+             insertXrefEntry does not validate offsets either); only the \
+             ObjStm gap-filler's own byte slicing must not panic on it"
         );
     }
 
