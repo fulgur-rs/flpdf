@@ -80,7 +80,7 @@
 //! The warning sink stays the easiest way to get this wrong, because
 //! `push_warning` needs `borrow_mut` and the code that warns is the code that
 //! has just finished reading something. The live file-object parser returns
-//! diagnostics to [`ResolverHandle::read_object_at_offset`] after it has
+//! diagnostics to [`ResolverHandle::read_object_at_offset_with_description`] after it has
 //! released its input adapter, so each source token contributes at most one
 //! document warning.
 
@@ -202,7 +202,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// `borrow()`, so neither may be called while a borrow of this core is
     /// already held. That constraint binds the read-and-parse phase, which
     /// warns from [`ResolverHandle::validate_stream_line_end`] and from
-    /// [`ResolverHandle::read_object_at_offset`] in between input operations;
+    /// [`ResolverHandle::read_object_at_offset_with_description`] in between input operations;
     /// each of those takes and drops its own borrow, so nothing is held when
     /// the push happens.
     repair_diagnostics: Diagnostics,
@@ -1780,7 +1780,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     ///   to resolve to null (`:1745-1748`). Observed: `object 4/0: error
     ///   reading object: seek to …, offset 9223372036854775000 (1): Invalid
     ///   argument`, exit 3, 8.9 MB peak RSS. The resolve-to-null fallback is
-    ///   not ported either — see [`Self::read_object_at_offset`].
+    ///   not ported either — see [`Self::read_object_at_offset_with_description`].
     fn read_stream(&self, dict: ObjectValue, dict_offset: i64) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
 
@@ -2264,7 +2264,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     ///
     /// qpdf's `case 1:` (`libqpdf/QPDF.cc:1720-1727`) calls
     /// `readObjectAtOffset`, which caches the object it read.
-    /// [`Self::read_object_at_offset`] is that call; the value it returns is
+    /// [`Self::read_object_at_offset_with_description`] is that call; the value it returns is
     /// written into `handle`'s slot, which *is* the
     /// [`ResolverCore::object_cache`] entry (see the loop branch above).
     ///
@@ -2273,7 +2273,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// 1. *Short borrows.* [`ResolveMark::begin`] takes one to test and set
     ///    `resolving`; [`Self::xref_entry`] takes one to read the entry. Both
     ///    end inside their own call.
-    /// 2. *No borrow at all.* `read_object_at_offset` runs here. It reads and
+    /// 2. *No borrow at all.* `read_object_at_offset_with_description` runs here. It reads and
     ///    parses through [`Self::scan_forward`], every step of which takes and
     ///    drops its own borrow, so the `/Length` dereference inside
     ///    [`Self::read_stream`] is free to re-enter this very method.
@@ -2303,7 +2303,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// **This method is re-entrant, and nothing bounds how deep.** A stream
     /// whose `/Length` is an indirect reference to another stream whose
     /// `/Length` is an indirect reference to another … recurses
-    /// `resolve_indirect` → [`Self::read_object_at_offset`] →
+    /// `resolve_indirect` → [`Self::read_object_at_offset_with_description`] →
     /// [`Self::read_stream`] → [`Self::stream_length`] →
     /// [`ObjectHandle::try_dereference`] → `resolve_indirect` once per link.
     /// The loop branch above cannot stop it: `resolving` holds *references*,
