@@ -542,7 +542,7 @@ fn check_terminal_open_failure_prints_repair_warnings_before_error_once() {
             "WARNING: {input}: file is damaged\n\
              WARNING: {input}: can't find startxref\n\
              WARNING: {input}: Attempting to reconstruct cross-reference table\n\
-             flpdf: {input}: parse error at byte 0: trailer dictionary not found\n"
+             flpdf: {input}: parse error at byte 0: unable to find trailer dictionary while recovering damaged file\n"
         )
     );
 }

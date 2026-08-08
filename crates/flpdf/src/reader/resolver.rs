@@ -773,7 +773,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "input ended before the detected PDF header offset",
             )
         })?;
-        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
+        let mut new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
+        // `recover_xref_entries` only performs qpdf's own line scan; this
+        // resolve-time retry has no candidate-xref-stream re-entry of its
+        // own to prioritize over (unlike `recover_xref_from_linear_scan`),
+        // so it can gap-fill immediately (see `recover_objstm_compressed_entries`'s doc).
+        crate::xref::recover_objstm_compressed_entries(
+            logical_bytes,
+            &mut new_entries,
+            &std::collections::BTreeSet::new(),
+        );
 
         {
             let mut core = self.core.borrow_mut();
