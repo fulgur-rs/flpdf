@@ -6,7 +6,7 @@
 
 **Architecture:** `DocumentResolver` gains a warn receiver equivalent to `QPDF::warn`. `ObjectHandle` gains `type_warning` / `warn_if_possible` / `object_warning`, each reaching the document through the `Weak<dyn DocumentResolver>` it already carries — qpdf's `QPDF*` context. The no-context branches are ported separately because qpdf's are not the same: `typeWarning` / `objectWarning` throw, `warnIfPossible` writes to the default logger and returns normally. Finally the `try_*` accessors whose qpdf counterparts warn are converted, and the two integer accessors the acceptance criteria need are added.
 
-**Tech Stack:** Rust, `crates/flpdf`. Branch base is `feature/flpdf-qynx.4-cli-output-routing` (PR #677 tip), because `QPDFLogger` and the `Result`-returning warning sink live there and not on `main`.
+**Tech Stack:** Rust, `crates/flpdf`. Written when the branch base was `feature/flpdf-qynx.4-cli-output-routing` (PR #677 tip), because `QPDFLogger` and the `Result`-returning warning sink lived there and not on `main` at the time. PR #677's stack (#669, #672, #677) has since merged, so a fresh checkout of this plan targets `main` directly — see Task 6's coverage step.
 
 **Beads issue:** flpdf-25kg.3.27
 
@@ -168,6 +168,7 @@ fn an_object_warning_is_collected_alongside_document_warnings_in_emission_order(
         .resolver
         .repair_diagnostics()
         .entries()
+        .iter()
         .map(|entry| entry.message.clone())
         .collect();
     assert_eq!(messages, vec!["first".to_owned(), "second".to_owned()]);
@@ -798,13 +799,18 @@ Expected: all green. `cargo fmt` before pushing is a hard CI gate here.
 Commit first — the script errors on a dirty tree by design.
 
 ```bash
-scripts/patch-coverage.sh --base feature/flpdf-qynx.4-cli-output-routing
+scripts/patch-coverage.sh --base main
 ```
 
 Expected: `flpdf` changed lines 100%. The script's fresh mode runs
 `--features qpdf-zlib-compat --ignore-run-fail`, matching the CI Coverage job:
 `overlay::byte_gate`'s byte-identical tests are gated behind that feature, so a
 measurement without it reports hundreds of false-positive uncovered lines.
+
+The whole qynx.4 stack (#669, #672, #677) has since merged to `main`, so `main`
+is this branch's actual fork point — use it rather than a feature-branch name,
+which is deleted once its PR merges and leaves `--base` unresolvable
+(`scripts/patch-coverage.sh` calls `git merge-base` on it and exits 2).
 
 **Step 4: Byte-identical corpus**
 
@@ -825,6 +831,9 @@ for t in cli_byte_identical cli_byte_identical_overlay encrypt_cli_tests \
          compat_baseline_static_id compat_matrix_baseline; do
   cargo test -p flpdf-cli --features qpdf-zlib-compat --test "$t"
 done
+# flpdf-qtest-tools' flate-compression-tolerance e2e is gated behind the same
+# feature (`.github/workflows/ci.yml:289-292`); a plain `cargo test` cfgs it out.
+cargo test -p flpdf-qtest-tools --features qpdf-zlib-compat --test e2e
 ```
 
 Check each line's `test result:` count is non-zero.
@@ -842,7 +851,7 @@ git commit -m "docs(qpdf): record the ported object warning surface"
 
 Declared non-goals, carried verbatim from flpdf-25kg.3.27:
 
-- Object description propagation — qpdf's `Description` / `ChildDescr` and the `$OG` / `$PO` / `$VD` substitutions in `QPDFValue::getDescription`. Tracked as flpdf-25kg.3.28. Propagating the *context* to direct children belongs there too, because qpdf sets `QPDFValue::qpdf` from the same description setters.
+- Object description propagation — qpdf's `Description` / `ChildDescr` and the `$OG` / `$PO` / `$VD` substitutions in `QPDFValue::getDescription`. Tracked as flpdf-25kg.3.28. **Not** the same follow-up as Task 4's deferred `getKey`/`getKeys` warnings: qpdf sets both the context pointer and the description string from the same setters (`libqpdf/qpdf/QPDFValue.hh:60-83`), but the context propagation Task 4 needs is canonical-resolver work, tracked against flpdf-25kg.3.5 (see Task 4). flpdf-25kg.3.28 owns the description *text*, which is a separate, still-open gap even after Task 4's prerequisite lands.
 - CLI exit-code aggregation on warnings — flpdf-w1cs.
 - Migrating `outline_document_helper.rs`'s existing `&mut Pdf` warning calls.
 

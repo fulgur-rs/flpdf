@@ -738,18 +738,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// [`Self::push_warning`] for a warning an object raised about itself.
     ///
-    /// qpdf's object-level emitters build their exception with an empty
-    /// filename — `QPDFExc(qpdf_e_object, "", description, 0, message)`
-    /// (`libqpdf/QPDFObjectHandle.cc:2180-2188`) — so the object description
-    /// is the only location `QPDFExc::createWhat` (`libqpdf/QPDFExc.cc:19-49`)
-    /// can interpose. `QPDF::resolve` reads with an empty description
-    /// (`libqpdf/QPDF.cc:1725`), which makes `setLastObjectDescription`
-    /// (`:1297-1309`) yield `"object N G"` and never a file name.
-    /// [`Self::push_warning`]'s input-source description is the slot qpdf
-    /// fills for `damagedPDF` warnings instead (`libqpdf/QPDFParser.cc:512`,
-    /// `input->getName()`), so reusing it here would emit a file name qpdf
-    /// does not. Object descriptions themselves are not yet propagated, so
-    /// this location is empty rather than `"object N G"`.
+    /// Three qpdf emitters reach this sink through `DocumentResolver::warn`,
+    /// and they build different exceptions. `typeWarning` and `objectWarning`
+    /// use `QPDFExc(qpdf_e_object, "", description, 0, message)`
+    /// (`libqpdf/QPDFObjectHandle.cc:2180-2188,2210`); `warnIfPossible`'s
+    /// context branch instead uses `qpdf_e_damaged_pdf` (`:2202`). All three
+    /// build their exception with an empty filename, so the object
+    /// description is the only location `QPDFExc::createWhat`
+    /// (`libqpdf/QPDFExc.cc:19-49`) can interpose — that part of the routing
+    /// is uniform even though the error code is not. `QPDF::resolve` reads
+    /// with an empty description (`libqpdf/QPDF.cc:1725`), which makes
+    /// `setLastObjectDescription` (`:1297-1309`) yield `"object N G"` and
+    /// never a file name. [`Self::push_warning`]'s input-source description
+    /// is the slot qpdf fills for `damagedPDF` warnings instead
+    /// (`libqpdf/QPDFParser.cc:512`, `input->getName()`), so reusing it here
+    /// would emit a file name qpdf does not. Object descriptions themselves
+    /// are not yet propagated, so this location is empty rather than
+    /// `"object N G"`.
     ///
     /// Same borrow discipline as [`Self::push_warning`]: the `borrow_mut()`
     /// is taken and dropped before the logger write.
