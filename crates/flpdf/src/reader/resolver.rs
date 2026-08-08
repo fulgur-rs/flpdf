@@ -6932,7 +6932,8 @@ mod tests {
             .as_bytes(),
         );
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size 3 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+            format!("trailer\n<< /Size 3 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
         );
         pdf
     }
@@ -6956,7 +6957,12 @@ mod tests {
 
         assert!(pdf.reconstructed_xref());
 
-        let warnings: Vec<String> = pdf.repair_diagnostics().entries().iter().map(|d| d.message.clone()).collect();
+        let warnings: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
         assert!(
             warnings.iter().any(|w| w.contains("file is damaged")),
             "diagnostics must contain 'file is damaged': {warnings:?}"
@@ -7009,11 +7015,15 @@ mod tests {
 
         assert!(pdf.reconstructed_xref());
 
-        let warnings: Vec<String> = pdf.repair_diagnostics().entries().iter().map(|d| d.message.clone()).collect();
+        let warnings: Vec<String> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|d| d.message.clone())
+            .collect();
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("object 1 0 not found in file after regenerating cross reference table")),
+            warnings.iter().any(|w| w
+                .contains("object 1 0 not found in file after regenerating cross reference table")),
             "diagnostics must contain absent-after-rebuild warning: {warnings:?}"
         );
     }
