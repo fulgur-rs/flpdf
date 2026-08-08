@@ -16,7 +16,14 @@
 
 ### The three qpdf emitters differ in their no-context behavior
 
-Pinned source is `/home/ubuntu/.cache/flpdf/qpdf-11.9.0`.
+Resolve the pinned 11.9.0 worktree with the repository script; do not hard-code a
+home directory:
+
+```bash
+qpdf_source=$(scripts/fetch-qpdf-source.sh --print-path)
+```
+
+Every `libqpdf/...` and `include/qpdf/...` path below is relative to that root.
 
 ```cpp
 // libqpdf/QPDFObjectHandle.cc:2168-2189
@@ -97,7 +104,27 @@ So handle warnings need a sink that passes an **empty** location. `route_warning
 
 ### Which handles have a context, and why that is not a gap
 
-In qpdf, `QPDFValue::qpdf` is set by `setDescription` / `setDefaultDescription` / `setChildDescription` — the same description machinery flpdf-25kg.3.28 owns. In flpdf today only canonical indirect handles carry `resolver: Some(..)`; direct children built during resolution carry `None`. So a direct child takes the no-context branch, which is qpdf's own behavior for an object created without a document (`QPDFObjectHandle::parse` from a string). Propagating context to direct children belongs with the descriptions in flpdf-25kg.3.28. No production consumer is affected: every `try_*` accessor touched here is still `#[allow(dead_code)]`.
+In qpdf, `QPDFParser` stamps the owning `QPDF*` on every value it creates —
+`obj->setDescription(context, description, ...)` (`libqpdf/QPDFParser.cc:416,425,434,442`),
+which sets `QPDFValue::qpdf` (`libqpdf/qpdf/QPDFValue.hh:60-66`). So a direct object
+parsed from a file has a context upstream. In flpdf only canonical indirect handles
+carry `resolver: Some(..)`; direct children built during resolution carry `None`, so
+they would take a branch qpdf cannot take.
+
+**`try_get_key` and `try_get_keys` have live production consumers**, so this is not a
+documentation-only gap. A leftover `#[allow(dead_code)]` attribute does not prove an
+accessor is unused — audit the callers, not the attribute:
+
+| Caller | Path |
+| --- | --- |
+| `inspect_stream_encryption`, reached from `pipe_stream_data` (`reader/resolver.rs:1015`) | `reader/resolver.rs:1829,1844,1848,1854,1874` |
+| `decode_params_from_consuming_handle` | `stream_filter.rs:584,588` |
+| `encode_stream_data_from_handle` / `decode_stream_data_from_handle_with_mode` | `filters.rs:350,351,482,483` |
+| `try_is_dictionary_of_type` — guarded by an `is_dictionary` test first, mirroring qpdf's `isDictionary() &&` (`libqpdf/QPDFObjectHandle.cc:462-466`) | `object_handle.rs:1144,1151` |
+
+That is why Task 4 defers the two dictionary warning arms; see its own section.
+`try_get_int_value` / `try_get_int_value_as_int` are the accessors with no production
+caller, which is what makes them safe to land warning and all.
 
 ### `try_as_dictionary` must stay silent
 
@@ -181,7 +208,7 @@ In `crates/flpdf/src/reader/resolver.rs`, beside `push_warning_with_offset`:
                 .push(Diagnostic::warning(message.clone(), None));
             (core.logger.clone(), core.suppress_warnings)
         };
-        Self::route_warning(&logger, suppress_warnings, "", None, &message)
+        route_warning(&logger, suppress_warnings, "", None, &message)
     }
 ```
 
@@ -460,11 +487,17 @@ Expected: FAIL — methods not defined.
     /// the bare message to the default logger and returns normally rather
     /// than reporting an error.
     pub(crate) fn warn_if_possible(&self, warning: &str) -> Result<()> {
+        // The context is tested BEFORE resolution. A handle whose document
+        // has been dropped is this port's counterpart of qpdf's null context,
+        // and it is also the one state `try_dereference` cannot resolve —
+        // dereferencing first would turn it into an error and lose the
+        // branch, while still swallowing a reachable document's genuine
+        // resolution failure.
+        let Some(context) = self.context() else {
+            return crate::QPDFLogger::default_logger().error(format!("{warning}\n"));
+        };
         self.try_dereference()?;
-        match self.context() {
-            Some(context) => context.warn(warning.to_owned()),
-            None => crate::QPDFLogger::default_logger().error(format!("{warning}\n")),
-        }
+        context.warn(warning.to_owned())
     }
 
     /// Report an object-level problem whose message qpdf passes through
@@ -494,121 +527,131 @@ git commit -m "feat(object): port warnIfPossible and objectWarning"
 ```
 
 ---
-
-## Task 4: Convert the dictionary accessors
+## Task 4: Leave the dictionary accessors silent — do NOT add the warning arms
 
 **Files:**
-- Modify: `crates/flpdf/src/object_handle.rs:899-912` (`try_get_keys`)
-- Modify: `crates/flpdf/src/object_handle.rs:1068-1073` (`try_get_key`)
+- Modify: `crates/flpdf/src/object_handle.rs` (`try_get_keys`, `try_get_key`) — doc comments only
 - Test: `crates/flpdf/src/object_handle.rs` (`mod warning_emission_tests`)
 
-`try_as_dictionary` (`:884-892`) stays silent — it ports `asDictionary()`, which does not warn.
+**This task deliberately does not port the warnings, and an earlier revision of this
+plan was wrong to instruct otherwise.** qpdf does emit them —
+`typeWarning("dictionary", "treating as empty")` at
+`libqpdf/QPDFObjectHandle.cc:1000` and
+`typeWarning("dictionary", "returning null for attempted key retrieval")` at `:984` —
+but its receiver always has a context, because `QPDFParser` stamps the owning `QPDF*`
+on every value it creates (`libqpdf/QPDFParser.cc:416-442`). flpdf's direct children
+have none, so the emit would reach `warn`'s `throw` arm on a path qpdf warns and
+continues on.
 
-**Step 1: Write the failing test**
+That path is live. `SF_FlateLzwDecode::setDecodeParms` calls `decode_parms.getKeys()`
+with no type guard (`libqpdf/SF_FlateLzwDecode.cc:28`); the flpdf counterpart is
+`stream_filter.rs`'s `decode_params_from_consuming_handle`. Adding the arms turns the
+corpus row "present non-dictionary /DecodeParms" into
+`Error::System("operation for dictionary attempted on object of type integer: treating
+as empty")` where the legacy path decodes fine — caught by
+`filters::tests::equivalence::legacy_and_native_entry_points_agree_on_every_corpus_row`
+and two `stream_filter` tests. `inspect_stream_encryption`
+(`reader/resolver.rs:1829-1874`, reached from `pipe_stream_data`) is a second live
+consumer.
+
+The prerequisite is parse-time context stamping on direct children, which belongs to
+the canonical resolver work, **not** to object description propagation — upstream both
+live in the same `QPDFValue` fields, but the context pointer is what these accessors
+need and the description string is separate. Tracked as its own issue; see the beads
+tracker for the follow-up that depends on it.
+
+`try_as_dictionary` stays silent for a different and permanent reason: it ports
+`asDictionary()`, the internal helper, which does not warn in qpdf either.
+
+**Step 1: Write the tests that pin the silence**
 
 ```rust
     #[test]
-    fn get_keys_on_a_non_dictionary_warns_and_returns_an_empty_set() {
-        // libqpdf/QPDFObjectHandle.cc:999-1003
-        let (resolver, recorder) = recorder();
-        let handle = ObjectHandle::new_indirect_with_resolver(
-            ObjectRef { number: 3, generation: 0 },
-            Rc::downgrade(&resolver),
-        );
-        assert!(handle.try_get_keys().unwrap().is_empty());
-        assert_eq!(
-            recorder.warnings.borrow().as_slice(),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
-        );
-    }
+    fn get_key_on_a_non_dictionary_returns_null_without_warning_yet() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
 
-    #[test]
-    fn get_key_on_a_non_dictionary_warns_and_returns_null() {
-        // libqpdf/QPDFObjectHandle.cc:983-988
-        let (resolver, recorder) = recorder();
-        let handle = ObjectHandle::new_indirect_with_resolver(
-            ObjectRef { number: 3, generation: 0 },
-            Rc::downgrade(&resolver),
-        );
         assert!(handle.try_get_key(b"Type").unwrap().is_null());
-        assert_eq!(
-            recorder.warnings.borrow().as_slice(),
-            ["operation for dictionary attempted on object of type integer: returning null for attempted key retrieval"]
-        );
+        assert!(handle.try_get_keys().unwrap().is_empty());
+
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]
     fn as_dictionary_on_a_non_dictionary_stays_silent_like_qpdf() {
-        // asDictionary() is the internal helper; only getKey/getKeys/getDictAsMap warn.
-        let (resolver, recorder) = recorder();
-        let handle = ObjectHandle::new_indirect_with_resolver(
-            ObjectRef { number: 3, generation: 0 },
-            Rc::downgrade(&resolver),
-        );
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
         assert!(handle.try_as_dictionary().unwrap().is_none());
-        assert!(recorder.warnings.borrow().is_empty());
+
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]
-    fn get_keys_on_a_dictionary_neither_warns_nor_changes_its_result() {
-        let dict = ObjectHandle::dictionary(vec![
-            (b"A".to_vec(), ObjectHandle::integer(1)),
-            (b"B".to_vec(), ObjectHandle::null()),
-        ]);
-        assert_eq!(dict.try_get_keys().unwrap(), [b"A".to_vec()].into_iter().collect());
+    fn dictionary_accessors_neither_warn_nor_change_their_result() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Dictionary(
+            [
+                (b"A".to_vec(), ObjectHandle::integer(1)),
+                (b"B".to_vec(), ObjectHandle::null()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+
+        assert_eq!(
+            handle.try_get_keys().unwrap(),
+            [b"A".to_vec()].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
+        assert!(handle.try_get_key(b"Missing").unwrap().is_null());
+        assert!(warnings(&recorder).is_empty());
     }
 ```
 
-**Step 2: Run test to verify it fails**
+The first test is the one that matters: it makes the silence deliberate, so whoever
+lands the context prerequisite has to change a test on purpose rather than discover
+the behavior by accident.
+
+**Step 2: Run them**
 
 Run: `cargo test -p flpdf --lib warning_emission_tests`
-Expected: FAIL — the two warning assertions find an empty recorder.
+Expected: PASS. They pass against the accessors as they already are; nothing about
+their behavior changes in this task.
 
-**Step 3: Write minimal implementation**
+**Step 3: Record the reason in the doc comments**
 
-`try_get_keys` currently delegates through `try_as_dictionary`. Break that delegation so only the non-dictionary arm here warns:
+Extend both accessors' doc comments to say the warning is qpdf's and is not
+reproduced yet, and why — the receiver must be able to reach its owning document.
+Keep the citation to `:984` / `:1000` so the gap is findable from the code.
+
+While here, make `try_get_key` fetch through a single `with_value` that both
+type-tests and fetches, rather than `as_dictionary().is_none()` followed by
+`get_key`. `as_dictionary()` clones the whole entry map (`entries.clone()`), which is
+review-pattern 1 in `.claude/rules/pdf-rust-review-patterns.md`. This is an
+independent improvement and carries no behavior change:
 
 ```rust
-    pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
-        self.try_dereference()?;
-        let Some(entries) = self.as_dictionary() else {
-            self.type_warning("dictionary", "treating as empty")?;
-            return Ok(BTreeSet::new());
-        };
-        let mut result = BTreeSet::new();
-        for (key, child) in entries {
-            if !child.try_is_null()? {
-                result.insert(key);
-            }
-        }
-        Ok(result)
-    }
-
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
-        if self.as_dictionary().is_none() {
-            self.type_warning("dictionary", "returning null for attempted key retrieval")?;
-            return Ok(ObjectHandle::null());
-        }
-        Ok(self.get_key(key))
+        Ok(self
+            .with_value(|value| match value {
+                Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(ObjectHandle::null))
     }
 ```
 
-Keep the existing doc comments and extend them with the warning citation. `try_get_key`'s qpdf counterpart returns `QPDF_Null::create(obj, msg, "")` — a null carrying a child description; the description half is flpdf-25kg.3.28's, so note that rather than inventing it.
+**Step 4: Confirm nothing regressed**
 
-**Step 4: Run test to verify it passes**
-
-Run: `cargo test -p flpdf --lib`
-Expected: PASS, whole lib suite green.
+Run: `cargo test -p flpdf`
+Expected: PASS, including the three consumer tests named above, **unedited**. If any
+of them needed editing, the warning arms leaked back in.
 
 **Step 5: Commit**
 
 ```bash
 git add crates/flpdf/src/object_handle.rs
-git commit -m "feat(object): warn from getKey and getKeys like qpdf"
+git commit -m "test(object): pin the silent dictionary accessors and their reason"
 ```
-
----
 
 ## Task 5: The integer accessors
 
@@ -734,17 +777,17 @@ git commit -m "feat(object): port getIntValue and getIntValueAsInt"
 
 **Step 1: Record the ported surface**
 
-Add `typeWarning` / `warnIfPossible` / `objectWarning` / `getIntValue` / `getIntValueAsInt` / `getKey` / `getKeys` to the `QPDFObjectHandle.cc` row, and note the two deviations this issue knowingly carries:
+Add `typeWarning` / `warnIfPossible` / `objectWarning` / `warn` / `getIntValue` / `getIntValueAsInt` to the `QPDFObjectHandle.cc` row — **not** `getKey` / `getKeys`, which Task 4 leaves unported — and note the two deviations this issue knowingly carries:
 
 1. Object descriptions are empty, so warnings render without qpdf's `"object N G: "` prefix until the description propagation work lands.
-2. Only canonical indirect handles carry a context, so direct children take the no-context branch.
+2. Only canonical indirect handles carry a context, so direct children take the no-context branch. Record that this is what defers `getKey` / `getKeys`, and name the live consumers (`reader/resolver.rs`'s `inspect_stream_encryption`, `stream_filter.rs`'s consuming `/DecodeParms` read) so the row states a reachable constraint rather than a theoretical one.
 
 **Step 2: Run the workspace gates**
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test -p flpdf
+cargo test --workspace
 cargo test -p flpdf --doc
 ```
 
@@ -758,15 +801,33 @@ Commit first — the script errors on a dirty tree by design.
 scripts/patch-coverage.sh --base feature/flpdf-qynx.4-cli-output-routing
 ```
 
-Expected: `flpdf` changed lines 100%. Do **not** pass `--features qpdf-zlib-compat`.
+Expected: `flpdf` changed lines 100%. The script's fresh mode runs
+`--features qpdf-zlib-compat --ignore-run-fail`, matching the CI Coverage job:
+`overlay::byte_gate`'s byte-identical tests are gated behind that feature, so a
+measurement without it reports hundreds of false-positive uncovered lines.
 
 **Step 4: Byte-identical corpus**
 
-The existing corpus must be unaffected; these accessors have no production consumer yet, so this is a regression check rather than a new gate.
+The existing corpus must be unaffected. `cargo test`'s trailing `[TESTNAME]` is a
+substring filter, so a package/filter pair that matches nothing compiles and reports
+success while running zero tests — name the targets explicitly instead. The
+authoritative list is the `qpdf-zlib-compat` block in `.github/workflows/ci.yml`;
+these gated suites are not run by a plain `cargo test`.
 
 ```bash
-cargo test -p flpdf --features qpdf-zlib-compat compat_baseline
+for t in zlib_compat_tests cmp_diff_zero_tests cmp_null_visibility_tests \
+         deterministic_id_qpdf_parity_tests cmp_generate_objstm_tests \
+         cmp_linearize_tests cmp_linearize_objstm_tests; do
+  cargo test -p flpdf --features qpdf-zlib-compat --test "$t"
+done
+cargo test -p flpdf --features qpdf-zlib-compat --lib overlay::byte_gate
+for t in cli_byte_identical cli_byte_identical_overlay encrypt_cli_tests \
+         compat_baseline_static_id compat_matrix_baseline; do
+  cargo test -p flpdf-cli --features qpdf-zlib-compat --test "$t"
+done
 ```
+
+Check each line's `test result:` count is non-zero.
 
 **Step 5: Commit**
 
