@@ -990,8 +990,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core
             .borrow()
             .source_xref_entries
-            .iter()
-            .map(|(object_ref, _)| *object_ref)
+            .keys()
+            .copied()
             .collect()
     }
 
