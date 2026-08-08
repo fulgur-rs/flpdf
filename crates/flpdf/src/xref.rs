@@ -207,7 +207,7 @@ fn parse_xref_from_start(
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
         let (entries, trailer) = parse_xref_table(&mut cursor, bytes)?;
         let trailer_references = collect_trailer_references(&trailer);
-        return Ok(LoadedXrefState {
+        let mut loaded = LoadedXrefState {
             loaded: LoadedXref {
                 version: version.to_string(),
                 startxref,
@@ -219,10 +219,83 @@ fn parse_xref_from_start(
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
             header_offset: 0,
-        });
+        };
+        merge_xref_stream_from_classic_trailer(bytes, xref_pos, &mut loaded, options)?;
+        return Ok(loaded);
     }
 
     parse_xref_stream(bytes, xref_pos, startxref, version.to_string(), options)
+}
+
+/// Read the optional hybrid-reference stream named by a classic trailer's
+/// `/XRefStm`. This is the `QPDF::read_xrefTable` branch at QPDF.cc:915-927:
+/// it reads the stream before the table's deferred free entries and deliberately
+/// discards the stream trailer's `/Prev` continuation.
+fn merge_xref_stream_from_classic_trailer(
+    bytes: &[u8],
+    classic_xref_pos: usize,
+    loaded: &mut LoadedXrefState,
+    options: XrefLoadOptions,
+) -> Result<()> {
+    let Some(xref_stream_offset) = loaded.loaded.trailer.get("XRefStm") else {
+        return Ok(());
+    };
+
+    // qpdf's ignore gate precedes both the integer check and read_xrefStream.
+    // Do not rely on parse_xref_stream's internal gate: at this call site qpdf
+    // succeeds without inspecting an ignored, malformed `/XRefStm` value.
+    if options.ignore_xref_streams {
+        return Ok(());
+    }
+
+    let Some(xref_stream_offset) = xref_stream_offset.as_integer() else {
+        return Err(Error::parse(classic_xref_pos, "invalid /XRefStm"));
+    };
+    let xref_stream_pos = usize::try_from(xref_stream_offset).map_err(|_| {
+        // qpdf passes the signed integer to InputSource::seek; a negative
+        // value therefore fails as an invalid seek rather than as malformed
+        // `/XRefStm` syntax.
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("xref stream offset {xref_stream_offset} is before the file start"),
+        ))
+    })?;
+
+    // The hybrid stream contributes entries and raw-object discovery state, but
+    // its own trailer is not the current trailer and its `/Prev` is ignored.
+    let hybrid = parse_xref_stream(
+        bytes,
+        xref_stream_pos,
+        xref_stream_pos as u64,
+        loaded.loaded.version.clone(),
+        options,
+    )?;
+    for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
+        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+    }
+    loaded
+        .trailer_references
+        .extend(hybrid.trailer_references.iter().copied());
+    loaded
+        .parsed_xref_streams
+        .extend(hybrid.parsed_xref_streams);
+
+    // qpdf registers classic live entries before it reads the hybrid stream,
+    // so the table wins a same-section collision. flpdf's existing xref merge
+    // remains object-number keyed; its classic-free/hybrid-live difference is
+    // intentionally owned by flpdf-25kg.3.30.
+    for (object_ref, entry) in hybrid.loaded.entries {
+        if !loaded
+            .loaded
+            .entries
+            .keys()
+            .any(|existing| existing.number == object_ref.number)
+        {
+            loaded.loaded.entries.insert(object_ref, entry);
+        }
+    }
+
+    Ok(())
 }
 
 fn merge_previous_xref_sections(
@@ -781,6 +854,15 @@ fn parse_xref_stream(
         Object::Stream(stream) => stream,
         _ => return Err(Error::parse(xref_pos, "xref not found")),
     };
+    // QPDF::read_xrefStream accepts an xref stream only when
+    // `isStreamOfType("/XRef")` succeeds. The shared parser owns this check
+    // for both direct startxref streams and classic-trailer `/XRefStm` targets.
+    if !matches!(
+        stream.dict.get("Type"),
+        Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef"
+    ) {
+        return Err(Error::parse(xref_pos, "xref not found"));
+    }
 
     let trailer = stream.dict.clone();
     let size = parse_non_negative_u64(

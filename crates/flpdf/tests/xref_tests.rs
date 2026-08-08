@@ -356,6 +356,7 @@ fn preserves_recovery_diagnostics_from_previous_xref_streams() {
         3,
         None,
         1,
+        XrefStreamIndex::full(3),
         &previous_entries,
         previous_entries.len() + 10,
     ));
@@ -399,6 +400,7 @@ fn preserves_previous_xref_diagnostics_through_linear_scan_fallback() {
         3,
         Some(bad_prev),
         1,
+        XrefStreamIndex::full(3),
         &previous_entries,
         previous_entries.len() + 10,
     ));
@@ -449,6 +451,21 @@ fn build_encoded_xref_stream_entries(entries: &[(u8, u64, u64)]) -> Vec<u8> {
     encoded
 }
 
+#[derive(Clone, Copy)]
+struct XrefStreamIndex {
+    start: u32,
+    count: u32,
+}
+
+impl XrefStreamIndex {
+    const fn full(size: u32) -> Self {
+        Self {
+            start: 0,
+            count: size,
+        }
+    }
+}
+
 fn make_xref_stream_object(
     object_number: u32,
     size: u32,
@@ -456,11 +473,30 @@ fn make_xref_stream_object(
     root_ref_number: u32,
     entries: &[u8],
 ) -> Vec<u8> {
+    make_xref_stream_object_with_index(
+        object_number,
+        size,
+        prev_offset,
+        root_ref_number,
+        XrefStreamIndex::full(size),
+        entries,
+    )
+}
+
+fn make_xref_stream_object_with_index(
+    object_number: u32,
+    size: u32,
+    prev_offset: Option<u64>,
+    root_ref_number: u32,
+    index: XrefStreamIndex,
+    entries: &[u8],
+) -> Vec<u8> {
     make_xref_stream_object_with_declared_length(
         object_number,
         size,
         prev_offset,
         root_ref_number,
+        index,
         entries,
         entries.len(),
     )
@@ -471,6 +507,7 @@ fn make_xref_stream_object_with_declared_length(
     size: u32,
     prev_offset: Option<u64>,
     root_ref_number: u32,
+    index: XrefStreamIndex,
     entries: &[u8],
     declared_length: usize,
 ) -> Vec<u8> {
@@ -479,7 +516,9 @@ fn make_xref_stream_object_with_declared_length(
         .unwrap_or_default();
 
     let mut object = format!(
-        "{object_number} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [0 {size}] /Length {declared_length}{prev} >>\nstream\n",
+        "{object_number} 0 obj\n<< /Type /XRef /Size {size} /Root {root_ref_number} 0 R /W [1 4 2] /Index [{} {}] /Length {declared_length}{prev} >>\nstream\n",
+        index.start,
+        index.count,
     )
     .into_bytes();
     object.extend_from_slice(entries);
@@ -2397,6 +2436,348 @@ fn ignore_xref_streams_options(repair: bool) -> PdfOpenOptions {
         ignore_xref_streams: true,
         ..PdfOpenOptions::default()
     }
+}
+
+fn classic_xref_with_hybrid_only_entry() -> (Vec<u8>, u64) {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let hybrid_only_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /HybridOnly true >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65535),
+        (1, catalog_offset, 0),
+        (1, hybrid_only_offset, 0),
+        (1, xref_stream_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        3,
+        4,
+        None,
+        1,
+        &xref_stream_entries,
+    ));
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 4 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    (bytes, hybrid_only_offset)
+}
+
+#[test]
+fn classic_xref_table_reads_entries_from_its_xrefstm() {
+    let (bytes, hybrid_only_offset) = classic_xref_with_hybrid_only_entry();
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes.clone())).expect("hybrid xref loads");
+    assert_eq!(loaded.last_xref_form, XrefForm::Table);
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: hybrid_only_offset
+        }),
+        "the classic trailer's /XRefStm contributes its hybrid-only entry"
+    );
+
+    let mut pdf = Pdf::open_mem_owned(bytes).expect("the reader sees the hybrid-only object");
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(2, 0))
+            .expect("resolve hybrid-only object")
+            .as_dict()
+            .and_then(|dict| dict.get("HybridOnly"))
+            .and_then(Object::as_bool),
+        Some(true)
+    );
+}
+
+/// qpdf's `read_xrefStream` accepts a stream only when it has `/Type /XRef`.
+/// An otherwise valid hybrid stream without that type must therefore be
+/// rejected rather than contributing entries from a classic trailer's
+/// `/XRefStm`.
+#[test]
+fn rejects_hybrid_xref_stream_without_xref_type() {
+    let (mut bytes, _) = classic_xref_with_hybrid_only_entry();
+    let type_marker = b"/Type /XRef";
+    let type_pos = bytes
+        .windows(type_marker.len())
+        .position(|window| window == type_marker)
+        .expect("hybrid fixture contains an xref type");
+    // Keep the fixture's stored xref offsets valid while removing its `/Type`
+    // key: `/Bogus /Yep` has the same length as `/Type /XRef`.
+    bytes[type_pos..type_pos + type_marker.len()].copy_from_slice(b"/Bogus /Yep");
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("untyped hybrid stream must not be accepted as xref");
+    let message = format!("{err}");
+    assert!(message.contains("xref not found"), "got {message}");
+    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+}
+
+#[test]
+fn classic_xref_table_hybrid_entries_match_pinned_qpdf_show_xref() {
+    // cov:ignore-start: CI provides qpdf; this fallback is for developer hosts only.
+    if std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("qpdf not available; skipping hybrid xref differential");
+        return;
+    }
+    // cov:ignore-end
+
+    let (bytes, hybrid_only_offset) = classic_xref_with_hybrid_only_entry();
+    let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+    let path = directory.path().join("classic-xref-xrefstm.pdf");
+    std::fs::write(&path, bytes).expect("write hybrid xref fixture");
+
+    let qpdf = std::process::Command::new("qpdf")
+        .arg("--show-xref")
+        .arg(&path)
+        .output()
+        .expect("run pinned qpdf --show-xref");
+    assert!(
+        qpdf.status.success(),
+        "qpdf --show-xref failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&qpdf.stdout),
+        String::from_utf8_lossy(&qpdf.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&qpdf.stdout)
+            .contains(&format!("2/0: uncompressed; offset = {hybrid_only_offset}")),
+        "qpdf --show-xref output:\n{}",
+        String::from_utf8_lossy(&qpdf.stdout)
+    );
+}
+
+fn classic_xref_with_xrefstm_value(value: &[u8]) -> (Vec<u8>, u64) {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R /XRefStm ");
+    bytes.extend_from_slice(value);
+    bytes.extend_from_slice(format!(" >>\nstartxref\n{table_offset}\n%%EOF\n").as_bytes());
+
+    (bytes, table_offset)
+}
+
+#[test]
+fn classic_xref_table_rejects_non_integer_xrefstm_at_the_table_offset() {
+    for value in [b"/NotAnOffset".as_slice(), b"<< /Offset 42 >>", b"42.5"] {
+        let (bytes, table_offset) = classic_xref_with_xrefstm_value(value);
+        let error = load_xref_and_trailer(&mut Cursor::new(bytes))
+            .expect_err("a classic /XRefStm must be an integer");
+        assert_eq!(
+            error.to_string(),
+            format!("parse error at byte {table_offset}: invalid /XRefStm"),
+            "value: {}",
+            String::from_utf8_lossy(value),
+        );
+    }
+}
+
+#[test]
+fn classic_xref_table_reports_negative_xrefstm_as_an_invalid_seek() {
+    let (bytes, _) = classic_xref_with_xrefstm_value(b"-1");
+    let error = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("negative /XRefStm must fail while seeking the stream");
+    assert!(
+        matches!(error, Error::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidInput),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn ignored_classic_xrefstm_skips_non_integer_validation() {
+    let (bytes, _) = classic_xref_with_xrefstm_value(b"/NotAnOffset");
+    let pdf = Pdf::open_mem_owned_with_options(bytes, ignore_xref_streams_options(false))
+        .expect("ignore_xref_streams skips the classic /XRefStm branch");
+    assert_eq!(pdf.root_ref(), Some(ObjectRef::new(1, 0)));
+}
+
+#[test]
+fn classic_xref_table_reports_a_non_stream_xrefstm_at_its_target_offset() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let not_a_stream_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /NotAnXRefStream true >>\nendobj\n");
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /XRefStm {not_a_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let error = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect_err("the /XRefStm target must be an xref stream");
+    assert_eq!(
+        error.to_string(),
+        format!("parse error at byte {not_a_stream_offset}: xref not found")
+    );
+}
+
+#[test]
+fn classic_xref_table_preserves_recovery_diagnostics_from_its_xrefstm() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object_with_declared_length(
+        2,
+        3,
+        None,
+        1,
+        XrefStreamIndex::full(3),
+        &xref_stream_entries,
+        xref_stream_entries.len() + 10,
+    ));
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode recovers the hybrid xref stream length");
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message.contains("recovered stream length")
+                && diagnostic.message.contains("(object 2 0,")
+        }));
+}
+
+#[test]
+fn classic_xref_entries_take_precedence_over_its_xrefstm_entries() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let classic_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /Source /Classic >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (1, xref_stream_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        3,
+        4,
+        None,
+        1,
+        &xref_stream_entries,
+    ));
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{classic_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 4 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).expect("hybrid xref loads");
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: classic_offset
+        })
+    );
+}
+
+#[test]
+fn classic_xref_prev_continues_past_the_xrefstms_discarded_prev() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let previous_only_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /Source /ClassicPrev >>\nendobj\n");
+    let discarded_prev_only_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"4 0 obj\n<< /Source /DiscardedStreamPrev >>\nendobj\n");
+
+    let classic_prev_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{previous_only_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"trailer\n<< /Size 7 /Root 1 0 R >>\n");
+
+    let discarded_prev_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&make_xref_stream_object_with_index(
+        5,
+        7,
+        None,
+        1,
+        XrefStreamIndex { start: 4, count: 1 },
+        &build_encoded_xref_stream_entries(&[(1, discarded_prev_only_offset, 0)]),
+    ));
+
+    let xref_stream_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&make_xref_stream_object_with_index(
+        6,
+        7,
+        Some(discarded_prev_offset),
+        1,
+        XrefStreamIndex { start: 6, count: 1 },
+        &build_encoded_xref_stream_entries(&[(1, xref_stream_offset, 0)]),
+    ));
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 7 /Root 1 0 R /XRefStm {xref_stream_offset} /Prev {classic_prev_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).expect("hybrid xref loads");
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: previous_only_offset
+        }),
+        "the classic trailer's /Prev remains the continuation"
+    );
+    assert!(
+        !loaded.entries.contains_key(&ObjectRef::new(4, 0)),
+        "the hybrid stream's /Prev must not be followed"
+    );
 }
 
 // `Pdf` deliberately has no `Debug`, so `Result::expect_err` is unavailable.
