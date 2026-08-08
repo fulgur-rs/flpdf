@@ -108,6 +108,11 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// cannot read/parse the whole remaining file — which would make resolving
     /// many objects quadratic, a CPU DoS on a crafted (e.g. repaired) document.
     pub(crate) sorted_object_offsets: Vec<u64>,
+    /// Whether the legacy cache and object-boundary snapshot already reflect
+    /// the resolver's reconstructed xref. Open-time recovery initializes all
+    /// three from the same recovered table; resolution-time recovery flips
+    /// this lazily before the next legacy read.
+    pub(crate) legacy_resolution_state_synced: bool,
     /// Remaining read-to-end fallbacks allowed when a bounded object window does
     /// not contain a complete object (a corrupt offset pointing inside another
     /// object, or a header-like line recorded inside stream data during repair).

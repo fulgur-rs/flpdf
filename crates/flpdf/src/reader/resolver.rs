@@ -750,7 +750,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // OffsetInputSource which seeks to logical-0 at QPDF.cc:543.
         let header_offset = self.core.borrow().header_offset;
         let raw_bytes = self.core.borrow_mut().read_underlying_bytes()?;
-        let logical_bytes = &raw_bytes[header_offset..];
+        let logical_bytes = raw_bytes.get(header_offset..).ok_or_else(|| {
+            Error::parse(
+                header_offset,
+                "input ended before the detected PDF header offset",
+            )
+        })?;
         let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
 
         {
@@ -762,15 +767,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         // Lookup object_ref in reconstructed xref table
         let retry_entry = self.xref_entry(object_ref);
-        if let Some(XrefEntry::Uncompressed { offset: new_offset }) = retry_entry {
-            // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
-            // any parse failure propagates as an exception (Err here).
-            match self.read_object_at_offset(new_offset, object_ref) {
-                Ok(res) => Ok(Some(res)),
-                Err(err) => Err(err),
+        match retry_entry {
+            Some(XrefEntry::Uncompressed { offset: new_offset }) => {
+                // qpdf QPDF.cc:1622-1628: the retry call has try_recovery=false, so
+                // any parse failure propagates as an exception (Err here).
+                self.read_object_at_offset(new_offset, object_ref).map(Some)
             }
-        } else {
-            Ok(None)
+            Some(XrefEntry::Compressed { .. }) => Err(Error::Unsupported(format!(
+                "canonical resolver cannot yet resolve object {} {}: only uncompressed cross-reference entries are implemented",
+                object_ref.number, object_ref.generation
+            ))),
+            Some(XrefEntry::Free { .. }) | None => Ok(None),
         }
     }
 
@@ -2327,10 +2334,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                                             Ok(())
                                         }
                                         Ok(None) => {
-                                            self.push_warning(format!(
+                                            let warning = format!(
                                                 "object {} {} not found in file after regenerating cross reference table",
                                                 object_ref.number, object_ref.generation
-                                            ))?;
+                                            );
+                                            self.push_warning(warning)?;
                                             handle.set_missing();
                                             Ok(())
                                         }
@@ -6970,6 +6978,88 @@ mod tests {
         pdf
     }
 
+    /// A recovered stream whose original xref entries both point into the
+    /// first object's dictionary.  The stale second offset is intentionally
+    /// between the real object boundaries so it can truncate a legacy read
+    /// window after canonical recovery.
+    fn recovered_stream_with_stale_boundary() -> (Vec<u8>, u64, u64) {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let object_one_offset = pdf.len() as u64;
+        let object_one = b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n";
+        let false_offset = object_one_offset + b"1 0 obj\n<< /Length".len() as u64;
+        pdf.extend_from_slice(object_one);
+        let object_two_offset = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n22\nendobj\n");
+        let xref_offset = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{false_offset:010} 00000 n \n{false_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        (pdf, object_one_offset, object_two_offset)
+    }
+
+    fn malformed_recovery_pdf() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let object_offset = pdf.len() as u64;
+        // The initial xref points into the object header, forcing recovery;
+        // the recovered object then has an unusable stream length, which the
+        // retry must propagate as a parse error.
+        pdf.extend_from_slice(b"1 0 obj\n<< /Length /Broken >>\nstream\nabc\nendstream\nendobj\n");
+        let false_offset = object_offset + 4;
+        let xref_offset = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{false_offset:010} 00000 n \n").as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn recovered_objstm_member_pdf() -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let catalog_offset = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let object_stream_offset = pdf.len() as u64;
+        let object_stream_data = b"7 0 << /Value 9 >>";
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n",
+                object_stream_data.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(object_stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = pdf.len() as u64;
+        let mut xref = String::from("xref\n0 8\n0000000000 65535 f \n");
+        xref.push_str(&format!("{catalog_offset:010} 00000 n \n"));
+        for _ in 2..=4 {
+            xref.push_str("0000000000 00000 f \n");
+        }
+        xref.push_str(&format!("{object_stream_offset:010} 00000 n \n"));
+        xref.push_str("0000000000 00000 f \n");
+        // The damaged table advertises object 7 as uncompressed at the
+        // object-stream offset; recovery replaces it with the validated type-2
+        // mapping discovered from the stream contents.
+        xref.push_str(&format!("{object_stream_offset:010} 00000 n \n"));
+        pdf.extend_from_slice(xref.as_bytes());
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     #[test]
     fn reconstruct_retry_on_header_mismatch_with_recovery_enabled() {
         let bytes = synthetic_mismatch_pdf(true);
@@ -7141,38 +7231,102 @@ mod tests {
     #[test]
     fn reconstruct_xref_and_retry_when_read_object_at_offset_fails() {
         // A PDF where reconstruction finds the object in the xref scan but
-        // the bytes at that offset produce an empty (null) object.
-        // flpdf treats `1 0 obj\nendobj` as null ("empty object treated as null"),
-        // so read_object_at_offset succeeds with Ok((Null, _)).
-        // The retry therefore returns Ok(Some((Null, _))).
-        let mut pdf_bytes = Vec::new();
-        pdf_bytes.extend_from_slice(b"%PDF-1.7\n");
-        let obj1_offset = pdf_bytes.len();
-        pdf_bytes.extend_from_slice(b"1 0 obj\nendobj\n");
-        let xref_offset = pdf_bytes.len();
-        pdf_bytes.extend_from_slice(
-            format!(
-                "xref\n0 2\n0000000000 65535 f \n{obj1_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
+        // the recovered object body is malformed.  The retry is the qpdf
+        // `try_recovery=false` path, so its parse error must be preserved.
         let options = crate::PdfOpenOptions {
             repair: true,
             ..Default::default()
         };
-        let pdf = Pdf::open_mem_owned_with_options(pdf_bytes, options).expect("open");
+        let mut pdf = Pdf::open_mem_owned_with_options(malformed_recovery_pdf(), options)
+            .expect("open malformed-object fixture");
 
-        let err = Error::parse(10, "trigger");
-        let res = pdf
-            .resolver
-            .reconstruct_xref_and_retry(err, ObjectRef::new(1, 0));
-        // Empty object is treated as null by the recovery path; retry succeeds.
+        let error = pdf
+            .get_object_handle(ObjectRef::new(1, 0))
+            .try_dereference()
+            .expect_err("the reconstructed malformed body must remain an error");
         assert!(
-            matches!(
-                res,
-                Ok(Some((crate::reader::resolver::ObjectValue::Null, _)))
-            ),
-            "empty-object retry must succeed as Ok(Some(Null)): {res:?}"
+            matches!(error, Error::Parse { .. }),
+            "retry parse error must propagate unchanged: {error:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruction_synchronizes_legacy_cache_and_object_boundaries() {
+        let (bytes, object_one_offset, object_two_offset) = recovered_stream_with_stale_boundary();
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open fixture");
+        let initial_fallback_budget = pdf.resolution_fallbacks_remaining;
+
+        pdf.get_object_handle(ObjectRef::new(1, 0))
+            .try_dereference()
+            .expect("canonical resolution must recover object 1");
+
+        assert_eq!(
+            pdf.resolve(ObjectRef::new(2, 0))
+                .expect("legacy cache must use the rebuilt offset"),
+            crate::Object::Integer(22)
+        );
+        assert_eq!(
+            pdf.sorted_object_offsets,
+            vec![object_one_offset, object_two_offset],
+            "legacy object boundaries must follow the live reconstructed xref"
+        );
+        assert_eq!(
+            pdf.source_stream_data_offset(ObjectRef::new(1, 0))
+                .expect("recovered stream offset"),
+            Some(object_one_offset + b"1 0 obj\n<< /Length 3 >>\nstream\n".len() as u64)
+        );
+        assert_eq!(
+            pdf.resolution_fallbacks_remaining, initial_fallback_budget,
+            "recovered boundaries must not consume a stale-window fallback"
+        );
+    }
+
+    #[test]
+    fn reconstruction_returns_unsupported_for_recovered_compressed_target() {
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let mut pdf = Pdf::open_mem_owned_with_options(recovered_objstm_member_pdf(), options)
+            .expect("open object-stream recovery fixture");
+
+        let error = pdf
+            .get_object_handle(ObjectRef::new(7, 0))
+            .try_dereference()
+            .expect_err("compressed canonical resolution is not implemented");
+        assert!(
+            matches!(&error, Error::Unsupported(message) if message.contains("object 7 0")),
+            "a recovered type-2 entry must remain distinguishable from an absent object: {error:?}"
+        );
+    }
+
+    #[test]
+    fn reconstruction_returns_an_error_when_the_detected_header_disappears() {
+        let prefix = b"prefix\n";
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(&synthetic_mismatch_pdf(true));
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open prefixed PDF");
+        assert_eq!(pdf.resolver.header_offset(), prefix.len());
+
+        pdf.resolver.with_reader_mut(|reader| {
+            reader.get_mut().truncate(prefix.len() - 1);
+        });
+
+        let error = pdf
+            .get_object_handle(ObjectRef::new(1, 0))
+            .try_dereference()
+            .expect_err("a truncated reread must return an error, not panic");
+        assert!(
+            matches!(error, Error::Parse { .. }),
+            "truncated logical input must be reported as a parse error: {error:?}"
         );
     }
 }

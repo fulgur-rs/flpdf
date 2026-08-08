@@ -159,6 +159,7 @@ impl<R: Read + Seek> Pdf<R> {
             legacy_materialized_memo: BTreeMap::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
+            legacy_resolution_state_synced: loaded_state.already_reconstructed,
             resolution_fallbacks_remaining: MAX_RESOLUTION_FALLBACKS,
             dirty_object_refs: BTreeSet::new(),
             handle_mutated_object_refs: BTreeSet::new(),

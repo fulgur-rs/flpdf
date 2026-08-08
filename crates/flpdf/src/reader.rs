@@ -996,6 +996,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// normal resolution, so `stream` text inside strings, names, comments, or
     /// earlier stream payloads cannot be mistaken for the stream marker.
     pub fn source_stream_data_offset(&mut self, object_ref: ObjectRef) -> Result<Option<u64>> {
+        self.synchronize_legacy_resolution_state();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
@@ -1019,6 +1020,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         filter_index: usize,
     ) -> Result<Option<u64>> {
+        self.synchronize_legacy_resolution_state();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
@@ -1042,6 +1044,7 @@ impl<R: Read + Seek> Pdf<R> {
         &mut self,
         object_ref: ObjectRef,
     ) -> Result<Option<u64>> {
+        self.synchronize_legacy_resolution_state();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
@@ -1068,6 +1071,7 @@ impl<R: Read + Seek> Pdf<R> {
         object_ref: ObjectRef,
         array_index: usize,
     ) -> Result<Option<u64>> {
+        self.synchronize_legacy_resolution_state();
         let Some(XrefEntry::Uncompressed { offset }) = self.resolver.xref_entry(object_ref) else {
             return Ok(None);
         };
@@ -2655,7 +2659,29 @@ impl<R: Read + Seek> Pdf<R> {
         self.sorted_object_offsets.get(index).copied()
     }
 
+    /// Bring the legacy cache and bounded-read offsets in line with the
+    /// canonical resolver after a resolution-time xref reconstruction.
+    fn synchronize_legacy_resolution_state(&mut self) {
+        if self.legacy_resolution_state_synced || !self.resolver.reconstructed_xref() {
+            return;
+        }
+
+        let entries = self.resolver.xref_entries();
+        self.cache.synchronize_with_xref(&entries);
+        self.sorted_object_offsets = entries
+            .values()
+            .filter_map(|entry| match entry {
+                XrefEntry::Uncompressed { offset } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        self.sorted_object_offsets.sort_unstable();
+        self.sorted_object_offsets.dedup();
+        self.legacy_resolution_state_synced = true;
+    }
+
     fn resolve_to_cache(&mut self, object_ref: ObjectRef) -> Result<bool> {
+        self.synchronize_legacy_resolution_state();
         let entry = self.cache.entry(object_ref);
         if matches!(entry, Some(CacheEntry::Resolved(_))) {
             return Ok(true);
