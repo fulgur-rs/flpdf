@@ -2991,6 +2991,22 @@ fn write_pass1_debug_comments(writer: &mut dyn Write, comments: &[u8]) {
     let _ = buffered.write(comments);
 }
 
+/// Reject manually-constructed plans whose per-page private-object lists do
+/// not have one entry for every page hint. `from_pdf` always preserves this
+/// alignment; keeping the check separate makes the hand-built-plan failure
+/// observable without forcing a malformed plan through the full writer.
+fn validate_per_page_private_objects(plan: &LinearizationPlan) -> Result<()> {
+    if plan.per_page_private_objects.len() != plan.page_hints.len() {
+        return Err(crate::Error::Unsupported(format!(
+            "linearization writer: per_page_private_objects length ({}) does not \
+                 match page_hints length ({}) — plan invariant violated",
+            plan.per_page_private_objects.len(),
+            plan.page_hints.len()
+        )));
+    }
+    Ok(())
+}
+
 fn write_linearized_impl<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -3753,17 +3769,8 @@ fn write_linearized_impl<R: Read + Seek>(
     let part3_byte_len: u64 = part3_plain_len + part3_container_len;
 
     // Manually-constructed plans must keep `per_page_private_objects`
-    // aligned with `page_hints` (one entry per page).  A shorter list
-    // would silently leave some page-length hint fields unpatched —
-    // fail fast instead.
-    if plan.per_page_private_objects.len() != plan.page_hints.len() {
-        return Err(crate::Error::Unsupported(format!(
-            "linearization writer: per_page_private_objects length ({}) does not \
-                 match page_hints length ({}) — plan invariant violated",
-            plan.per_page_private_objects.len(),
-            plan.page_hints.len()
-        )));
-    }
+    // aligned with `page_hints` (one entry per page).
+    validate_per_page_private_objects(plan)?;
 
     // Containers a non-first page must not add to its byte length: only a
     // part7 container owned entirely by this one page is a section object.
@@ -4587,6 +4594,26 @@ mod tests {
             }
             other => panic!("expected file-aware pass-1 write error, got {other:?}"), // cov:ignore: assertion failure arm
         }
+    }
+
+    #[test]
+    fn validate_per_page_private_objects_rejects_mismatched_page_hints() {
+        let plan = LinearizationPlan {
+            page_hints: vec![crate::linearization::plan::PageHintEntry::placeholder(
+                ObjectRef::new(3, 0),
+            )],
+            per_page_private_objects: Vec::new(),
+            ..Default::default()
+        };
+
+        let error = validate_per_page_private_objects(&plan)
+            .expect_err("a page/private-object length mismatch must be rejected");
+        assert!(matches!(
+            error,
+            crate::Error::Unsupported(ref message)
+                if message.contains("per_page_private_objects length (0) does not")
+                    && message.contains("page_hints length (1)")
+        ));
     }
 
     #[test]
