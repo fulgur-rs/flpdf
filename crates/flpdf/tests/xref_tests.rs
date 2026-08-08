@@ -2979,6 +2979,37 @@ fn ignore_xref_streams_finds_a_candidate_but_cannot_decode_it() {
 }
 
 #[test]
+fn candidate_recovery_warns_when_xref_size_is_not_one_plus_highest_object() {
+    let (mut bytes, xref_stream_offset) = xref_stream_document(false);
+    let size_token = b"/Size 3";
+    let size_offset = bytes
+        .windows(size_token.len())
+        .position(|window| window == size_token)
+        .expect("candidate xref stream has a /Size entry");
+    bytes[size_offset + b"/Size ".len()] = b'4';
+
+    let original_suffix = format!("startxref\n{xref_stream_offset}\n%%EOF\n");
+    assert!(bytes.ends_with(original_suffix.as_bytes()));
+    bytes.truncate(bytes.len() - original_suffix.len());
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("candidate xref-stream recovery should succeed");
+
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert_eq!(loaded.startxref, xref_stream_offset);
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (4) is not one plus the highest object number (2)"
+                && diagnostic.offset.is_none()
+        }));
+}
+
+#[test]
 fn incremental_write_after_candidate_recovery_uses_the_recovered_offset() {
     // flpdf-specific correctness gate: qpdf's own `QPDFWriter` has no
     // incremental-update mode at all, so there is no oracle behavior to

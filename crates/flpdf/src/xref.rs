@@ -472,11 +472,24 @@ fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
 /// Emit qpdf's post-chain `/Size` warning while the construction-scoped
 /// deleted-object set is still available.
 fn append_xref_size_warning(loaded: &mut LoadedXref, deleted_objects: &BTreeSet<u32>) {
-    let Some(Object::Integer(size)) = loaded.trailer.get("Size") else {
+    append_xref_size_warning_for(
+        &loaded.trailer,
+        &loaded.entries,
+        deleted_objects,
+        &mut loaded.repair_diagnostics,
+    );
+}
+
+fn append_xref_size_warning_for(
+    trailer: &Dictionary,
+    entries: &BTreeMap<ObjectRef, XrefEntry>,
+    deleted_objects: &BTreeSet<u32>,
+    repair_diagnostics: &mut Diagnostics,
+) {
+    let Some(Object::Integer(size)) = trailer.get("Size") else {
         return;
     };
-    let max_live = loaded
-        .entries
+    let max_live = entries
         .keys()
         .map(|object_ref| object_ref.number)
         .max()
@@ -485,7 +498,7 @@ fn append_xref_size_warning(loaded: &mut LoadedXref, deleted_objects: &BTreeSet<
     let max_object = max_live.max(max_deleted);
 
     if *size < 1 || *size - 1 != i64::from(max_object) {
-        loaded.repair_diagnostics.push(Diagnostic::warning(
+        repair_diagnostics.push(Diagnostic::warning(
             format!(
                 "reported number of objects ({size}) is not one plus the highest object number ({max_object})"
             ),
@@ -814,14 +827,6 @@ fn recover_trailer_from_xref_stream_candidate(
     for (object_ref, xref_entry) in reentry.loaded.entries {
         entries.entry(object_ref).or_insert(xref_entry);
     }
-    // The candidate/its `/Prev` chain's own free rows have no map presence
-    // to block the ObjStm gap-filler with (`reentry_registration.entries`
-    // never holds them either); surface the object numbers directly so the
-    // caller can seed the gap-filler's occupied-number set with them,
-    // mirroring qpdf's `m->deleted_objects` (`std::set<int>`, `QPDF.hh:1466`)
-    // discarding a type-0 row's own generation field
-    // (`QPDF.cc:1120-1124`, "Ignore fields[2]").
-    deleted_object_numbers.extend(reentry_registration.deleted_objects);
     parsed_xref_streams.extend(reentry.parsed_xref_streams);
     trailer_references.extend(reentry.trailer_references);
     // The candidate re-entry (and any `/Prev` chain it follows) can itself
@@ -831,6 +836,20 @@ fn recover_trailer_from_xref_stream_candidate(
     for diagnostic in reentry.loaded.repair_diagnostics.entries() {
         repair_diagnostics.push(diagnostic.clone());
     }
+    append_xref_size_warning_for(
+        &candidate.trailer,
+        entries,
+        &reentry_registration.deleted_objects,
+        repair_diagnostics,
+    );
+    // The candidate/its `/Prev` chain's own free rows have no map presence
+    // to block the ObjStm gap-filler with (`reentry_registration.entries`
+    // never holds them either); surface the object numbers directly so the
+    // caller can seed the gap-filler's occupied-number set with them,
+    // mirroring qpdf's `m->deleted_objects` (`std::set<int>`, `QPDF.hh:1466`)
+    // discarding a type-0 row's own generation field
+    // (`QPDF.cc:1120-1124`, "Ignore fields[2]").
+    deleted_object_numbers.extend(reentry_registration.deleted_objects);
 
     Ok((candidate.trailer, max_offset, reentry.loaded.last_xref_form))
 }
