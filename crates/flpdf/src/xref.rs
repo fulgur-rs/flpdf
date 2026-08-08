@@ -2344,6 +2344,139 @@ mod tests {
     }
 
     #[test]
+    fn xref_stream_candidate_successful_prev_repair_diagnostics_preserve_order() {
+        // The candidate and its valid `/Prev` section both need stream-length
+        // recovery. Their re-entry diagnostics must be appended in the same
+        // order qpdf reads the sections, without duplicating the candidate's
+        // warning when the merge succeeds.
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        // Object 2 is a valid older xref-stream section, but its declared
+        // length is shorter than its six-byte payload and needs recovery.
+        let off2 = bytes.len() as u64;
+        let stream2 = [0u8, 0, 0, 1, off2 as u8, 0];
+        bytes.extend_from_slice(b"2 0 obj\n");
+        bytes.extend_from_slice(b"<< /Type /XRef /W [1 1 1] /Size 2 /Length 3 >>\nstream\n");
+        bytes.extend_from_slice(&stream2);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        // Object 1 is the winning candidate and points to object 2 through
+        // `/Prev`; it also needs stream-length recovery on both reads.
+        let off1 = bytes.len() as u64;
+        let stream1 = [1u8, 0, 0, 1, off1 as u8, 0];
+        bytes.extend_from_slice(b"1 0 obj\n");
+        bytes.extend_from_slice(
+            format!("<< /Type /XRef /W [1 1 1] /Size 2 /Prev {off2} /Length 3 >>\nstream\n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream1);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+        assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+
+        let mut input = Cursor::new(bytes);
+        let loaded = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect("the candidate and its valid /Prev section both recover");
+        let recovered_length_warnings: Vec<&str> = loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("recovered stream length"))
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+
+        assert_eq!(
+            recovered_length_warnings.len(),
+            4,
+            "each repaired stream warns once at discovery and once at re-entry"
+        );
+        assert!(recovered_length_warnings[0].contains("object 1"));
+        assert!(recovered_length_warnings[1].contains("object 2"));
+        assert!(recovered_length_warnings[2].contains("object 1"));
+        assert!(recovered_length_warnings[3].contains("object 2"));
+    }
+
+    #[test]
+    fn xref_stream_candidate_prev_success_then_failure_preserves_all_repair_order() {
+        // Exercise the failure path after an earlier `/Prev` section has
+        // already merged a repair diagnostic into `reentry.loaded`. That
+        // diagnostic must be surfaced before the later failing section's
+        // buffered diagnostic.
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+
+        // Use a two-byte offset field so the three-object fixture remains
+        // valid even after the object dictionaries make the offsets exceed a
+        // single byte. Object 3 will fail filter decoding after its length
+        // repair, while object 2 is a valid intermediate `/Prev` section.
+        let make_stream_data = |offset: u64| {
+            let offset = u16::try_from(offset).expect("fixture offset fits in two bytes");
+            [1u8, (offset >> 8) as u8, offset as u8, 0]
+        };
+
+        // Keep object 3's low offset byte outside PDF whitespace so its
+        // deliberately short `/Length` cannot look like an exact boundary.
+        bytes.extend_from_slice(b"% xref-chain-padding-for-repair-order-test\n");
+        let off3 = bytes.len() as u64;
+        let stream3 = make_stream_data(off3);
+        bytes.extend_from_slice(b"3 0 obj\n");
+        bytes.extend_from_slice(
+            b"<< /Type /XRef /W [1 2 1] /Size 2 /Index [1 1] /Filter /Bogus /Length 1 >>\nstream\n",
+        );
+        bytes.extend_from_slice(&stream3);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let off2 = bytes.len() as u64;
+        let stream2 = make_stream_data(off2);
+        bytes.extend_from_slice(b"2 0 obj\n");
+        bytes.extend_from_slice(
+            format!("<< /Type /XRef /W [1 2 1] /Size 2 /Index [1 1] /Prev {off3} /Length 1 >>\nstream\n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream2);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let off1 = bytes.len() as u64;
+        let stream1 = make_stream_data(off1);
+        bytes.extend_from_slice(b"1 0 obj\n");
+        bytes.extend_from_slice(
+            format!("<< /Type /XRef /W [1 2 1] /Size 2 /Index [1 1] /Prev {off2} /Length 1 >>\nstream\n")
+                .as_bytes(),
+        );
+        bytes.extend_from_slice(&stream1);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+        assert!(!bytes.windows(7).any(|window| window == b"trailer"));
+
+        let mut input = Cursor::new(bytes);
+        let error = load_xref_and_trailer_with_repair(&mut input, true)
+            .expect_err("the oldest /Prev section fails its unsupported filter validation");
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("repair failure carries diagnostics");
+        assert!(source
+            .to_string()
+            .contains("error decoding candidate xref stream while recovering damaged file"));
+
+        let recovered_length_warnings: Vec<&str> = diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("recovered stream length"))
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            recovered_length_warnings.len(),
+            6,
+            "each section warns at discovery and each re-entered section warns once; got {recovered_length_warnings:?}"
+        );
+        assert!(recovered_length_warnings[0].contains("object 1"));
+        assert!(recovered_length_warnings[1].contains("object 2"));
+        assert!(recovered_length_warnings[2].contains("object 3"));
+        assert!(recovered_length_warnings[3].contains("object 1"));
+        assert!(recovered_length_warnings[4].contains("object 2"));
+        assert!(recovered_length_warnings[5].contains("object 3"));
+    }
+
+    #[test]
     fn xref_stream_candidate_trailer_prefers_lowest_objgen_over_highest_offset() {
         // qpdf 11.9.0 `reconstruct_xref` (`QPDF.cc:592-597`): `setTrailer`
         // only ever takes effect once, so the placeholder trailer set inside
