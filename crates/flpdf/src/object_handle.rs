@@ -1159,6 +1159,14 @@ impl ObjectHandle {
         }
     }
 
+    /// Clear source-description metadata when the handle's value is replaced
+    /// by caller-supplied data. The replacement no longer belongs to the
+    /// source location that produced the old description, so the indirect
+    /// object fallback (`object N G`) must be used instead.
+    pub(crate) fn clear_description(&self) {
+        self.0.borrow_mut().description = None;
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_child_description(
         &self,

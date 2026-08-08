@@ -1197,7 +1197,13 @@ impl<R: Read + Seek> Pdf<R> {
         // from *before* this call.
         self.legacy_materialized_memo.remove(&object_ref);
         let handle = self.get_object_handle(object_ref);
-        match self.lift_for_set_object(&object, &handle) {
+        let lifted = self.lift_for_set_object(&object, &handle);
+        // A caller-supplied replacement no longer describes the source bytes
+        // that populated this handle. Clear both pieces of parsed provenance;
+        // otherwise a rendered description retains the old `$PO` value even
+        // after `reset_parsed_offset()` has removed the old offset.
+        handle.clear_description();
+        match lifted {
             Ok(value) => {
                 handle.set_resolved(value);
                 // The value is now caller-supplied, in-memory-constructed
@@ -8411,6 +8417,38 @@ mod tests {
 
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
         assert!(handle.is_null());
+    }
+
+    #[test]
+    fn set_object_drops_the_replaced_handle_source_description() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve");
+        assert!(
+            handle.description().contains("offset"),
+            "the fixture must establish a source description before replacement"
+        );
+
+        pdf.set_object(object_ref, Object::Integer(42));
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert_eq!(handle.description(), "object 1 0");
+        handle
+            .object_warning("replacement warning")
+            .expect("replacement warning should use the replacement description");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .last()
+                .expect("replacement warning is recorded")
+                .message,
+            "object 1 0: replacement warning"
+        );
     }
 
     /// `Pdf::resolve_borrowed` now returns the *native*-parsed dictionary
