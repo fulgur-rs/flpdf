@@ -3872,26 +3872,24 @@ fn write_linearized_impl<R: Read + Seek>(
     // leaves the content-offset fields at 0 (matching Adobe implementation
     // note 127).  Mirroring this gives readers a usable initial-rendering
     // hint and keeps us on the path toward bytes-identical hint streams.
-    if !per_page_byte_lengths.is_empty() {
-        let least_pl = per_page_byte_lengths.iter().copied().min().unwrap_or(0);
-        let max_pl = per_page_byte_lengths.iter().copied().max().unwrap_or(0);
-        let bits_delta_pl = bits_needed(max_pl.saturating_sub(least_pl));
-        po_table.header.least_page_length = least_pl;
-        po_table.header.bits_page_length_delta = bits_delta_pl;
-        po_table.header.least_content_length = least_pl;
-        po_table.header.bits_content_length_delta = bits_delta_pl;
-        // `per_page_byte_lengths.len() == page_hints.len() ==
-        // po_table.entries.len()` is enforced by the length check at the
-        // top of this block, so zip is bounds-check-free.
-        for (entry, &bl) in po_table
-            .entries
-            .iter_mut()
-            .zip(per_page_byte_lengths.iter())
-        {
-            let delta = bl.saturating_sub(least_pl);
-            entry.page_length_minus_least = delta;
-            entry.content_stream_length = delta;
-        }
+    let least_pl = per_page_byte_lengths.iter().copied().min().unwrap_or(0);
+    let max_pl = per_page_byte_lengths.iter().copied().max().unwrap_or(0);
+    let bits_delta_pl = bits_needed(max_pl.saturating_sub(least_pl));
+    po_table.header.least_page_length = least_pl;
+    po_table.header.bits_page_length_delta = bits_delta_pl;
+    po_table.header.least_content_length = least_pl;
+    po_table.header.bits_content_length_delta = bits_delta_pl;
+    // `per_page_byte_lengths.len() == page_hints.len() ==
+    // po_table.entries.len()` is enforced by the length check at the
+    // top of this block, so zip is bounds-check-free.
+    for (entry, &bl) in po_table
+        .entries
+        .iter_mut()
+        .zip(per_page_byte_lengths.iter())
+    {
+        let delta = bl.saturating_sub(least_pl);
+        entry.page_length_minus_least = delta;
+        entry.content_stream_length = delta;
     }
 
     // Shared object table fields.
@@ -3900,129 +3898,127 @@ fn write_linearized_impl<R: Read + Seek>(
     // entries first, then part3 entries).  Per qpdf's checkHSharedObject,
     // the table starts at the first-page section's first object (part2[0] =
     // page dict), so we use shared_hints[0] for the location field.
-    if !plan.shared_hints.is_empty() {
-        // Collect byte lengths for all shared hint entries in plan order.
-        //
-        // Resolve renumber + pass-1 byte-length lookups strictly:
-        // a missing entry indicates a planner / renumber inconsistency or
-        // a pass-1 coverage bug, both of which would silently produce
-        // a hint table with `least_length = 0` / `header.location = 0` if
-        // we substituted zeros.  Bubble Err so the writer fails loudly
-        // and the caller can surface the broken plan.
-        // Iterate the FOLDED shared list (the same list the hint tables are
-        // built from): first-page ObjStm members are folded into a single
-        // container entry whose byte length is the container object's own
-        // length.  A folded container entry carries the container's *new*
-        // object number with the sentinel generation `u16::MAX` (see
-        // `LinearizationPlan::canonical_shared_hints`); every other entry
-        // carries a real original ref (generation 0).  We discriminate by
-        // that sentinel — no live object uses generation `u16::MAX` — so a
-        // real original ref whose number happens to coincide with a
-        // container's new number can never be mistaken for a container (and
-        // vice versa).
-        let folded_shared = plan.canonical_shared_hints(
-            &objstm_layout.member_to_container,
-            renumber,
-            &second_half_container_nums,
-            &open_document_container_nums,
-        );
-        let shared_section_lens: Vec<u64> = folded_shared
-            .iter()
-            .map(|h| -> Result<u64> {
-                // Folded container entry: the synthetic ref's sentinel
-                // generation identifies it. Use the container object's
-                // own byte length.
-                if h.object_ref.generation == u16::MAX {
-                    // cov:ignore-start: unreachable — a first-half
-                    // container is always emitted (and probed) before
-                    // this back-patch, so its byte length is present; the
-                    // guard defends against a layout/probe mismatch.
-                    let len = byte_lengths
-                        .get(&h.object_ref.number)
-                        .copied()
-                        .ok_or_else(|| {
-                            crate::Error::Unsupported(format!(
-                                "shared hint container (new #{}) has no probed byte length",
-                                h.object_ref.number
-                            ))
-                        })?;
-                    // cov:ignore-end
-                    return Ok(len as u64);
-                }
-                // cov:ignore-start: unreachable — non-container shared
-                // hints are plan objects with a renumber entry, and every
-                // plain shared object is emitted (and probed) before this
-                // back-patch; absence signals a planner/renumber/probe
-                // inconsistency.
-                let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "shared hint object {} has no renumber entry",
-                        h.object_ref
-                    ))
-                })?;
-                let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "shared hint object {} (new #{}) has no probed byte length",
-                        h.object_ref, new_ref.number
-                    ))
-                })?;
+    // Collect byte lengths for all shared hint entries in plan order.
+    //
+    // Resolve renumber + pass-1 byte-length lookups strictly:
+    // a missing entry indicates a planner / renumber inconsistency or
+    // a pass-1 coverage bug, both of which would silently produce
+    // a hint table with `least_length = 0` / `header.location = 0` if
+    // we substituted zeros.  Bubble Err so the writer fails loudly
+    // and the caller can surface the broken plan.
+    // Iterate the FOLDED shared list (the same list the hint tables are
+    // built from): first-page ObjStm members are folded into a single
+    // container entry whose byte length is the container object's own
+    // length.  A folded container entry carries the container's *new*
+    // object number with the sentinel generation `u16::MAX` (see
+    // `LinearizationPlan::canonical_shared_hints`); every other entry
+    // carries a real original ref (generation 0).  We discriminate by
+    // that sentinel — no live object uses generation `u16::MAX` — so a
+    // real original ref whose number happens to coincide with a
+    // container's new number can never be mistaken for a container (and
+    // vice versa).
+    let folded_shared = plan.canonical_shared_hints(
+        &objstm_layout.member_to_container,
+        renumber,
+        &second_half_container_nums,
+        &open_document_container_nums,
+    );
+    let shared_section_lens: Vec<u64> = folded_shared
+        .iter()
+        .map(|h| -> Result<u64> {
+            // Folded container entry: the synthetic ref's sentinel
+            // generation identifies it. Use the container object's
+            // own byte length.
+            if h.object_ref.generation == u16::MAX {
+                // cov:ignore-start: unreachable — a first-half
+                // container is always emitted (and probed) before
+                // this back-patch, so its byte length is present; the
+                // guard defends against a layout/probe mismatch.
+                let len = byte_lengths
+                    .get(&h.object_ref.number)
+                    .copied()
+                    .ok_or_else(|| {
+                        crate::Error::Unsupported(format!(
+                            "shared hint container (new #{}) has no probed byte length",
+                            h.object_ref.number
+                        ))
+                    })?;
                 // cov:ignore-end
-                Ok(len as u64)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let least = shared_section_lens.iter().copied().min().unwrap_or(0);
-        let max = shared_section_lens.iter().copied().max().unwrap_or(0);
-        so_table.header.least_length = least;
-        so_table.header.bits_length_delta = bits_needed(max.saturating_sub(least));
-
-        // Location (item 2): qpdf's pass-1 virtual byte offset of the first
-        // Part-8 shared object. In the final file qpdf's
-        // `adjusted_offset(location)` adds the exact `/H[1]` bytes that are
-        // spliced between Part 1 and this object.
-        //
-        // This is only meaningful when nshared_total > nshared_first_page
-        // (i.e., there are Part-8 objects).  When part4_other_pages_shared
-        // is empty the location value is ignored (qpdf Implementation Note 131).
-        // `from_plan` already set `first_object_number` to the FIRST
-        // SECOND-HALF (Part-8) shared entry — the container number when that
-        // entry is an ObjStm container, or the object's own number when it is
-        // plain — and crucially EXCLUDES part4-shared objects that the global
-        // even split placed in a first-page (part6) container (those are
-        // before /E, not Part-8). It is 0 when there are no Part-8 entries
-        // (location is then ignored per Implementation Note 131). Look up that
-        // object's probe offset for the `location` field; the object number
-        // itself is already correct, so it is not overwritten here.
-        let first_part8_lookup_num = so_table.header.first_object_number;
-        if first_part8_lookup_num != 0 {
-            let first_part8_off = xref_offsets
-                .get(&first_part8_lookup_num)
-                .copied()
-                // cov:ignore-start: the first Part-8 entry (a container or a
-                // plain Part-8 object) is always probed in the same pass that
-                // fills `xref_offsets`, so this lookup never misses for a
-                // well-formed plan.
-                .ok_or_else(|| {
-                    crate::Error::Unsupported(format!(
-                        "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
-                             has no probed offset"
-                    ))
-                })?;
+                return Ok(len as u64);
+            }
+            // cov:ignore-start: unreachable — non-container shared
+            // hints are plan objects with a renumber entry, and every
+            // plain shared object is emitted (and probed) before this
+            // back-patch; absence signals a planner/renumber/probe
+            // inconsistency.
+            let new_ref = renumber.new_for_original(h.object_ref).ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "shared hint object {} has no renumber entry",
+                    h.object_ref
+                ))
+            })?;
+            let len = byte_lengths.get(&new_ref.number).copied().ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "shared hint object {} (new #{}) has no probed byte length",
+                    h.object_ref, new_ref.number
+                ))
+            })?;
             // cov:ignore-end
-            so_table.header.location = first_part8_off as u64;
-        }
+            Ok(len as u64)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-        // Per-object length_minus_least.  group_offset is no longer a
-        // per-entry field (see hint_stream::encode_shared_object_entries:
-        // it does not match Annex F.4.5 / qpdf's HSharedObjectEntry layout
-        // and was previously emitting an extra 32 bits per entry that
-        // qpdf misinterpreted as the next entry's length delta).
-        // `nobjects_minus_one` stays at 0 from `from_plan`.  `so_table.objects`
-        // and `shared_section_lens` are both built from the folded shared
-        // list, so zipping keeps the per-object length deltas aligned.
-        for (obj, &len) in so_table.objects.iter_mut().zip(&shared_section_lens) {
-            obj.length_minus_least = (len.saturating_sub(least)) as u32;
-        }
+    let least = shared_section_lens.iter().copied().min().unwrap_or(0);
+    let max = shared_section_lens.iter().copied().max().unwrap_or(0);
+    so_table.header.least_length = least;
+    so_table.header.bits_length_delta = bits_needed(max.saturating_sub(least));
+
+    // Location (item 2): qpdf's pass-1 virtual byte offset of the first
+    // Part-8 shared object. In the final file qpdf's
+    // `adjusted_offset(location)` adds the exact `/H[1]` bytes that are
+    // spliced between Part 1 and this object.
+    //
+    // This is only meaningful when nshared_total > nshared_first_page
+    // (i.e., there are Part-8 objects).  When part4_other_pages_shared
+    // is empty the location value is ignored (qpdf Implementation Note 131).
+    // `from_plan` already set `first_object_number` to the FIRST
+    // SECOND-HALF (Part-8) shared entry — the container number when that
+    // entry is an ObjStm container, or the object's own number when it is
+    // plain — and crucially EXCLUDES part4-shared objects that the global
+    // even split placed in a first-page (part6) container (those are
+    // before /E, not Part-8). It is 0 when there are no Part-8 entries
+    // (location is then ignored per Implementation Note 131). Look up that
+    // object's probe offset for the `location` field; the object number
+    // itself is already correct, so it is not overwritten here.
+    let first_part8_lookup_num = so_table.header.first_object_number;
+    if first_part8_lookup_num != 0 {
+        let first_part8_off = xref_offsets
+            .get(&first_part8_lookup_num)
+            .copied()
+            // cov:ignore-start: the first Part-8 entry (a container or a
+            // plain Part-8 object) is always probed in the same pass that
+            // fills `xref_offsets`, so this lookup never misses for a
+            // well-formed plan.
+            .ok_or_else(|| {
+                crate::Error::Unsupported(format!(
+                    "first Part-8 shared object (lookup #{first_part8_lookup_num}) \
+                         has no probed offset"
+                ))
+            })?;
+        // cov:ignore-end
+        so_table.header.location = first_part8_off as u64;
+    }
+
+    // Per-object length_minus_least.  group_offset is no longer a
+    // per-entry field (see hint_stream::encode_shared_object_entries:
+    // it does not match Annex F.4.5 / qpdf's HSharedObjectEntry layout
+    // and was previously emitting an extra 32 bits per entry that
+    // qpdf misinterpreted as the next entry's length delta).
+    // `nobjects_minus_one` stays at 0 from `from_plan`.  `so_table.objects`
+    // and `shared_section_lens` are both built from the folded shared
+    // list, so zipping keeps the per-object length deltas aligned.
+    for (obj, &len) in so_table.objects.iter_mut().zip(&shared_section_lens) {
+        obj.length_minus_least = (len.saturating_sub(least)) as u32;
     }
 
     // Patch the Outlines Hint Table (qpdf calculateHOutline): fill the
@@ -4056,7 +4052,7 @@ fn write_linearized_impl<R: Read + Seek>(
         structural_streams_filtered,
         encrypt_ctx.as_ref(),
         hint_stream_aes_iv,
-    )?;
+    )?; // cov:ignore: internally-built hint payload and encryption context make this only a defensive propagation boundary.
 
     // Final pass: write the layout with the exact hint object generated
     // above. The pass-1 virtual offsets and the spliced object length are
@@ -4107,7 +4103,7 @@ fn write_linearized_impl<R: Read + Seek>(
         id_writer,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
-    )?;
+    )?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     let LinearizedPassOutput {
         bytes: mut final_bytes,
         xref_offsets: final_xref_offsets,
