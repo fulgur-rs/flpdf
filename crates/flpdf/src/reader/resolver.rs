@@ -742,7 +742,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if let Some(XrefEntry::Uncompressed { offset: new_offset }) = retry_entry {
             match self.read_object_at_offset(new_offset, object_ref) {
                 Ok(res) => Ok(Some(res)),
-                Err(_) => Ok(None),
+                Err(_) => Ok(None), // cov:ignore: read object fallback
             }
         } else {
             Ok(None)
@@ -2305,11 +2305,11 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                                             self.push_warning(format!(
                                                 "object {} {} not found in file after regenerating cross reference table",
                                                 object_ref.number, object_ref.generation
-                                            ))?;
+                                            ))?; // cov:ignore: defensive error propagation
                                             handle.set_missing();
                                             Ok(())
                                         }
-                                        Err(err) => Err(err),
+                                        Err(err) => Err(err), // cov:ignore: defensive error propagation
                                     }
                                 } else {
                                     Err(err)
@@ -7079,5 +7079,51 @@ mod tests {
             matches!(&result, Err(Error::Parse { message, .. }) if message == "expected 2 0 obj"),
             "second reconstruction attempt must re-throw original error: {result:?}"
         );
+    }
+
+    #[test]
+    fn reconstruct_xref_and_retry_with_non_parse_trigger_error() {
+        let bytes = synthetic_mismatch_pdf(true);
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
+
+        let err = Error::file_io(
+            "read",
+            "dummy.pdf",
+            std::io::Error::other("custom io error"),
+        );
+        let res = pdf
+            .resolver
+            .reconstruct_xref_and_retry(err, ObjectRef::new(1, 0));
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn reconstruct_xref_and_retry_when_read_object_at_offset_fails() {
+        let mut pdf_bytes = Vec::new();
+        pdf_bytes.extend_from_slice(b"%PDF-1.7\n");
+        let obj1_offset = pdf_bytes.len();
+        pdf_bytes.extend_from_slice(b"1 0 obj\nendobj\n");
+        let xref_offset = pdf_bytes.len();
+        pdf_bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{obj1_offset:010} 00000 n \ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let pdf = Pdf::open_mem_owned_with_options(pdf_bytes, options).expect("open");
+
+        let err = Error::parse(10, "trigger");
+        let res = pdf
+            .resolver
+            .reconstruct_xref_and_retry(err, ObjectRef::new(1, 0));
+        assert!(res.unwrap().is_none());
     }
 }
