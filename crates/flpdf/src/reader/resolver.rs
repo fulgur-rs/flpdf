@@ -773,7 +773,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "input ended before the detected PDF header offset",
             )
         })?;
-        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
+        let new_entries = crate::xref::recover_xref_entries(logical_bytes, false)?.entries;
 
         {
             let mut core = self.core.borrow_mut();
