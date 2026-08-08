@@ -10,7 +10,7 @@ use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
     encode_run_length, stream_filter_for, validate_filter_chain_count, DecodeParams,
-    FilterDecodePhase, FilterSpec, DECODE_OUTPUT_LIMIT_PREFIX,
+    FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -374,12 +374,12 @@ fn decode_stream_data_with_filters(
 ///
 /// Plan decision D2 of `flpdf-25kg.3.4` keeps decryption out of this layer, so
 /// a `Crypt` stage is recognised during staging and then refused here. Shared
-/// by the legacy and `ObjectHandle` entry points so the message has one
-/// definition rather than one literal per path.
+/// by the legacy and `ObjectHandle` entry points, and the message itself is
+/// [`CRYPT_STAGE_UNSUPPORTED`] so that this provider and the registry-side
+/// `CryptStreamFilter::pipe_decode_recovering` report one definition rather
+/// than one literal per route.
 fn reject_crypt_stage(_decode_params: &DecodeParams, _data: &[u8]) -> Result<Vec<u8>> {
-    Err(Error::Unsupported(
-        "unsupported stream filter: Crypt".to_string(),
-    ))
+    Err(Error::Unsupported(CRYPT_STAGE_UNSUPPORTED.to_string()))
 }
 
 fn decode_stream_data_with_filters_and_crypt<F>(

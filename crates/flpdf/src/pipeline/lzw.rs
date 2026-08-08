@@ -1,6 +1,6 @@
 //! qpdf correspondence: Pl_LZWDecoder.cc bit accumulation, table growth, code-width transitions, end-of-data latching, output boundaries, and error text.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 
 /// The code value that resets the table and the code width.
 const CLEAR_CODE: u32 = 256;
@@ -23,7 +23,7 @@ const TABLE_LIMIT: u32 = 4096;
 /// part of the observable contract.
 pub(crate) struct LzwDecoder<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
 
     // Members used for converting bits to codes.
     buf: [u8; 3],
@@ -43,12 +43,12 @@ pub(crate) struct LzwDecoder<'a> {
 impl<'a> LzwDecoder<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
-        next: &'a mut dyn Pipeline,
+        next: impl Into<PipelineRef<'a>>,
         early_code_change: bool,
     ) -> Self {
         Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             buf: [0; 3],
             code_size: 9,
             buf_next: 0,

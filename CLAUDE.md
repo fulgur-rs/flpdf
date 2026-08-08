@@ -31,8 +31,11 @@ feature flag（`qpdf-zlib-compat`）に隔離してある。デフォルトは m
 - byte-identical を厳密に検証する場面（compat baseline 等）では `qpdf-zlib-compat`
   feature（zlib バックエンド）を使う。
 - **この 1 点が唯一の例外**。これ以外で byte-identical を崩す逸脱は認めない。
-- 関連の運用注意: llvm-cov / patch-coverage は `qpdf-zlib-compat` なしで回す
-  （compat baseline は miniz 固定のため、feature を付けた計測は失敗する）。
+- 関連の運用注意: llvm-cov / patch-coverage は **`--features qpdf-zlib-compat
+  --ignore-run-fail` で回す**。`overlay::byte_gate` の byte-identical テストが
+  この feature でゲートされているため、feature 無しの計測は 600 行超の偽陽性
+  未カバー行を出す（`.github/workflows/ci.yml` の Coverage job と
+  `scripts/patch-coverage.sh` の fresh-mode 既定が同じ形）。
 
 #### (B) 出力バイトを変えない内部構造の代替 — 条件付きで許容
 
@@ -90,7 +93,8 @@ PR を作成する**前**（beads「Session Completion」の品質ゲート手�
 
 1. 実行: `scripts/patch-coverage.sh [--base <親ブランチ>]`
    （スタック PR では親ブランチを `--base` に渡す。直前に
-   `cargo llvm-cov --workspace --lcov --output-path <path>` を回した場合は
+   `cargo llvm-cov --workspace --features qpdf-zlib-compat --ignore-run-fail
+   --lcov --output-path <path>` を回した場合は
    `--lcov <path>` で再利用すると、重い再ビルドを省ける。**作業を commit してから
    実行すること** — カバレッジは作業ツリーを計測する一方ゲートは HEAD を diff する
    ため、dirty tree では偽グリーンを避けるためエラーになる。意図的に上書きする場合のみ
