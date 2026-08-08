@@ -1,11 +1,12 @@
 use flpdf::pipeline::{
-    Base64Action, Discard, Pipeline, PipelineError, PipelineResult, PlBase64, PlConcatenate,
-    PlOStream, PlStdioFile, PlString,
+    Base64Action, Discard, Pipeline, PipelineError, PipelineHandle, PipelineResult, PlBase64,
+    PlConcatenate, PlOStream, PlStdioFile, PlString,
 };
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Write};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 struct ExternalSink(Vec<u8>);
 
@@ -120,6 +121,129 @@ fn discard_accepts_empty_and_nonempty_writes_across_finish_boundaries() {
     pipeline.finish().unwrap();
     pipeline.write(b"after finish").unwrap();
     pipeline.finish().unwrap();
+}
+
+#[test]
+fn ostream_can_own_a_writer() {
+    let mut stage = PlOStream::new("owned", Cursor::new(Vec::new()));
+
+    stage.write(b"owned bytes").unwrap();
+    stage.finish().unwrap();
+}
+
+struct SharedSink {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Pipeline for SharedSink {
+    fn identifier(&self) -> &str {
+        "shared"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.bytes.lock().unwrap().extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+struct LogicSink;
+
+impl Pipeline for LogicSink {
+    fn identifier(&self) -> &str {
+        "logic"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        Err(PipelineError::logic("logic detail"))
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+struct PanicOnceSink {
+    panicked: bool,
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Pipeline for PanicOnceSink {
+    fn identifier(&self) -> &str {
+        "panic-once"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        if !self.panicked {
+            self.panicked = true;
+            panic!("poison the pipeline mutex");
+        }
+        self.bytes.lock().unwrap().extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn pipeline_handle_clones_share_writes_and_identity() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let handle = PipelineHandle::new(SharedSink {
+        bytes: Arc::clone(&bytes),
+    });
+    let clone = handle.clone();
+    let distinct = PipelineHandle::new(SharedSink {
+        bytes: Arc::clone(&bytes),
+    });
+
+    handle.write(b"one").unwrap();
+    clone.write(b" two").unwrap();
+
+    assert_eq!(handle.identifier(), "shared");
+    assert!(handle.is_same(&clone));
+    assert!(!handle.is_same(&distinct));
+    assert_eq!(handle, clone);
+    assert_ne!(handle, distinct);
+    assert_eq!(
+        format!("{handle:?}"),
+        "PipelineHandle { identifier: \"shared\", .. }"
+    );
+    assert_eq!(&*bytes.lock().unwrap(), b"one two");
+}
+
+#[test]
+fn pipeline_handle_preserves_downstream_error_categories() {
+    let logic = PipelineHandle::new(LogicSink).write(b"x").unwrap_err();
+    let runtime = PipelineHandle::new(RejectingSink::default())
+        .write(b"x")
+        .unwrap_err();
+
+    assert!(matches!(logic, PipelineError::Logic(_)));
+    assert_eq!(logic.message(), "logic detail");
+    assert!(matches!(runtime, PipelineError::Runtime(_)));
+    assert_eq!(runtime.message(), "downstream rejected chunk");
+}
+
+#[test]
+fn pipeline_handle_recovers_from_a_poisoned_mutex() {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let handle = PipelineHandle::new(PanicOnceSink {
+        panicked: false,
+        bytes: Arc::clone(&bytes),
+    });
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = handle.write(b"first");
+    }));
+    assert!(panic.is_err());
+
+    handle.write(b"recovered").unwrap();
+    assert_eq!(&*bytes.lock().unwrap(), b"recovered");
 }
 
 fn record(

@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(crate) mod ascii85;
 
@@ -200,6 +201,67 @@ impl<'a> From<Box<dyn Pipeline + 'a>> for PipelineRef<'a> {
         Self::Owned(next)
     }
 }
+
+/// A shared owner for one pipeline stage.
+///
+/// Clones point at the same stage, matching qpdf's copied
+/// `std::shared_ptr<Pipeline>` handles. Operations recover a poisoned mutex
+/// with its contained pipeline so a prior panic does not create a new
+/// pipeline error category.
+#[derive(Clone)]
+pub struct PipelineHandle {
+    pipeline: Arc<Mutex<Box<dyn Pipeline + Send>>>,
+}
+
+impl PipelineHandle {
+    pub fn new<P>(pipeline: P) -> Self
+    where
+        P: Pipeline + Send + 'static,
+    {
+        Self {
+            pipeline: Arc::new(Mutex::new(Box::new(pipeline))),
+        }
+    }
+
+    pub fn identifier(&self) -> String {
+        self.lock().identifier().to_owned()
+    }
+
+    pub fn write(&self, data: &[u8]) -> PipelineResult<()> {
+        self.lock().write(data)
+    }
+
+    pub fn finish(&self) -> PipelineResult<()> {
+        self.lock().finish()
+    }
+
+    pub fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pipeline, &other.pipeline)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Box<dyn Pipeline + Send>> {
+        self.pipeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for PipelineHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PipelineHandle")
+            .field("identifier", &self.identifier())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for PipelineHandle {
+    fn eq(&self, other: &Self) -> bool {
+        self.is_same(other)
+    }
+}
+
+impl Eq for PipelineHandle {}
 
 #[cfg(test)]
 mod tests {

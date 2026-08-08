@@ -248,7 +248,33 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 |---|---|---|---|
 | `QPDFJob.cc` | 3116 | `flpdf-cli/src/main.rs`(6796) + `job/json.rs`（`QPDFJob::writeJSON` の出力選択部分、`QPDFJob.cc:3094-3115`）+ **`json_inspect.rs` の `doJSON*`**（下記。`QPDF::writeJSON` 相当は `document_json.rs` に分離済み — §8）+ `overlay*.rs` + `page_merge.rs`(1117) + `check.rs`(360) + `attachment_list.rs`(1074: `QPDFJob.cc:876-911` の `doListAttachments` 移植。`<file> has no embedded files` は infilename を要するため CLI 側に残す) + `acroform_field_prune.rs`(497: `QPDFJob.cc:2610-2632` の "Remove unreferenced form fields"。`prune_acroform_after_subset` が CLI から呼ばれる) + page 操作群 | 🔀 `job/json.rs` は JSON 出力選択だけを移植した slice で、`QPDFJob` 全体の移植ではない。完全な `QPDFJob` 集約モジュールは依然**存在しない**。集約は `flpdf-q2fo`(D1) / `flpdf-ukux`(D2) / `flpdf-s5cw`(D3) |
 | `QPDFJob_config` / `_argv` / `_json` / `QPDFArgParser` / `QPDFUsage` | 3164 | clap で代替 | ⚪ |
-| `QPDFLogger.cc` | 255 | `diagnostics.rs`(80) | 🔀 |
+| `QPDFLogger.cc` | 255 | `logger.rs`（private stdout tracker、shared info/warn/error/save routes、standard stdout/stderr/discard、reset/following、save collision、custom sink ownership）+ `reader/resolver.rs` / `reader.rs`（文書 warning の append-then-route、suppression、live logger replacement）+ `flpdf-cli/src/main.rs`（下記 qpdf-equivalent consumers） | ✅ `QPDFLogger.cc:9-40,43-51,80-254`。`diagnostics.rs` は logger ではなく collection-only value store として維持する |
+
+### `QPDFLogger` の CLI consumer cutover と retained direct routes
+
+qpdf の route ownership は `QPDFJob.cc:343,498-502,625,709-925,2934,3051-3054,3094-3115`
+と照合した。flpdf CLI は invocation ごとに 1 個の private `QPDFLogger` を共有し、次を
+logger consumer に移行済みである。
+
+- `save`: JSON stdout、raw/filtered stream stdout、attachment stdout、rewrite/QDF の
+  output `-`。いずれも document open / info write より先に `saveToStandardOutput`
+  相当を設定し、独立した stdout terminal を作らない
+- `info`: check summary、show object、show pages/npages、attachment listing、encryption /
+  linearization inspection、rewrite/page-operation verbose output
+- `warn`: document warning、warning completion summary、normalization/signature warning
+- `error`: check error と top-level fatal result/usage diagnostic
+
+以下の direct output は意図的に retained とする。
+
+- `run_show_info` / `run_show_catalog` / `run_show_metadata` / `run_show_outline` /
+  `run_show_fonts`: flpdf-only inspection で、qpdf 11.9.0 `QPDFJob` に同じ command consumer がない
+- `run_show_stream` の passthrough-codec marker: flpdf-only fallback 表示で、qpdf は
+  unfilterable stream を同じ marker へ変換しない
+- native `rewrite --static-id` warning、`--remove-restrictions` intent diagnostic、
+  `copy-attachments-from` count: flpdf-only surface
+- clap 前後の immediate option-validation diagnostics: production `QPDFJob` aggregation
+  (`flpdf-25kg.5.2`) より前の CLI shell responsibility。最終 dispatch error と usage result
+  は logger 済みだが、この validation 群は同 downstream cutover まで direct stderr を維持する
 
 ### `QPDFJob.cc` の `doJSON*` 族 — `json_inspect.rs` に埋没
 

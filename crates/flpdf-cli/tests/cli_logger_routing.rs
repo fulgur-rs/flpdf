@@ -1,0 +1,481 @@
+//! QPDFLogger routing coverage for qpdf-equivalent CLI output.
+
+use assert_cmd::Command;
+use std::path::Path;
+use std::process::{Command as ProcessCommand, Output};
+
+const MINIMAL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/minimal.pdf"
+);
+const MULTI_STREAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/multi-stream-one-page.pdf"
+);
+const ONE_PAGE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/one-page.pdf"
+);
+const WARNING_PDF: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/test_driver/missing_startxref.pdf"
+);
+const ATTACHMENT_PDF: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/attachment-two-page.pdf"
+);
+const LARGE_LINEARIZED: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/compat/objstm-lin-outlines-80-200.pdf"
+);
+const EXPECTED_QPDF_VERSION: &str = "11.9.0";
+
+fn flpdf() -> Command {
+    Command::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+}
+
+fn qpdf_version_is_expected(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .next()
+        .map(str::trim)
+        == Some(&format!("qpdf version {EXPECTED_QPDF_VERSION}"))
+}
+
+fn qpdf_available() -> bool {
+    let observation = match ProcessCommand::new("qpdf").arg("--version").output() {
+        Ok(output) if output.status.success() && qpdf_version_is_expected(&output.stdout) => {
+            return true;
+        }
+        Ok(output) => {
+            let first_line = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("<empty stdout>")
+                .to_owned();
+            format!("found {first_line:?} (status {})", output.status)
+        }
+        Err(error) => format!("unable to run qpdf --version: {error}"),
+    };
+
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "qpdf {EXPECTED_QPDF_VERSION} is required for cli_logger_routing differential tests on CI; {observation}"
+        );
+    }
+    eprintln!(
+        "skipping logger routing differential: qpdf {EXPECTED_QPDF_VERSION} is required; {observation}"
+    );
+    false
+}
+
+fn run_qpdf(args: &[&str]) -> Output {
+    ProcessCommand::new("qpdf").args(args).output().unwrap()
+}
+
+fn run_flpdf(args: &[&str]) -> Output {
+    ProcessCommand::new(assert_cmd::cargo::cargo_bin!("flpdf"))
+        .env("FLPDF_PROGNAME", "qpdf")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn normalize_text_newlines(bytes: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    let mut remaining = bytes;
+
+    while let Some((&byte, rest)) = remaining.split_first() {
+        if byte == b'\r' && rest.first() == Some(&b'\n') {
+            normalized.push(b'\n');
+            remaining = &rest[1..];
+        } else {
+            normalized.push(byte);
+            remaining = rest;
+        }
+    }
+
+    normalized
+}
+
+fn assert_observables_equal(label: &str, qpdf: &Output, flpdf: &Output, text_output: bool) {
+    assert_eq!(flpdf.status.code(), qpdf.status.code(), "{label}: status");
+    if cfg!(windows) && text_output {
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stdout),
+            normalize_text_newlines(&qpdf.stdout),
+            "{label}: stdout"
+        );
+        assert_eq!(
+            normalize_text_newlines(&flpdf.stderr),
+            normalize_text_newlines(&qpdf.stderr),
+            "{label}: stderr"
+        );
+    } else {
+        assert_eq!(flpdf.stdout, qpdf.stdout, "{label}: stdout");
+        assert_eq!(flpdf.stderr, qpdf.stderr, "{label}: stderr");
+    }
+}
+
+#[test]
+fn text_newline_normalization_only_collapses_crlf_pairs() {
+    assert_eq!(
+        normalize_text_newlines(b"first\r\nsecond\nthird\rfourth"),
+        b"first\nsecond\nthird\rfourth"
+    );
+}
+
+#[test]
+fn qpdf_logger_oracle_version_gate_accepts_only_11_9_0() {
+    assert!(qpdf_version_is_expected(
+        b"qpdf version 11.9.0\nRun qpdf --copyright for details\n"
+    ));
+    assert!(!qpdf_version_is_expected(b"qpdf version 12.0.0\n"));
+    assert!(!qpdf_version_is_expected(b"qpdf version 11.9.0-custom\n"));
+}
+
+#[test]
+fn binary_json_uses_stdout_without_stderr() {
+    let output = flpdf().args(["--json=2", MINIMAL]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["version"], serde_json::json!(2));
+}
+
+#[test]
+fn binary_raw_stream_preserves_exact_bytes() {
+    let output = flpdf()
+        .args(["show-stream", "4 0 R", MULTI_STREAM, "--raw"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        output.stdout,
+        [
+            0x78, 0x9c, 0x2b, 0x54, 0x30, 0x54, 0x30, 0x00, 0x42, 0x08, 0x99, 0x9c, 0x0b, 0x00,
+            0x1a, 0x69, 0x03, 0x44,
+        ]
+    );
+}
+
+#[test]
+fn binary_pdf_dash_writes_stdout_without_creating_a_dash_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([MINIMAL, "-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(!Path::new(directory.path()).join("-").exists());
+}
+
+#[test]
+fn binary_linearized_pdf_dash_uses_the_same_save_route() {
+    let output = flpdf()
+        .args(["--linearize", ONE_PAGE, "-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn binary_linearized_pdf_dash_writes_pass1_independently() {
+    let directory = tempfile::tempdir().unwrap();
+    let pass1 = directory.path().join("pass1.pdf");
+    let pass1_arg = format!("--linearize-pass1={}", pass1.display());
+    let output = flpdf()
+        .args(["--linearize", &pass1_arg, ONE_PAGE, "-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+    let pass1_bytes = std::fs::read(pass1).unwrap();
+    assert!(pass1_bytes.starts_with(b"%PDF-"));
+    assert_ne!(pass1_bytes, output.stdout);
+    assert!(pass1_bytes
+        .windows(b"% hint_offset=".len())
+        .any(|window| window == b"% hint_offset="));
+}
+
+#[test]
+fn binary_linearized_pass1_open_failure_names_path_before_final_stdout() {
+    let directory = tempfile::tempdir().unwrap();
+    let pass1 = directory.path().join("missing-parent").join("pass1.pdf");
+    let pass1_arg = format!("--linearize-pass1={}", pass1.display());
+    let output = flpdf()
+        .args(["--linearize", &pass1_arg, ONE_PAGE, "-"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stdout.is_empty(),
+        "final PDF must not be emitted after pass-1 open failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&format!("open {}: ", pass1.display())));
+    assert!(stderr.contains("No such file") || stderr.contains("cannot find"));
+}
+
+#[cfg(unix)]
+#[test]
+fn qpdf_differential_matches_small_and_large_pass1_dev_full_boundaries() {
+    if !Path::new("/dev/full").exists() || !qpdf_available() {
+        eprintln!("skipping pass-1 /dev/full differential");
+        return;
+    }
+
+    let small_args = ["--linearize", "--linearize-pass1=/dev/full", ONE_PAGE, "-"];
+    let qpdf_small = run_qpdf(&small_args);
+    let flpdf_small = run_flpdf(&small_args);
+    assert_eq!(qpdf_small.status.code(), Some(0), "qpdf small status");
+    assert_eq!(flpdf_small.status.code(), Some(0), "flpdf small status");
+    assert!(qpdf_small.stdout.starts_with(b"%PDF-"));
+    assert!(flpdf_small.stdout.starts_with(b"%PDF-"));
+    assert!(qpdf_small.stderr.is_empty());
+    assert!(flpdf_small.stderr.is_empty());
+
+    let large_args = [
+        "--linearize",
+        "--linearize-pass1=/dev/full",
+        LARGE_LINEARIZED,
+        "-",
+    ];
+    let qpdf_large = run_qpdf(&large_args);
+    let flpdf_large = run_flpdf(&large_args);
+    assert_eq!(qpdf_large.status.code(), Some(2), "qpdf large status");
+    assert_eq!(flpdf_large.status.code(), Some(2), "flpdf large status");
+    assert!(qpdf_large.stdout.is_empty());
+    assert!(flpdf_large.stdout.is_empty());
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf_large.stderr);
+    let flpdf_stderr = String::from_utf8_lossy(&flpdf_large.stderr);
+    assert!(qpdf_stderr.contains("linearization pass1: Pl_StdioFile::write"));
+    assert!(flpdf_stderr.contains("write /dev/full:"));
+    assert!(qpdf_stderr.contains("No space left on device"));
+    assert!(flpdf_stderr.contains("No space left on device"));
+}
+
+#[test]
+fn binary_qdf_dash_uses_the_same_save_route() {
+    let output = flpdf().args(["qdf", MINIMAL, "-"]).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stdout.windows(5).any(|window| window == b"%QDF-"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn binary_page_extraction_dash_uses_the_save_route_without_creating_a_dash_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([ONE_PAGE, "--pages", ".", "1", "--", "-"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+    assert!(!directory.path().join("-").exists());
+}
+
+#[test]
+fn binary_rotate_dash_uses_the_save_route_without_creating_a_dash_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([ONE_PAGE, "-", "--rotate=+90:1"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+    assert!(!directory.path().join("-").exists());
+}
+
+#[test]
+fn split_pages_dash_is_rejected_before_output_is_created() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = flpdf()
+        .current_dir(directory.path())
+        .args([ONE_PAGE, "-", "--split-pages=1"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("--split-pages may not be used when writing to standard output"));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn verbose_page_extraction_dash_keeps_pdf_and_info_on_separate_routes() {
+    let output = flpdf()
+        .args(["--verbose", ONE_PAGE, "--pages", ".", "1", "--", "-"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(!output
+        .stdout
+        .windows(b"flpdf:".len())
+        .any(|window| window == b"flpdf:"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("flpdf: selecting --keep-open-files=y")
+    );
+}
+
+#[test]
+fn text_rewrite_verbose_uses_info_route_for_file_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let output_path = directory.path().join("out.pdf");
+    let output = flpdf()
+        .args(["--verbose", MINIMAL, output_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("flpdf: wrote file {}\n", output_path.display())
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn text_rewrite_verbose_does_not_announce_standard_output() {
+    let output = flpdf().args(["--verbose", MINIMAL, "-"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"%PDF-"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn text_check_success_stays_on_info_route() {
+    let output = flpdf().args(["--check", MINIMAL]).output().unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with(&format!("checking {MINIMAL}\n")));
+    assert!(stdout.ends_with("errors that flpdf cannot detect\n"));
+}
+
+#[test]
+fn qpdf_differential_matches_routed_output_matrix() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping logger routing differential");
+        return;
+    }
+
+    let cases: &[(&str, &[&str], &[&str], bool)] = &[
+        (
+            "clean check",
+            &["--check", MINIMAL],
+            &["--check", MINIMAL],
+            true,
+        ),
+        (
+            "warning check",
+            &["--check", WARNING_PDF],
+            &["--repair", "--check", WARNING_PDF],
+            true,
+        ),
+        (
+            "JSON stdout",
+            &["--json=2", MINIMAL],
+            &["--json=2", MINIMAL],
+            false,
+        ),
+        (
+            "raw stream",
+            &["--show-object=4", "--raw-stream-data", MULTI_STREAM],
+            &["show-stream", "4 0 R", MULTI_STREAM, "--raw"],
+            false,
+        ),
+        (
+            "filtered stream",
+            &["--show-object=4", "--filtered-stream-data", MULTI_STREAM],
+            &["show-stream", "4 0 R", MULTI_STREAM],
+            false,
+        ),
+        (
+            "attachment",
+            &["--show-attachment=attachment.txt", ATTACHMENT_PDF],
+            &["--show-attachment=attachment.txt", ATTACHMENT_PDF],
+            false,
+        ),
+    ];
+
+    for (label, qpdf_args, flpdf_args, text_output) in cases {
+        assert_observables_equal(
+            label,
+            &run_qpdf(qpdf_args),
+            &run_flpdf(flpdf_args),
+            *text_output,
+        );
+    }
+}
+
+#[test]
+fn qpdf_differential_classifies_existing_native_open_error_text_gap() {
+    if !qpdf_available() {
+        eprintln!("qpdf not available; skipping logger routing differential");
+        return;
+    }
+
+    let missing = "/tmp/flpdf-qynx4-cli-logger-missing.pdf";
+    let qpdf = run_qpdf(&["--check", missing]);
+    let flpdf = run_flpdf(&["--check", missing]);
+
+    assert_eq!(flpdf.status.code(), qpdf.status.code());
+    assert_eq!(flpdf.stdout, qpdf.stdout);
+    assert!(!qpdf.stderr.is_empty());
+    assert!(!flpdf.stderr.is_empty());
+    assert_ne!(
+        flpdf.stderr, qpdf.stderr,
+        "native I/O error formatting is an existing oracle mismatch, not a logger route mismatch"
+    );
+}

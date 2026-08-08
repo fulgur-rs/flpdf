@@ -25,6 +25,31 @@ fn check_reports_missing_header() {
 }
 
 #[test]
+fn check_preserves_repair_warnings_before_terminal_open_error() {
+    let input = include_bytes!("../../../tests/fixtures/test_driver/open_repair_failure.pdf");
+    let report = check_reader(Cursor::new(input)).unwrap();
+
+    assert!(!report.valid);
+    assert!(report.summary.is_none());
+    let diagnostics = report.diagnostics.entries();
+    assert_eq!(diagnostics.len(), 4);
+    assert_eq!(diagnostics[0].severity, Severity::Warning);
+    assert_eq!(diagnostics[0].message, "file is damaged");
+    assert_eq!(diagnostics[1].severity, Severity::Warning);
+    assert_eq!(diagnostics[1].message, "can't find startxref");
+    assert_eq!(diagnostics[2].severity, Severity::Warning);
+    assert_eq!(
+        diagnostics[2].message,
+        "Attempting to reconstruct cross-reference table"
+    );
+    assert_eq!(diagnostics[3].severity, Severity::Error);
+    assert_eq!(
+        diagnostics[3].message,
+        "parse error at byte 0: trailer dictionary not found"
+    );
+}
+
+#[test]
 fn check_reports_linearized_pdf_warning() {
     let input = linearized_fixture_pdf();
     let report = check_reader(Cursor::new(input)).unwrap();

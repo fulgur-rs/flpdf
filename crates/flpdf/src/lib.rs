@@ -109,6 +109,7 @@ pub mod job;
 pub mod json;
 pub mod json_inspect;
 pub mod linearization;
+pub mod logger;
 pub mod matrix;
 pub mod name_number_tree;
 pub mod name_tree_dests;
@@ -176,6 +177,8 @@ pub mod tokenizer;
 pub mod writer;
 pub mod xref;
 pub mod xref_entry;
+
+pub use logger::QPDFLogger;
 
 // Internal security primitives — not part of the public API.
 pub(crate) mod security;

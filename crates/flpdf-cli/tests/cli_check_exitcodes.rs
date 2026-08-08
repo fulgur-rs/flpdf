@@ -468,6 +468,26 @@ fn check_warnings_use_qpdf_stderr_format() {
         .stderr(predicate::str::contains("warning: ").not());
 }
 
+#[test]
+fn check_object_warning_uses_qpdf_space_before_object_context() {
+    let input = "../../tests/fixtures/compat/chained-indirect-contents.pdf";
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", input])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {input} (object 5 0, offset 232): expected endobj\n"
+        )))
+        .stderr(
+            predicate::str::contains(format!(
+                "WARNING: {input}: (object 5 0, offset 232): expected endobj"
+            ))
+            .not(),
+        );
+}
+
 /// The trigger warning (and only the trigger warning) carries `(offset N)`.
 #[test]
 fn check_trigger_warning_carries_offset() {
@@ -502,6 +522,29 @@ fn check_corrupt_pdf_exits_2() {
     cmd.args(["--check", f.path().to_str().unwrap()])
         .assert()
         .code(2);
+}
+
+#[test]
+fn check_terminal_open_failure_prints_repair_warnings_before_error_once() {
+    let input = "../../tests/fixtures/test_driver/open_repair_failure.pdf";
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    let output = cmd
+        .env_remove("FLPDF_PROGNAME")
+        .args(["--check", "--repair", input])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        format!(
+            "WARNING: {input}: file is damaged\n\
+             WARNING: {input}: can't find startxref\n\
+             WARNING: {input}: Attempting to reconstruct cross-reference table\n\
+             flpdf: {input}: parse error at byte 0: trailer dictionary not found\n"
+        )
+    );
 }
 
 /// A document that opens cleanly but whose page content stream fails to decode

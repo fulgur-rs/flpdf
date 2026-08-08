@@ -46,6 +46,42 @@ pub(crate) struct RecordingSink {
     finish_failure_category: FailureCategory,
 }
 
+pub(crate) struct NthWriteFailure {
+    fail_at: usize,
+    write_attempts: usize,
+}
+
+impl NthWriteFailure {
+    pub(crate) fn new(fail_at: usize) -> Self {
+        Self {
+            fail_at,
+            write_attempts: 0,
+        }
+    }
+}
+
+impl Pipeline for NthWriteFailure {
+    fn identifier(&self) -> &str {
+        "nth write failure"
+    }
+
+    fn write(&mut self, _data: &[u8]) -> PipelineResult<()> {
+        self.write_attempts += 1;
+        if self.write_attempts == self.fail_at {
+            Err(PipelineError::runtime(format!(
+                "sink write failure {}",
+                self.write_attempts
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        Ok(())
+    }
+}
+
 impl RecordingSink {
     pub(crate) fn new(fail_writes: &[usize], fail_finishes: &[usize]) -> Self {
         Self::with_trace(shared_trace(), fail_writes, fail_finishes)
@@ -117,5 +153,22 @@ impl Pipeline for RecordingSink {
                 .error(format!("sink finish failure {}", self.finish_attempts)));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nth_write_failure_exposes_pipeline_basics() {
+        let mut sink = NthWriteFailure::new(2);
+
+        assert_eq!(sink.identifier(), "nth write failure");
+        sink.write(b"first").unwrap();
+        sink.finish().unwrap();
+
+        let error = sink.write(b"second").unwrap_err();
+        assert_eq!(error.to_string(), "sink write failure 2");
     }
 }

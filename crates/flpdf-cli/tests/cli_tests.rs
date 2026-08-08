@@ -803,7 +803,7 @@ fn top_level_linearize_normalize_content_preserves_warning_exit() {
 }
 
 #[test]
-fn top_level_linearize_normalize_content_warning_writes_pass1_copy() {
+fn top_level_linearize_normalize_content_warning_writes_independent_pass1() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("bad-content.pdf");
     let output = temp.path().join("normalized-linearized.pdf");
@@ -822,11 +822,13 @@ fn top_level_linearize_normalize_content_warning_writes_pass1_copy() {
 
     assert_eq!(result.status.code(), Some(3));
     assert!(output.exists(), "warning exit must retain the final output");
-    assert_eq!(
-        std::fs::read(&pass1).unwrap(),
-        std::fs::read(&output).unwrap(),
-        "warning exit must replace a stale pass-1 file with the final output"
-    );
+    let pass1_bytes = std::fs::read(&pass1).unwrap();
+    let output_bytes = std::fs::read(&output).unwrap();
+    assert!(pass1_bytes.starts_with(b"%PDF-"));
+    assert!(pass1_bytes
+        .windows(b"% hint_offset=".len())
+        .any(|window| window == b"% hint_offset="));
+    assert_ne!(pass1_bytes, output_bytes);
 }
 
 #[test]
@@ -957,8 +959,13 @@ fn top_level_linearize_accepts_compress_streams_and_pass1() {
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::is_empty());
 
-    assert!(output.exists());
-    assert!(pass1.exists());
+    let output_bytes = std::fs::read(&output).unwrap();
+    let pass1_bytes = std::fs::read(&pass1).unwrap();
+    assert!(pass1_bytes.starts_with(b"%PDF-"));
+    assert!(pass1_bytes
+        .windows(b"% hint_offset=".len())
+        .any(|window| window == b"% hint_offset="));
+    assert_ne!(pass1_bytes, output_bytes);
 }
 
 // ---------------------------------------------------------------------------

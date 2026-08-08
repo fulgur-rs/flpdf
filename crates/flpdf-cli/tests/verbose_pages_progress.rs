@@ -48,22 +48,23 @@ fn verbose_pages_alone_emits_qpdf_parity_progress_block() {
         .arg(out.to_str().unwrap())
         .assert()
         .success()
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "flpdf: selecting --keep-open-files=y\n",
         ))
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "two-page.pdf: checking for shared resources\n",
         ))
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "flpdf: no shared resources found\n",
         ))
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "flpdf: removing unreferenced pages from primary input\n",
         ))
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "flpdf: adding pages from two-page.pdf\n",
         ))
-        .stderr(predicate::str::contains("flpdf: wrote file"));
+        .stdout(predicate::str::contains("flpdf: wrote file"))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -82,24 +83,25 @@ fn verbose_pages_progress_lines_are_ordered_matching_qpdf() {
         .output()
         .expect("flpdf invocation");
     assert!(output.status.success(), "flpdf failed: {:?}", output);
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
 
-    let i_kfo = stderr
+    let i_kfo = stdout
         .find("selecting --keep-open-files")
         .expect("kfo line present");
-    let i_check = stderr
+    let i_check = stdout
         .find("checking for shared resources")
         .expect("checking line present");
-    let i_nosh = stderr
+    let i_nosh = stdout
         .find("no shared resources found")
         .expect("no-shared line present");
-    let i_rm = stderr
+    let i_rm = stdout
         .find("removing unreferenced pages")
         .expect("removing line present");
-    let i_add = stderr
+    let i_add = stdout
         .find("adding pages from")
         .expect("adding-from line present");
-    let i_wrote = stderr.find("wrote file").expect("wrote-file line present");
+    let i_wrote = stdout.find("wrote file").expect("wrote-file line present");
 
     assert!(i_kfo < i_check, "keep-open-files must precede checking");
     assert!(i_check < i_nosh, "checking must precede no-shared");
@@ -132,15 +134,16 @@ fn verbose_pages_plus_overlay_emits_page_block_before_overlay_block() {
         "flpdf failed: stderr={:?}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
 
-    let i_pages = stderr
+    let i_pages = stdout
         .find("removing unreferenced pages")
         .expect("page-selection block present");
-    let i_overlay = stderr
+    let i_overlay = stdout
         .find("processing underlay/overlay")
         .expect("overlay block present");
-    let i_wrote = stderr.find("wrote file").expect("wrote-file present");
+    let i_wrote = stdout.find("wrote file").expect("wrote-file present");
 
     assert!(
         i_pages < i_overlay,
@@ -172,17 +175,18 @@ fn verbose_rotate_alone_emits_only_wrote_file_line() {
         .output()
         .expect("flpdf invocation");
     assert!(output.status.success(), "flpdf failed: {:?}", output);
-    let stderr = String::from_utf8(output.stderr).expect("utf-8 stderr");
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
     assert!(
-        stderr.contains("wrote file"),
-        "wrote-file line must appear, got: {stderr:?}"
+        stdout.contains("wrote file"),
+        "wrote-file line must appear, got: {stdout:?}"
     );
     assert!(
-        !stderr.contains("checking for shared resources"),
-        "no --pages → no shared-resources block, got: {stderr:?}"
+        !stdout.contains("checking for shared resources"),
+        "no --pages → no shared-resources block, got: {stdout:?}"
     );
     assert!(
-        !stderr.contains("removing unreferenced pages"),
-        "no --pages → no removing-unreferenced block, got: {stderr:?}"
+        !stdout.contains("removing unreferenced pages"),
+        "no --pages → no removing-unreferenced block, got: {stdout:?}"
     );
 }

@@ -1,7 +1,7 @@
 //! End-to-end CLI test for `--verbose` overlay/underlay progress lines.
 //!
 //! Verifies the `flpdf: processing underlay/overlay` header and per-page
-//! `  page N\n    <file> overlay <src>\n` mapping are emitted to stderr
+//! `  page N\n    <file> overlay <src>\n` mapping are emitted through logger info
 //! in the exact format qpdf `--verbose` uses (the flpdf-qtest shim
 //! normalizes the `flpdf:` prefix to `qpdf:`).
 
@@ -41,15 +41,16 @@ fn verbose_overlay_prints_processing_header_and_per_page_mapping() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
+        .stdout(predicate::str::contains(
             "flpdf: processing underlay/overlay\n",
         ))
-        .stderr(predicate::str::contains("  page 1\n"))
+        .stdout(predicate::str::contains("  page 1\n"))
         // The src fixture path is absolute; qpdf/flpdf verbose emits the raw
         // CLI-supplied filename. Assert the raw path + " overlay 1" appears
         // under page 1.
-        .stderr(predicate::str::contains(format!("    {} overlay 1\n", src)))
-        .stderr(predicate::str::contains("  page 2\n"));
+        .stdout(predicate::str::contains(format!("    {} overlay 1\n", src)))
+        .stdout(predicate::str::contains("  page 2\n"))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -73,10 +74,11 @@ fn verbose_underlay_prints_underlay_kind_string() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains(format!(
+        .stdout(predicate::str::contains(format!(
             "    {} underlay 1\n",
             src
-        )));
+        )))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -109,9 +111,10 @@ fn verbose_overlay_repeated_to_slots_emit_one_line_per_slot() {
         ])
         .assert()
         .success()
-        .stderr(predicate::str::contains("  page 1\n"))
-        .stderr(predicate::str::contains(format!("    {} overlay 1\n", src)))
-        .stderr(predicate::str::contains(format!("    {} overlay 2\n", src)));
+        .stdout(predicate::str::contains("  page 1\n"))
+        .stdout(predicate::str::contains(format!("    {} overlay 1\n", src)))
+        .stdout(predicate::str::contains(format!("    {} overlay 2\n", src)))
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
@@ -131,5 +134,6 @@ fn verbose_without_overlay_does_not_print_processing_header() {
         ])
         .assert()
         .success()
+        .stdout(predicate::str::contains("processing underlay/overlay").not())
         .stderr(predicate::str::contains("processing underlay/overlay").not());
 }
