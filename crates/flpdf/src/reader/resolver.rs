@@ -6941,8 +6941,10 @@ mod tests {
     #[test]
     fn reconstruct_retry_on_header_mismatch_with_recovery_enabled() {
         let bytes = synthetic_mismatch_pdf(true);
-        let mut options = crate::PdfOpenOptions::default();
-        options.repair = true;
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         assert!(!pdf.reconstructed_xref());
@@ -6980,8 +6982,10 @@ mod tests {
     #[test]
     fn mismatch_without_recovery_remains_error() {
         let bytes = synthetic_mismatch_pdf(true);
-        let mut options = crate::PdfOpenOptions::default();
-        options.repair = false;
+        let options = crate::PdfOpenOptions {
+            repair: false,
+            ..Default::default()
+        };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         assert!(!pdf.reconstructed_xref());
@@ -7001,8 +7005,10 @@ mod tests {
     #[test]
     fn absent_after_rebuild_warns_and_resolves_to_null() {
         let bytes = synthetic_mismatch_pdf(false);
-        let mut options = crate::PdfOpenOptions::default();
-        options.repair = true;
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         assert!(!pdf.reconstructed_xref());
@@ -7031,8 +7037,10 @@ mod tests {
     #[test]
     fn absent_from_xref_table_resolves_to_null_without_reconstruction() {
         let bytes = synthetic_mismatch_pdf(true);
-        let mut options = crate::PdfOpenOptions::default();
-        options.repair = true;
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         let handle = pdf.get_object_handle(ObjectRef::new(99, 0));
@@ -7049,8 +7057,10 @@ mod tests {
     #[test]
     fn second_reconstruction_attempt_rethrows_error_to_prevent_infinite_loop() {
         let bytes = synthetic_mismatch_pdf(false);
-        let mut options = crate::PdfOpenOptions::default();
-        options.repair = true;
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
         let mut pdf = Pdf::open_mem_owned_with_options(bytes, options).expect("open");
 
         // First resolution triggers reconstruction and sets reconstructed_xref = true
