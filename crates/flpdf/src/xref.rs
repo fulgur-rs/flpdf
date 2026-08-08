@@ -1352,8 +1352,12 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_xref_and_trailer_with_repair, prepend_repair_diagnostics, XrefRegistration};
-    use crate::{Diagnostic, Diagnostics, ObjectRef, XrefEntry};
+    use super::{
+        append_xref_size_warning, load_xref_and_trailer_with_repair, prepend_repair_diagnostics,
+        LoadedXref, XrefForm, XrefRegistration,
+    };
+    use crate::{Diagnostic, Diagnostics, Dictionary, ObjectRef, XrefEntry};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
     #[test]
@@ -1390,6 +1394,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             [8]
         );
+    }
+
+    #[test]
+    fn xref_size_warning_is_skipped_without_a_declared_size() {
+        let mut loaded = LoadedXref {
+            version: "1.7".to_string(),
+            startxref: 0,
+            entries: BTreeMap::new(),
+            trailer: Dictionary::new(),
+            last_xref_form: XrefForm::Table,
+            repair_diagnostics: Diagnostics::default(),
+        };
+
+        append_xref_size_warning(&mut loaded, &BTreeSet::from([5]));
+
+        assert!(loaded.repair_diagnostics.entries().is_empty());
     }
 
     #[test]

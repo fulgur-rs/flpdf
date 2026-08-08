@@ -230,4 +230,10 @@ mod tests {
             Some(CacheEntry::Unresolved { offset: 707 })
         ));
     }
+
+    #[test]
+    #[should_panic(expected = "reader effective xref cannot contain free entries")]
+    fn source_free_xref_entry_is_unreachable_during_cache_construction() {
+        ObjectCache::entry_from_xref(XrefEntry::Free { next: 0 });
+    }
 }

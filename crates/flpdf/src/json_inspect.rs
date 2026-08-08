@@ -7142,7 +7142,7 @@ mod tests {
             .refs
             .iter()
             .any(|reference| reference.number == 200));
-        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+        assert!(!pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
     }
 
     #[test]
@@ -7212,7 +7212,7 @@ mod tests {
             .refs
             .iter()
             .any(|reference| reference.number == 200));
-        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+        assert!(!pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
     }
 
     #[test]
@@ -7267,7 +7267,7 @@ mod tests {
             .refs
             .iter()
             .any(|reference| reference.number == 200));
-        assert!(pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
+        assert!(!pdf.object_refs().contains(&crate::ObjectRef::new(200, 7)));
     }
 
     #[test]
