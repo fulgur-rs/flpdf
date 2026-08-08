@@ -2471,11 +2471,11 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            ["operation for dictionary attempted on object of type integer: treating as empty"]
+            ["object 3 0: operation for dictionary attempted on object of type integer: treating as empty"]
         );
         assert_eq!(
             output.lock().unwrap().as_slice(),
-            b"WARNING: operation for dictionary attempted on object of type integer: \
+            b"WARNING: object 3 0: operation for dictionary attempted on object of type integer: \
               treating as empty\n"
         );
     }
