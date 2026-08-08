@@ -588,8 +588,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
             .is_some();
         if is_signature && has_byte_range && has_string_contents {
             if let Some((raw_contents, offset)) = contents {
-                let contents = ObjectHandle::string(raw_contents);
-                contents.set_parsed_offset_if_unset(offset);
+                let contents = self.direct_at(ObjectValue::String(raw_contents), offset);
                 values.insert(b"Contents".to_vec(), contents);
             }
         }
@@ -804,9 +803,11 @@ mod live_input_tests {
         HandleResolver, LiveInput, LiveParsedObject, LiveTokenSource, SliceLiveInput,
         StringDecrypter, MAX_PARSE_DEPTH,
     };
-    use crate::object_handle::{ObjectHandle, ObjectValue};
+    use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
     use crate::{Error, ObjectRef, Result};
+    use std::cell::RefCell;
+    use std::rc::{Rc, Weak};
 
     struct CountingInput {
         bytes: &'static [u8],
@@ -858,6 +859,48 @@ mod live_input_tests {
         fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
             ObjectHandle::new_indirect_unresolved(object_ref, -1)
         }
+    }
+
+    struct ContextualResolver {
+        resolver: Weak<dyn DocumentResolver>,
+    }
+
+    impl HandleResolver for ContextualResolver {
+        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+            ObjectHandle::new_indirect_unresolved(object_ref, -1)
+        }
+
+        fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+            ObjectHandle::from_value_with_resolver(value, self.resolver.clone())
+        }
+    }
+
+    struct WarningSink {
+        warnings: RefCell<Vec<String>>,
+    }
+
+    impl DocumentResolver for WarningSink {
+        fn resolve_indirect(&self, _object_ref: ObjectRef, _handle: &ObjectHandle) -> Result<()> {
+            Ok(())
+        }
+
+        fn warn(&self, message: String) -> Result<()> {
+            self.warnings.borrow_mut().push(message);
+            Ok(())
+        }
+    }
+
+    fn contextual_resolver() -> (ContextualResolver, Rc<WarningSink>) {
+        let sink = Rc::new(WarningSink {
+            warnings: RefCell::new(Vec::new()),
+        });
+        let erased: Rc<dyn DocumentResolver> = sink.clone();
+        (
+            ContextualResolver {
+                resolver: Rc::downgrade(&erased),
+            },
+            sink,
+        )
     }
 
     struct RecordingDecrypter {
@@ -972,7 +1015,11 @@ mod live_input_tests {
         let mut signature_input = CountingInput::new(
             b"<< /Type /Sig /ByteRange [0 10 20 30] /Contents (cipher) /Reason (reason) >>",
         );
-        let mut resolver = NullResolver;
+        let (mut resolver, warnings) = contextual_resolver();
+        let indirect = resolver.indirect_handle(ObjectRef::new(9, 0));
+        warnings
+            .resolve_indirect(ObjectRef::new(9, 0), &indirect)
+            .expect("test warning sink resolver");
         let mut decrypter = RecordingDecrypter {
             calls: Vec::new(),
             fail: false,
@@ -990,6 +1037,13 @@ mod live_input_tests {
             .expect("signature contents");
         assert_eq!(contents.as_string(), Some(b"cipher".to_vec()));
         assert_eq!(contents.get_parsed_offset(), 48);
+        contents
+            .object_warning("signature contents warning")
+            .expect("restored signature contents keeps the parser context");
+        assert_eq!(
+            warnings.warnings.borrow().as_slice(),
+            ["signature contents warning"]
+        );
         assert_eq!(
             signature_values
                 .get(b"Reason".as_slice())

@@ -1790,7 +1790,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_warning("expected endobj")?;
         }
 
-        let dict = ObjectHandle::from_value(dict);
+        let dict = self.direct_object_handle(dict);
         dict.set_parsed_offset_if_unset(dict_offset);
         Ok((
             ObjectValue::Stream {
@@ -2679,6 +2679,30 @@ mod tests {
             .object_warning("dropped document")
             .expect_err("a weak context must be gone with its resolver");
         assert!(matches!(error, Error::System(message) if message == "dropped document"));
+    }
+
+    #[test]
+    fn live_parser_stream_dictionary_keeps_the_owning_resolver_context() {
+        let resolver =
+            resolver_over(b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n".to_vec());
+        let (object, _) = resolver
+            .read_object_at_offset(0, ObjectRef::new(1, 0))
+            .expect("live stream should parse");
+        let stream = ObjectHandle::from_value(object);
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+
+        stream_dict
+            .object_warning("stream dictionary warning")
+            .expect("stream dictionary keeps the document context");
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            ["stream dictionary warning"]
+        );
     }
 
     #[test]
