@@ -389,6 +389,15 @@ pub struct EncryptionInfo {
 pub struct PdfOpenOptions {
     /// Enable xref/trailer repair when strict parsing fails.
     pub repair: bool,
+    /// Never read a cross-reference stream, even where `startxref` or a
+    /// `/Prev` chain points at one (qpdf `--ignore-xref-streams`).
+    ///
+    /// Such a section fails as though no cross-reference existed at that
+    /// offset, so with [`repair`](Self::repair) also set the document falls
+    /// back to reconstruction by scanning the body for object headers. Use it
+    /// when a cross-reference stream is malformed but the objects it indexes
+    /// are still readable.
+    pub ignore_xref_streams: bool,
     /// Password bytes supplied to the Standard security handler.
     pub password: Vec<u8>,
     /// How `password` should be interpreted before key derivation. See
