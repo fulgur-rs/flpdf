@@ -77,7 +77,7 @@ impl ObjectCache {
     }
 
     /// Return refs as if the cache had been reconciled with a resolver xref,
-    /// without mutating the cache. Direct [`ObjectHandle`] resolution can
+    /// without mutating the cache. Direct [`crate::ObjectHandle`] resolution can
     /// reconstruct the canonical xref without holding `&mut Pdf`, so the
     /// read-only enumeration APIs need this view until a later mutable path
     /// performs the eager synchronization.
