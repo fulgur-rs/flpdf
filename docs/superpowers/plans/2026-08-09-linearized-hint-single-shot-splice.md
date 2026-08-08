@@ -24,7 +24,7 @@
 - Modify: `crates/flpdf/src/linearization/writer.rs`, the existing
   `build_outline_hint_table` unit test and helper.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Change the regression to model qpdf's pass-1 coordinate directly:
 
@@ -49,7 +49,7 @@ fn build_outline_hint_table_uses_pass1_virtual_offset() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -60,13 +60,13 @@ cargo test -p flpdf --lib linearization::writer::tests::build_outline_hint_table
 Expected: compile failure because the old helper still requires a guessed
 hint-object length and the new pass-1 contract is not implemented.
 
-- [ ] **Step 3: Implement the minimal helper change**
+- [x] **Step 3: Implement the minimal helper change**
 
 Remove `hint_stream_obj_total_len` from `build_outline_hint_table`, use the
 pass-1 `first_off` directly for `first_object_offset`, and update its docs and
 the existing caller. Do not retain a fallback subtraction or sentinel.
 
-- [ ] **Step 4: Run GREEN**
+- [x] **Step 4: Run GREEN**
 
 Run the focused test again; it must pass, then run:
 
@@ -82,7 +82,7 @@ Expected: all outline-hint helper tests pass.
 - Modify: `crates/flpdf/src/linearization/writer.rs`, `do_write_pass`, the
   convergence-loop call sites, and related unit-test documentation.
 
-- [ ] **Step 1: Introduce the typed pass result and splice input**
+- [x] **Step 1: Introduce the typed pass result and splice input**
 
 Add `LinearizedPassOutput` for the current tuple return values. Change
 `do_write_pass` to accept `hint_stream_object: Option<&[u8]>` and return the
@@ -90,7 +90,7 @@ typed result. At the hint slot, `None` records no hint xref entry and emits no
 bytes; `Some(object)` appends the complete object and records its offset. Keep
 `pass1_digest` for the existing qpdf xref/ID placeholder behavior.
 
-- [ ] **Step 2: Run the focused writer tests**
+- [x] **Step 2: Run the focused writer tests**
 
 Run:
 
@@ -101,7 +101,7 @@ cargo test -p flpdf --lib linearization::writer::tests
 Expected: the compiler identifies every old call-site argument that still
 expects a payload/S/O/IV rather than a complete hint-object buffer.
 
-- [ ] **Step 3: Update all three pass call sites**
+- [x] **Step 3: Update all three pass call sites**
 
 Pass 1 supplies `None`; the final pass supplies `Some(&hint_stream_object)`.
 Remove the convergence-only `HintStreamMeasure`,
@@ -115,13 +115,13 @@ framing/encryption emitter.
 - Modify: `crates/flpdf/src/linearization/writer.rs`,
   `write_linearized_impl` and its module-level docs/tests.
 
-- [ ] **Step 1: Run the pass-1 write unconditionally**
+- [x] **Step 1: Run the pass-1 write unconditionally**
 
 Reuse the existing `pass1_digest` call, but always retain its bytes, xref
 offsets, last-xref metadata, and pass-1 hint-slot offset. The same result feeds
 deterministic-ID hashing and `write_linearized_with_pass1_file`.
 
-- [ ] **Step 2: Build hint tables from pass-1 measurements**
+- [x] **Step 2: Build hint tables from pass-1 measurements**
 
 Move the current page-length, shared-object, and outline-table calculation
 body out of the `for iter in 0..max_iters` loop and feed it the pass-1
@@ -129,7 +129,7 @@ body out of the `for iter in 0..max_iters` loop and feed it the pass-1
 the pass-1 hint-slot offset. Use pass-1 offsets directly for shared and outline
 locations; no hint-length subtraction is permitted.
 
-- [ ] **Step 3: Generate and retain the complete hint object once**
+- [x] **Step 3: Generate and retain the complete hint object once**
 
 Encode the patched tables once, choose the compressed/raw payload according to
 `effective_stream_policy`, and call:
@@ -150,14 +150,14 @@ append_hint_stream_object(
 
 This call is the only hint encryption/framing call in the invocation.
 
-- [ ] **Step 4: Run exactly one final pass**
+- [x] **Step 4: Run exactly one final pass**
 
 Call `do_write_pass` once with `Some(&hint_stream_object)`. Remove the
 `max_iters`, convergence comparison, and `did not converge` error. Preserve
 the final offsets, pass-1 comments, deterministic-ID direct-write/back-patch,
 and all existing fixed-padding paths.
 
-- [ ] **Step 5: Run focused RED/GREEN verification**
+- [x] **Step 5: Run focused RED/GREEN verification**
 
 Run:
 
@@ -174,7 +174,7 @@ Expected: writer unit tests and all classic/ObjStm qpdf parity tests pass.
 **Files:**
 - No additional implementation files.
 
-- [ ] **Step 1: Run formatting, lint, and docs checks**
+- [x] **Step 1: Run formatting, lint, and docs checks**
 
 ```bash
 cargo fmt --all -- --check
@@ -183,7 +183,7 @@ RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_l
 python3 scripts/qpdf-module-docs.py --check
 ```
 
-- [ ] **Step 2: Run the workspace and parity verification**
+- [x] **Step 2: Run the workspace and parity verification**
 
 ```bash
 cargo test --workspace
@@ -191,7 +191,7 @@ cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_tests
 cargo test -p flpdf --features qpdf-zlib-compat --test cmp_linearize_objstm_tests
 ```
 
-- [ ] **Step 3: Inspect the patch and commit**
+- [x] **Step 3: Inspect the patch and commit**
 
 ```bash
 git diff --check

@@ -1819,7 +1819,7 @@ fn build_outline_hint_table(
 /// (`<< >>`) instead of the full `/Linearized 1 /L .. /H [ .. ] /O .. >>` body,
 /// but pads the object region to the *same* size so the first-page `xref`
 /// keyword still lands at its fixed offset.  We reproduce that by cloning the
-/// converged Part-1 bytes and overwriting the rewritable dict region (`<<`
+/// finalized Part-1 bytes and overwriting the rewritable dict region (`<<`
 /// through the trailing pad) in place with `<< >>\nendobj\n` followed by ASCII
 /// spaces to refill the region.  The region length is invariant, so `obj1_offset`
 /// and every later offset are unchanged.
@@ -2928,9 +2928,9 @@ pub fn write_linearized<R: Read + Seek>(
 
 /// Write a linearized PDF and qpdf's first-pass representation to `pass1_path`.
 ///
-/// The pass-1 file is written only after the final hint-stream length has
-/// converged. Its body is the same throwaway first pass used for deterministic
-/// ID computation, followed by qpdf's pass-1 offset comments.
+/// The pass-1 file is written after the final hint object has been generated.
+/// Its body is the same throwaway first pass used for deterministic ID
+/// computation, followed by qpdf's pass-1 offset comments.
 pub fn write_linearized_with_pass1_file<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
@@ -3717,7 +3717,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // Use the xref keyword offset (not first_entry_offset) for length computation.
     // ------------------------------------------------------------------
     let byte_lengths = compute_byte_lengths(
-        &xref_offsets,
+        xref_offsets,
         last_xref_offset,
         hint_stream_new_num,
         renumber.param_dict_ref().number,
@@ -4023,7 +4023,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // `build_outline_hint_table`).
     let outline_table = outline_info
         .as_ref()
-        .map(|info| build_outline_hint_table(info, &xref_offsets, &byte_lengths))
+        .map(|info| build_outline_hint_table(info, xref_offsets, &byte_lengths))
         .transpose()?;
 
     // Re-encode hint stream with patched tables.
@@ -4165,7 +4165,7 @@ fn write_linearized_impl<R: Read + Seek>(
         );
         let mut pass1_file = std::fs::File::create(pass1_path)
             .map_err(|source| crate::Error::file_io("open", pass1_path, source))?;
-        write_pass1_stdio_body(&mut pass1_file, &pass1_bytes, pass1_path)?;
+        write_pass1_stdio_body(&mut pass1_file, pass1_bytes, pass1_path)?;
         write_pass1_debug_comments(&mut pass1_file, debug_comments.as_bytes());
     }
 
