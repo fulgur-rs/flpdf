@@ -1499,6 +1499,7 @@ impl RecoveredStreamEol {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn parse_indirect_object(
     input: &[u8],
     policy: crate::reader::file_object::RecoveryPolicy,
@@ -1507,7 +1508,7 @@ pub(crate) fn parse_indirect_object(
     Ok((object_ref, object))
 }
 
-/// Like [`parse_indirect_object`], but also returns the repair diagnostics
+/// Like the test-only `parse_indirect_object` wrapper, but also returns the repair diagnostics
 /// recorded while completing the object (e.g. stream-length recovery). qpdf
 /// emits these warnings as soon as the object is read (`readStream`,
 /// `QPDF.cc:1350-1393`), so a caller that discovers a candidate through this
