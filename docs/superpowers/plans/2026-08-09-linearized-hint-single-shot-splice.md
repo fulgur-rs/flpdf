@@ -200,7 +200,7 @@ git add crates/flpdf/src/linearization/writer.rs docs/superpowers/specs/2026-08-
 git commit -m "fix(linearization): splice one qpdf hint buffer"
 ```
 
-- [ ] **Step 4: Publish and persist Beads state**
+- [x] **Step 4: Publish and persist Beads state**
 
 ```bash
 git push -u origin feature/flpdf-26l3-linearized-hint-splice
