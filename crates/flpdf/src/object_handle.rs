@@ -10253,6 +10253,25 @@ mod warning_emission_tests {
     }
 
     #[test]
+    fn object_description_template_preserves_partial_and_unknown_markers() {
+        let cases = [
+            ("$$", "$"),
+            ("$PX", "$PX"),
+            ("$P", "$P"),
+            ("$OX", "$OX"),
+            ("$O", "$O"),
+            ("$X", "$X"),
+            ("trailing$", "trailing$"),
+        ];
+
+        for (template, expected) in cases {
+            let handle = ObjectHandle::integer(7);
+            handle.set_description(template.to_owned(), 300);
+            assert_eq!(handle.description(), expected, "template {template:?}");
+        }
+    }
+
+    #[test]
     fn set_description_does_not_overwrite_an_already_recorded_parsed_offset() {
         // Mirrors a parsed stream: `ObjectSlot::parsed_offset` already holds
         // the encoded stream-data start `pipe_stream_data` reads from before

@@ -6786,6 +6786,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_object_handle_lifts_when_the_canonical_retry_has_no_resolver() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
+            .expect("open false-next-offset PDF");
+        pdf.cache.set_resolved(
+            object_ref,
+            Object::Stream(Stream::new(Dictionary::new(), b"cached".to_vec())),
+        );
+
+        // A caller-owned unresolved handle can still point at an already
+        // cached legacy value. Its missing resolver makes the description-aware
+        // retry fail, so this test pins the final lift fallback rather than
+        // allowing that defensive branch to become uncovered.
+        let handle = ObjectHandle::new_indirect_unresolved(object_ref, NO_PARSED_OFFSET);
+        pdf.resolve_object_handle(&handle)
+            .expect("the cached legacy value must remain liftable");
+
+        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"cached".to_vec())));
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
     /// A malformed/overlapping xref layout whose bogus "next object" offset
     /// lands between object 1's dictionary and its `stream` keyword: long
     /// enough for the dictionary to parse successfully within the bounded
