@@ -1363,8 +1363,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// Object refs that the cross-reference table marks as live.
     ///
     /// Excludes:
-    /// - `Deleted` — free entries (from `XrefEntry::Free`) and explicit
-    ///   `delete_object()` calls,
+    /// - `Deleted` — explicit `delete_object()` calls,
     /// - `Missing` — referenced but never present in any xref,
     /// - `Reserved` — forward-reference placeholders that
     ///   [`Pdf::resolve`] returns as `Object::Null` (no real indirect
@@ -1728,15 +1727,13 @@ impl<R: Read + Seek> Pdf<R> {
     // qpdf's `m->xref_table` never contains free ("f"/type-0) entries in the
     // first place (`insertFreeXrefEntry` records them in a separate
     // `deleted_objects` set, never in `xref_table`), so `getAllObjects` never
-    // sees them. This crate's `source_xref_entries` is a more literal
-    // transcription of the on-disk table and *does* retain `XrefEntry::Free`
-    // rows (including the object-0 free-list head), so they are filtered out
-    // here to match what qpdf's object cache actually ends up holding.
+    // sees them. The reader's source table now follows that effective-table
+    // contract, so no Free predicate is needed at this boundary.
     /// Every indirect object known to this document.
     ///
     /// The result is the union of every reference already registered in the
-    /// canonical handle cache (see [`Pdf::get_object_handle`]) and every live
-    /// (non-free) reference recorded in the source cross-reference table,
+    /// canonical handle cache (see [`Pdf::get_object_handle`]) and every
+    /// reference recorded in the effective source cross-reference table,
     /// registering any of the latter that is not yet cached. Returned in
     /// `ObjectRef` order (ascending object number, then generation); every
     /// handle in the result is indirect ([`ObjectHandle::is_indirect`]).
@@ -1746,9 +1743,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// This method never returns an error: every candidate reference is
     /// registered via [`Pdf::get_object_handle`], which cannot fail.
     pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
-        let refs_to_register: Vec<ObjectRef> = self
-            .resolver
-            .xref_refs_matching(|entry| !matches!(entry, XrefEntry::Free { .. }));
+        let refs_to_register = self.resolver.xref_refs();
         for object_ref in refs_to_register {
             self.get_object_handle(object_ref);
         }

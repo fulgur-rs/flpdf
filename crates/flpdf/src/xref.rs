@@ -44,6 +44,47 @@ pub enum XrefForm {
     Stream,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ParsedXrefEntry {
+    Live {
+        object_ref: ObjectRef,
+        entry: XrefEntry,
+    },
+    Free {
+        object_ref: ObjectRef,
+    },
+}
+
+#[derive(Debug, Default)]
+struct XrefRegistration {
+    entries: BTreeMap<ObjectRef, XrefEntry>,
+    deleted_objects: BTreeSet<u32>,
+}
+
+impl XrefRegistration {
+    /// qpdf `insertXrefEntry`: a deleted object number suppresses every later
+    /// live registration, while an exact object-generation collision is
+    /// first-wins because sections are read newest to oldest.
+    fn insert_xref_entry(&mut self, object_ref: ObjectRef, entry: XrefEntry) {
+        if self.deleted_objects.contains(&object_ref.number) {
+            return;
+        }
+        self.entries.entry(object_ref).or_insert(entry);
+    }
+
+    /// qpdf `insertFreeXrefEntry`: free rows are represented only by the
+    /// object-number tombstone, and a matching exact live generation wins.
+    fn insert_free_xref_entry(&mut self, object_ref: ObjectRef) {
+        if !self.entries.contains_key(&object_ref) {
+            self.deleted_objects.insert(object_ref.number);
+        }
+    }
+
+    fn snapshot(&self) -> BTreeMap<ObjectRef, XrefEntry> {
+        self.entries.clone()
+    }
+}
+
 /// The `QPDF::Members` settings the cross-reference loader consults, carried
 /// together the way qpdf keeps them on `m` rather than as parallel arguments.
 #[derive(Debug, Clone, Copy, Default)]
@@ -149,7 +190,15 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
-    let mut loaded = match parse_xref_from_start(bytes, xref_pos, startxref, &version, options) {
+    let mut registration = XrefRegistration::default();
+    let mut loaded = match parse_xref_from_start(
+        bytes,
+        xref_pos,
+        startxref,
+        &version,
+        options,
+        &mut registration,
+    ) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
             // Report the first recorded failure; this parse error is only the
@@ -176,7 +225,9 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
-    if let Err(error) = merge_previous_xref_sections(bytes, &version, &mut loaded, options) {
+    if let Err(error) =
+        merge_previous_xref_sections(bytes, &version, &mut loaded, options, &mut registration)
+    {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
@@ -194,6 +245,10 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         return Err(error);
     }
 
+    loaded.loaded.entries = registration.snapshot();
+    append_xref_size_warning(&mut loaded.loaded, &registration.deleted_objects);
+    registration.deleted_objects.clear();
+
     if let Some(error) = parse_errors.into_iter().next() {
         push_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, &error, startxref);
     }
@@ -208,6 +263,7 @@ fn parse_xref_from_start(
     startxref: u64,
     version: &str,
     options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -215,12 +271,21 @@ fn parse_xref_from_start(
     {
         let mut cursor = ByteCursor::new(bytes, xref_pos + 4);
         let (entries, trailer) = parse_xref_table(&mut cursor, bytes)?;
+        let mut deferred_free = Vec::new();
+        for entry in entries {
+            match entry {
+                ParsedXrefEntry::Live { object_ref, entry } => {
+                    registration.insert_xref_entry(object_ref, entry);
+                }
+                ParsedXrefEntry::Free { object_ref } => deferred_free.push(object_ref),
+            }
+        }
         let trailer_references = collect_trailer_references(&trailer);
         let mut loaded = LoadedXrefState {
             loaded: LoadedXref {
                 version: version.to_string(),
                 startxref,
-                entries,
+                entries: registration.snapshot(),
                 trailer,
                 last_xref_form: XrefForm::Table,
                 repair_diagnostics: Diagnostics::default(),
@@ -230,11 +295,28 @@ fn parse_xref_from_start(
             header_offset: 0,
             already_reconstructed: false,
         };
-        merge_xref_stream_from_classic_trailer(bytes, xref_pos, &mut loaded, options)?;
+        merge_xref_stream_from_classic_trailer(
+            bytes,
+            xref_pos,
+            &mut loaded,
+            options,
+            registration,
+        )?;
+        for object_ref in deferred_free {
+            registration.insert_free_xref_entry(object_ref);
+        }
+        loaded.loaded.entries = registration.snapshot();
         return Ok(loaded);
     }
 
-    parse_xref_stream(bytes, xref_pos, startxref, version.to_string(), options)
+    parse_xref_stream(
+        bytes,
+        xref_pos,
+        startxref,
+        version.to_string(),
+        options,
+        registration,
+    )
 }
 
 /// Read the optional hybrid-reference stream named by a classic trailer's
@@ -246,6 +328,7 @@ fn merge_xref_stream_from_classic_trailer(
     classic_xref_pos: usize,
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
 ) -> Result<()> {
     let Some(xref_stream_offset) = loaded.loaded.trailer.get("XRefStm") else {
         return Ok(());
@@ -279,6 +362,7 @@ fn merge_xref_stream_from_classic_trailer(
         xref_stream_pos as u64,
         loaded.loaded.version.clone(),
         options,
+        registration,
     )?;
     for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -290,20 +374,7 @@ fn merge_xref_stream_from_classic_trailer(
         .parsed_xref_streams
         .extend(hybrid.parsed_xref_streams);
 
-    // qpdf registers classic live entries before it reads the hybrid stream,
-    // so the table wins a same-section collision. flpdf's existing xref merge
-    // remains object-number keyed; its classic-free/hybrid-live difference is
-    // intentionally owned by flpdf-25kg.3.30.
-    for (object_ref, entry) in hybrid.loaded.entries {
-        if !loaded
-            .loaded
-            .entries
-            .keys()
-            .any(|existing| existing.number == object_ref.number)
-        {
-            loaded.loaded.entries.insert(object_ref, entry);
-        }
-    }
+    loaded.loaded.entries = registration.snapshot();
 
     Ok(())
 }
@@ -313,6 +384,7 @@ fn merge_previous_xref_sections(
     version: &str,
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut previous_offset = parse_previous_xref_offset(&loaded.loaded.trailer);
@@ -325,7 +397,8 @@ fn merge_previous_xref_sections(
             return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
-        let previous = parse_xref_from_start(bytes, previous_pos, offset, version, options)?;
+        let previous =
+            parse_xref_from_start(bytes, previous_pos, offset, version, options, registration)?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
@@ -345,19 +418,10 @@ fn merge_previous_xref_sections(
             }
         }
 
-        for (object_ref, xref_offset) in previous.loaded.entries {
-            if !loaded
-                .loaded
-                .entries
-                .keys()
-                .any(|entry_ref| entry_ref.number == object_ref.number)
-            {
-                loaded.loaded.entries.insert(object_ref, xref_offset);
-            }
-        }
-
         previous_offset = parse_previous_xref_offset(&previous.loaded.trailer);
     }
+
+    loaded.loaded.entries = registration.snapshot();
 
     Ok(())
 }
@@ -373,6 +437,31 @@ fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
     let mut references = BTreeSet::new();
     collect_qpdf_object_references(&Object::Dictionary(trailer.clone()), &mut references);
     references
+}
+
+/// Emit qpdf's post-chain `/Size` warning while the construction-scoped
+/// deleted-object set is still available.
+fn append_xref_size_warning(loaded: &mut LoadedXref, deleted_objects: &BTreeSet<u32>) {
+    let Some(Object::Integer(size)) = loaded.trailer.get("Size") else {
+        return;
+    };
+    let max_live = loaded
+        .entries
+        .keys()
+        .map(|object_ref| object_ref.number)
+        .max()
+        .unwrap_or(0);
+    let max_deleted = deleted_objects.iter().copied().max().unwrap_or(0);
+    let max_object = max_live.max(max_deleted);
+
+    if *size < 1 || *size - 1 != i64::from(max_object) {
+        loaded.repair_diagnostics.push(Diagnostic::warning(
+            format!(
+                "reported number of objects ({size}) is not one plus the highest object number ({max_object})"
+            ),
+            None,
+        ));
+    }
 }
 
 fn recover_xref_from_linear_scan(
@@ -762,8 +851,8 @@ fn scan_object_header_at_line(
 fn parse_xref_table(
     cursor: &mut ByteCursor<'_>,
     bytes: &[u8],
-) -> Result<(BTreeMap<ObjectRef, XrefEntry>, Dictionary)> {
-    let mut entries = BTreeMap::new();
+) -> Result<(Vec<ParsedXrefEntry>, Dictionary)> {
+    let mut entries = Vec::new();
     loop {
         let first_token = cursor.read_token()?;
         if first_token.is_word_value(b"trailer") {
@@ -782,20 +871,16 @@ fn parse_xref_table(
             cursor.skip_line();
             match in_use {
                 b'f' => {
-                    entries.insert(
-                        ObjectRef::new(first + index, generation),
-                        XrefEntry::Free {
-                            next: u32::try_from(offset).map_err(|_| {
-                                Error::parse(0, "free xref next object does not fit u32")
-                            })?,
-                        },
-                    );
+                    let _next = offset;
+                    entries.push(ParsedXrefEntry::Free {
+                        object_ref: ObjectRef::new(first + index, generation),
+                    });
                 }
                 b'n' => {
-                    entries.insert(
-                        ObjectRef::new(first + index, generation),
-                        XrefEntry::Uncompressed { offset },
-                    );
+                    entries.push(ParsedXrefEntry::Live {
+                        object_ref: ObjectRef::new(first + index, generation),
+                        entry: XrefEntry::Uncompressed { offset },
+                    });
                 }
                 _ => return Err(Error::parse(0, "xref table entry status is not f or n")),
             }
@@ -823,6 +908,7 @@ fn parse_xref_stream(
     startxref: u64,
     version: String,
     options: XrefLoadOptions,
+    registration: &mut XrefRegistration,
 ) -> Result<LoadedXrefState> {
     // qpdf's `read_xrefStream` wraps its whole body in
     // `if (!m->ignore_xref_streams)` and otherwise falls straight through to
@@ -890,6 +976,16 @@ fn parse_xref_stream(
     let stream_data = filters::decode_stream_data(&stream.dict, &stream.data)?;
     let mut cursor = ByteCursor::new(&stream_data, 0);
     let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
+    for entry in entries {
+        match entry {
+            ParsedXrefEntry::Live { object_ref, entry } => {
+                registration.insert_xref_entry(object_ref, entry);
+            }
+            ParsedXrefEntry::Free { object_ref } => {
+                registration.insert_free_xref_entry(object_ref);
+            }
+        }
+    }
     let trailer_references = collect_trailer_references(&trailer);
     let parsed_xref_streams = BTreeMap::from([(object_ref, object)]);
 
@@ -897,7 +993,7 @@ fn parse_xref_stream(
         loaded: LoadedXref {
             version,
             startxref,
-            entries,
+            entries: registration.snapshot(),
             trailer,
             last_xref_form: XrefForm::Stream,
             repair_diagnostics,
@@ -986,14 +1082,14 @@ fn parse_xref_entries(
     size: u32,
     ranges: &[(u32, u32)],
     widths: XrefWidths,
-) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
+) -> Result<Vec<ParsedXrefEntry>> {
     let (w0, w1, w2) = widths;
     let entry_width = w0 + w1 + w2;
     if entry_width == 0 {
         return Err(Error::parse(0, "invalid cross-reference stream widths"));
     }
 
-    let mut entries = BTreeMap::new();
+    let mut entries = Vec::new();
     for &(start, count) in ranges {
         let start =
             usize::try_from(start).map_err(|_| Error::parse(0, "object number too large"))?;
@@ -1022,22 +1118,19 @@ fn parse_xref_entries(
             let object_number = (start + index) as u32;
             match object_type {
                 0 => {
-                    let next = u32::try_from(field1)
-                        .map_err(|_| Error::parse(0, "free xref next object does not fit u32"))?;
-                    let generation = u16::try_from(field2)
-                        .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
-                    entries.insert(
-                        ObjectRef::new(object_number, generation),
-                        XrefEntry::Free { next },
-                    );
+                    let _next = field1;
+                    let _generation = field2;
+                    entries.push(ParsedXrefEntry::Free {
+                        object_ref: ObjectRef::new(object_number, 0),
+                    });
                 }
                 1 => {
                     let generation = u16::try_from(field2)
                         .map_err(|_| Error::parse(0, "generation does not fit u16"))?;
-                    entries.insert(
-                        ObjectRef::new(object_number, generation),
-                        XrefEntry::Uncompressed { offset: field1 },
-                    );
+                    entries.push(ParsedXrefEntry::Live {
+                        object_ref: ObjectRef::new(object_number, generation),
+                        entry: XrefEntry::Uncompressed { offset: field1 },
+                    });
                 }
                 2 => {
                     let stream = u32::try_from(field1).map_err(|_| {
@@ -1045,10 +1138,10 @@ fn parse_xref_entries(
                     })?;
                     let index = u32::try_from(field2)
                         .map_err(|_| Error::parse(0, "xref stream index does not fit u32"))?;
-                    entries.insert(
-                        ObjectRef::new(object_number, 0),
-                        XrefEntry::Compressed { stream, index },
-                    );
+                    entries.push(ParsedXrefEntry::Live {
+                        object_ref: ObjectRef::new(object_number, 0),
+                        entry: XrefEntry::Compressed { stream, index },
+                    });
                 }
                 _ => {
                     return Err(Error::Unsupported(format!(
@@ -1259,9 +1352,65 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_xref_and_trailer_with_repair, prepend_repair_diagnostics};
-    use crate::{Diagnostic, Diagnostics};
+    use super::{
+        append_xref_size_warning, load_xref_and_trailer_with_repair, prepend_repair_diagnostics,
+        LoadedXref, XrefForm, XrefRegistration,
+    };
+    use crate::{Diagnostic, Diagnostics, Dictionary, ObjectRef, XrefEntry};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
+
+    #[test]
+    fn xref_registration_preserves_exact_generations_and_live_precedence() {
+        let mut registration = XrefRegistration::default();
+        let object_zero = ObjectRef::new(7, 0);
+        let object_two = ObjectRef::new(7, 2);
+
+        registration.insert_xref_entry(object_zero, XrefEntry::Uncompressed { offset: 10 });
+        registration.insert_free_xref_entry(object_zero);
+        registration.insert_xref_entry(object_two, XrefEntry::Uncompressed { offset: 20 });
+
+        assert!(registration.entries.contains_key(&object_zero));
+        assert!(registration.entries.contains_key(&object_two));
+        assert!(registration.deleted_objects.is_empty());
+    }
+
+    #[test]
+    fn xref_registration_free_object_suppresses_later_generations() {
+        let mut registration = XrefRegistration::default();
+        let object_zero = ObjectRef::new(8, 0);
+        let object_two = ObjectRef::new(8, 2);
+
+        registration.insert_free_xref_entry(object_zero);
+        registration.insert_xref_entry(object_two, XrefEntry::Uncompressed { offset: 30 });
+
+        assert!(!registration.entries.contains_key(&object_zero));
+        assert!(!registration.entries.contains_key(&object_two));
+        assert_eq!(
+            registration
+                .deleted_objects
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [8]
+        );
+    }
+
+    #[test]
+    fn xref_size_warning_is_skipped_without_a_declared_size() {
+        let mut loaded = LoadedXref {
+            version: "1.7".to_string(),
+            startxref: 0,
+            entries: BTreeMap::new(),
+            trailer: Dictionary::new(),
+            last_xref_form: XrefForm::Table,
+            repair_diagnostics: Diagnostics::default(),
+        };
+
+        append_xref_size_warning(&mut loaded, &BTreeSet::from([5]));
+
+        assert!(loaded.repair_diagnostics.entries().is_empty());
+    }
 
     #[test]
     fn initial_repair_diagnostics_precede_recovered_diagnostics() {

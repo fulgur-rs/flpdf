@@ -32,9 +32,11 @@ impl ObjectCache {
 
     fn entry_from_xref(xref_entry: XrefEntry) -> CacheEntry {
         match xref_entry {
-            XrefEntry::Free { .. } => CacheEntry::Deleted,
             XrefEntry::Uncompressed { offset } => CacheEntry::Unresolved { offset },
             XrefEntry::Compressed { stream, index } => CacheEntry::Compressed { stream, index },
+            XrefEntry::Free { .. } => {
+                unreachable!("reader effective xref cannot contain free entries")
+            }
         }
     }
 
@@ -205,6 +207,18 @@ impl ObjectCache {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{CacheEntry, ObjectCache};
+    use crate::ObjectRef;
+
+    pub(crate) fn stale_deleted_entry(object_ref: ObjectRef) -> ObjectCache {
+        let mut cache = ObjectCache::default();
+        cache.entries.insert(object_ref, CacheEntry::Deleted);
+        cache
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{CacheEntry, ObjectCache};
     use crate::{Object, ObjectRef, XrefEntry};
@@ -306,5 +320,11 @@ mod tests {
                 .map(|number| ObjectRef::new(number, 0))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "reader effective xref cannot contain free entries")]
+    fn source_free_xref_entry_is_unreachable_during_cache_construction() {
+        ObjectCache::entry_from_xref(XrefEntry::Free { next: 0 });
     }
 }

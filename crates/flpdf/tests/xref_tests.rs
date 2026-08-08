@@ -323,10 +323,7 @@ fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
     let mut reader = Cursor::new(bytes);
     let loaded = load_xref_and_trailer(&mut reader).unwrap();
 
-    assert_eq!(
-        loaded.entries.get(&ObjectRef::new(2, 0)),
-        Some(&XrefEntry::Free { next: 0 })
-    );
+    assert_eq!(loaded.entries.get(&ObjectRef::new(2, 0)), None);
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(1, 0)),
         Some(&XrefEntry::Uncompressed {
@@ -339,6 +336,98 @@ fn loads_latest_xref_stream_free_entries_over_previous_live_entries() {
             offset: latest_xref_offset
         })
     );
+}
+
+#[test]
+fn previous_xref_sections_retain_distinct_generations() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let object_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_entries = build_encoded_xref_stream_entries(&[(0, 0, 0), (1, object_offset, 0)]);
+    bytes.extend_from_slice(&make_xref_stream_object(2, 2, None, 1, &previous_entries));
+
+    let latest_xref_offset = bytes.len() as u64;
+    let latest_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, object_offset, 2),
+        (1, latest_xref_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(
+        3,
+        3,
+        Some(previous_xref_offset),
+        1,
+        &latest_entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{latest_xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+
+    assert!(matches!(
+        loaded.entries.get(&ObjectRef::new(1, 2)),
+        Some(XrefEntry::Uncompressed { .. })
+    ));
+    assert!(matches!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(XrefEntry::Uncompressed { .. })
+    ));
+}
+
+#[test]
+fn xref_stream_type_zero_ignores_a_wide_generation() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len() as u64;
+    let mut entries = Vec::new();
+    for _ in 0..2 {
+        entries.push(0);
+        entries.extend_from_slice(&0u32.to_be_bytes());
+        entries.extend_from_slice(&u32::MAX.to_be_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "1 0 obj\n<< /Type /XRef /Size 2 /W [1 4 4] /Index [0 2] /Length {} >>\nstream\n",
+            entries.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&entries);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+    let loaded =
+        load_xref_and_trailer(&mut Cursor::new(bytes)).expect("type-0 generation is ignored");
+    assert_eq!(loaded.entries.get(&ObjectRef::new(1, 0)), None);
+}
+
+#[test]
+fn warns_when_xref_size_is_not_one_plus_the_highest_deleted_object() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 6\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for _ in 1..6 {
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes)).unwrap();
+    assert!(loaded
+        .entries
+        .keys()
+        .all(|object_ref| object_ref.number != 5));
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (5) is not one plus the highest object number (5)"
+                && diagnostic.offset.is_none()
+        }));
 }
 
 #[test]
@@ -1863,35 +1952,26 @@ fn merge_failure_falls_back_to_linear_scan() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
 }
 
-/// A free (`f`) xref-table entry whose 10-digit offset field exceeds
-/// `u32::MAX` must be rejected in strict mode. In `parse_xref_table`, a free
-/// entry's offset becomes the `Free { next }` value via `u32::try_from(offset)`;
-/// when `offset` is `9999999999` (> `u32::MAX`) that conversion fails and the
-/// function returns the "free xref next object does not fit u32" error (the
-/// `b'f'` arm's `map_err`). Object 0's free entry (generation 65535, `next = 0`)
-/// fits and is accepted; the overflow is isolated to the second entry.
+/// qpdf reads the classic free-row offset as an offset-sized field and does not
+/// retain it in the effective reader xref table. The value may therefore exceed
+/// `u32::MAX` without affecting strict loading.
 #[test]
-fn rejects_xref_table_free_next_overflow() {
+fn classic_free_next_field_is_not_retained_or_u32_limited() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let xref_offset = bytes.len();
     bytes.extend_from_slice(b"xref\n0 2\n");
     // Object 0: free-list head, generation 65535, next = 0 (fits u32, accepted).
     bytes.extend_from_slice(b"0000000000 65535 f \n");
-    // Object 1: free, offset 9999999999 > u32::MAX -> overflow in the `f` arm.
+    // Object 1: free, offset 9999999999 > u32::MAX is still accepted.
     bytes.extend_from_slice(b"9999999999 00000 f \n");
     bytes.extend_from_slice(
         format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
     );
 
-    let err = load_xref_and_trailer(&mut Cursor::new(bytes))
-        .expect_err("free xref next overflowing u32 should fail strict parse");
-    let message = format!("{err}");
-    assert!(
-        message.contains("free xref next object does not fit u32"),
-        "got {message}"
-    );
-    assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("free xref next is not part of the effective table");
+    assert_eq!(loaded.entries.get(&ObjectRef::new(1, 0)), None);
 }
 
 /// An xref-table entry whose status byte is neither `f` nor `n` must be rejected
@@ -2462,8 +2542,9 @@ fn classic_xref_with_hybrid_only_entry() -> (Vec<u8>, u64) {
     ));
 
     let table_offset = bytes.len() as u64;
-    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
     bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
     bytes.extend_from_slice(
         format!(
             "trailer\n<< /Size 4 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
