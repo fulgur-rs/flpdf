@@ -148,6 +148,18 @@ impl ObjectCache {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use super::{CacheEntry, ObjectCache};
+    use crate::ObjectRef;
+
+    pub(crate) fn stale_deleted_entry(object_ref: ObjectRef) -> ObjectCache {
+        let mut cache = ObjectCache::default();
+        cache.entries.insert(object_ref, CacheEntry::Deleted);
+        cache
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{CacheEntry, ObjectCache};
     use crate::{Object, ObjectRef, XrefEntry};

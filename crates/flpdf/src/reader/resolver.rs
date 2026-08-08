@@ -7498,9 +7498,7 @@ mod tests {
     fn reconstruction_synchronizes_before_delete_object() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let object_ref = ObjectRef::new(1, 0);
-        let mut stale_xref = BTreeMap::new();
-        stale_xref.insert(object_ref, XrefEntry::Free { next: 0 });
-        pdf.cache = crate::cache::ObjectCache::from_offsets(&stale_xref);
+        pdf.cache = crate::cache::test_support::stale_deleted_entry(object_ref);
         pdf.resolver
             .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
         pdf.resolver.core.borrow_mut().reconstructed_xref = true;
