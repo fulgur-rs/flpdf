@@ -2356,6 +2356,250 @@ fn rejects_xref_table_missing_object_count() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
+// Build a document whose `startxref` points at a cross-reference stream.
+// `trailer_section` chooses whether an earlier revision leaves a classic
+// `xref`/`trailer` section in the file: qpdf's reconstruction pass recovers the
+// trailer from the `trailer` keyword, so only a document that has one can be
+// reconstructed at all.
+fn xref_stream_document(trailer_section: bool) -> (Vec<u8>, u64) {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let mut previous_offset = None;
+    if trailer_section {
+        let table_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+        bytes.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{table_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        previous_offset = Some(table_offset);
+    }
+
+    let xref_stream_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (1, xref_stream_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(2, 3, previous_offset, 1, &entries));
+    bytes.extend_from_slice(format!("startxref\n{xref_stream_offset}\n%%EOF\n").as_bytes());
+
+    (bytes, xref_stream_offset)
+}
+
+fn ignore_xref_streams_options(repair: bool) -> PdfOpenOptions {
+    PdfOpenOptions {
+        repair,
+        ignore_xref_streams: true,
+        ..PdfOpenOptions::default()
+    }
+}
+
+// `Pdf` deliberately has no `Debug`, so `Result::expect_err` is unavailable.
+fn open_error(bytes: Vec<u8>, options: PdfOpenOptions, context: &str) -> Error {
+    Pdf::open_mem_owned_with_options(bytes, options)
+        .err()
+        .unwrap_or_else(|| panic!("{context}"))
+}
+
+#[test]
+fn ignore_xref_streams_reports_xref_not_found_at_the_stream_offset() {
+    let (bytes, xref_stream_offset) = xref_stream_document(false);
+
+    // Without the option the same document parses as a cross-reference stream.
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes.clone())).expect("xref stream loads");
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+
+    let err = open_error(
+        bytes,
+        ignore_xref_streams_options(false),
+        "ignoring xref streams leaves no cross-reference at the offset",
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("parse error at byte {xref_stream_offset}: xref not found")
+    );
+}
+
+#[test]
+fn ignore_xref_streams_falls_back_to_reconstruction() {
+    let (bytes, xref_stream_offset) = xref_stream_document(true);
+
+    let mut pdf = Pdf::open_mem_owned_with_options(bytes, ignore_xref_streams_options(true))
+        .expect("reconstruction recovers the document");
+
+    // qpdf 11.9.0 observed with `--ignore-xref-streams` on a document whose
+    // startxref points at a cross-reference stream:
+    //   WARNING: ...: file is damaged
+    //   WARNING: ... (offset N): xref not found
+    //   WARNING: ...: Attempting to reconstruct cross-reference table
+    let diagnostics = pdf.repair_diagnostics();
+    let entries = diagnostics.entries();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "file is damaged",
+            "xref not found",
+            "Attempting to reconstruct cross-reference table",
+        ]
+    );
+    assert_eq!(
+        entries.iter().map(|entry| entry.offset).collect::<Vec<_>>(),
+        [None, Some(xref_stream_offset), None]
+    );
+
+    // The reconstruction pass, not the ignored cross-reference stream, supplied
+    // the offsets: it finds `1 0 obj` by scanning the body.
+    let root = pdf
+        .root_ref()
+        .expect("root reference recovered from trailer");
+    assert_eq!(root, ObjectRef::new(1, 0));
+    assert_eq!(
+        pdf.resolve(root)
+            .expect("resolve root")
+            .as_dict()
+            .and_then(|dict| dict.get("Type"))
+            .and_then(|value| value.as_name()),
+        Some(b"Catalog".as_slice())
+    );
+}
+
+#[test]
+fn ignore_xref_streams_cannot_reconstruct_a_document_without_a_trailer_keyword() {
+    let (bytes, xref_stream_offset) = xref_stream_document(false);
+
+    let err = open_error(
+        bytes,
+        ignore_xref_streams_options(true),
+        "a document with no trailer keyword cannot be reconstructed",
+    );
+    let (source, diagnostics) = err.open_failure().expect("open failure diagnostics");
+
+    // The warnings preceding the failure match qpdf 11.9.0 exactly, observed on
+    // this document shape with `--ignore-xref-streams`.
+    assert_eq!(
+        diagnostics
+            .entries()
+            .iter()
+            .map(|entry| (entry.message.as_str(), entry.offset))
+            .collect::<Vec<_>>(),
+        [
+            ("file is damaged", None),
+            ("xref not found", Some(xref_stream_offset)),
+            ("Attempting to reconstruct cross-reference table", None),
+        ]
+    );
+
+    // Known divergence, message only: both implementations fail here, but qpdf
+    // reports "error decoding candidate xref stream while recovering damaged
+    // file". Its reconstruct_xref takes the last candidate /XRef stream's
+    // dictionary as the trailer and re-enters read_xref, which hits the same
+    // gate; flpdf's recover_trailer searches only for the `trailer` keyword.
+    // This assertion changes when that fallback is ported.
+    assert_eq!(
+        source.to_string(),
+        "parse error at byte 0: trailer dictionary not found"
+    );
+}
+
+#[test]
+fn ignore_xref_streams_applies_to_previous_xref_sections() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    let previous_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (1, previous_xref_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_object(2, 3, None, 1, &previous_entries));
+
+    // The newest section is a classic table, so only the `/Prev` hop reaches the
+    // cross-reference stream reader.
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{obj1_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /Prev {previous_xref_offset} >>\n\
+             startxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded =
+        load_xref_and_trailer(&mut Cursor::new(bytes.clone())).expect("both sections load");
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: previous_xref_offset
+        }),
+        "the `/Prev` cross-reference stream contributes entry 2 0"
+    );
+
+    let err = open_error(
+        bytes,
+        ignore_xref_streams_options(false),
+        "the `/Prev` hop must honour the option too",
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("parse error at byte {previous_xref_offset}: xref not found")
+    );
+}
+
+#[test]
+fn ignore_xref_streams_precedes_the_end_of_file_offset_check() {
+    // qpdf's read_xrefStream reads nothing at the offset when the option is set,
+    // so a startxref past the end of the file still reports "xref not found"
+    // rather than the offset diagnostic the stream reader would produce.
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let past_eof = bytes.len() as u64 + 4096;
+    bytes.extend_from_slice(format!("startxref\n{past_eof}\n%%EOF\n").as_bytes());
+
+    let err = load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
+        .expect_err("startxref past EOF fails without the option");
+    assert_eq!(
+        err.to_string(),
+        format!("parse error at byte {past_eof}: xref stream offset is beyond end of file")
+    );
+
+    let err = open_error(
+        bytes,
+        ignore_xref_streams_options(false),
+        "startxref past EOF fails with the option",
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("parse error at byte {past_eof}: xref not found")
+    );
+}
+
+#[test]
+fn ignore_xref_streams_leaves_classic_xref_tables_untouched() {
+    let bytes = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
+
+    let mut pdf = Pdf::open_mem_owned_with_options(bytes, ignore_xref_streams_options(true))
+        .expect("a classic cross-reference table is unaffected");
+    assert!(
+        pdf.repair_diagnostics().entries().is_empty(),
+        "no reconstruction is triggered for a classic table"
+    );
+    let root = pdf.root_ref().expect("root reference");
+    assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
+}
+
 // The "succeeded but with accumulated parse errors" warning path in
 // `load_xref_and_trailer_with_repair` is exercised by
 // `with_repair_appends_diagnostic_when_stream_parse_succeeds`.

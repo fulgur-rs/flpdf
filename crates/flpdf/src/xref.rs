@@ -35,6 +35,18 @@ pub enum XrefForm {
     Stream,
 }
 
+/// The `QPDF::Members` settings the cross-reference loader consults, carried
+/// together the way qpdf keeps them on `m` rather than as parallel arguments.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct XrefLoadOptions {
+    /// qpdf `m->attempt_recovery`: run the reconstruction pass when the strict
+    /// parse fails.
+    pub(crate) allow_repair: bool,
+    /// qpdf `m->ignore_xref_streams` (`QPDF::setIgnoreXRefStreams`): never read
+    /// a cross-reference stream.
+    pub(crate) ignore_xref_streams: bool,
+}
+
 /// Load the cross-reference table and trailer dictionary from `reader`, with
 /// the qpdf-style recovery pass disabled (strict parse).
 ///
@@ -53,7 +65,7 @@ pub enum XrefForm {
 /// - [`Error::Unsupported`] when a cross-reference stream uses an unsupported
 ///   object or entry type.
 pub fn load_xref_and_trailer<R: Read + Seek>(reader: &mut R) -> Result<LoadedXref> {
-    load_xref_state_with_repair(reader, false).map(|state| state.loaded)
+    load_xref_and_trailer_with_repair(reader, false)
 }
 
 /// Load the cross-reference table and trailer dictionary from `reader`, running
@@ -78,13 +90,21 @@ pub fn load_xref_and_trailer_with_repair<R: Read + Seek>(
     reader: &mut R,
     allow_repair: bool,
 ) -> Result<LoadedXref> {
-    load_xref_state_with_repair(reader, allow_repair).map(|state| state.loaded)
+    load_xref_state_with_options(
+        reader,
+        XrefLoadOptions {
+            allow_repair,
+            ..XrefLoadOptions::default()
+        },
+    )
+    .map(|state| state.loaded)
 }
 
-pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
+pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     reader: &mut R,
-    allow_repair: bool,
+    options: XrefLoadOptions,
 ) -> Result<LoadedXrefState> {
+    let allow_repair = options.allow_repair;
     let mut source_bytes = Vec::new();
     reader.seek(SeekFrom::Start(0))?;
     reader.read_to_end(&mut source_bytes)?;
@@ -120,8 +140,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
         Err(_) => return Err(Error::parse(0, "startxref does not fit usize")),
     };
 
-    let mut loaded = match parse_xref_from_start(bytes, xref_pos, startxref, &version, allow_repair)
-    {
+    let mut loaded = match parse_xref_from_start(bytes, xref_pos, startxref, &version, options) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
             // Report the first recorded failure; this parse error is only the
@@ -148,7 +167,7 @@ pub(crate) fn load_xref_state_with_repair<R: Read + Seek>(
     };
     prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
-    if let Err(error) = merge_previous_xref_sections(bytes, &version, &mut loaded, allow_repair) {
+    if let Err(error) = merge_previous_xref_sections(bytes, &version, &mut loaded, options) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
@@ -179,7 +198,7 @@ fn parse_xref_from_start(
     xref_pos: usize,
     startxref: u64,
     version: &str,
-    allow_repair: bool,
+    options: XrefLoadOptions,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -203,20 +222,14 @@ fn parse_xref_from_start(
         });
     }
 
-    parse_xref_stream(
-        bytes,
-        xref_pos,
-        startxref,
-        version.to_string(),
-        allow_repair,
-    )
+    parse_xref_stream(bytes, xref_pos, startxref, version.to_string(), options)
 }
 
 fn merge_previous_xref_sections(
     bytes: &[u8],
     version: &str,
     loaded: &mut LoadedXrefState,
-    allow_repair: bool,
+    options: XrefLoadOptions,
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut previous_offset = parse_previous_xref_offset(&loaded.loaded.trailer);
@@ -229,7 +242,7 @@ fn merge_previous_xref_sections(
             return Err(Error::parse(0, "loop detected following xref tables"));
         }
 
-        let previous = parse_xref_from_start(bytes, previous_pos, offset, version, allow_repair)?;
+        let previous = parse_xref_from_start(bytes, previous_pos, offset, version, options)?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
         }
@@ -725,8 +738,17 @@ fn parse_xref_stream(
     xref_pos: usize,
     startxref: u64,
     version: String,
-    allow_repair: bool,
+    options: XrefLoadOptions,
 ) -> Result<LoadedXrefState> {
+    // qpdf's `read_xrefStream` wraps its whole body in
+    // `if (!m->ignore_xref_streams)` and otherwise falls straight through to
+    // `throw damagedPDF("", xref_offset, "xref not found")` — the offset is
+    // never read, so this precedes the end-of-file check below. The same error
+    // is what a non-stream object at the offset produces.
+    if options.ignore_xref_streams {
+        return Err(Error::parse(xref_pos, "xref not found"));
+    }
+    let allow_repair = options.allow_repair;
     let tail = bytes
         .get(xref_pos..)
         .filter(|slice| !slice.is_empty())

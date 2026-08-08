@@ -8,7 +8,7 @@ use crate::cache::ObjectCache;
 use crate::error::EncryptedError;
 use crate::reader::resolver::{ResolverHandle, ResolverWarningOptions};
 use crate::reader::PdfOpenOptions;
-use crate::xref::load_xref_state_with_repair;
+use crate::xref::{load_xref_state_with_options, XrefLoadOptions};
 #[allow(unused_imports)]
 use crate::{Error, ObjectHandle};
 use crate::{Pdf, Result};
@@ -98,7 +98,13 @@ impl<R: Read + Seek> Pdf<R> {
             options.suppress_warnings,
             options.description.clone(),
         );
-        let loaded_state = match load_xref_state_with_repair(&mut reader, options.repair) {
+        let loaded_state = match load_xref_state_with_options(
+            &mut reader,
+            XrefLoadOptions {
+                allow_repair: options.repair,
+                ignore_xref_streams: options.ignore_xref_streams,
+            },
+        ) {
             Ok(state) => state,
             Err(error) => {
                 if let Some((_, diagnostics)) = error.open_failure() {
