@@ -468,6 +468,26 @@ fn check_warnings_use_qpdf_stderr_format() {
         .stderr(predicate::str::contains("warning: ").not());
 }
 
+#[test]
+fn check_object_warning_uses_qpdf_space_before_object_context() {
+    let input = "../../tests/fixtures/compat/chained-indirect-contents.pdf";
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.env_remove("FLPDF_PROGNAME")
+        .args(["--check", input])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(format!(
+            "WARNING: {input} (object 5 0, offset 232): expected endobj\n"
+        )))
+        .stderr(
+            predicate::str::contains(format!(
+                "WARNING: {input}: (object 5 0, offset 232): expected endobj"
+            ))
+            .not(),
+        );
+}
+
 /// The trigger warning (and only the trigger warning) carries `(offset N)`.
 #[test]
 fn check_trigger_warning_carries_offset() {

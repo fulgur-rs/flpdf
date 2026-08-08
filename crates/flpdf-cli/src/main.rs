@@ -2416,7 +2416,15 @@ fn run_check(
         let location = diagnostic_location(&input, diagnostic.offset);
         match diagnostic.severity {
             Severity::Warning => {
-                cli_logger().warn(format!("WARNING: {location}: {}\n", diagnostic.message))?
+                let separator = if diagnostic.message.starts_with("(object ") {
+                    " "
+                } else {
+                    ": "
+                };
+                cli_logger().warn(format!(
+                    "WARNING: {location}{separator}{}\n",
+                    diagnostic.message
+                ))?
             }
             Severity::Error => {
                 eprintln!("{}: {location}: {}", progname(), diagnostic.message)
