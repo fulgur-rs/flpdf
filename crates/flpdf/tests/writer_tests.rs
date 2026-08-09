@@ -948,7 +948,7 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
 }
 
 #[test]
-fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
+fn write_pdf_incremental_xref_stream_strips_inherited_xref_stream_only_keys() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let mut objects = Vec::new();
@@ -998,12 +998,19 @@ fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
     let mut output = Vec::new();
     write_pdf(&mut pdf, &mut output).unwrap();
 
-    let trailer_section = parse_last_trailer_section(&output);
-    assert!(!trailer_section.contains(" /Type /XRef"));
-    assert!(!trailer_section.contains(" /W ["));
-    assert!(!trailer_section.contains(" /Index ["));
-    assert!(!trailer_section.contains(" /Length "));
-    assert!(!trailer_section.contains(" /XRefStm "));
+    let trailer = load_xref_and_trailer(&mut Cursor::new(&output))
+        .expect("output must have a reader-visible xref stream")
+        .trailer;
+    assert!(matches!(trailer.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"XRef"));
+    assert!(trailer.get("W").is_some());
+    assert!(trailer.get("Index").is_some());
+    assert!(trailer.get("Length").is_some());
+    assert!(trailer.get("F").is_none());
+    assert!(trailer.get("FFilter").is_none());
+    assert!(trailer.get("FDecodeParms").is_none());
+    assert!(trailer.get("Filter").is_none());
+    assert!(trailer.get("DecodeParms").is_none());
+    assert!(trailer.get("XRefStm").is_none());
 }
 
 #[test]
@@ -2501,23 +2508,6 @@ fn parse_last_xref_generations(bytes: &[u8]) -> BTreeMap<u32, u16> {
     }
 
     generations
-}
-
-fn parse_last_trailer_section(bytes: &[u8]) -> String {
-    let rendered = String::from_utf8_lossy(bytes);
-    let trailer_pos = rendered
-        .rfind("trailer")
-        .unwrap_or_else(|| panic!("missing trailer"));
-    let trailer_start = rendered[trailer_pos..]
-        .find("<<")
-        .map(|offset| trailer_pos + offset)
-        .unwrap_or_else(|| panic!("missing trailer dictionary"));
-    let startxref_pos = rendered[trailer_pos..]
-        .find("startxref")
-        .map(|offset| trailer_pos + offset)
-        .unwrap_or_else(|| panic!("missing startxref"));
-
-    rendered[trailer_start..startxref_pos].to_string()
 }
 
 fn as_integer(object: &Object) -> Option<i64> {

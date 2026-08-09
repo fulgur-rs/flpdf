@@ -1084,32 +1084,38 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
         object_count = object_count.max(oi.container.number as usize + 1);
     }
 
-    let xref_offset = match pdf.last_xref_form() {
-        XrefForm::Table => write_incremental_xref(&mut bytes, &final_offsets)?,
+    let selected_id = generate_id_array(pdf.trailer().get("ID"), options.static_id);
+    match pdf.last_xref_form() {
+        XrefForm::Table => {
+            let xref_offset = write_incremental_xref(&mut bytes, &final_offsets)?;
+            write_incremental_trailer(
+                &mut bytes,
+                pdf,
+                &selected_id,
+                &root_ref,
+                object_count,
+                pdf.previous_xref_offset(),
+                xref_offset,
+            )?;
+            xref_offset
+        }
         XrefForm::Stream => {
             let xref_object_number = next_xref_stream_object_number(&final_xref_offsets)?;
             object_count = object_count.max(xref_object_number as usize + 1);
             let xref_offset = write_incremental_xref_stream(
                 &mut bytes,
                 pdf.trailer(),
+                &selected_id,
                 &final_xref_offsets,
                 &root_ref,
                 xref_object_number,
                 object_count,
                 pdf.previous_xref_offset(),
             )?;
+            bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
             xref_offset
         }
     };
-    write_incremental_trailer(
-        &mut bytes,
-        pdf,
-        &root_ref,
-        object_count,
-        pdf.previous_xref_offset(),
-        xref_offset,
-        options,
-    )?;
 
     // flpdf-9hc.22.4: guard the byte-preservation invariant. The source prefix
     // (and any signed `/ByteRange` covered by it) must survive verbatim — the
@@ -1753,6 +1759,7 @@ fn write_incremental_xref(
 fn write_incremental_xref_stream(
     bytes: &mut Vec<u8>,
     trailer: &Dictionary,
+    selected_id: &Object,
     source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
     root_ref: &ObjectRef,
     xref_object_number: u32,
@@ -1814,6 +1821,7 @@ fn write_incremental_xref_stream(
         .map_err(|_| crate::Error::Unsupported("xref stream /Size does not fit i64".to_string()))?;
     let mut stream_dict = trailer.clone();
     strip_incremental_trailer_keys(&mut stream_dict);
+    stream_dict.insert("ID", selected_id.clone());
     stream_dict.insert("Type", Object::Name(b"XRef".to_vec()));
     stream_dict.insert("Size", Object::Integer(size));
     stream_dict.insert(
@@ -1839,8 +1847,7 @@ fn write_incremental_xref_stream(
         })?),
     );
 
-    // The incremental xref-stream inherits `/ID` from the source trailer
-    // (via the `trailer.clone()` above). Render the stream via the
+    // The incremental xref-stream owns the caller-selected `/ID`. Render it via the
     // `_with_id_writer(None)` variant so the stored `/ID` array goes through
     // `write_id_style_value` and emits qpdf's compact `[<hex1><hex2>]` shape
     // — a direct `Object::Stream::write_pdf` would route the array through
@@ -1904,11 +1911,11 @@ fn build_xref_stream_bytes(
 fn write_incremental_trailer<R: Read + Seek>(
     bytes: &mut Vec<u8>,
     pdf: &Pdf<R>,
+    selected_id: &Object,
     root_ref: &ObjectRef,
     object_count: usize,
     previous_xref_offset: u64,
     xref_offset: usize,
-    options: &WriteOptions,
 ) -> Result<()> {
     let mut trailer = pdf.trailer().clone();
     strip_xref_stream_trailer_keys(&mut trailer);
@@ -1920,10 +1927,7 @@ fn write_incremental_trailer<R: Read + Seek>(
             crate::Error::Unsupported("startxref offset does not fit i64".to_string())
         })?),
     );
-    trailer.insert(
-        "ID",
-        generate_id_array(trailer.get("ID"), options.static_id),
-    );
+    trailer.insert("ID", selected_id.clone());
 
     bytes.extend_from_slice(b"trailer\n");
     // Route the stored `/ID` value through the qpdf-trailer compact writer so
@@ -5968,6 +5972,7 @@ mod tests {
         write_incremental_xref_stream(
             &mut bytes,
             &trailer,
+            trailer.get("ID").expect("test trailer must carry /ID"),
             &source_offsets,
             &root_ref,
             /* xref_object_number */ 2,
