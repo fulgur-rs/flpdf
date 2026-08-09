@@ -10320,6 +10320,21 @@ mod warning_emission_tests {
     }
 
     #[test]
+    fn description_template_ignores_non_template_descriptions() {
+        let without_description = ObjectHandle::integer(7);
+        assert_eq!(without_description.description_template(), None);
+
+        let json = ObjectHandle::null();
+        json.set_description_json("input.pdf".to_owned(), "object 1 0".to_owned(), 123);
+        assert_eq!(json.description_template(), None);
+
+        let parent = ObjectHandle::dictionary(vec![]);
+        let child = ObjectHandle::null();
+        child.set_child_description(&parent, " -> dictionary key $VD", "/Value");
+        assert_eq!(child.description_template(), None);
+    }
+
+    #[test]
     fn object_description_child_chaining_and_var_descr() {
         let parent = ObjectHandle::dictionary(vec![]);
         parent.set_description("object 5 0 at offset 253".to_owned(), 253);
