@@ -482,7 +482,16 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                     // resolveObjectsInStream; QPDF::resolve then warns and
                     // nulls only the requested object. The once-only marker
                     // above keeps later members unresolved as well.
-                    return Err(error);
+                    return Err(match error.rebase_offset(member_start) {
+                        Error::Parse { offset, message } => Error::parse(
+                            offset,
+                            format!(
+                                "object stream {stream_number} (object {} 0, offset {offset}): {message}",
+                                object_ref.number
+                            ),
+                        ),
+                        other => other, // cov:ignore: byte-backed direct parser errors are parse errors
+                    });
                 }
             };
             self.cache.insert(object_ref, parsed);
@@ -3312,6 +3321,37 @@ mod tests {
                 Object::Null
             );
             assert!(!context.diagnostics.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_rebases_member_parse_error_to_decoded_offset() {
+        let members = [
+            (2, b"42".as_slice()),
+            (4, b"<< /Value 2147483648 0 R >>".as_slice()),
+        ];
+        let (_, first) = test_objstm_payload(&members);
+        let member_start = first + b"42\n".len();
+        let parse_error_offset = b"<< /Value ".len();
+        let expected_offset = member_start + parse_error_offset;
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Null
+            );
+            let diagnostic = context
+                .diagnostics
+                .entries()
+                .iter()
+                .find(|diagnostic| diagnostic.message.contains("integer out of range"))
+                .expect("member parse failure warning");
+            assert_eq!(diagnostic.offset, Some(expected_offset as u64));
+            assert!(diagnostic.message.contains(&format!(
+                "object stream 8 (object 4 0, offset {expected_offset}):"
+            )));
         });
     }
 
