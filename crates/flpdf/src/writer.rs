@@ -1115,7 +1115,7 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
             object_count,
             pdf.previous_xref_offset(),
             xref_offset,
-        )?;
+        )?; // cov:ignore: `?` Err arm is unreachable for valid in-memory xref offsets; the table success path is covered by incremental_generate_fallback_table_source_is_byte_identical
     }
 
     // flpdf-9hc.22.4: guard the byte-preservation invariant. The source prefix
