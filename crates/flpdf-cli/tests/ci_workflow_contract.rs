@@ -117,10 +117,18 @@ fn shell_command_segments(line: &str) -> Vec<&str> {
                         start = index + 2;
                         characters.next();
                     }
+                    '&' => {
+                        segments.push(&line[start..index]);
+                        start = index + 1;
+                    }
                     '|' if line[index..].starts_with("||") => {
                         segments.push(&line[start..index]);
                         start = index + 2;
                         characters.next();
+                    }
+                    '|' => {
+                        segments.push(&line[start..index]);
+                        start = index + 1;
                     }
                     _ => {}
                 }
@@ -565,6 +573,24 @@ fn test_job_workspace_command_rejects_echo_segment_duplicate() {
 steps:
   - shell: bash
     run: echo pre; cargo test --workspace
+  - shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_pipe_segment_duplicate() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: echo pre | cargo test --workspace
   - shell: bash
     run: cargo test --workspace
 ",
