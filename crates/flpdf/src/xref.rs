@@ -2355,12 +2355,13 @@ mod tests {
 
     #[test]
     fn hybrid_xref_header_mismatch_requests_reconstruction_before_stream_read() {
-        let bytes = b" 3 0 obj\n999\nendobj\n";
+        let bytes = b" 3 0 obj\n999\n";
         let requested = ObjectRef::new(2, 0);
         let mut registration = XrefRegistration::default();
         registration.insert_xref_entry(requested, XrefEntry::Uncompressed { offset: 1 });
         let mut trailer = Dictionary::new();
         trailer.insert("XRefStm", Object::Reference(requested));
+        let mut diagnostics = Diagnostics::default();
         let mut loaded = LoadedXrefState {
             loaded: LoadedXref {
                 version: "1.7".to_string(),
@@ -2385,12 +2386,153 @@ mod tests {
                 ..XrefLoadOptions::default()
             },
             &mut registration,
-            None,
+            Some(&mut diagnostics),
             XrefReadContextSpec::ActiveSection,
         )
         .expect_err("a hybrid /XRefStm header mismatch must trigger reconstruction");
 
         assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn hybrid_xref_invalid_offset_forwards_holder_diagnostics_to_sink() {
+        let bytes = b" 2 0 obj\n/not-an-offset\n";
+        let referenced = ObjectRef::new(2, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(referenced, XrefEntry::Uncompressed { offset: 1 });
+        let mut trailer = Dictionary::new();
+        trailer.insert("XRefStm", Object::Reference(referenced));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+        let mut diagnostics = Diagnostics::default();
+
+        let error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a non-integer /XRefStm must fail");
+
+        assert_eq!(error.to_string(), "parse error at byte 0: invalid /XRefStm");
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn hybrid_xref_negative_offset_forwards_holder_diagnostics_to_sink() {
+        let bytes = b" 2 0 obj\n-1\n";
+        let referenced = ObjectRef::new(2, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(referenced, XrefEntry::Uncompressed { offset: 1 });
+        let mut trailer = Dictionary::new();
+        trailer.insert("XRefStm", Object::Reference(referenced));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+        let mut diagnostics = Diagnostics::default();
+
+        let error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a negative /XRefStm must fail as an invalid seek");
+
+        assert!(error.to_string().contains("before the file start"));
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn hybrid_xref_stream_failure_forwards_stream_diagnostics_to_sink() {
+        let bytes = b" 3 0 obj\n<< /NotXRef true >>\n";
+        let mut trailer = Dictionary::new();
+        trailer.insert("XRefStm", Object::Integer(1));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+        let mut registration = XrefRegistration::default();
+        let mut diagnostics = Diagnostics::default();
+
+        let error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a non-stream hybrid object must fail xref-stream parsing");
+
+        assert_eq!(error.to_string(), "parse error at byte 1: xref not found");
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
     }
 
     #[test]
