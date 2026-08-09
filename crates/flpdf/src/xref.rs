@@ -205,12 +205,16 @@ impl<'a> XrefReadContext<'a> {
     ) -> Result<FileObjectRead> {
         // qpdf's `readObjectAtOffset` checks the expected object generation
         // (`QPDF.cc:1591-1612`) immediately after reading the indirect-object
-        // header, before `readObject` parses the body. In strict mode qpdf
-        // warns and continues parsing the object, so emit that warning before
-        // the body diagnostics. Recovery keeps the established bootstrap
-        // reconstruction sequence below.
+        // header, before `readObject` parses the body. It rejects object ID 0
+        // (`QPDF.cc:1599-1605`) before that expected-reference comparison. In
+        // strict mode qpdf warns and continues parsing a nonzero mismatch, so
+        // emit that warning before the body diagnostics. Recovery keeps the
+        // established bootstrap reconstruction sequence below.
         if !self.options.allow_repair && policy != RecoveryPolicy::Bounded {
             let actual_object_ref = parse_file_object_header(input)?;
+            if actual_object_ref.number == 0 {
+                return Err(Error::parse(absolute_offset as usize, "object with ID 0"));
+            }
             if actual_object_ref != object_ref {
                 let message = format!(
                     "expected {} {} obj",
@@ -2740,6 +2744,32 @@ mod tests {
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>(),
             ["(object 1 0, offset 1): expected 1 0 obj"]
+        );
+        assert_eq!(context.diagnostics.entries()[0].offset, Some(1));
+    }
+
+    #[test]
+    fn bootstrap_object_zero_header_in_strict_mode_warns_and_resolves_null() {
+        let bytes = b" 0 0 obj\n42\nendobj\n";
+        let requested = ObjectRef::new(1, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(requested, XrefEntry::Uncompressed { offset: 1 });
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(requested), Object::Null);
+        assert_eq!(
+            context
+                .diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["parse error at byte 1: object with ID 0"]
         );
         assert_eq!(context.diagnostics.entries()[0].offset, Some(1));
     }
