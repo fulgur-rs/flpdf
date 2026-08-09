@@ -23,8 +23,6 @@ use crate::XrefEntry;
 pub(crate) struct EligibilityContext {
     /// The indirect reference of the encryption dictionary, if any.
     pub encryption_ref: Option<ObjectRef>,
-    /// The indirect reference of the linearization parameter dictionary, if any.
-    pub linearization_param_ref: Option<ObjectRef>,
 }
 
 // ── Predicate ────────────────────────────────────────────────────────────────
@@ -38,7 +36,6 @@ pub(crate) struct EligibilityContext {
 /// 3. The object is a dictionary with `/Type /ObjStm` — no nested ObjStm.
 /// 4. The object is a dictionary with `/Type /XRef` — xref streams must be direct.
 /// 5. `object_ref` is the encryption dictionary reference.
-/// 6. `object_ref` is the linearization parameter dictionary reference.
 pub(crate) fn is_eligible_for_objstm(
     object_ref: ObjectRef,
     object: &Object,
@@ -66,26 +63,19 @@ pub(crate) fn is_eligible_for_objstm(
         return false;
     }
 
-    // 6. Linearization parameter dictionary must not be embedded.
-    if Some(object_ref) == ctx.linearization_param_ref {
-        return false;
-    }
-
     true
 }
 
 // ── Context builder ──────────────────────────────────────────────────────────
 
-/// Build an [`EligibilityContext`] by querying `pdf` for the encryption and
-/// linearization parameter references.  Must be called once before processing
-/// any objects; the result is then used with [`is_eligible_for_objstm`] which
-/// is a pure function.
+/// Build an eligibility context by querying pdf for the encryption reference.
+/// Must be called once before processing any objects; the result is then used
+/// with is_eligible_for_objstm, which is a pure function.
 pub(crate) fn eligibility_context<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<EligibilityContext> {
     Ok(EligibilityContext {
         encryption_ref: pdf.encryption_ref(),
-        linearization_param_ref: pdf.linearized_hint_ref()?,
     })
 }
 
@@ -232,6 +222,34 @@ pub(crate) fn plan_object_streams<R: std::io::Read + std::io::Seek>(
         ),
         ObjectStreamMode::Generate => plan_generate(pdf, config, &ctx, &length_exclusions),
     }
+}
+
+/// Apply qpdf's output-mode ObjStm exclusions after membership planning.
+///
+/// This mirrors QPDFWriter.cc:2141-2160: linearized output removes page
+/// dictionaries and the root Catalog; encrypted output removes the root
+/// Catalog. The input document's linearization state is deliberately not
+/// consulted here.
+pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>(
+    pdf: &mut crate::Pdf<R>,
+    batches: &mut Vec<Vec<ObjectRef>>,
+    output_linearized: bool,
+    output_encrypted: bool,
+) -> crate::Result<()> {
+    let root = (output_linearized || output_encrypted)
+        .then(|| pdf.root_ref())
+        .flatten();
+    let page_refs: BTreeSet<ObjectRef> = if output_linearized {
+        crate::pages::page_refs(pdf)?.into_iter().collect()
+    } else {
+        BTreeSet::new()
+    };
+
+    for batch in batches.iter_mut() {
+        batch.retain(|member| root != Some(*member) && !page_refs.contains(member));
+    }
+    batches.retain(|batch| !batch.is_empty());
+    Ok(())
 }
 
 /// Reconstruct Preserve-mode source containers after filtering their members
@@ -843,7 +861,6 @@ mod tests {
     fn no_ctx() -> EligibilityContext {
         EligibilityContext {
             encryption_ref: None,
-            linearization_param_ref: None,
         }
     }
 
@@ -953,6 +970,12 @@ mod tests {
     /// between `N 0 obj\n` and `\nendobj`), `/Root 1 0 R`. Object numbers must be
     /// `1..=bodies.len()` and supplied in ascending order.
     fn pdf_from_bodies(bodies: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        pdf_from_bodies_with_root(bodies, 1)
+    }
+
+    /// Build the same fixture shape with an explicitly selected trailer root.
+    /// This permits malformed object 1 to remain present but unreachable.
+    fn pdf_from_bodies_with_root(bodies: &[(u32, Vec<u8>)], root: u32) -> Vec<u8> {
         let mut out: Vec<u8> = b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let total = bodies.len() as u32 + 1; // + free object 0
         let mut offsets: Vec<usize> = vec![0; total as usize];
@@ -968,9 +991,76 @@ mod tests {
         for num in 1..total {
             out.extend_from_slice(format!("{:010} 00000 n \n", offsets[num as usize]).as_bytes());
         }
-        out.extend_from_slice(format!("trailer\n<< /Size {total} /Root 1 0 R >>\n").as_bytes());
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {total} /Root {root} 0 R >>\n").as_bytes(),
+        );
         out.extend_from_slice(format!("startxref\n{xref_start}\n%%EOF\n").as_bytes());
         out
+    }
+
+    #[test]
+    fn eligibility_context_ignores_unreachable_malformed_object_one() {
+        let bytes = pdf_from_bodies_with_root(
+            &[
+                (1, b"<< /Broken".to_vec()),
+                (
+                    2,
+                    b"<< /Type /Catalog /Pages 3 0 R /Child 4 0 R >>".to_vec(),
+                ),
+                (3, b"<< /Type /Pages /Count 1 /Kids [ 4 0 R ] >>".to_vec()),
+                (
+                    4,
+                    b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+                ),
+            ],
+            2,
+        );
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+
+        let context = eligibility_context(&mut pdf)
+            .expect("base eligibility must not inspect unreachable object 1");
+
+        assert_eq!(context.encryption_ref, None);
+    }
+
+    #[test]
+    fn generate_rewrite_ignores_unreachable_malformed_object_one() {
+        let bytes = pdf_from_bodies_with_root(
+            &[
+                (1, b"<< /Broken".to_vec()),
+                (
+                    2,
+                    b"<< /Type /Catalog /Pages 3 0 R /Child 4 0 R >>".to_vec(),
+                ),
+                (3, b"<< /Type /Pages /Count 1 /Kids [ 4 0 R ] >>".to_vec()),
+                (
+                    4,
+                    b"<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>".to_vec(),
+                ),
+            ],
+            2,
+        );
+        let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
+        let options = crate::WriteOptions {
+            full_rewrite: true,
+            object_streams: ObjectStreamMode::Generate,
+            static_id: true,
+            ..crate::WriteOptions::default()
+        };
+        let mut output = Vec::new();
+
+        crate::write_pdf_with_options(&mut pdf, &mut output, &options)
+            .expect("unreachable malformed object must not block qpdf-style rewrite");
+
+        assert!(
+            !output
+                .windows(b"/Broken".len())
+                .any(|window| window == b"/Broken"),
+            "unreachable malformed object must not be emitted"
+        );
+        let mut rewritten = crate::Pdf::open(std::io::Cursor::new(output)).unwrap();
+        assert!(rewritten.root_ref().is_some());
+        assert_eq!(crate::pages::page_refs(&mut rewritten).unwrap().len(), 1);
     }
 
     /// One-page document whose page `/Contents` is a stream (obj 4); the stream
@@ -1453,20 +1543,33 @@ mod tests {
     fn encryption_dict_ref_is_ineligible() {
         let ctx = EligibilityContext {
             encryption_ref: Some(ref0(5)),
-            linearization_param_ref: None,
         };
         let obj = Object::Null;
         assert!(!is_eligible_for_objstm(ref0(5), &obj, &ctx));
     }
 
     #[test]
-    fn linearization_param_dict_ref_is_ineligible() {
-        let ctx = EligibilityContext {
-            encryption_ref: None,
-            linearization_param_ref: Some(ref0(7)),
-        };
-        let obj = Object::Null;
-        assert!(!is_eligible_for_objstm(ref0(7), &obj, &ctx));
+    fn output_mode_filter_matches_qpdf_exclusions() {
+        let mut pdf = open_pdf(reverse_kids_pdf(1));
+        let root = pdf.root_ref().expect("fixture root");
+        let page = crate::pages::page_refs(&mut pdf).unwrap()[0];
+        let child = ref0(99);
+
+        let mut plain = vec![vec![root, page, child]];
+        filter_objstm_batches_for_output(&mut pdf, &mut plain, false, false).unwrap();
+        assert_eq!(plain, vec![vec![root, page, child]]);
+
+        let mut encrypted = vec![vec![root, page, child]];
+        filter_objstm_batches_for_output(&mut pdf, &mut encrypted, false, true).unwrap();
+        assert_eq!(encrypted, vec![vec![page, child]]);
+
+        let mut linearized = vec![vec![root, page, child]];
+        filter_objstm_batches_for_output(&mut pdf, &mut linearized, true, false).unwrap();
+        assert_eq!(linearized, vec![vec![child]]);
+
+        let mut empty = vec![Vec::new(), vec![root]];
+        filter_objstm_batches_for_output(&mut pdf, &mut empty, false, true).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

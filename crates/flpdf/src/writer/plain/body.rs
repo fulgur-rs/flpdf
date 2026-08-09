@@ -181,9 +181,6 @@ fn planned_member_body_violation(
     if context.encryption_ref == Some(source) {
         return Some("encryption dictionary");
     }
-    if context.linearization_param_ref == Some(source) {
-        return Some("linearization parameter dictionary");
-    }
     None
 }
 
@@ -400,7 +397,6 @@ mod tests {
         let object = Object::Null;
         let ordinary = object_streams::EligibilityContext {
             encryption_ref: None,
-            linearization_param_ref: None,
         };
         assert_eq!(
             planned_member_body_violation(source, crate::ObjectRef::new(2, 1), &object, &ordinary,),
@@ -409,25 +405,10 @@ mod tests {
 
         let encrypted = object_streams::EligibilityContext {
             encryption_ref: Some(source),
-            linearization_param_ref: None,
         };
         assert_eq!(
             planned_member_body_violation(source, crate::ObjectRef::new(2, 0), &object, &encrypted,),
             Some("encryption dictionary")
-        );
-
-        let linearized = object_streams::EligibilityContext {
-            encryption_ref: None,
-            linearization_param_ref: Some(source),
-        };
-        assert_eq!(
-            planned_member_body_violation(
-                source,
-                crate::ObjectRef::new(2, 0),
-                &object,
-                &linearized,
-            ),
-            Some("linearization parameter dictionary")
         );
     }
 }
