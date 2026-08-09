@@ -127,6 +127,7 @@ struct XrefReadContext<'a> {
     cache: BTreeMap<ObjectRef, Object>,
     resolving: BTreeSet<ObjectRef>,
     diagnostics: Diagnostics,
+    reconstruction_trigger: Option<(u64, String)>,
 }
 
 impl<'a> XrefReadContext<'a> {
@@ -164,6 +165,7 @@ impl<'a> XrefReadContext<'a> {
             cache: BTreeMap::new(),
             resolving: BTreeSet::new(),
             diagnostics: Diagnostics::default(),
+            reconstruction_trigger: None,
         }
     }
 
@@ -210,6 +212,15 @@ impl<'a> XrefReadContext<'a> {
         if completed.object_ref != object_ref
             && (self.options.allow_repair || policy == RecoveryPolicy::Bounded)
         {
+            if self.reconstruction_trigger.is_none() {
+                self.reconstruction_trigger = Some((
+                    absolute_offset,
+                    format!(
+                        "expected {} {} obj",
+                        object_ref.number, object_ref.generation
+                    ),
+                ));
+            }
             return Err(Error::parse(
                 0,
                 format!(
@@ -290,10 +301,16 @@ impl<'a> XrefReadContext<'a> {
                                 self.resolve_value(&completed.object)
                             }
                             Err(error) => {
-                                self.diagnostics.push(Diagnostic::warning(
-                                    error.to_string(),
-                                    Some(start as u64),
-                                ));
+                                let deferred_to_reconstruction = self
+                                    .reconstruction_trigger
+                                    .as_ref()
+                                    .is_some_and(|(offset, _)| *offset == start as u64);
+                                if !deferred_to_reconstruction {
+                                    self.diagnostics.push(Diagnostic::warning(
+                                        error.to_string(),
+                                        Some(start as u64),
+                                    ));
+                                }
                                 Object::Null
                             }
                         }
@@ -336,6 +353,12 @@ impl<'a> XrefReadContext<'a> {
         for diagnostic in self.diagnostics.entries() {
             diagnostics.push(diagnostic.clone());
         }
+    }
+
+    fn take_reconstruction_trigger(&mut self) -> Option<Error> {
+        self.reconstruction_trigger
+            .take()
+            .map(|(offset, message)| Error::parse(offset as usize, message))
     }
 }
 
@@ -601,10 +624,12 @@ fn merge_xref_stream_from_classic_trailer(
     }
 
     let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
-    let Some(xref_stream_offset) = context
-        .resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm")
-        .and_then(|value| value.as_integer())
-    else {
+    let xref_stream_value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
+    if let Some(error) = context.take_reconstruction_trigger() {
+        context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
+        return Err(error);
+    }
+    let Some(xref_stream_offset) = xref_stream_value.and_then(|value| value.as_integer()) else {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
         return Err(Error::parse(classic_xref_pos, "invalid /XRefStm"));
     };
@@ -668,15 +693,19 @@ fn merge_previous_xref_sections(
 ) -> Result<()> {
     let mut visited = HashSet::new();
     let mut section_context_spec = context_spec;
-    let (mut previous_offset, previous_diagnostics) = resolve_previous_xref_offset(
-        bytes,
-        options,
-        registration,
-        section_context_spec,
-        &loaded.loaded.trailer,
-    );
+    let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
+        resolve_previous_xref_offset(
+            bytes,
+            options,
+            registration,
+            section_context_spec,
+            &loaded.loaded.trailer,
+        );
     for diagnostic in previous_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+    }
+    if let Some(error) = reconstruction_trigger {
+        return Err(error);
     }
 
     while let Some(offset) = previous_offset {
@@ -724,15 +753,19 @@ fn merge_previous_xref_sections(
                 XrefReadContextSpec::PreviousSection
             }
         };
-        let (next_previous_offset, previous_diagnostics) = resolve_previous_xref_offset(
-            bytes,
-            options,
-            registration,
-            section_context_spec,
-            &previous.loaded.trailer,
-        );
+        let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
+            resolve_previous_xref_offset(
+                bytes,
+                options,
+                registration,
+                section_context_spec,
+                &previous.loaded.trailer,
+            );
         for diagnostic in previous_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        if let Some(error) = reconstruction_trigger {
+            return Err(error);
         }
         previous_offset = next_previous_offset;
     }
@@ -748,14 +781,15 @@ fn resolve_previous_xref_offset(
     registration: &XrefRegistration,
     context_spec: XrefReadContextSpec<'_>,
     trailer: &Dictionary,
-) -> (Option<u64>, Diagnostics) {
+) -> (Option<u64>, Diagnostics, Option<Error>) {
     let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
     let offset = context
         .resolve_dictionary_value(trailer, "Prev")
         .and_then(|offset| parse_non_negative_u64(&offset, "/Prev").ok())
         .filter(|&offset| offset != 0);
+    let reconstruction_trigger = context.take_reconstruction_trigger();
     let diagnostics = context.diagnostics.clone();
-    (offset, diagnostics)
+    (offset, diagnostics, reconstruction_trigger)
 }
 
 fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
@@ -1239,6 +1273,12 @@ fn find_xref_stream_trailer_candidate(
         let parsed = if let Some(cached) = context.cache.get(&object_ref).cloned() {
             Some(cached)
         } else {
+            // qpdf's `getObjectByObjGen` enters the normal resolve path before
+            // candidate inspection (`QPDF.cc:585-589`). Keep this candidate
+            // marked as active while its dictionary is parsed so a
+            // self-referential `/Length` reaches the same cycle guard as any
+            // other indirect stream read.
+            context.resolving.insert(object_ref);
             let parsed = match context.read_file_object_for_reference(
                 &bytes[start..window_end],
                 offset,
@@ -1264,17 +1304,27 @@ fn find_xref_stream_trailer_candidate(
                 }
                 Err(_) => None,
             };
+            let cached_during_read = context.cache.get(&object_ref).cloned();
+            context.resolving.remove(&object_ref);
             match parsed {
                 Some(mut completed) => {
                     let _ = completed.remove_included_recovery_eol_for_decryption();
                     let object = completed.object;
-                    context.cache.insert(object_ref, object.clone());
-                    Some(object)
+                    match cached_during_read {
+                        Some(cached) => Some(cached),
+                        None => {
+                            context.cache.insert(object_ref, object.clone());
+                            Some(object)
+                        }
+                    }
                 }
-                None => {
-                    context.cache.insert(object_ref, Object::Null);
-                    None
-                }
+                None => match cached_during_read {
+                    Some(cached) => Some(cached),
+                    None => {
+                        context.cache.insert(object_ref, Object::Null);
+                        None
+                    }
+                },
             }
         };
         append_new_context_diagnostics(
@@ -1659,8 +1709,20 @@ fn parse_xref_stream(
     };
 
     match build() {
-        Ok(state) => Ok(state),
+        Ok(state) => {
+            let Some(error) = context.take_reconstruction_trigger() else {
+                return Ok(state);
+            };
+            context.append_diagnostics_to(&mut repair_diagnostics);
+            if let Some(sink) = error_diagnostics_sink {
+                for diagnostic in repair_diagnostics.entries() {
+                    sink.push(diagnostic.clone());
+                }
+            }
+            Err(error)
+        }
         Err(error) => {
+            let error = context.take_reconstruction_trigger().unwrap_or(error);
             context.append_diagnostics_to(&mut repair_diagnostics);
             if let Some(sink) = error_diagnostics_sink {
                 for diagnostic in repair_diagnostics.entries() {
@@ -2240,11 +2302,83 @@ mod tests {
         );
 
         assert_eq!(context.resolve_reference(requested), Object::Null);
-        assert!(context
-            .diagnostics
-            .entries()
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("expected 1 0 obj")));
+        assert_eq!(
+            context
+                .take_reconstruction_trigger()
+                .expect("recovery-mode header mismatch must request reconstruction")
+                .to_string(),
+            "parse error at byte 1: expected 1 0 obj"
+        );
+    }
+
+    #[test]
+    fn bootstrap_header_mismatch_enters_xref_reconstruction() {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let old_only_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"5 0 obj\n(old revision)\nendobj\n");
+
+        let previous_xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 6\n");
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{old_only_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"trailer\n<< /Size 6 >>\n");
+
+        let previous_reference_offset = bytes.len() as u64;
+        bytes.extend_from_slice(format!("2 0 obj\n{previous_xref_offset}\nendobj\n").as_bytes());
+        let wrong_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"3 0 obj\n999\nendobj\n");
+        let root_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"4 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+        let active_xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 6\n");
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{wrong_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{wrong_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{root_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 6 /Root 4 0 R /Prev 2 0 R >>\nstartxref\n{active_xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+
+        let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true)
+            .expect("recovery must rebuild the table after an indirect /Prev mismatch");
+
+        assert_eq!(
+            loaded.entries.get(&ObjectRef::new(2, 0)),
+            Some(&XrefEntry::Uncompressed {
+                offset: previous_reference_offset
+            }),
+            "reconstruction must replace the stale offset for the indirect /Prev object"
+        );
+        assert_eq!(
+            loaded.entries.get(&ObjectRef::new(5, 0)),
+            Some(&XrefEntry::Uncompressed {
+                offset: old_only_offset
+            }),
+            "reconstruction must retain objects omitted by the active xref section"
+        );
+        assert_eq!(
+            loaded
+                .repair_diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "file is damaged",
+                "expected 2 0 obj",
+                "Attempting to reconstruct cross-reference table",
+            ]
+        );
     }
 
     #[test]
@@ -2646,6 +2780,41 @@ mod tests {
             1,
             "a cached reference read must not emit the target warning twice"
         );
+    }
+
+    #[test]
+    fn xref_stream_candidate_discovery_preserves_a_cyclic_null_cache() {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let candidate_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Length 1 0 R >>\nstream\n",
+        );
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let entries = BTreeMap::from([(
+            ObjectRef::new(1, 0),
+            XrefEntry::Uncompressed {
+                offset: candidate_offset,
+            },
+        )]);
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+
+        assert!(
+            candidate.is_none(),
+            "a self-referential stream length resolves to cached null, so the object is not a candidate"
+        );
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message == "loop detected resolving object 1 0"));
     }
 
     #[test]
