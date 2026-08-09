@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDF.cc xref loading and repair.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_qpdf_direct_object, Parser};
+use crate::parser::{parse_qpdf_file_object, Parser};
 use crate::reader::file_object::{
     finish_file_object, parse_file_object_header, parse_file_object_syntax, FileObjectDiagnostic,
     FileObjectRead, PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
@@ -463,8 +463,20 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                 ));
             }
 
-            let parsed = match parse_qpdf_direct_object(&decoded_stream_data[member_start..]) {
-                Ok(parsed) => parsed,
+            let parsed = match parse_qpdf_file_object(&decoded_stream_data[member_start..]) {
+                Ok((object, diagnostics)) => {
+                    for diagnostic in diagnostics {
+                        let offset = member_start.saturating_add(diagnostic.relative_offset);
+                        self.diagnostics.push(Diagnostic::warning(
+                            format!(
+                                "object stream {stream_number} (object {} 0, offset {offset}): {}",
+                                object_ref.number, diagnostic.message
+                            ),
+                            Some(offset as u64),
+                        ));
+                    }
+                    object
+                }
                 Err(error) => {
                     if !matches!(error, Error::Parse { .. }) {
                         return Err(error); // cov:ignore: byte-backed direct parser errors are parse errors
@@ -484,27 +496,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                     continue;
                 }
             };
-            if let Some(empty_offset) = parsed.empty_offset {
-                let diagnostic_offset = member_start.saturating_add(empty_offset);
-                self.diagnostics.push(Diagnostic::warning(
-                    format!(
-                        "object stream {stream_number} (object {} 0, offset {diagnostic_offset}): empty object treated as null",
-                        object_ref.number
-                    ),
-                    Some(diagnostic_offset as u64),
-                ));
-            }
-            for diagnostic in parsed.diagnostics {
-                let offset = member_start.saturating_add(diagnostic.relative_offset);
-                self.diagnostics.push(Diagnostic::warning(
-                    format!(
-                        "object stream {stream_number} (object {} 0, offset {offset}): {}",
-                        object_ref.number, diagnostic.message
-                    ),
-                    Some(offset as u64),
-                ));
-            }
-            self.cache.insert(object_ref, parsed.object);
+            self.cache.insert(object_ref, parsed);
         }
 
         Ok(())
@@ -3370,6 +3362,49 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("has wrong type")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_recovers_non_name_objstm_member_with_live_parser() {
+        let members = [(2, b"<< 12 >>".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            let object = context.resolve_reference(ObjectRef::new(2, 0));
+            assert_eq!(
+                object
+                    .as_dict()
+                    .and_then(|dictionary| dictionary.get("QPDFFake1")),
+                Some(&Object::Integer(12))
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("expected dictionary key but found non-name object")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_warns_and_caches_null_for_live_parser_error() {
+        let members = [(2, b"<< /Value 2147483648 0 R >>".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("integer out of range")));
         });
     }
 
