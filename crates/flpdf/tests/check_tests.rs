@@ -60,8 +60,9 @@ fn check_reports_linearized_pdf_warning() {
         .entries()
         .iter()
         .any(|entry| entry.severity == Severity::Warning && entry.message.contains("linearized")));
-    // The summary mirrors the structural detector: an object-(1,0) `/Linearized`
-    // dictionary is reported as linearized.
+    // The summary mirrors qpdf's structural detector: the first object carries
+    // a `/Linearized` dictionary. `/L` is intentionally absent because this
+    // test covers the check-layer warning, not the `/L` predicate itself.
     assert!(report.summary.expect("summary present").linearized);
 }
 
@@ -97,7 +98,7 @@ fn linearized_fixture_pdf() -> Vec<u8> {
     };
 
     add_object(
-        b"1 0 obj\n<< /Linearized 1 /L 100 /E 0 /N 1 /T 1 >>\nendobj\n",
+        b"1 0 obj\n<< /Linearized 1 /E 0 /N 1 /T 1 >>\nendobj\n",
         &mut bytes,
         &mut offsets,
     );

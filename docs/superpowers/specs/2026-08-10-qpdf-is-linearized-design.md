@@ -14,7 +14,9 @@ predicate; `/N`, `/O`, `/H`, `/T`, and `/P` belong to the separate
 
 ## Design
 
-Add one canonical reader-owned predicate and cut `check.rs` over to it:
+Add one canonical predicate owned by `linearization/check.rs` and cut the
+general `check.rs` route over to it. The resolver remains the only owner of
+the live source seek/read seam:
 
 1. Read the first 1024 logical bytes from the resolver source.
 2. Scan from the first digit and use the shared qpdf-shaped tokenizer to find
@@ -32,7 +34,9 @@ tokenizer. It must not introduce a new full-file buffer or build the predicate
 on the legacy bounded-window helper. Candidate resolution failures are
 translated to the qpdf observable false result; the existing check-layer
 diagnostic boundary remains responsible for any source-operation error that is
-still surfaced.
+still surfaced. Keeping the `Pdf` extension method in `linearization/check.rs`
+keeps the `QPDF_linearization.cc` responsibility out of the transitional
+`reader.rs` container while preserving the public `Pdf::is_linearized` API.
 
 ## Route cleanup
 

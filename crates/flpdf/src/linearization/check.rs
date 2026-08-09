@@ -1,5 +1,5 @@
-//! qpdf correspondence: QPDF_linearization.cc structural validation represented as a standalone checker.
-//! Linearization structural checker.
+//! qpdf correspondence: QPDF_linearization.cc `isLinearized` detection and structural validation represented as a standalone checker.
+//! Linearization detector and structural checker.
 //!
 //! This module validates that a PDF file conforms to the linearization layout
 //! described in ISO 32000-1 Annex F.  It is invoked by the `check-linearization`
@@ -29,7 +29,7 @@
 
 use crate::filters::decode_stream_data;
 use crate::pages::page_refs;
-use crate::{Object, ObjectRef, Pdf};
+use crate::{Object, ObjectRef, Pdf, Result};
 use std::fmt;
 use std::io::{BufReader, Read, Seek};
 
@@ -86,6 +86,71 @@ impl From<std::io::Error> for LinearizationCheckError {
 
 /// Shorthand result type for the checker.
 pub type CheckResult = std::result::Result<(), LinearizationCheckError>;
+
+impl<R: Read + Seek> Pdf<R> {
+    /// Return whether qpdf would classify this document as linearized.
+    ///
+    /// This ports `QPDF::isLinearized` from
+    /// `libqpdf/QPDF_linearization.cc:84-155`: only the first 1024-byte
+    /// candidate scan, `/Linearized`, and integer `/L` participate. Candidate
+    /// resolution failures become `false`, as qpdf's `QPDF::resolve` converts
+    /// damaged objects to null (`libqpdf/QPDF.cc:1700-1753`).
+    ///
+    /// The predicate lives with the `QPDF_linearization.cc` responsibility;
+    /// the source seek/read seam remains owned by the canonical resolver.
+    /// The deeper `/N`, `/O`, `/H`, `/T`, and `/P` checks belong to this
+    /// module's [`check_linearization`] analogue.
+    pub fn is_linearized(&mut self) -> Result<bool> {
+        let Some(object_number) = self.resolver.linearization_candidate()? else {
+            return Ok(false);
+        };
+        let Ok(object_number) = u32::try_from(object_number) else {
+            return Ok(false);
+        };
+        if object_number == 0 {
+            return Ok(false);
+        }
+
+        let candidate = self.get_object_handle(ObjectRef::new(object_number, 0));
+        if !matches!(candidate.try_as_dictionary(), Ok(Some(_))) {
+            return Ok(false);
+        }
+
+        let linearized = match candidate.try_get_key(b"Linearized") {
+            Ok(value) => value,
+            Err(_) => return Ok(false),
+        };
+        if linearized.try_dereference().is_err() {
+            return Ok(false);
+        }
+        let Some(value) = linearized
+            .as_integer()
+            .map(|value| value as f64)
+            .or_else(|| linearized.as_real())
+        else {
+            return Ok(false);
+        };
+        if !value.is_finite() || value.floor() != 1.0 {
+            return Ok(false);
+        }
+
+        let l_value = match candidate.try_get_key(b"L") {
+            Ok(value) => value,
+            Err(_) => return Ok(false),
+        };
+        if l_value.try_dereference().is_err() {
+            return Ok(false);
+        }
+        if let Some(l_value) = l_value.as_integer() {
+            let file_size = self.resolver.source_length()?;
+            if l_value < 0 || l_value as u64 != file_size {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -757,6 +822,152 @@ mod tests {
         );
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
+    }
+
+    /// Build a minimal PDF whose first physical object is object `(3, 0)` and
+    /// carries the supplied linearization dictionary entries.
+    fn linearized_like_pdf_bytes(
+        linearized: &[u8],
+        l_literal: Option<&[u8]>,
+        prefix: &[u8],
+    ) -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        pdf.extend_from_slice(prefix);
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(b"3 0 obj\n<< /Linearized ");
+        pdf.extend_from_slice(linearized);
+        if let Some(l_literal) = l_literal {
+            pdf.extend_from_slice(b" /L ");
+            pdf.extend_from_slice(l_literal);
+        }
+        pdf.extend_from_slice(b" /N 0 /O 0 /H [0 0] /T 0 /P 0 >>\nendobj\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    const LINEARIZED_L_MARKER: &[u8] = b"00000000000000000000";
+
+    fn set_linearized_l(bytes: &mut [u8], value: u64) {
+        let marker_start = bytes
+            .windows(b"/L ".len())
+            .position(|window| window == b"/L ")
+            .expect("linearization fixture has /L")
+            + b"/L ".len();
+        let encoded = format!("{value:020}");
+        bytes[marker_start..marker_start + LINEARIZED_L_MARKER.len()]
+            .copy_from_slice(encoded.as_bytes());
+    }
+
+    /// qpdf accepts `/Linearized` only when its numeric floor is exactly one.
+    /// It also ignores the deeper hint parameters, which belong to
+    /// `checkLinearization`, not `isLinearized`.
+    #[test]
+    fn is_linearized_uses_qpdf_numeric_floor_and_ignores_deeper_parameters() {
+        let mut below_one = Pdf::open_mem_owned(linearized_like_pdf_bytes(
+            b".9",
+            None,
+            b"7 8 not-an-object\n",
+        ))
+        .expect("open .9 PDF");
+        assert!(!below_one.is_linearized().expect("check .9"));
+
+        let mut one_or_above = Pdf::open_mem_owned(linearized_like_pdf_bytes(
+            b"1.9",
+            None,
+            b"7 8 not-an-object\n",
+        ))
+        .expect("open 1.9 PDF");
+        assert!(one_or_above.is_linearized().expect("check 1.9"));
+    }
+
+    #[test]
+    fn is_linearized_uses_first_object_number_instead_of_object_one() {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/compat/linearized-one-page.pdf"),
+        )
+        .expect("linearized fixture");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open linearized fixture");
+
+        assert!(pdf.is_linearized().expect("check linearized fixture"));
+    }
+
+    #[test]
+    fn is_linearized_requires_an_integer_l_to_match_the_file_size() {
+        let mut matching = linearized_like_pdf_bytes(b"1", Some(LINEARIZED_L_MARKER), &[]);
+        let matching_length = matching.len() as u64;
+        set_linearized_l(&mut matching, matching_length);
+        let mut matching = Pdf::open_mem_owned(matching).expect("open matching /L PDF");
+        assert!(matching.is_linearized().expect("check matching /L"));
+
+        let mut mismatch = linearized_like_pdf_bytes(b"1", Some(LINEARIZED_L_MARKER), &[]);
+        let mismatch_length = mismatch.len() as u64;
+        set_linearized_l(&mut mismatch, mismatch_length + 1);
+        let mut mismatch = Pdf::open_mem_owned(mismatch).expect("open mismatching /L PDF");
+        assert!(!mismatch.is_linearized().expect("check mismatching /L"));
+
+        let mut non_integer_l =
+            Pdf::open_mem_owned(linearized_like_pdf_bytes(b"1", Some(b"1.5"), &[]))
+                .expect("open non-integer /L PDF");
+        assert!(non_integer_l.is_linearized().expect("check non-integer /L"));
+    }
+
+    #[test]
+    fn is_linearized_rejects_candidates_after_the_first_1024_bytes() {
+        let prefix = vec![b'x'; 1024];
+        let mut pdf = Pdf::open_mem_owned(linearized_like_pdf_bytes(b"1", None, &prefix))
+            .expect("open late-candidate PDF");
+
+        assert!(!pdf
+            .is_linearized()
+            .expect("late candidate is outside the scan"));
+    }
+
+    #[test]
+    fn is_linearized_rejects_a_non_dictionary_first_candidate() {
+        let mut bytes = linearized_like_pdf_bytes(b"1", None, &[]);
+        let marker = b"<< /Linearized";
+        let marker_start = bytes
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("linearization dictionary marker")
+            + b"<<".len();
+        bytes[marker_start..marker_start + 2].copy_from_slice(b"42");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open non-dictionary PDF");
+
+        assert!(!pdf
+            .is_linearized()
+            .expect("non-dictionary candidate is false"));
+    }
+
+    #[test]
+    fn is_linearized_returns_false_for_an_unresolvable_first_candidate() {
+        let mut pdf = Pdf::open_mem_owned(linearized_like_pdf_bytes(
+            b"1",
+            None,
+            b"99 0 obj\n<< /Linearized 1 >>\nendobj\n",
+        ))
+        .expect("open unresolved-candidate PDF");
+
+        assert!(!pdf
+            .is_linearized()
+            .expect("unresolved candidate is not an error"));
     }
 
     fn build_linearized_bytes() -> Vec<u8> {

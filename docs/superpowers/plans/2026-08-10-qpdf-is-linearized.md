@@ -12,7 +12,7 @@
 - Run the focused test and confirm it fails against the current
   object-`(1, 0)` implementation before writing production code.
 
-## 2. Implement the qpdf-shaped detector
+## 2. Implement the qpdf-shaped detector in the linearization component
 
 - Add the smallest resolver/reader seam needed to read the first 1024 bytes
   through live seek/read operations and the existing tokenizer.
@@ -21,6 +21,9 @@
   failures to false, and apply only `/Linearized` and integer `/L` checks.
 - Preserve the existing source-error responsibility outside malformed candidate
   handling.
+- Keep the public `Pdf::is_linearized` extension method in
+  `crates/flpdf/src/linearization/check.rs`; `reader.rs` remains responsible
+  only for the resolver seam it exposes to this component.
 
 ## 3. Cut over and remove the bridge
 

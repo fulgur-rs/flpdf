@@ -193,12 +193,15 @@ fn linearize_generate_emits_objstm_and_roundtrips() {
     );
 
     // Structural sanity via flpdf's own checker (back_patch + xref
-    // consistency).  This is 5.8.2's "back_patch offsets remain consistent".
+    // consistency).  The qpdf-compatible shallow detector now recognizes the
+    // generated first-object dictionary, so the existing linearization advisory
+    // warning makes `check` exit 3; warning/exit policy remains owned by the
+    // downstream check-status slice.
     Command::cargo_bin("flpdf")
         .unwrap()
         .args(["check", out.to_str().unwrap()])
         .assert()
-        .success();
+        .code(3);
 }
 
 // ---------------------------------------------------------------------------

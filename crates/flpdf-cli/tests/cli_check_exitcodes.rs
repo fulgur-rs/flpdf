@@ -284,16 +284,16 @@ fn extension_level_pdf_bytes() -> Vec<u8> {
     pdf
 }
 
-/// Valid PDF whose first object (object 1) carries `/Linearized 1`. flpdf's
-/// structural detector (`Pdf::linearized_hint_ref`, object (1,0)) reports this
-/// as linearized, which pushes the "linearized PDF detected" advisory warning
-/// → exit 3. (Full qpdf-accurate linearization parity is tracked in flpdf-u1ro.)
+/// Valid PDF whose first object (object 1) carries `/Linearized 1` and an
+/// accurate `/L`. The detector reports it as linearized, which pushes the
+/// existing "linearized PDF detected" advisory warning → exit 3. The warning
+/// and exit-code policy is tracked separately in flpdf-u1ro.
 fn linearized_obj1_pdf_bytes() -> Vec<u8> {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.4\n");
     let off1 = pdf.len();
     pdf.extend_from_slice(
-        b"1 0 obj\n<< /Linearized 1 /L 0 /H [ 0 0 ] /O 4 /E 0 /N 1 /T 0 >>\nendobj\n",
+        b"1 0 obj\n<< /Linearized 1 /L 0000000000 /H [ 0 0 ] /O 4 /E 0 /N 1 /T 0 >>\nendobj\n",
     );
     let off2 = pdf.len();
     pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
@@ -313,6 +313,13 @@ fn linearized_obj1_pdf_bytes() -> Vec<u8> {
     pdf.extend_from_slice(
         format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
     );
+    let l_start = pdf
+        .windows(b"/L ".len())
+        .position(|window| window == b"/L ")
+        .expect("linearization fixture has /L")
+        + b"/L ".len();
+    let file_size = format!("{:010}", pdf.len());
+    pdf[l_start..l_start + file_size.len()].copy_from_slice(file_size.as_bytes());
     pdf
 }
 
