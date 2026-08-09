@@ -2040,9 +2040,10 @@ mod tests {
     use super::{
         append_xref_size_warning, find_xref_stream_trailer_candidate,
         load_xref_and_trailer_with_repair, load_xref_state_with_options,
+        merge_previous_xref_sections, parse_xref_index, parse_xref_stream,
         prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate, LoadedXref,
-        RecoveryPolicy, XrefForm, XrefLoadOptions, XrefReadContext, XrefReadContextSpec,
-        XrefRegistration,
+        LoadedXrefState, RecoveryPolicy, XrefForm, XrefLoadOptions, XrefReadContext,
+        XrefReadContextSpec, XrefRegistration,
     };
     use crate::{Diagnostic, Diagnostics, Dictionary, Object, ObjectRef, XrefEntry};
     use std::collections::{BTreeMap, BTreeSet};
@@ -2052,8 +2053,16 @@ mod tests {
     fn bootstrap_context_resolves_missing_and_free_references_to_null() {
         let missing = ObjectRef::new(9, 0);
         let freed = ObjectRef::new(10, 0);
+        let compressed = ObjectRef::new(11, 0);
         let mut registration = XrefRegistration::default();
         registration.insert_free_xref_entry(freed);
+        registration.insert_xref_entry(
+            compressed,
+            XrefEntry::Compressed {
+                stream: 12,
+                index: 0,
+            },
+        );
         let mut context = XrefReadContext::new(
             &[],
             XrefReadContextSpec::ActiveSection,
@@ -2063,7 +2072,155 @@ mod tests {
 
         assert_eq!(context.resolve_reference(missing), Object::Null);
         assert_eq!(context.resolve_reference(freed), Object::Null);
+        assert_eq!(context.resolve_reference(compressed), Object::Null);
         assert!(context.diagnostics.entries().is_empty());
+
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Index", Object::Reference(missing));
+        assert_eq!(
+            parse_xref_index(&mut context, &dictionary, 7).unwrap(),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn previous_reference_diagnostics_are_forwarded_before_the_section_read() {
+        let bytes = b" 5 0 obj\n999999\n";
+        let object_ref = ObjectRef::new(5, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 1 });
+
+        let mut trailer = Dictionary::new();
+        trailer.insert("Prev", Object::Reference(object_ref));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+
+        let error = merge_previous_xref_sections(
+            bytes,
+            "1.7",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the recovered /Prev value points beyond this fixture");
+
+        assert!(error
+            .to_string()
+            .contains("xref stream offset is beyond end of file"));
+        assert!(loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn previous_section_reference_diagnostics_are_forwarded_after_the_section_read() {
+        let mut bytes = b" ".to_vec();
+        let object_offset = bytes.len();
+        bytes.extend_from_slice(b"6 0 obj\n999999\n");
+        let xref_offset = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f \n6 1\n{object_offset:010} 00000 n \ntrailer\n<< /Size 7 /Prev 6 0 R >>\n"
+            )
+            .as_bytes(),
+        );
+
+        let mut trailer = Dictionary::new();
+        trailer.insert("Prev", Object::Integer(xref_offset as i64));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+        let mut registration = XrefRegistration::default();
+
+        let error = merge_previous_xref_sections(
+            &bytes,
+            "1.7",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the indirect /Prev value points beyond this fixture");
+
+        assert!(error
+            .to_string()
+            .contains("xref stream offset is beyond end of file"));
+        assert!(loaded
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn xref_stream_read_errors_forward_repair_diagnostics_to_the_sink() {
+        let mut bytes =
+            b"1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 2 /Length 6 0 R >>\nstream\ntruncated"
+                .to_vec();
+        let length_offset = bytes.len();
+        bytes.extend_from_slice(b"\n6 0 obj\n3\n");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(6, 0),
+            XrefEntry::Uncompressed {
+                offset: length_offset as u64 + 1,
+            },
+        );
+        let mut diagnostics = Diagnostics::default();
+
+        let error = parse_xref_stream(
+            &bytes,
+            0,
+            0,
+            "1.7".to_string(),
+            XrefLoadOptions::default(),
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a truncated stream cannot satisfy strict xref-stream framing");
+
+        assert!(error.to_string().contains("stream data exceeds input"));
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
     }
 
     #[test]
@@ -2479,11 +2636,7 @@ mod tests {
         let (candidate, diagnostics) =
             find_xref_stream_trailer_candidate(&bytes, &entries, XrefLoadOptions::default());
 
-        assert!(
-            candidate.is_some(),
-            "the indirect /Type must still find the candidate: {:?}",
-            diagnostics.entries()
-        );
+        assert!(candidate.is_some());
         assert_eq!(
             diagnostics
                 .entries()
