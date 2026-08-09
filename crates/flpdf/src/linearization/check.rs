@@ -948,6 +948,16 @@ mod tests {
     }
 
     #[test]
+    fn is_linearized_rejects_a_non_numeric_linearized_value() {
+        let mut pdf = Pdf::open_mem_owned(linearized_like_pdf_bytes(b"true", None, &[]))
+            .expect("open non-numeric /Linearized PDF");
+
+        assert!(!pdf
+            .is_linearized()
+            .expect("non-numeric /Linearized is false"));
+    }
+
+    #[test]
     fn is_linearized_uses_first_object_number_instead_of_object_one() {
         let bytes = std::fs::read(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

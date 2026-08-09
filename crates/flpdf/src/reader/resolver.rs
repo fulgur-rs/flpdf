@@ -1670,11 +1670,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 result
             };
 
-            match tokens {
-                Ok(Some(object_number)) => return Ok(Some(object_number)),
-                Ok(None) => continue,
-                Err(error) => return Err(error),
-            }
+            let Some(object_number) = tokens? else {
+                continue;
+            };
+            return Ok(Some(object_number));
         }
 
         Ok(None)
