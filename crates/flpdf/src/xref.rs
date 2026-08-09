@@ -634,7 +634,7 @@ fn merge_xref_stream_from_classic_trailer(
     let xref_stream_value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
     if let Some(error) = context.take_reconstruction_trigger() {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
-        if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+        if let Some(sink) = error_diagnostics_sink.as_mut() {
             for diagnostic in loaded.loaded.repair_diagnostics.entries() {
                 sink.push(diagnostic.clone());
             }
@@ -643,7 +643,7 @@ fn merge_xref_stream_from_classic_trailer(
     }
     let Some(xref_stream_offset) = xref_stream_value.and_then(|value| value.as_integer()) else {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
-        if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+        if let Some(sink) = error_diagnostics_sink.as_mut() {
             for diagnostic in loaded.loaded.repair_diagnostics.entries() {
                 sink.push(diagnostic.clone());
             }
@@ -661,7 +661,7 @@ fn merge_xref_stream_from_classic_trailer(
                 std::io::ErrorKind::InvalidInput,
                 format!("xref stream offset {xref_stream_offset} is before the file start"),
             ));
-            if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+            if let Some(sink) = error_diagnostics_sink.as_mut() {
                 for diagnostic in loaded.loaded.repair_diagnostics.entries() {
                     sink.push(diagnostic.clone());
                 }
@@ -685,7 +685,7 @@ fn merge_xref_stream_from_classic_trailer(
     ) {
         Ok(hybrid) => hybrid,
         Err(error) => {
-            if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+            if let Some(sink) = error_diagnostics_sink.as_mut() {
                 for diagnostic in loaded.loaded.repair_diagnostics.entries() {
                     sink.push(diagnostic.clone());
                 }
