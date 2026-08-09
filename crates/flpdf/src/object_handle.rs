@@ -349,14 +349,6 @@ pub(crate) enum ObjectDescription {
     Child(ChildDescription),
 }
 
-/// Escape literal dollar signs before an input description is embedded in a
-/// qpdf-style template. `$$` is decoded back to `$` by
-/// [`expand_description_template`], while unescaped `$PO`/`$OG` remain the
-/// parser-owned placeholders.
-pub(crate) fn escape_description_input(input: &str) -> String {
-    input.replace('$', "$$")
-}
-
 fn expand_description_template(
     template: &str,
     object_ref: Option<ObjectRef>,
@@ -380,45 +372,15 @@ fn expand_description_template(
         parsed_offset.to_string()
     };
 
-    let mut result = String::with_capacity(template.len());
-    let mut chars = template.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '$' {
-            result.push(ch);
-            continue;
-        }
-        match chars.next() {
-            Some('$') => result.push('$'),
-            Some('P') => match chars.next() {
-                Some('O') => result.push_str(&offset),
-                Some(next) => {
-                    result.push('$');
-                    result.push('P');
-                    result.push(next);
-                }
-                None => {
-                    result.push('$');
-                    result.push('P');
-                }
-            },
-            Some('O') => match chars.next() {
-                Some('G') => result.push_str(&og),
-                Some(next) => {
-                    result.push('$');
-                    result.push('O');
-                    result.push(next);
-                }
-                None => {
-                    result.push('$');
-                    result.push('O');
-                }
-            },
-            Some(next) => {
-                result.push('$');
-                result.push(next);
-            }
-            None => result.push('$'),
-        }
+    // qpdf's QPDFValue::getDescription performs one `find`/`replace` for
+    // each marker (`libqpdf/QPDFValue.cc:23-31`). There is no `$$` escape
+    // convention: unknown and repeated markers remain in the result.
+    let mut result = template.to_owned();
+    if let Some(position) = result.find("$OG") {
+        result.replace_range(position..position + 3, &og);
+    }
+    if let Some(position) = result.find("$PO") {
+        result.replace_range(position..position + 3, &offset);
     }
     result
 }
@@ -463,8 +425,11 @@ impl ObjectSlot {
                         result = parent_slot.borrow().get_description();
                     }
                     result.push_str(&child.static_descr);
-                    if result.contains("$VD") {
-                        result = result.replace("$VD", &child.var_descr);
+                    // qpdf's child branch replaces only the first marker in
+                    // the already-rendered parent/static string
+                    // (`libqpdf/QPDFValue.cc:52-54`).
+                    if let Some(position) = result.find("$VD") {
+                        result.replace_range(position..position + 3, &child.var_descr);
                     }
                     result
                 }
@@ -822,9 +787,9 @@ impl ObjectHandle {
     }
 
     /// Construct a direct handle wrapping an already-built [`ObjectValue`], at
-    /// the no-offset sentinel. Used by the resolution bridge
-    /// (`Pdf::lift`/`Pdf::lift_to_handle`) to wrap a value lifted from a
-    /// legacy [`crate::Object`] without going through one of the typed public
+    /// the no-offset sentinel. Used at the explicit raw-object materialization
+    /// boundary (`Pdf::lift`/`Pdf::lift_to_handle`) to wrap a value lifted from
+    /// a legacy [`crate::Object`] without going through one of the typed public
     /// factories above.
     pub(crate) fn from_value(value: ObjectValue) -> Self {
         Self::new_direct(value, NO_PARSED_OFFSET)
@@ -844,8 +809,8 @@ impl ObjectHandle {
     /// Consume a directly-constructed, exclusively-owned handle and return
     /// its value and parsed offset without cloning.
     ///
-    /// Used by the parser's top-level file-object handle entry point
-    /// (`parser::parse_qpdf_direct_object_handle`), which builds the
+    /// Used by the canonical parser's top-level file-object handle entry point
+    /// (`parser::parse_qpdf_direct_object_handle_with_diagnostics`), which builds the
     /// top-level value as a handle purely to reuse the same
     /// offset-assignment machinery as every nested child, then immediately
     /// unwraps it into the pre-existing indirect slot the resolved object
@@ -1119,14 +1084,6 @@ impl ObjectHandle {
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
         !matches!(self.0.borrow().state, ObjectState::NotYetResolved)
-    }
-
-    /// True only when the slot contains an actual resolved value. `Missing`
-    /// is intentionally excluded even though it is terminal for the public
-    /// null-like accessors; callers preserving an already-resolved legacy
-    /// value must not mistake that fallback state for a successful parse.
-    pub(crate) fn has_resolved_value(&self) -> bool {
-        matches!(self.0.borrow().state, ObjectState::Resolved(_))
     }
 
     /// Resolve this handle's own canonical slot in place, mirroring
@@ -10275,7 +10232,7 @@ mod warning_emission_tests {
     #[test]
     fn object_description_template_preserves_partial_and_unknown_markers() {
         let cases = [
-            ("$$", "$"),
+            ("$$", "$$"),
             ("$PX", "$PX"),
             ("$P", "$P"),
             ("$OX", "$OX"),
@@ -10289,6 +10246,16 @@ mod warning_emission_tests {
             handle.set_description(template.to_owned(), 300);
             assert_eq!(handle.description(), expected, "template {template:?}");
         }
+    }
+
+    #[test]
+    fn object_description_template_replaces_each_qpdf_marker_only_once() {
+        let handle = ObjectHandle::dictionary(vec![]);
+        handle.set_description("$$/$PO/$PO/$OG/$OG".to_owned(), 100);
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(SinklessResolver);
+        handle.promote_to_indirect(ObjectRef::new(5, 0), 1, Rc::downgrade(&resolver));
+
+        assert_eq!(handle.description(), "$$/102/$PO/5 0/$OG");
     }
 
     #[test]
@@ -10346,6 +10313,17 @@ mod warning_emission_tests {
             child.description(),
             "object 5 0 at offset 253 -> dictionary key /EF"
         );
+    }
+
+    #[test]
+    fn object_description_child_replaces_only_the_first_qpdf_marker() {
+        let parent = ObjectHandle::dictionary(vec![]);
+        parent.set_description("parent $VD".to_owned(), 253);
+
+        let child = ObjectHandle::null();
+        child.set_child_description(&parent, " -> dictionary key $VD", "/EF");
+
+        assert_eq!(child.description(), "parent /EF -> dictionary key $VD");
     }
 
     #[test]

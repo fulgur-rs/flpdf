@@ -1,18 +1,13 @@
-//! Public-API parity tests for `Pdf::resolve_object_handle` (the dual-write
-//! `ObjectHandle` resolution bridge) and, from the materialization bridge
-//! task onward, for `Pdf::resolve`/`Pdf::resolve_borrowed`/`Pdf::set_object`/
-//! `Pdf::delete_object` themselves once they are thin views over the same
-//! `ObjectHandle` graph: proves the public API reaches the same observable
-//! outcomes it always has — missing/dangling references resolve to null,
-//! compressed (ObjStm) members and cyclic indirect `/Length` streams resolve
-//! without erroring or hanging, repeated `get_object_handle` calls observe
-//! the same canonical, already-resolved state, and `resolve`/`set_object`
-//! round trip structurally.
+//! Public-API contract tests for canonical `Pdf::resolve_object_handle` and
+//! the explicit raw-`Object` compatibility boundary. The canonical tests
+//! prove qpdf-shaped lazy resolution directly: missing/dangling references
+//! resolve to null, compressed (ObjStm) members retain their source offsets,
+//! repaired cyclic indirect `/Length` streams recover through the canonical
+//! resolver, and repeated `get_object_handle` calls observe one cache.
 
 use flpdf::{Object, ObjectHandle, ObjectRef, Pdf};
 use std::fs::File;
 use std::io::BufReader;
-use std::rc::Rc;
 
 fn minimal_fixture_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf")
@@ -140,16 +135,10 @@ fn resolve_object_handle_resolves_a_dangling_reference_to_null() {
 /// (object 1's `/Length` points at object 2, object 2's `/Length` points
 /// back at object 1 — the same mutual-cycle fixture the legacy engine's own
 /// `qpdf_reader_bounds_unusable_indirect_length_recovery` test exercises)
-/// resolves without hanging or erroring through the new bridge. The
-/// untouched `Reserved`-state guard is what breaks the cycle; this proves it
-/// still works when reached via `resolve_object_handle` instead of
-/// `resolve`/`resolve_borrowed`.
-///
-/// Unlike Task 6 (where an indirect stream lifted to `ObjectValue::Null`,
-/// since `Pdf::lift` does not convert `Object::Stream`), this task's native
-/// parse for the plain uncompressed-file-object case builds a real
-/// `ObjectValue::Stream` — so the object under test here resolves to the
-/// actual (cycle-recovered) stream payload, not null.
+/// resolves without hanging or erroring through the canonical resolver when
+/// qpdf-style repair is enabled. The untouched `Reserved`-state guard breaks
+/// the cycle; `recoverStreamLength` then records the bytes through the lazy
+/// source stream rather than eagerly materializing a replacement buffer.
 #[test]
 fn resolve_object_handle_survives_a_cyclic_indirect_stream_length() {
     let bytes = classic_pdf_with_bodies(
@@ -159,18 +148,31 @@ fn resolve_object_handle_survives_a_cyclic_indirect_stream_length() {
         ],
         ObjectRef::new(1, 0),
     );
-    let mut pdf = Pdf::open_mem_owned(bytes).expect("open cyclic-length fixture");
+    let mut pdf = Pdf::open_mem_owned_with_options(
+        bytes,
+        flpdf::PdfOpenOptions {
+            repair: true,
+            ..flpdf::PdfOpenOptions::default()
+        },
+    )
+    .expect("open cyclic-length fixture");
     let object_ref = ObjectRef::new(1, 0);
 
     let handle = pdf.get_object_handle(object_ref);
     pdf.resolve_object_handle(&handle)
         .expect("a cyclic indirect /Length must not error");
 
-    // The untouched legacy engine's cycle-recovered payload ("abc") and the
-    // new bridge's own materialized stream data must match.
-    let legacy = pdf.resolve(object_ref).expect("legacy resolve");
-    assert_eq!(legacy.as_stream().expect("stream").data, b"abc");
-    assert_eq!(handle.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
+    assert!(
+        handle.as_stream_data().is_none(),
+        "canonical qpdf streams retain source bytes lazily"
+    );
+    assert_eq!(
+        handle
+            .get_raw_stream_data()
+            .expect("recovered source stream")
+            .as_ref(),
+        b"abc\n"
+    );
 
     // The stream's own dictionary is a distinct, natively-parsed handle
     // (not folded into the stream value itself), and its /Length entry
@@ -469,7 +471,17 @@ fn stream_handle_and_its_dictionary_handle_have_distinct_offsets() {
     let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
     pdf.resolve_object_handle(&handle).expect("resolve stream");
 
-    assert_eq!(handle.as_stream_data(), Some(Rc::new(b"Hello".to_vec())));
+    assert!(
+        handle.as_stream_data().is_none(),
+        "canonical streams retain source bytes lazily"
+    );
+    assert_eq!(
+        handle
+            .get_raw_stream_data()
+            .expect("read source stream")
+            .as_ref(),
+        b"Hello"
+    );
     assert_eq!(handle.get_parsed_offset(), expected_stream_offset);
 
     let dict_handle = handle.as_stream_dict().expect("stream dictionary handle");
@@ -514,15 +526,11 @@ fn indirect_reference_child_is_the_canonical_handle_not_a_fresh_value() {
     assert_eq!(canonical.as_integer(), Some(99));
 }
 
-/// An ObjStm-member handle keeps the Task 6 `lift`-based route (offset `-1`
-/// always): full ObjStm-relative parsed-offset coordinate correctness is a
-/// later layer's scope, not this task's. Asserting the sentinel here (not
-/// merely "resolved without error") is the proof it took the `lift` route —
-/// the native route never leaves an `Integer` value at the sentinel offset,
-/// since every native-parsed scalar gets a real, non-negative offset from
-/// construction.
+/// A canonical ObjStm-member handle records the member's decoded-source
+/// offset. The fixture's `/First` is four bytes (`"2 0 "`), so object 2's
+/// integer begins at decoded offset four.
 #[test]
-fn compressed_object_stream_member_keeps_the_sentinel_offset_via_legacy_lift() {
+fn compressed_object_stream_member_records_its_canonical_member_offset() {
     let mut pdf = Pdf::open(std::io::Cursor::new(compressed_entry_pdf())).unwrap();
     let object_ref = ObjectRef::new(2, 0);
 
@@ -533,8 +541,8 @@ fn compressed_object_stream_member_keeps_the_sentinel_offset_via_legacy_lift() {
     assert_eq!(handle.as_integer(), Some(42));
     assert_eq!(
         handle.get_parsed_offset(),
-        -1,
-        "an ObjStm member must keep the no-offset sentinel in this task"
+        4,
+        "an ObjStm member keeps its decoded member-local offset"
     );
 }
 
@@ -555,25 +563,14 @@ fn real_literal_round_trips_through_native_parsing() {
 }
 
 // ---------------------------------------------------------------------
-// Task 7, Step 2b: cross-path parity — the drift tripwire.
-//
-// These compare `Pdf::resolve` (legacy) against `resolve_object_handle`
-// (native, for the Uncompressed case) at the public-API level, per the
-// plan's literal Step 2b list. Note that `resolve_object_handle` calls the
-// untouched `resolve_to_cache` engine *first* and propagates its error
-// via `?` before the native parse ever runs, so for malformed input these
-// two public entry points are *guaranteed* to agree here (both surface the
-// exact same underlying error) — that is still worth pinning as a
-// regression (a future edit could easily break the delegation), but the
-// real drift tripwire for the handle-producing container shells
-// themselves (`dictionary_handle`/`array_handle`/`object_handle`) is
-// `parser.rs`'s own `handle_path_parity_tests` module, which calls
-// `Parser::object` and `Parser::object_handle` directly and so actually
-// exercises the native path's own error arms.
+// Canonical parser recovery: malformed containers are qpdf-style nulls with
+// diagnostics. These tests deliberately do not call `Pdf::resolve`; the old
+// recursive handle parser was removed, and the live parser is now the sole
+// ObjectHandle implementation.
 // ---------------------------------------------------------------------
 
 #[test]
-fn cross_path_parity_unterminated_dictionary_matches_legacy_error() {
+fn canonical_unterminated_dictionary_resolves_to_null_with_diagnostics() {
     let bytes = classic_pdf_with_bodies(
         &[
             b"1 0 obj\n<< /A 1\nendobj\n".as_slice(),
@@ -581,54 +578,50 @@ fn cross_path_parity_unterminated_dictionary_matches_legacy_error() {
         ],
         ObjectRef::new(1, 0),
     );
-    let object_ref = ObjectRef::new(1, 0);
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open unterminated-dict fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle)
+        .expect("qpdf parser recovers an unterminated dictionary");
 
-    let legacy_error = pdf
-        .resolve(object_ref)
-        .expect_err("legacy must reject the unterminated dictionary")
-        .to_string();
-    assert!(
-        legacy_error.contains("expected byte 47"),
-        "unexpected legacy error: {legacy_error}"
-    );
-
-    let handle = pdf.get_object_handle(object_ref);
-    let native_error = pdf
-        .resolve_object_handle(&handle)
-        .expect_err("the native path must reject it identically")
-        .to_string();
-    assert_eq!(legacy_error, native_error);
+    assert!(handle.is_null());
+    let diagnostics = pdf.repair_diagnostics();
+    let messages: Vec<_> = diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert!(messages
+        .iter()
+        .any(|message| message == &"parse error while reading object"));
+    assert!(messages.iter().any(|message| message == &"unexpected EOF"));
 }
 
 #[test]
-fn cross_path_parity_unterminated_array_matches_legacy_error() {
+fn canonical_unterminated_array_resolves_to_null_with_diagnostics() {
     let bytes = classic_pdf_with_bodies(
         &[b"1 0 obj\n[1 2 3".as_slice(), b"2 0 obj\nnull\nendobj\n"],
         ObjectRef::new(1, 0),
     );
-    let object_ref = ObjectRef::new(1, 0);
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open unterminated-array fixture");
+    let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&handle)
+        .expect("qpdf parser recovers an unterminated array");
 
-    let legacy_error = pdf
-        .resolve(object_ref)
-        .expect_err("legacy must reject the unterminated array")
-        .to_string();
-    assert!(
-        legacy_error.contains("unexpected EOF in array"),
-        "unexpected legacy error: {legacy_error}"
-    );
-
-    let handle = pdf.get_object_handle(object_ref);
-    let native_error = pdf
-        .resolve_object_handle(&handle)
-        .expect_err("the native path must reject it identically")
-        .to_string();
-    assert_eq!(legacy_error, native_error);
+    assert!(handle.is_null());
+    let diagnostics = pdf.repair_diagnostics();
+    let messages: Vec<_> = diagnostics
+        .entries()
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    assert!(messages
+        .iter()
+        .any(|message| message == &"parse error while reading object"));
+    assert!(messages.iter().any(|message| message == &"unexpected EOF"));
 }
 
 #[test]
-fn cross_path_parity_nesting_past_max_parse_depth_matches_legacy_error() {
+fn canonical_nesting_past_max_parse_depth_resolves_to_null_with_warning() {
     // Matches the stack-budget reasoning in `parser.rs`'s own
     // `handle_path_parity_tests` module: constructing `ObjectHandle`s this
     // deep needs more stack than an unoptimized test binary's default
@@ -642,28 +635,21 @@ fn cross_path_parity_nesting_past_max_parse_depth_matches_legacy_error() {
             body.extend(std::iter::repeat_n(b']', depth));
             body.extend_from_slice(b"\nendobj\n");
             let bytes = classic_pdf_with_bodies(&[&body], ObjectRef::new(1, 0));
-            let object_ref = ObjectRef::new(1, 0);
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open deep-nesting fixture");
+            let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+            pdf.resolve_object_handle(&handle)
+                .expect("qpdf parser recovers excessive nesting");
 
-            let legacy_error = pdf
-                .resolve(object_ref)
-                .expect_err("legacy must reject nesting past MAX_PARSE_DEPTH")
-                .to_string();
-            assert!(
-                legacy_error.contains("object nesting too deep"),
-                "unexpected legacy error: {legacy_error}"
-            );
-
-            let handle = pdf.get_object_handle(object_ref);
-            let native_error = pdf
-                .resolve_object_handle(&handle)
-                .expect_err("the native path must reject it identically")
-                .to_string();
-            assert_eq!(legacy_error, native_error);
+            assert!(handle.is_null());
+            assert!(pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|entry| entry.message == "ignoring excessively deeply nested data structure"));
         })
         .expect("comparison thread must start")
         .join()
-        .expect("comparison must not overflow the stack");
+        .expect("canonical parser must not overflow the stack");
 }
 
 // ---------------------------------------------------------------------
