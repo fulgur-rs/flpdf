@@ -156,9 +156,50 @@ fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
         .sum()
 }
 
+fn bash_line_has_unquoted_operator_or_continuation(line: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in line.chars() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+
+                match character {
+                    '\\' => escaped = true,
+                    '\'' | '"' => quote = Some(character),
+                    ';' | '|' | '&' => return true,
+                    _ => {}
+                }
+            }
+            Some(_) => unreachable!("shell quote must be single or double"),
+        }
+    }
+
+    quote != Some('\'') && escaped
+}
+
 fn bash_run_has_control_flow(run: &str) -> bool {
     run.lines().map(str::trim).any(|line| {
-        line.contains("<<")
+        bash_line_has_unquoted_operator_or_continuation(line)
+            || line.contains("<<")
             || line.split_whitespace().next().is_some_and(|word| {
                 BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
             })
@@ -594,6 +635,23 @@ steps:
   - shell: bash
     run: cargo test --workspace
 ",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_conditional_continuation() {
+    let workflow = workspace_test_job_workflow(
+        r#"steps:
+  - shell: bash
+    run: |
+      true || \
+      cargo test --workspace
+"#,
     );
 
     assert!(
