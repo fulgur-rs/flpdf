@@ -1321,31 +1321,56 @@ fn best_effort_candidate_discovery_resolves_indirect_xref_length_before_recovery
 
     // The pinned qpdf oracle must also accept the repaired candidate. Keep the
     // probe optional for developer environments without qpdf, matching the
-    // existing differential tests in this suite.
-    if std::process::Command::new("qpdf")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
-        let path = directory.path().join("indirect-length-candidate.pdf");
-        std::fs::write(&path, &bytes).expect("write indirect-length candidate fixture");
-        let qpdf = std::process::Command::new("qpdf")
-            .arg("--show-xref")
-            .arg(&path)
-            .output()
-            .expect("run pinned qpdf --show-xref");
-        let stdout = String::from_utf8_lossy(&qpdf.stdout);
-        assert!(
-            stdout.contains(&format!("1/0: uncompressed; offset = {candidate_offset}")),
-            "qpdf --show-xref did not recover the candidate:\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&qpdf.stderr)
-        );
-        assert!(
-            stdout.contains(&format!("3/0: uncompressed; offset = {root_offset}")),
-            "qpdf --show-xref did not retain the resolved root:\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&qpdf.stderr)
-        );
+    // existing differential tests in this suite, but never treat an arbitrary
+    // qpdf version or an error exit as an oracle result.
+    let expected_qpdf_version = "qpdf version 11.9.0";
+    let qpdf_version = std::process::Command::new("qpdf").arg("--version").output();
+    match qpdf_version {
+        Ok(version)
+            if version.status.success()
+                && String::from_utf8_lossy(&version.stdout)
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim() == expected_qpdf_version) =>
+        {
+            let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+            let path = directory.path().join("indirect-length-candidate.pdf");
+            std::fs::write(&path, &bytes).expect("write indirect-length candidate fixture");
+            // The damaged startxref is intentional, so qpdf emits warnings.
+            // --warning-exit-0 makes the expected warning exit successful while
+            // still returning nonzero for an actual oracle failure.
+            let qpdf = std::process::Command::new("qpdf")
+                .args(["--warning-exit-0", "--show-xref"])
+                .arg(&path)
+                .output()
+                .expect("run pinned qpdf --show-xref");
+            assert!(
+                qpdf.status.success(),
+                "qpdf --show-xref failed (exit {:?}):\nstdout:\n{}\nstderr:\n{}",
+                qpdf.status.code(),
+                String::from_utf8_lossy(&qpdf.stdout),
+                String::from_utf8_lossy(&qpdf.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&qpdf.stdout);
+            assert!(
+                stdout.contains(&format!("1/0: uncompressed; offset = {candidate_offset}")),
+                "qpdf --show-xref did not recover the candidate:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&qpdf.stderr)
+            );
+            assert!(
+                stdout.contains(&format!("3/0: uncompressed; offset = {root_offset}")),
+                "qpdf --show-xref did not retain the resolved root:\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&qpdf.stderr)
+            );
+        }
+        Ok(version) => eprintln!(
+            "skipping qpdf 11.9.0 oracle probe: got {}",
+            String::from_utf8_lossy(&version.stdout)
+                .lines()
+                .next()
+                .unwrap_or("unrecognized version")
+        ),
+        Err(error) => eprintln!("skipping qpdf 11.9.0 oracle probe: {error}"),
     }
 
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
@@ -1355,11 +1380,99 @@ fn best_effort_candidate_discovery_resolves_indirect_xref_length_before_recovery
         loaded.trailer.get("Type"),
         Some(&Object::Name(b"XRef".to_vec()))
     );
-    assert!(loaded
+    let relevant_diagnostics: Vec<_> = loaded
         .repair_diagnostics
         .entries()
         .iter()
-        .all(|diagnostic| !diagnostic.message.contains("recovered stream length")));
+        .filter(|diagnostic| {
+            diagnostic.message.contains("stream length")
+                || diagnostic.message.ends_with("expected endstream")
+        })
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert!(
+        relevant_diagnostics.is_empty(),
+        "resolved indirect /Length must not trigger stream-boundary recovery: {relevant_diagnostics:?}"
+    );
+}
+
+#[test]
+fn best_effort_candidate_discovery_and_reentry_recover_mismatched_indirect_xref_length() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let candidate_offset = bytes.len() as u64;
+    let candidate_header =
+        b"1 0 obj\n<< /Type /XRef /Size 4 /Root 3 0 R /W [1 4 2] /Index [0 4] /Length 2 0 R >>\nstream\n";
+    let candidate_suffix = b"\nendstream\nendobj\n";
+    let holder_object = b"2 0 obj\n3\nendobj\n";
+    let root_object = b"3 0 obj\n<< /Type /Catalog >>\nendobj\n";
+    let stream_payload_len = 28u64;
+    let holder_offset = candidate_offset
+        + candidate_header.len() as u64
+        + stream_payload_len
+        + candidate_suffix.len() as u64;
+    let root_offset = holder_offset + holder_object.len() as u64;
+    let stream_payload = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, candidate_offset, 0),
+        (1, holder_offset, 0),
+        (1, root_offset, 0),
+    ]);
+    assert_eq!(stream_payload.len(), stream_payload_len as usize);
+    bytes.extend_from_slice(candidate_header);
+    bytes.extend_from_slice(&stream_payload);
+    bytes.extend_from_slice(candidate_suffix);
+    bytes.extend_from_slice(holder_object);
+    bytes.extend_from_slice(root_object);
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("reconstruction should recover a mismatched indirect /Length");
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert_eq!(
+        loaded.trailer.get("Type"),
+        Some(&Object::Name(b"XRef".to_vec()))
+    );
+
+    let recovered_diagnostics: Vec<_> = loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic.message.contains("recovered stream length")
+                || diagnostic.message.ends_with("expected endstream")
+                || diagnostic
+                    .message
+                    .ends_with("attempting to recover stream length")
+        })
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    let expected = vec![
+        format!(
+            "(object 1 0, offset {}): expected endstream",
+            candidate_offset + candidate_header.len() as u64 + 3
+        ),
+        format!(
+            "(object 1 0, offset {}): attempting to recover stream length",
+            candidate_offset + candidate_header.len() as u64
+        ),
+        format!(
+            "(object 1 0, offset {}): recovered stream length: 29",
+            candidate_offset + candidate_header.len() as u64
+        ),
+        format!(
+            "(object 1 0, offset {}): expected endstream",
+            candidate_offset + candidate_header.len() as u64 + 3
+        ),
+        format!(
+            "(object 1 0, offset {}): attempting to recover stream length",
+            candidate_offset + candidate_header.len() as u64
+        ),
+        format!(
+            "(object 1 0, offset {}): recovered stream length: 29",
+            candidate_offset + candidate_header.len() as u64
+        ),
+    ];
+    assert_eq!(recovered_diagnostics, expected);
 }
 
 /// Build a damaged document that strict parsing rejects (corrupt `xref` keyword)
