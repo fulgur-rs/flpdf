@@ -3296,6 +3296,17 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     }
     plan.batches.retain(|batch| !batch.is_empty());
 
+    // QPDFWriter.cc:2141-2160 removes output-sensitive members only after
+    // object-stream planning: encrypted output keeps the Catalog plain, while
+    // linearized output also keeps page dictionaries plain. This legacy route
+    // does not produce linearized output, so only output encryption applies.
+    object_streams::filter_objstm_batches_for_output(
+        pdf,
+        &mut plan.batches,
+        false,
+        options.encrypt.is_some(),
+    )?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
+
     // Xref form selection: ObjStm-resident objects need type-2 xref entries,
     // which can only live in xref streams.  When the planner emits any batch
     // we therefore force-upgrade to `Stream` even if the source used a

@@ -1997,8 +1997,8 @@ impl LinearizationPlan {
     /// # Invariants
     ///
     /// * No page dictionary or Catalog ref appears in any batch.
-    /// * Ineligible objects (streams, gen > 0, encryption dict, linearization
-    ///   param dict, `/Type /ObjStm`, `/Type /XRef`) are excluded via the
+    /// * Ineligible objects (streams, gen > 0, encryption dict, `/Type /ObjStm`,
+    ///   `/Type /XRef`) are excluded via the
     ///   shared [`is_eligible_for_objstm`] predicate.
     /// * Generate uses qpdf's fixed even split; Preserve retains source
     ///   container boundaries regardless of the configured planner cap.

@@ -607,6 +607,14 @@ fn generated_objstm_member_strings_are_encrypted_only_by_the_container() {
 
     let loaded = load_xref_and_trailer(&mut Cursor::new(bytes.as_slice()))
         .expect("load encrypted output xref");
+    let root_ref = reopened.root_ref().expect("encrypted output has /Root");
+    assert!(
+        !matches!(
+            loaded.entries.get(&root_ref),
+            Some(XrefEntry::Compressed { .. })
+        ),
+        "encrypted output must keep the Catalog outside ObjStm"
+    );
     let (container_number, member_index) = match loaded.entries.get(&info_ref) {
         Some(XrefEntry::Compressed { stream, index }) => (*stream, *index),
         other => panic!("/Info must have a type-2 xref entry, got {other:?}"),
