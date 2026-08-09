@@ -8,8 +8,10 @@ use crate::reader::file_object::{
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefEntry};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{Read, Seek, SeekFrom};
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct LoadedXref {
@@ -21,6 +23,12 @@ pub struct LoadedXref {
     pub repair_diagnostics: Diagnostics,
 }
 
+type SharedBootstrapCache = Rc<RefCell<BTreeMap<ObjectRef, Object>>>;
+
+fn empty_bootstrap_cache() -> SharedBootstrapCache {
+    Rc::new(RefCell::new(BTreeMap::new()))
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedXrefState {
     pub(crate) loaded: LoadedXref,
@@ -28,7 +36,7 @@ pub(crate) struct LoadedXrefState {
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
     /// Objects resolved while reading xref streams stay available to the
     /// post-chain trailer validation, matching qpdf's shared object cache.
-    pub(crate) bootstrap_cache: BTreeMap<ObjectRef, Object>,
+    pub(crate) bootstrap_cache: SharedBootstrapCache,
     pub(crate) header_offset: usize,
     /// True when open-time xref recovery via linear scan already ran.
     ///
@@ -111,13 +119,15 @@ pub(crate) struct XrefLoadOptions {
 #[derive(Debug, Clone, Copy)]
 enum XrefReadContextSpec<'a> {
     ActiveSection,
-    PreviousSection,
+    ActiveSectionWithCache {
+        bootstrap_cache: &'a SharedBootstrapCache,
+    },
     Reconstruction {
         line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
     },
     ReconstructionWithCache {
         line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
-        bootstrap_cache: &'a BTreeMap<ObjectRef, Object>,
+        bootstrap_cache: &'a SharedBootstrapCache,
     },
 }
 
@@ -147,17 +157,57 @@ impl XrefEntryLookup<'_> {
     }
 }
 
+/// A per-context overlay over qpdf's shared bootstrap object cache.
+#[derive(Debug)]
+struct XrefObjectCache {
+    shared: SharedBootstrapCache,
+    overlay: BTreeMap<ObjectRef, Object>,
+}
+
+impl XrefObjectCache {
+    fn new(shared: SharedBootstrapCache) -> Self {
+        Self {
+            shared,
+            overlay: BTreeMap::new(),
+        }
+    }
+
+    fn get(&self, object_ref: &ObjectRef) -> Option<Object> {
+        if let Some(value) = self.overlay.get(object_ref) {
+            return Some(value.clone());
+        }
+        self.shared.borrow().get(object_ref).cloned()
+    }
+
+    fn insert(&mut self, object_ref: ObjectRef, object: Object) {
+        self.overlay.insert(object_ref, object);
+    }
+
+    fn commit(&mut self) {
+        if self.overlay.is_empty() {
+            return;
+        }
+        self.shared
+            .borrow_mut()
+            .extend(std::mem::take(&mut self.overlay));
+    }
+
+    fn shared(&self) -> SharedBootstrapCache {
+        Rc::clone(&self.shared)
+    }
+}
+
 /// A qpdf-shaped, read-time resolver for xref bootstrap objects.
 ///
 /// The context borrows the currently visible xref entries through an explicit
-/// lookup view and owns only its cache/recursion guard. It never delegates to
-/// `Pdf::resolve` or the later canonical resolver, and it never uses an absent
-/// optional entry table to distinguish bootstrap phases.
+/// lookup view and owns only its cache overlay/recursion guard. It never
+/// delegates to `Pdf::resolve` or the later canonical resolver, and it never
+/// uses an absent optional entry table to distinguish bootstrap phases.
 struct XrefReadContext<'bytes, 'entries> {
     bytes: &'bytes [u8],
     entry_lookup: XrefEntryLookup<'entries>,
     options: XrefLoadOptions,
-    cache: BTreeMap<ObjectRef, Object>,
+    cache: XrefObjectCache,
     resolving: BTreeSet<ObjectRef>,
     diagnostics: Diagnostics,
     reconstruction_trigger: Option<(u64, String)>,
@@ -171,16 +221,20 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         options: XrefLoadOptions,
     ) -> Self {
         let (entry_lookup, bootstrap_cache) = match spec {
-            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => (
+            XrefReadContextSpec::ActiveSection => (
                 XrefEntryLookup::Registration(&registration.entries),
-                BTreeMap::new(),
+                empty_bootstrap_cache(),
+            ),
+            XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache } => (
+                XrefEntryLookup::Registration(&registration.entries),
+                Rc::clone(bootstrap_cache),
             ),
             XrefReadContextSpec::Reconstruction { line_scan_entries } => (
                 XrefEntryLookup::Reconstruction {
                     line_scan_entries,
                     registration_entries: &registration.entries,
                 },
-                BTreeMap::new(),
+                empty_bootstrap_cache(),
             ),
             XrefReadContextSpec::ReconstructionWithCache {
                 line_scan_entries,
@@ -190,14 +244,14 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                     line_scan_entries,
                     registration_entries: &registration.entries,
                 },
-                bootstrap_cache.clone(),
+                Rc::clone(bootstrap_cache),
             ),
         };
         Self {
             bytes,
             entry_lookup,
             options,
-            cache: bootstrap_cache,
+            cache: XrefObjectCache::new(bootstrap_cache),
             resolving: BTreeSet::new(),
             diagnostics: Diagnostics::default(),
             reconstruction_trigger: None,
@@ -312,7 +366,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
     /// the dictionary key it is reading.
     fn resolve_reference(&mut self, object_ref: ObjectRef) -> Object {
         if let Some(value) = self.cache.get(&object_ref) {
-            return value.clone();
+            return value;
         }
 
         if !self.resolving.insert(object_ref) {
@@ -385,7 +439,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         // cache entry with the object it was in the middle of parsing; the
         // `isUnresolved` check in `readObjectAtOffset` observes the same state
         // and leaves the null in place.
-        if let Some(cached) = self.cache.get(&object_ref).cloned() {
+        if let Some(cached) = self.cache.get(&object_ref) {
             self.resolving.remove(&object_ref);
             return cached;
         }
@@ -582,17 +636,14 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     // canonical document resolver is constructed only after this stage.
     let mut size_context = XrefReadContext::new(
         bytes,
-        XrefReadContextSpec::ActiveSection,
+        XrefReadContextSpec::ActiveSectionWithCache {
+            bootstrap_cache: &loaded.bootstrap_cache,
+        },
         &registration,
         options,
     );
-    size_context.cache.extend(
-        loaded
-            .bootstrap_cache
-            .iter()
-            .map(|(&object_ref, object)| (object_ref, object.clone())),
-    );
     let resolved_size = size_context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
+    size_context.cache.commit();
     size_context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
     append_xref_size_warning_for(
         resolved_size.as_ref(),
@@ -648,7 +699,7 @@ fn parse_xref_from_start(
             },
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -678,6 +729,21 @@ fn parse_xref_from_start(
         error_diagnostics_sink,
         context_spec,
     )
+}
+
+fn merge_bootstrap_cache_prefer_source(
+    destination: &SharedBootstrapCache,
+    source: &SharedBootstrapCache,
+) {
+    if Rc::ptr_eq(destination, source) {
+        return;
+    }
+    let source = source.borrow();
+    destination.borrow_mut().extend(
+        source
+            .iter()
+            .map(|(object_ref, object)| (*object_ref, object.clone())),
+    );
 }
 
 /// Read the optional hybrid-reference stream named by a classic trailer's
@@ -779,7 +845,7 @@ fn merge_xref_stream_from_classic_trailer(
     loaded
         .parsed_xref_streams
         .extend(hybrid.parsed_xref_streams);
-    loaded.bootstrap_cache.extend(hybrid.bootstrap_cache);
+    merge_bootstrap_cache_prefer_source(&loaded.bootstrap_cache, &hybrid.bootstrap_cache);
 
     loaded.loaded.entries = registration.snapshot();
 
@@ -807,7 +873,29 @@ fn merge_previous_xref_sections(
     context_spec: XrefReadContextSpec<'_>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
-    let mut section_context_spec = context_spec;
+    let chain_bootstrap_cache = match context_spec {
+        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
+            Rc::clone(&loaded.bootstrap_cache)
+        }
+        XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
+        | XrefReadContextSpec::ReconstructionWithCache {
+            bootstrap_cache, ..
+        } => Rc::clone(bootstrap_cache),
+    };
+    let section_context_spec = match context_spec {
+        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
+            XrefReadContextSpec::ActiveSectionWithCache {
+                bootstrap_cache: &chain_bootstrap_cache,
+            }
+        }
+        XrefReadContextSpec::Reconstruction { line_scan_entries }
+        | XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries, ..
+        } => XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries,
+            bootstrap_cache: &chain_bootstrap_cache,
+        },
+    };
     let (mut previous_offset, previous_diagnostics, reconstruction_trigger) =
         resolve_previous_xref_offset(
             bytes,
@@ -859,25 +947,6 @@ fn merge_previous_xref_sections(
                     .or_insert(object);
             }
         }
-        for (object_ref, object) in previous.bootstrap_cache {
-            loaded.bootstrap_cache.entry(object_ref).or_insert(object);
-        }
-
-        section_context_spec = match section_context_spec {
-            XrefReadContextSpec::Reconstruction { line_scan_entries } => {
-                XrefReadContextSpec::Reconstruction { line_scan_entries }
-            }
-            XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries,
-                bootstrap_cache,
-            } => XrefReadContextSpec::ReconstructionWithCache {
-                line_scan_entries,
-                bootstrap_cache,
-            },
-            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => {
-                XrefReadContextSpec::PreviousSection
-            }
-        };
         let (next_previous_offset, previous_diagnostics, reconstruction_trigger) =
             resolve_previous_xref_offset(
                 bytes,
@@ -913,6 +982,7 @@ fn resolve_previous_xref_offset(
         .and_then(|offset| parse_non_negative_u64(&offset, "/Prev").ok())
         .filter(|&offset| offset != 0);
     let reconstruction_trigger = context.take_reconstruction_trigger();
+    context.cache.commit();
     let diagnostics = context.diagnostics.clone();
     (offset, diagnostics, reconstruction_trigger)
 }
@@ -1024,7 +1094,7 @@ fn recover_xref_from_linear_scan(
         },
         trailer_references,
         parsed_xref_streams,
-        bootstrap_cache: BTreeMap::new(),
+        bootstrap_cache: empty_bootstrap_cache(),
         header_offset: 0,
         already_reconstructed: true,
     })
@@ -1068,9 +1138,7 @@ fn merge_recovered_qpdf_state(
         .append(&mut accumulated.parsed_xref_streams);
     // The accumulated state is the newer parsed xref prefix, so its shared
     // bootstrap objects supersede any same-reference value from recovery.
-    recovered
-        .bootstrap_cache
-        .extend(accumulated.bootstrap_cache);
+    merge_bootstrap_cache_prefer_source(&recovered.bootstrap_cache, &accumulated.bootstrap_cache);
     recovered
 }
 
@@ -1329,6 +1397,7 @@ fn recover_trailer_from_xref_stream_candidate(
         options,
     );
     let resolved_size = size_context.resolve_dictionary_value(&candidate.trailer, "Size");
+    size_context.cache.commit();
     size_context.append_diagnostics_to(repair_diagnostics);
     append_xref_size_warning_for(
         resolved_size.as_ref(),
@@ -1350,7 +1419,7 @@ struct XrefStreamCandidate {
     /// qpdf's reconstruction pass resolves and caches every type-1 object
     /// while discovering candidates. Reuse that cache for the later
     /// post-chain `/Size` lookup so a repair warning is not emitted again.
-    bootstrap_cache: BTreeMap<ObjectRef, Object>,
+    bootstrap_cache: SharedBootstrapCache,
 }
 
 /// Find the trailer dictionary and re-entry offset for
@@ -1426,7 +1495,7 @@ fn find_xref_stream_trailer_candidate(
         // `QPDF.cc:1391`). `Bounded` mirrors that: a directly-resolvable but
         // mismatched `/Length` still falls through to stream-boundary
         // recovery here, instead of being rejected outright.
-        let parsed = if let Some(cached) = context.cache.get(&object_ref).cloned() {
+        let parsed = if let Some(cached) = context.cache.get(&object_ref) {
             Some(cached)
         } else {
             // qpdf's `getObjectByObjGen` enters the normal resolve path before
@@ -1460,7 +1529,7 @@ fn find_xref_stream_trailer_candidate(
                 }
                 Err(_) => None,
             };
-            let cached_during_read = context.cache.get(&object_ref).cloned();
+            let cached_during_read = context.cache.get(&object_ref);
             context.resolving.remove(&object_ref);
             match parsed {
                 Some(mut completed) => {
@@ -1520,10 +1589,11 @@ fn find_xref_stream_trailer_candidate(
         }
     }
 
+    context.cache.commit();
     let candidate = trailer.map(|dict| XrefStreamCandidate {
         trailer: dict,
         max_offset,
-        bootstrap_cache: context.cache.clone(),
+        bootstrap_cache: context.cache.shared(),
     });
     append_new_context_diagnostics(
         &context,
@@ -1834,7 +1904,8 @@ fn parse_xref_stream(
         });
         let reconstruction_trigger = context.take_reconstruction_trigger();
         context.append_diagnostics_to(&mut repair_diagnostics);
-        let bootstrap_cache = context.cache.clone();
+        context.cache.commit();
+        let bootstrap_cache = context.cache.shared();
         (build_result, reconstruction_trigger, bootstrap_cache)
     };
 
@@ -2256,11 +2327,12 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_xref_size_warning_for, find_xref_stream_trailer_candidate,
+        append_xref_size_warning_for, empty_bootstrap_cache, find_xref_stream_trailer_candidate,
         load_xref_and_trailer_with_repair, load_xref_state_with_options,
-        merge_previous_xref_sections, merge_xref_stream_from_classic_trailer, parse_xref_index,
-        parse_xref_stream, prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
-        LoadedXref, LoadedXrefState, RecoveryPolicy, XrefEntryLookup, XrefForm, XrefLoadOptions,
+        merge_bootstrap_cache_prefer_source, merge_previous_xref_sections,
+        merge_xref_stream_from_classic_trailer, parse_xref_index, parse_xref_stream,
+        prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate, LoadedXref,
+        LoadedXrefState, RecoveryPolicy, XrefEntryLookup, XrefForm, XrefLoadOptions,
         XrefReadContext, XrefReadContextSpec, XrefRegistration,
     };
     use crate::{Diagnostic, Diagnostics, Dictionary, Object, ObjectRef, XrefEntry};
@@ -2281,6 +2353,17 @@ mod tests {
             context.entry_lookup,
             XrefEntryLookup::Registration(_)
         ));
+    }
+
+    #[test]
+    fn shared_bootstrap_cache_merge_skips_the_same_cache() {
+        let cache = empty_bootstrap_cache();
+        let object_ref = ObjectRef::new(1, 0);
+        cache.borrow_mut().insert(object_ref, Object::Integer(7));
+
+        merge_bootstrap_cache_prefer_source(&cache, &cache);
+
+        assert_eq!(cache.borrow().get(&object_ref), Some(&Object::Integer(7)));
     }
 
     #[test]
@@ -2390,7 +2473,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2446,7 +2529,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2499,7 +2582,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2542,7 +2625,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2608,7 +2691,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2671,7 +2754,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2728,7 +2811,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
-            bootstrap_cache: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
         };

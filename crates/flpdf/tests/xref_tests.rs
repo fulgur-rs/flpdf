@@ -2759,6 +2759,88 @@ fn classic_xref_with_shared_indirect_size_object() -> Vec<u8> {
     bytes
 }
 
+fn xref_stream_prev_loop_with_shared_indirect_previous_offset() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_body_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n0000000000\n");
+    let previous_two_offset = bytes.len() as u64;
+    let previous_two_offset_bytes = format!("{previous_two_offset:010}");
+    bytes[size_body_offset + 8..size_body_offset + 18]
+        .copy_from_slice(previous_two_offset_bytes.as_bytes());
+
+    let previous_two_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (0, 0, 0),
+        (1, size_body_offset as u64, 0),
+        (1, previous_two_offset, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_with_prev_ref(
+        4,
+        7,
+        "/Prev 3 0 R",
+        &previous_two_entries,
+    ));
+
+    let previous_one_offset = bytes.len() as u64;
+    let previous_one_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (0, 0, 0),
+        (1, size_body_offset as u64, 0),
+        (1, previous_two_offset, 0),
+        (1, previous_one_offset, 0),
+        (0, 0, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_with_prev_ref(
+        5,
+        7,
+        "/Prev 3 0 R",
+        &previous_one_entries,
+    ));
+
+    let latest_offset = bytes.len() as u64;
+    let latest_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (0, 0, 0),
+        (1, size_body_offset as u64, 0),
+        (1, previous_two_offset, 0),
+        (1, previous_one_offset, 0),
+        (1, latest_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_with_prev_ref(
+        6,
+        7,
+        &format!("/Prev {previous_one_offset}"),
+        &latest_entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{latest_offset}\n%%EOF\n").as_bytes());
+
+    bytes
+}
+
+fn make_xref_stream_with_prev_ref(
+    object_number: u32,
+    size: u32,
+    prev: &str,
+    entries: &[u8],
+) -> Vec<u8> {
+    let mut object = format!(
+        "{object_number} 0 obj\n<< /Type /XRef /Size {size} /Root 1 0 R /W [1 4 2] /Index [0 {size}] /Length {} {prev} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    object.extend_from_slice(entries);
+    object.extend_from_slice(b"\nendstream\nendobj\n");
+    object
+}
+
 #[test]
 fn classic_xref_table_reads_entries_from_its_xrefstm() {
     let (bytes, hybrid_only_offset) = classic_xref_with_hybrid_only_entry();
@@ -2798,6 +2880,24 @@ fn hybrid_xref_reuses_an_indirect_size_resolution_diagnostic() {
             .count(),
         1,
         "the shared indirect /Size object warning must be emitted once"
+    );
+}
+
+#[test]
+fn xref_stream_prev_loop_reuses_an_indirect_previous_offset_cache() {
+    let bytes = xref_stream_prev_loop_with_shared_indirect_previous_offset();
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should report the repeated /Prev loop");
+
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the shared indirect /Prev object warning must be emitted once"
     );
 }
 
