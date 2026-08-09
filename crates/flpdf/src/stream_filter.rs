@@ -241,42 +241,78 @@ pub(crate) fn decode_filter_specs_from_object(
     decode_params: Option<&Object>,
     max_filter_chain: Option<usize>,
 ) -> Result<Vec<FilterSpec>> {
-    let names: Vec<&[u8]> = match filter {
+    let mut clone = |value: &Object| value.clone();
+    decode_filter_specs_from_object_with_resolver(
+        filter,
+        decode_params,
+        max_filter_chain,
+        &mut clone,
+    )
+}
+
+/// Read filter metadata from an `Object` dictionary while resolving each
+/// object position that qpdf inspects during `QPDF_Stream::filterable`.
+///
+/// This is the bootstrap counterpart of [`decode_filter_specs_from_handle`].
+/// It keeps the `Object` shape, because xref-stream decoding happens before
+/// the live `ObjectHandle` resolver is available, and injects only the
+/// read-time resolver needed by that bootstrap context. `/Filter`, its array
+/// items, `/DecodeParms`, and its array items are always resolved. Values
+/// inside a `/DecodeParms` dictionary are resolved only for filters whose
+/// qpdf implementation consumes those entries (`QPDF_Stream.cc:386-482`,
+/// `SF_FlateLzwDecode.cc:21-72`).
+pub(crate) fn decode_filter_specs_from_object_with_resolver(
+    filter: Option<&Object>,
+    decode_params: Option<&Object>,
+    max_filter_chain: Option<usize>,
+    resolve: &mut dyn FnMut(&Object) -> Object,
+) -> Result<Vec<FilterSpec>> {
+    let names: Vec<Vec<u8>> = match filter {
         None | Some(Object::Null) => return Ok(Vec::new()),
-        Some(Object::Name(name)) => vec![name],
-        Some(Object::Array(items)) => {
-            // Counted on the array as parsed, so an over-long chain is
-            // reported ahead of a malformed item or a `/DecodeParms` length
-            // mismatch.
-            validate_filter_chain_count(items.len(), max_filter_chain)?;
-            items
-                .iter()
-                .map(|item| {
-                    item.as_name()
-                        .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
-                })
-                .collect::<Result<_>>()?
-        }
-        Some(_) => return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string())),
+        Some(value) => match resolve(value) {
+            Object::Null => return Ok(Vec::new()),
+            Object::Name(name) => vec![name],
+            Object::Array(items) => {
+                // Counted on the resolved array before its children are
+                // inspected, matching qpdf's getArrayNItems ordering.
+                validate_filter_chain_count(items.len(), max_filter_chain)?;
+                items
+                    .iter()
+                    .map(|item| {
+                        let item = resolve(item);
+                        item.as_name()
+                            .map(ToOwned::to_owned)
+                            .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
+                    })
+                    .collect::<Result<_>>()?
+            }
+            _ => return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string())),
+        },
     };
 
     if names.is_empty() {
         return Ok(Vec::new());
     }
 
-    let params = match decode_params {
+    let params: Vec<Option<Object>> = match decode_params {
         None | Some(Object::Null) => vec![None; names.len()],
-        Some(Object::Array(items)) if items.is_empty() => vec![None; names.len()],
-        Some(Object::Array(items)) => {
-            if items.len() != names.len() {
-                return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
+        Some(value) => match resolve(value) {
+            Object::Null => vec![None; names.len()],
+            Object::Array(items) if items.is_empty() => vec![None; names.len()],
+            Object::Array(items) => {
+                if items.len() != names.len() {
+                    return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
+                }
+                items
+                    .iter()
+                    .map(|item| {
+                        let item = resolve(item);
+                        (!matches!(item, Object::Null)).then_some(item)
+                    })
+                    .collect()
             }
-            items
-                .iter()
-                .map(|item| (!matches!(item, Object::Null)).then_some(item))
-                .collect()
-        }
-        Some(item) => vec![Some(item); names.len()],
+            item => vec![Some(item); names.len()],
+        },
     };
 
     validate_filter_chain_count(names.len(), max_filter_chain)?;
@@ -285,8 +321,12 @@ pub(crate) fn decode_filter_specs_from_object(
         .into_iter()
         .zip(params)
         .map(|(name, decode_params)| FilterSpec {
-            name: name.to_vec(),
-            decode_params: decode_params_from_object(decode_params, name),
+            decode_params: decode_params_from_object_with_resolver(
+                decode_params.as_ref(),
+                &name,
+                resolve,
+            ),
+            name,
         })
         .collect())
 }
@@ -677,17 +717,27 @@ fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
     }
 }
 
-/// The legacy `Object` shape reader's counterpart of the handle reduction.
+/// Reduce a `/DecodeParms` dictionary for the `Object` shape reader.
 ///
-/// This reader resolves nothing, because an indirect value is an
-/// `Object::Reference` it classifies as [`ParamValue::Other`] without looking
-/// through (plan decision D1 of `flpdf-25kg.3.4`). `filter_name` decides both
-/// whether qpdf's filter enumerates entries — and therefore whether direct
-/// `Object::Null` values are omitted — and whether the stage is the `Crypt`
-/// one that keeps every key ([`retains_decode_param_key`]) with name payloads
-/// under [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`]. References and every other
-/// non-null shape remain `ParamValue::Other` when retained.
+/// The normal direct reader passes an identity resolver, so an indirect value
+/// remains `Object::Reference` and reduces to [`ParamValue::Other`] (plan
+/// decision D1 of `flpdf-25kg.3.4`). The xref bootstrap reader supplies its
+/// read-time resolver instead. `filter_name` decides both whether qpdf's
+/// filter enumerates entries — and therefore whether null values are omitted
+/// — and whether the stage is `Crypt`, which keeps every key
+/// ([`retains_decode_param_key`]) with name payloads under
+/// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`].
+#[cfg(test)]
 fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> DecodeParams {
+    let mut clone = |value: &Object| value.clone();
+    decode_params_from_object_with_resolver(params, filter_name, &mut clone)
+}
+
+fn decode_params_from_object_with_resolver(
+    params: Option<&Object>,
+    filter_name: &[u8],
+    resolve: &mut dyn FnMut(&Object) -> Object,
+) -> DecodeParams {
     let omits_null_values = filter_reads_decode_params(filter_name);
     let crypt_stage = is_crypt_filter(filter_name);
     match params {
@@ -695,11 +745,25 @@ fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> Dec
         Some(object) => DecodeParams::Present(match object.as_dict() {
             Some(dict) => dict
                 .iter()
-                .filter(|(_, value)| !omits_null_values || !matches!(value, Object::Null))
-                .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
-                .map(|(key, value)| {
+                .filter_map(|(key, value)| {
+                    // qpdf's consuming filters enumerate with getKeys(),
+                    // which resolves every dictionary value before selecting
+                    // the parameter keys it reads. Non-consuming filters
+                    // retain the direct-object behavior and never inspect
+                    // child values.
+                    let value = if omits_null_values {
+                        resolve(value)
+                    } else {
+                        value.clone()
+                    };
+                    if omits_null_values && matches!(value, Object::Null) {
+                        return None;
+                    }
+                    if !retains_decode_param_key(key, crypt_stage) {
+                        return None;
+                    }
                     let keeps_name = keeps_crypt_name_payload(key, crypt_stage);
-                    (key.to_vec(), param_value_from_object(value, keeps_name))
+                    Some((key.to_vec(), param_value_from_object(&value, keeps_name)))
                 })
                 .collect(),
             None => Vec::new(),

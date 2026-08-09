@@ -1751,7 +1751,11 @@ fn parse_xref_stream(
             let widths = parse_xref_widths(&mut context, &trailer)?;
             let index = parse_xref_index(&mut context, &trailer, size)?;
             let ranges = build_xref_ranges(index)?;
-            let stream_data = filters::decode_stream_data(&stream.dict, &stream.data)?;
+            let stream_data = filters::decode_stream_data_from_xref_context(
+                &stream.dict,
+                &stream.data,
+                &mut |value| context.resolve_value(value),
+            )?;
             let mut cursor = ByteCursor::new(&stream_data, 0);
             let entries = parse_xref_entries(&mut cursor, size, &ranges, widths)?;
             let trailer_references = collect_trailer_references(&trailer);

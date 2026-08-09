@@ -8,9 +8,10 @@ use crate::pipeline::{PipelineError, PipelineResult};
 #[cfg(test)]
 use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
-    decode_filter_specs_from_handle, decode_filter_specs_from_object, encode_flate,
-    encode_run_length, stream_filter_for, validate_filter_chain_count, DecodeParams,
-    FilterDecodePhase, FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
+    decode_filter_specs_from_handle, decode_filter_specs_from_object,
+    decode_filter_specs_from_object_with_resolver, encode_flate, encode_run_length,
+    stream_filter_for, validate_filter_chain_count, DecodeParams, FilterDecodePhase, FilterSpec,
+    CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -75,6 +76,37 @@ pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u
         DecodeLimits::default(),
         &mut reject_decode_warning,
     )
+}
+
+/// Decode xref-stream bytes after reading filter metadata through the xref
+/// bootstrap resolver.
+///
+/// The xref stream is parsed before the normal `ObjectHandle` graph is live,
+/// so this route uses the same `Object`-shape codec engine as
+/// [`decode_stream_data`] while supplying the xref reader's reference
+/// resolver only to filter metadata. This mirrors qpdf's
+/// `QPDF_Stream::filterable` metadata reads (`libqpdf/QPDF_Stream.cc:386-482`)
+/// without creating a second decode pipeline.
+pub(crate) fn decode_stream_data_from_xref_context(
+    dict: &Dictionary,
+    stream_data: &[u8],
+    resolve: &mut dyn FnMut(&Object) -> Object,
+) -> Result<Vec<u8>> {
+    let limits = DecodeLimits::default();
+    let specs = decode_filter_specs_from_object_with_resolver(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        limits.max_filter_chain,
+        resolve,
+    )?;
+    let outcome = decode_prepared_specs(
+        specs,
+        stream_data,
+        limits,
+        DataEventMode::Suppress,
+        &mut reject_crypt_stage,
+    )?;
+    replay_strict_decode_outcome(outcome, &mut reject_decode_warning)
 }
 
 /// A non-fatal warning emitted while decoding a stream codec.
