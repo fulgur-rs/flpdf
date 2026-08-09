@@ -2954,13 +2954,21 @@ mod tests {
 
     #[test]
     fn xref_stream_build_propagates_a_bootstrap_header_mismatch() {
-        let bytes = b" 1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Index 2 0 R /Length 3 >>\nstream\n\0\0\0\nendstream\nendobj\n";
+        let mut bytes = b" 1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Index 2 0 R /Length 3 0 R >>\nstream\n\0\0\0\nendstream\nendobj\n".to_vec();
+        let cyclic_length_offset = bytes.len();
+        bytes.extend_from_slice(b"3 0 obj\n3 0 R\nendobj\n");
         let mut registration = XrefRegistration::default();
         registration.insert_xref_entry(ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 1 });
+        registration.insert_xref_entry(
+            ObjectRef::new(3, 0),
+            XrefEntry::Uncompressed {
+                offset: cyclic_length_offset as u64,
+            },
+        );
         let mut diagnostics = Diagnostics::default();
 
         let error = parse_xref_stream(
-            bytes,
+            &bytes,
             1,
             1,
             "1.7".to_string(),
@@ -2975,7 +2983,14 @@ mod tests {
         .expect_err("a successful xref build with a mismatch must still request reconstruction");
 
         assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
-        assert!(diagnostics.entries().is_empty());
+        assert!(
+            diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("expected endobj")),
+            "diagnostics: {:?}",
+            diagnostics.entries()
+        );
     }
 
     #[test]
