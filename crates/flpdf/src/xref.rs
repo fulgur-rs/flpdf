@@ -518,8 +518,9 @@ fn recover_xref_from_linear_scan(
 ) -> Result<LoadedXrefState> {
     push_repair_diagnostics(&mut repair_diagnostics, &trigger_error, startxref);
 
-    let mut entries = recover_xref_entries(bytes)
+    let recovered = recover_xref_entries(bytes, fallback_trailer.is_none())
         .map_err(|error| Error::with_open_diagnostics(error, repair_diagnostics.clone()))?;
+    let mut entries = recovered.entries;
     let mut parsed_xref_streams = BTreeMap::new();
     let mut extra_trailer_references = BTreeSet::new();
 
@@ -531,8 +532,9 @@ fn recover_xref_from_linear_scan(
     // newest revision whose `/Prev` chain later broke -- models exactly
     // that already-initialized state: qpdf never looks at a stray candidate
     // elsewhere in the file when the correct trailer is already in hand, so
-    // neither `recover_trailer` nor the candidate search runs at all in
-    // that case. `startxref` (the position that produced `fallback_trailer`)
+    // neither trailer capture in `recover_xref_entries` nor the candidate search
+    // runs at all in that case. `startxref` (the position that produced
+    // `fallback_trailer`)
     // is already valid then too, so it needs no adjustment; it is only
     // rewritten to the candidate's own verified re-entry point when the
     // candidate path is what actually recovered the trailer. `last_xref_form`
@@ -543,9 +545,9 @@ fn recover_xref_from_linear_scan(
     let (trailer, recovered_startxref, recovered_form) = if let Some(trailer) = fallback_trailer {
         (trailer.clone(), startxref, XrefForm::Table)
     } else {
-        match recover_trailer(bytes) {
-            Ok(trailer) => (trailer, startxref, XrefForm::Table),
-            Err(_) => match recover_trailer_from_xref_stream_candidate(
+        match recovered.trailer {
+            Some(trailer) => (trailer, startxref, XrefForm::Table),
+            None => match recover_trailer_from_xref_stream_candidate(
                 bytes,
                 &version,
                 options,
@@ -642,34 +644,47 @@ pub fn load_xref_and_trailer_best_effort<R: Read + Seek>(reader: &mut R) -> Resu
     load_xref_and_trailer_with_repair(reader, true)
 }
 
-/// Recover uncompressed object offsets by replaying qpdf's `reconstruct_xref`
+/// Recover uncompressed object offsets and, when requested, the first valid
+/// trailer dictionary by replaying qpdf's `reconstruct_xref`
 /// (`libqpdf/QPDF.cc`, qpdf 11.9.0): scan the file line by line, and on each line
 /// whose first token sequence is `int int obj`, record the object at the offset of
-/// its *number* token. Only the first token of a line is inspected, object bodies
-/// are never parsed, and the last occurrence of an object in the file wins (qpdf's
-/// `insertReconstructedXrefEntry` overwrites). Inspecting at most three short
-/// tokens per line — never re-parsing a body to end-of-file — makes the scan
-/// linear in the file size, unlike a per-candidate full-object parse which an
-/// unterminated literal string can drive to quadratic cost.
+/// its *number* token. A first-token `trailer` candidate is parsed in the same
+/// forward scan; malformed or non-dictionary candidates are ignored so scanning
+/// can continue. Only the first valid trailer is retained (`QPDF::setTrailer`
+/// refuses subsequent assignments). Object bodies are never parsed, and the last
+/// occurrence of an object in the file wins (`insertReconstructedXrefEntry`
+/// overwrites). Inspecting at most three short tokens per object-header line —
+/// never re-parsing a body to end-of-file — keeps the entry scan linear in the
+/// file size.
 ///
 /// qpdf records only uncompressed (type-1) entries during reconstruction and
 /// declines to look inside object streams (`reconstruct_xref` trailing comment in
 /// `QPDF.cc:532-575, 618-623`). A real xref-stream candidate is still re-entered separately by
 /// [`recover_trailer_from_xref_stream_candidate`].
-pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
+pub(crate) struct RecoveredXref {
+    pub(crate) entries: BTreeMap<ObjectRef, XrefEntry>,
+    pub(crate) trailer: Option<Dictionary>,
+}
+
+pub(crate) fn recover_xref_entries(bytes: &[u8], capture_trailer: bool) -> Result<RecoveredXref> {
     let mut entries = BTreeMap::new();
+    let mut trailer = None;
     let mut line_start = 0usize;
     while line_start < bytes.len() {
         let next_line_start = next_line_start(bytes, line_start);
-        if let Some((object_ref, offset)) =
-            scan_object_header_at_line(bytes, line_start, next_line_start)
-        {
-            entries.insert(object_ref, XrefEntry::Uncompressed { offset });
+        if let Some(first_token) = read_scan_token(bytes, line_start, next_line_start) {
+            if capture_trailer && trailer.is_none() && first_token.is_word_value(b"trailer") {
+                trailer = parse_trailer_candidate(bytes, first_token.end);
+            } else if let Some((object_ref, offset)) =
+                scan_object_header_after_first_token(bytes, &first_token)
+            {
+                entries.insert(object_ref, XrefEntry::Uncompressed { offset });
+            }
         }
         line_start = next_line_start;
     }
 
-    Ok(entries)
+    Ok(RecoveredXref { entries, trailer })
 }
 
 /// How many further offset-*positions* (not bytes) a truncated candidate's
@@ -685,7 +700,7 @@ pub(crate) fn recover_xref_entries(bytes: &[u8]) -> Result<BTreeMap<ObjectRef, X
 const XREF_CANDIDATE_FALLBACK_SPAN: usize = 64;
 
 /// qpdf's second trailer-recovery fallback (`reconstruct_xref`, `QPDF.cc:577-608`,
-/// qpdf 11.9.0): entered only when the line scan found no `trailer` keyword.
+/// qpdf 11.9.0): entered only when the line scan found no usable trailer dictionary.
 /// Walk the reconstructed type-1 entries in ascending object order looking for
 /// one that is a `/Type /XRef` stream with a positive offset. `setTrailer`
 /// only ever takes effect once, so the *first* candidate encountered supplies
@@ -1014,24 +1029,12 @@ fn push_repair_diagnostics(diagnostics: &mut Diagnostics, trigger_error: &Error,
     ));
 }
 
-fn recover_trailer(bytes: &[u8]) -> Result<Dictionary> {
-    let marker = b"trailer";
-    let Some(pos) = bytes
-        .windows(marker.len())
-        .rposition(|window| window == marker)
-    else {
-        return Err(Error::parse(0, "trailer dictionary not found"));
-    };
-
-    let cursor = ByteCursor::new(bytes, pos + marker.len());
-    let mut tokenizer = Tokenizer::new(&bytes[cursor.pos..]);
+fn parse_trailer_candidate(bytes: &[u8], start: usize) -> Option<Dictionary> {
+    let mut tokenizer = Tokenizer::new(bytes.get(start..)?);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
-    match parser.object()? {
-        Object::Dictionary(trailer) => Ok(trailer),
-        _ => Err(Error::parse(
-            cursor.pos + parser.position(),
-            "trailer dictionary is not a dictionary",
-        )),
+    match parser.object().ok()? {
+        Object::Dictionary(trailer) => Some(trailer),
+        _ => None,
     }
 }
 
@@ -1081,8 +1084,8 @@ fn parse_scan_integer(token: &Token) -> Option<i64> {
     std::str::from_utf8(&token.value).ok()?.parse().ok()
 }
 
-/// If the line beginning at `line_start` opens with an `int int obj` token
-/// sequence, return the recovered object and the offset of its number token.
+/// If the already-read first token opens an `int int obj` token sequence,
+/// return the recovered object and the offset of its number token.
 ///
 /// Mirrors qpdf's `reconstruct_xref` per-line logic: the first token must begin
 /// on this line (otherwise the line records nothing — qpdf's
@@ -1090,15 +1093,11 @@ fn parse_scan_integer(token: &Token) -> Option<i64> {
 /// token read to `next_line_start`), the second and third tokens may spill onto
 /// following lines, and the object/generation must satisfy qpdf's
 /// `insertReconstructedXrefEntry` guards (`obj > 0`, `0 <= gen < 65535`).
-fn scan_object_header_at_line(
+fn scan_object_header_after_first_token(
     bytes: &[u8],
-    line_start: usize,
-    next_line_start: usize,
+    number_token: &Token,
 ) -> Option<(ObjectRef, u64)> {
-    // Bounding the first token to this line is what keeps a whitespace- or
-    // comment-only line from re-scanning the remaining file on every iteration.
-    let number_token = read_scan_token(bytes, line_start, next_line_start)?;
-    let obj = parse_scan_integer(&number_token)?;
+    let obj = parse_scan_integer(number_token)?;
 
     let gen_token = read_scan_token(bytes, number_token.end, bytes.len())?;
     let gen = parse_scan_integer(&gen_token)?;

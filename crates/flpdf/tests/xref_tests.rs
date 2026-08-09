@@ -1247,6 +1247,73 @@ fn best_effort_errors_when_trailer_not_dictionary() {
     assert_eq!(diagnostics.entries().len(), 3);
 }
 
+/// qpdf's reconstruction scan keeps the first successfully parsed trailer
+/// dictionary and ignores a later malformed/non-dictionary candidate. A raw
+/// last-occurrence search would select `trailer 42` and fail recovery instead.
+#[test]
+fn best_effort_recovery_keeps_first_valid_trailer_before_invalid_candidate() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let object_offset = 9;
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R >>\ntrailer\n42\nstartxref\n{start_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.trailer.get("Size"), Some(&Object::Integer(2)));
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: object_offset
+        })
+    );
+}
+
+/// A malformed candidate must not terminate qpdf's forward scan; a later
+/// valid dictionary is accepted when no earlier valid trailer exists.
+#[test]
+fn best_effort_recovery_skips_invalid_trailer_before_valid_candidate() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n42\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.trailer.get("Size"), Some(&Object::Integer(2)));
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+/// Once a valid dictionary has been accepted, a later valid dictionary is
+/// ignored as well (`QPDF::setTrailer` is first-valid-wins, not last-wins).
+#[test]
+fn best_effort_recovery_keeps_first_valid_trailer_before_later_valid_candidate() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R >>\ntrailer\n<< /Size 99 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.trailer.get("Size"), Some(&Object::Integer(2)));
+}
+
 /// When `startxref` is absent, repair pushes a "can't find startxref" error
 /// and retries `parse_xref_from_start` at offset 0, which fails at the header
 /// and pushes a second error. Only the first (triggering) error appears in the
