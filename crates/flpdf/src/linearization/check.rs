@@ -112,13 +112,12 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         let candidate = self.get_object_handle(ObjectRef::new(object_number, 0));
-        if !matches!(candidate.try_as_dictionary(), Ok(Some(_))) {
+        let Some(dictionary) = candidate.try_as_dictionary().ok().flatten() else {
             return Ok(false);
-        }
+        };
 
-        let linearized = match candidate.try_get_key(b"Linearized") {
-            Ok(value) => value,
-            Err(_) => return Ok(false),
+        let Some(linearized) = dictionary.get(&b"Linearized"[..]) else {
+            return Ok(false);
         };
         if linearized.try_dereference().is_err() {
             return Ok(false);
@@ -134,17 +133,15 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(false);
         }
 
-        let l_value = match candidate.try_get_key(b"L") {
-            Ok(value) => value,
-            Err(_) => return Ok(false),
-        };
-        if l_value.try_dereference().is_err() {
-            return Ok(false);
-        }
-        if let Some(l_value) = l_value.as_integer() {
-            let file_size = self.resolver.source_length()?;
-            if l_value < 0 || l_value as u64 != file_size {
+        if let Some(l_value) = dictionary.get(&b"L"[..]) {
+            if l_value.try_dereference().is_err() {
                 return Ok(false);
+            }
+            if let Some(l_value) = l_value.as_integer() {
+                let file_size = self.resolver.source_length()?;
+                if l_value < 0 || l_value as u64 != file_size {
+                    return Ok(false);
+                }
             }
         }
 
@@ -797,7 +794,7 @@ mod tests {
     use crate::linearization::renumber::RenumberMap;
     use crate::linearization::writer::write_linearized;
     use crate::writer::WriteOptions;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     fn tiny_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
@@ -850,13 +847,15 @@ mod tests {
         pdf.extend_from_slice(
             b"4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
         );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(b"5 0 obj\n1\nendobj\n");
         let xref_start = pdf.len() as u64;
         let xref = format!(
-            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
+            "xref\n0 6\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n{off5:010} 00000 n \n"
         );
         pdf.extend_from_slice(xref.as_bytes());
         let trailer =
-            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+            format!("trailer\n<< /Size 6 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
         pdf.extend_from_slice(trailer.as_bytes());
         pdf
     }
@@ -874,6 +873,40 @@ mod tests {
             .copy_from_slice(encoded.as_bytes());
     }
 
+    /// Keep the document readable until lazy resolution reaches object `5`.
+    /// This exercises qpdf's damaged-object-to-null behavior without making
+    /// the initial xref/trailer open fail.
+    struct FailingObjectReader {
+        inner: Cursor<Vec<u8>>,
+        failure_offset: u64,
+    }
+
+    impl Read for FailingObjectReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() == self.failure_offset {
+                return Err(std::io::Error::other("linearization object read failed"));
+            }
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Seek for FailingObjectReader {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    fn failing_at_object_five(bytes: Vec<u8>) -> FailingObjectReader {
+        let failure_offset = bytes
+            .windows(b"5 0 obj\n".len())
+            .position(|window| window == b"5 0 obj\n")
+            .expect("linearization fixture has object 5") as u64;
+        FailingObjectReader {
+            inner: Cursor::new(bytes),
+            failure_offset,
+        }
+    }
+
     /// qpdf accepts `/Linearized` only when its numeric floor is exactly one.
     /// It also ignores the deeper hint parameters, which belong to
     /// `checkLinearization`, not `isLinearized`.
@@ -887,13 +920,31 @@ mod tests {
         .expect("open .9 PDF");
         assert!(!below_one.is_linearized().expect("check .9"));
 
-        let mut one_or_above = Pdf::open_mem_owned(linearized_like_pdf_bytes(
-            b"1.9",
-            None,
-            b"7 8 not-an-object\n",
-        ))
-        .expect("open 1.9 PDF");
+        let mut one_or_above =
+            Pdf::open_mem_owned(linearized_like_pdf_bytes(b"1.9", None, b"7 8 obj 42\n"))
+                .expect("open 1.9 PDF");
         assert!(one_or_above.is_linearized().expect("check 1.9"));
+    }
+
+    #[test]
+    fn is_linearized_rejects_zero_and_out_of_range_object_numbers() {
+        let mut zero = Pdf::open_mem_owned(linearized_like_pdf_bytes(
+            b"1",
+            None,
+            b"0 0 obj << /Linearized 1 >>\nendobj\n",
+        ))
+        .expect("open zero-object candidate PDF");
+        assert!(!zero.is_linearized().expect("zero object number is false"));
+
+        let mut out_of_range = Pdf::open_mem_owned(linearized_like_pdf_bytes(
+            b"1",
+            None,
+            b"4294967296 0 obj << /Linearized 1 >>\nendobj\n",
+        ))
+        .expect("open out-of-range candidate PDF");
+        assert!(!out_of_range
+            .is_linearized()
+            .expect("out-of-range object number is false"));
     }
 
     #[test]
@@ -968,6 +1019,26 @@ mod tests {
         assert!(!pdf
             .is_linearized()
             .expect("unresolved candidate is not an error"));
+    }
+
+    #[test]
+    fn is_linearized_returns_false_when_linearized_key_cannot_be_resolved() {
+        let reader = failing_at_object_five(linearized_like_pdf_bytes(b"5 0 R", None, &[]));
+        let mut pdf = Pdf::open(reader).expect("open indirect /Linearized PDF");
+
+        assert!(!pdf
+            .is_linearized()
+            .expect("unresolvable /Linearized is not an error"));
+    }
+
+    #[test]
+    fn is_linearized_returns_false_when_l_key_cannot_be_resolved() {
+        let reader = failing_at_object_five(linearized_like_pdf_bytes(b"1", Some(b"5 0 R"), &[]));
+        let mut pdf = Pdf::open(reader).expect("open indirect /L PDF");
+
+        assert!(!pdf
+            .is_linearized()
+            .expect("unresolvable /L is not an error"));
     }
 
     fn build_linearized_bytes() -> Vec<u8> {

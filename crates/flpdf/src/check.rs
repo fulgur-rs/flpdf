@@ -552,22 +552,29 @@ mod tests {
         assert!(report.summary.is_none());
     }
 
-    /// Reader that remains usable while the document is opened, then fails on
-    /// the exact 1024-byte prefix read owned by `Pdf::is_linearized`.
-    struct FailingLinearizationPrefixReader(Cursor<Vec<u8>>);
+    /// Reader that remains usable while the document is opened, then fails
+    /// after the exact 1024-byte prefix read owned by `Pdf::is_linearized`.
+    struct FailingLinearizationPrefixReader {
+        inner: Cursor<Vec<u8>>,
+        fail_after_prefix: bool,
+    }
 
     impl std::io::Read for FailingLinearizationPrefixReader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if buffer.len() == 1024 {
+            if self.fail_after_prefix {
                 return Err(std::io::Error::other("linearization prefix read failed"));
             }
-            self.0.read(buffer)
+            let read = self.inner.read(buffer)?;
+            if buffer.len() == 1024 {
+                self.fail_after_prefix = true;
+            }
+            Ok(read)
         }
     }
 
     impl std::io::Seek for FailingLinearizationPrefixReader {
         fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
-            self.0.seek(position)
+            self.inner.seek(position)
         }
     }
 
@@ -576,9 +583,10 @@ mod tests {
         // A source-operation failure during the probe must be downgraded to a
         // warning rather than propagating out of `check_reader`, so the caller
         // still receives a report with `linearized = false`.
-        let report = check_reader_strict(FailingLinearizationPrefixReader(Cursor::new(
-            minimal_pdf_bytes(),
-        )))
+        let report = check_reader_strict(FailingLinearizationPrefixReader {
+            inner: Cursor::new(minimal_pdf_bytes()),
+            fail_after_prefix: false,
+        })
         .unwrap();
         let summary = report
             .summary

@@ -1673,10 +1673,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
             match tokens {
                 Ok(Some(object_number)) => return Ok(Some(object_number)),
                 Ok(None) => continue,
-                // qpdf's token reads return a non-matching token for malformed
-                // input. Treat a parser failure in this speculative candidate
-                // exactly the same way and continue scanning the prefix.
-                Err(Error::Parse { .. }) => continue,
                 Err(error) => return Err(error),
             }
         }
