@@ -2676,12 +2676,26 @@ fn classic_xref_document_with_indirect_size(size_value: i64) -> Vec<u8> {
 }
 
 fn classic_xref_with_indirect_size_header_mismatch(size_value: i64) -> (Vec<u8>, u64) {
+    classic_xref_with_indirect_size_header_mismatch_body(size_value, b"endobj\n")
+}
+
+fn classic_xref_with_indirect_size_header_mismatch_missing_endobj(
+    size_value: i64,
+) -> (Vec<u8>, u64) {
+    classic_xref_with_indirect_size_header_mismatch_body(size_value, b"")
+}
+
+fn classic_xref_with_indirect_size_header_mismatch_body(
+    size_value: i64,
+    size_object_terminator: &[u8],
+) -> (Vec<u8>, u64) {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let catalog_offset = bytes.len() as u64;
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     let size_offset = bytes.len() as u64;
-    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\nendobj\n").as_bytes());
+    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\n").as_bytes());
+    bytes.extend_from_slice(size_object_terminator);
     let wrong_offset = bytes.len() as u64;
     bytes.extend_from_slice(b"4 0 obj\n<< /Foo true >>\nendobj\n");
 
@@ -3519,6 +3533,19 @@ fn repair_revalidates_indirect_xref_size_after_header_reconstruction() {
             diagnostic.message
                 == "reported number of objects (3) is not one plus the highest object number (4)"
         }));
+}
+
+#[test]
+fn repair_forwards_size_resolution_diagnostics_after_header_reconstruction() {
+    let (bytes, _) = classic_xref_with_indirect_size_header_mismatch_missing_endobj(3);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should retain the recovered /Size diagnostic");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("expected endobj")));
 }
 
 #[test]
