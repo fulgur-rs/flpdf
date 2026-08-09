@@ -76,12 +76,12 @@ fn run_exact_command_line_count(run: &str, command: &str) -> usize {
         .count()
 }
 
-fn shell_command_segments(line: &str) -> Vec<&str> {
+fn shell_command_segments(script: &str) -> Vec<&str> {
     let mut segments = Vec::new();
     let mut start = 0;
     let mut quote = None;
     let mut escaped = false;
-    let mut characters = line.char_indices();
+    let mut characters = script.char_indices();
 
     while let Some((index, character)) = characters.next() {
         match quote {
@@ -108,26 +108,26 @@ fn shell_command_segments(line: &str) -> Vec<&str> {
                 match character {
                     '\\' => escaped = true,
                     '\'' | '"' => quote = Some(character),
-                    ';' => {
-                        segments.push(&line[start..index]);
+                    ';' | '\n' => {
+                        segments.push(&script[start..index]);
                         start = index + 1;
                     }
-                    '&' if line[index..].starts_with("&&") => {
-                        segments.push(&line[start..index]);
+                    '&' if script[index..].starts_with("&&") => {
+                        segments.push(&script[start..index]);
                         start = index + 2;
                         characters.next();
                     }
                     '&' => {
-                        segments.push(&line[start..index]);
+                        segments.push(&script[start..index]);
                         start = index + 1;
                     }
-                    '|' if line[index..].starts_with("||") => {
-                        segments.push(&line[start..index]);
+                    '|' if script[index..].starts_with("||") => {
+                        segments.push(&script[start..index]);
                         start = index + 2;
                         characters.next();
                     }
                     '|' => {
-                        segments.push(&line[start..index]);
+                        segments.push(&script[start..index]);
                         start = index + 1;
                     }
                     _ => {}
@@ -137,7 +137,7 @@ fn shell_command_segments(line: &str) -> Vec<&str> {
         }
     }
 
-    segments.push(&line[start..]);
+    segments.push(&script[start..]);
     segments
 }
 
@@ -146,38 +146,50 @@ fn is_plain_echo_output_segment(segment: &str) -> bool {
     segment.split_whitespace().next() == Some("echo")
         && !segment.contains("$(")
         && !segment.contains('`')
+        && !segment.contains("<(")
+        && !segment.contains(">(")
 }
 
 fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
-    run.lines()
-        .flat_map(shell_command_segments)
+    shell_command_segments(run)
+        .into_iter()
         .filter(|segment| !is_plain_echo_output_segment(segment))
         .map(|segment| segment.match_indices(command).count())
         .sum()
 }
 
-fn bash_line_has_unquoted_operator_or_continuation(line: &str) -> bool {
+fn bash_run_has_unsupported_syntax(run: &str) -> bool {
     let mut quote = None;
     let mut escaped = false;
 
-    for character in line.chars() {
+    for (index, character) in run.char_indices() {
         match quote {
             Some('\'') => {
                 if character == '\'' {
                     quote = None;
+                } else if character == '\n' {
+                    return true;
                 }
             }
             Some('"') => {
                 if escaped {
+                    if character == '\n' {
+                        return true;
+                    }
                     escaped = false;
                 } else if character == '\\' {
                     escaped = true;
                 } else if character == '"' {
                     quote = None;
+                } else if character == '\n' {
+                    return true;
                 }
             }
             None => {
                 if escaped {
+                    if character == '\n' {
+                        return true;
+                    }
                     escaped = false;
                     continue;
                 }
@@ -185,7 +197,9 @@ fn bash_line_has_unquoted_operator_or_continuation(line: &str) -> bool {
                 match character {
                     '\\' => escaped = true,
                     '\'' | '"' => quote = Some(character),
-                    ';' | '|' | '&' => return true,
+                    ';' | '|' | '&' | '{' | '}' | '(' | ')' => return true,
+                    '<' if run[index..].starts_with("<(") => return true,
+                    '>' if run[index..].starts_with(">(") => return true,
                     _ => {}
                 }
             }
@@ -193,17 +207,17 @@ fn bash_line_has_unquoted_operator_or_continuation(line: &str) -> bool {
         }
     }
 
-    quote != Some('\'') && escaped
+    quote.is_some() || escaped
 }
 
 fn bash_run_has_control_flow(run: &str) -> bool {
-    run.lines().map(str::trim).any(|line| {
-        bash_line_has_unquoted_operator_or_continuation(line)
-            || line.contains("<<")
-            || line.split_whitespace().next().is_some_and(|word| {
-                BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
-            })
-    })
+    bash_run_has_unsupported_syntax(run)
+        || run.lines().map(str::trim).any(|line| {
+            line.contains("<<")
+                || line.split_whitespace().next().is_some_and(|word| {
+                    BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
+                })
+        })
 }
 
 fn bash_run_exact_command_line_count(run: &str, command: &str) -> usize {
@@ -652,6 +666,62 @@ fn test_job_workspace_command_rejects_conditional_continuation() {
       true || \
       cargo test --workspace
 "#,
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_uncalled_function() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      f() {
+        cargo test --workspace
+      }
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_multiline_quoted_echo() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      echo \"begin
+      cargo test --workspace
+      end\"
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_process_substitution() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: echo <(cargo test --workspace)
+  - shell: bash
+    run: cargo test --workspace
+",
     );
 
     assert!(
