@@ -232,6 +232,6 @@ git diff --stat
 
 The selector names must have no production consumers after removal, and the diff must contain only the spec/plan plus the focused implementation and tests.
 
-- [ ] **Step 5: Update Beads with evidence and persist**
+- [x] **Step 5: Update Beads with evidence and persist**
 
 Read back `flpdf-m0q1`, append the verification summary without overwriting prior notes, run `bd dep cycles`, and run `bd dolt push`. Do not close the issue until the implementation and all required evidence are complete.
