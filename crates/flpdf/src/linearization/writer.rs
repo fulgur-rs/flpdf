@@ -8607,7 +8607,7 @@ mod tests {
     /// (`part4_other_pages_shared`) Shared Objects Hint Table entry — the two
     /// concrete tables the PR review named — has internally self-consistent
     /// hint tables with a genuinely random (non-`--static-aes-iv`) IV. The
-    /// deterministic companion test above supplies the complementary proof
+    /// deterministic companion test below supplies the complementary proof
     /// that both ciphertext-dependent framing outcomes work end to end.
     ///
     /// Decode the hint stream via
@@ -8682,7 +8682,7 @@ mod tests {
     /// independently located object headers. The framing assertion is based
     /// on the declared encrypted `/Length`, so it does not mistake qpdf's
     /// optional framing newline for ciphertext. This complements the separate
-    /// random-IV end-to-end test below, which keeps the production IV path.
+    /// random-IV end-to-end test above, which keeps the production IV path.
     #[test]
     fn deterministic_encrypted_hint_cases_cover_both_ciphertext_framing_outcomes() {
         let first_src = outlines_and_part8_shared_pdf_bytes();
