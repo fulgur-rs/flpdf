@@ -292,6 +292,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         object_ref: ObjectRef,
         policy: RecoveryPolicy,
     ) -> Result<FileObjectRead> {
+        let absolute_base = usize::try_from(absolute_offset).unwrap_or(usize::MAX);
         // qpdf's `readObjectAtOffset` checks the expected object generation
         // (`QPDF.cc:1591-1612`) immediately after reading the indirect-object
         // header, before `readObject` parses the body. It rejects object ID 0
@@ -300,9 +301,10 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         // emit that warning before the body diagnostics. Recovery keeps the
         // established bootstrap reconstruction sequence below.
         if !self.options.allow_repair && policy != RecoveryPolicy::Bounded {
-            let actual_object_ref = parse_file_object_header(input)?;
+            let actual_object_ref = parse_file_object_header(input)
+                .map_err(|error| error.rebase_offset(absolute_base))?;
             if actual_object_ref.number == 0 {
-                return Err(Error::parse(absolute_offset as usize, "object with ID 0"));
+                return Err(Error::parse(absolute_base, "object with ID 0"));
             }
             if actual_object_ref != object_ref {
                 let message = format!(
@@ -319,7 +321,9 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
             }
         }
 
-        let completed = self.read_file_object(input, absolute_offset, policy)?;
+        let completed = self
+            .read_file_object(input, absolute_offset, policy)
+            .map_err(|error| error.rebase_offset(absolute_base))?;
         if completed.object_ref != object_ref
             && (self.options.allow_repair || policy == RecoveryPolicy::Bounded)
         {
@@ -330,7 +334,7 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
             if self.reconstruction_trigger.is_none() {
                 self.reconstruction_trigger = Some((absolute_offset, message.clone()));
             }
-            return Err(Error::parse(0, message));
+            return Err(Error::parse(absolute_base, message));
         }
         Ok(completed)
     }
@@ -409,9 +413,13 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                                     .as_ref()
                                     .is_some_and(|(offset, _)| *offset == start as u64);
                                 if !deferred_to_reconstruction {
+                                    let diagnostic_offset = match &error {
+                                        Error::Parse { offset, .. } => Some(*offset as u64),
+                                        _ => Some(start as u64), // cov:ignore: bootstrap reference reads only return parse errors
+                                    };
                                     self.diagnostics.push(Diagnostic::warning(
                                         error.to_string(),
-                                        Some(start as u64),
+                                        diagnostic_offset,
                                     ));
                                 }
                                 Object::Null
@@ -2647,6 +2655,43 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.offset == Some(1)));
+    }
+
+    #[test]
+    fn bootstrap_context_rebases_reference_parse_errors_to_source_offsets() {
+        let object_ref = ObjectRef::new(1, 0);
+        let object_start = 7usize;
+        let object = b"1 0 obj\n<0g>\nendobj\n";
+        let bytes = [vec![b' '; object_start], object.to_vec()].concat();
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            object_ref,
+            XrefEntry::Uncompressed {
+                offset: object_start as u64,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(object_ref), Object::Null);
+
+        let expected_offset = object_start + b"1 0 obj\n".len();
+        let diagnostic = context
+            .diagnostics
+            .entries()
+            .first()
+            .expect("referenced parse failure warning");
+        assert_eq!(diagnostic.offset, Some(expected_offset as u64));
+        assert!(
+            diagnostic
+                .message
+                .starts_with(&format!("parse error at byte {expected_offset}:")),
+            "diagnostic = {diagnostic:?}"
+        );
     }
 
     #[test]
