@@ -4,7 +4,7 @@
 
 **Scope:** This branch cuts over `Pdf::resolve_object_handle` and completes the canonical resolver's source classes needed by that API, including compressed object streams. The raw `Pdf::resolve`/`resolve_borrowed` API remains an explicitly legacy consumer boundary until `flpdf-egzr.3.2` migrates its in-tree consumers; it must not be called as a fallback from canonical resolution.
 
-**Oracle:** qpdf 11.9.0 source under `/home/ubuntu/.cache/flpdf/qpdf-11.9.0` and live `/usr/bin/qpdf` output. Relevant source seams are `QPDF::resolve`/`resolveObjectsInStream` (`libqpdf/QPDF.cc:1699-1788`), `QPDF::readObjectInStream` (`libqpdf/QPDF.cc:1450-1475`), `QPDFParser::withDescription`/`addScalar` (`libqpdf/QPDFParser.cc:413-443`), and `QPDFValue::getDescription` (`libqpdf/QPDFValue.cc:13-61`).
+**Oracle:** Resolve the pinned qpdf 11.9.0 source with `scripts/fetch-qpdf-source.sh --print-path`, and use live `/usr/bin/qpdf` output. Relevant source seams are `QPDF::resolve`/`resolveObjectsInStream` (`libqpdf/QPDF.cc:1699-1788`), `QPDF::readObjectInStream` (`libqpdf/QPDF.cc:1450-1475`), `QPDFParser::withDescription`/`addScalar` (`libqpdf/QPDFParser.cc:413-443`), and `QPDFValue::getDescription` (`libqpdf/QPDFValue.cc:13-61`).
 
 ## 1. Pin the canonical contracts with RED tests
 
