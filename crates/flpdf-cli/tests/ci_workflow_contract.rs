@@ -10,6 +10,7 @@ const REQUIRED_TEST_MATRIX_OS: [&str; 4] = [
     "macos-latest",
     "windows-latest",
 ];
+const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
 
 type ContractResult<T> = Result<T, String>;
 
@@ -65,33 +66,36 @@ fn run_contains_test_command(run: &str, command: &str) -> bool {
     })
 }
 
-fn run_contains_exact_command_line(run: &str, command: &str) -> bool {
-    run.lines().map(str::trim).any(|line| line == command)
-}
-
-fn bash_run_contains_exact_command_line(run: &str, command: &str) -> bool {
+fn bash_run_exact_command_line_count(run: &str, command: &str) -> usize {
     if run
         .lines()
         .map(str::trim)
         .any(|line| line == "if" || line.starts_with("if ") || line.contains("<<"))
     {
-        return false;
+        return 0;
     }
 
-    run_contains_exact_command_line(run, command)
+    run.lines()
+        .map(str::trim)
+        .filter(|line| *line == command)
+        .count()
 }
 
-fn test_job_step_contains_exact_command(step: &Yaml, command: &str) -> bool {
-    step.as_hash().is_some()
+fn test_job_step_exact_command_line_count(step: &Yaml, command: &str) -> usize {
+    if !(step.as_hash().is_some()
         && !mapping_contains_key(step, "if")
         && !mapping_contains_key(step, "working-directory")
         && continue_on_error_is_gating(step)
         && mapping_get(step, "shell")
             .and_then(Yaml::as_str)
-            .is_some_and(|shell| shell == "bash")
-        && mapping_get(step, "run")
-            .and_then(Yaml::as_str)
-            .is_some_and(|run| bash_run_contains_exact_command_line(run, command))
+            .is_some_and(|shell| shell == "bash"))
+    {
+        return 0;
+    }
+
+    mapping_get(step, "run")
+        .and_then(Yaml::as_str)
+        .map_or(0, |run| bash_run_exact_command_line_count(run, command))
 }
 
 fn job_contains_test_command(job: &Yaml, command: &str) -> ContractResult<bool> {
@@ -144,6 +148,9 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
     {
         return Ok(false);
     }
+    if mapping_get(test_job, "runs-on").and_then(Yaml::as_str) != Some(TEST_JOB_RUNS_ON) {
+        return Ok(false);
+    }
     if !test_job_has_required_os_matrix(test_job)? {
         return Ok(false);
     }
@@ -156,7 +163,9 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
 
     Ok(steps
         .iter()
-        .any(|step| test_job_step_contains_exact_command(step, command)))
+        .map(|step| test_job_step_exact_command_line_count(step, command))
+        .sum::<usize>()
+        == 1)
 }
 
 fn test_job_has_required_os_matrix(test_job: &Yaml) -> ContractResult<bool> {
@@ -370,6 +379,66 @@ fn test_matrix_runs_default_workspace_suite() {
     );
 }
 
+#[test]
+fn test_job_workspace_command_rejects_duplicate_workspace_commands() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace
+  - shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_duplicate_workspace_command_lines() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      cargo test --workspace
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_static_runs_on() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
 fn workspace_test_job_workflow(test_job_fields: &str) -> String {
     let test_job_fields = test_job_fields
         .lines()
@@ -381,6 +450,7 @@ fn workspace_test_job_workflow(test_job_fields: &str) -> String {
         "\
 jobs:
   test:
+    runs-on: ${{{{ matrix.os }}}}
     strategy:
       matrix:
         include:
@@ -398,6 +468,7 @@ fn test_job_workspace_command_rejects_missing_matrix() {
     let workflow = "\
 jobs:
   test:
+    runs-on: ${{ matrix.os }}
     steps:
       - shell: bash
         run: cargo test --workspace
@@ -414,6 +485,7 @@ fn test_job_workspace_command_rejects_empty_matrix() {
     let workflow = "\
 jobs:
   test:
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include: []
@@ -433,6 +505,7 @@ fn test_job_workspace_command_rejects_wrong_matrix_os() {
     let workflow = "\
 jobs:
   test:
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
