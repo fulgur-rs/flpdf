@@ -144,6 +144,11 @@ pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject
     parse_file_object_syntax_impl(input, parse_qpdf_direct_object)
 }
 
+pub(crate) fn parse_file_object_header(input: &[u8]) -> Result<ObjectRef> {
+    let mut tokenizer = Tokenizer::new(input);
+    parse_file_object_header_tokens(&mut tokenizer)
+}
+
 #[cfg(test)]
 pub(crate) fn parse_strict_file_object_syntax(input: &[u8]) -> Result<PendingFileObject> {
     parse_file_object_syntax_impl(input, parse_strict_direct_object)
@@ -154,17 +159,11 @@ fn parse_file_object_syntax_impl(
     parse_direct: fn(&[u8]) -> Result<ParsedDirectObject>,
 ) -> Result<PendingFileObject> {
     let mut tokenizer = Tokenizer::new(input);
-    let number = tokenizer.next_integer()?;
-    let generation = tokenizer.next_integer()?;
-    tokenizer.expect_word(b"obj")?;
+    let object_ref = parse_file_object_header_tokens(&mut tokenizer)?;
     tokenizer.skip_ignorable()?;
     let body_start = tokenizer.position();
     let parsed =
         parse_direct(&input[body_start..]).map_err(|error| error.rebase_offset(body_start))?;
-    let object_ref = ObjectRef::new(
-        u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
-        u16::try_from(generation).map_err(|_| Error::parse(0, "invalid indirect generation"))?,
-    );
     let ParsedDirectObject {
         object,
         next_offset,
@@ -232,6 +231,16 @@ fn parse_file_object_syntax_impl(
         },
         diagnostics,
     })
+}
+
+fn parse_file_object_header_tokens(tokenizer: &mut Tokenizer<'_>) -> Result<ObjectRef> {
+    let number = tokenizer.next_integer()?;
+    let generation = tokenizer.next_integer()?;
+    tokenizer.expect_word(b"obj")?;
+    Ok(ObjectRef::new(
+        u32::try_from(number).map_err(|_| Error::parse(0, "invalid indirect object number"))?,
+        u16::try_from(generation).map_err(|_| Error::parse(0, "invalid indirect generation"))?,
+    ))
 }
 
 pub(crate) fn finish_strict_direct_object(

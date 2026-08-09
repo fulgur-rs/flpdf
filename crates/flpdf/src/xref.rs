@@ -3,8 +3,8 @@ use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
 use crate::parser::Parser;
 use crate::reader::file_object::{
-    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, FileObjectRead,
-    PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
+    finish_file_object, parse_file_object_header, parse_file_object_syntax, FileObjectDiagnostic,
+    FileObjectRead, PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefEntry};
@@ -203,31 +203,41 @@ impl<'a> XrefReadContext<'a> {
         object_ref: ObjectRef,
         policy: RecoveryPolicy,
     ) -> Result<FileObjectRead> {
-        let completed = self.read_file_object(input, absolute_offset, policy)?;
         // qpdf's `readObjectAtOffset` checks the expected object generation
-        // (`QPDF.cc:1591-1612`). With recovery enabled, a mismatch fails this
-        // read and enters xref reconstruction; with recovery disabled qpdf
-        // warns and continues parsing the object. `Bounded` is used only by
-        // recovery-time candidate discovery, so preserve both modes here.
+        // (`QPDF.cc:1591-1612`) immediately after reading the indirect-object
+        // header, before `readObject` parses the body. In strict mode qpdf
+        // warns and continues parsing the object, so emit that warning before
+        // the body diagnostics. Recovery keeps the established bootstrap
+        // reconstruction sequence below.
+        if !self.options.allow_repair && policy != RecoveryPolicy::Bounded {
+            let actual_object_ref = parse_file_object_header(input)?;
+            if actual_object_ref != object_ref {
+                let message = format!(
+                    "expected {} {} obj",
+                    object_ref.number, object_ref.generation
+                );
+                self.diagnostics.push(Diagnostic::warning(
+                    format!(
+                        "(object {} {}, offset {}): {}",
+                        object_ref.number, object_ref.generation, absolute_offset, message
+                    ),
+                    Some(absolute_offset),
+                ));
+            }
+        }
+
+        let completed = self.read_file_object(input, absolute_offset, policy)?;
         if completed.object_ref != object_ref
             && (self.options.allow_repair || policy == RecoveryPolicy::Bounded)
         {
+            let message = format!(
+                "expected {} {} obj",
+                object_ref.number, object_ref.generation
+            );
             if self.reconstruction_trigger.is_none() {
-                self.reconstruction_trigger = Some((
-                    absolute_offset,
-                    format!(
-                        "expected {} {} obj",
-                        object_ref.number, object_ref.generation
-                    ),
-                ));
+                self.reconstruction_trigger = Some((absolute_offset, message.clone()));
             }
-            return Err(Error::parse(
-                0,
-                format!(
-                    "expected {} {} obj",
-                    object_ref.number, object_ref.generation
-                ),
-            ));
+            return Err(Error::parse(0, message));
         }
         Ok(completed)
     }
@@ -2706,6 +2716,32 @@ mod tests {
                 .to_string(),
             "parse error at byte 1: expected 1 0 obj"
         );
+    }
+
+    #[test]
+    fn bootstrap_header_mismatch_in_strict_mode_warns_and_keeps_parsed_object() {
+        let bytes = b" 5 0 obj\n42\nendobj\n";
+        let requested = ObjectRef::new(1, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(requested, XrefEntry::Uncompressed { offset: 1 });
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(requested), Object::Integer(42));
+        assert_eq!(
+            context
+                .diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["(object 1 0, offset 1): expected 1 0 obj"]
+        );
+        assert_eq!(context.diagnostics.entries()[0].offset, Some(1));
     }
 
     #[test]
