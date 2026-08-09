@@ -26,6 +26,9 @@ pub(crate) struct LoadedXrefState {
     pub(crate) loaded: LoadedXref,
     pub(crate) trailer_references: BTreeSet<ObjectRef>,
     pub(crate) parsed_xref_streams: BTreeMap<ObjectRef, Object>,
+    /// Objects resolved while reading xref streams stay available to the
+    /// post-chain trailer validation, matching qpdf's shared object cache.
+    pub(crate) bootstrap_cache: BTreeMap<ObjectRef, Object>,
     pub(crate) header_offset: usize,
     /// True when open-time xref recovery via linear scan already ran.
     ///
@@ -583,6 +586,12 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         &registration,
         options,
     );
+    size_context.cache.extend(
+        loaded
+            .bootstrap_cache
+            .iter()
+            .map(|(&object_ref, object)| (object_ref, object.clone())),
+    );
     let resolved_size = size_context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
     size_context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
     append_xref_size_warning_for(
@@ -639,6 +648,7 @@ fn parse_xref_from_start(
             },
             trailer_references,
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -769,6 +779,7 @@ fn merge_xref_stream_from_classic_trailer(
     loaded
         .parsed_xref_streams
         .extend(hybrid.parsed_xref_streams);
+    loaded.bootstrap_cache.extend(hybrid.bootstrap_cache);
 
     loaded.loaded.entries = registration.snapshot();
 
@@ -847,6 +858,9 @@ fn merge_previous_xref_sections(
                     .entry(object_ref)
                     .or_insert(object);
             }
+        }
+        for (object_ref, object) in previous.bootstrap_cache {
+            loaded.bootstrap_cache.entry(object_ref).or_insert(object);
         }
 
         section_context_spec = match section_context_spec {
@@ -1010,6 +1024,7 @@ fn recover_xref_from_linear_scan(
         },
         trailer_references,
         parsed_xref_streams,
+        bootstrap_cache: BTreeMap::new(),
         header_offset: 0,
         already_reconstructed: true,
     })
@@ -1051,6 +1066,11 @@ fn merge_recovered_qpdf_state(
     recovered
         .parsed_xref_streams
         .append(&mut accumulated.parsed_xref_streams);
+    // The accumulated state is the newer parsed xref prefix, so its shared
+    // bootstrap objects supersede any same-reference value from recovery.
+    recovered
+        .bootstrap_cache
+        .extend(accumulated.bootstrap_cache);
     recovered
 }
 
@@ -1744,7 +1764,7 @@ fn parse_xref_stream(
     // object and its dictionary are being decoded. qpdf mutates the shared
     // xref table after this read, so the Rust borrow must end before the
     // cumulative registration receives these entries.
-    let (build_result, reconstruction_trigger) = {
+    let (build_result, reconstruction_trigger, bootstrap_cache) = {
         let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
         let mut completed = match context.read_file_object(tail, xref_pos as u64, policy) {
             Ok(completed) => completed,
@@ -1814,7 +1834,8 @@ fn parse_xref_stream(
         });
         let reconstruction_trigger = context.take_reconstruction_trigger();
         context.append_diagnostics_to(&mut repair_diagnostics);
-        (build_result, reconstruction_trigger)
+        let bootstrap_cache = context.cache.clone();
+        (build_result, reconstruction_trigger, bootstrap_cache)
     };
 
     let (object_ref, object, trailer, entries, trailer_references) = match build_result {
@@ -1852,6 +1873,7 @@ fn parse_xref_stream(
         },
         trailer_references,
         parsed_xref_streams,
+        bootstrap_cache,
         header_offset: 0,
         already_reconstructed: false,
     };
@@ -2368,6 +2390,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2423,6 +2446,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2475,6 +2499,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2517,6 +2542,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2582,6 +2608,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2644,6 +2671,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
@@ -2700,6 +2728,7 @@ mod tests {
             },
             trailer_references: BTreeSet::new(),
             parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: BTreeMap::new(),
             header_offset: 0,
             already_reconstructed: false,
         };
