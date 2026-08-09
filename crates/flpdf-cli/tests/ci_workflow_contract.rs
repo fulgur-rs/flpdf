@@ -63,6 +63,16 @@ fn run_contains_exact_command_line(run: &str, command: &str) -> bool {
     run.lines().map(str::trim).any(|line| line == command)
 }
 
+fn test_job_step_contains_exact_command(step: &Yaml, command: &str) -> bool {
+    step.as_hash().is_some()
+        && !mapping_contains_key(step, "if")
+        && !mapping_contains_key(step, "working-directory")
+        && continue_on_error_is_gating(step)
+        && mapping_get(step, "run")
+            .and_then(Yaml::as_str)
+            .is_some_and(|run| run_contains_exact_command_line(run, command))
+}
+
 fn job_contains_test_command(job: &Yaml, command: &str) -> ContractResult<bool> {
     let job = require_mapping(job, "job")?;
     let Some(steps) = mapping_get(job, "steps") else {
@@ -98,12 +108,21 @@ fn workflow_contains_test_command(workflow: &str, command: &str) -> ContractResu
 
 fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResult<bool> {
     let workflow = parse_workflow(workflow)?;
+    if has_default_run_override(&workflow, "workflow")? {
+        return Ok(false);
+    }
     let jobs =
         mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
     let jobs = require_mapping(jobs, "workflow.jobs")?;
     let test_job = mapping_get(jobs, "test")
         .ok_or_else(|| "ci workflow must define the test job".to_owned())?;
     let test_job = require_mapping(test_job, "test job")?;
+    if has_default_run_override(test_job, "test job")?
+        || mapping_contains_key(test_job, "if")
+        || !continue_on_error_is_gating(test_job)
+    {
+        return Ok(false);
+    }
     let Some(steps) = mapping_get(test_job, "steps") else {
         return Ok(false);
     };
@@ -111,15 +130,9 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
         .as_vec()
         .ok_or_else(|| "test job.steps must be a sequence".to_owned())?;
 
-    Ok(steps.iter().any(|step| {
-        step.as_hash().is_some()
-            && !mapping_contains_key(step, "if")
-            && !mapping_contains_key(step, "working-directory")
-            && continue_on_error_is_gating(step)
-            && mapping_get(step, "run")
-                .and_then(Yaml::as_str)
-                .is_some_and(|run| run_contains_exact_command_line(run, command))
-    }))
+    Ok(steps
+        .iter()
+        .any(|step| test_job_step_contains_exact_command(step, command)))
 }
 
 fn mapping_get<'a>(mapping: &'a Yaml, key: &str) -> Option<&'a Yaml> {
@@ -297,6 +310,78 @@ fn test_matrix_runs_default_workspace_suite() {
         test_job_contains_test_command(CI_WORKFLOW, "cargo test --workspace")
             .expect("ci workflow must be valid and define the test job"),
         "the four-OS test matrix must run the complete default workspace suite"
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_job_condition() {
+    let workflow = "\
+jobs:
+  test:
+    if: runner.os == 'Linux'
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_job_continue_on_error() {
+    let workflow = "\
+jobs:
+  test:
+    continue-on-error: true
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_workflow_default_working_directory() {
+    let workflow = "\
+defaults:
+  run:
+    working-directory: crates/flpdf
+jobs:
+  test:
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_job_default_working_directory() {
+    let workflow = "\
+jobs:
+  test:
+    defaults:
+      run:
+        working-directory: crates/flpdf
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
     );
 }
 
