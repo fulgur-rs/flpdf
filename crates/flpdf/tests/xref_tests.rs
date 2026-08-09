@@ -1,3 +1,5 @@
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
     write_pdf, Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions,
@@ -5,8 +7,7 @@ use flpdf::{
 };
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Cursor;
+use std::io::{BufReader, Cursor, Write};
 
 #[test]
 fn loaded_xref_remains_constructible_with_original_public_fields() {
@@ -107,6 +108,71 @@ fn loads_xref_stream_and_trailer() {
     assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
     assert_eq!(startxref, loaded.startxref as usize);
     assert_eq!(startxref, xref_object_offset);
+}
+
+#[test]
+fn indirect_xref_stream_filter_metadata() {
+    let logical_entry = [(1, 1, 0)];
+    let bytes = hybrid_xref_stream_with_filter_metadata(
+        21,
+        5,
+        "/Filter 10 0 R",
+        vec![
+            (1, b"<< /Type /Catalog >>".to_vec()),
+            (10, b"[20 0 R]".to_vec()),
+            (20, b"/FlateDecode".to_vec()),
+        ],
+        &build_encoded_xref_stream_entries(&logical_entry),
+        false,
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("xref stream filter metadata should resolve through the active table");
+    let xref_offset = loaded
+        .entries
+        .get(&ObjectRef::new(5, 0))
+        .and_then(|entry| match entry {
+            XrefEntry::Uncompressed { offset } => Some(*offset),
+            _ => None,
+        })
+        .expect("xref stream object should remain live after decoding");
+    assert!(xref_offset > 0);
+}
+
+#[test]
+fn indirect_xref_stream_decode_parms() {
+    let logical_entry = [(1, 1, 0)];
+    let bytes = hybrid_xref_stream_with_filter_metadata(
+        26,
+        5,
+        "/Filter /FlateDecode /DecodeParms 11 0 R",
+        vec![
+            (1, b"<< /Type /Catalog >>".to_vec()),
+            (
+                11,
+                b"<< /Predictor 22 0 R /Columns 23 0 R /Colors 24 0 R /BitsPerComponent 25 0 R >>"
+                    .to_vec(),
+            ),
+            (22, b"12".to_vec()),
+            (23, b"7".to_vec()),
+            (24, b"1".to_vec()),
+            (25, b"8".to_vec()),
+        ],
+        &build_encoded_xref_stream_entries(&logical_entry),
+        true,
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("xref stream decode parameters should resolve through the active table");
+    let xref_offset = loaded
+        .entries
+        .get(&ObjectRef::new(5, 0))
+        .and_then(|entry| match entry {
+            XrefEntry::Uncompressed { offset } => Some(*offset),
+            _ => None,
+        })
+        .expect("PNG predictor must be removed before xref rows are parsed");
+    assert!(xref_offset > 0);
 }
 
 #[test]
@@ -688,6 +754,71 @@ fn build_encoded_xref_stream_entries(entries: &[(u8, u64, u64)]) -> Vec<u8> {
         encoded.extend_from_slice(&field2.to_be_bytes()[6..]);
     }
     encoded
+}
+
+fn flate_encode(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn hybrid_xref_stream_with_filter_metadata(
+    size: u32,
+    indexed_object: u32,
+    metadata: &str,
+    objects: Vec<(u32, Vec<u8>)>,
+    logical_entries: &[u8],
+    png_predictor: bool,
+) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+
+    for (object_number, body) in objects {
+        offsets.insert(object_number, bytes.len() as u64);
+        bytes.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_stream_offset = bytes.len() as u64;
+    let mut logical_entries = logical_entries.to_vec();
+    assert_eq!(logical_entries.len(), 7);
+    logical_entries[1..5].copy_from_slice(&xref_stream_offset.to_be_bytes()[4..]);
+    offsets.insert(2, xref_stream_offset);
+    let mut filter_input = Vec::with_capacity(logical_entries.len() + usize::from(png_predictor));
+    if png_predictor {
+        filter_input.push(0);
+    }
+    filter_input.extend_from_slice(&logical_entries);
+    let compressed = flate_encode(&filter_input);
+    bytes.extend_from_slice(
+        format!(
+            "2 0 obj\n<< /Type /XRef /Size {size} /Root 1 0 R /W [1 4 2] /Index [{indexed_object} 1] /Length {} {metadata} >>\nstream\n",
+            compressed.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&compressed);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+    let classic_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+    for object_number in 0..size {
+        if object_number == 0 {
+            bytes.extend_from_slice(b"0000000000 65535 f \n");
+        } else if let Some(offset) = offsets.get(&object_number) {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        } else {
+            bytes.extend_from_slice(b"0000000000 00000 f \n");
+        }
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {size} /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{classic_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    bytes
 }
 
 #[derive(Clone, Copy)]
