@@ -439,6 +439,26 @@ pub(crate) fn decode_stream_data_from_handle(
         stream_data,
         limits,
         DataEventMode::Suppress,
+        false,
+    )?;
+    replay_strict_decode_outcome(outcome, &mut reject_decode_warning)
+}
+
+/// Decode an object stream after `getRawStreamData` has already consumed its
+/// encryption stage. qpdf's `SF_Crypt` is a no-op in the later filter chain
+/// (`QPDF_Stream.cc:27-57`); `QPDF::decryptStream` handled the bytes before
+/// the filter chain was constructed (`QPDF.cc:2489-2492`).
+pub(crate) fn decode_stream_data_from_handle_after_raw_stream_read(
+    stream_dict: &ObjectHandle,
+    stream_data: &[u8],
+    limits: DecodeLimits,
+) -> Result<Vec<u8>> {
+    let outcome = decode_stream_data_from_handle_with_mode(
+        stream_dict,
+        stream_data,
+        limits,
+        DataEventMode::Suppress,
+        true,
     )?;
     replay_strict_decode_outcome(outcome, &mut reject_decode_warning)
 }
@@ -470,6 +490,7 @@ pub(crate) fn decode_stream_data_recovering_from_handle(
         stream_data,
         limits,
         DataEventMode::Record,
+        false,
     )
 }
 
@@ -478,10 +499,19 @@ fn decode_stream_data_from_handle_with_mode(
     stream_data: &[u8],
     limits: DecodeLimits,
     data_events: DataEventMode,
+    skip_consumed_crypt: bool,
 ) -> Result<StreamDecodeOutcome> {
     let filter = stream_dict.try_get_key(b"Filter")?;
     let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
     let specs = decode_filter_specs_from_handle(&filter, &decode_params, limits.max_filter_chain)?;
+    let specs = if skip_consumed_crypt {
+        specs
+            .into_iter()
+            .filter(|spec| spec.normalized_name() != b"Crypt")
+            .collect()
+    } else {
+        specs
+    };
     decode_prepared_specs(
         specs,
         stream_data,

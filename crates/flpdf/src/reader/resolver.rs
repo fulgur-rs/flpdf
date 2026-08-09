@@ -1067,11 +1067,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })?;
 
         let raw_stream_data = stream_handle.get_raw_stream_data()?;
-        let decoded_stream_data = crate::filters::decode_stream_data_from_handle(
-            &stream_dict,
-            raw_stream_data.as_ref(),
-            crate::filters::DecodeLimits::default(),
-        )?;
+        let decoded_stream_data =
+            crate::filters::decode_stream_data_from_handle_after_raw_stream_read(
+                &stream_dict,
+                raw_stream_data.as_ref(),
+                crate::filters::DecodeLimits::default(),
+            )?;
 
         let object_count = Self::object_stream_integer(&stream_dict, b"N", "/N")?;
         let first = Self::object_stream_integer(&stream_dict, b"First", "/First")?;
@@ -1945,7 +1946,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let stream_offset = self.tell()?;
 
         let mut recovered = false;
-        let length = match Self::stream_length(&dict) {
+        let mut length = match Self::stream_length(&dict) {
             Ok(length) => length,
             Err(error) if self.is_recoverable_stream_error(&error) => {
                 if !self.attempt_recovery() {
@@ -1976,7 +1977,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     return Err(error);
                 }
                 self.warn_stream_failure(&error, object_offset)?;
-                self.recover_stream_length(stream_offset)?;
+                length = self.recover_stream_length(stream_offset)?;
             }
         }
 
@@ -5685,6 +5686,74 @@ mod tests {
         assert!(first.is_same_object_as(&member));
     }
 
+    #[test]
+    fn a_compressed_object_stream_skips_crypt_after_raw_stream_read() {
+        let member_data = b"<< /Value 1 >>";
+        let header = b"7 0 ";
+        let first = header.len();
+        let mut stream_data = header.to_vec();
+        stream_data.extend_from_slice(member_data);
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(first as i64)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+            (b"Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
+            (
+                b"DecodeParms".to_vec(),
+                crypt_filter_decode_params(b"StdCF"),
+            ),
+        ]);
+        let encryption = v4_encryption(EncryptionMode::Rc4);
+        let ciphertext = rc4_stream_ciphertext(stream_ref, &stream_data, &encryption);
+        let mut source = vec![0];
+        source.extend_from_slice(&ciphertext);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(source),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        *resolver.encryption_parameters().borrow_mut() = Some(encryption);
+        let stream = resolver.get_object_handle(stream_ref);
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict,
+            stream_data: None,
+            stream_length: ciphertext.len(),
+        });
+        stream.set_parsed_offset_if_unset(1);
+
+        let member = resolver.get_object_handle(member_ref);
+        member
+            .try_dereference()
+            .expect("qpdf's already-consumed Crypt stage must not reject ObjStm data");
+        assert_eq!(
+            member
+                .as_dictionary()
+                .and_then(|dict| dict.get(b"Value".as_slice()).cloned())
+                .and_then(|value| value.as_integer()),
+            Some(1)
+        );
+    }
+
     /// A detected loop warns, with qpdf's own message text.
     ///
     /// qpdf: `warn(damagedPDF("", "loop detected resolving object " +
@@ -6935,6 +7004,39 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn canonical_stream_reuses_the_length_recovered_from_bad_framing() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("bad framing enters qpdf's recovery arm");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            b"abc\n"
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message == "recovered stream length: 4"));
     }
 
     /// A `/Length` too large to be a position in the input is diagnosed

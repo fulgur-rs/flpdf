@@ -1764,7 +1764,7 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// A direct handle, or an indirect handle that has already been resolved,
     /// is a no-op. Resolution is delegated directly to the canonical
-    /// [`ResolverHandle`] cache; it never materializes a legacy [`Object`].
+    /// `ResolverHandle` cache; it never materializes a legacy [`Object`].
     ///
     /// This does not chase through an already-resolved
     /// [`Pdf::set_object`]-driven bare-reference redirect to its terminal
