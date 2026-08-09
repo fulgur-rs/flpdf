@@ -1603,6 +1603,37 @@ fn hint_stream_dict_prefix(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only IV queue used to model a probe/final re-encryption regression
+    /// without exposing an IV-injection option in the production API. The
+    /// queue is thread-local because Rust unit tests run in parallel.
+    static TEST_HINT_STREAM_AES_IVS:
+        std::cell::RefCell<std::collections::VecDeque<[u8; 16]>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+fn next_test_hint_stream_aes_iv(default: [u8; 16]) -> [u8; 16] {
+    TEST_HINT_STREAM_AES_IVS.with(|ivs| ivs.borrow_mut().pop_front().unwrap_or(default))
+}
+
+#[cfg(test)]
+fn with_test_hint_stream_aes_ivs<T>(
+    ivs: impl IntoIterator<Item = [u8; 16]>,
+    f: impl FnOnce() -> T,
+) -> (T, Vec<[u8; 16]>) {
+    let previous = TEST_HINT_STREAM_AES_IVS.with(|slot| slot.replace(ivs.into_iter().collect()));
+    let result = f();
+    let remaining = TEST_HINT_STREAM_AES_IVS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let remaining = slot.drain(..).collect();
+        *slot = previous;
+        remaining
+    });
+    (result, remaining)
+}
+
 /// Emit the primary hint-stream object and return its start byte offset.
 ///
 /// qpdf 11.9.0 serializes the hint-stream object dict in the key order
@@ -1643,6 +1674,9 @@ fn append_hint_stream_object(
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     hint_stream_aes_iv: [u8; 16],
 ) -> Result<usize> {
+    #[cfg(test)]
+    let hint_stream_aes_iv = next_test_hint_stream_aes_iv(hint_stream_aes_iv);
+
     // Encrypt the payload BEFORE computing the dict prefix, so `/Length`
     // reflects the on-disk (encrypted) byte count — mirrors qpdf's
     // `adjustAESStreamLength` call between `setDataKey` and writing `/Length`.
@@ -5490,22 +5524,21 @@ mod tests {
         pdf
     }
 
-    /// Fixed source variant selected to make the encrypted hint ciphertext end
-    /// in `\n` under [`configure_deterministic_aes128`]. The payload and
-    /// `/ID[0]` values are intentionally fixed test data, not a search at test
-    /// runtime; the short loop only constructs the one deterministic stream
-    /// payload.
-    fn outlines_and_part8_shared_pdf_bytes_with_newline_framing_variant() -> Vec<u8> {
-        let mut content = b"BT /F1 12 Tf 72 700 Td (".to_vec();
-        for i in 0..146 {
-            content.push((i as u8).wrapping_mul(37).wrapping_add(11));
-        }
-        content.extend_from_slice(b") Tj ET\n");
-        outlines_and_part8_shared_pdf_bytes_with_payload_and_id(
-            &content,
-            b"outline-producer-146",
-            Some(&[146u8; 16]),
-        )
+    #[test]
+    fn outlines_and_part8_fixture_can_emit_supplied_source_id() {
+        let source = outlines_and_part8_shared_pdf_bytes_with_payload_and_id(
+            b"BT /F1 12 Tf 72 700 Td (id fixture) Tj ET\n",
+            b"outline-producer-id",
+            Some(&[146_u8; 16]),
+        );
+        let expected_id =
+            b"/ID [<92929292929292929292929292929292><92929292929292929292929292929292>]";
+        assert!(
+            source
+                .windows(expected_id.len())
+                .any(|window| window == expected_id),
+            "fixture must include the supplied source ID"
+        );
     }
 
     #[test]
@@ -6489,6 +6522,28 @@ mod tests {
             b"owner".to_vec(),
         ));
     }
+
+    // These fixed IVs were selected against the complete three-page fixture
+    // below. They produce opposite ciphertext-last-byte framing outcomes while
+    // leaving the hint tables and the encryption key inputs unchanged. The
+    // compatibility feature uses a different compression implementation, so it
+    // needs its own pair of IVs to reach the same framing boundaries.
+    #[cfg(not(feature = "qpdf-zlib-compat"))]
+    const HINT_IV_NO_FRAMING_NEWLINE: [u8; 16] = [
+        172, 10, 255, 113, 144, 81, 27, 235, 20, 47, 87, 178, 60, 65, 226, 247,
+    ];
+    #[cfg(not(feature = "qpdf-zlib-compat"))]
+    const HINT_IV_WITH_FRAMING_NEWLINE: [u8; 16] = [
+        144, 3, 147, 208, 28, 39, 53, 128, 99, 2, 45, 208, 190, 187, 8, 27,
+    ];
+    #[cfg(feature = "qpdf-zlib-compat")]
+    const HINT_IV_NO_FRAMING_NEWLINE: [u8; 16] = [
+        173, 114, 118, 125, 12, 37, 246, 18, 191, 188, 47, 115, 60, 50, 129, 185,
+    ];
+    #[cfg(feature = "qpdf-zlib-compat")]
+    const HINT_IV_WITH_FRAMING_NEWLINE: [u8; 16] = [
+        174, 226, 85, 64, 141, 180, 169, 76, 244, 19, 246, 109, 168, 31, 180, 103,
+    ];
 
     /// Compute the encrypted output's hint-stream object number from the same
     /// plan construction as [`linearize_with`]. Encryption reserves one slot
@@ -8672,34 +8727,49 @@ mod tests {
     }
 
     /// Deterministic end-to-end proof of both ciphertext-dependent hint-stream
-    /// framing outcomes. The two source variants retain the same three-page
-    /// graph, Outlines root, and Part-8 shared object, but their fixed payload
-    /// and input `/ID[0]` values select opposite AES ciphertext final bytes.
+    /// framing outcomes. The same three-page graph, Outlines root, and Part-8
+    /// shared object is encrypted twice with fixed IVs selected to land on
+    /// opposite ciphertext-last-byte outcomes.
     ///
     /// Each output goes through the complete `linearize_with` pipeline, then
     /// checks the linearization parameter dictionary, encrypted body strings,
     /// decrypted hint tables, and the Shared Objects/Outlines offsets against
     /// independently located object headers. The framing assertion is based
     /// on the declared encrypted `/Length`, so it does not mistake qpdf's
-    /// optional framing newline for ciphertext. This complements the separate
-    /// random-IV end-to-end test above, which keeps the production IV path.
+    /// optional framing newline for ciphertext.
+    ///
+    /// The first invocation deliberately arms the test-only IV queue with the
+    /// probe/final pair. The current qpdf-shaped implementation must consume
+    /// exactly one IV while building the complete hint object and replay that
+    /// object in pass 2; if a probe/final re-encryption loop returns, it
+    /// consumes the second, opposite-framing IV and this assertion fails.
     #[test]
     fn deterministic_encrypted_hint_cases_cover_both_ciphertext_framing_outcomes() {
-        let first_src = outlines_and_part8_shared_pdf_bytes();
-        let second_src = outlines_and_part8_shared_pdf_bytes_with_newline_framing_variant();
-        let first_hint_stream_num = encrypted_hint_stream_number(&first_src);
-        let second_hint_stream_num = encrypted_hint_stream_number(&second_src);
-
-        let first = linearize_with(&first_src, configure_deterministic_aes128);
-        let second = linearize_with(&second_src, configure_deterministic_aes128);
+        let source = outlines_and_part8_shared_pdf_bytes();
+        let hint_stream_num = encrypted_hint_stream_number(&source);
+        let (first, remaining) = with_test_hint_stream_aes_ivs(
+            [HINT_IV_NO_FRAMING_NEWLINE, HINT_IV_WITH_FRAMING_NEWLINE],
+            || linearize_with(&source, configure_deterministic_aes128),
+        );
+        assert_eq!(
+            remaining,
+            vec![HINT_IV_WITH_FRAMING_NEWLINE],
+            "the complete hint object must be encrypted once; a second queued IV \
+             would indicate probe/final re-encryption"
+        );
+        let (second, remaining) =
+            with_test_hint_stream_aes_ivs([HINT_IV_WITH_FRAMING_NEWLINE], || {
+                linearize_with(&source, configure_deterministic_aes128)
+            });
+        assert!(remaining.is_empty());
 
         let mut framing_newline = Vec::new();
-        for (label, output, hint_stream_num) in [
-            ("default", &first, first_hint_stream_num),
-            ("ciphertext-newline", &second, second_hint_stream_num),
-        ] {
+        for (label, output) in [("no-framing-newline", &first), ("framing-newline", &second)] {
             crate::linearization::check_linearization_bytes(output).unwrap_or_else(|error| {
+                // cov:ignore-start: the test constructs valid linearized PDFs;
+                // this branch only guards an unexpected checker regression.
                 panic!("{label}: encrypted linearized output must pass checker: {error}")
+                // cov:ignore-end
             });
             assert_encrypted_body_strings_are_hex(output);
 
@@ -8739,7 +8809,7 @@ mod tests {
 
         assert_eq!(
             framing_newline,
-            [true, false],
+            [false, true],
             "the deterministic end-to-end cases must cover both hint-stream framing outcomes"
         );
     }

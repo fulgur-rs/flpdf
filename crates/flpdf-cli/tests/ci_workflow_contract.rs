@@ -296,7 +296,7 @@ fn bash_run_has_early_success_before_command(run: &str, command: &str) -> bool {
         if segment == command {
             return false;
         }
-        if matches!(segment, "exit 0" | "exec true") {
+        if matches!(segment, "exit" | "exit 0" | "exec true") {
             return true;
         }
     }
@@ -712,6 +712,25 @@ steps:
   - shell: bash
     run: |
       exit 0
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_bare_exit_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      exit
       cargo test --workspace
 ",
     );
