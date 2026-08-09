@@ -873,7 +873,7 @@ fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
 /// deleted-object set is still available.
 fn append_xref_size_warning(loaded: &mut LoadedXref, deleted_objects: &BTreeSet<u32>) {
     append_xref_size_warning_for(
-        &loaded.trailer,
+        loaded.trailer.get("Size"),
         &loaded.entries,
         deleted_objects,
         &mut loaded.repair_diagnostics,
@@ -881,12 +881,12 @@ fn append_xref_size_warning(loaded: &mut LoadedXref, deleted_objects: &BTreeSet<
 }
 
 fn append_xref_size_warning_for(
-    trailer: &Dictionary,
+    size: Option<&Object>,
     entries: &BTreeMap<ObjectRef, XrefEntry>,
     deleted_objects: &BTreeSet<u32>,
     repair_diagnostics: &mut Diagnostics,
 ) {
-    let Some(Object::Integer(size)) = trailer.get("Size") else {
+    let Some(Object::Integer(size)) = size else {
         return;
     };
     let max_live = entries
@@ -1264,8 +1264,22 @@ fn recover_trailer_from_xref_stream_candidate(
     {
         repair_diagnostics.push(diagnostic.clone());
     }
+    // qpdf's post-chain `m->trailer.getKey("/Size").getIntValueAsInt()`
+    // dereferences an indirect `/Size` through the reconstructed table
+    // (`QPDF.cc:697`). Resolve it with the same bootstrap context used while
+    // re-entering the candidate instead of inspecting the raw reference.
+    let mut size_context = XrefReadContext::new(
+        bytes,
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries: entries,
+        },
+        &reentry_registration,
+        options,
+    );
+    let resolved_size = size_context.resolve_dictionary_value(&candidate.trailer, "Size");
+    size_context.append_diagnostics_to(repair_diagnostics);
     append_xref_size_warning_for(
-        &candidate.trailer,
+        resolved_size.as_ref(),
         entries,
         &reentry_registration.deleted_objects,
         repair_diagnostics,

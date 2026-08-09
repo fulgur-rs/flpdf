@@ -2622,6 +2622,35 @@ fn xref_stream_document(trailer_section: bool) -> (Vec<u8>, u64) {
     (bytes, xref_stream_offset)
 }
 
+fn xref_stream_document_with_indirect_size(size_value: i64) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (1, xref_stream_offset, 0),
+    ]);
+    let mut xref_stream = format!(
+        "2 0 obj\n<< /Type /XRef /Size 3 0 R /Root 1 0 R /W [1 4 2] /Index [0 3] /Length {} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    xref_stream.extend_from_slice(&entries);
+    xref_stream.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(&xref_stream);
+
+    // The candidate's indirect `/Size` is available only through the
+    // reconstruction line-scan table, not through the candidate stream's
+    // own xref entries.
+    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\nendobj\n").as_bytes());
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+    bytes
+}
+
 fn ignore_xref_streams_options(repair: bool) -> PdfOpenOptions {
     PdfOpenOptions {
         repair,
@@ -3109,6 +3138,38 @@ fn candidate_recovery_warns_when_xref_size_is_not_one_plus_highest_object() {
         .any(|diagnostic| {
             diagnostic.message
                 == "reported number of objects (4) is not one plus the highest object number (2)"
+                && diagnostic.offset.is_none()
+        }));
+}
+
+#[test]
+fn candidate_recovery_resolves_matching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(
+        xref_stream_document_with_indirect_size(4),
+    ))
+    .expect("candidate xref-stream recovery should succeed");
+
+    assert!(!loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| { diagnostic.message.contains("reported number of objects") }));
+}
+
+#[test]
+fn candidate_recovery_warns_for_mismatching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(
+        xref_stream_document_with_indirect_size(3),
+    ))
+    .expect("candidate xref-stream recovery should succeed");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (3) is not one plus the highest object number (3)"
                 && diagnostic.offset.is_none()
         }));
 }
