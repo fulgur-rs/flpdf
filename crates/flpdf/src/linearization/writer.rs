@@ -1593,6 +1593,37 @@ fn hint_stream_dict_prefix(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only IV queue used to model a probe/final re-encryption regression
+    /// without exposing an IV-injection option in the production API. The
+    /// queue is thread-local because Rust unit tests run in parallel.
+    static TEST_HINT_STREAM_AES_IVS:
+        std::cell::RefCell<std::collections::VecDeque<[u8; 16]>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+fn next_test_hint_stream_aes_iv(default: [u8; 16]) -> [u8; 16] {
+    TEST_HINT_STREAM_AES_IVS.with(|ivs| ivs.borrow_mut().pop_front().unwrap_or(default))
+}
+
+#[cfg(test)]
+fn with_test_hint_stream_aes_ivs<T>(
+    ivs: impl IntoIterator<Item = [u8; 16]>,
+    f: impl FnOnce() -> T,
+) -> (T, Vec<[u8; 16]>) {
+    let previous = TEST_HINT_STREAM_AES_IVS.with(|slot| slot.replace(ivs.into_iter().collect()));
+    let result = f();
+    let remaining = TEST_HINT_STREAM_AES_IVS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let remaining = slot.drain(..).collect();
+        *slot = previous;
+        remaining
+    });
+    (result, remaining)
+}
+
 /// Emit the primary hint-stream object and return its start byte offset.
 ///
 /// qpdf 11.9.0 serializes the hint-stream object dict in the key order
@@ -1633,6 +1664,9 @@ fn append_hint_stream_object(
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     hint_stream_aes_iv: [u8; 16],
 ) -> Result<usize> {
+    #[cfg(test)]
+    let hint_stream_aes_iv = next_test_hint_stream_aes_iv(hint_stream_aes_iv);
+
     // Encrypt the payload BEFORE computing the dict prefix, so `/Length`
     // reflects the on-disk (encrypted) byte count — mirrors qpdf's
     // `adjustAESStreamLength` call between `setDataKey` and writing `/Length`.
@@ -5363,7 +5397,30 @@ mod tests {
     /// `compute_outline_hint_info` a non-empty retained outline set, which
     /// populates the Outlines Hint Table's `first_object_offset`.
     fn outlines_and_part8_shared_pdf_bytes() -> Vec<u8> {
-        let content = b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n";
+        outlines_and_part8_shared_pdf_bytes_with_payload(
+            b"BT /F1 12 Tf 72 700 Td (hi) Tj ET\n",
+            b"outline-producer-printable",
+        )
+    }
+
+    /// Variant of [`outlines_and_part8_shared_pdf_bytes`] for deterministic
+    /// encryption tests. Keeping the graph identical while varying the body
+    /// payload lets the tests select ciphertext bytes on either side of the
+    /// hint-stream framing boundary without changing which hint tables exist.
+    fn outlines_and_part8_shared_pdf_bytes_with_payload(
+        content: &[u8],
+        producer: &[u8],
+    ) -> Vec<u8> {
+        outlines_and_part8_shared_pdf_bytes_with_payload_and_id(content, producer, None)
+    }
+
+    /// As [`outlines_and_part8_shared_pdf_bytes_with_payload`], with an
+    /// optional fixed input `/ID[0]` for deterministic encryption-key variants.
+    fn outlines_and_part8_shared_pdf_bytes_with_payload_and_id(
+        content: &[u8],
+        producer: &[u8],
+        id0: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let mut offs = [0usize; 12];
@@ -5430,19 +5487,48 @@ mod tests {
         offs[11] = pdf.len();
         pdf.extend_from_slice(
             b"11 0 obj\n<< /Nested [(array-printable) << /Inner (inner-printable) >>] \
-              /Producer (outline-producer-printable) >>\nendobj\n",
+              /Producer (",
         );
+        pdf.extend_from_slice(producer);
+        pdf.extend_from_slice(b") >>\nendobj\n");
 
         let xref = pdf.len();
         pdf.extend_from_slice(b"xref\n0 12\n0000000000 65535 f \n");
         for off in offs.iter().skip(1) {
             pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
         }
+        let id_entry = id0
+            .filter(|bytes| !bytes.is_empty())
+            .map(|bytes| {
+                let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                format!(" /ID [<{hex}><{hex}>]")
+            })
+            .unwrap_or_default();
         pdf.extend_from_slice(
-            format!("trailer\n<< /Size 12 /Root 1 0 R /Info 11 0 R >>\nstartxref\n{xref}\n%%EOF\n")
-                .as_bytes(),
+            format!(
+                "trailer\n<< /Size 12 /Root 1 0 R /Info 11 0 R{id_entry} >>\n\
+                 startxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
         );
         pdf
+    }
+
+    #[test]
+    fn outlines_and_part8_fixture_can_emit_supplied_source_id() {
+        let source = outlines_and_part8_shared_pdf_bytes_with_payload_and_id(
+            b"BT /F1 12 Tf 72 700 Td (id fixture) Tj ET\n",
+            b"outline-producer-id",
+            Some(&[146_u8; 16]),
+        );
+        let expected_id =
+            b"/ID [<92929292929292929292929292929292><92929292929292929292929292929292>]";
+        assert!(
+            source
+                .windows(expected_id.len())
+                .any(|window| window == expected_id),
+            "fixture must include the supplied source ID"
+        );
     }
 
     #[test]
@@ -6435,6 +6521,51 @@ mod tests {
             write_linearized(&plan, &renumber, &mut pdf2, &opts).expect("write_linearized");
         doc.back_patch().expect("back_patch must succeed");
         doc.bytes
+    }
+
+    /// Configure the deterministic AES-128 mode used by the two framing
+    /// boundary fixtures. `static_id` fixes the encryption key inputs while
+    /// `static_aes_iv` fixes every AES IV; neither setting is used by the
+    /// random-IV production-path regression below.
+    fn configure_deterministic_aes128(options: &mut WriteOptions) {
+        options.static_id = true;
+        options.static_aes_iv = true;
+        options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+            Vec::new(),
+            b"owner".to_vec(),
+        ));
+    }
+
+    // These fixed IVs were selected against the complete three-page fixture
+    // below. They produce opposite ciphertext-last-byte framing outcomes while
+    // leaving the hint tables and the encryption key inputs unchanged. The
+    // compatibility feature uses a different compression implementation, so it
+    // needs its own pair of IVs to reach the same framing boundaries.
+    #[cfg(not(feature = "qpdf-zlib-compat"))]
+    const HINT_IV_NO_FRAMING_NEWLINE: [u8; 16] = [
+        172, 10, 255, 113, 144, 81, 27, 235, 20, 47, 87, 178, 60, 65, 226, 247,
+    ];
+    #[cfg(not(feature = "qpdf-zlib-compat"))]
+    const HINT_IV_WITH_FRAMING_NEWLINE: [u8; 16] = [
+        144, 3, 147, 208, 28, 39, 53, 128, 99, 2, 45, 208, 190, 187, 8, 27,
+    ];
+    #[cfg(feature = "qpdf-zlib-compat")]
+    const HINT_IV_NO_FRAMING_NEWLINE: [u8; 16] = [
+        173, 114, 118, 125, 12, 37, 246, 18, 191, 188, 47, 115, 60, 50, 129, 185,
+    ];
+    #[cfg(feature = "qpdf-zlib-compat")]
+    const HINT_IV_WITH_FRAMING_NEWLINE: [u8; 16] = [
+        174, 226, 85, 64, 141, 180, 169, 76, 244, 19, 246, 109, 168, 31, 180, 103,
+    ];
+
+    /// Compute the encrypted output's hint-stream object number from the same
+    /// plan construction as [`linearize_with`]. Encryption reserves one slot
+    /// immediately before the hint stream, so the final number is the
+    /// unencrypted hint slot plus one.
+    fn encrypted_hint_stream_number(source_bytes: &[u8]) -> u32 {
+        let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
+        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
+        RenumberMap::from_plan(&plan).hint_stream_slot() + 1
     }
 
     /// The classic xref-table path (no object streams) must carry `/ID` in
@@ -8472,12 +8603,15 @@ mod tests {
     /// `IV_NO_NEWLINE` / `IV_WITH_NEWLINE` were found by brute-forcing 16-byte
     /// IVs against this exact payload + key until one landed on each side of
     /// the boundary (`stream.data.last() == Some(&b'\n')`); they are not
-    /// otherwise meaningful values. This is the premise half of the fix's
-    /// proof — see [`hint_stream_length_is_stable_across_a_forced_iv_change`]
-    /// (this file) for why the length difference this test demonstrates does
-    /// NOT translate into a corrupted hint table, and
-    /// `append_hint_stream_object`'s own doc for the invariant that makes
-    /// that true.
+    /// otherwise meaningful values. This direct fixed-IV framing test covers
+    /// the local ciphertext/newline length difference. The deterministic
+    /// end-to-end test
+    /// [`deterministic_encrypted_hint_cases_cover_both_ciphertext_framing_outcomes`]
+    /// below covers both outcomes through the complete linearization pipeline,
+    /// while the separate random-IV test retains production-path coverage and
+    /// checks the resulting Shared Objects and Outlines offsets. The
+    /// `append_hint_stream_object` doc describes the framing invariant that
+    /// connects these tests.
     #[test]
     fn identical_plaintext_different_iv_can_change_hint_stream_object_length() {
         use crate::writer::{EncryptionContext, WriteCipher};
@@ -8591,134 +8725,169 @@ mod tests {
         panic!("dump has no \"{needle}\" line:\n{dump}"); // cov:ignore: defensive — every dump this test module produces contains every field it queries; only guards a future show.rs field-name rename from failing silently.
     }
 
-    /// End-to-end proof (task item 5): a real linearized + AES-128-encrypted
-    /// document carrying BOTH an Outlines Hint Table entry and a Part-8
+    /// End-to-end proof: a real linearized + AES-128-encrypted document
+    /// carrying BOTH an Outlines Hint Table entry and a Part-8
     /// (`part4_other_pages_shared`) Shared Objects Hint Table entry — the two
     /// concrete tables the PR review named — has internally self-consistent
-    /// hint tables under the fix, run repeatedly with genuinely random
-    /// (non-`--static-aes-iv`) per-invocation IVs.
+    /// hint tables with a genuinely random (non-`--static-aes-iv`) IV. The
+    /// deterministic companion test below supplies the complementary proof
+    /// that both ciphertext-dependent framing outcomes work end to end.
     ///
-    /// For each run: decode the hint stream via
+    /// Decode the hint stream via
     /// [`crate::linearization::show_linearization_bytes`] (the same decoder
     /// that reconstructs qpdf's `adjusted_offset`, i.e. `stored_value +
     /// /H[1]`) and independently locate the REAL physical byte offset of the
-    /// referenced object by scanning the actually-shipped bytes — then assert
+    /// referenced objects by scanning the actually-shipped bytes — then assert
     /// they agree. `check_linearization_bytes` alone would not catch a
     /// regression here: per its own doc table it validates the linearization
     /// PARAMETER DICT (`/L /N /O /H /E /T`), not the hint stream's internal
     /// Page/Shared/Outline tables — this test's `show_linearization_bytes` +
-    /// manual offset reconstruction is the actual oracle for those (see task
-    /// item 6 in the commit/PR description for this gap in the checker).
+    /// manual offset reconstruction is the actual oracle for those.
     #[test]
-    fn linearized_encrypted_outline_and_part8_shared_hint_tables_stay_consistent_across_many_random_iv_runs(
-    ) {
+    fn linearized_encrypted_outline_and_part8_shared_hint_tables_are_consistent_with_random_iv() {
         let src = outlines_and_part8_shared_pdf_bytes();
-        let mut observed_hint_lengths: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
-        let mut observed_outputs: std::collections::BTreeSet<Vec<u8>> =
-            std::collections::BTreeSet::new();
+        let out = linearize_with(&src, |o| {
+            // Empty user password so `check_linearization_bytes` and
+            // `show_linearization_bytes` below (both open with no password)
+            // can decrypt transparently — the same convention
+            // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
+            // uses. `static_aes_iv` stays at its default `false`, so this
+            // case uses a genuinely random IV.
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
 
-        // 3000 trials keeps the (informational, not asserted — see below)
-        // probability of never observing the newline-before-endstream
-        // boundary below 1e-5: each trial independently has a ~1/256 chance
-        // of the hint-stream ciphertext's last byte landing on `\n`, so
-        // P(never in N trials) = (255/256)^N ≈ e^(-N/256); N=3000 gives
-        // e^-11.7 ≈ 8e-6.
-        const TRIALS: usize = 3000;
-        for _ in 0..TRIALS {
-            let out = linearize_with(&src, |o| {
-                // Empty user password so `check_linearization_bytes` and
-                // `show_linearization_bytes` below (both open with no
-                // password) can decrypt transparently — the same convention
-                // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
-                // uses. `static_aes_iv` stays at its default `false`: this
-                // test's whole point is genuinely random per-invocation IVs.
-                o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                    Vec::new(),
-                    b"owner".to_vec(),
-                ));
-            });
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("encrypted linearized output must pass the linearization checker");
+        assert_encrypted_body_strings_are_hex(&out);
 
-            crate::linearization::check_linearization_bytes(&out)
-                .expect("encrypted linearized output must pass the linearization checker");
-            assert_encrypted_body_strings_are_hex(&out);
+        let dump = crate::linearization::show_linearization_bytes(&out, "test")
+            .expect("hint stream must decode (decryption + bit-unpacking)");
 
-            let dump = crate::linearization::show_linearization_bytes(&out, "test")
-                .expect("hint stream must decode (decryption + bit-unpacking)");
-
-            // Shared Objects Hint Table: `first_shared_offset` (already
-            // adjusted_offset()-reconstructed by the dump) must equal the
-            // REAL physical offset of the renumbered first Part-8 object.
-            let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
-            let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
-            let real_shared_offset = find_object_offset(&out, first_shared_obj);
-            assert_eq!(
-                first_shared_offset, real_shared_offset,
-                "Shared Objects Hint Table's first_shared_offset must match the \
-                 real physical offset of object {first_shared_obj} (dump:\n{dump})"
-            );
-
-            // Outlines Hint Table: same check for `first_object_offset`.
-            assert!(
-                dump.contains("Outlines Hint Table"),
-                "test premise: fixture's /Outlines must produce an Outlines Hint \
-                 Table section (dump:\n{dump})"
-            );
-            let first_object = parse_dump_field(&dump, "first_object") as u32;
-            let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
-            let real_object_offset = find_object_offset(&out, first_object);
-            assert_eq!(
-                first_object_offset, real_object_offset,
-                "Outlines Hint Table's first_object_offset must match the real \
-                 physical offset of object {first_object} (dump:\n{dump})"
-            );
-
-            let h_length = parse_dump_field(&dump, "H_length") as usize;
-            observed_hint_lengths.insert(h_length);
-            observed_outputs.insert(out);
-        }
-
-        // Randomness sanity check: confirm the fix pins the IV only WITHIN
-        // one `write_linearized` call, not accidentally across every call —
-        // every one of these `TRIALS` invocations still draws its own fresh
-        // IV, so the shipped bytes vary from run to run. This assertion is
-        // effectively certain to hold regardless of the newline-before-
-        // endstream boundary: every OTHER encrypted string/stream in the
-        // fixture also draws its own fresh per-invocation IV, so the output
-        // bytes differ across runs even on trials where the hint stream's
-        // own length happens to match.
-        assert!(
-            observed_outputs.len() > 1,
-            "{TRIALS} independent encrypted runs produced byte-identical output \
-             — the per-invocation IV draw appears to have been hardcoded away"
+        // Shared Objects Hint Table: `first_shared_offset` (already
+        // adjusted_offset()-reconstructed by the dump) must equal the REAL
+        // physical offset of the renumbered first Part-8 object.
+        let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
+        let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
+        let real_shared_offset = find_object_offset(&out, first_shared_obj);
+        assert_eq!(
+            first_shared_offset, real_shared_offset,
+            "Shared Objects Hint Table's first_shared_offset must match the \
+             real physical offset of object {first_shared_obj} (dump:\n{dump})"
         );
-        // NOT asserted (deliberately): whether this run's `TRIALS` draws ever
-        // landed on the opposite side of the hint stream's newline-before-
-        // endstream boundary is a low-probability (~1/256 per trial) event.
-        // `TRIALS` is sized so missing it entirely is rare (≈8e-6), but "rare"
-        // is not "never" — turning this into a hard assertion would make the
-        // test flaky under CI's normal run-to-run variance. When it DOES
-        // fire, it is a second, independent confirmation (beyond the offset
-        // assertions above, which run unconditionally on every trial) that a
-        // real hint-stream length difference occurred and self-consistency
-        // still held for it.
-        eprintln!(
-            "observed {} distinct H_length value(s) across {TRIALS} trials \
-             (>1 means the newline-before-endstream boundary was hit and \
-             self-consistency held across it too)",
-            observed_hint_lengths.len()
+
+        // Outlines Hint Table: same check for `first_object_offset`.
+        assert!(
+            dump.contains("Outlines Hint Table"),
+            "test premise: fixture's /Outlines must produce an Outlines Hint \
+             Table section (dump:\n{dump})"
+        );
+        let first_object = parse_dump_field(&dump, "first_object") as u32;
+        let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
+        let real_object_offset = find_object_offset(&out, first_object);
+        assert_eq!(
+            first_object_offset, real_object_offset,
+            "Outlines Hint Table's first_object_offset must match the real \
+             physical offset of object {first_object} (dump:\n{dump})"
         );
     }
 
-    /// Extract just the hint stream object's stream *payload* (the bytes
-    /// between its `stream\n` marker and the following `endstream`),
-    /// locating the object by its pre-computed reserved number. Companion to
-    /// [`find_object_bytes`] — needed because the hint dict prefix (`/S`,
-    /// `/O`, `/Length`) legitimately differs in decimal width between an
-    /// unencrypted and an encrypted run even before considering the payload
-    /// itself, so diffing whole `find_object_bytes` output would conflate
-    /// that dict-width noise with the payload comparison this helper's
-    /// caller actually wants.
+    /// Deterministic end-to-end proof of both ciphertext-dependent hint-stream
+    /// framing outcomes. The same three-page graph, Outlines root, and Part-8
+    /// shared object is encrypted twice with fixed IVs selected to land on
+    /// opposite ciphertext-last-byte outcomes.
+    ///
+    /// Each output goes through the complete `linearize_with` pipeline, then
+    /// checks the linearization parameter dictionary, encrypted body strings,
+    /// decrypted hint tables, and the Shared Objects/Outlines offsets against
+    /// independently located object headers. The framing assertion is based
+    /// on the declared encrypted `/Length`, so it does not mistake qpdf's
+    /// optional framing newline for ciphertext.
+    ///
+    /// The first invocation deliberately arms the test-only IV queue with the
+    /// probe/final pair. The current qpdf-shaped implementation must consume
+    /// exactly one IV while building the complete hint object and replay that
+    /// object in pass 2; if a probe/final re-encryption loop returns, it
+    /// consumes the second, opposite-framing IV and this assertion fails.
+    #[test]
+    fn deterministic_encrypted_hint_cases_cover_both_ciphertext_framing_outcomes() {
+        let source = outlines_and_part8_shared_pdf_bytes();
+        let hint_stream_num = encrypted_hint_stream_number(&source);
+        let (first, remaining) = with_test_hint_stream_aes_ivs(
+            [HINT_IV_NO_FRAMING_NEWLINE, HINT_IV_WITH_FRAMING_NEWLINE],
+            || linearize_with(&source, configure_deterministic_aes128),
+        );
+        assert_eq!(
+            remaining,
+            vec![HINT_IV_WITH_FRAMING_NEWLINE],
+            "the complete hint object must be encrypted once; a second queued IV \
+             would indicate probe/final re-encryption"
+        );
+        let (second, remaining) =
+            with_test_hint_stream_aes_ivs([HINT_IV_WITH_FRAMING_NEWLINE], || {
+                linearize_with(&source, configure_deterministic_aes128)
+            });
+        assert!(remaining.is_empty());
+
+        let mut framing_newline = Vec::new();
+        for (label, output) in [("no-framing-newline", &first), ("framing-newline", &second)] {
+            crate::linearization::check_linearization_bytes(output).unwrap_or_else(|error| {
+                // cov:ignore-start: the test constructs valid linearized PDFs;
+                // this branch only guards an unexpected checker regression.
+                panic!("{label}: encrypted linearized output must pass checker: {error}")
+                // cov:ignore-end
+            });
+            assert_encrypted_body_strings_are_hex(output);
+
+            let dump = crate::linearization::show_linearization_bytes(output, "test")
+                .unwrap_or_else(|error| panic!("{label}: hint stream must decode: {error}"));
+
+            let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
+            let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
+            assert_eq!(
+                first_shared_offset,
+                find_object_offset(output, first_shared_obj),
+                "{label}: Shared Objects Hint Table offset must match object {first_shared_obj}"
+            );
+
+            assert!(
+                dump.contains("Outlines Hint Table"),
+                "{label}: fixture must produce an Outlines Hint Table (dump:\n{dump})"
+            );
+            let first_object = parse_dump_field(&dump, "first_object") as u32;
+            let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
+            assert_eq!(
+                first_object_offset,
+                find_object_offset(output, first_object),
+                "{label}: Outlines Hint Table offset must match object {first_object}"
+            );
+
+            let payload = hint_stream_payload_bytes(output, hint_stream_num);
+            let has_framing_newline =
+                hint_stream_has_newline_before_endstream(output, hint_stream_num);
+            assert_eq!(
+                payload.last() == Some(&b'\n'),
+                !has_framing_newline,
+                "{label}: framing newline must be the inverse of the ciphertext final byte"
+            );
+            framing_newline.push(has_framing_newline);
+        }
+
+        assert_eq!(
+            framing_newline,
+            [false, true],
+            "the deterministic end-to-end cases must cover both hint-stream framing outcomes"
+        );
+    }
+
+    /// Extract just the hint stream object's stream *payload* using the
+    /// dictionary's `/Length`, locating the object by its
+    /// pre-computed reserved number. Using `/Length` rather than the next
+    /// `endstream` marker is essential: qpdf conditionally emits one framing
+    /// newline after a payload whose last byte is not `\n`, and that newline is
+    /// not part of the ciphertext.
     fn hint_stream_payload_bytes(out: &[u8], hint_num: u32) -> &[u8] {
         let object_bytes = find_object_bytes(out, hint_num);
         let stream_marker: &[u8] = b"stream\n";
@@ -8733,13 +8902,56 @@ mod tests {
                 // cov:ignore-end
             })
             + stream_marker.len();
-        let after_stream = &object_bytes[payload_start..];
-        let end_marker: &[u8] = b"endstream";
-        let payload_end = after_stream
-            .windows(end_marker.len())
-            .position(|w| w == end_marker)
-            .unwrap_or(after_stream.len());
-        &after_stream[..payload_end]
+        let length_marker: &[u8] = b"/Length ";
+        let length_start = object_bytes
+            .windows(length_marker.len())
+            .position(|w| w == length_marker)
+            .unwrap_or_else(|| {
+                // cov:ignore-start: every primary hint-stream dictionary
+                // carries /Length; this only guards a future serializer drift.
+                panic!("hint stream object {hint_num} must contain /Length")
+                // cov:ignore-end
+            })
+            + length_marker.len();
+        let length_end = object_bytes[length_start..]
+            .iter()
+            .position(|byte| !byte.is_ascii_digit())
+            .map(|offset| length_start + offset)
+            .unwrap_or(object_bytes.len());
+        let payload_len: usize = std::str::from_utf8(&object_bytes[length_start..length_end])
+            .unwrap_or_else(|error| {
+                // cov:ignore-start: /Length is emitted as ASCII decimal.
+                panic!("hint stream /Length is not ASCII: {error}")
+                // cov:ignore-end
+            })
+            .parse()
+            .unwrap_or_else(|error| {
+                // cov:ignore-start: /Length is emitted as a non-negative decimal.
+                panic!("hint stream /Length is not decimal: {error}")
+                // cov:ignore-end
+            });
+        &object_bytes[payload_start..payload_start + payload_len]
+    }
+
+    /// Return whether qpdf's conditional newline was emitted between the
+    /// ciphertext payload and `endstream`. The payload itself is located by
+    /// `/Length`, so this distinguishes the two framing outcomes even though
+    /// both valid encodings place a newline immediately before `endstream`.
+    fn hint_stream_has_newline_before_endstream(out: &[u8], hint_num: u32) -> bool {
+        let object_bytes = find_object_bytes(out, hint_num);
+        let stream_marker: &[u8] = b"stream\n";
+        let payload_start = object_bytes
+            .windows(stream_marker.len())
+            .position(|window| window == stream_marker)
+            .unwrap_or_else(|| {
+                // cov:ignore-start: every primary hint-stream dictionary
+                // carries a stream marker; this only guards serializer drift.
+                panic!("hint stream object {hint_num} must contain a stream marker")
+                // cov:ignore-end
+            })
+            + stream_marker.len();
+        let payload = hint_stream_payload_bytes(out, hint_num);
+        object_bytes[payload_start + payload.len()] == b'\n'
     }
 
     /// Locate the classic (stream-free) `xref\n<start> <count>\n` subsection

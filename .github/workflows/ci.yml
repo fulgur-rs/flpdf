@@ -199,34 +199,13 @@ jobs:
           qpdf --version
           test "$(qpdf --version | sed -n '1p' | tr -d '\r')" = "qpdf version ${QPDF_VERSION}"
 
-      - name: Run tests in required order
+      - name: Run workspace test suite
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "[ci] cargo test -p flpdf --test reader_tests"
-          cargo test -p flpdf --test reader_tests
-
-          echo "[ci] cargo test -p flpdf --test xref_tests"
-          cargo test -p flpdf --test xref_tests
-
-          echo "[ci] cargo test -p flpdf --test check_tests"
-          cargo test -p flpdf --test check_tests
-
-          echo "[ci] cargo test -p flpdf --test writer_tests"
-          cargo test -p flpdf --test writer_tests
-
-          echo "[ci] cargo test -p flpdf-cli --test cli_tests"
-          cargo test -p flpdf-cli --test cli_tests
-
-          echo "[ci] cargo test -p flpdf-cli --test compat_matrix_tests"
-          cargo test -p flpdf-cli --test compat_matrix_tests
-
-          echo "[ci] cargo test -p flpdf"
-          cargo test -p flpdf
-
-          echo "[ci] cargo test"
-          cargo test
+          echo "[ci] cargo test --workspace"
+          cargo test --workspace
 
       # amd64-Linux-only: the captured reference bytes match the amd64 Ubuntu
       # base image's zlib1g version; Windows (libz-sys vendored zlib),

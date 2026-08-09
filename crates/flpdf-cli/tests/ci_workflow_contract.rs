@@ -4,6 +4,16 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 const WHOLE_FILE_ZLIB_GATE: &str = "#![cfg(feature = \"qpdf-zlib-compat\")]";
+const REQUIRED_TEST_MATRIX_OS: [&str; 4] = [
+    "ubuntu-latest",
+    "ubuntu-24.04-arm",
+    "macos-latest",
+    "windows-latest",
+];
+const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
+const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
+    "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
+];
 
 type ContractResult<T> = Result<T, String>;
 
@@ -59,6 +69,284 @@ fn run_contains_test_command(run: &str, command: &str) -> bool {
     })
 }
 
+fn run_exact_command_line_count(run: &str, command: &str) -> usize {
+    let run = shell_script_without_comments(run);
+    run.lines()
+        .map(str::trim)
+        .filter(|line| *line == command)
+        .count()
+}
+
+fn shell_script_without_comments(script: &str) -> String {
+    let mut uncommented = String::with_capacity(script.len());
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+
+    for character in script.chars() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+                uncommented.push(character);
+            }
+            continue;
+        }
+
+        match quote {
+            Some('\'') => {
+                uncommented.push(character);
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                uncommented.push(character);
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            None => {
+                if escaped {
+                    uncommented.push(character);
+                    escaped = false;
+                    continue;
+                }
+
+                match character {
+                    '\\' => {
+                        uncommented.push(character);
+                        escaped = true;
+                    }
+                    '\'' | '"' => {
+                        uncommented.push(character);
+                        quote = Some(character);
+                    }
+                    '#' => in_comment = true,
+                    _ => uncommented.push(character),
+                }
+            }
+            Some(_) => unreachable!("shell quote must be single or double"),
+        }
+    }
+
+    uncommented
+}
+
+fn shell_command_segments(script: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut characters = script.char_indices();
+
+    while let Some((index, character)) = characters.next() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+
+                match character {
+                    '\\' => escaped = true,
+                    '\'' | '"' => quote = Some(character),
+                    ';' | '\n' => {
+                        segments.push(&script[start..index]);
+                        start = index + 1;
+                    }
+                    '&' if script[index..].starts_with("&&") => {
+                        segments.push(&script[start..index]);
+                        start = index + 2;
+                        characters.next();
+                    }
+                    '&' => {
+                        segments.push(&script[start..index]);
+                        start = index + 1;
+                    }
+                    '|' if script[index..].starts_with("||") => {
+                        segments.push(&script[start..index]);
+                        start = index + 2;
+                        characters.next();
+                    }
+                    '|' => {
+                        segments.push(&script[start..index]);
+                        start = index + 1;
+                    }
+                    _ => {}
+                }
+            }
+            Some(_) => unreachable!("shell quote must be single or double"),
+        }
+    }
+
+    segments.push(&script[start..]);
+    segments
+}
+
+fn is_plain_echo_output_segment(segment: &str) -> bool {
+    let segment = segment.trim();
+    segment.split_whitespace().next() == Some("echo")
+        && !segment.contains("$(")
+        && !segment.contains('`')
+        && !segment.contains("<(")
+        && !segment.contains(">(")
+}
+
+fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
+    let run = shell_script_without_comments(run);
+    shell_command_segments(&run)
+        .into_iter()
+        .filter(|segment| !is_plain_echo_output_segment(segment))
+        .map(|segment| segment.match_indices(command).count())
+        .sum()
+}
+
+fn bash_run_has_unsupported_syntax(run: &str) -> bool {
+    let run = shell_script_without_comments(run);
+    if run.contains("$(") || run.contains('`') {
+        return true;
+    }
+
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, character) in run.char_indices() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else if character == '\n' {
+                    return true;
+                }
+            }
+            Some('"') => {
+                if escaped {
+                    if character == '\n' {
+                        return true;
+                    }
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                } else if character == '\n' {
+                    return true;
+                }
+            }
+            None => {
+                if escaped {
+                    if character == '\n' {
+                        return true;
+                    }
+                    escaped = false;
+                    continue;
+                }
+
+                match character {
+                    '\\' => escaped = true,
+                    '\'' | '"' => quote = Some(character),
+                    ';' | '|' | '&' | '{' | '}' | '(' | ')' | '`' => return true,
+                    '<' if run[index..].starts_with("<(") => return true,
+                    '>' if run[index..].starts_with(">(") => return true,
+                    _ => {}
+                }
+            }
+            Some(_) => unreachable!("shell quote must be single or double"),
+        }
+    }
+
+    quote.is_some() || escaped
+}
+
+fn bash_run_has_control_flow(run: &str) -> bool {
+    bash_run_has_unsupported_syntax(run)
+        || shell_script_without_comments(run)
+            .lines()
+            .map(str::trim)
+            .any(|line| {
+                line.contains("<<")
+                    || line.split_whitespace().next().is_some_and(|word| {
+                        BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
+                    })
+            })
+}
+
+fn bash_run_has_early_success_before_command(run: &str, command: &str) -> bool {
+    let run = shell_script_without_comments(run);
+    for segment in shell_command_segments(&run) {
+        let segment = segment.trim();
+        if segment == command {
+            return false;
+        }
+        if matches!(segment, "exit" | "exit 0" | "exec true") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn bash_run_disables_errexit(run: &str) -> bool {
+    let run = shell_script_without_comments(run);
+    shell_command_segments(&run).into_iter().any(|segment| {
+        let mut words = segment.split_whitespace();
+        if words.next() != Some("set") {
+            return false;
+        }
+
+        let words = words.collect::<Vec<_>>();
+        words.iter().enumerate().any(|(index, word)| {
+            word.starts_with("+e") || (*word == "+o" && words.get(index + 1) == Some(&"errexit"))
+        })
+    })
+}
+
+fn bash_run_exact_command_line_count(run: &str, command: &str) -> usize {
+    if bash_run_has_control_flow(run)
+        || bash_run_has_early_success_before_command(run, command)
+        || bash_run_disables_errexit(run)
+    {
+        return 0;
+    }
+
+    run_exact_command_line_count(run, command)
+}
+
+fn test_job_step_exact_command_line_count(step: &Yaml, command: &str) -> usize {
+    if !(step.as_hash().is_some()
+        && !mapping_contains_key(step, "if")
+        && !mapping_contains_key(step, "working-directory")
+        && continue_on_error_is_gating(step)
+        && mapping_get(step, "shell")
+            .and_then(Yaml::as_str)
+            .is_some_and(|shell| shell == "bash"))
+    {
+        return 0;
+    }
+
+    mapping_get(step, "run")
+        .and_then(Yaml::as_str)
+        .map_or(0, |run| bash_run_exact_command_line_count(run, command))
+}
+
 fn job_contains_test_command(job: &Yaml, command: &str) -> ContractResult<bool> {
     let job = require_mapping(job, "job")?;
     let Some(steps) = mapping_get(job, "steps") else {
@@ -90,6 +378,119 @@ fn workflow_contains_test_command(workflow: &str, command: &str) -> ContractResu
         }
     }
     Ok(false)
+}
+
+fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResult<bool> {
+    let workflow = parse_workflow(workflow)?;
+    if has_default_run_override(&workflow, "workflow")? {
+        return Ok(false);
+    }
+    let jobs =
+        mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
+    let jobs = require_mapping(jobs, "workflow.jobs")?;
+    let test_job = mapping_get(jobs, "test")
+        .ok_or_else(|| "ci workflow must define the test job".to_owned())?;
+    let test_job = require_mapping(test_job, "test job")?;
+    if has_default_run_override(test_job, "test job")?
+        || mapping_contains_key(test_job, "if")
+        || !continue_on_error_is_gating(test_job)
+    {
+        return Ok(false);
+    }
+    if mapping_get(test_job, "runs-on").and_then(Yaml::as_str) != Some(TEST_JOB_RUNS_ON) {
+        return Ok(false);
+    }
+    if !test_job_has_required_os_matrix(test_job)? {
+        return Ok(false);
+    }
+    let Some(steps) = mapping_get(test_job, "steps") else {
+        return Ok(false);
+    };
+    let steps = steps
+        .as_vec()
+        .ok_or_else(|| "test job.steps must be a sequence".to_owned())?;
+
+    let total_raw_command_occurrences = steps
+        .iter()
+        .map(|step| {
+            mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .map_or(0, |run| run_raw_command_occurrence_count(run, command))
+        })
+        .sum::<usize>();
+    let total_exact_command_lines = steps
+        .iter()
+        .map(|step| {
+            mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .map_or(0, |run| run_exact_command_line_count(run, command))
+        })
+        .sum::<usize>();
+    let executable_command_lines = steps
+        .iter()
+        .map(|step| test_job_step_exact_command_line_count(step, command))
+        .sum::<usize>();
+
+    Ok(total_raw_command_occurrences == 1
+        && total_exact_command_lines == 1
+        && executable_command_lines == 1)
+}
+
+fn test_job_has_required_os_matrix(test_job: &Yaml) -> ContractResult<bool> {
+    let Some(strategy) = mapping_get(test_job, "strategy") else {
+        return Ok(false);
+    };
+    let strategy = require_mapping(strategy, "test job.strategy")?;
+    let Some(matrix) = mapping_get(strategy, "matrix") else {
+        return Ok(false);
+    };
+    let matrix = require_mapping(matrix, "test job.strategy.matrix")?;
+    let matrix_entries = matrix
+        .as_hash()
+        .expect("required mapping must remain a mapping");
+    if matrix_entries.len() != 1 {
+        return Ok(false);
+    }
+
+    if let Some(include) = mapping_get(matrix, "include") {
+        let include = include
+            .as_vec()
+            .ok_or_else(|| "test job.strategy.matrix.include must be a sequence".to_owned())?;
+        let mut os_values = Vec::with_capacity(include.len());
+        for entry in include {
+            let entry = require_mapping(entry, "test job.strategy.matrix.include entry")?;
+            let os = mapping_get(entry, "os")
+                .and_then(Yaml::as_str)
+                .ok_or_else(|| {
+                    "test job.strategy.matrix.include entry must define os".to_owned()
+                })?;
+            os_values.push(os);
+        }
+        return Ok(has_required_test_matrix_os_values(&os_values));
+    }
+
+    let Some(os) = mapping_get(matrix, "os") else {
+        return Ok(false);
+    };
+    let os = os
+        .as_vec()
+        .ok_or_else(|| "test job.strategy.matrix.os must be a sequence".to_owned())?;
+    let mut os_values = Vec::with_capacity(os.len());
+    for os in os {
+        let os = os
+            .as_str()
+            .ok_or_else(|| "test job.strategy.matrix.os must contain strings".to_owned())?;
+        os_values.push(os);
+    }
+
+    Ok(has_required_test_matrix_os_values(&os_values))
+}
+
+fn has_required_test_matrix_os_values(os_values: &[&str]) -> bool {
+    os_values.len() == REQUIRED_TEST_MATRIX_OS.len()
+        && REQUIRED_TEST_MATRIX_OS
+            .iter()
+            .all(|expected| os_values.contains(expected))
 }
 
 fn mapping_get<'a>(mapping: &'a Yaml, key: &str) -> Option<&'a Yaml> {
@@ -259,6 +660,747 @@ jobs:
 
     assert!(workflow_contains_test_command(&workflow, command)
         .expect("synthetic complete workflow must be valid"));
+}
+
+#[test]
+fn test_matrix_runs_default_workspace_suite() {
+    assert!(
+        test_job_contains_test_command(CI_WORKFLOW, "cargo test --workspace")
+            .expect("ci workflow must be valid and define the test job"),
+        "the four-OS test matrix must run the complete default workspace suite"
+    );
+}
+
+#[test]
+fn raw_command_occurrence_count_ignores_comments_but_preserves_quoted_hashes() {
+    let command = "cargo test --workspace";
+    let run = "\
+# cargo test --workspace
+printf '%s' \"# cargo test --workspace\"
+printf '%s' '# cargo test --workspace'
+cargo test --workspace # comment
+";
+
+    assert_eq!(
+        run_raw_command_occurrence_count(run, command),
+        3,
+        "shell comments must be ignored while quoted # text and the real command remain visible"
+    );
+}
+
+#[test]
+fn test_job_workspace_command_accepts_real_command_with_inline_comment() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace # the suite is required
+",
+    );
+
+    assert!(
+        test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_exit_zero_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      exit 0
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_bare_exit_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      exit
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_exec_true_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      exec true
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_disabled_errexit_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      set +e
+      cargo test --workspace
+      echo done
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_accepts_errexit_failure_gating() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_duplicate_workspace_commands() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace
+  - shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_duplicate_workspace_command_lines() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      cargo test --workspace
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_inline_semicolon_duplicate() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace; cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_echo_segment_duplicate() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: echo pre; cargo test --workspace
+  - shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_pipe_segment_duplicate() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: echo pre | cargo test --workspace
+  - shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_conditional_continuation() {
+    let workflow = workspace_test_job_workflow(
+        r#"steps:
+  - shell: bash
+    run: |
+      true || \
+      cargo test --workspace
+"#,
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_uncalled_function() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      f() {
+        cargo test --workspace
+      }
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_multiline_quoted_echo() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      echo \"begin
+      cargo test --workspace
+      end\"
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_process_substitution() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: echo <(cargo test --workspace)
+  - shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn bash_safety_rejects_backtick_command_substitution() {
+    assert!(bash_run_has_unsupported_syntax(
+        "echo `cargo test --workspace`"
+    ));
+}
+
+#[test]
+fn bash_safety_rejects_quoted_dollar_paren_command_substitution() {
+    assert!(bash_run_has_unsupported_syntax(
+        "echo \"$(printf '%s' ignored)\"\ncargo test --workspace"
+    ));
+}
+
+#[test]
+fn test_job_workspace_command_rejects_gated_duplicate_workspace_command() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace
+  - if: false
+    shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_while_control_flow() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      while false; do
+        cargo test --workspace
+      done
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_static_runs_on() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_matrix_exclude() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+        exclude:
+          - os: windows-latest
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_accepts_direct_os_matrix() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_matrix_extra_axis() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+        arch:
+          - amd64
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+fn workspace_test_job_workflow(test_job_fields: &str) -> String {
+    let test_job_fields = test_job_fields
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "\
+jobs:
+  test:
+    runs-on: ${{{{ matrix.os }}}}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+{test_job_fields}
+"
+    )
+}
+
+#[test]
+fn test_job_workspace_command_rejects_missing_matrix() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_empty_matrix() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include: []
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_wrong_matrix_os() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: macos-13
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_inactive_shell_branch() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      if false; then
+        cargo test --workspace
+      fi
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_heredoc_body() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      cat <<'EOF'
+      cargo test --workspace
+      EOF
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_custom_shell() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: pwsh
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_job_condition() {
+    let workflow = "\
+jobs:
+  test:
+    if: runner.os == 'Linux'
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_job_continue_on_error() {
+    let workflow = "\
+jobs:
+  test:
+    continue-on-error: true
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_workflow_default_working_directory() {
+    let workflow = "\
+defaults:
+  run:
+    working-directory: crates/flpdf
+jobs:
+  test:
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_job_default_working_directory() {
+    let workflow = "\
+jobs:
+  test:
+    defaults:
+      run:
+        working-directory: crates/flpdf
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_longer_suffix() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace --no-run
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_ignored_failure_suffix() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace || true
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_conditional_step() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - if: runner.os == 'Linux'
+    shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_working_directory_override() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    working-directory: crates/flpdf
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_continue_on_error() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    continue-on-error: true
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
 }
 
 #[test]
