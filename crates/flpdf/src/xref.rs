@@ -1,7 +1,7 @@
 //! qpdf correspondence: QPDF.cc xref loading and repair.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::Parser;
+use crate::parser::{parse_qpdf_file_object, Parser};
 use crate::reader::file_object::{
     finish_file_object, parse_file_object_header, parse_file_object_syntax, FileObjectDiagnostic,
     FileObjectRead, PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
@@ -23,10 +23,16 @@ pub struct LoadedXref {
     pub repair_diagnostics: Diagnostics,
 }
 
-type SharedBootstrapCache = Rc<RefCell<BTreeMap<ObjectRef, Object>>>;
+#[derive(Debug, Default)]
+pub(crate) struct BootstrapCache {
+    objects: BTreeMap<ObjectRef, Object>,
+    resolved_object_streams: BTreeSet<u32>,
+}
+
+type SharedBootstrapCache = Rc<RefCell<BootstrapCache>>;
 
 fn empty_bootstrap_cache() -> SharedBootstrapCache {
-    Rc::new(RefCell::new(BTreeMap::new()))
+    Rc::new(RefCell::new(BootstrapCache::default()))
 }
 
 #[derive(Debug, Clone)]
@@ -176,11 +182,18 @@ impl XrefObjectCache {
         if let Some(value) = self.overlay.get(object_ref) {
             return Some(value.clone());
         }
-        self.shared.borrow().get(object_ref).cloned()
+        self.shared.borrow().objects.get(object_ref).cloned()
     }
 
     fn insert(&mut self, object_ref: ObjectRef, object: Object) {
         self.overlay.insert(object_ref, object);
+    }
+
+    fn mark_object_stream_resolved(&mut self, stream_number: u32) -> bool {
+        self.shared
+            .borrow_mut()
+            .resolved_object_streams
+            .insert(stream_number)
     }
 
     fn commit(&mut self) {
@@ -189,6 +202,7 @@ impl XrefObjectCache {
         }
         self.shared
             .borrow_mut()
+            .objects
             .extend(std::mem::take(&mut self.overlay));
     }
 
@@ -363,6 +377,129 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         }
     }
 
+    fn resolve_object_stream_integer(
+        &mut self,
+        dictionary: &Dictionary,
+        key: &str,
+    ) -> Result<usize> {
+        let label = format!("object stream /{key}");
+        let value = self
+            .resolve_dictionary_value(dictionary, key)
+            .ok_or_else(|| Error::parse(0, format!("{label} is not an integer")))?;
+        let Object::Integer(value) = value else {
+            return Err(Error::parse(0, format!("{label} is not an integer")));
+        };
+        usize::try_from(value).map_err(|_| Error::parse(0, format!("{label} is invalid")))
+    }
+
+    /// qpdf QPDF::resolveObjectsInStream's once-only object-stream read and
+    /// cache population (QPDF.cc:1756-1833). This stays in the bootstrap
+    /// context: the later canonical resolver and the legacy Pdf route are
+    /// deliberately not reachable from here.
+    fn resolve_object_stream(&mut self, stream_number: u32) -> Result<()> {
+        if !self.cache.mark_object_stream_resolved(stream_number) {
+            return Ok(());
+        }
+
+        let stream_ref = ObjectRef::new(stream_number, 0);
+        let stream = match self.resolve_reference(stream_ref) {
+            Object::Stream(stream) => stream,
+            _ => {
+                return Err(Error::parse(
+                    0,
+                    format!("supposed object stream {stream_number} is not a stream"),
+                ));
+            }
+        };
+
+        if !matches!(
+            self.resolve_dictionary_value(&stream.dict, "Type"),
+            Some(Object::Name(name)) if name == b"ObjStm"
+        ) {
+            self.diagnostics.push(Diagnostic::warning(
+                format!("supposed object stream {stream_number} has wrong type"),
+                None,
+            ));
+        }
+
+        let object_count = self.resolve_object_stream_integer(&stream.dict, "N")?;
+        let first = self.resolve_object_stream_integer(&stream.dict, "First")?;
+        let decoded_stream_data = filters::decode_stream_data_from_xref_context(
+            &stream.dict,
+            &stream.data,
+            &mut |value| self.resolve_value(value),
+        )?;
+
+        let mut tokenizer = Tokenizer::new(&decoded_stream_data);
+        let mut members = BTreeMap::new();
+        for _ in 0..object_count {
+            let object_number = u32::try_from(tokenizer.next_integer()?)
+                .map_err(|_| Error::parse(0, "object stream object number is invalid"))?;
+            let object_offset = usize::try_from(tokenizer.next_integer()?)
+                .map_err(|_| Error::parse(0, "object stream object offset is invalid"))?;
+            // qpdf stores these in a map, so a duplicate object number keeps
+            // the last header offset (QPDF.cc:1778-1789).
+            members.insert(object_number, object_offset);
+        }
+
+        for (object_number, object_offset) in members {
+            let object_ref = ObjectRef::new(object_number, 0);
+            if !matches!(
+                self.entry_lookup.get(&object_ref),
+                Some(XrefEntry::Compressed { stream, .. }) if stream == stream_number
+            ) {
+                // qpdf skips members overridden by a newer effective xref
+                // entry (QPDF.cc:1792-1795).
+                continue;
+            }
+
+            let member_start = first
+                .checked_add(object_offset)
+                .ok_or_else(|| Error::parse(0, "object stream member offset overflow"))?;
+            if member_start > decoded_stream_data.len() {
+                return Err(Error::parse(
+                    member_start,
+                    "object stream member offset is out of range",
+                ));
+            }
+
+            let parsed = match parse_qpdf_file_object(&decoded_stream_data[member_start..]) {
+                Ok((object, diagnostics)) => {
+                    for diagnostic in diagnostics {
+                        let offset = member_start.saturating_add(diagnostic.relative_offset);
+                        self.diagnostics.push(Diagnostic::warning(
+                            format!(
+                                "object stream {stream_number} (object {} 0, offset {offset}): {}",
+                                object_ref.number, diagnostic.message
+                            ),
+                            Some(offset as u64),
+                        ));
+                    }
+                    object
+                }
+                Err(error) => {
+                    // qpdf lets QPDF::readObjectInStream's parse error abort
+                    // resolveObjectsInStream; QPDF::resolve then warns and
+                    // nulls only the requested object. The once-only marker
+                    // above keeps later members unresolved as well.
+                    return Err(match error.rebase_offset(member_start) {
+                        Error::Parse { offset, message } => Error::parse(
+                            offset,
+                            format!(
+                                "object stream {stream_number} (object {} 0, offset {offset}): {message}",
+                                object_ref.number
+                            ),
+                        ),
+                        other => other, // cov:ignore: byte-backed direct parser errors are parse errors
+                    });
+                }
+            };
+            self.cache.insert(object_ref, parsed);
+        }
+
+        Ok(())
+    }
+
     /// qpdf `QPDF::resolve`'s active-xref lookup, cache, cycle guard, and
     /// resolve-to-null fallback (`QPDF.cc:1700-1753`). Errors from reading a
     /// referenced object are warnings here, matching qpdf's catch-and-null
@@ -439,7 +576,17 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                 }
             }
             Some(XrefEntry::Free { .. }) | None => Object::Null,
-            Some(XrefEntry::Compressed { .. }) => Object::Null,
+            Some(XrefEntry::Compressed { stream, .. }) => {
+                if let Err(error) = self.resolve_object_stream(stream) {
+                    let diagnostic_offset = match &error {
+                        Error::Parse { offset, .. } => Some(*offset as u64),
+                        _ => None,
+                    };
+                    self.diagnostics
+                        .push(Diagnostic::warning(error.to_string(), diagnostic_offset));
+                }
+                self.cache.get(&object_ref).unwrap_or(Object::Null)
+            }
         };
 
         // A nested resolution loop updates the same cache slot to null in
@@ -809,11 +956,16 @@ fn merge_bootstrap_cache_prefer_source(
         return;
     }
     let source = source.borrow();
-    destination.borrow_mut().extend(
+    let mut destination = destination.borrow_mut();
+    destination.objects.extend(
         source
+            .objects
             .iter()
             .map(|(object_ref, object)| (*object_ref, object.clone())),
     );
+    destination
+        .resolved_object_streams
+        .extend(source.resolved_object_streams.iter().copied());
 }
 
 /// Read the optional hybrid-reference stream named by a classic trailer's
@@ -2437,6 +2589,87 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
+    fn test_objstm_payload(members: &[(u32, &[u8])]) -> (Vec<u8>, usize) {
+        let mut header = Vec::new();
+        let mut body = Vec::new();
+        for &(object_number, object) in members {
+            let offset = body.len();
+            header.extend_from_slice(format!("{object_number} {offset} ").as_bytes());
+            body.extend_from_slice(object);
+            body.push(b'\n');
+        }
+        let first = header.len();
+        let mut payload = header;
+        payload.extend_from_slice(&body);
+        (payload, first)
+    }
+
+    fn test_objstm_bytes(stream_number: u32, members: &[(u32, &[u8])]) -> Vec<u8> {
+        test_objstm_bytes_with_type(stream_number, members, "ObjStm")
+    }
+
+    fn test_objstm_bytes_with_type(
+        stream_number: u32,
+        members: &[(u32, &[u8])],
+        type_name: &str,
+    ) -> Vec<u8> {
+        let (payload, first) = test_objstm_payload(members);
+        let mut bytes = format!(
+            "{stream_number} 0 obj\n<< /Type /{type_name} /N {} /First {first} /Length {} >>\nstream\n",
+            members.len(),
+            payload.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    }
+
+    fn with_bootstrap_objstm_context<T>(
+        bytes: &[u8],
+        stream_offset: u64,
+        object_numbers: &[u32],
+        test: impl FnOnce(&mut XrefReadContext<'_, '_>) -> T,
+    ) -> T {
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        for (index, object_number) in object_numbers.iter().copied().enumerate() {
+            registration.insert_xref_entry(
+                ObjectRef::new(object_number, 0),
+                XrefEntry::Compressed {
+                    stream: 8,
+                    index: index as u32,
+                },
+            );
+        }
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        test(&mut context)
+    }
+
+    fn test_flate_objstm_bytes(stream_number: u32, members: &[(u32, &[u8])]) -> Vec<u8> {
+        let (payload, first) = test_objstm_payload(members);
+        let encoded = crate::stream_filter::encode_flate(&payload).unwrap();
+        let mut bytes = format!(
+            "{stream_number} 0 obj\n<< /Type /ObjStm /N {} /First {first} /Filter /FlateDecode /Length {} >>\nstream\n",
+            members.len(),
+            encoded.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&encoded);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        bytes
+    }
+
     #[test]
     fn active_context_uses_borrowed_registration_view() {
         let registration = XrefRegistration::default();
@@ -2457,11 +2690,17 @@ mod tests {
     fn shared_bootstrap_cache_merge_skips_the_same_cache() {
         let cache = empty_bootstrap_cache();
         let object_ref = ObjectRef::new(1, 0);
-        cache.borrow_mut().insert(object_ref, Object::Integer(7));
+        cache
+            .borrow_mut()
+            .objects
+            .insert(object_ref, Object::Integer(7));
 
         merge_bootstrap_cache_prefer_source(&cache, &cache);
 
-        assert_eq!(cache.borrow().get(&object_ref), Some(&Object::Integer(7)));
+        assert_eq!(
+            cache.borrow().objects.get(&object_ref),
+            Some(&Object::Integer(7))
+        );
     }
 
     #[test]
@@ -2553,6 +2792,7 @@ mod tests {
         let shared_cache = empty_bootstrap_cache();
         shared_cache
             .borrow_mut()
+            .objects
             .insert(previous_ref, Object::Integer(previous_xref_offset as i64));
         let mut reconstructed_with_cache = make_loaded();
         let mut cached_registration = XrefRegistration::default();
@@ -2607,13 +2847,689 @@ mod tests {
     fn bootstrap_context_resolves_missing_and_free_references_to_null() {
         let missing = ObjectRef::new(9, 0);
         let freed = ObjectRef::new(10, 0);
-        let compressed = ObjectRef::new(11, 0);
         let mut registration = XrefRegistration::default();
         registration.insert_free_xref_entry(freed);
+        let mut context = XrefReadContext::new(
+            &[],
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(missing), Object::Null);
+        assert_eq!(context.resolve_reference(freed), Object::Null);
+        assert!(context.diagnostics.entries().is_empty());
+
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Index", Object::Reference(missing));
+        assert_eq!(
+            parse_xref_index(&mut context, &dictionary, 7).unwrap(),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn bootstrap_context_resolves_type2_members_and_caches_all_applicable_members() {
+        let members = [
+            (2, b"<< /Value /First >>".as_slice()),
+            (4, b"[ /Second ]".as_slice()),
+        ];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        let mut registration = XrefRegistration::default();
         registration.insert_xref_entry(
-            compressed,
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
             XrefEntry::Compressed {
-                stream: 12,
+                stream: 8,
+                index: 0,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(4, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 1,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        let mut expected_dictionary = Dictionary::new();
+        expected_dictionary.insert("Value", Object::Name(b"First".to_vec()));
+        let first_value = context.resolve_reference(ObjectRef::new(2, 0));
+        assert_eq!(first_value, Object::Dictionary(expected_dictionary));
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(4, 0)),
+            Object::Array(vec![Object::Name(b"Second".to_vec())])
+        );
+        assert!(context.diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_context_does_not_replace_an_overridden_objstm_member() {
+        let members = [(2, b"10".as_slice()), (3, b"20".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        let standalone_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"2 0 obj\n99\nendobj\n");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Uncompressed {
+                offset: standalone_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(3, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 1,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        let overridden_value = context.resolve_reference(ObjectRef::new(2, 0));
+        assert_eq!(overridden_value, Object::Integer(99));
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(3, 0)),
+            Object::Integer(20)
+        );
+        assert!(context.diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_context_resolves_indirect_prev_through_objstm() {
+        let mut bytes = b" \n".to_vec();
+        let object_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"1 0 obj\n42\nendobj\n");
+        let previous_xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \ntrailer\n<< /Size 2 >>\n"
+            )
+            .as_bytes(),
+        );
+        let previous_value = previous_xref_offset.to_string();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &[(5, previous_value.as_bytes())]));
+
+        let previous_ref = ObjectRef::new(5, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            previous_ref,
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut trailer = Dictionary::new();
+        trailer.insert("Prev", Object::Reference(previous_ref));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+
+        merge_previous_xref_sections(
+            &bytes,
+            "1.7",
+            &mut loaded,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect("an indirect /Prev stored in an ObjStm must be followed");
+        assert_eq!(
+            loaded.loaded.entries.get(&ObjectRef::new(1, 0)),
+            Some(&XrefEntry::Uncompressed {
+                offset: object_offset,
+            })
+        );
+    }
+
+    #[test]
+    fn bootstrap_context_resolves_indirect_xrefstm_through_objstm() {
+        let mut bytes = b" \n".to_vec();
+        let xref_stream_offset = bytes.len() as u64;
+        let xref_stream_data = [0u8; 6];
+        bytes.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /XRef /W [1 1 1] /Size 2 /Length {} >>\nstream\n",
+                xref_stream_data.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&xref_stream_data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_stream_value = xref_stream_offset.to_string();
+        let objstm_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &[(5, xref_stream_value.as_bytes())]));
+
+        let xref_stream_ref = ObjectRef::new(3, 0);
+        let hybrid_ref = ObjectRef::new(5, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            xref_stream_ref,
+            XrefEntry::Uncompressed {
+                offset: xref_stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: objstm_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            hybrid_ref,
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut trailer = Dictionary::new();
+        trailer.insert("XRefStm", Object::Reference(hybrid_ref));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            bootstrap_cache: empty_bootstrap_cache(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+
+        merge_xref_stream_from_classic_trailer(
+            &bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect("an indirect /XRefStm stored in an ObjStm must be followed");
+        assert!(loaded.parsed_xref_streams.contains_key(&xref_stream_ref));
+    }
+
+    #[test]
+    fn bootstrap_context_turns_malformed_objstm_metadata_into_null_with_warning() {
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"8 0 obj\n<< /Type /ObjStm /N /bad /First 0 /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        );
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(2, 0)),
+            Object::Null
+        );
+        assert!(context
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("object stream /N")));
+    }
+
+    #[test]
+    fn bootstrap_context_decodes_a_filtered_objstm_before_parsing_members() {
+        let members = [(2, b"<< /Value /Decoded >>".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_flate_objstm_bytes(8, &members));
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        let mut expected = Dictionary::new();
+        expected.insert("Value", Object::Name(b"Decoded".to_vec()));
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(2, 0)),
+            Object::Dictionary(expected)
+        );
+        assert!(context.diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_context_rejects_a_non_integer_objstm_first() {
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"8 0 obj\n<< /Type /ObjStm /N 1 /First /bad /Length 0 >>\nstream\n\nendstream\nendobj\n",
+        );
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(2, 0)),
+            Object::Null
+        );
+        assert!(context
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("object stream /First")));
+    }
+
+    #[test]
+    fn bootstrap_context_reports_a_malformed_objstm_header_as_null() {
+        let payload = b"2 nope << /Value /Bad >>";
+        let first = b"2 nope ".len();
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(2, 0)),
+            Object::Null
+        );
+        assert!(context
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected integer")));
+    }
+
+    #[test]
+    fn bootstrap_context_reports_an_objstm_member_parse_failure_as_null() {
+        let payload = b"2 0 << /Value";
+        let first = b"2 0 ".len();
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(
+            context.resolve_reference(ObjectRef::new(2, 0)),
+            Object::Null
+        );
+        assert!(!context.diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_context_stops_caching_later_member_after_parse_failure() {
+        let members = [
+            (2, b"<< /Value 2147483648 0 R >>".as_slice()),
+            (4, b"42".as_slice()),
+        ];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Null
+            );
+            assert!(!context.diagnostics.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_rebases_member_parse_error_to_decoded_offset() {
+        let members = [
+            (2, b"42".as_slice()),
+            (4, b"<< /Value 2147483648 0 R >>".as_slice()),
+        ];
+        let (_, first) = test_objstm_payload(&members);
+        let member_start = first + b"42\n".len();
+        let parse_error_offset = b"<< /Value ".len();
+        let expected_offset = member_start + parse_error_offset;
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Null
+            );
+            let diagnostic = context
+                .diagnostics
+                .entries()
+                .iter()
+                .find(|diagnostic| diagnostic.message.contains("integer out of range"))
+                .expect("member parse failure warning");
+            assert_eq!(diagnostic.offset, Some(expected_offset as u64));
+            assert!(diagnostic.message.contains(&format!(
+                "object stream 8 (object 4 0, offset {expected_offset}):"
+            )));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_warns_for_empty_member_and_caches_following_member() {
+        let members = [(2, b"endobj".as_slice()), (4, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Integer(42)
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("empty object treated as null")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_preserves_wrong_type_warning_while_resolving_members() {
+        let members = [(2, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes_with_type(8, &members, "BadTyp"));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Integer(42)
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("has wrong type")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_recovers_non_name_objstm_member_with_live_parser() {
+        let members = [(2, b"<< 12 >>".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            let object = context.resolve_reference(ObjectRef::new(2, 0));
+            assert_eq!(
+                object
+                    .as_dict()
+                    .and_then(|dictionary| dictionary.get("QPDFFake1")),
+                Some(&Object::Integer(12))
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("expected dictionary key but found non-name object")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_warns_and_caches_null_for_live_parser_error() {
+        let members = [(2, b"<< /Value 2147483648 0 R >>".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("integer out of range")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_reports_member_offset_out_of_range() {
+        let (payload, _) = test_objstm_payload(&[(2, b"42".as_slice())]);
+        let first = payload.len() + 100;
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("object stream member offset is out of range")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_records_member_parser_diagnostics() {
+        let members = [(2, b"/Bad#Name".as_slice()), (4, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Name(b"Bad\0Name".to_vec())
+            );
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Integer(42)
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("stray #")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_warns_and_returns_null_for_non_parse_objstm_errors() {
+        let payload = b"2 0 42";
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /NoSuchFilter /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert!(!context.diagnostics.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_does_not_reenter_a_compressed_objstm_container() {
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(2, 0),
+            XrefEntry::Compressed {
+                stream: 8,
+                index: 0,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Compressed {
+                stream: 8,
                 index: 0,
             },
         );
@@ -2624,17 +3540,17 @@ mod tests {
             XrefLoadOptions::default(),
         );
 
-        assert_eq!(context.resolve_reference(missing), Object::Null);
-        assert_eq!(context.resolve_reference(freed), Object::Null);
-        assert_eq!(context.resolve_reference(compressed), Object::Null);
-        assert!(context.diagnostics.entries().is_empty());
-
-        let mut dictionary = Dictionary::new();
-        dictionary.insert("Index", Object::Reference(missing));
         assert_eq!(
-            parse_xref_index(&mut context, &dictionary, 7).unwrap(),
-            vec![0, 7]
+            context.resolve_reference(ObjectRef::new(2, 0)),
+            Object::Null
         );
+        assert!(context
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("supposed object stream 8 is not a stream")));
     }
 
     #[test]
