@@ -11,6 +11,9 @@ const REQUIRED_TEST_MATRIX_OS: [&str; 4] = [
     "windows-latest",
 ];
 const TEST_JOB_RUNS_ON: &str = "${{ matrix.os }}";
+const BASH_CONTROL_FLOW_KEYWORDS: [&str; 11] = [
+    "if", "then", "else", "fi", "case", "esac", "for", "while", "until", "do", "done",
+];
 
 type ContractResult<T> = Result<T, String>;
 
@@ -66,19 +69,28 @@ fn run_contains_test_command(run: &str, command: &str) -> bool {
     })
 }
 
-fn bash_run_exact_command_line_count(run: &str, command: &str) -> usize {
-    if run
-        .lines()
-        .map(str::trim)
-        .any(|line| line == "if" || line.starts_with("if ") || line.contains("<<"))
-    {
-        return 0;
-    }
-
+fn run_exact_command_line_count(run: &str, command: &str) -> usize {
     run.lines()
         .map(str::trim)
         .filter(|line| *line == command)
         .count()
+}
+
+fn bash_run_has_control_flow(run: &str) -> bool {
+    run.lines().map(str::trim).any(|line| {
+        line.contains("<<")
+            || line.split_whitespace().next().is_some_and(|word| {
+                BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
+            })
+    })
+}
+
+fn bash_run_exact_command_line_count(run: &str, command: &str) -> usize {
+    if bash_run_has_control_flow(run) {
+        return 0;
+    }
+
+    run_exact_command_line_count(run, command)
 }
 
 fn test_job_step_exact_command_line_count(step: &Yaml, command: &str) -> usize {
@@ -161,11 +173,20 @@ fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResu
         .as_vec()
         .ok_or_else(|| "test job.steps must be a sequence".to_owned())?;
 
-    Ok(steps
+    let total_command_lines = steps
+        .iter()
+        .map(|step| {
+            mapping_get(step, "run")
+                .and_then(Yaml::as_str)
+                .map_or(0, |run| run_exact_command_line_count(run, command))
+        })
+        .sum::<usize>();
+    let executable_command_lines = steps
         .iter()
         .map(|step| test_job_step_exact_command_line_count(step, command))
-        .sum::<usize>()
-        == 1)
+        .sum::<usize>();
+
+    Ok(total_command_lines == 1 && executable_command_lines == 1)
 }
 
 fn test_job_has_required_os_matrix(test_job: &Yaml) -> ContractResult<bool> {
@@ -177,6 +198,9 @@ fn test_job_has_required_os_matrix(test_job: &Yaml) -> ContractResult<bool> {
         return Ok(false);
     };
     let matrix = require_mapping(matrix, "test job.strategy.matrix")?;
+    if mapping_contains_key(matrix, "exclude") {
+        return Ok(false);
+    }
     let Some(include) = mapping_get(matrix, "include") else {
         return Ok(false);
     };
@@ -416,6 +440,44 @@ steps:
 }
 
 #[test]
+fn test_job_workspace_command_rejects_gated_duplicate_workspace_command() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace
+  - if: false
+    shell: bash
+    run: cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_while_control_flow() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      while false; do
+        cargo test --workspace
+      done
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
 fn test_job_workspace_command_rejects_static_runs_on() {
     let workflow = "\
 jobs:
@@ -427,6 +489,32 @@ jobs:
           - os: ubuntu-latest
           - os: ubuntu-24.04-arm
           - os: macos-latest
+          - os: windows-latest
+    steps:
+      - shell: bash
+        run: cargo test --workspace
+";
+
+    assert!(
+        !test_job_contains_test_command(workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_matrix_exclude() {
+    let workflow = "\
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+        exclude:
           - os: windows-latest
     steps:
       - shell: bash
