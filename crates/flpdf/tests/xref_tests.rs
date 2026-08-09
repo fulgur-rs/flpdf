@@ -1284,6 +1284,84 @@ fn best_effort_candidate_discovery_resolves_indirect_xref_type() {
     );
 }
 
+#[test]
+fn best_effort_candidate_discovery_resolves_indirect_xref_length_before_recovery() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let candidate_offset = bytes.len() as u64;
+    let candidate_header =
+        b"1 0 obj\n<< /Type /XRef /Size 4 /Root 3 0 R /W [1 8 2] /Index [0 4] /Length 2 0 R >>\nstream\n";
+    let candidate_suffix = b"\nendstream\nendobj\n";
+    let holder_object = b"2 0 obj\n44\nendobj\n";
+    let root_object = b"3 0 obj\n<< /Type /Catalog >>\nendobj\n";
+    let holder_offset =
+        candidate_offset + candidate_header.len() as u64 + 44 + candidate_suffix.len() as u64;
+    let root_offset = holder_offset + holder_object.len() as u64;
+    let stream_payload = {
+        // The free xref row ignores the wide fields, so they can contain a
+        // line-anchored `endstream` token inside the real payload. qpdf's
+        // resolved indirect `/Length` keeps that token inside the stream;
+        // boundary recovery would truncate the payload before all fields.
+        let mut payload = vec![0];
+        payload.extend_from_slice(b"\nendstre");
+        payload.extend_from_slice(b"am");
+        for field1 in [candidate_offset, holder_offset, root_offset] {
+            payload.push(1);
+            payload.extend_from_slice(&field1.to_be_bytes());
+            payload.extend_from_slice(&0u16.to_be_bytes());
+        }
+        payload
+    };
+    assert_eq!(stream_payload.len(), 44);
+    bytes.extend_from_slice(candidate_header);
+    bytes.extend_from_slice(&stream_payload);
+    bytes.extend_from_slice(candidate_suffix);
+    bytes.extend_from_slice(holder_object);
+    bytes.extend_from_slice(root_object);
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    // The pinned qpdf oracle must also accept the repaired candidate. Keep the
+    // probe optional for developer environments without qpdf, matching the
+    // existing differential tests in this suite.
+    if std::process::Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+        let path = directory.path().join("indirect-length-candidate.pdf");
+        std::fs::write(&path, &bytes).expect("write indirect-length candidate fixture");
+        let qpdf = std::process::Command::new("qpdf")
+            .arg("--show-xref")
+            .arg(&path)
+            .output()
+            .expect("run pinned qpdf --show-xref");
+        let stdout = String::from_utf8_lossy(&qpdf.stdout);
+        assert!(
+            stdout.contains(&format!("1/0: uncompressed; offset = {candidate_offset}")),
+            "qpdf --show-xref did not recover the candidate:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("3/0: uncompressed; offset = {root_offset}")),
+            "qpdf --show-xref did not retain the resolved root:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&qpdf.stderr)
+        );
+    }
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("reconstruction should trust the resolved indirect /Length");
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert_eq!(
+        loaded.trailer.get("Type"),
+        Some(&Object::Name(b"XRef".to_vec()))
+    );
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("recovered stream length")));
+}
+
 /// Build a damaged document that strict parsing rejects (corrupt `xref` keyword)
 /// so best-effort falls into the linear scan: a recoverable catalog (object 1),
 /// then `count` malformed candidate objects each beginning with `body_suffix`

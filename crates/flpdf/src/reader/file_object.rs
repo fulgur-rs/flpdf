@@ -403,9 +403,12 @@ fn complete_stream(
         }
     };
     let exact_end = length.and_then(|length| data_start.checked_add(length));
-    let directly_usable_length = matches!(
-        dict.get("Length"),
-        Some(Object::Integer(value)) if *value >= 0
+    // qpdf's readStream checks the boundary after `/Length` has gone through
+    // object-handle dereference; a resolved indirect integer is authoritative
+    // in the same way as a direct integer (`QPDF.cc:1368-1389`).
+    let usable_length = matches!(
+        resolved_length,
+        ResolvedStreamLength::Integer(value) if value >= 0
     ) && exact_end.is_some_and(|end| end <= input.len());
     let exact_terminator = if let Some(end) = exact_end.filter(|&end| end <= input.len()) {
         let terminator = skip_pdf_ignorable(input, end)?;
@@ -421,7 +424,7 @@ fn complete_stream(
             RecoveryPolicy::RequireTerminator
                 | RecoveryPolicy::RequireTokenTerminator
                 | RecoveryPolicy::RequireEndstream
-        ) && directly_usable_length =>
+        ) && usable_length =>
         {
             return Err(Error::parse(
                 exact_end.expect("usable stream length has an exact boundary"),
@@ -1046,6 +1049,23 @@ mod tests {
         let pending = parse_file_object_syntax(input).unwrap();
         assert!(
             finish_file_object(input, pending, None, RecoveryPolicy::RequireEndstream).is_err()
+        );
+    }
+
+    #[test]
+    fn require_endstream_rejects_mismatched_resolved_indirect_length() {
+        let input = b"1 0 obj\n<< /Length 9 0 R >>\nstream\nabc\nendstream\nendobj\n";
+        let pending = parse_file_object_syntax(input).unwrap();
+        let error = finish_file_object(
+            input,
+            pending,
+            Some(ResolvedStreamLength::Integer(2)),
+            RecoveryPolicy::RequireEndstream,
+        )
+        .expect_err("a resolved but mismatched length must not enter recovery");
+        assert!(
+            error.to_string().contains("expected endstream"),
+            "unexpected error: {error}"
         );
     }
 
