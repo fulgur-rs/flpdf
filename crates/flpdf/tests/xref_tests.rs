@@ -2675,6 +2675,27 @@ fn classic_xref_document_with_indirect_size(size_value: i64) -> Vec<u8> {
     bytes
 }
 
+fn classic_xref_with_indirect_size_header_mismatch() -> (Vec<u8>, u64) {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"3 0 obj\n5\nendobj\n");
+    let wrong_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"4 0 obj\n<< /Foo true >>\nendobj\n");
+
+    let xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{catalog_offset:010} 00000 n \n0000000000 65535 f \n{wrong_offset:010} 00000 n \n{wrong_offset:010} 00000 n \ntrailer\n<< /Size 3 0 R /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    (bytes, size_offset)
+}
+
 fn ignore_xref_streams_options(repair: bool) -> PdfOpenOptions {
     PdfOpenOptions {
         repair,
@@ -2752,6 +2773,47 @@ fn classic_xref_with_shared_indirect_size_object() -> Vec<u8> {
     bytes.extend_from_slice(
         format!(
             "trailer\n<< /Size 3 0 R /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}
+
+fn classic_xref_with_shared_indirect_xrefstm_and_size_object() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n0000000000\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    bytes[size_offset + 8..size_offset + 18]
+        .copy_from_slice(format!("{xref_stream_offset:010}").as_bytes());
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (1, size_offset as u64, 0),
+    ]);
+    let mut xref_stream = format!(
+        "2 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 4 2] /Index [0 4] /Length {} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    xref_stream.extend_from_slice(&entries);
+    xref_stream.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(&xref_stream);
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{size_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 0 R /Root 1 0 R /XRefStm 3 0 R >>\nstartxref\n{table_offset}\n%%EOF\n"
         )
         .as_bytes(),
     );
@@ -2880,6 +2942,24 @@ fn hybrid_xref_reuses_an_indirect_size_resolution_diagnostic() {
             .count(),
         1,
         "the shared indirect /Size object warning must be emitted once"
+    );
+}
+
+#[test]
+fn hybrid_xref_commits_shared_indirect_xrefstm_size_cache() {
+    let bytes = classic_xref_with_shared_indirect_xrefstm_and_size_object();
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should load the hybrid xref");
+
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the /XRefStm resolution must share its cache with post-chain /Size"
     );
 }
 
@@ -3403,6 +3483,26 @@ fn normal_xref_accepts_matching_indirect_xref_size() {
         .entries()
         .iter()
         .any(|diagnostic| diagnostic.message.contains("reported number of objects")));
+}
+
+#[test]
+fn repair_reconstructs_xref_after_an_indirect_size_header_mismatch() {
+    let (bytes, size_offset) = classic_xref_with_indirect_size_header_mismatch();
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should reconstruct the mismatched xref entry");
+
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: size_offset,
+        }),
+        "qpdf reconstruction must replace the stale offset before /Size validation"
+    );
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("expected 3 0 obj")));
 }
 
 #[test]

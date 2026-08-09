@@ -643,8 +643,37 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         options,
     );
     let resolved_size = size_context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
-    size_context.cache.commit();
+    let size_reconstruction_trigger = size_context.take_reconstruction_trigger();
+    if size_reconstruction_trigger.is_none() {
+        size_context.cache.commit();
+    }
     size_context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
+
+    // qpdf's ordinary post-chain `/Size` lookup calls `resolve`, whose
+    // `readObjectAtOffset(true, ...)` can reconstruct the xref table when the
+    // active entry points at a different object header (`QPDF.cc:1605-1623`).
+    // This is the same top-level `reconstruct_xref` responsibility as an
+    // initial xref failure, not a size-validation warning: consume the
+    // deferred trigger before comparing `/Size`, and run the line-scan
+    // recovery with the already-established trailer (`QPDF.cc:516-575`).
+    if let Some(error) = size_reconstruction_trigger {
+        // The trigger is only recorded by a bounded (repair-mode) read; keep
+        // this path as the single qpdf-style reconstruction handoff.
+        let diagnostics = std::mem::take(&mut loaded.loaded.repair_diagnostics);
+        let recovered = recover_xref_from_linear_scan(
+            bytes,
+            version.clone(),
+            startxref,
+            error,
+            Some(&loaded.loaded.trailer),
+            options,
+            diagnostics,
+        )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
+        let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
+        recovered.header_offset = header_offset;
+        return Ok(recovered);
+    }
+
     append_xref_size_warning_for(
         resolved_size.as_ref(),
         &loaded.loaded.entries,
@@ -770,7 +799,30 @@ fn merge_xref_stream_from_classic_trailer(
         return Ok(());
     }
 
-    let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
+    let hybrid_bootstrap_cache = match context_spec {
+        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::Reconstruction { .. } => {
+            &loaded.bootstrap_cache
+        }
+        XrefReadContextSpec::ActiveSectionWithCache { bootstrap_cache }
+        | XrefReadContextSpec::ReconstructionWithCache {
+            bootstrap_cache, ..
+        } => bootstrap_cache,
+    };
+    let hybrid_context_spec = match context_spec {
+        XrefReadContextSpec::ActiveSection | XrefReadContextSpec::ActiveSectionWithCache { .. } => {
+            XrefReadContextSpec::ActiveSectionWithCache {
+                bootstrap_cache: hybrid_bootstrap_cache,
+            }
+        }
+        XrefReadContextSpec::Reconstruction { line_scan_entries }
+        | XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries, ..
+        } => XrefReadContextSpec::ReconstructionWithCache {
+            line_scan_entries,
+            bootstrap_cache: hybrid_bootstrap_cache,
+        },
+    };
+    let mut context = XrefReadContext::new(bytes, hybrid_context_spec, registration, options);
     let xref_stream_value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
     if let Some(error) = context.take_reconstruction_trigger() {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
@@ -781,6 +833,7 @@ fn merge_xref_stream_from_classic_trailer(
         }
         return Err(error);
     }
+    context.cache.commit();
     let Some(xref_stream_offset) = xref_stream_value.and_then(|value| value.as_integer()) else {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
         if let Some(sink) = error_diagnostics_sink.as_mut() {
@@ -821,7 +874,7 @@ fn merge_xref_stream_from_classic_trailer(
         options,
         registration,
         Some(&mut hybrid_error_diagnostics),
-        context_spec,
+        hybrid_context_spec,
     ) {
         Ok(hybrid) => hybrid,
         Err(error) => {
@@ -2776,6 +2829,91 @@ mod tests {
             no_sink_error.to_string(),
             "parse error at byte 1: expected 2 0 obj"
         );
+    }
+
+    #[test]
+    fn hybrid_xref_normalizes_all_bootstrap_context_cache_variants() {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let xref_stream_offset = bytes.len();
+        bytes.extend(xref_stream_object_bytes(
+            2,
+            "/Size 1 /Index [0 1]",
+            &[0, 0, 0],
+        ));
+
+        fn loaded_state(xref_stream_offset: usize) -> LoadedXrefState {
+            let mut trailer = Dictionary::new();
+            trailer.insert("XRefStm", Object::Integer(xref_stream_offset as i64));
+            LoadedXrefState {
+                loaded: LoadedXref {
+                    version: "1.7".to_string(),
+                    startxref: 0,
+                    entries: BTreeMap::new(),
+                    trailer,
+                    last_xref_form: XrefForm::Table,
+                    repair_diagnostics: Diagnostics::default(),
+                },
+                trailer_references: BTreeSet::new(),
+                parsed_xref_streams: BTreeMap::new(),
+                bootstrap_cache: empty_bootstrap_cache(),
+                header_offset: 0,
+                already_reconstructed: false,
+            }
+        }
+
+        let options = XrefLoadOptions {
+            allow_repair: true,
+            ..XrefLoadOptions::default()
+        };
+
+        let mut active = loaded_state(xref_stream_offset);
+        let mut active_registration = XrefRegistration::default();
+        let active_cache = empty_bootstrap_cache();
+        merge_xref_stream_from_classic_trailer(
+            &bytes,
+            0,
+            &mut active,
+            options,
+            &mut active_registration,
+            None,
+            XrefReadContextSpec::ActiveSectionWithCache {
+                bootstrap_cache: &active_cache,
+            },
+        )
+        .expect("active cached context should read the hybrid stream");
+
+        let line_scan_entries = BTreeMap::new();
+        let mut reconstruction = loaded_state(xref_stream_offset);
+        let mut reconstruction_registration = XrefRegistration::default();
+        merge_xref_stream_from_classic_trailer(
+            &bytes,
+            0,
+            &mut reconstruction,
+            options,
+            &mut reconstruction_registration,
+            None,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &line_scan_entries,
+            },
+        )
+        .expect("reconstruction context should read the hybrid stream");
+
+        let reconstruction_cache = empty_bootstrap_cache();
+        let mut reconstruction_with_cache = loaded_state(xref_stream_offset);
+        let mut reconstruction_with_cache_registration = XrefRegistration::default();
+        merge_xref_stream_from_classic_trailer(
+            &bytes,
+            0,
+            &mut reconstruction_with_cache,
+            options,
+            &mut reconstruction_with_cache_registration,
+            None,
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries: &line_scan_entries,
+                bootstrap_cache: &reconstruction_cache,
+            },
+        )
+        .expect("reconstruction cached context should read the hybrid stream");
     }
 
     #[test]
