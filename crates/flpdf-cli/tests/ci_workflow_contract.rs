@@ -92,6 +92,16 @@ fn workflow_contains_test_command(workflow: &str, command: &str) -> ContractResu
     Ok(false)
 }
 
+fn test_job_contains_test_command(workflow: &str, command: &str) -> ContractResult<bool> {
+    let workflow = parse_workflow(workflow)?;
+    let jobs =
+        mapping_get(&workflow, "jobs").ok_or_else(|| "ci workflow must define jobs".to_owned())?;
+    let jobs = require_mapping(jobs, "workflow.jobs")?;
+    let test_job = mapping_get(jobs, "test")
+        .ok_or_else(|| "ci workflow must define the test job".to_owned())?;
+    job_contains_test_command(test_job, command)
+}
+
 fn mapping_get<'a>(mapping: &'a Yaml, key: &str) -> Option<&'a Yaml> {
     mapping.as_hash()?.get(&Yaml::String(key.to_owned()))
 }
@@ -259,6 +269,15 @@ jobs:
 
     assert!(workflow_contains_test_command(&workflow, command)
         .expect("synthetic complete workflow must be valid"));
+}
+
+#[test]
+fn test_matrix_runs_default_workspace_suite() {
+    assert!(
+        test_job_contains_test_command(CI_WORKFLOW, "cargo test --workspace")
+            .expect("ci workflow must be valid and define the test job"),
+        "the four-OS test matrix must run the complete default workspace suite"
+    );
 }
 
 #[test]
