@@ -1920,11 +1920,10 @@ fn write_incremental_trailer<R: Read + Seek>(
             crate::Error::Unsupported("startxref offset does not fit i64".to_string())
         })?),
     );
-    if options.static_id {
-        apply_static_id(&mut trailer);
-    } else {
-        apply_random_id(&mut trailer);
-    }
+    trailer.insert(
+        "ID",
+        generate_id_array(trailer.get("ID"), options.static_id),
+    );
 
     bytes.extend_from_slice(b"trailer\n");
     // Route the stored `/ID` value through the qpdf-trailer compact writer so
@@ -1936,26 +1935,6 @@ fn write_incremental_trailer<R: Read + Seek>(
     trailer.write_pdf_with_id_writer(bytes, None);
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
-}
-
-/// Replace `trailer`'s `/ID` so the changing identifier (element 2) is qpdf's
-/// static-id constant. The permanent identifier (element 1) is taken from the
-/// existing `/ID` when its shape matches a 2-element array of strings; in any
-/// other case (missing, wrong arity, wrong types) both elements fall back to
-/// the constant — matching qpdf's behaviour on inputs without a usable `/ID`.
-pub(crate) fn apply_static_id(trailer: &mut Dictionary) {
-    let pi_id = Object::String(QPDF_STATIC_ID.to_vec());
-    let first_id = match trailer.get("ID") {
-        Some(Object::Array(values))
-            if values.len() == 2
-                && matches!(values[0], Object::String(_))
-                && matches!(values[1], Object::String(_)) =>
-        {
-            values[0].clone()
-        }
-        _ => pi_id.clone(),
-    };
-    trailer.insert("ID", Object::Array(vec![first_id, pi_id]));
 }
 
 /// Ensure the trailer carries an `/ID` key for qpdf's `--deterministic-id`
@@ -2007,39 +1986,6 @@ fn fresh_id_bytes() -> [u8; 16] {
     hasher.update(pid.to_le_bytes());
     hasher.update(seq.to_le_bytes());
     hasher.finalize().into()
-}
-
-/// Replace `trailer`'s `/ID` following the default (no-flag) identifier
-/// strategy of ISO 32000-1 §14.4.
-///
-/// The permanent identifier (element 1) is preserved from the existing `/ID`
-/// when its shape matches a 2-element array of strings — i.e. on a re-save of a
-/// file that already carries a well-formed `/ID`.  In every other case
-/// (missing, wrong arity, wrong element types — i.e. the first save by flpdf)
-/// element 1 is freshly generated.  The changing identifier (element 2) is
-/// **always** freshly generated, so the `/ID` varies on every save while the
-/// permanent identifier remains stable across re-saves.  This matches qpdf's
-/// default observable behaviour (random `/ID`s differ between runs).
-pub(crate) fn random_id_array(source_id: Option<&Object>) -> Object {
-    let first_id = match source_id {
-        Some(Object::Array(values))
-            if values.len() == 2
-                && matches!(values[0], Object::String(_))
-                && matches!(values[1], Object::String(_)) =>
-        {
-            values[0].clone()
-        }
-        _ => Object::String(fresh_id_bytes().to_vec()),
-    };
-    let second_id = Object::String(fresh_id_bytes().to_vec());
-    Object::Array(vec![first_id, second_id])
-}
-
-/// Apply [`random_id_array`] to a trailer dictionary in place, reading the
-/// existing `/ID` (if any) as the permanent-identifier source.
-pub(crate) fn apply_random_id(trailer: &mut Dictionary) {
-    let id = random_id_array(trailer.get("ID"));
-    trailer.insert("ID", id);
 }
 
 fn strip_incremental_trailer_keys(trailer: &mut Dictionary) {
@@ -2314,7 +2260,7 @@ pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> O
 
 /// `id0` is the `/ID[0]` bytes the file encryption key is derived from
 /// (PDF 1.7 §7.6.3.3 Algorithm 2); the caller must have already decided this
-/// value — typically via [`resolve_id0_for_encryption`] — and must write the
+/// value — typically extracted from [`generate_id_array`] — and must write the
 /// SAME bytes into the output trailer's `/ID[0]`, since a reader re-derives
 /// the file key from `/ID[0]` to validate the password. Taking it as a
 /// parameter (rather than resolving it internally from `pdf`) lets a caller
@@ -2536,29 +2482,6 @@ pub(crate) fn build_copy_encryption_context(
     })
 }
 
-/// Resolve the `/ID[0]` bytes to use for the encrypted output's file key
-/// derivation AND the output trailer's `/ID` array. Preference order:
-///
-/// 1. Input trailer's existing `/ID[0]` (preserved across re-encrypt).
-/// 2. `qpdf --static-id` constant when [`WriteOptions::static_id`] is set.
-/// 3. Freshly generated random 16 bytes (via [`fresh_id_bytes`]).
-fn resolve_id0_for_encryption<R: Read + Seek>(pdf: &Pdf<R>, options: &WriteOptions) -> Vec<u8> {
-    if let Some(Object::Array(values)) = pdf.trailer().get("ID") {
-        if values.len() == 2 {
-            if let Some(Object::String(bytes)) = values.first() {
-                if !bytes.is_empty() {
-                    return bytes.clone();
-                }
-            }
-        }
-    }
-    if options.static_id {
-        QPDF_STATIC_ID.to_vec()
-    } else {
-        fresh_id_bytes().to_vec()
-    }
-}
-
 /// Append the lowercase-hex encoding of `bytes` to `out` via a table lookup,
 /// avoiding the per-byte `String` allocation a `format!("{:02x}")` loop incurs.
 /// Both the fixed-width `/ID` hex form and the deterministic-ID seed must be
@@ -2614,14 +2537,37 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &
 /// serialized `/ID` array is [`deterministic_id_array_len`]`(id0.len())` bytes
 /// wide. An empty `/ID[0]` is treated as absent (not preserved as `""`): qpdf
 /// falls back to the changing identifier for an empty original ID string.
-pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
-    match trailer.get("ID") {
+fn source_permanent_id_value(source_id: Option<&Object>) -> Option<Vec<u8>> {
+    match source_id {
         Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
             (Object::String(first), Object::String(_)) if !first.is_empty() => Some(first.clone()),
             _ => None,
         },
         _ => None,
     }
+}
+
+pub(crate) fn source_permanent_id(trailer: &Dictionary) -> Option<Vec<u8>> {
+    source_permanent_id_value(trailer.get("ID"))
+}
+
+/// Generate qpdf's ordinary/static two-element `/ID` array.
+///
+/// qpdf creates the changing identifier once and then uses the non-empty
+/// source permanent identifier when one is available. An absent or empty
+/// source permanent identifier falls back to that same changing identifier,
+/// so `/ID[0] == /ID[1]` for a first save or an empty source `/ID[0]`.
+pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> Object {
+    let changing_id = if static_id {
+        QPDF_STATIC_ID.to_vec()
+    } else {
+        fresh_id_bytes().to_vec()
+    };
+    let permanent_id = source_permanent_id_value(source_id).unwrap_or_else(|| changing_id.clone());
+    Object::Array(vec![
+        Object::String(permanent_id),
+        Object::String(changing_id),
+    ])
 }
 
 /// Build the `/Info`-derived suffix of qpdf's deterministic `/ID` seed.
@@ -2756,22 +2702,29 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
     options: &WriteOptions,
     encrypt_ctx: Option<&EncryptionContext>,
     deterministic_id: bool,
+    generated_id: Option<&Object>,
 ) {
     if let Some(ctx) = encrypt_ctx {
-        // Reference the freshly-emitted /Encrypt object and pin /ID[0] to
-        // the bytes the file key was derived from. /ID[1] is the changing
-        // identifier (qpdf --static-id constant when --static-id is set,
-        // otherwise random per save).
+        // Reference the freshly-emitted /Encrypt object. For ordinary/static
+        // encryption, `generated_id` is the complete array selected before
+        // key derivation, so inserting it unchanged keeps both the emitted
+        // /ID[0] and /ID[1] tied to the same qpdf decision. The fallback is
+        // retained for copy-encryption, whose donor supplies /ID[0] and whose
+        // changing /ID[1] follows the existing donor route.
         trailer.insert("Encrypt", Object::Reference(ctx.encrypt_ref));
-        let id1 = if options.static_id {
-            QPDF_STATIC_ID.to_vec()
+        if let Some(id) = generated_id {
+            trailer.insert("ID", id.clone());
         } else {
-            fresh_id_bytes().to_vec()
-        };
-        trailer.insert(
-            "ID",
-            Object::Array(vec![Object::String(ctx.id0.clone()), Object::String(id1)]),
-        );
+            let id1 = if options.static_id {
+                QPDF_STATIC_ID.to_vec()
+            } else {
+                fresh_id_bytes().to_vec()
+            };
+            trailer.insert(
+                "ID",
+                Object::Array(vec![Object::String(ctx.id0.clone()), Object::String(id1)]),
+            );
+        }
     } else {
         if pdf.is_encrypted() {
             trailer.remove("Encrypt");
@@ -2783,10 +2736,13 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
         // the content digest) are known; see compute_deterministic_id.
         if deterministic_id {
             apply_deterministic_id_placeholder(trailer);
-        } else if options.static_id {
-            apply_static_id(trailer);
+        } else if let Some(id) = generated_id {
+            trailer.insert("ID", id.clone());
         } else {
-            apply_random_id(trailer);
+            trailer.insert(
+                "ID",
+                generate_id_array(pdf.trailer().get("ID"), options.static_id),
+            );
         }
     }
 }
@@ -3530,6 +3486,18 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         qdf_max_emission = next_emission;
     }
 
+    // Generate qpdf's ordinary/static identifier once before either encryption
+    // key derivation or trailer emission. The complete array is reused at every
+    // trailer site so the emitted /ID[0] is the exact salt used by the context.
+    let generated_id = if options.deterministic_id || options.copy_encryption.is_some() {
+        None
+    } else {
+        Some(generate_id_array(
+            pdf.trailer().get("ID"),
+            options.static_id,
+        ))
+    };
+
     // ── flpdf-9hc.4.9 / 4.11 / 4.16: encryption context ────────────────────
     // Built ONCE up front so /ID[0] is decided before any object is encrypted.
     // Compact /Encrypt follows existing objects and generated ObjStm containers.
@@ -3551,10 +3519,18 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             })?
             // cov:ignore-end
         };
-        // Resolve /ID[0] here (rather than inside `build_encryption_context`) so
-        // this is the single place that decides it — matching qpdf's own
-        // `generateID()`-is-idempotent contract (see that function's doc).
-        let id0 = resolve_id0_for_encryption(pdf, options);
+        let id0 = generated_id
+            .as_ref()
+            .and_then(Object::as_array)
+            .and_then(|values| values.first())
+            .and_then(Object::as_string)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                crate::Error::Unsupported(
+                    "full-rewrite: ordinary/static ID generator returned an invalid /ID array"
+                        .to_string(),
+                )
+            })?;
         let context =
             build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
         Some(context?)
@@ -4063,6 +4039,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
+                generated_id.as_ref(),
             );
 
             if options.qdf {
@@ -4284,6 +4261,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 options,
                 encrypt_ctx.as_ref(),
                 options.deterministic_id,
+                generated_id.as_ref(),
             );
 
             // The cross-reference stream dictionary is serialized in plain
@@ -4570,6 +4548,7 @@ fn write_qdf_trailer(
 mod tests {
     use super::*;
     use crate::rewrite_renumber::CatalogFirstRenumber;
+    use std::io::Cursor;
     use std::sync::Arc;
 
     #[test]
@@ -4643,48 +4622,19 @@ mod tests {
                 if message.contains("reference 3 0 R absent from renumber map")));
     }
 
-    fn id_array(d: &Dictionary) -> Vec<Object> {
-        match d.get("ID") {
-            Some(Object::Array(v)) => v.clone(),
-            other => panic!("expected /ID array, got {other:?}"),
-        }
-    }
-
     #[test]
-    fn apply_static_id_preserves_first_when_both_elements_are_strings() {
-        let mut t = Dictionary::new();
-        t.insert(
-            "ID",
-            Object::Array(vec![
-                Object::String(b"permanent".to_vec()),
-                Object::String(b"changing".to_vec()),
-            ]),
-        );
-        apply_static_id(&mut t);
-        let v = id_array(&t);
-        assert_eq!(
-            v[0],
-            Object::String(b"permanent".to_vec()),
-            "element 1 must be preserved when /ID is a 2-string array"
-        );
-        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
-    }
-
-    #[test]
-    fn apply_static_id_falls_back_when_second_element_is_not_a_string() {
+    fn generate_id_array_static_falls_back_when_second_element_is_not_a_string() {
         // `/ID [<valid> 123]` — arity 2 but element 2 is not a string.
         // Both elements must fall back to the constant (qpdf parity); the
         // old guard checked only element 1 and wrongly kept it.
-        let mut t = Dictionary::new();
-        t.insert(
-            "ID",
-            Object::Array(vec![
-                Object::String(b"permanent".to_vec()),
-                Object::Integer(123),
-            ]),
-        );
-        apply_static_id(&mut t);
-        let v = id_array(&t);
+        let source = Object::Array(vec![
+            Object::String(b"permanent".to_vec()),
+            Object::Integer(123),
+        ]);
+        let v = match generate_id_array(Some(&source), true) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
         assert_eq!(
             v[0],
             Object::String(QPDF_STATIC_ID.to_vec()),
@@ -4694,12 +4644,73 @@ mod tests {
     }
 
     #[test]
-    fn apply_static_id_falls_back_when_id_is_missing() {
-        let mut t = Dictionary::new();
-        apply_static_id(&mut t);
-        let v = id_array(&t);
+    fn generate_id_array_static_falls_back_when_id_is_missing() {
+        let v = match generate_id_array(None, true) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
         assert_eq!(v[0], Object::String(QPDF_STATIC_ID.to_vec()));
         assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
+    }
+
+    #[test]
+    fn generate_id_array_empty_source_uses_same_generated_id() {
+        let source = Object::Array(vec![
+            Object::String(Vec::new()),
+            Object::String(b"source-changing".to_vec()),
+        ]);
+        let generated = generate_id_array(Some(&source), false);
+        let values = match generated {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], values[1]);
+        assert!(!str_bytes(&values[0]).is_empty());
+        assert_ne!(str_bytes(&values[0]), &QPDF_STATIC_ID[..]);
+    }
+
+    #[test]
+    fn generate_id_array_empty_source_static_uses_pi_for_both_ids() {
+        let source = Object::Array(vec![
+            Object::String(Vec::new()),
+            Object::String(b"source-changing".to_vec()),
+        ]);
+        let generated = generate_id_array(Some(&source), true);
+        let values = match generated {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
+        assert_eq!(
+            values,
+            vec![
+                Object::String(QPDF_STATIC_ID.to_vec()),
+                Object::String(QPDF_STATIC_ID.to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_id_array_preserves_non_empty_source_id0() {
+        let source = Object::Array(vec![
+            Object::String(b"permanent".to_vec()),
+            Object::String(b"source-changing".to_vec()),
+        ]);
+        let generated = generate_id_array(Some(&source), false);
+        let values = match generated {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
+        assert_eq!(values[0], Object::String(b"permanent".to_vec()));
+        assert!(!str_bytes(&values[1]).is_empty());
+
+        let static_generated = generate_id_array(Some(&source), true);
+        let static_values = match static_generated {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
+        assert_eq!(static_values[0], Object::String(b"permanent".to_vec()));
+        assert_eq!(static_values[1], Object::String(QPDF_STATIC_ID.to_vec()));
     }
 
     // --- Default (no-flag) /ID generation strategy (flpdf-9hc.13.2) ---------
@@ -4712,12 +4723,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_random_id_first_save_generates_both_elements_fresh() {
-        // No source /ID: both elements must be fresh 16-byte randoms — never
-        // the π constant and never all-zero.
-        let mut t = Dictionary::new();
-        apply_random_id(&mut t);
-        let v = id_array(&t);
+    fn generate_id_array_first_save_uses_one_fresh_id_for_both_elements() {
+        // No source /ID: qpdf reuses the changing identifier as the permanent
+        // identifier, so both elements are equal and independently generated
+        // saves still differ.
+        let v = match generate_id_array(None, false) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
         assert_eq!(v.len(), 2);
         let (e0, e1) = (str_bytes(&v[0]), str_bytes(&v[1]));
         assert_eq!(e0.len(), 16, "element 1 must be 16 bytes");
@@ -4734,38 +4747,35 @@ mod tests {
         );
         assert!(e0.iter().any(|&b| b != 0), "element 1 must not be all-zero");
         assert!(e1.iter().any(|&b| b != 0), "element 2 must not be all-zero");
-        // First save: the two elements are independently random.
-        assert_ne!(
-            e0, e1,
-            "first-save elements must be independently generated"
-        );
+        assert_eq!(e0, e1, "qpdf reuses id2 when source id1 is absent");
     }
 
     #[test]
-    fn apply_random_id_varies_per_save() {
+    fn generate_id_array_varies_per_save() {
         // Two saves of the same (no-/ID) input yield different /ID arrays —
         // even back-to-back, thanks to the process-global counter.
-        let mut a = Dictionary::new();
-        let mut b = Dictionary::new();
-        apply_random_id(&mut a);
-        apply_random_id(&mut b);
-        assert_ne!(id_array(&a), id_array(&b), "/ID must change on every save");
+        let a = generate_id_array(None, false);
+        let b = generate_id_array(None, false);
+        assert_ne!(a, b, "/ID must change on every save");
     }
 
     #[test]
-    fn apply_random_id_re_save_preserves_element1_rotates_element2() {
+    fn generate_id_array_re_save_preserves_element1_rotates_element2() {
         // First save (no source /ID): both fresh.
-        let mut first = Dictionary::new();
-        apply_random_id(&mut first);
-        let v1 = id_array(&first);
+        let first = match generate_id_array(None, false) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
+        let v1 = first;
         let perm = v1[0].clone();
 
         // Re-save: feed the well-formed 2-string /ID back in.  Element 1 must
         // be preserved verbatim (ISO 32000-1 §14.4); element 2 must rotate.
-        let mut second = Dictionary::new();
-        second.insert("ID", Object::Array(v1.clone()));
-        apply_random_id(&mut second);
-        let v2 = id_array(&second);
+        let source = Object::Array(v1.clone());
+        let v2 = match generate_id_array(Some(&source), false) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
 
         assert_eq!(
             v2[0], perm,
@@ -4778,19 +4788,17 @@ mod tests {
     }
 
     #[test]
-    fn apply_random_id_regenerates_element1_when_source_id_is_malformed() {
+    fn generate_id_array_regenerates_element1_when_source_id_is_malformed() {
         // Arity-2 array but element 2 is not a string → not a usable /ID, so
-        // element 1 is treated as a first save and regenerated.
-        let mut t = Dictionary::new();
-        t.insert(
-            "ID",
-            Object::Array(vec![
-                Object::String(b"would-be-permanent".to_vec()),
-                Object::Integer(123),
-            ]),
-        );
-        apply_random_id(&mut t);
-        let v = id_array(&t);
+        // element 1 falls back to the generated element 2.
+        let source = Object::Array(vec![
+            Object::String(b"would-be-permanent".to_vec()),
+            Object::Integer(123),
+        ]);
+        let v = match generate_id_array(Some(&source), false) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"),
+        };
         assert_ne!(
             v[0],
             Object::String(b"would-be-permanent".to_vec()),
@@ -4798,6 +4806,7 @@ mod tests {
         );
         assert_eq!(str_bytes(&v[0]).len(), 16);
         assert_eq!(str_bytes(&v[1]).len(), 16);
+        assert_eq!(v[0], v[1]);
     }
 
     // --- deterministic-id (qpdf --deterministic-id) -----------------------
@@ -4892,6 +4901,69 @@ mod tests {
         assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
         // Distinct from the --static-id constant so the two flags never collide.
         assert_ne!(id0.as_slice(), &QPDF_STATIC_ID[..]);
+    }
+
+    #[test]
+    fn ordinary_full_rewrite_empty_source_id0_matches_qpdf_default_and_static() {
+        for id_entry in ["/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", "/ID [() ()]"] {
+            let source = build_det_id_source(id_entry, &[]);
+
+            let default_output = write_full_rewrite_with(
+                &source,
+                &WriteOptions {
+                    full_rewrite: true,
+                    ..WriteOptions::default()
+                },
+            );
+            let (default_id0, default_id1) = trailer_id_pair(&default_output);
+            assert!(!default_id0.is_empty(), "default /ID[0] must be non-empty");
+            assert_eq!(default_id0, default_id1);
+
+            let static_output = write_full_rewrite_with(
+                &source,
+                &WriteOptions {
+                    full_rewrite: true,
+                    static_id: true,
+                    ..WriteOptions::default()
+                },
+            );
+            assert_eq!(
+                trailer_id_pair(&static_output),
+                (QPDF_STATIC_ID.to_vec(), QPDF_STATIC_ID.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_full_rewrite_empty_source_id0_matches_emitted_id1() {
+        let source = build_det_id_source("/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", &[]);
+        let mut pdf = Pdf::open(Cursor::new(source)).expect("source parses");
+        let mut output = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            )),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut output, &options).expect("encrypted write");
+        let (id0, id1) = trailer_id_pair(&output);
+        assert!(!id0.is_empty());
+        assert_eq!(
+            id0, id1,
+            "empty source /ID[0] must reuse qpdf's generated id2"
+        );
+
+        let reopened = Pdf::open_with_options(
+            Cursor::new(output),
+            crate::PdfOpenOptions {
+                password: Vec::new(),
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("encrypted output must reopen with the empty user password");
+        assert!(reopened.trailer().get("Encrypt").is_some());
     }
 
     #[test]

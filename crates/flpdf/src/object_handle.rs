@@ -3790,7 +3790,7 @@ impl ObjectHandle {
     /// reason `t_lin_second` is (see below). `/ID` and `/Encrypt` are
     /// read from `self`'s own stored values instead of from writer state
     /// -- the caller is expected to have already placed the correct
-    /// values there (`apply_encrypt_trailer_entries`/`apply_random_id`/
+    /// values there (`apply_encrypt_trailer_entries`/`generate_id_array`/
     /// `apply_deterministic_id_placeholder`, `writer.rs`), the same contract
     /// [`crate::object::Dictionary::write_pdf_trailer`] already
     /// establishes and this primitive matches for that dimension.
