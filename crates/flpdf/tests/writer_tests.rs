@@ -415,6 +415,59 @@ fn default_id_random_on_incremental_path_first_save_and_resave() {
     );
 }
 
+/// qpdf's incremental xref-stream dictionary and the ignored trailing classic
+/// trailer must carry the same selected `/ID`.  In particular, `static_id`
+/// must be visible through the xref stream that `startxref` names, not only
+/// through the trailing trailer dictionary.
+#[test]
+fn incremental_xref_stream_static_id_is_reader_visible() {
+    let source = fs::read("../../tests/fixtures/compat/three-page-objstm.pdf").unwrap();
+    let source_trailer = load_xref_and_trailer(&mut Cursor::new(&source))
+        .unwrap()
+        .trailer;
+    let root_ref = source_trailer
+        .get_ref("Root")
+        .expect("fixture must contain a /Root");
+
+    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let root = pdf.resolve(root_ref).unwrap();
+    pdf.set_object(root_ref, root);
+
+    let mut options = WriteOptions::default();
+    options.static_id = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(&output)).unwrap();
+    let Object::Array(id) = loaded.trailer.get("ID").expect("output must contain /ID") else {
+        panic!("output /ID must be an array");
+    };
+    assert_eq!(id.len(), 2, "output /ID must have two elements");
+    let pi: [u8; 16] = [
+        0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27,
+        0x95,
+    ];
+    assert_eq!(
+        id[1],
+        Object::String(pi.to_vec()),
+        "reader-visible xref-stream /ID[1] must use the selected static ID"
+    );
+    assert_eq!(
+        id[0],
+        source_trailer
+            .get("ID")
+            .and_then(|value| match value {
+                Object::Array(values) if values.len() == 2 => values.first().cloned(),
+                _ => None,
+            })
+            .expect("fixture must contain a two-element /ID"),
+        "incremental write must preserve the source permanent identifier"
+    );
+    assert!(!output
+        .windows(b"\ntrailer\n".len())
+        .any(|w| w == b"\ntrailer\n"));
+}
+
 #[test]
 fn write_pdf_preserves_source_bytes() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
