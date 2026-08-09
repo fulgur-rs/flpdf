@@ -2400,6 +2400,112 @@ mod tests {
     }
 
     #[test]
+    fn reconstruction_previous_sections_reuse_the_selected_bootstrap_cache() {
+        let previous_ref = ObjectRef::new(5, 0);
+        let mut bytes = b" ".to_vec();
+        let previous_object_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"5 0 obj\n101\nendobj\n");
+        while bytes.len() < 100 {
+            bytes.push(b' ');
+        }
+        let previous_xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \ntrailer\n<< /Size 1 >>\n");
+
+        let line_scan_entries = BTreeMap::from([(
+            previous_ref,
+            XrefEntry::Uncompressed {
+                offset: previous_object_offset,
+            },
+        )]);
+        let make_loaded = || {
+            let mut trailer = Dictionary::new();
+            trailer.insert("Prev", Object::Reference(previous_ref));
+            LoadedXrefState {
+                loaded: LoadedXref {
+                    version: "1.7".to_string(),
+                    startxref: 0,
+                    entries: BTreeMap::new(),
+                    trailer,
+                    last_xref_form: XrefForm::Table,
+                    repair_diagnostics: Diagnostics::default(),
+                },
+                trailer_references: BTreeSet::new(),
+                parsed_xref_streams: BTreeMap::new(),
+                bootstrap_cache: empty_bootstrap_cache(),
+                header_offset: 0,
+                already_reconstructed: false,
+            }
+        };
+
+        let mut reconstructed = make_loaded();
+        let mut registration = XrefRegistration::default();
+        merge_previous_xref_sections(
+            &bytes,
+            "1.7",
+            &mut reconstructed,
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::Reconstruction {
+                line_scan_entries: &line_scan_entries,
+            },
+        )
+        .expect_err("the uncached reconstruction context follows the file value");
+
+        let shared_cache = empty_bootstrap_cache();
+        shared_cache
+            .borrow_mut()
+            .insert(previous_ref, Object::Integer(previous_xref_offset as i64));
+        let mut reconstructed_with_cache = make_loaded();
+        let mut cached_registration = XrefRegistration::default();
+        merge_previous_xref_sections(
+            &bytes,
+            "1.7",
+            &mut reconstructed_with_cache,
+            XrefLoadOptions::default(),
+            &mut cached_registration,
+            None,
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries: &line_scan_entries,
+                bootstrap_cache: &shared_cache,
+            },
+        )
+        .expect("reconstruction context with cache follows an indirect /Prev");
+
+        assert!(reconstructed_with_cache
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .is_empty());
+
+        let mut active_with_cache = make_loaded();
+        let mut active_registration = XrefRegistration::default();
+        active_registration.insert_xref_entry(
+            previous_ref,
+            XrefEntry::Uncompressed {
+                offset: previous_object_offset,
+            },
+        );
+        merge_previous_xref_sections(
+            &bytes,
+            "1.7",
+            &mut active_with_cache,
+            XrefLoadOptions::default(),
+            &mut active_registration,
+            None,
+            XrefReadContextSpec::ActiveSectionWithCache {
+                bootstrap_cache: &shared_cache,
+            },
+        )
+        .expect("active context with cache follows an indirect /Prev");
+        assert!(active_with_cache
+            .loaded
+            .repair_diagnostics
+            .entries()
+            .is_empty());
+    }
+
+    #[test]
     fn bootstrap_context_resolves_missing_and_free_references_to_null() {
         let missing = ObjectRef::new(9, 0);
         let freed = ObjectRef::new(10, 0);
