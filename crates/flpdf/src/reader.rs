@@ -2141,14 +2141,14 @@ impl<R: Read + Seek> Pdf<R> {
                     .get(&object_ref)
                     .expect("inserted materialized ObjectHandle value"));
             }
-            return Ok(&NULL_OBJECT);
+            return Ok(&NULL_OBJECT); // cov:ignore: a successful canonical resolve always leaves a missing handle resolved
         }
 
         match self.resolve_to_cache(object_ref) {
             Ok(true) => {
                 if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
                     return Ok(object);
-                }
+                } // cov:ignore: resolve_to_cache returns true only after installing a resolved cache entry
             }
             Ok(false)
                 if self.resolver.attempt_recovery() && !self.resolver.reconstructed_xref() =>
@@ -2158,7 +2158,7 @@ impl<R: Read + Seek> Pdf<R> {
                         .legacy_materialized_memo
                         .get(&object_ref)
                         .expect("inserted recovered canonical value"));
-                }
+                } // cov:ignore: canonical materialization cannot return false after resolving an indirect handle
             }
             Err(error)
                 if self.resolver.attempt_recovery()
@@ -2205,7 +2205,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolve_object_handle(&handle)?;
         self.synchronize_legacy_resolution_state();
         if !handle.is_resolved() {
-            return Ok(false);
+            return Ok(false); // cov:ignore: the canonical resolver resolves or errors for every indirect handle
         }
 
         if handle.get_parsed_offset() < 0 && !self.handle_mutated_object_refs.contains(&object_ref)
@@ -6317,6 +6317,62 @@ mod tests {
 
         assert_eq!(stream.data.as_ptr(), payload_ptr);
         assert_eq!(stream.data.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn borrowed_resolution_materializes_a_pre_resolved_canonical_value_after_a_legacy_parse_error()
+    {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n[2147483648 0 R]\nendobj\n"], object_ref);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+
+        // Simulate the compatibility state produced when a canonical caller
+        // has already resolved the handle but the legacy cache still contains
+        // a stale source offset. The legacy parser must fail first, then the
+        // repair path may expose the canonical value without reparsing it.
+        let handle = pdf.get_object_handle(object_ref);
+        handle.set_resolved(ObjectValue::Integer(42));
+        let xref_offset = pdf
+            .source_bytes()
+            .expect("read fixture bytes")
+            .windows(b"xref\n".len())
+            .position(|window| window == b"xref\n")
+            .expect("xref marker") as u64;
+        pdf.cache.set_unresolved(object_ref, xref_offset);
+
+        assert_eq!(
+            pdf.resolve_borrowed(object_ref)
+                .expect("canonical value after legacy parse failure"),
+            &Object::Integer(42)
+        );
+    }
+
+    #[test]
+    fn canonical_compatibility_materialization_reuses_a_resolved_legacy_stream() {
+        let object_ref = ObjectRef::new(91, 0);
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let handle = pdf.get_object_handle(object_ref);
+        let stream_data = b"canonical stream bytes".to_vec();
+        handle.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: Some(Rc::new(stream_data.clone())),
+            stream_length: stream_data.len(),
+        });
+
+        let legacy = Object::Stream(Stream::new(Dictionary::new(), b"legacy bytes".to_vec()));
+        pdf.cache.set_resolved(object_ref, legacy.clone());
+
+        assert!(pdf
+            .materialize_canonical_compatibility_value(object_ref)
+            .expect("canonical stream compatibility materialization"));
+        assert_eq!(pdf.legacy_materialized_memo.get(&object_ref), Some(&legacy));
     }
 
     fn top_level_bare_reference_pdf() -> Vec<u8> {

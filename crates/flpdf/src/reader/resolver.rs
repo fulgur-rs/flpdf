@@ -2645,6 +2645,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                                             handle.set_missing();
                                             Ok(())
                                         }
+                                        // cov:ignore-start: resolution-time reconstruct_xref records only type-1 entries; type-2 retry handoff belongs to xref-stream recovery before resolution
                                         Err(err) if matches!(&err, Error::Unsupported(_)) => {
                                             // Reconstruction can replace the
                                             // requested type-1 entry with a
@@ -2664,6 +2665,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
                                                 Err(err)
                                             }
                                         }
+                                        // cov:ignore-end
                                         Err(err) => Err(err),
                                     }
                                 } else {
@@ -2710,6 +2712,7 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::process::Command;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     /// A three-object document with a classic cross-reference table: catalog,
@@ -5684,6 +5687,415 @@ mod tests {
             .next()
             .expect("array member");
         assert!(first.is_same_object_as(&member));
+    }
+
+    #[test]
+    fn an_object_stream_is_marked_resolved_and_not_parsed_twice() {
+        let (bytes, stream_offset) = compressed_object_stream_fixture();
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([
+                (
+                    stream_ref,
+                    XrefEntry::Uncompressed {
+                        offset: stream_offset,
+                    },
+                ),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+
+        resolver
+            .get_object_handle(member_ref)
+            .try_dereference()
+            .expect("first object-stream resolution");
+        resolver
+            .resolve_object_stream(stream_ref.number)
+            .expect("the qpdf resolved-object-stream guard is idempotent");
+    }
+
+    #[test]
+    fn an_object_stream_propagates_a_decode_filter_error() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 << /Value 1 >>".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"UnknownFilter".to_vec()),
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        let error = resolver
+            .get_object_handle(member_ref)
+            .try_dereference()
+            .expect_err("an unsupported object-stream filter must propagate");
+        assert!(matches!(error, Error::Unsupported(message) if message.contains("UnknownFilter")));
+    }
+
+    #[test]
+    fn an_object_stream_skips_a_member_overridden_by_the_effective_xref() {
+        let (bytes, stream_offset) = compressed_object_stream_fixture();
+        let stream_ref = ObjectRef::new(4, 0);
+        let overridden_ref = ObjectRef::new(7, 0);
+        let array_ref = ObjectRef::new(8, 0);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([
+                (
+                    stream_ref,
+                    XrefEntry::Uncompressed {
+                        offset: stream_offset,
+                    },
+                ),
+                (overridden_ref, XrefEntry::Uncompressed { offset: 0 }),
+                (
+                    array_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 1,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+
+        resolver
+            .get_object_handle(array_ref)
+            .try_dereference()
+            .expect("the active ObjStm member must still resolve");
+        assert!(
+            !resolver.get_object_handle(overridden_ref).is_resolved(),
+            "an overridden member must not be populated from the object stream"
+        );
+    }
+
+    #[test]
+    fn an_object_stream_rejects_a_member_offset_out_of_range() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 << /Value 1 >>".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(999)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        let error = resolver
+            .get_object_handle(member_ref)
+            .try_dereference()
+            .expect_err("an out-of-range member offset must fail");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. } if message == "object stream member offset is out of range"
+        ));
+    }
+
+    #[test]
+    fn an_object_stream_propagates_a_member_parse_error() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 [ 2147483648 0 R ]".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        assert!(matches!(
+            resolver
+                .get_object_handle(member_ref)
+                .try_dereference()
+                .expect_err("an incomplete object-stream dictionary must fail"),
+            Error::Parse { .. }
+        ));
+    }
+
+    #[test]
+    fn an_object_stream_warning_sink_failure_propagates_parser_diagnostics() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 << /A#zB 1 >>".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        assert!(matches!(
+            resolver
+                .get_object_handle(member_ref)
+                .try_dereference()
+                .expect_err("diagnostic delivery failure must propagate"),
+            Error::System(message) if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
+    fn object_stream_integer_rejects_a_non_integer_metadata_value() {
+        let dictionary = ObjectHandle::dictionary(vec![(
+            b"N".to_vec(),
+            ObjectHandle::name(b"not-an-integer".to_vec()),
+        )]);
+        let error =
+            ResolverHandle::<Cursor<Vec<u8>>>::object_stream_integer(&dictionary, b"N", "/N")
+                .expect_err("object-stream metadata must be integer");
+        assert!(matches!(
+            error,
+            Error::Parse { message, .. } if message == "object stream /N is not an integer"
+        ));
+    }
+
+    #[test]
+    fn stream_recovery_without_a_terminator_treats_the_payload_as_empty() {
+        let resolver = resolver_over(b"payload without a framing token".to_vec());
+        assert_eq!(
+            resolver
+                .recover_stream_length(0)
+                .expect("recovery without a terminator"),
+            0
+        );
+        assert!(resolver.repair_diagnostics().entries().iter().any(
+            |entry| entry.message == "unable to recover stream data; treating stream as empty"
+        ));
+    }
+
+    #[test]
+    fn empty_stream_recovery_warning_sink_failure_propagates() {
+        let resolver =
+            resolver_over_with_failing_warning(b"payload without a framing token".to_vec(), 2);
+        assert!(matches!(
+            resolver
+                .recover_stream_length(0)
+                .expect_err("the empty-recovery warning must reach the sink"),
+            Error::System(message) if message == "sink write failure 2"
+        ));
+    }
+
+    #[test]
+    fn stream_failure_warning_ignores_non_parse_errors() {
+        let resolver = resolver_over(Vec::new());
+        resolver
+            .warn_stream_failure(&Error::Unsupported("not a parse failure".to_owned()), 7)
+            .expect("non-parse failures do not emit stream-recovery warnings");
+        assert!(resolver.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
+    fn trailing_object_warning_sink_failure_propagates() {
+        let resolver = resolver_over_with_failing_warning(b"1 0 obj\n42\nnot-endobj\n".to_vec(), 1);
+        assert!(matches!(
+            resolver
+                .read_object_at_offset(0, ObjectRef::new(1, 0))
+                .expect_err("a warning sink failure must propagate"),
+            Error::System(message) if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
+    fn compressed_member_missing_from_an_object_stream_resolves_to_null() {
+        let (bytes, stream_offset) = compressed_object_stream_fixture();
+        let stream_ref = ObjectRef::new(4, 0);
+        let missing_ref = ObjectRef::new(9, 0);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(bytes),
+            0,
+            BTreeMap::from([
+                (
+                    stream_ref,
+                    XrefEntry::Uncompressed {
+                        offset: stream_offset,
+                    },
+                ),
+                (
+                    missing_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+
+        let missing = resolver.get_object_handle(missing_ref);
+        missing
+            .try_dereference()
+            .expect("a missing compressed member resolves to null");
+        assert!(missing.is_resolved());
+        assert!(missing.is_null());
+    }
+
+    #[test]
+    fn a_free_xref_entry_resolves_to_null() {
+        let object_ref = ObjectRef::new(9, 0);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([(object_ref, XrefEntry::Free { next: 0 })]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+
+        let handle = resolver.get_object_handle(object_ref);
+        handle
+            .try_dereference()
+            .expect("a free xref entry resolves to null");
+        assert!(handle.is_resolved());
+        assert!(handle.is_null());
     }
 
     #[test]

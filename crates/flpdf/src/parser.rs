@@ -1491,6 +1491,31 @@ mod live_input_tests {
             vec![(0, "empty object treated as null")]
         );
     }
+
+    #[test]
+    fn handle_parser_preserves_empty_objects_and_wrapper_delegations() {
+        let mut resolver = NullResolver;
+        let (value, parsed_offset, diagnostics) =
+            super::parse_qpdf_direct_object_handle_with_diagnostics(
+                b" \nendobj\n",
+                0,
+                None,
+                &mut resolver,
+            )
+            .expect("empty handle object");
+        assert!(matches!(value, ObjectValue::Null));
+        assert_eq!(parsed_offset, super::NO_PARSED_OFFSET);
+        assert!(diagnostics.is_empty());
+
+        let mut rebasing = super::OffsetHandleResolver {
+            resolver: &mut resolver,
+            base_offset: 17,
+            top_level_offset: None,
+        };
+        let direct = HandleResolver::direct_handle(&mut rebasing, ObjectValue::Integer(42));
+        assert_eq!(direct.as_integer(), Some(42));
+        assert_eq!(HandleResolver::description_template(&rebasing), None);
+    }
 }
 
 /// Parse a single PDF object from `input`, which must contain nothing but
