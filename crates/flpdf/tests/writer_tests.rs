@@ -415,10 +415,10 @@ fn default_id_random_on_incremental_path_first_save_and_resave() {
     );
 }
 
-/// qpdf's incremental xref-stream dictionary and the ignored trailing classic
-/// trailer must carry the same selected `/ID`.  In particular, `static_id`
-/// must be visible through the xref stream that `startxref` names, not only
-/// through the trailing trailer dictionary.
+/// qpdf's incremental xref-stream dictionary must be reader-visible through
+/// the xref stream that `startxref` names, and stream-form updates must not
+/// append a second classic trailer.  In particular, `static_id` must be
+/// visible through the selected xref stream.
 #[test]
 fn incremental_xref_stream_static_id_is_reader_visible() {
     let source = fs::read("../../tests/fixtures/compat/three-page-objstm.pdf").unwrap();
@@ -429,7 +429,7 @@ fn incremental_xref_stream_static_id_is_reader_visible() {
         .get_ref("Root")
         .expect("fixture must contain a /Root");
 
-    let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
     let root = pdf.resolve(root_ref).unwrap();
     pdf.set_object(root_ref, root);
 
@@ -438,6 +438,10 @@ fn incremental_xref_stream_static_id_is_reader_visible() {
     let mut output = Vec::new();
     write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
 
+    assert!(
+        output.starts_with(&source),
+        "incremental output must preserve the complete original source prefix byte-for-byte"
+    );
     let loaded = load_xref_and_trailer(&mut Cursor::new(&output)).unwrap();
     let Object::Array(id) = loaded.trailer.get("ID").expect("output must contain /ID") else {
         panic!("output /ID must be an array");
