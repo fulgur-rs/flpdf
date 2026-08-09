@@ -197,7 +197,7 @@ fn bash_run_has_unsupported_syntax(run: &str) -> bool {
                 match character {
                     '\\' => escaped = true,
                     '\'' | '"' => quote = Some(character),
-                    ';' | '|' | '&' | '{' | '}' | '(' | ')' => return true,
+                    ';' | '|' | '&' | '{' | '}' | '(' | ')' | '`' => return true,
                     '<' if run[index..].starts_with("<(") => return true,
                     '>' if run[index..].starts_with(">(") => return true,
                     _ => {}
@@ -728,6 +728,13 @@ steps:
         !test_job_contains_test_command(&workflow, "cargo test --workspace")
             .expect("synthetic complete workflow must be valid")
     );
+}
+
+#[test]
+fn bash_safety_rejects_backtick_command_substitution() {
+    assert!(bash_run_has_unsupported_syntax(
+        "echo `cargo test --workspace`"
+    ));
 }
 
 #[test]
