@@ -76,11 +76,75 @@ fn run_exact_command_line_count(run: &str, command: &str) -> usize {
         .count()
 }
 
+fn shell_command_segments(line: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut characters = line.char_indices();
+
+    while let Some((index, character)) = characters.next() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+
+                match character {
+                    '\\' => escaped = true,
+                    '\'' | '"' => quote = Some(character),
+                    ';' => {
+                        segments.push(&line[start..index]);
+                        start = index + 1;
+                    }
+                    '&' if line[index..].starts_with("&&") => {
+                        segments.push(&line[start..index]);
+                        start = index + 2;
+                        characters.next();
+                    }
+                    '|' if line[index..].starts_with("||") => {
+                        segments.push(&line[start..index]);
+                        start = index + 2;
+                        characters.next();
+                    }
+                    _ => {}
+                }
+            }
+            Some(_) => unreachable!("shell quote must be single or double"),
+        }
+    }
+
+    segments.push(&line[start..]);
+    segments
+}
+
+fn is_plain_echo_output_segment(segment: &str) -> bool {
+    let segment = segment.trim();
+    segment.split_whitespace().next() == Some("echo")
+        && !segment.contains("$(")
+        && !segment.contains('`')
+}
+
 fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
     run.lines()
-        .map(str::trim)
-        .filter(|line| line.split_whitespace().next() != Some("echo"))
-        .map(|line| line.match_indices(command).count())
+        .flat_map(shell_command_segments)
+        .filter(|segment| !is_plain_echo_output_segment(segment))
+        .map(|segment| segment.match_indices(command).count())
         .sum()
 }
 
@@ -485,6 +549,24 @@ fn test_job_workspace_command_rejects_inline_semicolon_duplicate() {
 steps:
   - shell: bash
     run: cargo test --workspace; cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_echo_segment_duplicate() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: echo pre; cargo test --workspace
+  - shell: bash
+    run: cargo test --workspace
 ",
     );
 
