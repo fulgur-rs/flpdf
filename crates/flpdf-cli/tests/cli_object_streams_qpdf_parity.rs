@@ -406,7 +406,8 @@ fn uncovered_eligible_objects(path: &Path, xref: &[XrefRecord]) -> BTreeSet<u32>
          broaden the eligibility check before reusing it on encrypted inputs"
     );
     assert!(
-        pdf.linearized_hint_ref().ok().flatten().is_none(),
+        !pdf.is_linearized()
+            .expect("linearization detector must run"),
         "uncovered_eligible_objects assumes the fixture is not linearized; \
          broaden the eligibility check before reusing it on linearized inputs"
     );

@@ -58,9 +58,9 @@ pub struct CheckSummary {
 ///   diagnostic.
 /// - [`Error::System`] or [`Error::Internal`] when runtime or logic failures occur while
 ///   delivering warnings through the configured logger; these are propagated unchanged.
-/// - A failed linearization probe (resolving object `(1, 0)` via
-///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
-///   document is treated as non-linearized; the error is not propagated.
+/// - A failed linearization probe via [`Pdf::is_linearized`] is recorded as a
+///   warning [`Diagnostic`] and the document is treated as non-linearized; the
+///   error is not propagated.
 ///
 /// Other failures from the repair-enabled open path are turned into an error
 /// [`Diagnostic`] and returned inside an `Ok(CheckReport)`.
@@ -93,9 +93,9 @@ pub fn check_reader<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckR
 ///   `Ok(CheckReport)`.
 /// - When `options.repair` is clear, any error from [`Pdf::open_with_options`] is
 ///   propagated unchanged (e.g. [`Error::Io`], [`Error::Parse`], [`Error::Encrypted`]).
-/// - A failed linearization probe (resolving object `(1, 0)` via
-///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
-///   document is treated as non-linearized; the error is not propagated.
+/// - A failed linearization probe via [`Pdf::is_linearized`] is recorded as a
+///   warning [`Diagnostic`] and the document is treated as non-linearized; the
+///   error is not propagated.
 pub fn check_reader_with_options<R: Read + Seek + 'static>(
     reader: R,
     options: PdfOpenOptions,
@@ -149,9 +149,9 @@ pub fn check_reader_with_options_and_limits<R: Read + Seek + 'static>(
 /// - Propagates any error from [`Pdf::open_with_options`] unchanged, since the
 ///   recovery heuristics are disabled (e.g. [`Error::Io`], [`Error::Parse`],
 ///   [`Error::Encrypted`]).
-/// - A failed linearization probe (resolving object `(1, 0)` via
-///   [`Pdf::linearized_hint_ref`]) is recorded as a warning [`Diagnostic`] and the
-///   document is treated as non-linearized; the error is not propagated.
+/// - A failed linearization probe via [`Pdf::is_linearized`] is recorded as a
+///   warning [`Diagnostic`] and the document is treated as non-linearized; the
+///   error is not propagated.
 pub fn check_reader_strict<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckReport> {
     check_reader_inner(reader, false)
 }
@@ -215,7 +215,7 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     // The document already opened, so a failed linearization probe must not
     // sink the whole check. Downgrade the error to a warning and treat the file
     // as non-linearized rather than propagating a hard error.
-    let linearized = match is_linearized_pdf(&mut pdf) {
+    let linearized = match pdf.is_linearized() {
         Ok(value) => value,
         Err(error) => {
             diagnostics.push(Diagnostic::warning(
@@ -260,10 +260,6 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
         diagnostics,
         summary: Some(summary),
     })
-}
-
-fn is_linearized_pdf<R: Read + Seek>(reader: &mut Pdf<R>) -> crate::Result<bool> {
-    reader.linearized_hint_ref().map(|hint| hint.is_some())
 }
 
 /// The generalized filters flpdf fully decodes. A decode failure on a stream
@@ -556,43 +552,42 @@ mod tests {
         assert!(report.summary.is_none());
     }
 
-    /// A document whose object 1 has a malformed body. The file opens (its
-    /// `/Root` is object 2), but resolving object `(1, 0)` while probing for
-    /// linearization fails to parse — exercising the probe-error downgrade.
-    fn malformed_object1_pdf_bytes() -> Vec<u8> {
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.4\n");
-        let off1 = pdf.len();
-        pdf.extend_from_slice(b"1 0 obj\nthis is not a valid object\nendobj\n");
-        let off2 = pdf.len();
-        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
-        let off3 = pdf.len();
-        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
-        let off4 = pdf.len();
-        pdf.extend_from_slice(
-            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-        );
-        let xref_start = pdf.len();
-        pdf.extend_from_slice(
-            format!(
-                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
-            )
-            .as_bytes(),
-        );
-        pdf.extend_from_slice(
-            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
-                .as_bytes(),
-        );
-        pdf
+    /// Reader that remains usable while the document is opened, then fails
+    /// after the exact 1024-byte prefix read owned by `Pdf::is_linearized`.
+    struct FailingLinearizationPrefixReader {
+        inner: Cursor<Vec<u8>>,
+        fail_after_prefix: bool,
+    }
+
+    impl std::io::Read for FailingLinearizationPrefixReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_after_prefix {
+                return Err(std::io::Error::other("linearization prefix read failed"));
+            }
+            let read = self.inner.read(buffer)?;
+            if buffer.len() == 1024 {
+                self.fail_after_prefix = true;
+            }
+            Ok(read)
+        }
+    }
+
+    impl std::io::Seek for FailingLinearizationPrefixReader {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
     }
 
     #[test]
     fn linearization_probe_error_downgraded_to_warning() {
-        // The probe resolves object (1,0), whose body is malformed. The parse
-        // failure must be downgraded to a warning rather than propagating out of
-        // `check_reader` (the document already opened), so the caller still
-        // receives a report with `linearized = false`.
-        let report = check_reader_strict(Cursor::new(malformed_object1_pdf_bytes())).unwrap();
+        // A source-operation failure during the probe must be downgraded to a
+        // warning rather than propagating out of `check_reader`, so the caller
+        // still receives a report with `linearized = false`.
+        let report = check_reader_strict(FailingLinearizationPrefixReader {
+            inner: Cursor::new(minimal_pdf_bytes()),
+            fail_after_prefix: false,
+        })
+        .unwrap();
         let summary = report
             .summary
             .expect("summary present: the document opened");

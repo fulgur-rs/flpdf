@@ -93,7 +93,7 @@ use crate::parser::{
 use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
-use crate::tokenizer::{Token, Tokenizer};
+use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -339,6 +339,13 @@ impl<R: Read + Seek> ResolverCore<R> {
             .reader
             .stream_position()?
             .saturating_sub(self.header_offset as u64))
+    }
+
+    fn source_length(&mut self) -> Result<u64> {
+        let position = self.reader.stream_position()?;
+        let end = self.reader.seek(SeekFrom::End(0))?;
+        self.reader.seek(SeekFrom::Start(position))?;
+        Ok(end.saturating_sub(self.header_offset as u64))
     }
 
     /// Advance the input by `delta` bytes from wherever it currently is,
@@ -1601,6 +1608,83 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// See [`ResolverCore::read`].
     fn read(&self, buf: &mut [u8]) -> Result<usize> {
         self.core.borrow_mut().read(buf)
+    }
+
+    /// Locate qpdf's linearization candidate using the same two-stage input
+    /// shape as `QPDF::isLinearized` (`libqpdf/QPDF_linearization.cc:95-125`):
+    /// scan only the first 1024 bytes for a digit, then read real source
+    /// tokens from that position until the first `integer integer obj <<`
+    /// sequence is found.
+    pub(crate) fn linearization_candidate(&self) -> Result<Option<i64>> {
+        const PREFIX_LENGTH: usize = 1024;
+
+        self.seek(0)?;
+        let mut prefix = [0u8; PREFIX_LENGTH];
+        let read = self.read(&mut prefix)?;
+        let mut scan = 0;
+
+        while scan < read {
+            while scan < read && !prefix[scan].is_ascii_digit() {
+                scan += 1;
+            }
+            if scan == read {
+                break;
+            }
+
+            let candidate_start = scan;
+            while scan < read && prefix[scan].is_ascii_digit() {
+                scan += 1;
+            }
+
+            self.seek(candidate_start as u64)?;
+            let tokens = {
+                let mut input = self.live_input();
+                let mut tokenizer = LiveTokenSource::new(&mut input);
+                let result = (|| -> Result<Option<i64>> {
+                    let first = tokenizer.next_token()?;
+                    if !first.is_integer() {
+                        return Ok(None);
+                    }
+
+                    let second = tokenizer.next_token()?;
+                    if !second.is_integer() {
+                        return Ok(None);
+                    }
+
+                    let object = tokenizer.next_token()?;
+                    if !object.is_word_value(b"obj") {
+                        return Ok(None);
+                    }
+
+                    let dictionary = tokenizer.next_token()?;
+                    if dictionary.token_type != TokenType::DictOpen {
+                        return Ok(None);
+                    }
+
+                    Ok(std::str::from_utf8(&first.value)
+                        .ok()
+                        .and_then(|value| value.parse::<i64>().ok()))
+                })();
+                drop(tokenizer);
+                input.finish()?;
+                result
+            };
+
+            let Some(object_number) = tokens? else {
+                continue;
+            };
+            return Ok(Some(object_number));
+        }
+
+        Ok(None)
+    }
+
+    /// Return the qpdf-logical source length used by `/L` in
+    /// `QPDF::isLinearized` (`QPDF_linearization.cc:141-150`). Preserve the
+    /// caller's live position because the Rust resolver may be re-entered by
+    /// later lazy resolution.
+    pub(crate) fn source_length(&self) -> Result<u64> {
+        self.core.borrow_mut().source_length()
     }
 
     /// Append the next chunk of input to `bytes`, reporting whether anything

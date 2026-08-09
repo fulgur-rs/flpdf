@@ -1478,39 +1478,6 @@ impl<R: Read + Seek> Pdf<R> {
         refs
     }
 
-    /// Locate the linearization hint dictionary if this document is linearized
-    /// ("fast web view"). Returns `Ok(None)` for non-linearized documents.
-    ///
-    /// This resolves object `(1, 0)` and inspects its `/Linearized` entry.
-    ///
-    /// # Errors
-    ///
-    /// Propagates any error from [`Pdf::resolve_borrowed`] while resolving object
-    /// `(1, 0)` (for example [`Error::Io`] / [`Error::Parse`] / [`Error::Encrypted`]).
-    pub fn linearized_hint_ref(&mut self) -> Result<Option<ObjectRef>> {
-        let candidate = ObjectRef::new(1, 0);
-        let object = self.resolve_borrowed(candidate)?;
-        let Some(dict) = object.as_dict() else {
-            return Ok(None);
-        };
-
-        let Some(linearized) = dict.get("Linearized") else {
-            return Ok(None);
-        };
-
-        Ok(match linearized {
-            // QPDF::isLinearized accepts only a numeric /Linearized value
-            // whose floor is one (QPDF_linearization.cc:139-141).
-            Object::Integer(1) => Some(candidate),
-            Object::Real(value) | Object::RealLiteral { value, .. }
-                if value.is_finite() && value.floor() == 1.0 =>
-            {
-                Some(candidate)
-            }
-            _ => None,
-        })
-    }
-
     /// Returns the canonical [`ObjectHandle`] for `object_ref`, creating and
     /// registering an unresolved one on first request.
     ///
@@ -6584,51 +6551,6 @@ mod tests {
             .entries()
             .iter()
             .all(|entry| !entry.message.contains("expected endobj")));
-    }
-
-    /// Build a minimal PDF whose object `(1, 0)` is a linearization
-    /// parameter dictionary with the supplied `/Linearized` literal.
-    fn linearized_like_pdf_bytes_real_literal(linearized: &[u8]) -> Vec<u8> {
-        let mut pdf = Vec::new();
-        pdf.extend_from_slice(b"%PDF-1.4\n");
-        let off1 = pdf.len() as u64;
-        pdf.extend_from_slice(b"1 0 obj\n<< /Linearized ");
-        pdf.extend_from_slice(linearized);
-        pdf.extend_from_slice(b" >>\nendobj\n");
-        let off2 = pdf.len() as u64;
-        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Catalog /Pages 3 0 R >>\nendobj\n");
-        let off3 = pdf.len() as u64;
-        pdf.extend_from_slice(b"3 0 obj\n<< /Type /Pages /Kids [4 0 R] /Count 1 >>\nendobj\n");
-        let off4 = pdf.len() as u64;
-        pdf.extend_from_slice(
-            b"4 0 obj\n<< /Type /Page /Parent 3 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-        );
-        let xref_start = pdf.len() as u64;
-        let xref = format!(
-            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \n"
-        );
-        pdf.extend_from_slice(xref.as_bytes());
-        let trailer =
-            format!("trailer\n<< /Size 5 /Root 2 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
-        pdf.extend_from_slice(trailer.as_bytes());
-        pdf
-    }
-
-    /// qpdf accepts `/Linearized` only when its numeric floor is exactly
-    /// one. In particular, `.9` is not a linearization marker while `1.9`
-    /// is, even though both are parsed as [`Object::RealLiteral`].
-    #[test]
-    fn linearized_hint_ref_uses_qpdf_numeric_floor() {
-        let mut below_one = Pdf::open_mem_owned(linearized_like_pdf_bytes_real_literal(b".9"))
-            .expect("open .9 PDF");
-        assert_eq!(below_one.linearized_hint_ref().expect("check .9"), None);
-
-        let mut one_or_above = Pdf::open_mem_owned(linearized_like_pdf_bytes_real_literal(b"1.9"))
-            .expect("open 1.9 PDF");
-        assert_eq!(
-            one_or_above.linearized_hint_ref().expect("check 1.9"),
-            Some(ObjectRef::new(1, 0))
-        );
     }
 
     // ------------------------------------------------------------------
