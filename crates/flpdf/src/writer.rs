@@ -2739,10 +2739,12 @@ fn apply_encrypt_trailer_entries<R: Read + Seek>(
         } else if let Some(id) = generated_id {
             trailer.insert("ID", id.clone());
         } else {
+            // cov:ignore-start: ordinary/static full-rewrite callers precompute generated_id; deterministic and copy routes are handled above
             trailer.insert(
                 "ID",
                 generate_id_array(pdf.trailer().get("ID"), options.static_id),
             );
+            // cov:ignore-end
         }
     }
 }
@@ -3526,11 +3528,13 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             .and_then(Object::as_string)
             .map(<[u8]>::to_vec)
             .ok_or_else(|| {
+                // cov:ignore-start: generate_id_array always returns a valid two-string array here
                 crate::Error::Unsupported(
                     "full-rewrite: ordinary/static ID generator returned an invalid /ID array"
                         .to_string(),
                 )
-            })?;
+                // cov:ignore-end
+            })?; // cov:ignore: invalid ID guard is unreachable after generate_id_array
         let context =
             build_encryption_context(options, params, base_for_encrypt, metadata_ref, &id0);
         Some(context?)
@@ -4633,7 +4637,7 @@ mod tests {
         ]);
         let v = match generate_id_array(Some(&source), true) {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(
             v[0],
@@ -4647,7 +4651,7 @@ mod tests {
     fn generate_id_array_static_falls_back_when_id_is_missing() {
         let v = match generate_id_array(None, true) {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(v[0], Object::String(QPDF_STATIC_ID.to_vec()));
         assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
@@ -4662,7 +4666,7 @@ mod tests {
         let generated = generate_id_array(Some(&source), false);
         let values = match generated {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(values.len(), 2);
         assert_eq!(values[0], values[1]);
@@ -4679,7 +4683,7 @@ mod tests {
         let generated = generate_id_array(Some(&source), true);
         let values = match generated {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(
             values,
@@ -4699,7 +4703,7 @@ mod tests {
         let generated = generate_id_array(Some(&source), false);
         let values = match generated {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(values[0], Object::String(b"permanent".to_vec()));
         assert!(!str_bytes(&values[1]).is_empty());
@@ -4707,7 +4711,7 @@ mod tests {
         let static_generated = generate_id_array(Some(&source), true);
         let static_values = match static_generated {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(static_values[0], Object::String(b"permanent".to_vec()));
         assert_eq!(static_values[1], Object::String(QPDF_STATIC_ID.to_vec()));
@@ -4729,7 +4733,7 @@ mod tests {
         // saves still differ.
         let v = match generate_id_array(None, false) {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_eq!(v.len(), 2);
         let (e0, e1) = (str_bytes(&v[0]), str_bytes(&v[1]));
@@ -4764,7 +4768,7 @@ mod tests {
         // First save (no source /ID): both fresh.
         let first = match generate_id_array(None, false) {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         let v1 = first;
         let perm = v1[0].clone();
@@ -4774,7 +4778,7 @@ mod tests {
         let source = Object::Array(v1.clone());
         let v2 = match generate_id_array(Some(&source), false) {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
 
         assert_eq!(
@@ -4797,7 +4801,7 @@ mod tests {
         ]);
         let v = match generate_id_array(Some(&source), false) {
             Object::Array(values) => values,
-            other => panic!("expected generated /ID array, got {other:?}"),
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
         assert_ne!(
             v[0],
