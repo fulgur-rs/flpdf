@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `crates/flpdf/src/xref.rs:2633-2655`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add `bootstrap_context_rebases_reference_parse_errors_to_source_offsets` next to the existing `bootstrap_context_reports_reference_read_errors` test. Build a referenced object at a nonzero offset with a malformed direct-object token, resolve it through `XrefReadContext::resolve_reference`, and assert that the warning text and stored offset use the object’s source position plus the body-relative parser position:
 
@@ -58,7 +58,7 @@ Add `bootstrap_context_rebases_reference_parse_errors_to_source_offsets` next to
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p flpdf --lib bootstrap_context_rebases_reference_parse_errors_to_source_offsets`
 
@@ -70,15 +70,15 @@ Expected: FAIL because the current bootstrap path reports the tail-relative pars
 - Modify: `crates/flpdf/src/xref.rs:288-335`
 - Modify: `crates/flpdf/src/xref.rs:396-417`
 
-- [ ] **Step 1: Rebase parser errors at the source-tail boundary**
+- [x] **Step 1: Rebase parser errors at the source-tail boundary**
 
 In `read_file_object_for_reference`, convert the declared absolute offset once with `usize::try_from(...).unwrap_or(usize::MAX)`. Rebase errors from `parse_file_object_header` and `read_file_object` with the existing `Error::rebase_offset` primitive. Keep the explicit absolute offset for the object-ID-zero error, and make recovery header-mismatch errors carry the absolute object start rather than the synthetic zero offset.
 
-- [ ] **Step 2: Preserve exact rebased offsets in diagnostics**
+- [x] **Step 2: Preserve exact rebased offsets in diagnostics**
 
 In `resolve_reference`, calculate the warning offset from `Error::Parse { offset, .. }` after the reference-read boundary has rebased it. Keep `Some(start as u64)` for non-parse errors. Continue to suppress warnings deferred to reconstruction and return `Object::Null` on every read failure.
 
-- [ ] **Step 3: Run the focused regression**
+- [x] **Step 3: Run the focused regression**
 
 Run: `cargo test -p flpdf --lib bootstrap_context_rebases_reference_parse_errors_to_source_offsets`
 
@@ -89,19 +89,19 @@ Expected: PASS with the warning text and `Diagnostic::offset` both pointing at t
 **Files:**
 - No additional files.
 
-- [ ] **Step 1: Run the bootstrap unit tests**
+- [x] **Step 1: Run the bootstrap unit tests**
 
 Run: `cargo test -p flpdf --lib xref::tests::bootstrap_context`
 
 Expected: all bootstrap context tests pass, including zero-offset, beyond-EOF, successful resolution, indirect stream length, and cycle behavior.
 
-- [ ] **Step 2: Run xref integration tests**
+- [x] **Step 2: Run xref integration tests**
 
 Run: `cargo test -p flpdf --test xref_tests`
 
 Expected: all xref integration tests pass with zero failures.
 
-- [ ] **Step 3: Run formatting and lint gates**
+- [x] **Step 3: Run formatting and lint gates**
 
 Run: `cargo fmt --all -- --check`
 
@@ -111,13 +111,13 @@ Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 
 Expected: exit status 0 with no warnings.
 
-- [ ] **Step 4: Inspect the final diff and status**
+- [x] **Step 4: Inspect the final diff and status**
 
 Run: `git diff --check` and `git status --short`
 
 Expected: only the planned xref implementation, regression test, and this plan are changed; no generated or unrelated files are present.
 
-- [ ] **Step 5: Commit the implementation**
+- [x] **Step 5: Commit the implementation**
 
 Run:
 
