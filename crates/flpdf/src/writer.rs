@@ -1104,13 +1104,15 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
             object_count = object_count.max(xref_object_number as usize + 1);
             let xref_offset = write_incremental_xref_stream(
                 &mut bytes,
-                pdf.trailer(),
-                &selected_id,
-                &final_xref_offsets,
-                &root_ref,
-                xref_object_number,
-                object_count,
-                pdf.previous_xref_offset(),
+                IncrementalXrefStreamInput {
+                    trailer: pdf.trailer(),
+                    selected_id: &selected_id,
+                    source_offsets: &final_xref_offsets,
+                    root_ref: &root_ref,
+                    xref_object_number,
+                    object_count,
+                    previous_xref_offset: pdf.previous_xref_offset(),
+                },
             )?;
             bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
             xref_offset
@@ -1756,16 +1758,29 @@ fn write_incremental_xref(
     Ok(xref_offset)
 }
 
-fn write_incremental_xref_stream(
-    bytes: &mut Vec<u8>,
-    trailer: &Dictionary,
-    selected_id: &Object,
-    source_offsets: &BTreeMap<u32, (u16, XrefEntry)>,
-    root_ref: &ObjectRef,
+struct IncrementalXrefStreamInput<'a> {
+    trailer: &'a Dictionary,
+    selected_id: &'a Object,
+    source_offsets: &'a BTreeMap<u32, (u16, XrefEntry)>,
+    root_ref: &'a ObjectRef,
     xref_object_number: u32,
     object_count: usize,
     previous_xref_offset: u64,
+}
+
+fn write_incremental_xref_stream(
+    bytes: &mut Vec<u8>,
+    input: IncrementalXrefStreamInput<'_>,
 ) -> Result<usize> {
+    let IncrementalXrefStreamInput {
+        trailer,
+        selected_id,
+        source_offsets,
+        root_ref,
+        xref_object_number,
+        object_count,
+        previous_xref_offset,
+    } = input;
     let xref_offset = bytes.len();
     if source_offsets.contains_key(&xref_object_number) {
         return Err(crate::Error::Unsupported(format!(
@@ -5986,13 +6001,15 @@ mod tests {
         let mut bytes = Vec::new();
         write_incremental_xref_stream(
             &mut bytes,
-            &trailer,
-            &selected_id,
-            &source_offsets,
-            &root_ref,
-            /* xref_object_number */ 2,
-            /* object_count */ 3,
-            /* previous_xref_offset */ 0,
+            IncrementalXrefStreamInput {
+                trailer: &trailer,
+                selected_id: &selected_id,
+                source_offsets: &source_offsets,
+                root_ref: &root_ref,
+                xref_object_number: 2,
+                object_count: 3,
+                previous_xref_offset: 0,
+            },
         )
         .expect("write_incremental_xref_stream must succeed");
 
