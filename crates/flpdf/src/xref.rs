@@ -456,6 +456,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
 
     let mut registration = XrefRegistration::default();
+    let mut initial_parse_diagnostics = Diagnostics::default();
     let mut loaded = match parse_xref_from_start(
         bytes,
         xref_pos,
@@ -463,7 +464,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         &version,
         options,
         &mut registration,
-        None,
+        Some(&mut initial_parse_diagnostics),
         XrefReadContextSpec::ActiveSection,
     ) {
         Ok(loaded) => loaded,
@@ -477,6 +478,9 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                     error
                 }
             });
+            for diagnostic in initial_parse_diagnostics.entries() {
+                initial_diagnostics.push(diagnostic.clone());
+            }
             let mut recovered = recover_xref_from_linear_scan(
                 bytes,
                 version,
@@ -493,13 +497,14 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     };
     prepend_repair_diagnostics(&mut loaded.loaded.repair_diagnostics, initial_diagnostics);
 
+    let mut previous_parse_diagnostics = Diagnostics::default();
     if let Err(error) = merge_previous_xref_sections(
         bytes,
         &version,
         &mut loaded,
         options,
         &mut registration,
-        None,
+        Some(&mut previous_parse_diagnostics),
         XrefReadContextSpec::ActiveSection,
     ) {
         if allow_repair {
@@ -511,7 +516,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
                 trigger,
                 Some(&loaded.loaded.trailer),
                 options,
-                Diagnostics::default(),
+                previous_parse_diagnostics,
             )?;
             let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
             recovered.header_offset = header_offset;
@@ -579,6 +584,7 @@ fn parse_xref_from_start(
             &mut loaded,
             options,
             registration,
+            error_diagnostics_sink,
             context_spec,
         )?;
         for object_ref in deferred_free {
@@ -610,6 +616,7 @@ fn merge_xref_stream_from_classic_trailer(
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    mut error_diagnostics_sink: Option<&mut Diagnostics>,
     context_spec: XrefReadContextSpec<'_>,
 ) -> Result<()> {
     if loaded.loaded.trailer.get("XRefStm").is_none() {
@@ -627,35 +634,68 @@ fn merge_xref_stream_from_classic_trailer(
     let xref_stream_value = context.resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm");
     if let Some(error) = context.take_reconstruction_trigger() {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
+        if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+            for diagnostic in loaded.loaded.repair_diagnostics.entries() {
+                sink.push(diagnostic.clone());
+            }
+        }
         return Err(error);
     }
     let Some(xref_stream_offset) = xref_stream_value.and_then(|value| value.as_integer()) else {
         context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
+        if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+            for diagnostic in loaded.loaded.repair_diagnostics.entries() {
+                sink.push(diagnostic.clone());
+            }
+        }
         return Err(Error::parse(classic_xref_pos, "invalid /XRefStm"));
     };
     context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
-    let xref_stream_pos = usize::try_from(xref_stream_offset).map_err(|_| {
-        // qpdf passes the signed integer to InputSource::seek; a negative
-        // value therefore fails as an invalid seek rather than as malformed
-        // `/XRefStm` syntax.
-        Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("xref stream offset {xref_stream_offset} is before the file start"),
-        ))
-    })?;
+    let xref_stream_pos = match usize::try_from(xref_stream_offset) {
+        Ok(xref_stream_pos) => xref_stream_pos,
+        Err(_) => {
+            // qpdf passes the signed integer to InputSource::seek; a negative
+            // value therefore fails as an invalid seek rather than as malformed
+            // `/XRefStm` syntax.
+            let error = Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("xref stream offset {xref_stream_offset} is before the file start"),
+            ));
+            if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                for diagnostic in loaded.loaded.repair_diagnostics.entries() {
+                    sink.push(diagnostic.clone());
+                }
+            }
+            return Err(error);
+        }
+    };
 
     // The hybrid stream contributes entries and raw-object discovery state, but
     // its own trailer is not the current trailer and its `/Prev` is ignored.
-    let hybrid = parse_xref_stream(
+    let mut hybrid_error_diagnostics = Diagnostics::default();
+    let hybrid = match parse_xref_stream(
         bytes,
         xref_stream_pos,
         xref_stream_pos as u64,
         loaded.loaded.version.clone(),
         options,
         registration,
-        None,
+        Some(&mut hybrid_error_diagnostics),
         context_spec,
-    )?;
+    ) {
+        Ok(hybrid) => hybrid,
+        Err(error) => {
+            if let Some(sink) = error_diagnostics_sink.as_deref_mut() {
+                for diagnostic in loaded.loaded.repair_diagnostics.entries() {
+                    sink.push(diagnostic.clone());
+                }
+                for diagnostic in hybrid_error_diagnostics.entries() {
+                    sink.push(diagnostic.clone());
+                }
+            }
+            return Err(error);
+        }
+    };
     for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
     }
@@ -1713,9 +1753,8 @@ fn parse_xref_stream(
             let Some(error) = context.take_reconstruction_trigger() else {
                 return Ok(state);
             };
-            context.append_diagnostics_to(&mut repair_diagnostics);
             if let Some(sink) = error_diagnostics_sink {
-                for diagnostic in repair_diagnostics.entries() {
+                for diagnostic in state.loaded.repair_diagnostics.entries() {
                     sink.push(diagnostic.clone());
                 }
             }
@@ -2346,11 +2385,45 @@ mod tests {
                 ..XrefLoadOptions::default()
             },
             &mut registration,
+            None,
             XrefReadContextSpec::ActiveSection,
         )
         .expect_err("a hybrid /XRefStm header mismatch must trigger reconstruction");
 
         assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
+    }
+
+    #[test]
+    fn hybrid_xref_holder_diagnostics_survive_a_later_stream_failure() {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let bad_stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"3 0 obj\n<< /NotXRef true >>\nendobj\n");
+        let holder_offset = bytes.len() as u64;
+        bytes.extend_from_slice(format!("2 0 obj\n{bad_stream_offset}\n").as_bytes());
+        let xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 4\n");
+        bytes.extend_from_slice(b"0000000000 65535 f \n");
+        bytes.extend_from_slice(b"0000000000 00000 f \n");
+        bytes.extend_from_slice(format!("{holder_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(format!("{bad_stream_offset:010} 00000 n \n").as_bytes());
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 4 /XRefStm 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        let loaded = load_xref_and_trailer_with_repair(&mut Cursor::new(bytes), true)
+            .expect("linear recovery must retain the classic trailer after hybrid failure");
+
+        assert_eq!(
+            loaded
+                .repair_diagnostics
+                .entries()
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+                .count(),
+            1,
+            "the indirect /XRefStm holder warning must survive the failed hybrid parse"
+        );
     }
 
     #[test]
@@ -2983,10 +3056,15 @@ mod tests {
         .expect_err("a successful xref build with a mismatch must still request reconstruction");
 
         assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
-        assert!(diagnostics
-            .entries()
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+                .count(),
+            1,
+            "a successful build must forward bootstrap diagnostics exactly once"
+        );
 
         let mut registration_without_sink = XrefRegistration::default();
         registration_without_sink
