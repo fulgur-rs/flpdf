@@ -159,6 +159,10 @@ fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
 }
 
 fn bash_run_has_unsupported_syntax(run: &str) -> bool {
+    if run.contains("$(") || run.contains('`') {
+        return true;
+    }
+
     let mut quote = None;
     let mut escaped = false;
 
@@ -734,6 +738,13 @@ steps:
 fn bash_safety_rejects_backtick_command_substitution() {
     assert!(bash_run_has_unsupported_syntax(
         "echo `cargo test --workspace`"
+    ));
+}
+
+#[test]
+fn bash_safety_rejects_quoted_dollar_paren_command_substitution() {
+    assert!(bash_run_has_unsupported_syntax(
+        "echo \"$(printf '%s' ignored)\"\ncargo test --workspace"
     ));
 }
 
