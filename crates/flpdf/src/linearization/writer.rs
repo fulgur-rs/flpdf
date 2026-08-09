@@ -8404,12 +8404,13 @@ mod tests {
     /// `IV_NO_NEWLINE` / `IV_WITH_NEWLINE` were found by brute-forcing 16-byte
     /// IVs against this exact payload + key until one landed on each side of
     /// the boundary (`stream.data.last() == Some(&b'\n')`); they are not
-    /// otherwise meaningful values. This is the premise half of the fix's
-    /// proof — see [`hint_stream_length_is_stable_across_a_forced_iv_change`]
-    /// (this file) for why the length difference this test demonstrates does
-    /// NOT translate into a corrupted hint table, and
-    /// `append_hint_stream_object`'s own doc for the invariant that makes
-    /// that true.
+    /// otherwise meaningful values. This direct fixed-IV framing test covers
+    /// the local ciphertext/newline length difference. The end-to-end test
+    /// [`linearized_encrypted_outline_and_part8_shared_hint_tables_are_consistent_with_random_iv`]
+    /// below covers the resulting integration behavior by decoding the
+    /// encrypted hint stream and checking its Shared Objects and Outlines
+    /// offsets against the final linearized bytes. `append_hint_stream_object`'s
+    /// own doc describes the framing invariant that connects the two tests.
     #[test]
     fn identical_plaintext_different_iv_can_change_hint_stream_object_length() {
         use crate::writer::{EncryptionContext, WriteCipher};
@@ -8523,122 +8524,70 @@ mod tests {
         panic!("dump has no \"{needle}\" line:\n{dump}"); // cov:ignore: defensive — every dump this test module produces contains every field it queries; only guards a future show.rs field-name rename from failing silently.
     }
 
-    /// End-to-end proof (task item 5): a real linearized + AES-128-encrypted
-    /// document carrying BOTH an Outlines Hint Table entry and a Part-8
+    /// End-to-end proof: a real linearized + AES-128-encrypted document
+    /// carrying BOTH an Outlines Hint Table entry and a Part-8
     /// (`part4_other_pages_shared`) Shared Objects Hint Table entry — the two
     /// concrete tables the PR review named — has internally self-consistent
-    /// hint tables under the fix, run repeatedly with genuinely random
-    /// (non-`--static-aes-iv`) per-invocation IVs.
+    /// hint tables with a genuinely random (non-`--static-aes-iv`) IV.
     ///
-    /// For each run: decode the hint stream via
+    /// Decode the hint stream via
     /// [`crate::linearization::show_linearization_bytes`] (the same decoder
     /// that reconstructs qpdf's `adjusted_offset`, i.e. `stored_value +
     /// /H[1]`) and independently locate the REAL physical byte offset of the
-    /// referenced object by scanning the actually-shipped bytes — then assert
+    /// referenced objects by scanning the actually-shipped bytes — then assert
     /// they agree. `check_linearization_bytes` alone would not catch a
     /// regression here: per its own doc table it validates the linearization
     /// PARAMETER DICT (`/L /N /O /H /E /T`), not the hint stream's internal
     /// Page/Shared/Outline tables — this test's `show_linearization_bytes` +
-    /// manual offset reconstruction is the actual oracle for those (see task
-    /// item 6 in the commit/PR description for this gap in the checker).
+    /// manual offset reconstruction is the actual oracle for those.
     #[test]
-    fn linearized_encrypted_outline_and_part8_shared_hint_tables_stay_consistent_across_many_random_iv_runs(
-    ) {
+    fn linearized_encrypted_outline_and_part8_shared_hint_tables_are_consistent_with_random_iv() {
         let src = outlines_and_part8_shared_pdf_bytes();
-        let mut observed_hint_lengths: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
-        let mut observed_outputs: std::collections::BTreeSet<Vec<u8>> =
-            std::collections::BTreeSet::new();
+        let out = linearize_with(&src, |o| {
+            // Empty user password so `check_linearization_bytes` and
+            // `show_linearization_bytes` below (both open with no password)
+            // can decrypt transparently — the same convention
+            // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
+            // uses. `static_aes_iv` stays at its default `false`, so this
+            // case uses a genuinely random IV.
+            o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
 
-        // 3000 trials keeps the (informational, not asserted — see below)
-        // probability of never observing the newline-before-endstream
-        // boundary below 1e-5: each trial independently has a ~1/256 chance
-        // of the hint-stream ciphertext's last byte landing on `\n`, so
-        // P(never in N trials) = (255/256)^N ≈ e^(-N/256); N=3000 gives
-        // e^-11.7 ≈ 8e-6.
-        const TRIALS: usize = 3000;
-        for _ in 0..TRIALS {
-            let out = linearize_with(&src, |o| {
-                // Empty user password so `check_linearization_bytes` and
-                // `show_linearization_bytes` below (both open with no
-                // password) can decrypt transparently — the same convention
-                // `linearize_with_encrypt_body_strings_and_streams_are_ciphertext`
-                // uses. `static_aes_iv` stays at its default `false`: this
-                // test's whole point is genuinely random per-invocation IVs.
-                o.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                    Vec::new(),
-                    b"owner".to_vec(),
-                ));
-            });
+        crate::linearization::check_linearization_bytes(&out)
+            .expect("encrypted linearized output must pass the linearization checker");
+        assert_encrypted_body_strings_are_hex(&out);
 
-            crate::linearization::check_linearization_bytes(&out)
-                .expect("encrypted linearized output must pass the linearization checker");
-            assert_encrypted_body_strings_are_hex(&out);
+        let dump = crate::linearization::show_linearization_bytes(&out, "test")
+            .expect("hint stream must decode (decryption + bit-unpacking)");
 
-            let dump = crate::linearization::show_linearization_bytes(&out, "test")
-                .expect("hint stream must decode (decryption + bit-unpacking)");
-
-            // Shared Objects Hint Table: `first_shared_offset` (already
-            // adjusted_offset()-reconstructed by the dump) must equal the
-            // REAL physical offset of the renumbered first Part-8 object.
-            let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
-            let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
-            let real_shared_offset = find_object_offset(&out, first_shared_obj);
-            assert_eq!(
-                first_shared_offset, real_shared_offset,
-                "Shared Objects Hint Table's first_shared_offset must match the \
-                 real physical offset of object {first_shared_obj} (dump:\n{dump})"
-            );
-
-            // Outlines Hint Table: same check for `first_object_offset`.
-            assert!(
-                dump.contains("Outlines Hint Table"),
-                "test premise: fixture's /Outlines must produce an Outlines Hint \
-                 Table section (dump:\n{dump})"
-            );
-            let first_object = parse_dump_field(&dump, "first_object") as u32;
-            let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
-            let real_object_offset = find_object_offset(&out, first_object);
-            assert_eq!(
-                first_object_offset, real_object_offset,
-                "Outlines Hint Table's first_object_offset must match the real \
-                 physical offset of object {first_object} (dump:\n{dump})"
-            );
-
-            let h_length = parse_dump_field(&dump, "H_length") as usize;
-            observed_hint_lengths.insert(h_length);
-            observed_outputs.insert(out);
-        }
-
-        // Randomness sanity check: confirm the fix pins the IV only WITHIN
-        // one `write_linearized` call, not accidentally across every call —
-        // every one of these `TRIALS` invocations still draws its own fresh
-        // IV, so the shipped bytes vary from run to run. This assertion is
-        // effectively certain to hold regardless of the newline-before-
-        // endstream boundary: every OTHER encrypted string/stream in the
-        // fixture also draws its own fresh per-invocation IV, so the output
-        // bytes differ across runs even on trials where the hint stream's
-        // own length happens to match.
-        assert!(
-            observed_outputs.len() > 1,
-            "{TRIALS} independent encrypted runs produced byte-identical output \
-             — the per-invocation IV draw appears to have been hardcoded away"
+        // Shared Objects Hint Table: `first_shared_offset` (already
+        // adjusted_offset()-reconstructed by the dump) must equal the REAL
+        // physical offset of the renumbered first Part-8 object.
+        let first_shared_obj = parse_dump_field(&dump, "first_shared_obj") as u32;
+        let first_shared_offset = parse_dump_field(&dump, "first_shared_offset") as usize;
+        let real_shared_offset = find_object_offset(&out, first_shared_obj);
+        assert_eq!(
+            first_shared_offset, real_shared_offset,
+            "Shared Objects Hint Table's first_shared_offset must match the \
+             real physical offset of object {first_shared_obj} (dump:\n{dump})"
         );
-        // NOT asserted (deliberately): whether this run's `TRIALS` draws ever
-        // landed on the opposite side of the hint stream's newline-before-
-        // endstream boundary is a low-probability (~1/256 per trial) event.
-        // `TRIALS` is sized so missing it entirely is rare (≈8e-6), but "rare"
-        // is not "never" — turning this into a hard assertion would make the
-        // test flaky under CI's normal run-to-run variance. When it DOES
-        // fire, it is a second, independent confirmation (beyond the offset
-        // assertions above, which run unconditionally on every trial) that a
-        // real hint-stream length difference occurred and self-consistency
-        // still held for it.
-        eprintln!(
-            "observed {} distinct H_length value(s) across {TRIALS} trials \
-             (>1 means the newline-before-endstream boundary was hit and \
-             self-consistency held across it too)",
-            observed_hint_lengths.len()
+
+        // Outlines Hint Table: same check for `first_object_offset`.
+        assert!(
+            dump.contains("Outlines Hint Table"),
+            "test premise: fixture's /Outlines must produce an Outlines Hint \
+             Table section (dump:\n{dump})"
+        );
+        let first_object = parse_dump_field(&dump, "first_object") as u32;
+        let first_object_offset = parse_dump_field(&dump, "first_object_offset") as usize;
+        let real_object_offset = find_object_offset(&out, first_object);
+        assert_eq!(
+            first_object_offset, real_object_offset,
+            "Outlines Hint Table's first_object_offset must match the real \
+             physical offset of object {first_object} (dump:\n{dump})"
         );
     }
 
