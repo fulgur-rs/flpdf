@@ -1,10 +1,10 @@
 //! qpdf correspondence: QPDF.cc xref loading and repair.
 use crate::diagnostics::Diagnostic;
 use crate::object::collect_qpdf_object_references;
-use crate::parser::{parse_indirect_object_with_diagnostics, Parser};
+use crate::parser::Parser;
 use crate::reader::file_object::{
-    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, RecoveryPolicy,
-    ResolvedStreamLength,
+    finish_file_object, parse_file_object_syntax, FileObjectDiagnostic, FileObjectRead,
+    PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{filters, Diagnostics, Dictionary, Error, Object, ObjectRef, Result, XrefEntry};
@@ -95,6 +95,216 @@ pub(crate) struct XrefLoadOptions {
     /// qpdf `m->ignore_xref_streams` (`QPDF::setIgnoreXRefStreams`): never read
     /// a cross-reference stream.
     pub(crate) ignore_xref_streams: bool,
+}
+
+/// The owner that qpdf uses while an xref section is still being read.
+///
+/// This is deliberately separate from the post-bootstrap `ResolverCore`.
+/// qpdf's `read_xrefStream` can dereference `/Type`, `/Length`, and other
+/// dictionary values before the canonical document resolver exists. The
+/// three construction sites mirror the three qpdf call-order contexts:
+/// reconstruction's complete line-scan table, the current classic/hybrid
+/// section, and a section reached through `/Prev`.
+#[derive(Debug, Clone, Copy)]
+enum XrefReadContextSpec<'a> {
+    ActiveSection,
+    PreviousSection,
+    Reconstruction {
+        line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
+    },
+}
+
+/// A qpdf-shaped, read-time resolver for xref bootstrap objects.
+///
+/// The context owns its snapshot of the currently visible xref entries and
+/// its own cache/recursion guard. It never delegates to `Pdf::resolve` or the
+/// later canonical resolver, and it never uses an absent optional entry table
+/// to distinguish bootstrap phases.
+struct XrefReadContext<'a> {
+    bytes: &'a [u8],
+    entries: BTreeMap<ObjectRef, XrefEntry>,
+    options: XrefLoadOptions,
+    cache: BTreeMap<ObjectRef, Object>,
+    resolving: BTreeSet<ObjectRef>,
+    diagnostics: Diagnostics,
+}
+
+impl<'a> XrefReadContext<'a> {
+    fn new(
+        bytes: &'a [u8],
+        spec: XrefReadContextSpec<'_>,
+        registration: &XrefRegistration,
+        options: XrefLoadOptions,
+    ) -> Self {
+        let mut entries = match spec {
+            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => {
+                registration.snapshot()
+            }
+            XrefReadContextSpec::Reconstruction { line_scan_entries } => {
+                let mut entries = line_scan_entries.clone();
+                // qpdf's reconstruction table already contains the line-scan
+                // entries when candidate re-entry begins. Newly read stream
+                // entries are added only when the exact object-generation pair
+                // is not already present there.
+                for (&object_ref, &entry) in &registration.entries {
+                    entries.entry(object_ref).or_insert(entry);
+                }
+                entries
+            }
+        };
+        // Free rows are intentionally absent from `XrefRegistration::entries`;
+        // keeping only live rows here makes both free and genuinely missing
+        // references follow qpdf's resolve-to-null path.
+        entries.retain(|_, entry| !matches!(entry, XrefEntry::Free { .. }));
+
+        Self {
+            bytes,
+            entries,
+            options,
+            cache: BTreeMap::new(),
+            resolving: BTreeSet::new(),
+            diagnostics: Diagnostics::default(),
+        }
+    }
+
+    fn object_policy(&self) -> RecoveryPolicy {
+        if self.options.allow_repair {
+            RecoveryPolicy::Bounded
+        } else {
+            RecoveryPolicy::RequireEndstream
+        }
+    }
+
+    fn read_file_object(
+        &mut self,
+        input: &[u8],
+        absolute_offset: u64,
+        policy: RecoveryPolicy,
+    ) -> Result<FileObjectRead> {
+        let pending = parse_file_object_syntax(input)?;
+        let resolved_length = self.resolve_stream_length(&pending);
+        let completed = finish_file_object(input, pending, resolved_length, policy)?;
+        for diagnostic in &completed.diagnostics {
+            self.diagnostics.push(xref_file_object_diagnostic(
+                completed.object_ref,
+                absolute_offset,
+                diagnostic.clone(),
+            ));
+        }
+        Ok(completed)
+    }
+
+    fn resolve_stream_length(
+        &mut self,
+        pending: &PendingFileObject,
+    ) -> Option<ResolvedStreamLength> {
+        let object_ref = pending.indirect_length_ref()?;
+        let value = self.resolve_reference(object_ref);
+        Some(match value {
+            Object::Integer(value) => ResolvedStreamLength::Integer(value),
+            Object::Null => ResolvedStreamLength::Missing,
+            _ => ResolvedStreamLength::Invalid,
+        })
+    }
+
+    fn resolve_dictionary_value(&mut self, dictionary: &Dictionary, key: &str) -> Option<Object> {
+        dictionary.get(key).map(|value| self.resolve_value(value))
+    }
+
+    fn resolve_value(&mut self, value: &Object) -> Object {
+        match value {
+            Object::Reference(object_ref) => self.resolve_reference(*object_ref),
+            _ => value.clone(),
+        }
+    }
+
+    /// qpdf `QPDF::resolve`'s active-xref lookup, cache, cycle guard, and
+    /// resolve-to-null fallback (`QPDF.cc:1700-1753`). Errors from reading a
+    /// referenced object are warnings here, matching qpdf's catch-and-null
+    /// path; the caller then decides whether the resulting null is valid for
+    /// the dictionary key it is reading.
+    fn resolve_reference(&mut self, object_ref: ObjectRef) -> Object {
+        if let Some(value) = self.cache.get(&object_ref) {
+            return value.clone();
+        }
+
+        if !self.resolving.insert(object_ref) {
+            self.diagnostics.push(Diagnostic::warning(
+                format!(
+                    "loop detected resolving object {} {}",
+                    object_ref.number, object_ref.generation
+                ),
+                None,
+            ));
+            self.cache.insert(object_ref, Object::Null);
+            return Object::Null;
+        }
+
+        let value = match self.entries.get(&object_ref).copied() {
+            Some(XrefEntry::Uncompressed { offset }) => {
+                if offset == 0 {
+                    self.diagnostics
+                        .push(Diagnostic::warning("object has offset 0", Some(0)));
+                    return self.finish_resolution(object_ref, Object::Null);
+                }
+                let result = usize::try_from(offset)
+                    .ok()
+                    .and_then(|start| self.bytes.get(start..).map(|tail| (start, tail)));
+                match result {
+                    Some((start, tail)) => {
+                        match self.read_file_object(tail, offset, self.object_policy()) {
+                            Ok(mut completed) => {
+                                let _ = completed.remove_included_recovery_eol_for_decryption();
+                                self.resolve_value(&completed.object)
+                            }
+                            Err(error) => {
+                                self.diagnostics.push(Diagnostic::warning(
+                                    error.to_string(),
+                                    Some(start as u64),
+                                ));
+                                Object::Null
+                            }
+                        }
+                    }
+                    None => {
+                        self.diagnostics.push(Diagnostic::warning(
+                            format!(
+                                "object {} {} is beyond the end of the file",
+                                object_ref.number, object_ref.generation
+                            ),
+                            Some(offset),
+                        ));
+                        Object::Null
+                    }
+                }
+            }
+            Some(XrefEntry::Free { .. }) | None => Object::Null,
+            Some(XrefEntry::Compressed { .. }) => Object::Null,
+        };
+
+        // A nested resolution loop updates the same cache slot to null in
+        // qpdf (`QPDF.cc:1710-1711`). The outer read must not overwrite that
+        // cache entry with the object it was in the middle of parsing; the
+        // `isUnresolved` check in `readObjectAtOffset` observes the same state
+        // and leaves the null in place.
+        if let Some(cached) = self.cache.get(&object_ref).cloned() {
+            self.resolving.remove(&object_ref);
+            return cached;
+        }
+        self.finish_resolution(object_ref, value)
+    }
+
+    fn finish_resolution(&mut self, object_ref: ObjectRef, value: Object) -> Object {
+        self.resolving.remove(&object_ref);
+        self.cache.insert(object_ref, value.clone());
+        value
+    }
+
+    fn append_diagnostics_to(&self, diagnostics: &mut Diagnostics) {
+        for diagnostic in self.diagnostics.entries() {
+            diagnostics.push(diagnostic.clone());
+        }
+    }
 }
 
 /// Load the cross-reference table and trailer dictionary from `reader`, with
@@ -199,6 +409,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         options,
         &mut registration,
         None,
+        XrefReadContextSpec::ActiveSection,
     ) {
         Ok(loaded) => loaded,
         Err(error) if allow_repair => {
@@ -234,6 +445,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         options,
         &mut registration,
         None,
+        XrefReadContextSpec::ActiveSection,
     ) {
         if allow_repair {
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
@@ -265,6 +477,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     Ok(loaded)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_xref_from_start(
     bytes: &[u8],
     xref_pos: usize,
@@ -273,6 +486,7 @@ fn parse_xref_from_start(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     error_diagnostics_sink: Option<&mut Diagnostics>,
+    context_spec: XrefReadContextSpec<'_>,
 ) -> Result<LoadedXrefState> {
     if bytes
         .get(xref_pos..)
@@ -310,6 +524,7 @@ fn parse_xref_from_start(
             &mut loaded,
             options,
             registration,
+            context_spec,
         )?;
         for object_ref in deferred_free {
             registration.insert_free_xref_entry(object_ref);
@@ -326,6 +541,7 @@ fn parse_xref_from_start(
         options,
         registration,
         error_diagnostics_sink,
+        context_spec,
     )
 }
 
@@ -339,10 +555,11 @@ fn merge_xref_stream_from_classic_trailer(
     loaded: &mut LoadedXrefState,
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
+    context_spec: XrefReadContextSpec<'_>,
 ) -> Result<()> {
-    let Some(xref_stream_offset) = loaded.loaded.trailer.get("XRefStm") else {
+    if loaded.loaded.trailer.get("XRefStm").is_none() {
         return Ok(());
-    };
+    }
 
     // qpdf's ignore gate precedes both the integer check and read_xrefStream.
     // Do not rely on parse_xref_stream's internal gate: at this call site qpdf
@@ -351,9 +568,15 @@ fn merge_xref_stream_from_classic_trailer(
         return Ok(());
     }
 
-    let Some(xref_stream_offset) = xref_stream_offset.as_integer() else {
+    let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
+    let Some(xref_stream_offset) = context
+        .resolve_dictionary_value(&loaded.loaded.trailer, "XRefStm")
+        .and_then(|value| value.as_integer())
+    else {
+        context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
         return Err(Error::parse(classic_xref_pos, "invalid /XRefStm"));
     };
+    context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
     let xref_stream_pos = usize::try_from(xref_stream_offset).map_err(|_| {
         // qpdf passes the signed integer to InputSource::seek; a negative
         // value therefore fails as an invalid seek rather than as malformed
@@ -374,6 +597,7 @@ fn merge_xref_stream_from_classic_trailer(
         options,
         registration,
         None,
+        context_spec,
     )?;
     for diagnostic in hybrid.loaded.repair_diagnostics.entries() {
         loaded.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -408,9 +632,20 @@ fn merge_previous_xref_sections(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     mut error_diagnostics_sink: Option<&mut Diagnostics>,
+    context_spec: XrefReadContextSpec<'_>,
 ) -> Result<()> {
     let mut visited = HashSet::new();
-    let mut previous_offset = parse_previous_xref_offset(&loaded.loaded.trailer);
+    let mut section_context_spec = context_spec;
+    let (mut previous_offset, previous_diagnostics) = resolve_previous_xref_offset(
+        bytes,
+        options,
+        registration,
+        section_context_spec,
+        &loaded.loaded.trailer,
+    );
+    for diagnostic in previous_diagnostics.entries() {
+        loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+    }
 
     while let Some(offset) = previous_offset {
         let previous_pos = usize::try_from(offset)
@@ -428,6 +663,7 @@ fn merge_previous_xref_sections(
             options,
             registration,
             error_diagnostics_sink.as_deref_mut(),
+            section_context_spec,
         )?;
         for diagnostic in previous.loaded.repair_diagnostics.entries() {
             loaded.loaded.repair_diagnostics.push(diagnostic.clone());
@@ -448,7 +684,25 @@ fn merge_previous_xref_sections(
             }
         }
 
-        previous_offset = parse_previous_xref_offset(&previous.loaded.trailer);
+        section_context_spec = match section_context_spec {
+            XrefReadContextSpec::Reconstruction { line_scan_entries } => {
+                XrefReadContextSpec::Reconstruction { line_scan_entries }
+            }
+            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => {
+                XrefReadContextSpec::PreviousSection
+            }
+        };
+        let (next_previous_offset, previous_diagnostics) = resolve_previous_xref_offset(
+            bytes,
+            options,
+            registration,
+            section_context_spec,
+            &previous.loaded.trailer,
+        );
+        for diagnostic in previous_diagnostics.entries() {
+            loaded.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        previous_offset = next_previous_offset;
     }
 
     loaded.loaded.entries = registration.snapshot();
@@ -456,11 +710,20 @@ fn merge_previous_xref_sections(
     Ok(())
 }
 
-fn parse_previous_xref_offset(trailer: &Dictionary) -> Option<u64> {
-    trailer
-        .get("Prev")
-        .and_then(|offset| parse_non_negative_u64(offset, "/Prev").ok())
-        .filter(|&offset| offset != 0)
+fn resolve_previous_xref_offset(
+    bytes: &[u8],
+    options: XrefLoadOptions,
+    registration: &XrefRegistration,
+    context_spec: XrefReadContextSpec<'_>,
+    trailer: &Dictionary,
+) -> (Option<u64>, Diagnostics) {
+    let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
+    let offset = context
+        .resolve_dictionary_value(trailer, "Prev")
+        .and_then(|offset| parse_non_negative_u64(&offset, "/Prev").ok())
+        .filter(|&offset| offset != 0);
+    let diagnostics = context.diagnostics.clone();
+    (offset, diagnostics)
 }
 
 fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
@@ -710,7 +973,8 @@ fn recover_trailer_from_xref_stream_candidate(
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
 ) -> Result<(Dictionary, u64, XrefForm)> {
-    let (candidate, discovery_diagnostics) = find_xref_stream_trailer_candidate(bytes, entries);
+    let (candidate, discovery_diagnostics) =
+        find_xref_stream_trailer_candidate(bytes, entries, options);
     // qpdf's candidate search resolves every type-1 entry unconditionally
     // (`getObjectByObjGen(iter.first)` runs before the `isStreamOfType`
     // check, `QPDF.cc:585-589`), warning immediately as each is read, in
@@ -762,6 +1026,9 @@ fn recover_trailer_from_xref_stream_candidate(
         options,
         &mut reentry_registration,
         Some(&mut *repair_diagnostics),
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries: entries,
+        },
     ) {
         Ok(reentry) => reentry,
         Err(_) => {
@@ -790,6 +1057,9 @@ fn recover_trailer_from_xref_stream_candidate(
         options,
         &mut reentry_registration,
         Some(&mut previous_failure_diagnostics),
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries: entries,
+        },
     )
     .is_err()
     {
@@ -893,6 +1163,7 @@ struct XrefStreamCandidate {
 fn find_xref_stream_trailer_candidate(
     bytes: &[u8],
     entries: &BTreeMap<ObjectRef, XrefEntry>,
+    options: XrefLoadOptions,
 ) -> (Option<XrefStreamCandidate>, Diagnostics) {
     let mut offsets: Vec<u64> = entries
         .values()
@@ -906,6 +1177,16 @@ fn find_xref_stream_trailer_candidate(
     let mut max_offset = 0u64;
     let mut trailer: Option<Dictionary> = None;
     let mut discovery_diagnostics = Diagnostics::default();
+    let empty_registration = XrefRegistration::default();
+    let mut context = XrefReadContext::new(
+        bytes,
+        XrefReadContextSpec::Reconstruction {
+            line_scan_entries: entries,
+        },
+        &empty_registration,
+        options,
+    );
+    let mut emitted_diagnostics = 0usize;
     for entry in entries.values() {
         let XrefEntry::Uncompressed { offset } = *entry else {
             continue;
@@ -923,8 +1204,9 @@ fn find_xref_stream_trailer_candidate(
         // `QPDF.cc:1391`). `Bounded` mirrors that: a directly-resolvable but
         // mismatched `/Length` still falls through to stream-boundary
         // recovery here, instead of being rejected outright.
-        let parsed = match parse_indirect_object_with_diagnostics(
+        let parsed = match context.read_file_object(
             &bytes[start..window_end],
+            offset,
             RecoveryPolicy::Bounded,
         ) {
             Ok(parsed) => Some(parsed),
@@ -935,20 +1217,22 @@ fn find_xref_stream_trailer_candidate(
                 let wide_end = offsets
                     .get(wide_index)
                     .map_or(bytes.len(), |&next| next as usize);
-                parse_indirect_object_with_diagnostics(
-                    &bytes[start..wide_end],
-                    RecoveryPolicy::Bounded,
-                )
-                .ok()
+                context
+                    .read_file_object(&bytes[start..wide_end], offset, RecoveryPolicy::Bounded)
+                    .ok()
             }
             Err(_) => None,
         };
-        let Some((object_ref, object, diagnostics)) = parsed else {
+        append_new_context_diagnostics(
+            &context,
+            &mut discovery_diagnostics,
+            &mut emitted_diagnostics,
+        );
+        let Some(mut completed) = parsed else {
             continue;
         };
-        for diagnostic in diagnostics {
-            discovery_diagnostics.push(xref_file_object_diagnostic(object_ref, offset, diagnostic));
-        }
+        let _ = completed.remove_included_recovery_eol_for_decryption();
+        let object = completed.object;
         // qpdf's `getObjectByObjGen` (`QPDF.cc:585`) resolves the object
         // before `isStreamOfType` (`QPDF.cc:587`) is even checked, so a
         // non-stream object's own read warnings (e.g. "expected endobj",
@@ -957,9 +1241,19 @@ fn find_xref_stream_trailer_candidate(
         let Object::Stream(stream) = object else {
             continue;
         };
-        if !is_xref_stream_dict(&stream.dict) {
+        if !is_xref_stream_dict(&mut context, &stream.dict) {
+            append_new_context_diagnostics(
+                &context,
+                &mut discovery_diagnostics,
+                &mut emitted_diagnostics,
+            );
             continue;
         }
+        append_new_context_diagnostics(
+            &context,
+            &mut discovery_diagnostics,
+            &mut emitted_diagnostics,
+        );
         if offset > max_offset {
             max_offset = offset;
             if trailer.is_none() {
@@ -972,11 +1266,30 @@ fn find_xref_stream_trailer_candidate(
         trailer: dict,
         max_offset,
     });
+    append_new_context_diagnostics(
+        &context,
+        &mut discovery_diagnostics,
+        &mut emitted_diagnostics,
+    );
     (candidate, discovery_diagnostics)
 }
 
-fn is_xref_stream_dict(dict: &Dictionary) -> bool {
-    matches!(dict.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"XRef")
+fn append_new_context_diagnostics(
+    context: &XrefReadContext<'_>,
+    diagnostics: &mut Diagnostics,
+    emitted: &mut usize,
+) {
+    for diagnostic in context.diagnostics.entries().iter().skip(*emitted) {
+        diagnostics.push(diagnostic.clone());
+    }
+    *emitted = context.diagnostics.entries().len();
+}
+
+fn is_xref_stream_dict(context: &mut XrefReadContext<'_>, dict: &Dictionary) -> bool {
+    matches!(
+        context.resolve_dictionary_value(dict, "Type"),
+        Some(Object::Name(name)) if name.as_slice() == b"XRef"
+    )
 }
 
 /// Push the qpdf-compatible repair warning sequence onto `diagnostics`.
@@ -1174,6 +1487,7 @@ fn parse_xref_table(
     Ok((entries, trailer))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_xref_stream(
     bytes: &[u8],
     xref_pos: usize,
@@ -1182,6 +1496,7 @@ fn parse_xref_stream(
     options: XrefLoadOptions,
     registration: &mut XrefRegistration,
     error_diagnostics_sink: Option<&mut Diagnostics>,
+    context_spec: XrefReadContextSpec<'_>,
 ) -> Result<LoadedXrefState> {
     // qpdf's `read_xrefStream` wraps its whole body in
     // `if (!m->ignore_xref_streams)` and otherwise falls straight through to
@@ -1196,30 +1511,30 @@ fn parse_xref_stream(
         .get(xref_pos..)
         .filter(|slice| !slice.is_empty())
         .ok_or_else(|| Error::parse(xref_pos, "xref stream offset is beyond end of file"))?;
-    let pending = parse_file_object_syntax(tail).map_err(|err| err.rebase_offset(xref_pos))?;
-    let object_ref = pending.object_ref;
-    let unresolved_length = pending
-        .indirect_length_ref()
-        .map(|_| ResolvedStreamLength::Missing);
     let policy = if allow_repair {
         RecoveryPolicy::Bounded
     } else {
         RecoveryPolicy::RequireEndstream
     };
-    let mut completed = finish_file_object(tail, pending, unresolved_length, policy)
-        .map_err(|err| err.rebase_offset(xref_pos))?;
+    let mut context = XrefReadContext::new(bytes, context_spec, registration, options);
+    let mut repair_diagnostics = Diagnostics::default();
+    let mut completed = match context.read_file_object(tail, xref_pos as u64, policy) {
+        Ok(completed) => completed,
+        Err(error) => {
+            context.append_diagnostics_to(&mut repair_diagnostics);
+            if let Some(sink) = error_diagnostics_sink {
+                for diagnostic in repair_diagnostics.entries() {
+                    sink.push(diagnostic.clone());
+                }
+            }
+            return Err(error.rebase_offset(xref_pos));
+        }
+    };
     // Xref streams are not encrypted, but filter decoding still requires the
     // logical payload rather than qpdf's raw recovery EOL.
     let _recovered_eol = completed.remove_included_recovery_eol_for_decryption();
+    let object_ref = completed.object_ref;
     let object = completed.object;
-    let mut repair_diagnostics = Diagnostics::default();
-    for diagnostic in completed.diagnostics {
-        repair_diagnostics.push(xref_file_object_diagnostic(
-            object_ref,
-            xref_pos as u64,
-            diagnostic,
-        ));
-    }
     // qpdf's own read of this object (`readObjectAtOffset`, `QPDF.cc:956`)
     // happens before `processXRefStream` validates `/Type`, `/W`, `/Index`,
     // `/Size`, or the entry data (`QPDF.cc:960-1128`); any repair warning
@@ -1233,8 +1548,7 @@ fn parse_xref_stream(
     // function's own `Err` propagates -- mirroring that same qpdf ordering
     // without changing what any `error_diagnostics_sink: None` caller
     // observes (the sink is write-only, and only on this closure's `Err`).
-    let repair_diagnostics_for_result = repair_diagnostics.clone();
-    let build = move || -> Result<LoadedXrefState> {
+    let build = || -> Result<LoadedXrefState> {
         let stream = match &object {
             Object::Stream(stream) => stream,
             _ => return Err(Error::parse(xref_pos, "xref not found")),
@@ -1243,24 +1557,21 @@ fn parse_xref_stream(
         // `isStreamOfType("/XRef")` succeeds. The shared parser owns this
         // check for both direct startxref streams and classic-trailer
         // `/XRefStm` targets.
-        if !matches!(
-            stream.dict.get("Type"),
-            Some(Object::Name(type_name)) if type_name.as_slice() == b"XRef"
-        ) {
+        if !is_xref_stream_dict(&mut context, &stream.dict) {
             return Err(Error::parse(xref_pos, "xref not found"));
         }
 
         let trailer = stream.dict.clone();
         let size = parse_non_negative_u64(
-            trailer
-                .get("Size")
+            &context
+                .resolve_dictionary_value(&trailer, "Size")
                 .ok_or(Error::Missing("XRef stream /Size"))?,
             "/Size",
         )?;
         let size = u32::try_from(size).map_err(|_| Error::parse(0, "/Size does not fit u32"))?;
 
-        let widths = parse_xref_widths(&trailer)?;
-        let index = parse_xref_index(&trailer, size)?;
+        let widths = parse_xref_widths(&mut context, &trailer)?;
+        let index = parse_xref_index(&mut context, &trailer, size)?;
         let ranges = build_xref_ranges(index)?;
         let stream_data = filters::decode_stream_data(&stream.dict, &stream.data)?;
         let mut cursor = ByteCursor::new(&stream_data, 0);
@@ -1276,7 +1587,8 @@ fn parse_xref_stream(
             }
         }
         let trailer_references = collect_trailer_references(&trailer);
-        let parsed_xref_streams = BTreeMap::from([(object_ref, object)]);
+        context.append_diagnostics_to(&mut repair_diagnostics);
+        let parsed_xref_streams = BTreeMap::from([(object_ref, object.clone())]);
 
         Ok(LoadedXrefState {
             loaded: LoadedXref {
@@ -1285,7 +1597,7 @@ fn parse_xref_stream(
                 entries: registration.snapshot(),
                 trailer,
                 last_xref_form: XrefForm::Stream,
-                repair_diagnostics: repair_diagnostics_for_result,
+                repair_diagnostics: repair_diagnostics.clone(),
             },
             trailer_references,
             parsed_xref_streams,
@@ -1297,6 +1609,7 @@ fn parse_xref_stream(
     match build() {
         Ok(state) => Ok(state),
         Err(error) => {
+            context.append_diagnostics_to(&mut repair_diagnostics);
             if let Some(sink) = error_diagnostics_sink {
                 for diagnostic in repair_diagnostics.entries() {
                     sink.push(diagnostic.clone());
@@ -1326,11 +1639,20 @@ fn xref_file_object_diagnostic(
 
 type XrefWidths = (usize, usize, usize);
 
-fn parse_xref_widths(trailer: &Dictionary) -> Result<XrefWidths> {
-    let Object::Array(values) = trailer.get("W").ok_or(Error::Missing("XRef stream /W"))? else {
+fn parse_xref_widths(
+    context: &mut XrefReadContext<'_>,
+    trailer: &Dictionary,
+) -> Result<XrefWidths> {
+    let value = context
+        .resolve_dictionary_value(trailer, "W")
+        .ok_or(Error::Missing("XRef stream /W"))?;
+    let Object::Array(values) = value else {
         return Err(Error::parse(0, "/W must be array"));
     };
-
+    let values = values
+        .iter()
+        .map(|value| context.resolve_value(value))
+        .collect::<Vec<_>>();
     if values.len() != 3 {
         return Err(Error::parse(0, "/W must contain three integers"));
     }
@@ -1342,30 +1664,39 @@ fn parse_xref_widths(trailer: &Dictionary) -> Result<XrefWidths> {
     Ok((w0, w1, w2))
 }
 
-fn parse_xref_index(trailer: &Dictionary, size: u32) -> Result<Vec<u32>> {
-    match trailer.get("Index") {
-        None => Ok(vec![0, size]),
-        Some(Object::Array(values)) => {
-            if values.len() % 2 != 0 {
-                return Err(Error::parse(
-                    0,
-                    "/Index must contain an even number of integers",
-                ));
-            }
-
-            let mut index = Vec::with_capacity(values.len());
-            for value in values {
-                let integer = parse_non_negative_u64(value, "/Index")?;
-                index.push(
-                    integer
-                        .try_into()
-                        .map_err(|_| Error::parse(0, "xref /Index value must fit u32"))?,
-                );
-            }
-            Ok(index)
+fn parse_xref_index(
+    context: &mut XrefReadContext<'_>,
+    trailer: &Dictionary,
+    size: u32,
+) -> Result<Vec<u32>> {
+    let Some(value) = context.resolve_dictionary_value(trailer, "Index") else {
+        return Ok(vec![0, size]);
+    };
+    let Object::Array(values) = value else {
+        if matches!(value, Object::Null) {
+            return Ok(vec![0, size]);
         }
-        _ => Err(Error::parse(0, "/Index must be array")),
+        return Err(Error::parse(0, "/Index must be array"));
+    };
+
+    if values.len() % 2 != 0 {
+        return Err(Error::parse(
+            0,
+            "/Index must contain an even number of integers",
+        ));
     }
+
+    let mut index = Vec::with_capacity(values.len());
+    for value in values {
+        let value = context.resolve_value(&value);
+        let integer = parse_non_negative_u64(&value, "/Index")?;
+        index.push(
+            integer
+                .try_into()
+                .map_err(|_| Error::parse(0, "xref /Index value must fit u32"))?,
+        );
+    }
+    Ok(index)
 }
 
 fn build_xref_ranges(index: Vec<u32>) -> Result<Vec<(u32, u32)>> {
@@ -1658,11 +1989,98 @@ mod tests {
         append_xref_size_warning, find_xref_stream_trailer_candidate,
         load_xref_and_trailer_with_repair, load_xref_state_with_options,
         prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate, LoadedXref,
-        XrefForm, XrefLoadOptions, XrefRegistration,
+        XrefForm, XrefLoadOptions, XrefReadContext, XrefReadContextSpec, XrefRegistration,
     };
     use crate::{Diagnostic, Diagnostics, Dictionary, Object, ObjectRef, XrefEntry};
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
+
+    #[test]
+    fn bootstrap_context_resolves_missing_and_free_references_to_null() {
+        let missing = ObjectRef::new(9, 0);
+        let freed = ObjectRef::new(10, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_free_xref_entry(freed);
+        let mut context = XrefReadContext::new(
+            &[],
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(missing), Object::Null);
+        assert_eq!(context.resolve_reference(freed), Object::Null);
+        assert!(context.diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_context_resolves_generic_indirect_dictionary_values() {
+        let size_offset = 2u64;
+        let widths_offset = size_offset + b"6 0 obj\n12\nendobj\n".len() as u64;
+        let bytes = b"  \n6 0 obj\n12\nendobj\n7 0 obj\n[1 2 3]\nendobj\n";
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(6, 0),
+            XrefEntry::Uncompressed {
+                offset: size_offset,
+            },
+        );
+        registration.insert_xref_entry(
+            ObjectRef::new(7, 0),
+            XrefEntry::Uncompressed {
+                offset: widths_offset,
+            },
+        );
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Size", Object::Reference(ObjectRef::new(6, 0)));
+        dictionary.insert("W", Object::Reference(ObjectRef::new(7, 0)));
+
+        assert_eq!(
+            context.resolve_dictionary_value(&dictionary, "Size"),
+            Some(Object::Integer(12))
+        );
+        assert_eq!(
+            context.resolve_dictionary_value(&dictionary, "W"),
+            Some(Object::Array(vec![
+                Object::Integer(1),
+                Object::Integer(2),
+                Object::Integer(3),
+            ]))
+        );
+    }
+
+    #[test]
+    fn bootstrap_context_resolves_a_cyclic_stream_length_to_null() {
+        let object = b"1 0 obj\n<< /Length 1 0 R >>\nstream\nabc\nendstream\nendobj\n";
+        let object_ref = ObjectRef::new(1, 0);
+        let mut registration = XrefRegistration::default();
+        // The object is deliberately recorded at a non-zero offset in the
+        // table snapshot; the source slice is prefixed to make that offset
+        // valid while keeping the fixture readable.
+        let bytes = [b' '; 1]
+            .into_iter()
+            .chain(object.iter().copied())
+            .collect::<Vec<_>>();
+        registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 1 });
+        let mut context = XrefReadContext::new(
+            &bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(object_ref), Object::Null);
+        assert_eq!(
+            context.diagnostics.entries()[0].message,
+            "loop detected resolving object 1 0"
+        );
+    }
 
     #[test]
     fn xref_registration_preserves_exact_generations_and_live_precedence() {
@@ -2608,7 +3026,8 @@ mod tests {
             },
         );
 
-        let (candidate, _diagnostics) = find_xref_stream_trailer_candidate(&bytes, &entries);
+        let (candidate, _diagnostics) =
+            find_xref_stream_trailer_candidate(&bytes, &entries, XrefLoadOptions::default());
         let candidate = candidate
             .expect("the unbounded retry still finds the candidate past its truncated window");
         assert_eq!(candidate.max_offset, candidate_offset);
@@ -2661,7 +3080,8 @@ mod tests {
             },
         );
 
-        let (candidate, _diagnostics) = find_xref_stream_trailer_candidate(&bytes, &entries);
+        let (candidate, _diagnostics) =
+            find_xref_stream_trailer_candidate(&bytes, &entries, XrefLoadOptions::default());
         let candidate = candidate.expect(
             "64 unrelated entries needing their own fallback must not deny \
              candidate 200's fallback, visited last in ascending object-number order",
@@ -3086,7 +3506,8 @@ mod tests {
             },
         );
 
-        let (candidate, _diagnostics) = find_xref_stream_trailer_candidate(&bytes, &entries);
+        let (candidate, _diagnostics) =
+            find_xref_stream_trailer_candidate(&bytes, &entries, XrefLoadOptions::default());
         let candidate =
             candidate.expect("the lone Uncompressed entry is still found as a candidate");
         assert_eq!(candidate.max_offset, candidate_offset);
@@ -3128,7 +3549,7 @@ mod tests {
         );
 
         let (candidate, discovery_diagnostics) =
-            find_xref_stream_trailer_candidate(&bytes, &entries);
+            find_xref_stream_trailer_candidate(&bytes, &entries, XrefLoadOptions::default());
         candidate.expect("object 2 is still found as the /Type /XRef candidate");
         assert!(
             discovery_diagnostics

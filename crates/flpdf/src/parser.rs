@@ -1513,6 +1513,7 @@ pub(crate) fn parse_indirect_object(
 /// emits these warnings as soon as the object is read (`readStream`,
 /// `QPDF.cc:1350-1393`), so a caller that discovers a candidate through this
 /// path needs them even if it later abandons the object.
+#[cfg(test)]
 pub(crate) fn parse_indirect_object_with_diagnostics(
     input: &[u8],
     policy: crate::reader::file_object::RecoveryPolicy,

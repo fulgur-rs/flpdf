@@ -110,6 +110,112 @@ fn loads_xref_stream_and_trailer() {
 }
 
 #[test]
+fn hybrid_xref_stream_resolves_indirect_type_from_active_classic_table() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_header = format!(
+        "2 0 obj\n<< /Type 5 0 R /Size 6 /Root 1 0 R /W [1 4 2] /Index [0 6] /Length {} >>\nstream\n",
+        6 * 7
+    );
+    let xref_stream_suffix = b"\nendstream\nendobj\n";
+    let type_target_offset = xref_stream_offset
+        + xref_stream_header.len() as u64
+        + (6 * 7) as u64
+        + xref_stream_suffix.len() as u64;
+    let xref_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (1, type_target_offset, 0),
+    ]);
+    bytes.extend_from_slice(xref_stream_header.as_bytes());
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(xref_stream_suffix);
+
+    assert_eq!(bytes.len() as u64, type_target_offset);
+    bytes.extend_from_slice(b"5 0 obj\n/XRef\nendobj\n");
+
+    let classic_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 6\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(format!("{type_target_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{classic_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("hybrid xref stream should resolve indirect /Type");
+    assert_eq!(loaded.last_xref_form, XrefForm::Table);
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: xref_stream_offset
+        })
+    );
+}
+
+#[test]
+fn hybrid_xref_stream_resolves_indirect_length_from_active_classic_table() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let xref_stream_header =
+        "2 0 obj\n<< /Type /XRef /Size 6 /Root 1 0 R /W [1 4 2] /Index [0 6] /Length 5 0 R >>\nstream\n"
+            .to_string();
+    let xref_stream_suffix = b"\nendstream\nendobj\n";
+    let length_target_offset = xref_stream_offset
+        + xref_stream_header.len() as u64
+        + (6 * 7) as u64
+        + xref_stream_suffix.len() as u64;
+    let xref_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+        (1, length_target_offset, 0),
+    ]);
+    bytes.extend_from_slice(xref_stream_header.as_bytes());
+    bytes.extend_from_slice(&xref_entries);
+    bytes.extend_from_slice(xref_stream_suffix);
+    assert_eq!(bytes.len() as u64, length_target_offset);
+    bytes.extend_from_slice(b"5 0 obj\n42\nendobj\n");
+
+    let classic_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 6\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(b"0000000000 00000 f \n");
+    bytes.extend_from_slice(format!("{length_target_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 6 /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{classic_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("hybrid xref stream should resolve indirect /Length");
+    assert!(loaded.repair_diagnostics.entries().is_empty());
+}
+
+#[test]
 fn xref_stream_direct_length_accepts_payload_adjacent_endstream_without_diagnostics() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let xref_offset = bytes.len();
@@ -373,6 +479,50 @@ fn previous_xref_sections_retain_distinct_generations() {
         loaded.entries.get(&ObjectRef::new(1, 0)),
         Some(XrefEntry::Uncompressed { .. })
     ));
+}
+
+#[test]
+fn previous_xref_section_offset_resolves_through_active_table() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let previous_object_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"2 0 obj\n<< /Marker /Previous >>\nendobj\n");
+
+    let previous_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 3\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{previous_object_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{previous_xref_offset}\n%%EOF\n")
+            .as_bytes(),
+    );
+
+    let latest_xref_offset = bytes.len() as u64;
+    let object9_offset = latest_xref_offset;
+    bytes.extend_from_slice(format!("9 0 obj\n{previous_xref_offset}\nendobj\n").as_bytes());
+    let latest_xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 2\n");
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(b"9 1\n");
+    bytes.extend_from_slice(format!("{object9_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 10 /Root 1 0 R /Prev 9 0 R >>\nstartxref\n{latest_xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer(&mut Cursor::new(bytes))
+        .expect("indirect /Prev should resolve through the latest xref table");
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(2, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: previous_object_offset
+        })
+    );
 }
 
 #[test]
@@ -965,6 +1115,41 @@ fn best_effort_accepts_recovered_trailer_without_objects() {
             "expected integer",
             "Attempting to reconstruct cross-reference table",
         ]
+    );
+}
+
+#[test]
+fn best_effort_candidate_discovery_resolves_indirect_xref_type() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let candidate_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[(0, 0, 0), (1, candidate_offset, 0)]);
+    let candidate_header = format!(
+        "1 0 obj\n<< /Type 5 0 R /Size 2 /Root 1 0 R /W [1 1 1] /Index [0 2] /Length {} >>\nstream\n",
+        entries.len()
+    );
+    let candidate_suffix = b"\nendstream\nendobj\n";
+    let target_offset = candidate_offset
+        + candidate_header.len() as u64
+        + entries.len() as u64
+        + candidate_suffix.len() as u64;
+    bytes.extend_from_slice(candidate_header.as_bytes());
+    bytes.extend_from_slice(&entries);
+    bytes.extend_from_slice(candidate_suffix);
+    assert_eq!(bytes.len() as u64, target_offset);
+    bytes.extend_from_slice(b"5 0 obj\n/XRef\nendobj\n");
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("reconstruction should discover an xref stream through indirect /Type");
+    assert_eq!(
+        loaded.trailer.get("Type"),
+        Some(&Object::Reference(ObjectRef::new(5, 0)))
+    );
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: candidate_offset
+        })
     );
 }
 
