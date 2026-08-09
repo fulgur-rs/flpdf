@@ -153,12 +153,21 @@ impl PlainWritePlan {
             &placement.removed_refs,
         )?; // cov:ignore: remap failure requires a malformed trailer rejected before plain planning
         dictionary.insert("Root", Object::Reference(root));
+        let generated_id = if options.deterministic_id || options.copy_encryption.is_some() {
+            None
+        } else {
+            Some(crate::writer::generate_id_array(
+                pdf.trailer().get("ID"),
+                options.static_id,
+            ))
+        };
         crate::writer::apply_encrypt_trailer_entries(
             &mut dictionary,
             pdf,
             options,
             None,
             options.deterministic_id,
+            generated_id.as_ref(),
         );
         let id = if options.deterministic_id {
             IdPlan::Deterministic {

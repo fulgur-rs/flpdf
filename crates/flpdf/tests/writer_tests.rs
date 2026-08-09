@@ -415,6 +415,63 @@ fn default_id_random_on_incremental_path_first_save_and_resave() {
     );
 }
 
+/// qpdf's incremental xref-stream dictionary must be reader-visible through
+/// the xref stream that `startxref` names, and stream-form updates must not
+/// append a second classic trailer.  In particular, `static_id` must be
+/// visible through the selected xref stream.
+#[test]
+fn incremental_xref_stream_static_id_is_reader_visible() {
+    let source = fs::read("../../tests/fixtures/compat/three-page-objstm.pdf").unwrap();
+    let source_trailer = load_xref_and_trailer(&mut Cursor::new(&source))
+        .unwrap()
+        .trailer;
+    let root_ref = source_trailer
+        .get_ref("Root")
+        .expect("fixture must contain a /Root");
+
+    let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
+    let root = pdf.resolve(root_ref).unwrap();
+    pdf.set_object(root_ref, root);
+
+    let mut options = WriteOptions::default();
+    options.static_id = true;
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+
+    assert!(
+        output.starts_with(&source),
+        "incremental output must preserve the complete original source prefix byte-for-byte"
+    );
+    let loaded = load_xref_and_trailer(&mut Cursor::new(&output)).unwrap();
+    let Object::Array(id) = loaded.trailer.get("ID").expect("output must contain /ID") else {
+        panic!("output /ID must be an array");
+    };
+    assert_eq!(id.len(), 2, "output /ID must have two elements");
+    let pi: [u8; 16] = [
+        0x31, 0x41, 0x59, 0x26, 0x53, 0x58, 0x97, 0x93, 0x23, 0x84, 0x62, 0x64, 0x33, 0x83, 0x27,
+        0x95,
+    ];
+    assert_eq!(
+        id[1],
+        Object::String(pi.to_vec()),
+        "reader-visible xref-stream /ID[1] must use the selected static ID"
+    );
+    assert_eq!(
+        id[0],
+        source_trailer
+            .get("ID")
+            .and_then(|value| match value {
+                Object::Array(values) if values.len() == 2 => values.first().cloned(),
+                _ => None,
+            })
+            .expect("fixture must contain a two-element /ID"),
+        "incremental write must preserve the source permanent identifier"
+    );
+    assert!(!output
+        .windows(b"\ntrailer\n".len())
+        .any(|w| w == b"\ntrailer\n"));
+}
+
 #[test]
 fn write_pdf_preserves_source_bytes() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -891,7 +948,7 @@ fn write_pdf_omits_unmapped_compressed_object_refs_from_xref() {
 }
 
 #[test]
-fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
+fn write_pdf_incremental_xref_stream_strips_inherited_xref_stream_only_keys() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let mut objects = Vec::new();
@@ -941,12 +998,19 @@ fn write_pdf_incremental_trailer_strips_xref_stream_only_keys() {
     let mut output = Vec::new();
     write_pdf(&mut pdf, &mut output).unwrap();
 
-    let trailer_section = parse_last_trailer_section(&output);
-    assert!(!trailer_section.contains(" /Type /XRef"));
-    assert!(!trailer_section.contains(" /W ["));
-    assert!(!trailer_section.contains(" /Index ["));
-    assert!(!trailer_section.contains(" /Length "));
-    assert!(!trailer_section.contains(" /XRefStm "));
+    let trailer = load_xref_and_trailer(&mut Cursor::new(&output))
+        .expect("output must have a reader-visible xref stream")
+        .trailer;
+    assert!(matches!(trailer.get("Type"), Some(Object::Name(name)) if name.as_slice() == b"XRef"));
+    assert!(trailer.get("W").is_some());
+    assert!(trailer.get("Index").is_some());
+    assert!(trailer.get("Length").is_some());
+    assert!(trailer.get("F").is_none());
+    assert!(trailer.get("FFilter").is_none());
+    assert!(trailer.get("FDecodeParms").is_none());
+    assert!(trailer.get("Filter").is_none());
+    assert!(trailer.get("DecodeParms").is_none());
+    assert!(trailer.get("XRefStm").is_none());
 }
 
 #[test]
@@ -2444,23 +2508,6 @@ fn parse_last_xref_generations(bytes: &[u8]) -> BTreeMap<u32, u16> {
     }
 
     generations
-}
-
-fn parse_last_trailer_section(bytes: &[u8]) -> String {
-    let rendered = String::from_utf8_lossy(bytes);
-    let trailer_pos = rendered
-        .rfind("trailer")
-        .unwrap_or_else(|| panic!("missing trailer"));
-    let trailer_start = rendered[trailer_pos..]
-        .find("<<")
-        .map(|offset| trailer_pos + offset)
-        .unwrap_or_else(|| panic!("missing trailer dictionary"));
-    let startxref_pos = rendered[trailer_pos..]
-        .find("startxref")
-        .map(|offset| trailer_pos + offset)
-        .unwrap_or_else(|| panic!("missing startxref"));
-
-    rendered[trailer_start..startxref_pos].to_string()
 }
 
 fn as_integer(object: &Object) -> Option<i64> {

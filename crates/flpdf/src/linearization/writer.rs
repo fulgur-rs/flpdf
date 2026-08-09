@@ -78,7 +78,7 @@ use crate::writer::{
     effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension, is_lone_flate,
     reencode_stream_for_compress, serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order,
     serialize::xref_stream, strip_adbe_extension, CompressStreams, NewlineBeforeEndstream,
-    WriteOptions, QPDF_STATIC_ID,
+    WriteOptions,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -1070,16 +1070,16 @@ struct FirstPageXrefPatch {
 ///     [`patch_linearized_deterministic_id`]). Either way the identifier is the
 ///     same width as the placeholder, so every later byte offset (`startxref`,
 ///     hint stream, xref offsets) is unchanged.
-///   - `--static-id`: `[source_id0_or_π, π_const]`
-///   - default: a fresh random two-element /ID — element 1 preserved from a
-///     well-formed source /ID on re-save, both fresh on first save
+///   - `--static-id`: `[source_id0_or_π, π_const]`, with an empty source
+///     `/ID[0]` falling back to the same pi value
+///   - default: a fresh changing identifier; a non-empty source `/ID[0]` is
+///     preserved, otherwise the same fresh value is used for both elements
 ///     (ISO 32000-1 §14.4).
 fn finalize_linearized_id(
     options: &WriteOptions,
     source_trailer: &Dictionary,
     det_id_source_id0: Option<&[u8]>,
 ) -> Object {
-    let pi_bytes = Object::String(QPDF_STATIC_ID.to_vec());
     if options.deterministic_id {
         // Size the all-zero permanent-identifier placeholder to the source
         // `/ID[0]` length so the serialized `/ID` array reaches its FINAL width
@@ -1095,18 +1095,8 @@ fn finalize_linearized_id(
             Object::String(vec![0u8; len0]),
             Object::String(vec![0u8; 16]),
         ])
-    } else if options.static_id {
-        let first_id = match source_trailer.get("ID") {
-            Some(Object::Array(values))
-                if values.len() == 2 && matches!(values[0], Object::String(_)) =>
-            {
-                values[0].clone()
-            }
-            _ => pi_bytes.clone(),
-        };
-        Object::Array(vec![first_id, pi_bytes])
     } else {
-        crate::writer::random_id_array(source_trailer.get("ID"))
+        crate::writer::generate_id_array(source_trailer.get("ID"), options.static_id)
     }
 }
 
@@ -5566,6 +5556,29 @@ mod tests {
             .expect("output must contain an /ID array")
     }
 
+    fn id_array_hex_parts(id: &[u8]) -> (&[u8], &[u8]) {
+        let lt0 = id
+            .iter()
+            .position(|&byte| byte == b'<')
+            .expect("id0 opening");
+        let gt0 = id[lt0 + 1..]
+            .iter()
+            .position(|&byte| byte == b'>')
+            .map(|offset| lt0 + 1 + offset)
+            .expect("id0 closing");
+        let lt1 = id[gt0 + 1..]
+            .iter()
+            .position(|&byte| byte == b'<')
+            .map(|offset| gt0 + 1 + offset)
+            .expect("id1 opening");
+        let gt1 = id[lt1 + 1..]
+            .iter()
+            .position(|&byte| byte == b'>')
+            .map(|offset| lt1 + 1 + offset)
+            .expect("id1 closing");
+        (&id[lt0 + 1..gt0], &id[lt1 + 1..gt1])
+    }
+
     /// Minimal single-page PDF carrying the given trailer-`/ID` and `/Info`
     /// fragments (already serialized, e.g. `"/ID [<aa..> <bb..>]"`).
     fn tiny_pdf_with(id_entry: &str, info_obj: Option<&str>) -> Vec<u8> {
@@ -6535,6 +6548,61 @@ mod tests {
         );
         crate::linearization::check_linearization_bytes(&out)
             .expect("static-id linearized output must pass the linearization checker");
+    }
+
+    #[test]
+    fn ordinary_linearized_empty_source_id0_matches_qpdf_default_and_static() {
+        for id_entry in ["/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", "/ID [() ()]"] {
+            let source = tiny_pdf_with(id_entry, None);
+
+            let default_output = linearize_with(&source, |_| {});
+            let default_ids = collect_id_arrays(&default_output);
+            assert_eq!(default_ids.len(), 2);
+            assert!(default_ids.iter().all(|id| id == &default_ids[0]));
+            let (default_id0, default_id1) = id_array_hex_parts(&default_ids[0]);
+            assert!(!default_id0.is_empty());
+            assert_eq!(default_id0, default_id1);
+            crate::linearization::check_linearization_bytes(&default_output)
+                .expect("default output must pass the linearization checker");
+
+            let static_output = linearize_with(&source, |options| options.static_id = true);
+            let static_ids = collect_id_arrays(&static_output);
+            assert_eq!(static_ids.len(), 2);
+            assert!(static_ids.iter().all(|id| id == &static_ids[0]));
+            let (static_id0, static_id1) = id_array_hex_parts(&static_ids[0]);
+            let pi_hex = b"31415926535897932384626433832795";
+            assert_eq!(static_id0, pi_hex);
+            assert_eq!(static_id1, pi_hex);
+            crate::linearization::check_linearization_bytes(&static_output)
+                .expect("static output must pass the linearization checker");
+        }
+    }
+
+    #[test]
+    fn encrypted_linearized_empty_source_id0_matches_emitted_id1() {
+        let source = tiny_pdf_with("/ID [<> <bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb>]", None);
+        let output = linearize_with(&source, |options| {
+            options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
+                Vec::new(),
+                b"owner".to_vec(),
+            ));
+        });
+        let ids = collect_id_arrays(&output);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.iter().all(|id| id == &ids[0]));
+        let (id0, id1) = id_array_hex_parts(&ids[0]);
+        assert!(!id0.is_empty());
+        assert_eq!(
+            id0, id1,
+            "empty source /ID[0] must reuse qpdf's generated id2"
+        );
+
+        crate::linearization::check_linearization_bytes(&output)
+            .expect("encrypted output must pass the linearization checker");
+        let reopened =
+            Pdf::open_with_options(Cursor::new(output), crate::PdfOpenOptions::default())
+                .expect("encrypted output must reopen with the empty user password");
+        assert!(reopened.trailer().get("Encrypt").is_some());
     }
 
     /// `--deterministic-id` combined with encryption is rejected up front:
