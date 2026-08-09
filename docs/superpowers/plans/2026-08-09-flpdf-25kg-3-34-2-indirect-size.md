@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make candidate-xref recovery resolve an indirect trailer `/Size` through the reconstructed xref context before qpdf-compatible post-chain validation.
+**Goal:** Make both ordinary xref loading and candidate-xref recovery resolve an indirect trailer `/Size` through the qpdf-equivalent active or reconstructed xref context before post-chain validation.
 
-**Architecture:** Keep `append_xref_size_warning_for` as the shared warning formatter and change only the recovery call site to obtain the resolved `/Size` from the existing canonical `XrefReadContext`. The context must use the reconstructed line-scan and re-entry registration state that qpdf has available after candidate `read_xref` completion; no late `Pdf::resolve` bridge or raw-reference special case is added.
+**Architecture:** Keep `append_xref_size_warning_for` as the shared warning formatter. Obtain the resolved `/Size` from `XrefReadContext` at each qpdf-equivalent post-chain call site: the completed active registration for ordinary loading and the reconstructed line-scan plus re-entry registration state for candidate recovery. No late `Pdf::resolve` bridge or raw-reference special case is added.
 
 **Tech Stack:** Rust workspace, `crates/flpdf/src/xref.rs`, `crates/flpdf/tests/xref_tests.rs`, qpdf 11.9.0 source and executable oracle.
 
@@ -12,13 +12,13 @@
 
 - qpdf 11.9.0 source and observed output are the semantic oracle.
 - Preserve qpdf's post-chain warning order and exact warning text.
-- Limit production changes to the candidate recovery `/Size` validation path.
+- Limit production changes to qpdf's post-chain `/Size` validation paths: ordinary loading and candidate recovery.
 - Add matching and mismatching indirect `/Size` regressions before production code.
 - Do not change bootstrap resolver, strict-mode policy, dependency graph, or unrelated xref behavior.
 
 ---
 
-### Task 1: Add failing candidate-recovery regressions
+### Task 1: Add failing regressions for candidate recovery and ordinary loading
 
 **Files:**
 - Modify: `crates/flpdf/tests/xref_tests.rs` near `xref_stream_document` and `candidate_recovery_warns_when_xref_size_is_not_one_plus_highest_object`
@@ -73,14 +73,18 @@ cargo test -p flpdf --test xref_tests candidate_recovery_
 
 Expected: the tests compile and the mismatching test fails because the current raw `Object::Reference` match returns without warning; the matching test must not fail for an unrelated fixture error.
 
-### Task 2: Resolve the candidate trailer value through the bootstrap context
+- [x] **Step 5: Add the ordinary-loading regression**
+
+Append a `classic_xref_document_with_indirect_size(size_value: i64)` helper whose classic xref table registers `3 0 R` before the final post-chain check. Add `normal_xref_warns_for_mismatching_indirect_xref_size`, using `/Size 3 0 R` resolving to integer `3` while the highest live object is `3`. The current raw `loaded.trailer.get("Size")` path must fail to emit qpdf's warning; the active-context fix must make it emit the exact same diagnostic as candidate recovery.
+
+### Task 2: Resolve ordinary and candidate trailer values through the bootstrap context
 
 **Files:**
-- Modify: `crates/flpdf/src/xref.rs` at `append_xref_size_warning_for` and the final candidate-recovery validation call
+- Modify: `crates/flpdf/src/xref.rs` at the ordinary and candidate post-chain validation call sites
 
 **Interfaces:**
-- Consumes: `XrefReadContext::new`, `XrefReadContextSpec::Reconstruction`, the merged candidate `entries`, and `reentry_registration`.
-- Produces: the same `append_xref_size_warning_for` warning behavior with a resolved integer `/Size` for candidate recovery.
+- Consumes: `XrefReadContext::new`, `XrefReadContextSpec::ActiveSection`, `XrefReadContextSpec::Reconstruction`, the completed active registration, merged candidate `entries`, and `reentry_registration`.
+- Produces: the same `append_xref_size_warning_for` warning behavior with a resolved integer `/Size` for ordinary and candidate loading.
 
 - [x] **Step 1: Replace the candidate call's raw trailer value with a resolved validation dictionary/value**
 
@@ -90,7 +94,11 @@ After candidate entries and `/Prev` state are merged, construct `XrefReadContext
 
 Run the command from Task 1. Expected: both tests pass, with the mismatching indirect value producing one exact warning and the matching value producing none.
 
-- [x] **Step 3: Run the focused xref suite**
+- [x] **Step 3: Resolve the ordinary trailer value through the active context**
+
+After the ordinary xref chain is complete and `registration.snapshot()` has been assigned, construct an `XrefReadContext` with `XrefReadContextSpec::ActiveSection` and resolve the loaded trailer's `Size` key. Append resolver diagnostics before the shared warning formatter, and keep `registration.deleted_objects` available until the warning completes, matching qpdf's `read_xref` order.
+
+- [x] **Step 4: Run the focused xref suite**
 
 ```bash
 cargo test -p flpdf --test xref_tests
@@ -107,9 +115,9 @@ Expected: all xref tests pass and no existing warning-order or strict-mode asser
 
 Verify `QPDF.cc:626-704` still performs `m->trailer.getKey("/Size").getIntValueAsInt()` after the xref chain and that `QPDFObjectHandle` integer accessors dereference references. Run `qpdf --version` and require `qpdf version 11.9.0`.
 
-- [x] **Step 2: Run the matching and mismatching real-PDF probes**
+- [x] **Step 2: Run the matching and mismatching real-PDF probes for both routes**
 
-Run qpdf repair/check on both indirect-size fixtures and capture that the matching case has no size-mismatch warning while the mismatching case contains:
+Run qpdf repair/check on the ordinary and candidate indirect-size fixtures and capture that each matching case has no size-mismatch warning while each mismatching case contains:
 
 ```text
 reported number of objects (3) is not one plus the highest object number (3)

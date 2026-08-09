@@ -557,7 +557,25 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     }
 
     loaded.loaded.entries = registration.snapshot();
-    append_xref_size_warning(&mut loaded.loaded, &registration.deleted_objects);
+    // qpdf's post-chain `m->trailer.getKey("/Size").getIntValueAsInt()`
+    // dereferences indirect `/Size` values through the completed active xref
+    // table before applying the consistency warning (`QPDF.cc:689-704`).
+    // Keep the resolver in the xref-loading responsibility boundary: the
+    // canonical document resolver is constructed only after this stage.
+    let mut size_context = XrefReadContext::new(
+        bytes,
+        XrefReadContextSpec::ActiveSection,
+        &registration,
+        options,
+    );
+    let resolved_size = size_context.resolve_dictionary_value(&loaded.loaded.trailer, "Size");
+    size_context.append_diagnostics_to(&mut loaded.loaded.repair_diagnostics);
+    append_xref_size_warning_for(
+        resolved_size.as_ref(),
+        &loaded.loaded.entries,
+        &registration.deleted_objects,
+        &mut loaded.loaded.repair_diagnostics,
+    );
     registration.deleted_objects.clear();
 
     if let Some(error) = parse_errors.into_iter().next() {
@@ -867,17 +885,6 @@ fn collect_trailer_references(trailer: &Dictionary) -> BTreeSet<ObjectRef> {
     let mut references = BTreeSet::new();
     collect_qpdf_object_references(&Object::Dictionary(trailer.clone()), &mut references);
     references
-}
-
-/// Emit qpdf's post-chain `/Size` warning while the construction-scoped
-/// deleted-object set is still available.
-fn append_xref_size_warning(loaded: &mut LoadedXref, deleted_objects: &BTreeSet<u32>) {
-    append_xref_size_warning_for(
-        loaded.trailer.get("Size"),
-        &loaded.entries,
-        deleted_objects,
-        &mut loaded.repair_diagnostics,
-    );
 }
 
 fn append_xref_size_warning_for(
@@ -2197,7 +2204,7 @@ fn parse_xref_subsection_u32(token: &Token) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_xref_size_warning, find_xref_stream_trailer_candidate,
+        append_xref_size_warning_for, find_xref_stream_trailer_candidate,
         load_xref_and_trailer_with_repair, load_xref_state_with_options,
         merge_previous_xref_sections, merge_xref_stream_from_classic_trailer, parse_xref_index,
         parse_xref_stream, prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
@@ -3142,7 +3149,13 @@ mod tests {
             repair_diagnostics: Diagnostics::default(),
         };
 
-        append_xref_size_warning(&mut loaded, &BTreeSet::from([5]));
+        let size = loaded.trailer.get("Size").cloned();
+        append_xref_size_warning_for(
+            size.as_ref(),
+            &loaded.entries,
+            &BTreeSet::from([5]),
+            &mut loaded.repair_diagnostics,
+        );
 
         assert!(loaded.repair_diagnostics.entries().is_empty());
     }

@@ -2651,6 +2651,25 @@ fn xref_stream_document_with_indirect_size(size_value: i64) -> Vec<u8> {
     bytes
 }
 
+fn classic_xref_document_with_indirect_size(size_value: i64) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len() as u64;
+    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\nendobj\n").as_bytes());
+
+    let xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n{catalog_offset:010} 00000 n \n0000000000 65535 f \n{size_offset:010} 00000 n \ntrailer\n<< /Size 3 0 R /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}
+
 fn ignore_xref_streams_options(repair: bool) -> PdfOpenOptions {
     PdfOpenOptions {
         repair,
@@ -3172,6 +3191,38 @@ fn candidate_recovery_warns_for_mismatching_indirect_xref_size() {
                 == "reported number of objects (3) is not one plus the highest object number (3)"
                 && diagnostic.offset.is_none()
         }));
+}
+
+#[test]
+fn normal_xref_warns_for_mismatching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer(&mut Cursor::new(classic_xref_document_with_indirect_size(
+        3,
+    )))
+    .expect("normal xref loading should resolve an indirect trailer /Size");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (3) is not one plus the highest object number (3)"
+                && diagnostic.offset.is_none()
+        }));
+}
+
+#[test]
+fn normal_xref_accepts_matching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer(&mut Cursor::new(classic_xref_document_with_indirect_size(
+        4,
+    )))
+    .expect("normal xref loading should resolve an indirect trailer /Size");
+
+    assert!(!loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("reported number of objects")));
 }
 
 #[test]
