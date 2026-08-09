@@ -1,4 +1,4 @@
-//! Measure scalar `/DecodeParms` expansion without sharing a process-wide
+//! Measure `/DecodeParms` expansion without sharing a process-wide
 //! allocator with unrelated integration tests.
 
 use flpdf::{filters, Dictionary, Object};
@@ -33,27 +33,54 @@ fn peak_growth_of(call: impl FnOnce()) -> usize {
     PEAK.load(Ordering::Relaxed).saturating_sub(baseline)
 }
 
-#[test]
-fn scalar_decode_parms_do_not_expand_a_large_dictionary_per_filter() {
-    let filter_count = 16;
-    let large_value_size = 1 << 20;
-    let filter = Object::Array(
-        (0..filter_count)
+fn flate_filter_chain(count: usize) -> Object {
+    Object::Array(
+        (0..count)
             .map(|_| Object::Name(b"FlateDecode".to_vec()))
             .collect(),
-    );
-    let mut decode_parms = Dictionary::new();
-    decode_parms.insert("Ignored", Object::String(vec![b'x'; large_value_size]));
-    let mut dictionary = Dictionary::new();
-    dictionary.insert("Filter", filter);
-    dictionary.insert("DecodeParms", Object::Dictionary(decode_parms));
+    )
+}
 
-    let peak = peak_growth_of(|| {
+fn ignored_decode_parms(size: usize) -> Object {
+    let mut decode_parms = Dictionary::new();
+    decode_parms.insert("Ignored", Object::String(vec![b'x'; size]));
+    Object::Dictionary(decode_parms)
+}
+
+#[test]
+fn decode_parms_do_not_expand_large_values_per_filter() {
+    let filter_count = 16;
+    let large_value_size = 1 << 20;
+    let mut dictionary = Dictionary::new();
+    dictionary.insert("Filter", flate_filter_chain(filter_count));
+    dictionary.insert("DecodeParms", ignored_decode_parms(large_value_size));
+
+    let scalar_peak = peak_growth_of(|| {
         let _ = filters::decode_stream_data(&dictionary, b"not zlib");
     });
 
     assert!(
-        peak < large_value_size * 4,
-        "scalar DecodeParms peak allocation was {peak} bytes"
+        scalar_peak < large_value_size * 4,
+        "scalar DecodeParms peak allocation was {scalar_peak} bytes"
+    );
+
+    let mut aligned_dictionary = Dictionary::new();
+    aligned_dictionary.insert("Filter", flate_filter_chain(filter_count));
+    aligned_dictionary.insert(
+        "DecodeParms",
+        Object::Array(
+            (0..filter_count)
+                .map(|_| ignored_decode_parms(large_value_size))
+                .collect(),
+        ),
+    );
+
+    let aligned_peak = peak_growth_of(|| {
+        let _ = filters::decode_stream_data(&aligned_dictionary, b"not zlib");
+    });
+
+    assert!(
+        aligned_peak < large_value_size * 4,
+        "aligned DecodeParms peak allocation was {aligned_peak} bytes"
     );
 }

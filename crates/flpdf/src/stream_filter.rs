@@ -241,13 +241,67 @@ pub(crate) fn decode_filter_specs_from_object(
     decode_params: Option<&Object>,
     max_filter_chain: Option<usize>,
 ) -> Result<Vec<FilterSpec>> {
-    let mut clone = |value: &Object| value.clone();
-    decode_filter_specs_from_object_with_resolver(
-        filter,
-        decode_params,
-        max_filter_chain,
-        &mut clone,
-    )
+    let names: Vec<&[u8]> = match filter {
+        None | Some(Object::Null) => return Ok(Vec::new()),
+        Some(Object::Name(name)) => vec![name],
+        Some(Object::Array(items)) => {
+            // Counted on the array as parsed, so an over-long chain is
+            // reported ahead of a malformed item or a `/DecodeParms` length
+            // mismatch.
+            validate_filter_chain_count(items.len(), max_filter_chain)?;
+            items
+                .iter()
+                .map(|item| {
+                    item.as_name()
+                        .ok_or_else(|| Error::Unsupported(FILTER_TYPE_ERROR.to_string()))
+                })
+                .collect::<Result<_>>()?
+        }
+        Some(_) => return Err(Error::Unsupported(FILTER_TYPE_ERROR.to_string())),
+    };
+
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let params: Vec<Option<&Object>> = match decode_params {
+        None | Some(Object::Null) => vec![None; names.len()],
+        Some(Object::Array(items)) if items.is_empty() => vec![None; names.len()],
+        Some(Object::Array(items)) => {
+            if items.len() != names.len() {
+                return Err(Error::Unsupported(DECODE_PARMS_LENGTH_ERROR.to_string()));
+            }
+            items
+                .iter()
+                .map(|item| (!matches!(item, Object::Null)).then_some(item))
+                .collect()
+        }
+        Some(item) => {
+            // Keep the direct reader borrowed. The public path already owns
+            // the parsed object graph, so cloning the whole DecodeParms array
+            // before cloning each item would briefly retain two copies of
+            // attacker-controlled dictionaries or strings.
+            validate_filter_chain_count(names.len(), max_filter_chain)?;
+            return Ok(names
+                .into_iter()
+                .map(|name| FilterSpec {
+                    name: name.to_vec(),
+                    decode_params: decode_params_from_object(Some(item), name),
+                })
+                .collect());
+        }
+    };
+
+    validate_filter_chain_count(names.len(), max_filter_chain)?;
+
+    Ok(names
+        .into_iter()
+        .zip(params)
+        .map(|(name, decode_params)| FilterSpec {
+            name: name.to_vec(),
+            decode_params: decode_params_from_object(decode_params, name),
+        })
+        .collect())
 }
 
 /// Read filter metadata from an `Object` dictionary while resolving each
@@ -736,18 +790,31 @@ fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
 
 /// Reduce a `/DecodeParms` dictionary for the `Object` shape reader.
 ///
-/// The normal direct reader passes an identity resolver, so an indirect value
-/// remains `Object::Reference` and reduces to [`ParamValue::Other`] (plan
-/// decision D1 of `flpdf-25kg.3.4`). The xref bootstrap reader supplies its
-/// read-time resolver instead. `filter_name` decides both whether qpdf's
-/// filter enumerates entries — and therefore whether null values are omitted
-/// — and whether the stage is `Crypt`, which keeps every key
-/// ([`retains_decode_param_key`]) with name payloads under
+/// The direct reader borrows dictionary values and reduces only the bounded
+/// parameter view. The xref bootstrap reader uses the resolver-aware sibling
+/// below because it must dereference the values it inspects. `filter_name`
+/// decides both whether qpdf's filter enumerates entries — and therefore
+/// whether null values are omitted — and whether the stage is `Crypt`, which
+/// keeps every key ([`retains_decode_param_key`]) with name payloads under
 /// [`CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS`].
-#[cfg(test)]
 fn decode_params_from_object(params: Option<&Object>, filter_name: &[u8]) -> DecodeParams {
-    let mut clone = |value: &Object| value.clone();
-    decode_params_from_object_with_resolver(params, filter_name, &mut clone)
+    let omits_null_values = filter_reads_decode_params(filter_name);
+    let crypt_stage = is_crypt_filter(filter_name);
+    match params {
+        None | Some(Object::Null) => DecodeParams::Absent,
+        Some(object) => DecodeParams::Present(match object.as_dict() {
+            Some(dict) => dict
+                .iter()
+                .filter(|(_, value)| !omits_null_values || !matches!(value, Object::Null))
+                .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
+                .map(|(key, value)| {
+                    let keeps_name = keeps_crypt_name_payload(key, crypt_stage);
+                    (key.to_vec(), param_value_from_object(value, keeps_name))
+                })
+                .collect(),
+            None => Vec::new(),
+        }),
+    }
 }
 
 fn decode_params_from_object_with_resolver(
@@ -2138,6 +2205,86 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(specs.len(), 1);
         assert!(specs[0].decode_params.is_absent());
+    }
+
+    #[test]
+    fn resolver_reader_covers_object_array_and_decode_param_shapes() {
+        let empty_filter = Object::Array(Vec::new());
+        let mut resolve = |value: &Object| value.clone();
+        let specs = decode_filter_specs_from_object_with_resolver(
+            Some(&empty_filter),
+            None,
+            None,
+            &mut resolve,
+        )
+        .unwrap();
+        assert!(specs.is_empty());
+
+        let invalid_filter = Object::Integer(1);
+        let mut resolve = |value: &Object| value.clone();
+        let error = decode_filter_specs_from_object_with_resolver(
+            Some(&invalid_filter),
+            None,
+            None,
+            &mut resolve,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream filter type is not name or array"
+        );
+
+        let filter = Object::Array(vec![
+            Object::Name(b"FlateDecode".to_vec()),
+            Object::Name(b"ASCIIHexDecode".to_vec()),
+        ]);
+        let decode_parms = Object::Array(vec![
+            params(&[
+                ("Ignored", Object::Integer(2)),
+                ("Predictor", Object::Reference(ObjectRef::new(20, 0))),
+            ]),
+            params(&[("Ignored", Object::Null)]),
+        ]);
+        let mut resolve = |value: &Object| match value {
+            Object::Reference(reference) if *reference == ObjectRef::new(20, 0) => Object::Null,
+            _ => value.clone(),
+        };
+        let specs = decode_filter_specs_from_object_with_resolver(
+            Some(&filter),
+            Some(&decode_parms),
+            None,
+            &mut resolve,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
+        assert_eq!(specs[1].decode_params, DecodeParams::Present(Vec::new()));
+
+        let mismatched = Object::Array(vec![Object::Null, Object::Null]);
+        let scalar_filter = Object::Name(b"FlateDecode".to_vec());
+        let mut resolve = |value: &Object| value.clone();
+        let error = decode_filter_specs_from_object_with_resolver(
+            Some(&scalar_filter),
+            Some(&mismatched),
+            None,
+            &mut resolve,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+
+        let non_dictionary = Object::Integer(1);
+        let mut resolve = |value: &Object| value.clone();
+        let specs = decode_filter_specs_from_object_with_resolver(
+            Some(&scalar_filter),
+            Some(&non_dictionary),
+            None,
+            &mut resolve,
+        )
+        .unwrap();
+        assert_eq!(specs[0].decode_params, DecodeParams::Present(Vec::new()));
     }
 
     #[test]
