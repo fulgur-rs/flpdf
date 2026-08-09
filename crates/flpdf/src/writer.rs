@@ -1085,20 +1085,8 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
     }
 
     let selected_id = generate_id_array(pdf.trailer().get("ID"), options.static_id);
-    match pdf.last_xref_form() {
-        XrefForm::Table => {
-            let xref_offset = write_incremental_xref(&mut bytes, &final_offsets)?;
-            write_incremental_trailer(
-                &mut bytes,
-                pdf,
-                &selected_id,
-                &root_ref,
-                object_count,
-                pdf.previous_xref_offset(),
-                xref_offset,
-            )?;
-            xref_offset
-        }
+    let xref_offset = match pdf.last_xref_form() {
+        XrefForm::Table => write_incremental_xref(&mut bytes, &final_offsets)?,
         XrefForm::Stream => {
             let xref_object_number = next_xref_stream_object_number(&final_xref_offsets)?;
             object_count = object_count.max(xref_object_number as usize + 1);
@@ -1118,6 +1106,17 @@ fn write_pdf_incremental<R: Read + Seek, W: Write>(
             xref_offset
         }
     };
+    if matches!(pdf.last_xref_form(), XrefForm::Table) {
+        write_incremental_trailer(
+            &mut bytes,
+            pdf,
+            &selected_id,
+            &root_ref,
+            object_count,
+            pdf.previous_xref_offset(),
+            xref_offset,
+        )?;
+    }
 
     // flpdf-9hc.22.4: guard the byte-preservation invariant. The source prefix
     // (and any signed `/ByteRange` covered by it) must survive verbatim — the
