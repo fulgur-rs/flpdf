@@ -478,22 +478,11 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                     object
                 }
                 Err(error) => {
-                    if !matches!(error, Error::Parse { .. }) {
-                        return Err(error); // cov:ignore: byte-backed direct parser errors are parse errors
-                    }
-                    let diagnostic_offset = match &error {
-                        Error::Parse { offset, .. } => member_start.saturating_add(*offset),
-                        _ => member_start, // cov:ignore: non-parse errors return above
-                    };
-                    self.diagnostics.push(Diagnostic::warning(
-                        format!(
-                            "object stream {stream_number} (object {} 0, offset {diagnostic_offset}): {error}",
-                            object_ref.number
-                        ),
-                        Some(diagnostic_offset as u64),
-                    ));
-                    self.cache.insert(object_ref, Object::Null);
-                    continue;
+                    // qpdf lets QPDF::readObjectInStream's parse error abort
+                    // resolveObjectsInStream; QPDF::resolve then warns and
+                    // nulls only the requested object. The once-only marker
+                    // above keeps later members unresolved as well.
+                    return Err(error);
                 }
             };
             self.cache.insert(object_ref, parsed);
@@ -3305,8 +3294,11 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_context_caches_later_member_after_earlier_parse_failure() {
-        let members = [(2, b"<< /Value".as_slice()), (4, b"42".as_slice())];
+    fn bootstrap_context_stops_caching_later_member_after_parse_failure() {
+        let members = [
+            (2, b"<< /Value 2147483648 0 R >>".as_slice()),
+            (4, b"42".as_slice()),
+        ];
         let mut bytes = b" \n".to_vec();
         let stream_offset = bytes.len() as u64;
         bytes.extend_from_slice(&test_objstm_bytes(8, &members));
@@ -3317,7 +3309,7 @@ mod tests {
             );
             assert_eq!(
                 context.resolve_reference(ObjectRef::new(4, 0)),
-                Object::Integer(42)
+                Object::Null
             );
             assert!(!context.diagnostics.entries().is_empty());
         });
