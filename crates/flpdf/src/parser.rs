@@ -1604,6 +1604,9 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
 /// offset `base_offset + p` — this is how the caller (`Pdf`, in `reader.rs`)
 /// converts this function's body-relative token positions into the
 /// file-relative coordinate system the qpdf `getParsedOffset` contract uses.
+/// `top_level_offset`, when present, is the pre-tokenization offset qpdf uses
+/// for an outermost scalar; containers retain their opening-token offset
+/// because qpdf's frame offset is set after that opening token is consumed.
 ///
 /// Applies the same "empty object recovered as null" and top-level
 /// bare-reference recovery as [`parse_qpdf_direct_object`] (object-stream
@@ -1627,12 +1630,14 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
 pub(crate) fn parse_qpdf_direct_object_handle(
     input: &[u8],
     base_offset: i64,
+    top_level_offset: Option<i64>,
     description_template: Option<String>,
     resolver: &mut dyn HandleResolver,
 ) -> Result<(ObjectValue, i64)> {
     let mut tokenizer = Tokenizer::new(input);
     let mut parser = Parser::with_tokenizer(&mut tokenizer);
     parser.description_template = description_template;
+    parser.top_level_description_offset = top_level_offset;
     parser.top_level_no_reference = true;
     let token = parser.peek_token()?;
     if token.is_word_value(b"endobj") {
@@ -1766,6 +1771,11 @@ pub(crate) struct Parser<'tokenizer, 'input> {
     /// state; this field covers the older `Parser::object_handle` route used
     /// by `parse_qpdf_direct_object_handle`.
     description_template: Option<String>,
+    /// Optional qpdf-style start offset for an outermost scalar. The parser
+    /// may receive a slice that starts after ignorable whitespace, while
+    /// qpdf records the position before its first tokenizer call for that
+    /// scalar; container offsets still use their opening token.
+    top_level_description_offset: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1821,6 +1831,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             content_bad_count: 0,
             content_give_up: false,
             description_template: None,
+            top_level_description_offset: None,
         }
     }
 
@@ -2229,37 +2240,38 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         resolver: &mut dyn HandleResolver,
     ) -> Result<ObjectHandle> {
         let token = self.next_token()?;
+        let top_level_offset = self.top_level_description_offset.take();
+        let token_offset = match token.token_type {
+            TokenType::DictOpen | TokenType::ArrayOpen => base_offset + token.start as i64,
+            _ => top_level_offset.unwrap_or_else(|| base_offset + token.start as i64),
+        };
         match token.token_type {
             TokenType::DictOpen => {
-                let offset = base_offset + token.start as i64;
                 let value = self.dictionary_handle(base_offset, resolver)?;
-                Ok(self.wrap_direct(value, offset, resolver))
+                Ok(self.wrap_direct(value, token_offset, resolver))
             }
             TokenType::ArrayOpen => {
-                let offset = base_offset + token.start as i64;
                 let value = self.array_handle(base_offset, resolver)?;
-                Ok(self.wrap_direct(value, offset, resolver))
+                Ok(self.wrap_direct(value, token_offset, resolver))
             }
             TokenType::Name => Ok(self.wrap_direct(
                 ObjectValue::Name(token.value[1..].to_vec()),
-                base_offset + token.start as i64,
+                token_offset,
                 resolver,
             )),
-            TokenType::String => Ok(self.wrap_direct(
-                ObjectValue::String(token.value),
-                base_offset + token.start as i64,
-                resolver,
-            )),
+            TokenType::String => {
+                Ok(self.wrap_direct(ObjectValue::String(token.value), token_offset, resolver))
+            }
             TokenType::Bool => Ok(self.wrap_direct(
                 ObjectValue::Boolean(token.value == b"true"),
-                base_offset + token.start as i64,
+                token_offset,
                 resolver,
             )),
             // qpdf constructs QPDF_Null without assigning a description or
             // offset (design's Fixed qpdf Facts) — the sentinel stays -1.
             TokenType::Null => Ok(ObjectHandle::null()),
-            TokenType::Integer => self.integer_or_ref_handle(token, base_offset, resolver),
-            TokenType::Real => self.real_object_handle(token, base_offset, resolver),
+            TokenType::Integer => self.integer_or_ref_handle(token, token_offset, resolver),
+            TokenType::Real => self.real_object_handle(token, token_offset, resolver),
             TokenType::Bad => Err(Error::parse(
                 token.error_offset,
                 token
@@ -2315,10 +2327,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     fn integer_or_ref_handle(
         &mut self,
         first_token: Token,
-        base_offset: i64,
+        offset: i64,
         resolver: &mut dyn HandleResolver,
     ) -> Result<ObjectHandle> {
-        let offset = base_offset + first_token.start as i64;
         match self.integer_or_ref_decision(&first_token)? {
             IntegerOrRefDecision::Integer(n) => {
                 Ok(self.wrap_direct(ObjectValue::Integer(n), offset, resolver))
@@ -2335,10 +2346,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     fn real_object_handle(
         &self,
         token: Token,
-        base_offset: i64,
+        offset: i64,
         resolver: &mut dyn HandleResolver,
     ) -> Result<ObjectHandle> {
-        let offset = base_offset + token.start as i64;
         let value = match classify_real(token)? {
             RealClassification::Canonical(value) => ObjectValue::Real(value),
             RealClassification::Literal { value, literal } => {
@@ -3193,7 +3203,7 @@ mod handle_path_parity_tests {
         let input = b" \nendobj\n";
         let mut resolver = NullResolver;
         let (value, offset) =
-            super::parse_qpdf_direct_object_handle(input, 100, None, &mut resolver)
+            super::parse_qpdf_direct_object_handle(input, 100, None, None, &mut resolver)
                 .expect("empty body recovers as null");
         assert!(matches!(value, crate::object_handle::ObjectValue::Null));
         assert_eq!(offset, -1);

@@ -1916,12 +1916,12 @@ impl<R: Read + Seek> Pdf<R> {
         // would silently resurrect the pre-decryption `/Filter` (with a
         // still-present `/Crypt` entry the caller can no longer decode) and
         // reuse `object`'s already-transformed *data* against that stale
-        // dictionary. Route it through `lift(&object, 0)` instead, which
-        // copies both the transformed dictionary and the transformed data
-        // from `object` directly — correct, at the cost of losing native
-        // parsed offsets for this ref (conservative: this also applies to a
-        // stream that was merely decrypted without an explicit crypt filter,
-        // whose dictionary was not actually rewritten, since
+        // dictionary. The transformed-stream branch below composes the
+        // transformed value with the canonical parser handles; only when
+        // that canonical retry is unavailable does the final wildcard arm
+        // fall back to a contextless lift (conservative: this also applies
+        // to a stream that was merely decrypted without an explicit crypt
+        // filter, whose dictionary was not actually rewritten, since
         // `transformed_stream_refs` does not distinguish the two cases).
         //
         // Both arms below lift against `parser::MAX_PARSE_DEPTH`, not
@@ -1934,6 +1934,41 @@ impl<R: Read + Seek> Pdf<R> {
         // (ObjStm-member) object — or, more rarely, an Uncompressed one whose
         // fast native-parse window failed for an unrelated reason — with
         // literal nesting between the two bounds.
+        // qpdf keeps the stream object created by its source parser while
+        // `decryptStream` prepends the decryption stage
+        // (`libqpdf/QPDF.cc:1331-1350`, `libqpdf/QPDF_encryption.cc:1045-1134`).
+        // The legacy bridge has already applied that transformation to
+        // `object`, including the explicit-`/Crypt` dictionary rewrite, so
+        // do the same composition here: resolve the canonical stream once
+        // to obtain its source descriptions, then replace only its
+        // dictionary payload and stream bytes with the transformed value.
+        // Reusing the canonical dictionary handle is important: lifting the
+        // transformed `Object` would mint a fresh dictionary with no parser
+        // provenance.
+        if self.transformed_stream_refs.contains(&object_ref) {
+            if let Object::Stream(stream) = &object {
+                if handle.try_dereference().is_ok() && handle.has_resolved_value() {
+                    if let Some(stream_dict) = handle.as_stream_dict() {
+                        let dict_value =
+                            ObjectValue::Dictionary(self.lift_transformed_dictionary_bounded(
+                                &stream.dict,
+                                Some(&stream_dict),
+                                0,
+                                crate::parser::MAX_PARSE_DEPTH,
+                            )?);
+                        stream_dict.replace_direct_value(dict_value);
+                        handle.set_resolved(ObjectValue::Stream {
+                            stream_dict,
+                            stream_data: Some(Rc::new(stream.data.clone())),
+                            stream_length: 0,
+                        });
+                        self.cache.set_resolved(object_ref, handle.materialize()?);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let mut native_parsed = false;
         let (mut value, parsed_offset) = match self.resolver.xref_entry(object_ref) {
             Some(XrefEntry::Uncompressed { offset })
@@ -2217,15 +2252,18 @@ impl<R: Read + Seek> Pdf<R> {
         let _number = tokenizer.next_integer()?;
         let _generation = tokenizer.next_integer()?;
         tokenizer.expect_word(b"obj")?;
+        let description_start = tokenizer.position();
         tokenizer.skip_ignorable()?;
         let body_start = tokenizer.position();
 
         let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
         let base_offset = file_origin + body_start as i64;
+        let top_level_offset = file_origin + description_start as i64;
         let description_template = self.resolver.parser_description_template(object_ref);
         let (value, value_offset) = crate::parser::parse_qpdf_direct_object_handle(
             &bytes[body_start..],
             base_offset,
+            Some(top_level_offset),
             Some(description_template.clone()),
             self,
         )
@@ -2439,6 +2477,90 @@ impl<R: Read + Seek> Pdf<R> {
                 ))
             })
             .collect()
+    }
+
+    // Lift a transformed stream dictionary while carrying the source parser's
+    // direct-handle metadata onto the replacement values. Decryption can
+    // remove `/Crypt` entries or rewrite literal strings, so reusing the
+    // canonical child handles verbatim is not correct; creating ordinary
+    // `ObjectHandle::from_value` children is not correct either, because it
+    // loses both the qpdf context and each child's parsed description.
+    fn lift_transformed_dictionary_bounded(
+        &mut self,
+        dict: &Dictionary,
+        template: Option<&ObjectHandle>,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
+        let template_entries = template.and_then(ObjectHandle::as_dictionary);
+        dict.iter()
+            .map(|(key, value)| {
+                let child_template = template_entries
+                    .as_ref()
+                    .and_then(|entries| entries.get(key));
+                Ok((
+                    key.to_vec(),
+                    self.lift_transformed_to_handle_bounded(
+                        value,
+                        child_template,
+                        depth + 1,
+                        max_depth,
+                    )?,
+                ))
+            })
+            .collect()
+    }
+
+    fn lift_transformed_to_handle_bounded(
+        &mut self,
+        object: &Object,
+        template: Option<&ObjectHandle>,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<ObjectHandle> {
+        if depth > max_depth {
+            return Err(Error::Unsupported(format!(
+                "object handle lift: inline object nesting exceeds maximum of {max_depth}"
+            )));
+        }
+
+        stacker::maybe_grow(READER_STACK_RED_ZONE, READER_STACK_GROWTH_SIZE, || {
+            if let Object::Reference(object_ref) = object {
+                return Ok(self.get_object_handle(*object_ref));
+            }
+
+            let value = match object {
+                Object::Array(items) => {
+                    let template_items = template.and_then(ObjectHandle::as_array);
+                    ObjectValue::Array(
+                        items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                let child_template =
+                                    template_items.as_ref().and_then(|items| items.get(index));
+                                self.lift_transformed_to_handle_bounded(
+                                    item,
+                                    child_template,
+                                    depth + 1,
+                                    max_depth,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                }
+                Object::Dictionary(dict) => ObjectValue::Dictionary(
+                    self.lift_transformed_dictionary_bounded(dict, template, depth, max_depth)?,
+                ),
+                other => self.lift_bounded(other, depth, max_depth)?,
+            };
+
+            let target = self.resolver.direct_object_handle(value);
+            if let Some(template) = template {
+                template.copy_description_and_parsed_offset_to(&target);
+            }
+            Ok(target)
+        })
     }
 
     // Lift a child `Object` (array element or dictionary value) to a handle.
@@ -8471,6 +8593,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_object_handle_preserves_descriptions_for_a_transformed_stream() {
+        let object_ref = ObjectRef::new(1, 0);
+        let encryption = EncryptionState {
+            encryption_v: 2,
+            encryption_r: 3,
+            cf_stream: EncryptionMode::Identity,
+            ..explicit_rc4_encryption_state()
+        };
+        let ciphertext = rc4_ciphertext(object_ref, b"abc", &encryption);
+        let mut stream_body =
+            b"1 0 obj\n<< /Length 3 /Filter /Crypt /DecodeParms << /Name /StdCF >> >>\nstream\n"
+                .to_vec();
+        stream_body.extend_from_slice(&ciphertext);
+        stream_body.extend_from_slice(b"\nendstream\nendobj\n");
+        let bytes = classic_pdf_with_bodies(&[stream_body.as_slice()], object_ref);
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: "input.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open transformed-stream fixture");
+        *pdf.encryption.borrow_mut() = Some(encryption);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve transformed stream");
+
+        assert_eq!(
+            handle.description(),
+            "input.pdf, stream object 1 0",
+            "the transformed stream root must retain qpdf's stream provenance"
+        );
+        assert!(
+            handle
+                .as_stream_dict()
+                .expect("transformed stream dictionary")
+                .description()
+                .contains("input.pdf, object 1 0 at offset"),
+            "the transformed stream dictionary must retain its parser provenance"
+        );
+        assert_eq!(
+            handle.as_stream_data().as_ref().map(|data| data.as_slice()),
+            Some(b"abc".as_slice())
+        );
+        assert!(
+            !handle
+                .as_stream_dict()
+                .expect("transformed stream dictionary")
+                .as_dictionary()
+                .expect("stream dictionary value")
+                .contains_key(b"Filter".as_slice()),
+            "the transformed dictionary must retain the consumed Crypt-filter rewrite"
+        );
+        handle
+            .as_stream_dict()
+            .expect("transformed stream dictionary")
+            .get_key(b"Length")
+            .object_warning("transformed dictionary context")
+            .expect("transformed dictionary children must retain the document resolver");
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("transformed dictionary context")));
+    }
+
     /// Object 0 (the qpdf-style xref free-list head) is exempt from every
     /// tracking side effect `delete_object` otherwise performs, including
     /// the handle-graph invalidation the previous test pins for every other
@@ -8678,6 +8869,34 @@ mod tests {
         assert!(
             nested.description().contains("object 1 0 at offset"),
             "the nested direct handle must retain its source description"
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_preserves_leading_whitespace_before_a_scalar_description() {
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n\n 7\nendobj\n"], ObjectRef::new(1, 0));
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: "input.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open scalar fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve through the public native bridge");
+
+        assert_eq!(
+            handle.get_parsed_offset(),
+            16,
+            "the scalar provenance starts immediately after `obj`, before leading whitespace"
+        );
+        assert_eq!(
+            handle.description(),
+            "input.pdf, object 1 0 at offset 16",
+            "the qpdf-style top-level scalar description must include its pre-tokenization offset"
         );
     }
 

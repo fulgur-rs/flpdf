@@ -374,10 +374,16 @@ fn after_object_header(body: &[u8]) -> usize {
 }
 
 #[test]
-fn scalar_parsed_offset_is_the_token_start_not_leading_whitespace() {
+fn scalar_parsed_offset_includes_leading_whitespace_like_qpdf() {
     let body: &[u8] = b"1 0 obj\n   42\nendobj\n";
     let scalar_local = find_after(body, b"42", after_object_header(body));
-    let expected_offset = (PDF_HEADER_LEN + scalar_local) as i64;
+    let object_header_end = find_after(body, b"obj", 0) + b"obj".len();
+    let expected_offset = (PDF_HEADER_LEN + object_header_end) as i64;
+    assert_ne!(
+        expected_offset,
+        (PDF_HEADER_LEN + scalar_local) as i64,
+        "the fixture must separate qpdf's pre-tokenization offset from the scalar token"
+    );
 
     let bytes = classic_pdf_with_bodies(&[body], ObjectRef::new(1, 0));
     let mut pdf = Pdf::open_mem_owned(bytes).expect("open scalar-offset fixture");
