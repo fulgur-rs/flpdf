@@ -2400,6 +2400,23 @@ mod tests {
                 .count(),
             1
         );
+        let no_sink_error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the no-sink mismatch path must still request reconstruction");
+        assert_eq!(
+            no_sink_error.to_string(),
+            "parse error at byte 1: expected 2 0 obj"
+        );
     }
 
     #[test]
@@ -2445,6 +2462,23 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+        let no_sink_error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the no-sink invalid /XRefStm path must still fail");
+        assert_eq!(
+            no_sink_error.to_string(),
+            "parse error at byte 0: invalid /XRefStm"
+        );
     }
 
     #[test]
@@ -2490,6 +2524,20 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+        let no_sink_error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the no-sink negative /XRefStm path must still fail");
+        assert!(no_sink_error.to_string().contains("before the file start"));
     }
 
     #[test]
@@ -2533,6 +2581,23 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+        let no_sink_error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the no-sink hybrid stream failure must still fail");
+        assert_eq!(
+            no_sink_error.to_string(),
+            "parse error at byte 1: xref not found"
+        );
     }
 
     #[test]
@@ -2601,6 +2666,21 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+
+        let no_sink_error = parse_xref_stream(
+            &bytes,
+            0,
+            0,
+            "1.7".to_string(),
+            XrefLoadOptions::default(),
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the no-sink read failure must retain its parse error");
+        assert!(no_sink_error
+            .to_string()
+            .contains("stream data exceeds input"));
     }
 
     #[test]
