@@ -2983,13 +2983,37 @@ mod tests {
         .expect_err("a successful xref build with a mismatch must still request reconstruction");
 
         assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
-        assert!(
-            diagnostics
-                .entries()
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("expected endobj")),
-            "diagnostics: {:?}",
-            diagnostics.entries()
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+
+        let mut registration_without_sink = XrefRegistration::default();
+        registration_without_sink
+            .insert_xref_entry(ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 1 });
+        registration_without_sink.insert_xref_entry(
+            ObjectRef::new(3, 0),
+            XrefEntry::Uncompressed {
+                offset: cyclic_length_offset as u64,
+            },
+        );
+        let no_sink_error = parse_xref_stream(
+            &bytes,
+            1,
+            1,
+            "1.7".to_string(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration_without_sink,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("the no-sink path must still propagate the reconstruction request");
+        assert_eq!(
+            no_sink_error.to_string(),
+            "parse error at byte 1: expected 2 0 obj"
         );
     }
 
