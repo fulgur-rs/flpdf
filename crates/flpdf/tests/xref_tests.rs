@@ -2675,13 +2675,13 @@ fn classic_xref_document_with_indirect_size(size_value: i64) -> Vec<u8> {
     bytes
 }
 
-fn classic_xref_with_indirect_size_header_mismatch() -> (Vec<u8>, u64) {
+fn classic_xref_with_indirect_size_header_mismatch(size_value: i64) -> (Vec<u8>, u64) {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let catalog_offset = bytes.len() as u64;
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     let size_offset = bytes.len() as u64;
-    bytes.extend_from_slice(b"3 0 obj\n5\nendobj\n");
+    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\nendobj\n").as_bytes());
     let wrong_offset = bytes.len() as u64;
     bytes.extend_from_slice(b"4 0 obj\n<< /Foo true >>\nendobj\n");
 
@@ -3487,7 +3487,7 @@ fn normal_xref_accepts_matching_indirect_xref_size() {
 
 #[test]
 fn repair_reconstructs_xref_after_an_indirect_size_header_mismatch() {
-    let (bytes, size_offset) = classic_xref_with_indirect_size_header_mismatch();
+    let (bytes, size_offset) = classic_xref_with_indirect_size_header_mismatch(5);
     let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
         .expect("repair mode should reconstruct the mismatched xref entry");
 
@@ -3503,6 +3503,22 @@ fn repair_reconstructs_xref_after_an_indirect_size_header_mismatch() {
         .entries()
         .iter()
         .any(|diagnostic| diagnostic.message.contains("expected 3 0 obj")));
+}
+
+#[test]
+fn repair_revalidates_indirect_xref_size_after_header_reconstruction() {
+    let (bytes, _) = classic_xref_with_indirect_size_header_mismatch(3);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should reconstruct and validate the xref");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (3) is not one plus the highest object number (4)"
+        }));
 }
 
 #[test]

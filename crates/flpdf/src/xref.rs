@@ -671,6 +671,39 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         )?; // cov:ignore: recover_xref_entries has no fallible branch; retain defensive propagation
         let mut recovered = merge_recovered_qpdf_state(recovered, loaded);
         recovered.header_offset = header_offset;
+
+        // qpdf continues the original read_xref call after
+        // readObjectAtOffset(true, ...) reconstructs the table: its
+        // m->trailer.getKey("/Size").getIntValueAsInt() at QPDF.cc:689
+        // therefore resolves the value against the newly reconstructed xref
+        // before the :697-704 size consistency warning. Re-run that one
+        // post-reconstruction lookup through the reconstruction context; the
+        // recovery state is already the canonical line-scan xref table.
+        let (recovered_size, recovered_size_diagnostics) = {
+            let reconstruction_registration = XrefRegistration::default();
+            let mut recovered_size_context = XrefReadContext::new(
+                bytes,
+                XrefReadContextSpec::ReconstructionWithCache {
+                    line_scan_entries: &recovered.loaded.entries,
+                    bootstrap_cache: &recovered.bootstrap_cache,
+                },
+                &reconstruction_registration,
+                options,
+            );
+            let recovered_size =
+                recovered_size_context.resolve_dictionary_value(&recovered.loaded.trailer, "Size");
+            recovered_size_context.cache.commit();
+            (recovered_size, recovered_size_context.diagnostics.clone())
+        };
+        for diagnostic in recovered_size_diagnostics.entries() {
+            recovered.loaded.repair_diagnostics.push(diagnostic.clone());
+        }
+        append_xref_size_warning_for(
+            recovered_size.as_ref(),
+            &recovered.loaded.entries,
+            &BTreeSet::new(),
+            &mut recovered.loaded.repair_diagnostics,
+        );
         return Ok(recovered);
     }
 
