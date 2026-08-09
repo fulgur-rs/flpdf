@@ -70,10 +70,70 @@ fn run_contains_test_command(run: &str, command: &str) -> bool {
 }
 
 fn run_exact_command_line_count(run: &str, command: &str) -> usize {
+    let run = shell_script_without_comments(run);
     run.lines()
         .map(str::trim)
         .filter(|line| *line == command)
         .count()
+}
+
+fn shell_script_without_comments(script: &str) -> String {
+    let mut uncommented = String::with_capacity(script.len());
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+
+    for character in script.chars() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+                uncommented.push(character);
+            }
+            continue;
+        }
+
+        match quote {
+            Some('\'') => {
+                uncommented.push(character);
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => {
+                uncommented.push(character);
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quote = None;
+                }
+            }
+            None => {
+                if escaped {
+                    uncommented.push(character);
+                    escaped = false;
+                    continue;
+                }
+
+                match character {
+                    '\\' => {
+                        uncommented.push(character);
+                        escaped = true;
+                    }
+                    '\'' | '"' => {
+                        uncommented.push(character);
+                        quote = Some(character);
+                    }
+                    '#' => in_comment = true,
+                    _ => uncommented.push(character),
+                }
+            }
+            Some(_) => unreachable!("shell quote must be single or double"),
+        }
+    }
+
+    uncommented
 }
 
 fn shell_command_segments(script: &str) -> Vec<&str> {
@@ -151,7 +211,8 @@ fn is_plain_echo_output_segment(segment: &str) -> bool {
 }
 
 fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
-    shell_command_segments(run)
+    let run = shell_script_without_comments(run);
+    shell_command_segments(&run)
         .into_iter()
         .filter(|segment| !is_plain_echo_output_segment(segment))
         .map(|segment| segment.match_indices(command).count())
@@ -159,6 +220,7 @@ fn run_raw_command_occurrence_count(run: &str, command: &str) -> usize {
 }
 
 fn bash_run_has_unsupported_syntax(run: &str) -> bool {
+    let run = shell_script_without_comments(run);
     if run.contains("$(") || run.contains('`') {
         return true;
     }
@@ -216,16 +278,52 @@ fn bash_run_has_unsupported_syntax(run: &str) -> bool {
 
 fn bash_run_has_control_flow(run: &str) -> bool {
     bash_run_has_unsupported_syntax(run)
-        || run.lines().map(str::trim).any(|line| {
-            line.contains("<<")
-                || line.split_whitespace().next().is_some_and(|word| {
-                    BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
-                })
+        || shell_script_without_comments(run)
+            .lines()
+            .map(str::trim)
+            .any(|line| {
+                line.contains("<<")
+                    || line.split_whitespace().next().is_some_and(|word| {
+                        BASH_CONTROL_FLOW_KEYWORDS.contains(&word.trim_end_matches(';'))
+                    })
+            })
+}
+
+fn bash_run_has_early_success_before_command(run: &str, command: &str) -> bool {
+    let run = shell_script_without_comments(run);
+    for segment in shell_command_segments(&run) {
+        let segment = segment.trim();
+        if segment == command {
+            return false;
+        }
+        if matches!(segment, "exit 0" | "exec true") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn bash_run_disables_errexit(run: &str) -> bool {
+    let run = shell_script_without_comments(run);
+    shell_command_segments(&run).into_iter().any(|segment| {
+        let mut words = segment.split_whitespace();
+        if words.next() != Some("set") {
+            return false;
+        }
+
+        let words = words.collect::<Vec<_>>();
+        words.iter().enumerate().any(|(index, word)| {
+            word.starts_with("+e") || (*word == "+o" && words.get(index + 1) == Some(&"errexit"))
         })
+    })
 }
 
 fn bash_run_exact_command_line_count(run: &str, command: &str) -> usize {
-    if bash_run_has_control_flow(run) {
+    if bash_run_has_control_flow(run)
+        || bash_run_has_early_success_before_command(run, command)
+        || bash_run_disables_errexit(run)
+    {
         return 0;
     }
 
@@ -570,6 +668,112 @@ fn test_matrix_runs_default_workspace_suite() {
         test_job_contains_test_command(CI_WORKFLOW, "cargo test --workspace")
             .expect("ci workflow must be valid and define the test job"),
         "the four-OS test matrix must run the complete default workspace suite"
+    );
+}
+
+#[test]
+fn raw_command_occurrence_count_ignores_comments_but_preserves_quoted_hashes() {
+    let command = "cargo test --workspace";
+    let run = "\
+# cargo test --workspace
+printf '%s' \"# cargo test --workspace\"
+printf '%s' '# cargo test --workspace'
+cargo test --workspace # comment
+";
+
+    assert_eq!(
+        run_raw_command_occurrence_count(run, command),
+        3,
+        "shell comments must be ignored while quoted # text and the real command remain visible"
+    );
+}
+
+#[test]
+fn test_job_workspace_command_accepts_real_command_with_inline_comment() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: cargo test --workspace # the suite is required
+",
+    );
+
+    assert!(
+        test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_exit_zero_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      exit 0
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_exec_true_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      exec true
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_rejects_disabled_errexit_before_suite() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      set +e
+      cargo test --workspace
+      echo done
+",
+    );
+
+    assert!(
+        !test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
+    );
+}
+
+#[test]
+fn test_job_workspace_command_accepts_errexit_failure_gating() {
+    let workflow = workspace_test_job_workflow(
+        "\
+steps:
+  - shell: bash
+    run: |
+      set -euo pipefail
+      cargo test --workspace
+",
+    );
+
+    assert!(
+        test_job_contains_test_command(&workflow, "cargo test --workspace")
+            .expect("synthetic complete workflow must be valid")
     );
 }
 
