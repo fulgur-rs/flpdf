@@ -8662,6 +8662,104 @@ mod tests {
             .any(|entry| entry.message.contains("transformed dictionary context")));
     }
 
+    #[test]
+    fn resolve_object_handle_falls_through_for_a_non_stream_transformed_value() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n7\nendobj\n"], object_ref);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open scalar fixture");
+        pdf.cache.set_resolved(object_ref, Object::Integer(7));
+        pdf.transformed_stream_refs.insert(object_ref);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("non-stream transformed values still use the fallback lift");
+
+        assert_eq!(handle.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn resolve_object_handle_falls_through_when_the_canonical_value_is_not_a_stream() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n7\nendobj\n"], object_ref);
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open canonical scalar fixture");
+        pdf.cache.set_resolved(
+            object_ref,
+            Object::Stream(Stream::new(Dictionary::new(), b"payload".to_vec())),
+        );
+        pdf.transformed_stream_refs.insert(object_ref);
+
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("a transformed stream falls back if canonical metadata is not a stream");
+
+        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"payload".to_vec())));
+    }
+
+    #[test]
+    fn resolve_object_handle_propagates_transformed_dictionary_depth_errors() {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n"],
+            object_ref,
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open deep transformed-stream fixture");
+
+        let mut nested = Object::Integer(0);
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            let mut dict = Dictionary::new();
+            dict.insert(b"Nested", nested);
+            nested = Object::Dictionary(dict);
+        }
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(b"Nested", nested);
+        pdf.cache.set_resolved(
+            object_ref,
+            Object::Stream(Stream::new(stream_dict, Vec::new())),
+        );
+        pdf.transformed_stream_refs.insert(object_ref);
+
+        let handle = pdf.get_object_handle(object_ref);
+        let error = pdf
+            .resolve_object_handle(&handle)
+            .expect_err("transformed dictionary depth must remain bounded");
+
+        assert!(matches!(
+            error,
+            Error::Unsupported(message)
+                if message.contains("inline object nesting exceeds maximum")
+        ));
+    }
+
+    #[test]
+    fn transformed_handle_lifts_cover_dictionary_and_depth_guards() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open lift fixture");
+
+        let mut dict = Dictionary::new();
+        dict.insert(b"Value", Object::Integer(7));
+        let error = pdf
+            .lift_transformed_dictionary_bounded(&dict, None, 0, 0)
+            .expect_err("a transformed dictionary child beyond the bound must fail");
+        assert!(matches!(
+            error,
+            Error::Unsupported(message)
+                if message.contains("inline object nesting exceeds maximum")
+        ));
+
+        let error = pdf
+            .lift_transformed_to_handle_bounded(&Object::Integer(7), None, 1, 0)
+            .expect_err("the transformed handle lift must enforce its depth bound");
+        assert!(matches!(
+            error,
+            Error::Unsupported(message)
+                if message.contains("inline object nesting exceeds maximum")
+        ));
+
+        let empty = pdf
+            .lift_transformed_to_handle_bounded(&Object::Dictionary(Dictionary::new()), None, 0, 0)
+            .expect("an empty transformed dictionary at the bound must lift");
+        assert!(empty.as_dictionary().is_some());
+    }
+
     /// Object 0 (the qpdf-style xref free-list head) is exempt from every
     /// tracking side effect `delete_object` otherwise performs, including
     /// the handle-graph invalidation the previous test pins for every other
