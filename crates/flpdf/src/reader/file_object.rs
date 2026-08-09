@@ -1,7 +1,8 @@
 //! qpdf correspondence: QPDF.cc readObject/readStream framing and recovery split from the document reader.
+#[cfg(test)]
+use crate::parser::parse_strict_direct_object;
 use crate::parser::{
-    keyword_token_end, parse_qpdf_direct_object, parse_strict_direct_object, ParsedDirectObject,
-    RecoveredStreamEol,
+    keyword_token_end, parse_qpdf_direct_object, ParsedDirectObject, RecoveredStreamEol,
 };
 use crate::tokenizer::{is_ws, Tokenizer};
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
@@ -143,6 +144,7 @@ pub(crate) fn parse_file_object_syntax(input: &[u8]) -> Result<PendingFileObject
     parse_file_object_syntax_impl(input, parse_qpdf_direct_object)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_strict_file_object_syntax(input: &[u8]) -> Result<PendingFileObject> {
     parse_file_object_syntax_impl(input, parse_strict_direct_object)
 }
