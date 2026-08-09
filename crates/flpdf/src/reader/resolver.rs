@@ -1704,7 +1704,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Ok((value, parsed_offset, String::new()));
         }
 
-        let description = parsed.value.description();
+        // Keep the parser's raw template through the canonical transfer.
+        // Rendering here would turn an escaped caller literal such as
+        // `input-$$PO.pdf` back into `$PO`, and a later set_description on the
+        // canonical handle would interpret that literal as a fresh offset
+        // placeholder.
+        let description = parsed
+            .value
+            .description_template()
+            .unwrap_or_else(|| parsed.value.description());
         let (value, parsed_offset) = parsed.value.into_direct_value().expect(
             "live file parser's top-level bare-reference recovery always returns a direct value",
         );

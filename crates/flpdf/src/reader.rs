@@ -1955,7 +1955,7 @@ impl<R: Read + Seek> Pdf<R> {
                         // resolver path; retain the already-proven legacy
                         // value lift only if the canonical retry cannot
                         // resolve the object.
-                        if handle.try_dereference().is_ok() && handle.is_resolved() {
+                        if handle.try_dereference().is_ok() && handle.has_resolved_value() {
                             // The canonical stream parser intentionally
                             // leaves original payload bytes lazy. Preserve
                             // the legacy resolution's already-materialized
@@ -3159,6 +3159,10 @@ impl<R: Read + Seek> crate::parser::HandleResolver for Pdf<R> {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
         self.get_object_handle(object_ref)
     }
+
+    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+        self.resolver.direct_object_handle(value)
+    }
 }
 
 /// qpdf `QPDF::decryptString`'s decryption half (`:1009-1038`), applied to
@@ -4111,6 +4115,7 @@ mod tests {
     use crate::write_pdf;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
+    use std::rc::Rc;
     use std::sync::Arc;
 
     struct ReadFailingCursor {
@@ -4139,6 +4144,19 @@ mod tests {
     impl Seek for ReadFailingCursor {
         fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
             self.inner.seek(pos)
+        }
+    }
+
+    struct MissingOnResolve;
+
+    impl crate::object_handle::DocumentResolver for MissingOnResolve {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            handle.set_missing();
+            Ok(())
         }
     }
 
@@ -6808,6 +6826,25 @@ mod tests {
         assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
     }
 
+    #[test]
+    fn resolve_object_handle_lifts_when_the_canonical_retry_marks_missing() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
+            .expect("open false-next-offset PDF");
+        pdf.cache.set_resolved(
+            object_ref,
+            Object::Stream(Stream::new(Dictionary::new(), b"cached".to_vec())),
+        );
+
+        let resolver: Rc<dyn crate::object_handle::DocumentResolver> = Rc::new(MissingOnResolve);
+        let handle = ObjectHandle::new_indirect_with_resolver(object_ref, Rc::downgrade(&resolver));
+        pdf.resolve_object_handle(&handle)
+            .expect("the cached legacy value must remain liftable");
+
+        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"cached".to_vec())));
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+    }
+
     /// A malformed/overlapping xref layout whose bogus "next object" offset
     /// lands between object 1's dictionary and its `stream` keyword: long
     /// enough for the dictionary to parse successfully within the bounded
@@ -8641,6 +8678,62 @@ mod tests {
         assert!(
             nested.description().contains("object 1 0 at offset"),
             "the nested direct handle must retain its source description"
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_gives_native_parser_children_the_document_resolver() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Outer << /Inner << /Value 7 >> >> >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve through the public native bridge");
+
+        let inner = handle
+            .as_dictionary()
+            .and_then(|entries| entries.get(b"Outer".as_slice()).cloned())
+            .and_then(|outer| outer.as_dictionary())
+            .and_then(|entries| entries.get(b"Inner".as_slice()).cloned())
+            .expect("nested dictionary");
+        inner
+            .object_warning("nested warning")
+            .expect("native parser children must retain the document warning resolver");
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("nested warning")));
+    }
+
+    #[test]
+    fn canonical_resolution_preserves_placeholder_text_in_the_input_description() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Value 7 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: "input-$PO-$OG.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        handle
+            .try_dereference()
+            .expect("resolve through the canonical lazy resolver");
+
+        assert!(
+            handle
+                .description()
+                .contains("input-$PO-$OG.pdf, object 1 0 at offset"),
+            "canonical transfer must preserve literal placeholder text"
         );
     }
 

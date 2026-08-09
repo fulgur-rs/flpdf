@@ -1121,6 +1121,14 @@ impl ObjectHandle {
         !matches!(self.0.borrow().state, ObjectState::NotYetResolved)
     }
 
+    /// True only when the slot contains an actual resolved value. `Missing`
+    /// is intentionally excluded even though it is terminal for the public
+    /// null-like accessors; callers preserving an already-resolved legacy
+    /// value must not mistake that fallback state for a successful parse.
+    pub(crate) fn has_resolved_value(&self) -> bool {
+        matches!(self.0.borrow().state, ObjectState::Resolved(_))
+    }
+
     /// Resolve this handle's own canonical slot in place, mirroring
     /// `QPDFObjectHandle::dereference` → `QPDFObject::resolve`.
     ///
@@ -1218,6 +1226,18 @@ impl ObjectHandle {
 
     pub(crate) fn description(&self) -> String {
         self.0.borrow().get_description()
+    }
+
+    /// Return the unrendered qpdf-style template, when this handle carries
+    /// one. Canonical resolver transfers must copy this representation rather
+    /// than the rendered [`Self::description`]: a caller's escaped literal
+    /// `$PO`/`$OG` would otherwise become parser-owned placeholders again on
+    /// the next render.
+    pub(crate) fn description_template(&self) -> Option<String> {
+        match self.0.borrow().description.as_ref() {
+            Some(ObjectDescription::Template(template)) => Some(template.clone()),
+            Some(ObjectDescription::Json(_) | ObjectDescription::Child(_)) | None => None,
+        }
     }
 
     #[allow(dead_code)]

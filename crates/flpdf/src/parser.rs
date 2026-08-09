@@ -2233,30 +2233,33 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             TokenType::DictOpen => {
                 let offset = base_offset + token.start as i64;
                 let value = self.dictionary_handle(base_offset, resolver)?;
-                Ok(self.wrap_direct(value, offset))
+                Ok(self.wrap_direct(value, offset, resolver))
             }
             TokenType::ArrayOpen => {
                 let offset = base_offset + token.start as i64;
                 let value = self.array_handle(base_offset, resolver)?;
-                Ok(self.wrap_direct(value, offset))
+                Ok(self.wrap_direct(value, offset, resolver))
             }
             TokenType::Name => Ok(self.wrap_direct(
                 ObjectValue::Name(token.value[1..].to_vec()),
                 base_offset + token.start as i64,
+                resolver,
             )),
             TokenType::String => Ok(self.wrap_direct(
                 ObjectValue::String(token.value),
                 base_offset + token.start as i64,
+                resolver,
             )),
             TokenType::Bool => Ok(self.wrap_direct(
                 ObjectValue::Boolean(token.value == b"true"),
                 base_offset + token.start as i64,
+                resolver,
             )),
             // qpdf constructs QPDF_Null without assigning a description or
             // offset (design's Fixed qpdf Facts) — the sentinel stays -1.
             TokenType::Null => Ok(ObjectHandle::null()),
             TokenType::Integer => self.integer_or_ref_handle(token, base_offset, resolver),
-            TokenType::Real => self.real_object_handle(token, base_offset),
+            TokenType::Real => self.real_object_handle(token, base_offset, resolver),
             TokenType::Bad => Err(Error::parse(
                 token.error_offset,
                 token
@@ -2318,7 +2321,7 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         let offset = base_offset + first_token.start as i64;
         match self.integer_or_ref_decision(&first_token)? {
             IntegerOrRefDecision::Integer(n) => {
-                Ok(self.wrap_direct(ObjectValue::Integer(n), offset))
+                Ok(self.wrap_direct(ObjectValue::Integer(n), offset, resolver))
             }
             // The referenced handle's own offset is populated only when (if
             // ever) it is itself parsed as a top-level object — a reference
@@ -2329,7 +2332,12 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
         }
     }
 
-    fn real_object_handle(&self, token: Token, base_offset: i64) -> Result<ObjectHandle> {
+    fn real_object_handle(
+        &self,
+        token: Token,
+        base_offset: i64,
+        resolver: &mut dyn HandleResolver,
+    ) -> Result<ObjectHandle> {
         let offset = base_offset + token.start as i64;
         let value = match classify_real(token)? {
             RealClassification::Canonical(value) => ObjectValue::Real(value),
@@ -2337,11 +2345,16 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
                 ObjectValue::RealLiteral { value, literal }
             }
         };
-        Ok(self.wrap_direct(value, offset))
+        Ok(self.wrap_direct(value, offset, resolver))
     }
 
-    fn wrap_direct(&self, value: ObjectValue, offset: i64) -> ObjectHandle {
-        let handle = ObjectHandle::from_value(value);
+    fn wrap_direct(
+        &self,
+        value: ObjectValue,
+        offset: i64,
+        resolver: &mut dyn HandleResolver,
+    ) -> ObjectHandle {
+        let handle = resolver.direct_handle(value);
         if let Some(description) = &self.description_template {
             handle.set_description(description.clone(), offset);
         } else {
