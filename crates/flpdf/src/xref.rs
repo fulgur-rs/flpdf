@@ -463,7 +463,37 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
                 ));
             }
 
-            let parsed = parse_qpdf_direct_object(&decoded_stream_data[member_start..])?;
+            let parsed = match parse_qpdf_direct_object(&decoded_stream_data[member_start..]) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    if !matches!(error, Error::Parse { .. }) {
+                        return Err(error); // cov:ignore: byte-backed direct parser errors are parse errors
+                    }
+                    let diagnostic_offset = match &error {
+                        Error::Parse { offset, .. } => member_start.saturating_add(*offset),
+                        _ => member_start, // cov:ignore: non-parse errors return above
+                    };
+                    self.diagnostics.push(Diagnostic::warning(
+                        format!(
+                            "object stream {stream_number} (object {} 0, offset {diagnostic_offset}): {error}",
+                            object_ref.number
+                        ),
+                        Some(diagnostic_offset as u64),
+                    ));
+                    self.cache.insert(object_ref, Object::Null);
+                    continue;
+                }
+            };
+            if let Some(empty_offset) = parsed.empty_offset {
+                let diagnostic_offset = member_start.saturating_add(empty_offset);
+                self.diagnostics.push(Diagnostic::warning(
+                    format!(
+                        "object stream {stream_number} (object {} 0, offset {diagnostic_offset}): empty object treated as null",
+                        object_ref.number
+                    ),
+                    Some(diagnostic_offset as u64),
+                ));
+            }
             for diagnostic in parsed.diagnostics {
                 let offset = member_start.saturating_add(diagnostic.relative_offset);
                 self.diagnostics.push(Diagnostic::warning(
@@ -2585,9 +2615,17 @@ mod tests {
     }
 
     fn test_objstm_bytes(stream_number: u32, members: &[(u32, &[u8])]) -> Vec<u8> {
+        test_objstm_bytes_with_type(stream_number, members, "ObjStm")
+    }
+
+    fn test_objstm_bytes_with_type(
+        stream_number: u32,
+        members: &[(u32, &[u8])],
+        type_name: &str,
+    ) -> Vec<u8> {
         let (payload, first) = test_objstm_payload(members);
         let mut bytes = format!(
-            "{stream_number} 0 obj\n<< /Type /ObjStm /N {} /First {first} /Length {} >>\nstream\n",
+            "{stream_number} 0 obj\n<< /Type /{type_name} /N {} /First {first} /Length {} >>\nstream\n",
             members.len(),
             payload.len()
         )
@@ -2595,6 +2633,37 @@ mod tests {
         bytes.extend_from_slice(&payload);
         bytes.extend_from_slice(b"\nendstream\nendobj\n");
         bytes
+    }
+
+    fn with_bootstrap_objstm_context<T>(
+        bytes: &[u8],
+        stream_offset: u64,
+        object_numbers: &[u32],
+        test: impl FnOnce(&mut XrefReadContext<'_, '_>) -> T,
+    ) -> T {
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(
+            ObjectRef::new(8, 0),
+            XrefEntry::Uncompressed {
+                offset: stream_offset,
+            },
+        );
+        for (index, object_number) in object_numbers.iter().copied().enumerate() {
+            registration.insert_xref_entry(
+                ObjectRef::new(object_number, 0),
+                XrefEntry::Compressed {
+                    stream: 8,
+                    index: index as u32,
+                },
+            );
+        }
+        let mut context = XrefReadContext::new(
+            bytes,
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+        test(&mut context)
     }
 
     fn test_flate_objstm_bytes(stream_number: u32, members: &[(u32, &[u8])]) -> Vec<u8> {
@@ -3241,6 +3310,143 @@ mod tests {
             Object::Null
         );
         assert!(!context.diagnostics.entries().is_empty());
+    }
+
+    #[test]
+    fn bootstrap_context_caches_later_member_after_earlier_parse_failure() {
+        let members = [(2, b"<< /Value".as_slice()), (4, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Integer(42)
+            );
+            assert!(!context.diagnostics.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_warns_for_empty_member_and_caches_following_member() {
+        let members = [(2, b"endobj".as_slice()), (4, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Integer(42)
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("empty object treated as null")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_preserves_wrong_type_warning_while_resolving_members() {
+        let members = [(2, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes_with_type(8, &members, "BadTyp"));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Integer(42)
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("has wrong type")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_reports_member_offset_out_of_range() {
+        let (payload, _) = test_objstm_payload(&[(2, b"42".as_slice())]);
+        let first = payload.len() + 100;
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic
+                    .message
+                    .contains("object stream member offset is out of range")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_records_member_parser_diagnostics() {
+        let members = [(2, b"/Bad#Name".as_slice()), (4, b"42".as_slice())];
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(&test_objstm_bytes(8, &members));
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2, 4], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Name(b"Bad\0Name".to_vec())
+            );
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(4, 0)),
+                Object::Integer(42)
+            );
+            assert!(context
+                .diagnostics
+                .entries()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("stray #")));
+        });
+    }
+
+    #[test]
+    fn bootstrap_context_warns_and_returns_null_for_non_parse_objstm_errors() {
+        let payload = b"2 0 42";
+        let mut bytes = b" \n".to_vec();
+        let stream_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!(
+                "8 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Filter /NoSuchFilter /Length {} >>\nstream\n",
+                payload.len()
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        with_bootstrap_objstm_context(&bytes, stream_offset, &[2], |context| {
+            assert_eq!(
+                context.resolve_reference(ObjectRef::new(2, 0)),
+                Object::Null
+            );
+            assert!(!context.diagnostics.entries().is_empty());
+        });
     }
 
     #[test]
