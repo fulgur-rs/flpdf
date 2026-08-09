@@ -784,9 +784,9 @@ fn rejects_startxref_offset_exactly_at_eof_without_panic() {
     assert!(matches!(err, Error::Parse { .. }), "got {err:?}");
 }
 
-/// Best-effort recovery must detect a `/Type /ObjStm` object stream during the
-/// linear scan and emit `XrefEntry::Compressed` entries for the objects it
-/// packs (`recover_xref_entries` ObjStm branch + `recover_compressed_offsets_from_objstm`).
+/// Best-effort recovery must not inspect a `/Type /ObjStm` object stream's
+/// contents during the linear scan. qpdf recovers the ObjStm container as an
+/// uncompressed entry but does not synthesize entries for packed members.
 ///
 /// The ObjStm carries no `/Filter`, so `decode_stream_data` is a passthrough and
 /// its raw bytes are the cross-reference pairs header `objnum offset ...` that
@@ -801,8 +801,8 @@ fn best_effort_recovers_objstm_compressed_entries() {
 
     // Object stream object number 5. Its payload begins with the pairs header
     // `7 0` (compressed object 7 at intra-stream offset 0) followed by the
-    // object body that lives at `/First`. `recover_compressed_offsets_from_objstm`
-    // only reads the leading `/N` pairs, so the body is incidental here.
+    // object body that lives at `/First`. qpdf's reconstruction scan does not
+    // inspect these stream contents.
     let objstm_obj_number: u32 = 5;
     let compressed_obj_number: u32 = 7;
     let objstm_data = b"7 0 <</Foo 1>>".to_vec();
@@ -846,22 +846,13 @@ fn best_effort_recovers_objstm_compressed_entries() {
             offset: objstm_offset
         })
     );
-    // The packed object recovers as a compressed entry pointing at the ObjStm.
+    // The packed object is not independently rediscovered from the ObjStm.
     assert_eq!(
         loaded
             .entries
             .get(&ObjectRef::new(compressed_obj_number, 0)),
-        Some(&XrefEntry::Compressed {
-            stream: objstm_obj_number,
-            index: 0,
-        })
-    );
-    assert!(
-        loaded
-            .entries
-            .values()
-            .any(|entry| matches!(entry, XrefEntry::Compressed { stream, .. } if *stream == objstm_obj_number)),
-        "expected at least one compressed entry referencing the ObjStm"
+        None,
+        "reconstruction must not synthesize a type-2 entry from ObjStm contents"
     );
 }
 
@@ -896,19 +887,15 @@ fn best_effort_recovers_objstm_with_indirect_length() {
     );
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefEntry::Compressed {
-            stream: 5,
-            index: 0,
-        })
+        None,
+        "indirect stream length must not enable ObjStm content recovery"
     );
 }
 
 /// An ObjStm whose stream payload contains a header-like line (`9 0 obj`) makes
-/// the linear scan record a spurious object *inside* the stream, whose offset
-/// would truncate the ObjStm's recovery window before its declared `/Length`.
-/// The bounded-window pass therefore fails to parse it; the read-to-end fallback
-/// recovers it from the stream's own `/Length`, so the packed object (7) still
-/// gets a compressed entry.
+/// the linear scan record a spurious object *inside* the stream. qpdf does not
+/// parse the ObjStm during reconstruction, so neither the spurious header nor
+/// the stream's `/Length` can cause packed object (7) to become a type-2 entry.
 #[test]
 fn best_effort_recovers_objstm_truncated_by_in_stream_header() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
@@ -942,147 +929,12 @@ fn best_effort_recovers_objstm_truncated_by_in_stream_header() {
             offset: objstm_offset
         })
     );
-    // The packed object recovers despite the in-stream header truncating the
-    // bounded window — proof the fallback ran.
+    // The packed object remains absent despite the in-stream header.
     assert_eq!(
         loaded.entries.get(&ObjectRef::new(7, 0)),
-        Some(&XrefEntry::Compressed {
-            stream: 5,
-            index: 0,
-        })
+        None,
+        "reconstruction must not inspect ObjStm contents after a header-like line"
     );
-}
-
-/// Build a best-effort fixture whose only `/Type /ObjStm` object carries the
-/// given `dict_body` (between `<<` and `>>`) and `stream_payload`. The xref
-/// keyword is corrupted so strict parsing fails and best-effort falls into the
-/// linear scan, which detects the ObjStm and calls
-/// `recover_compressed_offsets_from_objstm`. A plain catalog object (number 1)
-/// is included so recovery always yields at least one entry and returns `Ok`.
-///
-/// Returns the assembled bytes plus the ObjStm object number (5) so callers can
-/// assert that NO compressed entry was produced (each error arm of
-/// `recover_compressed_offsets_from_objstm` returns early without inserting).
-fn objstm_recovery_fixture(dict_body: &str, stream_payload: &[u8]) -> (Vec<u8>, u32) {
-    let mut bytes = b"%PDF-1.7\n".to_vec();
-    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
-
-    let objstm_obj_number: u32 = 5;
-    let objstm_obj = format!(
-        "{objstm_obj_number} 0 obj\n<< /Type /ObjStm {dict_body} /Length {} >>\nstream\n",
-        stream_payload.len()
-    )
-    .into_bytes();
-    bytes.extend_from_slice(&objstm_obj);
-    bytes.extend_from_slice(stream_payload);
-    bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-    let start_xref = bytes.len();
-    bytes.extend_from_slice(b"xref\n0 1\n0000000000 65535 f \n");
-    bytes.extend_from_slice(
-        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n").as_bytes(),
-    );
-    // Corrupt the standalone `xref` table keyword (xref -> xrzf) at its known
-    // offset, leaving `startxref` intact so strict parsing reaches and rejects
-    // the malformed table rather than failing on a missing `startxref`.
-    assert_eq!(
-        &bytes[start_xref..start_xref + 4],
-        b"xref",
-        "fixture layout changed: start_xref must point at the table keyword"
-    );
-    bytes[start_xref + 2] = b'z';
-
-    (bytes, objstm_obj_number)
-}
-
-/// Assert the fixture recovers via best-effort (Ok) but produced NO compressed
-/// entry referencing the ObjStm: every error arm of
-/// `recover_compressed_offsets_from_objstm` returns early before inserting.
-fn assert_no_compressed_entry(bytes: Vec<u8>, objstm_obj_number: u32) {
-    // Strict mode must reject the corrupt xref first.
-    load_xref_and_trailer(&mut Cursor::new(bytes.clone()))
-        .expect_err("corrupt xref should fail in strict mode");
-
-    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
-    // Recovery still produced the catalog as a normal offset entry.
-    assert!(
-        loaded.entries.contains_key(&ObjectRef::new(1, 0)),
-        "recovery should still yield the catalog object"
-    );
-    // But no compressed entry points at the (malformed) ObjStm.
-    assert!(
-        !loaded.entries.values().any(|entry| matches!(
-            entry,
-            XrefEntry::Compressed { stream, .. } if *stream == objstm_obj_number
-        )),
-        "malformed ObjStm must not yield a compressed entry"
-    );
-}
-
-/// `recover_compressed_offsets_from_objstm` decode-failure arm: an ObjStm whose
-/// `/Filter` cannot be decoded makes `decode_stream_data` return `Err`, so the
-/// routine returns early and emits no compressed entry.
-#[test]
-fn best_effort_objstm_undecodable_filter_yields_no_compressed_entry() {
-    // A bogus filter name `apply_single_filter_decode` does not recognize.
-    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 4 /Filter /NoSuchFilter", b"7 0 x");
-    assert_no_compressed_entry(bytes, objstm);
-}
-
-/// `recover_compressed_offsets_from_objstm` `/N` parse arm: a negative `/N`
-/// makes `parse_non_negative_u64` return `Err`, so the routine returns early.
-#[test]
-fn best_effort_objstm_negative_n_yields_no_compressed_entry() {
-    let (bytes, objstm) = objstm_recovery_fixture("/N -1 /First 4", b"7 0 <</Foo 1>>");
-    assert_no_compressed_entry(bytes, objstm);
-}
-
-/// `recover_compressed_offsets_from_objstm` object-number `parse_non_negative_i64`
-/// arm: a decoded object number that is negative makes the routine return early.
-#[test]
-fn best_effort_objstm_negative_object_number_yields_no_compressed_entry() {
-    // Decoded pairs lead with `-1 0`: the object number is negative.
-    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 6", b"-1 0 <</Foo 1>>");
-    assert_no_compressed_entry(bytes, objstm);
-}
-
-/// `recover_compressed_offsets_from_objstm` object-number read arm: the decoded
-/// data does not begin with an integer where the object number is expected, so
-/// `integer_for_indirect` fails and the routine returns early.
-#[test]
-fn best_effort_objstm_non_integer_object_number_yields_no_compressed_entry() {
-    // `/N 1` but the payload is a name, not the expected leading integer.
-    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 4", b"/Foo 0 0");
-    assert_no_compressed_entry(bytes, objstm);
-}
-
-/// `recover_compressed_offsets_from_objstm` `u32::try_from` arm: a decoded
-/// object number larger than `u32::MAX` overflows the `u32` conversion, so the
-/// routine returns early.
-#[test]
-fn best_effort_objstm_object_number_overflows_u32_yields_no_compressed_entry() {
-    // 5_000_000_000 > u32::MAX (4_294_967_295).
-    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 16", b"5000000000 0 <<>>");
-    assert_no_compressed_entry(bytes, objstm);
-}
-
-/// `recover_compressed_offsets_from_objstm` offset `parse_non_negative_i64` arm:
-/// a negative intra-stream offset makes the routine return early.
-#[test]
-fn best_effort_objstm_negative_offset_yields_no_compressed_entry() {
-    // Object number 7 is valid, but its offset `-1` is negative.
-    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 6", b"7 -1 <</Foo 1>>");
-    assert_no_compressed_entry(bytes, objstm);
-}
-
-/// `recover_compressed_offsets_from_objstm` offset read arm: after a valid
-/// object number, the offset slot is not an integer, so `integer_for_indirect`
-/// fails and the routine returns early.
-#[test]
-fn best_effort_objstm_non_integer_offset_yields_no_compressed_entry() {
-    // `7` parses as the object number, then `/Bar` is not the expected integer.
-    let (bytes, objstm) = objstm_recovery_fixture("/N 1 /First 4", b"7 /Bar 0");
-    assert_no_compressed_entry(bytes, objstm);
 }
 
 /// qpdf accepts a recovered trailer even when the linear scan finds no
@@ -1332,12 +1184,15 @@ fn best_effort_line_scan_honours_qpdf_reconstruct_guards() {
     assert_eq!(loaded.entries.len(), 1);
 }
 
-/// When recovery finds objects but no `trailer` keyword exists, `recover_trailer`
-/// must fail with "trailer dictionary not found".
+/// When recovery finds objects but no `trailer` keyword exists and none of the
+/// reconstructed objects is a `/Type /XRef` stream, `reconstruct_xref` must
+/// fail with "unable to find trailer dictionary while recovering damaged
+/// file" (qpdf 11.9.0 `QPDF.cc:615`).
 #[test]
 fn best_effort_errors_when_trailer_missing() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
-    // A recoverable indirect object so `recover_xref_entries` succeeds.
+    // A recoverable indirect object so `recover_xref_entries` succeeds, but not
+    // a stream, so it is not a `/Type /XRef` candidate either.
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     let start_xref = bytes.len();
     // Corrupt xref keyword and rename the `trailer` keyword to `traile_` so the
@@ -1351,7 +1206,7 @@ fn best_effort_errors_when_trailer_missing() {
         .expect_err("missing trailer keyword should fail");
     let message = format!("{err}");
     assert!(
-        message.contains("trailer dictionary not found"),
+        message.contains("unable to find trailer dictionary while recovering damaged file"),
         "got {message}"
     );
     let (source, diagnostics) = err
@@ -1361,12 +1216,17 @@ fn best_effort_errors_when_trailer_missing() {
     assert_eq!(diagnostics.entries().len(), 3);
 }
 
-/// When the `trailer` keyword is present but followed by a non-dictionary token,
-/// `recover_trailer` must fail with "trailer dictionary is not a dictionary".
+/// When the `trailer` keyword is present but followed by a non-dictionary
+/// token, qpdf's own `reconstruct_xref` (`QPDF.cc:564-570`) does not stop the
+/// scan or throw there ("Oh well. It was worth a try.") -- it just leaves the
+/// trailer unset and keeps scanning. With no `/Type /XRef` candidate either,
+/// the terminal error is the same "unable to find trailer dictionary while
+/// recovering damaged file" as a file with no `trailer` keyword at all.
 #[test]
 fn best_effort_errors_when_trailer_not_dictionary() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
-    // A recoverable indirect object so `recover_xref_entries` succeeds.
+    // A recoverable indirect object so `recover_xref_entries` succeeds, but not
+    // a stream, so it is not a `/Type /XRef` candidate either.
     bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
     let start_xref = bytes.len();
     bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
@@ -1377,7 +1237,7 @@ fn best_effort_errors_when_trailer_not_dictionary() {
         .expect_err("non-dictionary trailer should fail");
     let message = format!("{err}");
     assert!(
-        message.contains("trailer dictionary is not a dictionary"),
+        message.contains("unable to find trailer dictionary while recovering damaged file"),
         "got {message}"
     );
     let (source, diagnostics) = err
@@ -1385,6 +1245,73 @@ fn best_effort_errors_when_trailer_not_dictionary() {
         .expect("terminal repair failure carries warnings");
     assert!(matches!(source, Error::Parse { .. }), "got {source:?}");
     assert_eq!(diagnostics.entries().len(), 3);
+}
+
+/// qpdf's reconstruction scan keeps the first successfully parsed trailer
+/// dictionary and ignores a later malformed/non-dictionary candidate. A raw
+/// last-occurrence search would select `trailer 42` and fail recovery instead.
+#[test]
+fn best_effort_recovery_keeps_first_valid_trailer_before_invalid_candidate() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let object_offset = 9;
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R >>\ntrailer\n42\nstartxref\n{start_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.trailer.get("Size"), Some(&Object::Integer(2)));
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(1, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: object_offset
+        })
+    );
+}
+
+/// A malformed candidate must not terminate qpdf's forward scan; a later
+/// valid dictionary is accepted when no earlier valid trailer exists.
+#[test]
+fn best_effort_recovery_skips_invalid_trailer_before_valid_candidate() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n42\ntrailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.trailer.get("Size"), Some(&Object::Integer(2)));
+    assert_eq!(loaded.trailer.get_ref("Root"), Some(ObjectRef::new(1, 0)));
+}
+
+/// Once a valid dictionary has been accepted, a later valid dictionary is
+/// ignored as well (`QPDF::setTrailer` is first-valid-wins, not last-wins).
+#[test]
+fn best_effort_recovery_keeps_first_valid_trailer_before_later_valid_candidate() {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let start_xref = bytes.len();
+    bytes.extend_from_slice(b"zref\n0 2\n0000000000 65535 f \n");
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 2 /Root 1 0 R >>\ntrailer\n<< /Size 99 /Root 1 0 R >>\nstartxref\n{start_xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes)).unwrap();
+    assert_eq!(loaded.trailer.get("Size"), Some(&Object::Integer(2)));
 }
 
 /// When `startxref` is absent, repair pushes a "can't find startxref" error
@@ -2934,7 +2861,7 @@ fn ignore_xref_streams_falls_back_to_reconstruction() {
 }
 
 #[test]
-fn ignore_xref_streams_cannot_reconstruct_a_document_without_a_trailer_keyword() {
+fn ignore_xref_streams_finds_a_candidate_but_cannot_decode_it() {
     let (bytes, xref_stream_offset) = xref_stream_document(false);
 
     let err = open_error(
@@ -2959,16 +2886,81 @@ fn ignore_xref_streams_cannot_reconstruct_a_document_without_a_trailer_keyword()
         ]
     );
 
-    // Known divergence, message only: both implementations fail here, but qpdf
-    // reports "error decoding candidate xref stream while recovering damaged
-    // file". Its reconstruct_xref takes the last candidate /XRef stream's
-    // dictionary as the trailer and re-enters read_xref, which hits the same
-    // gate; flpdf's recover_trailer searches only for the `trailer` keyword.
-    // This assertion changes when that fallback is ported.
+    // qpdf 11.9.0's `reconstruct_xref` (`QPDF.cc:577-608`) finds the
+    // reconstructed `/Type /XRef` stream candidate (the line scan does not
+    // consult `ignore_xref_streams`) and re-enters `read_xref` at its offset;
+    // `read_xrefStream` then honors the option and refuses to read it, so the
+    // terminal error is the candidate-decode failure rather than "no trailer".
     assert_eq!(
         source.to_string(),
-        "parse error at byte 0: trailer dictionary not found"
+        "parse error at byte 0: error decoding candidate xref stream while recovering damaged file"
     );
+}
+
+#[test]
+fn candidate_recovery_warns_when_xref_size_is_not_one_plus_highest_object() {
+    let (mut bytes, xref_stream_offset) = xref_stream_document(false);
+    let size_token = b"/Size 3";
+    let size_offset = bytes
+        .windows(size_token.len())
+        .position(|window| window == size_token)
+        .expect("candidate xref stream has a /Size entry");
+    bytes[size_offset + b"/Size ".len()] = b'4';
+
+    let original_suffix = format!("startxref\n{xref_stream_offset}\n%%EOF\n");
+    assert!(bytes.ends_with(original_suffix.as_bytes()));
+    bytes.truncate(bytes.len() - original_suffix.len());
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("candidate xref-stream recovery should succeed");
+
+    assert_eq!(loaded.last_xref_form, XrefForm::Stream);
+    assert_eq!(loaded.startxref, xref_stream_offset);
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (4) is not one plus the highest object number (2)"
+                && diagnostic.offset.is_none()
+        }));
+}
+
+#[test]
+fn incremental_write_after_candidate_recovery_uses_the_recovered_offset() {
+    // flpdf-specific correctness gate: qpdf's own `QPDFWriter` has no
+    // incremental-update mode at all, so there is no oracle behavior to
+    // match here -- this instead protects flpdf's own incremental writer's
+    // structural contract. After a corrupt-`startxref` document recovers via
+    // the xref-stream-candidate fallback, a subsequent incremental write's
+    // `/Prev` must point at the recovered, verified offset, not the original
+    // corrupt `startxref` value that a strict reopen of the written output
+    // could never follow.
+    let (mut bytes, xref_stream_offset) = xref_stream_document(false);
+    let original_suffix = format!("startxref\n{xref_stream_offset}\n%%EOF\n");
+    assert!(bytes.ends_with(original_suffix.as_bytes()));
+    bytes.truncate(bytes.len() - original_suffix.len());
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+
+    let mut pdf =
+        Pdf::open_with_repair(Cursor::new(bytes)).expect("candidate recovery recovers the trailer");
+
+    let mut out = Vec::new();
+    write_pdf(&mut pdf, &mut out).expect("incremental write succeeds");
+    let out_str = String::from_utf8_lossy(&out);
+
+    assert!(
+        out_str.contains(&format!("/Prev {xref_stream_offset}")),
+        "incremental /Prev must point at the recovered offset, got:\n{out_str}"
+    );
+    assert!(
+        !out_str.contains("/Prev 999999"),
+        "incremental /Prev must not carry over the original corrupt startxref, got:\n{out_str}"
+    );
+
+    Pdf::open_mem_owned(out).expect("the incrementally-written output must be strictly reopenable");
 }
 
 #[test]
@@ -3090,7 +3082,3 @@ fn ignore_xref_streams_leaves_classic_xref_tables_untouched() {
 //   `merge_previous_xref_sections` is unreachable on 64-bit targets, where
 //   `usize::try_from(u64)` cannot overflow.
 //
-// * The `/N` `usize::try_from` overflow arm of
-//   `recover_compressed_offsets_from_objstm` is likewise unreachable on 64-bit
-//   targets: `/N` is parsed as a non-negative `u64`, and `usize::try_from(u64)`
-//   cannot overflow when `usize` is 64-bit.

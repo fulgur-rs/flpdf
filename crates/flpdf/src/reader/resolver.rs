@@ -664,6 +664,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    /// qpdf's `damagedPDF("expected endobj")` is rendered with the object
+    /// identity and the input source's last offset already in the message
+    /// (`libqpdf/QPDF.cc:1297-1310,1331-1355,2641-2644`). Keeping that
+    /// location in the diagnostic text also lets the qtest driver add only
+    /// the filename, as qpdf's warning formatter does.
+    fn expected_endobj_warning(object_ref: ObjectRef, offset: u64) -> String {
+        format!(
+            "(object {} {}, offset {offset}): expected endobj",
+            object_ref.number, object_ref.generation
+        )
+    }
+
     /// The canonical handle for `object_ref` **if one has already been
     /// minted**, without minting one.
     ///
@@ -789,7 +801,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "input ended before the detected PDF header offset",
             )
         })?;
-        let new_entries = crate::xref::recover_xref_entries(logical_bytes)?;
+        let new_entries = crate::xref::recover_xref_entries(logical_bytes, false)?.entries;
 
         {
             let mut core = self.core.borrow_mut();
@@ -1687,12 +1699,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// This legacy helper still reports a slice-relative error for malformed
     /// stream framing. File-object diagnostics no longer pass through it and
     /// retain their absolute input offsets.
-    fn read_token_from_input(&self) -> Result<Token> {
+    fn read_token_from_input(&self) -> Result<(Token, u64)> {
+        let start = self.tell()?;
         self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
             tokenizer.allow_eof();
             let token = tokenizer.read_token(false, 0)?;
             Ok((token, tokenizer.position()))
+        })
+        .map(|token| {
+            let offset = start.saturating_add(token.start as u64);
+            (token, offset)
         })
     }
 
@@ -1860,11 +1877,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if trailing.is_word_value(b"stream") {
             let stream_description = self.stream_description(expected);
             let (value, parsed_offset) =
-                self.read_stream(value, parsed_offset, description, offset)?;
+                self.read_stream(value, parsed_offset, description, offset, expected)?;
             Ok((value, parsed_offset, stream_description))
         } else {
             if !trailing.is_word_value(b"endobj") {
-                self.push_warning("expected endobj")?;
+                self.push_warning(Self::expected_endobj_warning(
+                    expected,
+                    u64::try_from(trailing.start).unwrap_or(u64::MAX),
+                ))?;
             }
             Ok((value, parsed_offset, description))
         }
@@ -1915,6 +1935,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         dict_offset: i64,
         dict_description: String,
         object_offset: u64,
+        object_ref: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
 
@@ -1949,7 +1970,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
             // qpdf `:1386-1389`. A mismatched framing token is a QPDFExc and
             // enters the same recovery arm as an unusable `/Length`.
-            if !self.read_token_from_input()?.is_word_value(b"endstream") {
+            if !self.read_token_from_input()?.0.is_word_value(b"endstream") {
                 let error = Error::parse(stream_offset as usize, "expected endstream");
                 if !self.attempt_recovery() {
                     return Err(error);
@@ -1961,8 +1982,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         // qpdf `:1350-1354`: `readObject` reads one more token after
         // `readStream` returns and warns if it is not `endobj`.
-        if !self.read_token_from_input()?.is_word_value(b"endobj") {
-            self.push_warning("expected endobj")?;
+        let (trailing, trailing_offset) = self.read_token_from_input()?;
+        if !trailing.is_word_value(b"endobj") {
+            self.push_warning(Self::expected_endobj_warning(object_ref, trailing_offset))?;
         }
 
         let dict = self.direct_object_handle(dict);
@@ -6525,7 +6547,7 @@ mod tests {
         with_second_object(b"2 0 obj\n42\nenddobj\n", |handle, outcome, warnings| {
             outcome.expect("qpdf warns here rather than failing");
             assert_eq!(handle.as_integer(), Some(42));
-            assert_eq!(warnings, ["expected endobj"]);
+            assert_eq!(warnings, ["(object 2 0, offset 56): expected endobj"]);
         });
     }
 
@@ -6598,7 +6620,7 @@ mod tests {
             .collect();
         assert_eq!(
             messages,
-            ["expected endobj"],
+            ["(object 9 0, offset 185): expected endobj"],
             "the EOF must surface as the missing framing keyword, exactly as \
              it does after `endstream`"
         );
@@ -6770,7 +6792,7 @@ mod tests {
                     warnings,
                     [
                         "name with stray # will not work with PDF >= 1.2",
-                        "expected endobj",
+                        "(object 2 0, offset 67): expected endobj",
                     ]
                 );
             },
@@ -6987,7 +7009,7 @@ mod tests {
                         .as_slice(),
                     &b"abc"[..]
                 );
-                assert_eq!(warnings, ["expected endobj"]);
+                assert_eq!(warnings, ["(object 2 0, offset 90): expected endobj"]);
             },
         );
     }
@@ -7206,7 +7228,7 @@ mod tests {
             .iter()
             .map(|entry| entry.message.clone())
             .collect();
-        assert_eq!(messages, ["expected endobj"]);
+        assert_eq!(messages, ["(object 9 0, offset 191): expected endobj"]);
     }
 
     /// An input source that starts failing part-way through a resolution
@@ -7798,7 +7820,7 @@ mod tests {
     }
 
     #[test]
-    fn public_resolve_uses_canonical_for_recovered_compressed_entries() {
+    fn public_resolve_returns_null_for_unindexed_objstm_member() {
         let object_ref = ObjectRef::new(7, 0);
         let mut pdf = Pdf::open_mem_owned_with_options(
             recovered_objstm_member_pdf(),
@@ -7809,11 +7831,11 @@ mod tests {
         )
         .expect("open");
 
-        assert!(matches!(
+        assert_eq!(
             pdf.resolve(object_ref)
-                .expect("canonical ObjStm resolution must survive xref reconstruction"),
-            crate::Object::Dictionary(_)
-        ));
+                .expect("an unindexed packed member must resolve to null"),
+            crate::Object::Null
+        );
         assert!(pdf.reconstructed_xref());
     }
 
@@ -8225,7 +8247,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstruction_resolves_a_recovered_compressed_target() {
+    fn reconstruction_returns_null_for_unindexed_objstm_member() {
         let options = crate::PdfOpenOptions {
             repair: true,
             ..Default::default()
@@ -8236,14 +8258,11 @@ mod tests {
         let handle = pdf.get_object_handle(ObjectRef::new(7, 0));
         handle
             .try_dereference()
-            .expect("recovered type-2 entries use the canonical ObjStm resolver");
+            .expect("an unindexed packed member must resolve to null");
         assert_eq!(
-            handle.as_dictionary().and_then(|dictionary| {
-                dictionary
-                    .get(b"Value".as_slice())
-                    .and_then(ObjectHandle::as_integer)
-            }),
-            Some(9)
+            handle.unparse_resolved(),
+            b"null",
+            "reconstruction must not manufacture a type-2 entry for the packed member"
         );
         assert!(pdf.reconstructed_xref());
     }

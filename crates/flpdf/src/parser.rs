@@ -1526,16 +1526,37 @@ impl RecoveredStreamEol {
     }
 }
 
-pub(crate) fn parse_indirect_object(input: &[u8]) -> Result<(ObjectRef, Object)> {
+#[cfg(test)]
+pub(crate) fn parse_indirect_object(
+    input: &[u8],
+    policy: crate::reader::file_object::RecoveryPolicy,
+) -> Result<(ObjectRef, Object)> {
+    let (object_ref, object, _diagnostics) = parse_indirect_object_with_diagnostics(input, policy)?;
+    Ok((object_ref, object))
+}
+
+/// Like the test-only `parse_indirect_object` wrapper, but also returns the repair diagnostics
+/// recorded while completing the object (e.g. stream-length recovery). qpdf
+/// emits these warnings as soon as the object is read (`readStream`,
+/// `QPDF.cc:1350-1393`), so a caller that discovers a candidate through this
+/// path needs them even if it later abandons the object.
+pub(crate) fn parse_indirect_object_with_diagnostics(
+    input: &[u8],
+    policy: crate::reader::file_object::RecoveryPolicy,
+) -> Result<(
+    ObjectRef,
+    Object,
+    Vec<crate::reader::file_object::FileObjectDiagnostic>,
+)> {
     let pending = crate::reader::file_object::parse_strict_file_object_syntax(input)?;
-    let mut completed = crate::reader::file_object::finish_file_object(
-        input,
-        pending,
-        None,
-        crate::reader::file_object::RecoveryPolicy::RequireTerminator,
-    )?;
+    let mut completed =
+        crate::reader::file_object::finish_file_object(input, pending, None, policy)?;
     let _ = completed.remove_included_recovery_eol_for_decryption();
-    Ok((completed.object_ref, completed.object))
+    Ok((
+        completed.object_ref,
+        completed.object,
+        completed.diagnostics,
+    ))
 }
 
 /// Parse one object using qpdf's file-object rules. A bare `N G R` at the
@@ -2503,7 +2524,8 @@ mod stream_length_tests {
     #[test]
     fn strict_indirect_parser_recovers_unresolved_indirect_length() {
         let input = b"3 0 obj\n<< /Length 9 0 R >>\nstream\nstrict payload\nendstream\nendobj\n";
-        let (_, object) = parse_indirect_object(input).expect("strict indirect stream must parse");
+        let (_, object) = parse_indirect_object(input, RecoveryPolicy::RequireTerminator)
+            .expect("strict indirect stream must parse");
         assert_eq!(
             object.as_stream().expect("expected stream").data,
             b"strict payload"
@@ -2582,7 +2604,7 @@ mod stream_length_tests {
             &b"3 0 obj\n<< /Length 5 >>\nstream\nabc\nendstream\nendobj\n"[..],
         ] {
             assert!(
-                parse_indirect_object(input).is_err(),
+                parse_indirect_object(input, RecoveryPolicy::RequireTerminator).is_err(),
                 "a usable direct /Length must define the boundary"
             );
         }
@@ -2706,7 +2728,7 @@ mod stream_length_tests {
         bytes.extend_from_slice(b"payload with no terminator");
         // intentionally no `endstream`
         assert!(
-            parse_indirect_object(&bytes).is_err(),
+            parse_indirect_object(&bytes, RecoveryPolicy::RequireTerminator).is_err(),
             "an indirect-length stream with no endstream must error, not hang"
         );
     }
@@ -2738,7 +2760,7 @@ mod stream_length_tests {
     #[test]
     fn empty_indirect_object_recovery_is_qpdf_only_and_token_bounded() {
         let empty = b"7 0 obj\n  endobj\n";
-        assert!(parse_indirect_object(empty).is_err());
+        assert!(parse_indirect_object(empty, RecoveryPolicy::RequireTerminator).is_err());
 
         let pending = parse_file_object_syntax(empty).expect("qpdf empty recovery syntax");
         assert!(pending.indirect_length_ref().is_none());
@@ -2794,9 +2816,12 @@ mod stream_length_tests {
             Object::Reference(ObjectRef::new(6, 0))
         );
         assert_eq!(
-            parse_indirect_object(b"5 0 obj\n6 0 R\nendobj\n")
-                .expect("strict indirect-object parser")
-                .1,
+            parse_indirect_object(
+                b"5 0 obj\n6 0 R\nendobj\n",
+                RecoveryPolicy::RequireTerminator
+            )
+            .expect("strict indirect-object parser")
+            .1,
             Object::Reference(ObjectRef::new(6, 0))
         );
     }
