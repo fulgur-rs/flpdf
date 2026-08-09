@@ -2531,20 +2531,19 @@ pub(crate) fn write_deterministic_id_array(out: &mut Vec<u8>, id0: &[u8], id1: &
     out.push(b']');
 }
 
-/// Extract the source trailer's permanent identifier `/ID[0]` when `/ID` is a
-/// well-formed 2-element array whose elements are both *non-empty* strings.
-/// Returns `None` for any other shape (missing, wrong arity, wrong types, or an
-/// empty `/ID[0]`), in which case qpdf reuses the changing identifier as the
-/// permanent one. The returned bytes are preserved verbatim at any length:
-/// qpdf's `getOriginalID1` copies `/ID[0]` unchanged regardless of its length
-/// and only regenerates the 16-byte changing identifier `/ID[1]`, so the
-/// serialized `/ID` array is [`deterministic_id_array_len`]`(id0.len())` bytes
-/// wide. An empty `/ID[0]` is treated as absent (not preserved as `""`): qpdf
-/// falls back to the changing identifier for an empty original ID string.
+/// Extract the source trailer's non-empty string permanent identifier `/ID[0]`.
+/// qpdf's `getOriginalID1` reads only that first array item: `/ID[1]` may be
+/// absent or have any type. Returns `None` for a missing or non-array `/ID`, or
+/// a missing, non-string, or empty first item, in which case qpdf reuses the
+/// changing identifier as the permanent one. The returned bytes are preserved
+/// verbatim at any length: qpdf copies `/ID[0]` unchanged and only regenerates
+/// the 16-byte changing identifier `/ID[1]`, so the serialized `/ID` array is
+/// [`deterministic_id_array_len`]`(id0.len())` bytes wide. An empty `/ID[0]` is
+/// treated as absent (not preserved as `""`).
 fn source_permanent_id_value(source_id: Option<&Object>) -> Option<Vec<u8>> {
     match source_id {
-        Some(Object::Array(values)) if values.len() == 2 => match (&values[0], &values[1]) {
-            (Object::String(first), Object::String(_)) if !first.is_empty() => Some(first.clone()),
+        Some(Object::Array(values)) => match values.first() {
+            Some(Object::String(first)) if !first.is_empty() => Some(first.clone()),
             _ => None,
         },
         _ => None,
@@ -4631,10 +4630,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_id_array_static_falls_back_when_second_element_is_not_a_string() {
+    fn generate_id_array_static_preserves_id0_when_second_element_is_not_a_string() {
         // `/ID [<valid> 123]` — arity 2 but element 2 is not a string.
-        // Both elements must fall back to the constant (qpdf parity); the
-        // old guard checked only element 1 and wrongly kept it.
+        // qpdf's getOriginalID1 reads only element 1, so it remains the
+        // permanent ID while element 2 becomes the static changing ID.
         let source = Object::Array(vec![
             Object::String(b"permanent".to_vec()),
             Object::Integer(123),
@@ -4645,8 +4644,8 @@ mod tests {
         };
         assert_eq!(
             v[0],
-            Object::String(QPDF_STATIC_ID.to_vec()),
-            "malformed second element must force element 1 to the constant"
+            Object::String(b"permanent".to_vec()),
+            "qpdf preserves non-empty element 1 without inspecting element 2"
         );
         assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
     }
@@ -4796,9 +4795,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_id_array_regenerates_element1_when_source_id_is_malformed() {
-        // Arity-2 array but element 2 is not a string → not a usable /ID, so
-        // element 1 falls back to the generated element 2.
+    fn generate_id_array_preserves_id0_when_second_element_is_not_a_string() {
+        // qpdf's getOriginalID1 reads only non-empty `/ID[0]`; malformed or
+        // missing later array elements do not affect the permanent ID.
         let source = Object::Array(vec![
             Object::String(b"would-be-permanent".to_vec()),
             Object::Integer(123),
@@ -4807,14 +4806,26 @@ mod tests {
             Object::Array(values) => values,
             other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
         };
-        assert_ne!(
+        assert_eq!(
             v[0],
             Object::String(b"would-be-permanent".to_vec()),
-            "malformed source /ID must not be trusted as permanent id"
+            "qpdf preserves non-empty element 1 without inspecting element 2"
         );
-        assert_eq!(str_bytes(&v[0]).len(), 16);
         assert_eq!(str_bytes(&v[1]).len(), 16);
-        assert_eq!(v[0], v[1]);
+        assert_ne!(v[0], v[1]);
+    }
+
+    #[test]
+    fn generate_id_array_static_preserves_singleton_source_id0() {
+        // qpdf's getArrayItem(0) needs only the first array item; `/ID[1]`
+        // need not exist for a non-empty source permanent identifier to persist.
+        let source = Object::Array(vec![Object::String(b"singleton-permanent".to_vec())]);
+        let v = match generate_id_array(Some(&source), true) {
+            Object::Array(values) => values,
+            other => panic!("expected generated /ID array, got {other:?}"), // cov:ignore: test-shape guard
+        };
+        assert_eq!(v[0], Object::String(b"singleton-permanent".to_vec()));
+        assert_eq!(v[1], Object::String(QPDF_STATIC_ID.to_vec()));
     }
 
     // --- deterministic-id (qpdf --deterministic-id) -----------------------
@@ -5943,8 +5954,8 @@ mod tests {
         assert_eq!(id0, id1, "absent source /ID makes /ID[0] equal /ID[1]");
     }
 
-    /// Regression: the incremental xref-stream writer preserves `/ID` from
-    /// the source trailer and must render it in qpdf's compact
+    /// Regression: the incremental xref-stream writer owns the selected `/ID`
+    /// rather than inheriting the source trailer's value, and renders it in qpdf's compact
     /// `[<hex1><hex2>]` shape — the incremental xref-stream is exactly the
     /// reader-visible trailer, and qpdf's `writeTrailer` /
     /// `xref_stream::write_object` both emit compact `/ID`. Before this
@@ -5955,8 +5966,8 @@ mod tests {
     /// an xref-stream input with an `/ID`.
     #[test]
     fn write_incremental_xref_stream_emits_qpdf_compact_id_shape() {
-        // Build a trailer carrying an `/ID`; xref-stream layouts inherit
-        // `/ID` from the trailer at `stream_dict = trailer.clone()`.
+        // Give the source trailer and selected ID distinct values: the stream
+        // dictionary must serialize the selected ID after cloning the trailer.
         let mut trailer = Dictionary::new();
         trailer.insert(
             "ID",
@@ -5965,6 +5976,10 @@ mod tests {
                 Object::String(vec![0xCDu8; 16]),
             ]),
         );
+        let selected_id = Object::Array(vec![
+            Object::String(vec![0x11u8; 16]),
+            Object::String(vec![0x22u8; 16]),
+        ]);
         let source_offsets = BTreeMap::new();
         let root_ref = ObjectRef::new(1, 0);
 
@@ -5972,7 +5987,7 @@ mod tests {
         write_incremental_xref_stream(
             &mut bytes,
             &trailer,
-            trailer.get("ID").expect("test trailer must carry /ID"),
+            &selected_id,
             &source_offsets,
             &root_ref,
             /* xref_object_number */ 2,
@@ -5985,6 +6000,14 @@ mod tests {
         // Materialize the diagnostic on the covered path so the assert
         // message arms are not a coverage hole.
         let out_str = String::from_utf8_lossy(&bytes).into_owned();
+        let selected_id_bytes =
+            b"/ID [<11111111111111111111111111111111><22222222222222222222222222222222>]";
+        assert!(
+            bytes
+                .windows(selected_id_bytes.len())
+                .any(|window| window == selected_id_bytes),
+            "incremental xref-stream must serialize the selected /ID, not the source /ID; got: {out_str}"
+        );
         assert!(
             bytes.windows(6).any(|w| w == b"/ID [<"),
             "incremental xref-stream /ID must be compact `/ID [<...` \
