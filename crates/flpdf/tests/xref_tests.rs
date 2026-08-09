@@ -2623,6 +2623,10 @@ fn xref_stream_document(trailer_section: bool) -> (Vec<u8>, u64) {
 }
 
 fn xref_stream_document_with_indirect_size(size_value: i64) -> Vec<u8> {
+    xref_stream_document_with_indirect_size_object(format!("{size_value}\nendobj\n").as_bytes())
+}
+
+fn xref_stream_document_with_indirect_size_object(object_body: &[u8]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let obj1_offset = bytes.len() as u64;
@@ -2646,7 +2650,8 @@ fn xref_stream_document_with_indirect_size(size_value: i64) -> Vec<u8> {
     // The candidate's indirect `/Size` is available only through the
     // reconstruction line-scan table, not through the candidate stream's
     // own xref entries.
-    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\nendobj\n").as_bytes());
+    bytes.extend_from_slice(b"3 0 obj\n");
+    bytes.extend_from_slice(object_body);
     bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
     bytes
 }
@@ -3191,6 +3196,24 @@ fn candidate_recovery_warns_for_mismatching_indirect_xref_size() {
                 == "reported number of objects (3) is not one plus the highest object number (3)"
                 && diagnostic.offset.is_none()
         }));
+}
+
+#[test]
+fn candidate_recovery_does_not_duplicate_indirect_size_resolution_diagnostics() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(
+        xref_stream_document_with_indirect_size_object(b"4\n"),
+    ))
+    .expect("candidate xref-stream recovery should succeed");
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the cached indirect /Size object warning must be emitted once"
+    );
 }
 
 #[test]

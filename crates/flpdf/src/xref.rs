@@ -112,6 +112,10 @@ enum XrefReadContextSpec<'a> {
     Reconstruction {
         line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
     },
+    ReconstructionWithCache {
+        line_scan_entries: &'a BTreeMap<ObjectRef, XrefEntry>,
+        bootstrap_cache: &'a BTreeMap<ObjectRef, Object>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,23 +167,34 @@ impl<'bytes, 'entries> XrefReadContext<'bytes, 'entries> {
         registration: &'entries XrefRegistration,
         options: XrefLoadOptions,
     ) -> Self {
-        let entry_lookup = match spec {
-            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => {
-                XrefEntryLookup::Registration(&registration.entries)
-            }
-            XrefReadContextSpec::Reconstruction { line_scan_entries } => {
+        let (entry_lookup, bootstrap_cache) = match spec {
+            XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => (
+                XrefEntryLookup::Registration(&registration.entries),
+                BTreeMap::new(),
+            ),
+            XrefReadContextSpec::Reconstruction { line_scan_entries } => (
                 XrefEntryLookup::Reconstruction {
                     line_scan_entries,
                     registration_entries: &registration.entries,
-                }
-            }
+                },
+                BTreeMap::new(),
+            ),
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries,
+                bootstrap_cache,
+            } => (
+                XrefEntryLookup::Reconstruction {
+                    line_scan_entries,
+                    registration_entries: &registration.entries,
+                },
+                bootstrap_cache.clone(),
+            ),
         };
-
         Self {
             bytes,
             entry_lookup,
             options,
-            cache: BTreeMap::new(),
+            cache: bootstrap_cache,
             resolving: BTreeSet::new(),
             diagnostics: Diagnostics::default(),
             reconstruction_trigger: None,
@@ -838,6 +853,13 @@ fn merge_previous_xref_sections(
             XrefReadContextSpec::Reconstruction { line_scan_entries } => {
                 XrefReadContextSpec::Reconstruction { line_scan_entries }
             }
+            XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries,
+                bootstrap_cache,
+            } => XrefReadContextSpec::ReconstructionWithCache {
+                line_scan_entries,
+                bootstrap_cache,
+            },
             XrefReadContextSpec::ActiveSection | XrefReadContextSpec::PreviousSection => {
                 XrefReadContextSpec::PreviousSection
             }
@@ -1185,8 +1207,9 @@ fn recover_trailer_from_xref_stream_candidate(
         options,
         &mut reentry_registration,
         Some(&mut *repair_diagnostics),
-        XrefReadContextSpec::Reconstruction {
+        XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
+            bootstrap_cache: &candidate.bootstrap_cache,
         },
     ) {
         Ok(reentry) => reentry,
@@ -1216,8 +1239,9 @@ fn recover_trailer_from_xref_stream_candidate(
         options,
         &mut reentry_registration,
         Some(&mut previous_failure_diagnostics),
-        XrefReadContextSpec::Reconstruction {
+        XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
+            bootstrap_cache: &candidate.bootstrap_cache,
         },
     )
     .is_err()
@@ -1277,8 +1301,9 @@ fn recover_trailer_from_xref_stream_candidate(
     // re-entering the candidate instead of inspecting the raw reference.
     let mut size_context = XrefReadContext::new(
         bytes,
-        XrefReadContextSpec::Reconstruction {
+        XrefReadContextSpec::ReconstructionWithCache {
             line_scan_entries: entries,
+            bootstrap_cache: &candidate.bootstrap_cache,
         },
         &reentry_registration,
         options,
@@ -1302,6 +1327,10 @@ fn recover_trailer_from_xref_stream_candidate(
 struct XrefStreamCandidate {
     trailer: Dictionary,
     max_offset: u64,
+    /// qpdf's reconstruction pass resolves and caches every type-1 object
+    /// while discovering candidates. Reuse that cache for the later
+    /// post-chain `/Size` lookup so a repair warning is not emitted again.
+    bootstrap_cache: BTreeMap<ObjectRef, Object>,
 }
 
 /// Find the trailer dictionary and re-entry offset for
@@ -1474,6 +1503,7 @@ fn find_xref_stream_trailer_candidate(
     let candidate = trailer.map(|dict| XrefStreamCandidate {
         trailer: dict,
         max_offset,
+        bootstrap_cache: context.cache.clone(),
     });
     append_new_context_diagnostics(
         &context,
