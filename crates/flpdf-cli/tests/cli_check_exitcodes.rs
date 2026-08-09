@@ -87,6 +87,27 @@ fn warnings_only_corrupt_xref_bytes() -> Vec<u8> {
     pdf
 }
 
+/// A repaired classic xref whose indirect trailer /Size points at an object
+/// whose stale xref offset names a different object. qpdf reconstructs the
+/// table, then continues its post-reconstruction /Size validation and emits
+/// the object-count mismatch warning.
+fn recovered_indirect_size_header_mismatch_pdf_bytes() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let catalog_offset = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let wrong_offset = pdf.len() + b"3 0 obj\n3\nendobj\n".len();
+    pdf.extend_from_slice(b"3 0 obj\n3\nendobj\n");
+    pdf.extend_from_slice(b"4 0 obj\n<< /Foo true >>\nendobj\n");
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{catalog_offset:010} 00000 n \n0000000000 65535 f \n{wrong_offset:010} 00000 n \n{wrong_offset:010} 00000 n \ntrailer\n<< /Size 3 0 R /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 /// PDF that is irrecoverably corrupt — no valid objects reachable, causing
 /// the check to report errors → exit 2.
 fn corrupt_pdf_bytes() -> Vec<u8> {
@@ -466,6 +487,21 @@ fn check_warnings_use_qpdf_stderr_format() {
         ))
         // The old lowercase `warning: <msg>` prefix must be gone.
         .stderr(predicate::str::contains("warning: ").not());
+}
+
+#[test]
+fn check_with_repair_reports_size_mismatch_after_xref_reconstruction() {
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(&recovered_indirect_size_header_mismatch_pdf_bytes())
+        .unwrap();
+
+    let mut cmd = Command::cargo_bin("flpdf").unwrap();
+    cmd.args(["--check", "--repair", f.path().to_str().unwrap()])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "reported number of objects (3) is not one plus the highest object number (4)",
+        ));
 }
 
 #[test]

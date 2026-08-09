@@ -2753,6 +2753,94 @@ fn xref_stream_document(trailer_section: bool) -> (Vec<u8>, u64) {
     (bytes, xref_stream_offset)
 }
 
+fn xref_stream_document_with_indirect_size(size_value: i64) -> Vec<u8> {
+    xref_stream_document_with_indirect_size_object(format!("{size_value}\nendobj\n").as_bytes())
+}
+
+fn xref_stream_document_with_indirect_size_object(object_body: &[u8]) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let obj1_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 0),
+        (1, obj1_offset, 0),
+        (1, xref_stream_offset, 0),
+    ]);
+    let mut xref_stream = format!(
+        "2 0 obj\n<< /Type /XRef /Size 3 0 R /Root 1 0 R /W [1 4 2] /Index [0 3] /Length {} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    xref_stream.extend_from_slice(&entries);
+    xref_stream.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(&xref_stream);
+
+    // The candidate's indirect `/Size` is available only through the
+    // reconstruction line-scan table, not through the candidate stream's
+    // own xref entries.
+    bytes.extend_from_slice(b"3 0 obj\n");
+    bytes.extend_from_slice(object_body);
+    bytes.extend_from_slice(b"startxref\n999999\n%%EOF\n");
+    bytes
+}
+
+fn classic_xref_document_with_indirect_size(size_value: i64) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len() as u64;
+    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\nendobj\n").as_bytes());
+
+    let xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 4\n0000000000 65535 f \n{catalog_offset:010} 00000 n \n0000000000 65535 f \n{size_offset:010} 00000 n \ntrailer\n<< /Size 3 0 R /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}
+
+fn classic_xref_with_indirect_size_header_mismatch(size_value: i64) -> (Vec<u8>, u64) {
+    classic_xref_with_indirect_size_header_mismatch_body(size_value, b"endobj\n")
+}
+
+fn classic_xref_with_indirect_size_header_mismatch_missing_endobj(
+    size_value: i64,
+) -> (Vec<u8>, u64) {
+    classic_xref_with_indirect_size_header_mismatch_body(size_value, b"")
+}
+
+fn classic_xref_with_indirect_size_header_mismatch_body(
+    size_value: i64,
+    size_object_terminator: &[u8],
+) -> (Vec<u8>, u64) {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len() as u64;
+    bytes.extend_from_slice(format!("3 0 obj\n{size_value}\n").as_bytes());
+    bytes.extend_from_slice(size_object_terminator);
+    let wrong_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"4 0 obj\n<< /Foo true >>\nendobj\n");
+
+    let xref_offset = bytes.len() as u64;
+    bytes.extend_from_slice(
+        format!(
+            "xref\n0 5\n0000000000 65535 f \n{catalog_offset:010} 00000 n \n0000000000 65535 f \n{wrong_offset:010} 00000 n \n{wrong_offset:010} 00000 n \ntrailer\n<< /Size 3 0 R /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    (bytes, size_offset)
+}
+
 fn ignore_xref_streams_options(repair: bool) -> PdfOpenOptions {
     PdfOpenOptions {
         repair,
@@ -2798,6 +2886,168 @@ fn classic_xref_with_hybrid_only_entry() -> (Vec<u8>, u64) {
     (bytes, hybrid_only_offset)
 }
 
+fn classic_xref_with_shared_indirect_size_object() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"3 0 obj\n4\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (1, size_offset, 0),
+    ]);
+    let mut xref_stream = format!(
+        "2 0 obj\n<< /Type /XRef /Size 3 0 R /Root 1 0 R /W [1 4 2] /Index [0 4] /Length {} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    xref_stream.extend_from_slice(&entries);
+    xref_stream.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(&xref_stream);
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{size_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 0 R /Root 1 0 R /XRefStm {xref_stream_offset} >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}
+
+fn classic_xref_with_shared_indirect_xrefstm_and_size_object() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n0000000000\n");
+
+    let xref_stream_offset = bytes.len() as u64;
+    bytes[size_offset + 8..size_offset + 18]
+        .copy_from_slice(format!("{xref_stream_offset:010}").as_bytes());
+    let entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (1, xref_stream_offset, 0),
+        (1, size_offset as u64, 0),
+    ]);
+    let mut xref_stream = format!(
+        "2 0 obj\n<< /Type /XRef /Size 4 /Root 1 0 R /W [1 4 2] /Index [0 4] /Length {} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    xref_stream.extend_from_slice(&entries);
+    xref_stream.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(&xref_stream);
+
+    let table_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    bytes.extend_from_slice(format!("{catalog_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{xref_stream_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(format!("{size_offset:010} 00000 n \n").as_bytes());
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 0 R /Root 1 0 R /XRefStm 3 0 R >>\nstartxref\n{table_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    bytes
+}
+
+fn xref_stream_prev_loop_with_shared_indirect_previous_offset() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+
+    let catalog_offset = bytes.len() as u64;
+    bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let size_body_offset = bytes.len();
+    bytes.extend_from_slice(b"3 0 obj\n0000000000\n");
+    let previous_two_offset = bytes.len() as u64;
+    let previous_two_offset_bytes = format!("{previous_two_offset:010}");
+    bytes[size_body_offset + 8..size_body_offset + 18]
+        .copy_from_slice(previous_two_offset_bytes.as_bytes());
+
+    let previous_two_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (0, 0, 0),
+        (1, size_body_offset as u64, 0),
+        (1, previous_two_offset, 0),
+        (0, 0, 0),
+        (0, 0, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_with_prev_ref(
+        4,
+        7,
+        "/Prev 3 0 R",
+        &previous_two_entries,
+    ));
+
+    let previous_one_offset = bytes.len() as u64;
+    let previous_one_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (0, 0, 0),
+        (1, size_body_offset as u64, 0),
+        (1, previous_two_offset, 0),
+        (1, previous_one_offset, 0),
+        (0, 0, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_with_prev_ref(
+        5,
+        7,
+        "/Prev 3 0 R",
+        &previous_one_entries,
+    ));
+
+    let latest_offset = bytes.len() as u64;
+    let latest_entries = build_encoded_xref_stream_entries(&[
+        (0, 0, 65_535),
+        (1, catalog_offset, 0),
+        (0, 0, 0),
+        (1, size_body_offset as u64, 0),
+        (1, previous_two_offset, 0),
+        (1, previous_one_offset, 0),
+        (1, latest_offset, 0),
+    ]);
+    bytes.extend_from_slice(&make_xref_stream_with_prev_ref(
+        6,
+        7,
+        &format!("/Prev {previous_one_offset}"),
+        &latest_entries,
+    ));
+    bytes.extend_from_slice(format!("startxref\n{latest_offset}\n%%EOF\n").as_bytes());
+
+    bytes
+}
+
+fn make_xref_stream_with_prev_ref(
+    object_number: u32,
+    size: u32,
+    prev: &str,
+    entries: &[u8],
+) -> Vec<u8> {
+    let mut object = format!(
+        "{object_number} 0 obj\n<< /Type /XRef /Size {size} /Root 1 0 R /W [1 4 2] /Index [0 {size}] /Length {} {prev} >>\nstream\n",
+        entries.len()
+    )
+    .into_bytes();
+    object.extend_from_slice(entries);
+    object.extend_from_slice(b"\nendstream\nendobj\n");
+    object
+}
+
 #[test]
 fn classic_xref_table_reads_entries_from_its_xrefstm() {
     let (bytes, hybrid_only_offset) = classic_xref_with_hybrid_only_entry();
@@ -2819,6 +3069,60 @@ fn classic_xref_table_reads_entries_from_its_xrefstm() {
             .and_then(|dict| dict.get("HybridOnly"))
             .and_then(Object::as_bool),
         Some(true)
+    );
+}
+
+#[test]
+fn hybrid_xref_reuses_an_indirect_size_resolution_diagnostic() {
+    let bytes = classic_xref_with_shared_indirect_size_object();
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should load the hybrid xref");
+
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the shared indirect /Size object warning must be emitted once"
+    );
+}
+
+#[test]
+fn hybrid_xref_commits_shared_indirect_xrefstm_size_cache() {
+    let bytes = classic_xref_with_shared_indirect_xrefstm_and_size_object();
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should load the hybrid xref");
+
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the /XRefStm resolution must share its cache with post-chain /Size"
+    );
+}
+
+#[test]
+fn xref_stream_prev_loop_reuses_an_indirect_previous_offset_cache() {
+    let bytes = xref_stream_prev_loop_with_shared_indirect_previous_offset();
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should report the repeated /Prev loop");
+
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the shared indirect /Prev object warning must be emitted once"
     );
 }
 
@@ -3242,6 +3546,137 @@ fn candidate_recovery_warns_when_xref_size_is_not_one_plus_highest_object() {
                 == "reported number of objects (4) is not one plus the highest object number (2)"
                 && diagnostic.offset.is_none()
         }));
+}
+
+#[test]
+fn candidate_recovery_resolves_matching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(
+        xref_stream_document_with_indirect_size(4),
+    ))
+    .expect("candidate xref-stream recovery should succeed");
+
+    assert!(!loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| { diagnostic.message.contains("reported number of objects") }));
+}
+
+#[test]
+fn candidate_recovery_warns_for_mismatching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(
+        xref_stream_document_with_indirect_size(3),
+    ))
+    .expect("candidate xref-stream recovery should succeed");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (3) is not one plus the highest object number (3)"
+                && diagnostic.offset.is_none()
+        }));
+}
+
+#[test]
+fn candidate_recovery_does_not_duplicate_indirect_size_resolution_diagnostics() {
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(
+        xref_stream_document_with_indirect_size_object(b"4\n"),
+    ))
+    .expect("candidate xref-stream recovery should succeed");
+    assert_eq!(
+        loaded
+            .repair_diagnostics
+            .entries()
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("expected endobj"))
+            .count(),
+        1,
+        "the cached indirect /Size object warning must be emitted once"
+    );
+}
+
+#[test]
+fn normal_xref_warns_for_mismatching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer(&mut Cursor::new(classic_xref_document_with_indirect_size(
+        3,
+    )))
+    .expect("normal xref loading should resolve an indirect trailer /Size");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (3) is not one plus the highest object number (3)"
+                && diagnostic.offset.is_none()
+        }));
+}
+
+#[test]
+fn normal_xref_accepts_matching_indirect_xref_size() {
+    let loaded = load_xref_and_trailer(&mut Cursor::new(classic_xref_document_with_indirect_size(
+        4,
+    )))
+    .expect("normal xref loading should resolve an indirect trailer /Size");
+
+    assert!(!loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("reported number of objects")));
+}
+
+#[test]
+fn repair_reconstructs_xref_after_an_indirect_size_header_mismatch() {
+    let (bytes, size_offset) = classic_xref_with_indirect_size_header_mismatch(5);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should reconstruct the mismatched xref entry");
+
+    assert_eq!(
+        loaded.entries.get(&ObjectRef::new(3, 0)),
+        Some(&XrefEntry::Uncompressed {
+            offset: size_offset,
+        }),
+        "qpdf reconstruction must replace the stale offset before /Size validation"
+    );
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("expected 3 0 obj")));
+}
+
+#[test]
+fn repair_revalidates_indirect_xref_size_after_header_reconstruction() {
+    let (bytes, _) = classic_xref_with_indirect_size_header_mismatch(3);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should reconstruct and validate the xref");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic.message
+                == "reported number of objects (3) is not one plus the highest object number (4)"
+        }));
+}
+
+#[test]
+fn repair_forwards_size_resolution_diagnostics_after_header_reconstruction() {
+    let (bytes, _) = classic_xref_with_indirect_size_header_mismatch_missing_endobj(3);
+    let loaded = load_xref_and_trailer_best_effort(&mut Cursor::new(bytes))
+        .expect("repair mode should retain the recovered /Size diagnostic");
+
+    assert!(loaded
+        .repair_diagnostics
+        .entries()
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("expected endobj")));
 }
 
 #[test]
