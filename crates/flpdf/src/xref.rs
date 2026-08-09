@@ -2102,9 +2102,9 @@ mod tests {
     use super::{
         append_xref_size_warning, find_xref_stream_trailer_candidate,
         load_xref_and_trailer_with_repair, load_xref_state_with_options,
-        merge_previous_xref_sections, parse_xref_index, parse_xref_stream,
-        prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate, LoadedXref,
-        LoadedXrefState, RecoveryPolicy, XrefForm, XrefLoadOptions, XrefReadContext,
+        merge_previous_xref_sections, merge_xref_stream_from_classic_trailer, parse_xref_index,
+        parse_xref_stream, prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
+        LoadedXref, LoadedXrefState, RecoveryPolicy, XrefForm, XrefLoadOptions, XrefReadContext,
         XrefReadContextSpec, XrefRegistration,
     };
     use crate::{Diagnostic, Diagnostics, Dictionary, Object, ObjectRef, XrefEntry};
@@ -2143,6 +2143,26 @@ mod tests {
             parse_xref_index(&mut context, &dictionary, 7).unwrap(),
             vec![0, 7]
         );
+    }
+
+    #[test]
+    fn bootstrap_context_reports_reference_read_errors() {
+        let object_ref = ObjectRef::new(1, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 1 });
+        let mut context = XrefReadContext::new(
+            b" x",
+            XrefReadContextSpec::ActiveSection,
+            &registration,
+            XrefLoadOptions::default(),
+        );
+
+        assert_eq!(context.resolve_reference(object_ref), Object::Null);
+        assert!(context
+            .diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.offset == Some(1)));
     }
 
     #[test]
@@ -2248,6 +2268,89 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message.contains("expected endobj")));
+    }
+
+    #[test]
+    fn previous_section_header_mismatch_requests_reconstruction_after_the_section_read() {
+        let mut bytes = b" 3 0 obj\n999\nendobj\n".to_vec();
+        let previous_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"xref\n0 3\n0000000000 65535 f \n0000000000 00000 f \n0000000001 00000 n \n",
+        );
+        bytes.extend_from_slice(b"trailer\n<< /Size 3 /Prev 2 0 R >>\n");
+
+        let mut trailer = Dictionary::new();
+        trailer.insert("Prev", Object::Integer(previous_offset as i64));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+        let mut registration = XrefRegistration::default();
+
+        let error = merge_previous_xref_sections(
+            &bytes,
+            "1.7",
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            None,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a previous section's indirect /Prev mismatch must trigger reconstruction");
+
+        assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
+    }
+
+    #[test]
+    fn hybrid_xref_header_mismatch_requests_reconstruction_before_stream_read() {
+        let bytes = b" 3 0 obj\n999\nendobj\n";
+        let requested = ObjectRef::new(2, 0);
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(requested, XrefEntry::Uncompressed { offset: 1 });
+        let mut trailer = Dictionary::new();
+        trailer.insert("XRefStm", Object::Reference(requested));
+        let mut loaded = LoadedXrefState {
+            loaded: LoadedXref {
+                version: "1.7".to_string(),
+                startxref: 0,
+                entries: BTreeMap::new(),
+                trailer,
+                last_xref_form: XrefForm::Table,
+                repair_diagnostics: Diagnostics::default(),
+            },
+            trailer_references: BTreeSet::new(),
+            parsed_xref_streams: BTreeMap::new(),
+            header_offset: 0,
+            already_reconstructed: false,
+        };
+
+        let error = merge_xref_stream_from_classic_trailer(
+            bytes,
+            0,
+            &mut loaded,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a hybrid /XRefStm header mismatch must trigger reconstruction");
+
+        assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
     }
 
     #[test]
@@ -2815,6 +2918,64 @@ mod tests {
             .entries()
             .iter()
             .any(|diagnostic| diagnostic.message == "loop detected resolving object 1 0"));
+    }
+
+    #[test]
+    fn xref_stream_candidate_discovery_preserves_a_cyclic_null_after_read_error() {
+        let mut bytes = b" ".to_vec();
+        let candidate_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            b"2 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Length 1 0 R >>\nstream\n",
+        );
+        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let entries = BTreeMap::from([(
+            ObjectRef::new(1, 0),
+            XrefEntry::Uncompressed {
+                offset: candidate_offset,
+            },
+        )]);
+        let (candidate, diagnostics) = find_xref_stream_trailer_candidate(
+            &bytes,
+            &entries,
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+        );
+
+        assert!(candidate.is_none());
+        assert!(diagnostics
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message == "loop detected resolving object 1 0"));
+    }
+
+    #[test]
+    fn xref_stream_build_propagates_a_bootstrap_header_mismatch() {
+        let bytes = b" 1 0 obj\n<< /Type /XRef /W [1 1 1] /Size 1 /Index 2 0 R /Length 3 >>\nstream\n\0\0\0\nendstream\nendobj\n";
+        let mut registration = XrefRegistration::default();
+        registration.insert_xref_entry(ObjectRef::new(2, 0), XrefEntry::Uncompressed { offset: 1 });
+        let mut diagnostics = Diagnostics::default();
+
+        let error = parse_xref_stream(
+            bytes,
+            1,
+            1,
+            "1.7".to_string(),
+            XrefLoadOptions {
+                allow_repair: true,
+                ..XrefLoadOptions::default()
+            },
+            &mut registration,
+            Some(&mut diagnostics),
+            XrefReadContextSpec::ActiveSection,
+        )
+        .expect_err("a successful xref build with a mismatch must still request reconstruction");
+
+        assert_eq!(error.to_string(), "parse error at byte 1: expected 2 0 obj");
+        assert!(diagnostics.entries().is_empty());
     }
 
     #[test]
