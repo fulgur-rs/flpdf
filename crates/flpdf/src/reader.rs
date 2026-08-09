@@ -9,7 +9,9 @@ use self::file_object::{
 use crate::cache::CacheEntry;
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
-use crate::object_handle::{ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::ObjectValue;
+#[cfg(test)]
+use crate::object_handle::NO_PARSED_OFFSET;
 #[cfg(feature = "qtest-driver")]
 use crate::parser::array_item_source_offset;
 #[cfg(feature = "qtest-driver")]
@@ -1197,9 +1199,15 @@ impl<R: Read + Seek> Pdf<R> {
         // from *before* this call.
         self.legacy_materialized_memo.remove(&object_ref);
         let handle = self.get_object_handle(object_ref);
-        match self.lift_for_set_object(&object, &handle) {
+        let lifted = self.lift_for_set_object(&object, &handle);
+        match lifted {
             Ok(value) => {
                 handle.set_resolved(value);
+                // A caller-supplied replacement no longer describes the
+                // source bytes that populated this handle. Clear the parsed
+                // description only after the replacement has been lifted and
+                // installed; a failed lift leaves the canonical value intact.
+                handle.clear_description();
                 // The value is now caller-supplied, in-memory-constructed
                 // data, not something parsed from a source position; any
                 // previously recorded offset no longer describes it.
@@ -1250,6 +1258,7 @@ impl<R: Read + Seek> Pdf<R> {
         {
             let dict_value = ObjectValue::Dictionary(self.lift_dictionary(&stream.dict, 0)?);
             existing_dict.replace_direct_value(dict_value);
+            existing_dict.clear_description();
             return Ok(ObjectValue::Stream {
                 stream_dict: existing_dict,
                 stream_data: Some(Rc::new(stream.data.clone())),
@@ -1605,6 +1614,7 @@ impl<R: Read + Seek> Pdf<R> {
         let new_ref = self.next_available_object_ref()?;
         let indirect = self.get_object_handle(new_ref);
         indirect.set_resolved(value);
+        handle.copy_description_and_parsed_offset_to(&indirect);
         // QPDF::makeIndirectFromQPDFObject installs the same shared object
         // pointer in obj_cache. `handle_registry` is this port's shared
         // state, and `prepare_qpdf_json_objects` recognizes its resolved
@@ -1750,23 +1760,11 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(self.resolver.all_object_handles())
     }
 
-    // qpdf-cutover-delete(flpdf-25kg.3.3): one-hop legacy bridge. Delete
-    // after all callers use ObjectHandle's slot-resident dereference; the new
-    // primitive must not delegate here.
-    //
-    // Bridge implementation: delegates to the existing *private*
-    // `resolve_to_cache` engine (unchanged) rather than reimplementing
-    // decryption, ObjStm decoding, or the cyclic `/Length` guard it already
-    // performs. Deliberately calls `resolve_to_cache` (private), NOT the
-    // public `resolve_borrowed` — a later task repoints `resolve_borrowed` to
-    // call *this* method, so routing through the public method here would
-    // recurse.
     /// Resolve `handle` in place if it is an unresolved indirect handle.
     ///
-    /// A direct handle, or an indirect handle that has already been
-    /// resolved, is a no-op. An indirect handle whose reference is absent
-    /// from — or broken in — the cross-reference table resolves to a null
-    /// handle rather than an error, matching [`Pdf::resolve`].
+    /// A direct handle, or an indirect handle that has already been resolved,
+    /// is a no-op. Resolution is delegated directly to the canonical
+    /// `ResolverHandle` cache; it never materializes a legacy [`Object`].
     ///
     /// This does not chase through an already-resolved
     /// [`Pdf::set_object`]-driven bare-reference redirect to its terminal
@@ -1776,201 +1774,20 @@ impl<R: Read + Seek> Pdf<R> {
     /// method exposing exactly one hop per call, not silently collapsing a
     /// multi-hop chain.
     ///
-    /// This reuses the same decryption, object-stream, and stream-`/Length`
-    /// resolution behavior as [`Pdf::resolve`]. For a plain uncompressed file
-    /// object, the resolved handle (and every direct child in its tree)
-    /// carries a real parsed offset from a native parse of the object's own
-    /// source bytes, per qpdf's `getParsedOffset` contract. A compressed
-    /// (object-stream member) reference keeps the no-offset sentinel: its
-    /// object-stream-relative parsed offset is not yet populated. In the
-    /// rare case where the object's cross-reference layout is malformed or
-    /// overlapping enough that the native parse's own read window is
-    /// insufficient, this falls back to the no-offset sentinel rather than
-    /// failing.
-    ///
-    /// This method never fails on a plain nesting/malformed-layout case
-    /// alone: it lifts the already-resolved cached value against the
-    /// parser's own nesting bound, not the tighter bound other structural
-    /// walkers in this crate use, so it never rejects a value
-    /// [`Pdf::resolve`]/[`Pdf::resolve_borrowed`] would have accepted.
+    /// The canonical parser records source descriptions and offsets while it
+    /// builds the graph. Streams retain their source filter dictionaries and
+    /// are decrypted at pipe time, matching qpdf's `QPDF_Stream` path.
     ///
     /// # Errors
     ///
-    /// Has the same error behavior as [`Pdf::resolve_borrowed`]: I/O, parse,
-    /// or decryption failures from resolution propagate. An unknown, freed,
-    /// or compressed-but-broken reference is **not** an error; it resolves to
-    /// a null handle.
+    /// I/O, parse, filter, or decryption failures propagate. Free, absent, or
+    /// overridden references resolve to the canonical null/missing state.
     pub fn resolve_object_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
-        let Some(object_ref) = handle.object_ref() else {
-            return Ok(()); // direct handle: already has a value
-        };
-        if handle.is_resolved() {
-            return Ok(());
-        }
-
-        let legacy_resolved = self.resolve_to_cache(object_ref)?;
-        if !legacy_resolved
-            && matches!(
-                self.cache.entry(object_ref),
-                Some(CacheEntry::Unresolved { .. })
-            )
-        {
-            // qpdf's `QPDF::readObjectAtOffset` retries a header mismatch
-            // through `reconstruct_xref` (`libqpdf/QPDF.cc:1614-1637`). The
-            // legacy parser above deliberately returns `false` when it sees
-            // the wrong object header, so without this bridge a public
-            // `Pdf::resolve` would turn the same recoverable object into
-            // null before the canonical resolver gets a chance to retry it.
-            // Keep compressed/free entries on the legacy path: the canonical
-            // resolver has not implemented those source classes yet.
-            match handle.try_dereference() {
-                Ok(()) => {
-                    self.synchronize_legacy_resolution_state();
-                    match self.resolver.xref_entry(object_ref) {
-                        Some(XrefEntry::Uncompressed { .. })
-                        | Some(XrefEntry::Compressed { .. }) => {
-                            self.cache.set_resolved(object_ref, handle.materialize()?);
-                        }
-                        _ => {
-                            self.cache.set_missing(object_ref);
-                        }
-                    }
-                }
-                Err(error) if matches!(&error, Error::Unsupported(_)) => {
-                    self.synchronize_legacy_resolution_state();
-                    self.resolve_to_cache(object_ref)?;
-                }
-                Err(error)
-                    if !self.resolver.attempt_recovery()
-                        && matches!(&error, Error::Parse { .. }) =>
-                {
-                    // With repair disabled, qpdf warns about the mismatch
-                    // and leaves the requested object unresolved; preserve
-                    // the legacy null result rather than exposing the
-                    // canonical resolver's internal parse error.
-                    handle.set_missing();
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let object = match self.cache.entry(object_ref) {
-            Some(CacheEntry::Resolved(object)) => object.clone(),
-            // A cyclic/self-referential resolution already in progress
-            // higher up the call stack (e.g. `resolve_pending_stream_length`
-            // resolving this same ref's indirect `/Length` holder, directly
-            // or transitively) leaves the cache entry `Reserved`, not
-            // genuinely missing — `resolve_to_cache` itself uses this state
-            // to break the cycle (see its own doc). Leave the handle
-            // unresolved rather than marking it permanently `Missing`: once
-            // the outer resolution completes, a later call must still
-            // resolve the real value, not keep observing a placeholder.
-            // `Pdf::resolve_borrowed` mirrors this same distinction so it
-            // never memoizes this transient observation.
-            Some(CacheEntry::Reserved) => return Ok(()),
-            _ => {
-                handle.set_missing();
-                return Ok(());
-            }
-        };
-
-        // Deciding native-parse vs. the legacy `lift` bridge requires the
-        // object's *xref-entry* classification, not its already-resolved
-        // `Object` shape (a `CacheEntry` alone can't distinguish "was always
-        // uncompressed" from other cache states after mutation) — consult
-        // the source xref table, matching the design's Parsed-Offset
-        // Contract table row-by-row: only `Uncompressed` file objects gain
-        // real offsets in this layer.
-        //
-        // The native parse below reads only the fast bounded-to-the-next-
-        // object window (`read_bounded_object_window`), not
-        // `read_object_at_with_policy`'s rare full-file fallback for a
-        // malformed/overlapping source xref layout (e.g. a stray xref entry
-        // whose offset lands inside another object's body, truncating the
-        // window `next_object_offset` computes). `resolve_to_cache` above
-        // already resolved `object` successfully — via that same fallback,
-        // if the fast window needed it — so a native-parse failure here
-        // does not mean the object is unresolvable; it means only this
-        // reparse's narrower window was insufficient. Falling back to the
-        // already-correct `lift(&object, 0)` (offset sentinel, exactly the
-        // Compressed-branch expression below) guarantees
-        // `resolve_object_handle` never fails where `resolve_borrowed`/
-        // `resolve` already succeeded.
-        // A stream in `self.transformed_stream_refs` had its payload bytes
-        // *and*, for an explicit `/Crypt` filter, its own dictionary
-        // (`/Filter`/`/DecodeParms` with the consumed `Crypt` entries
-        // stripped) rewritten by `decrypt_resolved_object`/
-        // `apply_explicit_crypt_filters` — transformations the native parse
-        // below cannot see, since it reads the dictionary straight from raw
-        // source bytes rather than from `object`. Native-parsing it anyway
-        // would silently resurrect the pre-decryption `/Filter` (with a
-        // still-present `/Crypt` entry the caller can no longer decode) and
-        // reuse `object`'s already-transformed *data* against that stale
-        // dictionary. Route it through `lift(&object, 0)` instead, which
-        // copies both the transformed dictionary and the transformed data
-        // from `object` directly — correct, at the cost of losing native
-        // parsed offsets for this ref (conservative: this also applies to a
-        // stream that was merely decrypted without an explicit crypt filter,
-        // whose dictionary was not actually rewritten, since
-        // `transformed_stream_refs` does not distinguish the two cases).
-        //
-        // Both arms below lift against `parser::MAX_PARSE_DEPTH`, not
-        // `lift`'s default `MAX_INLINE_DEPTH`: `object` already parsed
-        // successfully at that looser bound (via `resolve_to_cache` above),
-        // so re-lifting it through the tighter structural-walker bound would
-        // reject a value `resolve_borrowed`/`resolve` always accepted,
-        // breaking this function's own "never fails where `resolve_borrowed`/
-        // `resolve` already succeeded" guarantee for any Compressed
-        // (ObjStm-member) object — or, more rarely, an Uncompressed one whose
-        // fast native-parse window failed for an unrelated reason — with
-        // literal nesting between the two bounds.
-        let mut native_parsed = false;
-        let (mut value, parsed_offset) = match self.resolver.xref_entry(object_ref) {
-            Some(XrefEntry::Uncompressed { offset })
-                if !self.transformed_stream_refs.contains(&object_ref) =>
-            {
-                match self.native_parse_uncompressed_value(offset, &object) {
-                    Ok(native) => {
-                        native_parsed = true;
-                        native
-                    }
-                    Err(_) => (
-                        self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?,
-                        NO_PARSED_OFFSET,
-                    ),
-                }
-            }
-            _ => (
-                self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?,
-                NO_PARSED_OFFSET,
-            ),
-        };
-        // Only the native-parse success path above reads raw (possibly
-        // still-encrypted) source bytes directly into `ObjectValue::String`;
-        // every other route here lifts from `object`, which
-        // `resolve_to_cache` already decrypted through the legacy engine's
-        // own pipeline -- decrypting it again would corrupt it. See
-        // `native_parse_uncompressed_value`'s own doc for why this handle
-        // graph population, not `Pdf::resolve_borrowed`'s later
-        // materialization, is where this must happen: nested children here
-        // are already-populated `ObjectHandle`s carrying their own recorded
-        // parsed offsets, and round-tripping through `materialize`/`lift` to
-        // reach a legacy-engine decryption path would silently reset them.
-        if native_parsed {
-            // `borrow_mut` for the same reason as `decrypt_resolved_object`:
-            // qpdf's unknown-filter arm rewrites `cf_string`.
-            let mut encryption_guard = self.encryption.borrow_mut();
-            let warn = match encryption_guard.as_mut() {
-                Some(encryption) => {
-                    decrypt_object_value_strings(object_ref, &mut value, encryption)?
-                }
-                None => false,
-            };
-            drop(encryption_guard);
-            self.warn_unknown_crypt_filters(warn, false)?;
-        }
-        handle.set_resolved(value);
-        handle.set_parsed_offset_if_unset(parsed_offset);
-        Ok(())
+        // ObjectHandle resolution is qpdf's canonical cache operation. The
+        // resolver owns the source xref table, live parser, stream pipeline,
+        // and one handle per object reference; no raw Object materialization
+        // or metadata-only reparse belongs on this path.
+        handle.try_dereference()
     }
 
     /// Resolve `handle` (via [`Pdf::resolve_object_handle`]), then chase
@@ -2119,151 +1936,14 @@ impl<R: Read + Seek> Pdf<R> {
         Ok((ObjectHandle::null(), None))
     }
 
-    // Builds the resolved value for a plain uncompressed file object by
-    // parsing its own source bytes directly into `ObjectValue`/`ObjectHandle`
-    // in a single pass, so every node (including nested children) carries a
-    // real parsed offset from construction — never from a second pass over
-    // `object` (design, "Parser" section: no parallel metadata tree, no
-    // reparse-for-provenance). `object` is the value `resolve_to_cache`
-    // already fully resolved above (decryption, indirect `/Length`
-    // resolution, and stream-boundary recovery already applied); this reuses
-    // only its final stream *data* bytes below, which the native pass does
-    // not attempt to rederive (recovery/decryption stay entirely on the
-    // untouched legacy path).
-    //
-    // A native-parsed `ObjectValue::String` carries the *raw* (possibly
-    // still-encrypted) source bytes, not `object`'s already-decrypted string
-    // value (`ObjectValue::Name` has no such gap: PDF names are never
-    // encrypted regardless of path). This is real, output-visible ciphertext
-    // unless corrected: `Pdf::resolve_borrowed`'s `decrypt_materialized_strings`
-    // is the accessor that corrects it, applying `decrypt_object_strings` to
-    // the materialized `Object` for exactly a handle populated via this
-    // function (gated on the handle's own non-sentinel parsed offset, which
-    // only this function's success path sets). Do not remove or weaken that
-    // gate without re-deriving this fix: doing so silently reintroduces
-    // ciphertext leaking through the public `resolve`/`resolve_borrowed` API
-    // for any encrypted document whose `/Info` (or any other string-bearing
-    // dictionary) is not object-stream-compressed.
-    //
-    // `read_bounded_object_window` reads only the fast "bounded to the next
-    // object's offset" window, not `read_object_at_with_policy`'s rare
-    // full-file fallback for a malformed or overlapping source xref layout
-    // (e.g. `stream_with_false_next_xref_offset` in this module's own
-    // tests, whose bogus xref entry truncates the window mid-dictionary).
-    // An `Err` here therefore does not mean the object is unresolvable —
-    // `resolve_to_cache` already fully resolved `object` above, via that
-    // same fallback if the fast window needed it — so the caller
-    // (`resolve_object_handle`) treats this function's error as "fall back
-    // to `lift`", never as a hard failure.
-    fn native_parse_uncompressed_value(
-        &mut self,
-        offset: u64,
-        object: &Object,
-    ) -> Result<(ObjectValue, i64)> {
-        let bytes = self.read_bounded_object_window(offset)?;
-        let mut tokenizer = Tokenizer::new(&bytes);
-        let _number = tokenizer.next_integer()?;
-        let _generation = tokenizer.next_integer()?;
-        tokenizer.expect_word(b"obj")?;
-        tokenizer.skip_ignorable()?;
-        let body_start = tokenizer.position();
-
-        let file_origin = i64::try_from(offset).unwrap_or(i64::MAX);
-        let base_offset = file_origin + body_start as i64;
-        let (value, value_offset) =
-            crate::parser::parse_qpdf_direct_object_handle(&bytes[body_start..], base_offset, self)
-                .map_err(|error| error.rebase_offset(body_start))?;
-
-        let Object::Stream(stream) = object else {
-            return Ok((value, value_offset));
-        };
-
-        // The dictionary and stream-data-start positions came from the
-        // exact same deterministic, recovery-independent scan
-        // (`parse_file_object_syntax`, unmodified) that the legacy pipeline
-        // above already used to classify this object as a stream in the
-        // first place — reused here only for that one numeric fact, not
-        // reparsed for its (discarded) `Object` value.
-        let pending = parse_file_object_syntax(&bytes)?;
-        let data_start = match pending.body {
-            PendingBody::Stream { data_start, .. } => data_start,
-            // Defensive, not reachable in practice: `object` is already
-            // confirmed `Object::Stream` (checked above), and `object` can
-            // only be `Object::Stream` if either (a) the bounded window
-            // above already contains the "stream" keyword — so this
-            // identical-bytes reparse would also classify it as
-            // `PendingBody::Stream`, matching case `Stream{..}` above — or
-            // (b) `resolve_to_cache` needed the full-file fallback, which
-            // only triggers on a hard parse failure, meaning this
-            // function's own dictionary parse (shared decision functions,
-            // identical window) would have already propagated that same
-            // failure via `?` a few lines up, never reaching this match at
-            // all. See `resolve_object_handle_tracks_legacys_dictionary_vs_stream_classification`,
-            // which empirically confirms the seemingly-plausible third case
-            // (bounded window sees the dictionary but not "stream", while
-            // `resolve_to_cache` still resolves a real stream) cannot occur:
-            // the legacy engine hits the identical ambiguity first and
-            // resolves `object` to a bare `Object::Dictionary` instead,
-            // which the `Object::Stream` check above would already have
-            // routed around. Erroring here rather than silently treating
-            // some other position as the stream's own parsed offset is a
-            // deliberate belt-and-suspenders choice: if this reasoning is
-            // ever wrong, the caller's fallback to `lift(&object, 0)` is
-            // strictly safer than fabricating a number.
-            // cov:ignore-start: unreachable per the invariants noted above
-            PendingBody::Direct { .. } => {
-                return Err(Error::parse(0, "native parse: expected stream framing"));
-            } // cov:ignore-end
-        };
-        let dict_handle = ObjectHandle::from_value(value);
-        dict_handle.set_parsed_offset_if_unset(value_offset);
-        let stream_offset = file_origin + data_start as i64;
-        Ok((
-            ObjectValue::Stream {
-                stream_dict: dict_handle,
-                stream_data: Some(Rc::new(stream.data.clone())),
-                stream_length: 0,
-            },
-            stream_offset,
-        ))
-    }
-
-    // Convert a legacy `Object` into an `ObjectValue`. Called for Compressed
-    // (ObjStm-member) objects (which can never themselves be
-    // `Object::Stream`), as `resolve_object_handle`'s fallback when the
-    // native parse's own (narrower) read window fails on a malformed or
-    // overlapping source xref layout even though the object resolved fine
-    // via `resolve_to_cache`'s own full-file fallback, and by
-    // `Pdf::set_object`/`Pdf::lift_for_set_object` to write a caller-supplied
-    // `Object` through to the handle graph (the one caller for which
-    // `object` need not already be a legacy-engine-resolved value — it can
-    // be anything a consumer passes to `set_object`, including a bare
-    // `Object::Reference` used throughout this crate to redirect or
-    // collapse a holder chain in place — see `ObjectValue::Reference`'s own
-    // doc). The content-stream-only `Object::Operator`/`Object::InlineImage`
-    // variants return `Err`, routing `Pdf::set_object`'s caller to its own
-    // "cannot be represented in the handle graph" fallback (see that
-    // function's comment) instead of losing the value to a silent `Null`.
-    //
-    // `depth` bounds inline `Array`/`Dictionary`/`Stream`-dictionary nesting
-    // against `MAX_INLINE_DEPTH`, mirroring every other post-parse structural
-    // walker over an `Object` tree in this crate (`subset_prune.rs`,
-    // `object_copy.rs`, `page_closure.rs`, `rewrite_renumber.rs`, and
-    // others) — this is a separate, tighter bound than the parser's own
-    // `MAX_PARSE_DEPTH`.
+    // Convert a legacy `Object` into the handle graph for callers that
+    // explicitly operate at the raw-object boundary (for example,
+    // `Pdf::set_object`). Parsed file objects are built by the canonical live
+    // resolver above; this helper is not a fallback for that path.
     pub(crate) fn lift(&mut self, object: &Object, depth: usize) -> Result<ObjectValue> {
         self.lift_bounded(object, depth, crate::object::MAX_INLINE_DEPTH)
     }
 
-    // Same as `lift`, but against a caller-chosen `max_depth` instead of the
-    // fixed `MAX_INLINE_DEPTH`. `resolve_object_handle`'s Compressed-member
-    // (ObjStm) fallback is the only caller that needs this: `object` there
-    // already parsed successfully up to the parser's own `MAX_PARSE_DEPTH`
-    // (via `resolve_to_cache`), so re-lifting it through the tighter
-    // structural-walker bound would reject a value `resolve_borrowed` always
-    // accepted, breaking the "never fails where `resolve_borrowed`/`resolve`
-    // already succeeded" invariant documented at that call site. Every other
-    // caller keeps going through `lift` (i.e. `MAX_INLINE_DEPTH`) unchanged.
     fn lift_bounded(
         &mut self,
         object: &Object,
@@ -2281,8 +1961,9 @@ impl<R: Read + Seek> Pdf<R> {
         // one call site protects the whole walk the same way
         // `object_handle.rs`'s own recursive hubs do. Needed for real, not
         // just for a test with an oversized stack to pass: unlike the
-        // native parse path (`parser.rs`, itself `stacker`-protected), this
-        // lift path has no protection of its own, and `Pdf::trailer_key_handle`
+        // canonical live parser (`parser.rs`, itself `stacker`-protected), this
+        // legacy materialization path has no protection of its own, and
+        // `Pdf::trailer_key_handle`
         // now reaches it at the looser `MAX_PARSE_DEPTH` bound (500) — a
         // legitimately deep but successfully parsed value could otherwise
         // abort a production caller running on a small-stack thread instead
@@ -2449,99 +2130,98 @@ impl<R: Read + Seek> Pdf<R> {
     /// An unknown, freed, or compressed-but-broken reference is **not** an error;
     /// it resolves to [`Object::Null`].
     pub fn resolve_borrowed(&mut self, object_ref: ObjectRef) -> Result<&Object> {
-        // Check the memo *before* resolving/materializing: `Pdf::set_object`
-        // can write an authoritative override directly into
-        // `legacy_materialized_memo` for a value `lift` cannot represent as
-        // an `ObjectHandle` tree (see its own comment) without updating the
-        // handle graph at all. If we resolved the handle unconditionally
-        // first, `resolve_object_handle`'s own attempt to lift that same
-        // value for a *different*, offset-less path (e.g. a freshly
-        // allocated ref with no source xref entry) could propagate an `Err`
-        // via `?` before this method ever reached the memo that already has
-        // the right answer. Once the memo has an entry for `object_ref`, it
-        // is authoritative and the handle is not consulted at all.
-        if !self.legacy_materialized_memo.contains_key(&object_ref) {
-            let handle = self.get_object_handle(object_ref);
-            self.resolve_object_handle(&handle)?;
-
-            if !handle.is_resolved() {
-                // A cyclic/self-referential resolution already in progress
-                // higher up the call stack (`resolve_pending_stream_length`
-                // calls `resolve_borrowed` directly to look up an indirect
-                // `/Length` holder, which can transitively re-enter this
-                // same ref while it is still being resolved) left this
-                // ref's cache entry `Reserved` — `resolve_object_handle`
-                // deliberately leaves the handle unresolved for exactly
-                // this case rather than marking it permanently `Missing`.
-                // Return the same transient `Object::Null` the untouched
-                // legacy engine's own cache-reading `resolve_borrowed`
-                // always returned here, but do NOT memoize it: once the
-                // outer resolution completes, a later call must still
-                // resolve the real value instead of being stuck serving
-                // this placeholder forever.
-                return Ok(&NULL_OBJECT);
+        // This is intentionally the raw-Object compatibility boundary. The
+        // canonical ObjectHandle API above owns qpdf-shaped lazy resolution;
+        // the legacy reader still owns stream-length recovery, transformed
+        // stream bookkeeping, and qpdf JSON's materialized Object contract.
+        if self.handle_mutated_object_refs.contains(&object_ref) {
+            if self.materialize_canonical_compatibility_value(object_ref)? {
+                return Ok(self
+                    .legacy_materialized_memo
+                    .get(&object_ref)
+                    .expect("inserted materialized ObjectHandle value"));
             }
-
-            // A stream handle at the no-offset sentinel was populated by
-            // `lift` (`Pdf::set_object`'s write-through, or
-            // `resolve_object_handle`'s narrow native-parse-failure
-            // fallback) directly from the `Object` already sitting in
-            // `self.cache` for this same ref — `lift`'s `Object::Stream` arm
-            // builds the handle's value from exactly that cached `Object`.
-            // Serve the cache's own reference here instead of materializing
-            // a second copy: `materialize()` would clone the stream's
-            // (potentially huge) payload bytes yet again, on top of the
-            // clone `lift` already made getting the value into the handle
-            // graph in the first place — three copies of the same buffer
-            // alive at once for a single `set_object` + `resolve_borrowed`
-            // round trip. `borrowed_qpdf_resolution_preserves_historical_stream_fallback_without_clone`
-            // is the regression test for this.
-            //
-            // Correctness here rests on an invariant spanning three
-            // functions that mutate `self.cache` and `self.handle_registry`
-            // independently: whenever a sentinel-offset handle resolves to
-            // `ObjectValue::Stream`, `self.cache`'s entry for the same ref
-            // must already be the value-equal `Object::Stream` that handle
-            // was lifted from (true for `set_object`'s write-through and for
-            // `resolve_object_handle`'s native-parse-failure fallback, both
-            // of which lift directly from the same `object` that is — or
-            // was just — written into `self.cache`). A future edit to
-            // `Pdf::lift`, `Pdf::set_object`, or `Pdf::resolve_object_handle`
-            // that breaks this pairing would only be caught by the
-            // no-extra-clone regression test above if it also happened to
-            // change the pointer; a value-only divergence would not be.
-            // `mark_object_dirty` deliberately invalidates that invariant
-            // after an in-place ObjectHandle mutation (for example an
-            // EmbeddedFile `/Subtype` update): the cache still holds the
-            // old stream while the live handle holds the new dictionary.
-            // In that case materialize only on the next observation instead
-            // of copying attachment data at mutation time.
-            if handle.get_parsed_offset() < 0
-                && !self.handle_mutated_object_refs.contains(&object_ref)
-            {
-                if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
-                    self.cache.entry(object_ref)
-                {
-                    return Ok(cached);
-                }
-            }
-
-            // `handle`'s own resolved value is already correctly decrypted
-            // regardless of route: `resolve_object_handle`'s native-parse
-            // branch decrypts strings at population time (see its own
-            // comment), and every other route lifts from `object`, which
-            // `resolve_to_cache` already decrypted through the legacy
-            // engine's own pipeline. `materialize()` below is a plain
-            // structural copy, nothing left to decrypt here.
-            let materialized = handle.materialize()?;
-            self.legacy_materialized_memo
-                .insert(object_ref, materialized);
+            return Ok(&NULL_OBJECT); // cov:ignore: a successful canonical resolve always leaves a missing handle resolved
         }
 
-        Ok(self
-            .legacy_materialized_memo
-            .get(&object_ref)
-            .unwrap_or(&NULL_OBJECT))
+        match self.resolve_to_cache(object_ref) {
+            Ok(true) => {
+                if let Some(CacheEntry::Resolved(object)) = self.cache.entry(object_ref) {
+                    return Ok(object);
+                } // cov:ignore: resolve_to_cache returns true only after installing a resolved cache entry
+            }
+            Ok(false)
+                if self.resolver.attempt_recovery() && !self.resolver.reconstructed_xref() =>
+            {
+                if self.materialize_canonical_compatibility_value(object_ref)? {
+                    return Ok(self
+                        .legacy_materialized_memo
+                        .get(&object_ref)
+                        .expect("inserted recovered canonical value"));
+                } // cov:ignore: canonical materialization cannot return false after resolving an indirect handle
+            }
+            Err(error)
+                if self.resolver.attempt_recovery()
+                    && !self.resolver.reconstructed_xref()
+                    && matches!(error, Error::Parse { .. }) =>
+            {
+                if self.materialize_canonical_compatibility_value(object_ref)? {
+                    return Ok(self
+                        .legacy_materialized_memo
+                        .get(&object_ref)
+                        .expect("inserted recovered canonical value"));
+                }
+            }
+            Err(error) => return Err(error),
+            Ok(false) => {}
+        }
+
+        // A canonical handle may have been resolved by a caller without
+        // populating the raw cache. Expose that value only as an explicit
+        // compatibility read; it does not route canonical resolution back
+        // through the legacy engine.
+        if let Some(handle) = self
+            .resolver
+            .registered_handle(object_ref)
+            .filter(ObjectHandle::is_resolved)
+        {
+            let value = handle.materialize()?;
+            self.legacy_materialized_memo.insert(object_ref, value);
+            return Ok(self
+                .legacy_materialized_memo
+                .get(&object_ref)
+                .expect("inserted materialized ObjectHandle value"));
+        }
+
+        Ok(&NULL_OBJECT)
+    }
+
+    /// Materialize a canonical handle only for an explicit raw-object
+    /// compatibility read after the caller has mutated that handle. This is
+    /// not recovery for ordinary raw resolution: the raw reader keeps its own
+    /// bounded retry budget, and canonical parsing must never bypass it.
+    fn materialize_canonical_compatibility_value(&mut self, object_ref: ObjectRef) -> Result<bool> {
+        let handle = self.get_object_handle(object_ref);
+        self.resolve_object_handle(&handle)?;
+        self.synchronize_legacy_resolution_state();
+        if !handle.is_resolved() {
+            return Ok(false); // cov:ignore: the canonical resolver resolves or errors for every indirect handle
+        }
+
+        if handle.get_parsed_offset() < 0 && !self.handle_mutated_object_refs.contains(&object_ref)
+        {
+            if let Some(CacheEntry::Resolved(cached @ Object::Stream(_))) =
+                self.cache.entry(object_ref)
+            {
+                self.legacy_materialized_memo
+                    .insert(object_ref, cached.clone());
+                return Ok(true);
+            }
+        }
+
+        self.legacy_materialized_memo
+            .insert(object_ref, handle.materialize()?);
+        Ok(true)
     }
 
     /// Read and parse the indirect object stored at `offset`, returning the read
@@ -2573,9 +2253,8 @@ impl<R: Read + Seek> Pdf<R> {
     // Read the byte window starting at `offset`, bounded by the next known
     // object's offset when one exists, or by EOF for the last object in the
     // file. Shared by `read_object_at_with_policy`'s own (first-attempt)
-    // window read and by `native_parse_uncompressed_value`'s single read —
-    // extracted so the two never drift on how the fast-path window is
-    // computed.
+    // window read, extracted so the legacy reader's bounded fast path has one
+    // definition of its source window.
     fn read_bounded_object_window(&mut self, offset: u64) -> Result<Vec<u8>> {
         let next = self.next_object_offset(offset);
         self.resolver.read_window(offset, next)
@@ -3092,17 +2771,6 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-// Lets `parser::Parser::object_handle` reach `Pdf::get_object_handle` for a
-// nested `N G R` without `Parser` depending on `Pdf<R>`'s reader-generic
-// type. Named `indirect_handle` (not `get_object_handle`) so this trait
-// method and the inherent one it delegates to can never be confused for
-// each other at the call site below.
-impl<R: Read + Seek> crate::parser::HandleResolver for Pdf<R> {
-    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-        self.get_object_handle(object_ref)
-    }
-}
-
 /// qpdf `QPDF::decryptString`'s decryption half (`:1009-1038`), applied to
 /// every string reachable from `object`.
 fn decrypt_object_strings(
@@ -3161,20 +2829,16 @@ fn object_contains_string(object: &Object, depth: usize) -> Result<bool> {
     Ok(false)
 }
 
-// Mirrors `decrypt_object_strings`'s mode dispatch exactly (same key
-// derivation, same `decrypt_cipher_bytes` leaf primitive), but walks an
-// `ObjectValue`/`ObjectHandle` tree in place rather than a legacy `Object`
-// tree. Needed for `Pdf::resolve_object_handle`'s native-parse branch:
-// `native_parse_uncompressed_value` builds `ObjectValue`/`ObjectHandle`
-// directly from raw source bytes, never through an intermediate `Object`, so
-// `decrypt_object_strings` (which only accepts `&mut Object`) cannot be
-// called on it without materializing and re-lifting -- which would silently
-// reset every nested child's already-recorded parsed offset, the exact
-// invariant `native_parse_uncompressed_value`'s own doc protects.
+// Test-only mirror of `decrypt_object_strings`'s mode dispatch (same key
+// derivation, same `decrypt_cipher_bytes` leaf primitive), walking an
+// `ObjectValue`/`ObjectHandle` tree in place. The production canonical parser
+// decrypts literal strings as they are parsed; these helpers retain focused
+// coverage for the handle-tree encryption primitive itself.
 //
 // Returns whether the caller must emit the unknown-crypt-filter warning for
 // strings, exactly as `decrypt_resolved_object`'s string half does; the crypt
 // filter selection is shared, so a document only ever warns once.
+#[cfg(test)]
 fn decrypt_object_value_strings(
     object_ref: ObjectRef,
     value: &mut ObjectValue,
@@ -3196,6 +2860,7 @@ fn decrypt_object_value_strings(
     Ok(warn)
 }
 
+#[cfg(test)]
 fn object_value_contains_string(value: &ObjectValue) -> Result<bool> {
     match value {
         ObjectValue::String(_) => Ok(true),
@@ -3219,6 +2884,7 @@ fn object_value_contains_string(value: &ObjectValue) -> Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn handles_contain_string<'a>(
     handles: impl Iterator<Item = &'a ObjectHandle>,
     depth: usize,
@@ -3231,6 +2897,7 @@ fn handles_contain_string<'a>(
     Ok(false)
 }
 
+#[cfg(test)]
 fn handle_contains_string(handle: &ObjectHandle, depth: usize) -> Result<bool> {
     if handle.is_indirect() {
         return Ok(false);
@@ -3265,6 +2932,7 @@ fn handle_contains_string(handle: &ObjectHandle, depth: usize) -> Result<bool> {
 // `decrypt_handle_strings_in_place`, which tracks depth itself (this
 // function is the sole, always-depth-0 entry point -- it never recurses
 // into itself, so it carries no depth parameter of its own).
+#[cfg(test)]
 fn decrypt_strings_in_object_value(
     value: &mut ObjectValue,
     cipher: StringCipher<'_>,
@@ -3308,6 +2976,7 @@ fn decrypt_strings_in_object_value(
 // decrypted with the wrong (parent's) key. A direct string is decrypted and
 // written back in place via `replace_direct_value`, which preserves the
 // handle's identity and already-recorded parsed offset.
+#[cfg(test)]
 fn decrypt_handle_strings_in_place(
     handle: &ObjectHandle,
     cipher: StringCipher<'_>,
@@ -3352,13 +3021,11 @@ fn decrypt_handle_strings_in_place(
 // stream's dictionary entries at the *same* depth+1 the stream itself was
 // reached at -- the legacy walk never treats the stream's own dictionary
 // container as a nesting level in its own right, only its entries count.
-// Getting this wrong is real, not cosmetic: a document with native parsing
-// enabled but `/StmF /Identity` (so the legacy decryptor still runs, but
-// native-parsed handles need this same-depth accounting to match it) can
-// have a stream dictionary value nested exactly up to `MAX_INLINE_DEPTH`
-// levels that the legacy path accepts and decrypts -- charging one extra
-// level here would reject it, diverging `resolve_object_handle` from
-// `resolve_to_cache` on input the legacy engine already handles correctly.
+// Getting this wrong is real, not cosmetic: the focused tests exercise the
+// same-depth accounting used by the raw-object compatibility walker. Charging
+// one extra level would reject a value that that explicitly legacy boundary
+// accepts and decrypts.
+#[cfg(test)]
 fn decrypt_stream_dict_strings_in_place(
     dict: &ObjectHandle,
     cipher: StringCipher<'_>,
@@ -4053,6 +3720,7 @@ mod tests {
     use crate::write_pdf;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
+    use std::rc::Rc;
     use std::sync::Arc;
 
     struct ReadFailingCursor {
@@ -4160,7 +3828,7 @@ mod tests {
     }
 
     #[test]
-    fn object_handle_as_string_decrypts_native_parsed_encrypted_strings() {
+    fn object_handle_as_string_decrypts_canonical_parsed_encrypted_strings() {
         use crate::encrypt_setup::EncryptParams;
         use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
         use std::io::Cursor;
@@ -4168,8 +3836,8 @@ mod tests {
         // A minimal Catalog/Pages/Info fixture: /Info (trailer-reachable,
         // survives the writer's Catalog-first reachability walk) holds a
         // direct, uncompressed, plain-xref-table string -- exactly the shape
-        // `native_parse_uncompressed_value` builds directly from raw source
-        // bytes, the vulnerable path this test targets.
+        // The canonical live parser builds the handle graph directly from
+        // raw source bytes, which is the path this test targets.
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let mut entries: Vec<(u16, usize)> = Vec::new();
         entries.push((0, bytes.len()));
@@ -4233,8 +3901,8 @@ mod tests {
         assert_eq!(
             title.as_slice(),
             b"TopSecretTitle",
-            "ObjectHandle::as_string() must decrypt a native-parsed string from an \
-             encrypted document, not return raw ciphertext -- native_parse_uncompressed_value \
+            "ObjectHandle::as_string() must decrypt a canonical-parsed string from an \
+             encrypted document, not return raw ciphertext -- the live parser \
              builds ObjectValue::String directly from raw (possibly still-encrypted) source \
              bytes, and this accessor reads that stored value directly"
         );
@@ -4986,7 +4654,7 @@ mod tests {
         // legacy Object::Stream arm visits stream.dict.values_mut() at the
         // *same* depth+1 the stream itself was reached at, so a document the
         // legacy path (resolve_to_cache) accepts must not be rejected here
-        // just because native parsing routes it through this walk instead.
+        // just because the canonical handle parser uses this walk instead.
         // Pin the exact boundary both paths must agree on: a stream
         // dictionary entry nested MAX_INLINE_DEPTH levels deep (accepted --
         // matches decrypt_strings_in_value's own depth+1-at-entries
@@ -5440,6 +5108,21 @@ mod tests {
             .expect("make indirect");
         assert!(indirect.is_indirect());
         assert_eq!(indirect.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn make_indirect_object_handle_preserves_the_direct_description_and_offset() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let direct = ObjectHandle::parse(b"<< /Value 7 >>").expect("parse direct object");
+        let source_description = direct.description();
+        let source_offset = direct.get_parsed_offset();
+
+        let indirect = pdf
+            .make_indirect_object_handle(direct)
+            .expect("make indirect");
+
+        assert_eq!(indirect.description(), source_description);
+        assert_eq!(indirect.get_parsed_offset(), source_offset);
     }
 
     #[test]
@@ -6473,6 +6156,8 @@ mod tests {
         );
 
         let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve the canonical handle before mutating it");
         handle.replace_key(b"Value", ObjectHandle::integer(2));
         pdf.mark_object_dirty(object_ref);
 
@@ -6634,6 +6319,62 @@ mod tests {
         assert_eq!(stream.data.len(), 1024 * 1024);
     }
 
+    #[test]
+    fn borrowed_resolution_materializes_a_pre_resolved_canonical_value_after_a_legacy_parse_error()
+    {
+        let object_ref = ObjectRef::new(1, 0);
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n[2147483648 0 R]\nendobj\n"], object_ref);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            PdfOpenOptions {
+                repair: true,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+
+        // Simulate the compatibility state produced when a canonical caller
+        // has already resolved the handle but the legacy cache still contains
+        // a stale source offset. The legacy parser must fail first, then the
+        // repair path may expose the canonical value without reparsing it.
+        let handle = pdf.get_object_handle(object_ref);
+        handle.set_resolved(ObjectValue::Integer(42));
+        let xref_offset = pdf
+            .source_bytes()
+            .expect("read fixture bytes")
+            .windows(b"xref\n".len())
+            .position(|window| window == b"xref\n")
+            .expect("xref marker") as u64;
+        pdf.cache.set_unresolved(object_ref, xref_offset);
+
+        assert_eq!(
+            pdf.resolve_borrowed(object_ref)
+                .expect("canonical value after legacy parse failure"),
+            &Object::Integer(42)
+        );
+    }
+
+    #[test]
+    fn canonical_compatibility_materialization_reuses_a_resolved_legacy_stream() {
+        let object_ref = ObjectRef::new(91, 0);
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let handle = pdf.get_object_handle(object_ref);
+        let stream_data = b"canonical stream bytes".to_vec();
+        handle.set_resolved(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: Some(Rc::new(stream_data.clone())),
+            stream_length: stream_data.len(),
+        });
+
+        let legacy = Object::Stream(Stream::new(Dictionary::new(), b"legacy bytes".to_vec()));
+        pdf.cache.set_resolved(object_ref, legacy.clone());
+
+        assert!(pdf
+            .materialize_canonical_compatibility_value(object_ref)
+            .expect("canonical stream compatibility materialization"));
+        assert_eq!(pdf.legacy_materialized_memo.get(&object_ref), Some(&legacy));
+    }
+
     fn top_level_bare_reference_pdf() -> Vec<u8> {
         classic_pdf_with_bodies(
             &[
@@ -6666,124 +6407,6 @@ mod tests {
             .as_bytes(),
         );
         bytes
-    }
-
-    /// Regression for a spec-review finding: a malformed/overlapping source
-    /// xref layout (this exact, pre-existing fixture — its object-2 entry
-    /// deliberately points into the middle of object 1's own body) truncates
-    /// `native_parse_uncompressed_value`'s bounded read window, but
-    /// `resolve_to_cache`/`resolve_borrowed` already recover the real value
-    /// via `read_object_at_with_policy`'s full-file fallback. Before the
-    /// fallback added to `resolve_object_handle`, this made
-    /// `resolve_object_handle` return `Err` where `resolve_borrowed`
-    /// succeeds — this test pins that it no longer does.
-    #[test]
-    fn resolve_object_handle_falls_back_to_lift_when_the_native_window_is_truncated() {
-        let object_ref = ObjectRef::new(1, 0);
-        let mut pdf = Pdf::open_mem_owned(stream_with_false_next_xref_offset())
-            .expect("open false-next-offset PDF");
-
-        let legacy = pdf
-            .resolve(object_ref)
-            .expect("resolve_borrowed already succeeds via the full-file fallback");
-        assert!(matches!(legacy, Object::Stream(_)));
-
-        let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve_object_handle must not fail where resolve_borrowed succeeds");
-
-        // The fallback lands on the `lift` bridge, which (as of this task)
-        // properly splits a stream's dict/data instead of falling back to
-        // `ObjectValue::Null` — so the fallback path now carries the real
-        // stream value, matching `resolve_borrowed`, at the no-offset
-        // sentinel (this fallback never records a real parsed offset).
-        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
-        assert_eq!(handle.get_parsed_offset(), -1);
-    }
-
-    /// A malformed/overlapping xref layout whose bogus "next object" offset
-    /// lands between object 1's dictionary and its `stream` keyword: long
-    /// enough for the dictionary to parse successfully within the bounded
-    /// window, but too short to ever see `stream` itself. Investigated for
-    /// a spec-review follow-up concern about `native_parse_uncompressed_value`
-    /// silently misreporting a stream's parsed offset if its bounded window
-    /// disagreed with `resolve_to_cache`'s classification of the same
-    /// object — see `resolve_object_handle_tracks_legacys_dictionary_vs_stream_classification`
-    /// for why that turns out not to be reachable.
-    fn stream_with_false_next_xref_offset_between_dict_and_stream_keyword() -> Vec<u8> {
-        let mut bytes = b"%PDF-1.7\n".to_vec();
-        let stream_offset = bytes.len();
-        let body = b"1 0 obj\n<< /Length 5 >>\nstream\nHello\nendstream\nendobj\n";
-        bytes.extend_from_slice(body);
-        let dict_and_newline_len = b"1 0 obj\n<< /Length 5 >>\n".len();
-        let false_next = stream_offset + dict_and_newline_len;
-        let xref_offset = bytes.len();
-        bytes.extend_from_slice(
-            format!(
-                "xref\n0 3\n\
-                 0000000000 65535 f \n\
-                 {stream_offset:010} 00000 n \n\
-                 {false_next:010} 00000 n \n\
-                 trailer\n<< /Size 3 /Root 1 0 R >>\n\
-                 startxref\n{xref_offset}\n%%EOF\n"
-            )
-            .as_bytes(),
-        );
-        bytes
-    }
-
-    /// Empirically closes the spec-review follow-up concern: a bounded
-    /// window long enough for the dictionary to parse but too short to see
-    /// the `stream` keyword does *not* let `native_parse_uncompressed_value`
-    /// silently misclassify a genuine stream as a bare dictionary, because
-    /// the *legacy* engine's own bounded attempt hits the exact same
-    /// ambiguity first — and, since a missing `endobj`/`stream` is only ever
-    /// a soft warning (`check_endobj`), never a hard failure, `resolve_to_cache`
-    /// itself resolves `object` to a bare `Object::Dictionary` here (a
-    /// pre-existing flpdf quirk this task neither introduces nor fixes; it
-    /// affects `Pdf::resolve`/`resolve_borrowed` identically, with or
-    /// without this task's changes). Since `object`'s *actual* classification
-    /// is already `Dictionary`, not `Stream`, `native_parse_uncompressed_value`'s
-    /// `let Object::Stream(stream) = object else { return Ok(..) }` early
-    /// return takes over — the same code path exercised for any ordinary
-    /// dictionary — so the `PendingBody::Direct` arm inside the `Some(stream)`
-    /// branch is provably unreachable: `object` can only be `Object::Stream`
-    /// when the bounded window already saw `stream` (case: the legacy
-    /// bounded attempt's own classification would then agree), or when a
-    /// hard parse failure forced the full-file retry (case: this task's own
-    /// `resolve_object_handle_falls_back_to_lift_when_the_native_window_is_truncated`
-    /// regression, where the *dictionary* parse itself fails identically on
-    /// both paths, not just the stream-keyword visibility).
-    #[test]
-    fn resolve_object_handle_tracks_legacys_dictionary_vs_stream_classification() {
-        let object_ref = ObjectRef::new(1, 0);
-        let mut pdf = Pdf::open_mem_owned(
-            stream_with_false_next_xref_offset_between_dict_and_stream_keyword(),
-        )
-        .expect("open false-next-offset PDF");
-
-        let legacy = pdf
-            .resolve(object_ref)
-            .expect("legacy resolves, to the (pre-existing quirk's) wrong classification");
-        assert!(matches!(legacy, Object::Dictionary(_)));
-
-        let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve_object_handle must not fail");
-
-        let dict = handle
-            .as_dictionary()
-            .expect("must track object's actual Dictionary classification, not guess Stream");
-        assert_eq!(
-            dict.get(b"Length".as_slice())
-                .and_then(ObjectHandle::as_integer),
-            Some(5)
-        );
-        assert_ne!(
-            handle.get_parsed_offset(),
-            -1,
-            "a plain dictionary still gets a real native-parsed offset"
-        );
     }
 
     #[test]
@@ -7514,15 +7137,10 @@ mod tests {
         assert!(handle.as_array().is_some());
     }
 
-    // `lift`/`lift_bounded` (unlike the native parse path) has no
-    // `stacker::maybe_grow` protection of its own — matching
-    // `parser.rs`'s own `nesting_past_max_parse_depth_matches_between_legacy_and_native_paths`/
-    // `native_handle_path_preserves_the_object_nesting_guard`, recursing it
-    // all the way to `MAX_PARSE_DEPTH` needs a dedicated, larger-than-default
-    // thread stack to avoid aborting the whole test process on a
-    // small-default-stack CI runner (observed: Windows). Building the
-    // `Pdf`/`Object` tree inside the spawned closure, not moving one in from
-    // outside, sidesteps needing either type to be `Send`.
+    // `lift`/`lift_bounded` is a legacy materialization helper and has no
+    // parser stack-growth guard of its own. Building this synthetic
+    // `Pdf`/`Object` tree inside a larger spawned stack keeps the test focused
+    // on its depth contract without making either type cross a thread.
     #[test]
     fn trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound() {
         std::thread::Builder::new()
@@ -7994,16 +7612,11 @@ mod tests {
         assert_eq!(pdf.repair_diagnostics().entries().len(), 1);
     }
 
-    /// White-box companion to the public-API
-    /// `resolve_object_handle_distinguishes_a_literal_null_from_a_dangling_reference`
-    /// integration test: proves the two null-observing cases actually take
-    /// different internal routes through `self.cache`, not merely that both
-    /// happen to read as `is_null() == true` from the outside. A literal
-    /// `null` object present in the xref table resolves to a real
-    /// `CacheEntry::Resolved(Object::Null)`; a reference entirely absent from
-    /// the xref table never gains a cache entry at all.
+    /// White-box companion to the public canonical-handle null behavior:
+    /// canonical resolution updates the ResolverHandle slot only. It does
+    /// not populate the legacy raw-Object cache as a side effect.
     #[test]
-    fn resolve_object_handle_literal_null_and_dangling_ref_take_different_cache_paths() {
+    fn resolve_object_handle_keeps_legacy_cache_untouched_for_nulls() {
         let bytes = classic_pdf_with_bodies(&[b"1 0 obj\nnull\nendobj\n"], ObjectRef::new(1, 0));
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open literal-null fixture");
 
@@ -8012,10 +7625,13 @@ mod tests {
         pdf.resolve_object_handle(&literal_null_handle)
             .expect("resolve literal null");
         assert!(literal_null_handle.is_null());
-        assert!(matches!(
-            pdf.cache.entry(literal_null_ref),
-            Some(CacheEntry::Resolved(Object::Null))
-        ));
+        assert!(
+            !matches!(
+                pdf.cache.entry(literal_null_ref),
+                Some(CacheEntry::Resolved(_))
+            ),
+            "canonical resolution must not populate the legacy raw cache"
+        );
 
         let dangling_ref = ObjectRef::new(999, 0);
         let dangling_handle = pdf.get_object_handle(dangling_ref);
@@ -8031,14 +7647,10 @@ mod tests {
     #[test]
     fn resolve_object_handle_compressed_member_accepts_inline_nesting_past_max_inline_depth() {
         // Nesting between MAX_INLINE_DEPTH (256) and MAX_PARSE_DEPTH (500) is
-        // accepted by the parser that already produced this compressed
-        // member's cached `Object` (via `resolve_to_cache`/
-        // `parse_object_stream_chain_entry`). `resolve_object_handle` must
-        // lift it at that same looser bound rather than `lift`'s default
-        // `MAX_INLINE_DEPTH`, or a value `resolve_borrowed` always accepted
-        // at this depth would spuriously fail here — see the comment on
-        // `resolve_object_handle`'s call to `lift_bounded` for the
-        // regression this pins.
+        // accepted by the canonical live parser for ObjStm members. The
+        // handle route must preserve that qpdf parser bound rather than
+        // applying the tighter structural-walk limit used by legacy
+        // materialization helpers.
         let depth = crate::object::MAX_INLINE_DEPTH + 5;
         let mut member_value = Vec::new();
         member_value.extend(std::iter::repeat_n(b'[', depth));
@@ -8071,6 +7683,12 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: objstm_offset,
+            },
+        );
         pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
@@ -8129,6 +7747,12 @@ mod tests {
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
         pdf.resolver.insert_xref_entry(
+            ObjectRef::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: objstm_offset,
+            },
+        );
+        pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
                 stream: 4,
@@ -8152,19 +7776,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_object_handle_uncompressed_now_accepts_the_same_nesting_depth_via_native_parse() {
+    fn resolve_object_handle_uncompressed_accepts_the_same_nesting_depth_via_canonical_parser() {
         // Task 6's `resolve_object_handle` routed every indirect handle
         // (Uncompressed and Compressed alike) through the same `lift`
         // bridge, so this exact depth (between MAX_INLINE_DEPTH and
         // MAX_PARSE_DEPTH) used to be rejected for BOTH. This task reroutes
-        // the Uncompressed case to a native parse bounded only by
-        // MAX_PARSE_DEPTH (matching `object`/`object_inner` exactly, see
-        // `Parser::object_handle`) — so it now succeeds, matching what
+        // the Uncompressed case to the canonical live parser bounded only by
+        // MAX_PARSE_DEPTH — so it now succeeds, matching what
         // `resolve_borrowed` (which was never subject to MAX_INLINE_DEPTH)
         // already accepted at this depth. The Compressed case now also
         // accepts this depth (see
         // `resolve_object_handle_compressed_member_accepts_inline_nesting_past_max_inline_depth`),
-        // via `lift_bounded` rather than native parse. This is an
+        // via the canonical live parser rather than `lift_bounded`. This is an
         // intentional behavior change, not a weakened test: the assertion
         // below pins parity with `resolve_borrowed`, not just "no longer
         // errors".
@@ -8190,15 +7813,11 @@ mod tests {
         assert!(handle.as_array().is_some());
     }
 
-    /// Now that this task reroutes the Uncompressed case away from `lift`,
-    /// `lift`/`lift_to_handle`'s own scalar/dictionary/reference branches are
-    /// reachable only through the Compressed (ObjStm-member) route this task
-    /// deliberately leaves unchanged — this is the coverage anchor for that
-    /// route, mirroring what `resolve_object_handle_lifts_every_scalar_object_value_variant`
-    /// (the tests-crate parity file) already covers for the Uncompressed
-    /// (native-parse) case.
+    /// The canonical ObjStm route must preserve every direct scalar,
+    /// dictionary, and nested indirect-reference variant emitted by qpdf's
+    /// live parser. This is the coverage anchor for that source class.
     #[test]
-    fn resolve_object_handle_compressed_member_lifts_every_scalar_dictionary_and_reference_variant()
+    fn resolve_object_handle_compressed_member_preserves_scalar_dictionary_and_reference_variants()
     {
         let member_value: &[u8] =
             b"<< /B true /R 1.5 /RL .5 /N /Foo /S (bar) /Nul null /Kid 5 0 R /Sub << /X 1 >> >>";
@@ -8228,6 +7847,12 @@ mod tests {
         pdf.cache
             .set_unresolved(ObjectRef::new(4, 0), objstm_offset);
         pdf.cache.set_compressed(ObjectRef::new(7, 0), 4, 0);
+        pdf.resolver.insert_xref_entry(
+            ObjectRef::new(4, 0),
+            XrefEntry::Uncompressed {
+                offset: objstm_offset,
+            },
+        );
         pdf.resolver.insert_xref_entry(
             ObjectRef::new(7, 0),
             XrefEntry::Compressed {
@@ -8267,44 +7892,19 @@ mod tests {
         );
     }
 
-    /// `resolve_to_cache` records a stream's recovered `endstream`-scan EOL
-    /// alongside `CacheEntry::Resolved` (see `Self::recovered_stream_eol`).
-    /// `resolve_object_handle` calls `resolve_to_cache` as its very first
-    /// step for every indirect handle — this pins that it does not bypass
-    /// that side table.
-    ///
-    /// This test needs the crate-private `recovered_stream_eol` accessor, so
-    /// it lives here rather than in the `tests/` integration suite (which
-    /// only sees the public API).
     #[test]
-    fn resolve_object_handle_still_populates_recovered_stream_eol() {
-        let bytes = recovered_stream_fixture(b"", b"\n", None);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open recovered-stream fixture");
+    fn resolve_object_handle_preserves_source_filter_array_alignment() {
         let object_ref = ObjectRef::new(1, 0);
-
-        let handle = pdf.get_object_handle(object_ref);
-        pdf.resolve_object_handle(&handle)
-            .expect("resolve recovered stream");
-
-        assert_eq!(handle.as_stream_data(), Some(Rc::new(b"abc".to_vec())));
-        assert_eq!(pdf.recovered_stream_eol(object_ref), Some(&b"\n"[..]));
-    }
-
-    /// Companion to the above for the other side table
-    /// (`transformed_stream_refs`): when a stream's payload is actually
-    /// transformed (here, decrypted), `resolve_to_cache` marks that ref so
-    /// `recovered_stream_eol` stops surfacing a recovered EOL that belongs to
-    /// ciphertext framing, not the plaintext `resolve` returns. The
-    /// `EncryptionState` is injected directly (matching
-    /// `explicit_rc4_encryption_state`'s existing pattern) rather than
-    /// authenticating a real encrypted fixture, since only the
-    /// side-table bookkeeping is under test here, not decryption
-    /// correctness (already covered elsewhere).
-    #[test]
-    fn resolve_object_handle_still_marks_transformed_stream_refs_for_a_decrypted_stream() {
-        let bytes = recovered_stream_fixture(b"", b"\n", None);
-        let mut pdf = Pdf::open_mem_owned(bytes).expect("open recovered-stream fixture");
-        let object_ref = ObjectRef::new(1, 0);
+        let stream_body = b"1 0 obj\n<< /Length 3 /Filter [/ASCIIHexDecode /Crypt /FlateDecode] /DecodeParms [<< /A 1 >> << /Name /Identity >> << /B 2 >>] >>\nstream\nabc\nendstream\nendobj\n";
+        let bytes = classic_pdf_with_bodies(&[stream_body], object_ref);
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: "input.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open source-filter fixture");
         *pdf.encryption.borrow_mut() = Some(EncryptionState {
             encryption_v: 2,
             encryption_r: 3,
@@ -8314,16 +7914,37 @@ mod tests {
 
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle)
-            .expect("resolve recovered, (fake-)encrypted stream");
+            .expect("resolve through the canonical stream parser");
 
-        assert!(
-            pdf.transformed_stream_refs.contains(&object_ref),
-            "a decrypted stream's payload transformation must still be tracked via the handle path"
-        );
+        let dict = handle.as_stream_dict().expect("stream dictionary");
+        let entries = dict.as_dictionary().expect("dictionary entries");
+        let filters = entries
+            .get(b"Filter".as_slice())
+            .and_then(ObjectHandle::as_array)
+            .expect("source filter array");
         assert_eq!(
-            pdf.recovered_stream_eol(object_ref),
-            None,
-            "a transformed stream's recovered EOL belongs to ciphertext framing and must stay masked"
+            filters
+                .iter()
+                .map(|filter| filter.as_name().expect("filter name"))
+                .collect::<Vec<_>>(),
+            vec![
+                b"ASCIIHexDecode".to_vec(),
+                b"Crypt".to_vec(),
+                b"FlateDecode".to_vec()
+            ]
+        );
+
+        let decode_parms = entries
+            .get(b"DecodeParms".as_slice())
+            .and_then(ObjectHandle::as_array)
+            .expect("source decode-params array");
+        assert_eq!(decode_parms.len(), filters.len());
+        assert_eq!(
+            decode_parms[1]
+                .as_dictionary()
+                .and_then(|params| params.get(b"Name".as_slice()).cloned())
+                .and_then(|name| name.as_name()),
+            Some(b"Identity".to_vec())
         );
     }
 
@@ -8404,7 +8025,7 @@ mod tests {
         pdf.resolve_object_handle(&handle).expect("resolve");
         assert!(
             handle.get_parsed_offset() >= 0,
-            "native parse must record a real offset before deletion"
+            "canonical parsing must record a real offset before deletion"
         );
 
         pdf.delete_object(object_ref);
@@ -8413,16 +8034,263 @@ mod tests {
         assert!(handle.is_null());
     }
 
-    /// `Pdf::resolve_borrowed` now returns the *native*-parsed dictionary
-    /// value for a plain Uncompressed object (via `Pdf::materialize`) rather
-    /// than the legacy-resolved one, for the first time. The native
-    /// `dictionary_handle` parser (`parser.rs`) and the legacy
-    /// `Parser::dictionary` are two independently maintained left-to-right
-    /// `BTreeMap::insert` passes over the same token stream; this pins that
-    /// they still agree on a duplicate dictionary key (last write wins),
+    #[test]
+    fn delete_object_drops_the_source_description_of_an_already_resolved_handle() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve");
+        let source_description = handle.description();
+        assert!(
+            source_description.contains("offset"),
+            "the fixture must establish a source description before deletion"
+        );
+
+        pdf.delete_object(object_ref);
+
+        assert_eq!(handle.description(), "object 1 0");
+        handle
+            .object_warning("deleted object warning")
+            .expect("deleted handle warning should use the fallback description");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .last()
+                .expect("deleted warning is recorded")
+                .message,
+            "object 1 0: deleted object warning"
+        );
+        assert_ne!(handle.description(), source_description);
+    }
+
+    #[test]
+    fn set_object_drops_the_replaced_handle_source_description() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve");
+        assert!(
+            handle.description().contains("offset"),
+            "the fixture must establish a source description before replacement"
+        );
+
+        pdf.set_object(object_ref, Object::Integer(42));
+
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert_eq!(handle.description(), "object 1 0");
+        handle
+            .object_warning("replacement warning")
+            .expect("replacement warning should use the replacement description");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .last()
+                .expect("replacement warning is recorded")
+                .message,
+            "object 1 0: replacement warning"
+        );
+    }
+
+    #[test]
+    fn set_object_drops_the_reused_stream_dictionary_source_description() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 5 >>\nstream\nHello\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve stream");
+        let dictionary = handle.as_stream_dict().expect("stream dictionary");
+        assert!(
+            dictionary.description().contains("offset"),
+            "the fixture must establish a source description before replacement"
+        );
+
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("Length", Object::Integer(3));
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, b"Bye".to_vec())),
+        );
+
+        assert_eq!(
+            handle
+                .as_stream_dict()
+                .expect("stream dictionary after replacement")
+                .description(),
+            "",
+            "the reused dictionary must no longer identify the replaced source bytes"
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_stamps_the_public_canonical_root_and_nested_handles() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Nested << /Value 7 >> >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve through the public canonical path");
+
+        assert!(
+            handle.description().contains("object 1 0 at offset"),
+            "the canonical root must retain its source description"
+        );
+        let nested = handle
+            .as_dictionary()
+            .and_then(|entries| entries.get(b"Nested".as_slice()).cloned())
+            .expect("nested dictionary");
+        assert!(
+            nested.description().contains("object 1 0 at offset"),
+            "the nested direct handle must retain its source description"
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_preserves_leading_whitespace_before_a_scalar_description() {
+        let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n\n 7\nendobj\n"], ObjectRef::new(1, 0));
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: "input.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open scalar fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve through the public canonical path");
+
+        assert_eq!(
+            handle.get_parsed_offset(),
+            16,
+            "the scalar provenance starts immediately after `obj`, before leading whitespace"
+        );
+        assert_eq!(
+            handle.description(),
+            "input.pdf, object 1 0 at offset 16",
+            "the qpdf-style top-level scalar description must include its pre-tokenization offset"
+        );
+    }
+
+    #[test]
+    fn resolve_object_handle_gives_canonical_parser_children_the_document_resolver() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Outer << /Inner << /Value 7 >> >> >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve through the public canonical path");
+
+        let inner = handle
+            .as_dictionary()
+            .and_then(|entries| entries.get(b"Outer".as_slice()).cloned())
+            .and_then(|outer| outer.as_dictionary())
+            .and_then(|entries| entries.get(b"Inner".as_slice()).cloned())
+            .expect("nested dictionary");
+        inner
+            .object_warning("nested warning")
+            .expect("canonical parser children must retain the document warning resolver");
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message.contains("nested warning")));
+    }
+
+    #[test]
+    fn canonical_resolution_preserves_placeholder_text_in_the_input_description() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Value 7 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_with_options(
+            Cursor::new(bytes),
+            PdfOpenOptions {
+                description: "input-$PO-$OG.pdf".to_owned(),
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("open fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
+
+        handle
+            .try_dereference()
+            .expect("resolve through the canonical lazy resolver");
+
+        let expected_offset = handle.get_parsed_offset() + 2;
+        assert_eq!(
+            handle.description(),
+            format!("input-{expected_offset}-1 0.pdf, object 1 0 at offset $PO"),
+            "canonical descriptions must use qpdf's one-pass marker replacement"
+        );
+    }
+
+    #[test]
+    fn set_object_keeps_the_source_description_when_handle_lift_fails() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Type /Catalog /Count 1 >>\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle.try_dereference().expect("resolve");
+        let source_description = handle.description();
+        assert!(
+            source_description.contains("offset"),
+            "the fixture must establish a source description before replacement"
+        );
+
+        let mut replacement = Object::Null;
+        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement);
+
+        assert_eq!(
+            handle.description(),
+            source_description,
+            "a failed handle lift must leave the canonical value and provenance untouched"
+        );
+        handle
+            .object_warning("failed replacement warning")
+            .expect("unchanged handle warning should keep its source description");
+        assert_eq!(
+            pdf.repair_diagnostics()
+                .entries()
+                .last()
+                .expect("failed replacement warning is recorded")
+                .message,
+            format!("{source_description}: failed replacement warning")
+        );
+    }
+
+    /// Compare the canonical live parser's dictionary value for a plain
+    /// Uncompressed object with the raw-object compatibility path. The
+    /// canonical live parser and the legacy `Parser::dictionary` are two
+    /// independently maintained left-to-right `BTreeMap::insert` passes over
+    /// the same token stream; this pins that they still agree on a duplicate
+    /// dictionary key (last write wins),
     /// rather than relying on that being merely "true today, unverified".
     #[test]
-    fn native_and_legacy_dictionary_parsers_agree_on_a_duplicate_key() {
+    fn canonical_and_legacy_dictionary_parsers_agree_on_a_duplicate_key() {
         let body: &[u8] = b"1 0 obj\n<< /A 1 /A 2 /B 3 >>\nendobj\n";
         let object_ref = ObjectRef::new(1, 0);
 
@@ -8435,15 +8303,20 @@ mod tests {
             .resolve_qpdf_json_object(object_ref)
             .expect("legacy resolve");
 
-        // Bridge path: `resolve` materializes from a *native* parse of the
-        // same source bytes (`native_parse_uncompressed_value`), a separate
-        // `BTreeMap`-building pass over the identical duplicate-key
-        // dictionary token stream.
-        let mut native_pdf =
+        // Canonical path: resolve the same source through the live
+        // ObjectHandle parser, then materialize it only for comparison with
+        // the raw-object result.
+        let mut canonical_pdf =
             Pdf::open_mem_owned(classic_pdf_with_bodies(&[body], object_ref)).expect("open");
-        let native = native_pdf.resolve(object_ref).expect("bridge resolve");
+        let canonical_handle = canonical_pdf.get_object_handle(object_ref);
+        canonical_pdf
+            .resolve_object_handle(&canonical_handle)
+            .expect("canonical resolution");
+        let canonical = canonical_handle
+            .materialize()
+            .expect("canonical materialization");
 
-        assert_eq!(legacy, native);
+        assert_eq!(legacy, canonical);
         let Object::Dictionary(dict) = &legacy else {
             panic!("fixture body is always a dictionary"); // cov:ignore: unreachable
         };

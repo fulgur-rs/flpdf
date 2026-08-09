@@ -26,6 +26,26 @@ pub(crate) trait HandleResolver {
     fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
         ObjectHandle::from_value(value)
     }
+
+    /// Construct a direct value while applying the parser position that qpdf
+    /// records on the value. Live parsers that read a sliced source can
+    /// override this to translate local token positions into file offsets.
+    fn direct_handle_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+        let handle = self.direct_handle(value);
+        if let Some(description) = self.description_template() {
+            handle.set_description(description, offset);
+        } else {
+            handle.set_parsed_offset_if_unset(offset);
+        }
+        handle
+    }
+
+    /// Return the one qpdf-style description template shared by this parse
+    /// call, if the caller has an observable object-description context.
+    /// Detached legacy materialization keeps the default `None`.
+    fn description_template(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Decrypts one literal PDF string while the file-object parser still owns
@@ -113,11 +133,18 @@ impl LiveInput for SliceLiveInput<'_> {
 /// to `Object::Reference`. This resolver is deliberately local: object
 /// streams do not mint document-cache entries until their owning compressed-
 /// object resolver consumes the result.
-struct DetachedHandles;
+#[derive(Default)]
+struct DetachedHandles {
+    description_template: Option<String>,
+}
 
 impl HandleResolver for DetachedHandles {
     fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
         ObjectHandle::from_value(ObjectValue::Reference(object_ref))
+    }
+
+    fn description_template(&self) -> Option<String> {
+        self.description_template.clone()
     }
 }
 
@@ -279,7 +306,9 @@ pub(crate) fn parse_live_file_object_with_decrypter<I: LiveInput>(
 /// (`libqpdf/QPDFParser.cc:135-176`).
 pub(crate) fn parse_explicit_object_handle(input: &[u8]) -> Result<ObjectHandle> {
     let mut input_source = SliceLiveInput::new(input);
-    let mut detached_handles = DetachedHandles;
+    let mut detached_handles = DetachedHandles {
+        description_template: Some("parsed object,  at offset $PO".to_owned()),
+    };
     let parsed =
         parse_live_file_object_with_context(&mut input_source, &mut detached_handles, false, None)?;
 
@@ -742,9 +771,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
     }
 
     fn direct_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
-        let handle = self.resolver.direct_handle(value);
-        handle.set_parsed_offset_if_unset(offset);
-        handle
+        self.resolver.direct_handle_at(value, offset)
     }
 
     fn next_token(&mut self) -> Result<Token> {
@@ -1464,6 +1491,31 @@ mod live_input_tests {
             vec![(0, "empty object treated as null")]
         );
     }
+
+    #[test]
+    fn handle_parser_preserves_empty_objects_and_wrapper_delegations() {
+        let mut resolver = NullResolver;
+        let (value, parsed_offset, diagnostics) =
+            super::parse_qpdf_direct_object_handle_with_diagnostics(
+                b" \nendobj\n",
+                0,
+                None,
+                &mut resolver,
+            )
+            .expect("empty handle object");
+        assert!(matches!(value, ObjectValue::Null));
+        assert_eq!(parsed_offset, super::NO_PARSED_OFFSET);
+        assert!(diagnostics.is_empty());
+
+        let mut rebasing = super::OffsetHandleResolver {
+            resolver: &mut resolver,
+            base_offset: 17,
+            top_level_offset: None,
+        };
+        let direct = HandleResolver::direct_handle(&mut rebasing, ObjectValue::Integer(42));
+        assert_eq!(direct.as_integer(), Some(42));
+        assert_eq!(HandleResolver::description_template(&rebasing), None);
+    }
 }
 
 /// Parse a single PDF object from `input`, which must contain nothing but
@@ -1540,7 +1592,7 @@ pub(crate) fn parse_indirect_object_with_diagnostics(
 /// ObjStm body contains only adjacent direct-object representations.
 pub(crate) fn parse_qpdf_file_object(input: &[u8]) -> Result<(Object, Vec<ParserDiagnostic>)> {
     let mut input = SliceLiveInput::new(input);
-    let mut handles = DetachedHandles;
+    let mut handles = DetachedHandles::default();
     let parsed = parse_live_file_object(&mut input, &mut handles)?;
     let object = materialize_live_handle(&parsed.value)?;
     let mut diagnostics = parsed.diagnostics;
@@ -1592,55 +1644,59 @@ pub(crate) fn parse_qpdf_direct_object(input: &[u8]) -> Result<ParsedDirectObjec
     })
 }
 
-/// The handle-producing counterpart of [`parse_qpdf_direct_object`]: parses
-/// one file-object body directly into an [`ObjectValue`] with a real parsed
-/// offset, instead of a bare [`Object`] that a later pass must annotate.
-///
-/// `input` is the object body (the bytes right after "`N G obj`" and its
-/// trailing whitespace/comments), matching [`parse_qpdf_direct_object`]'s own
-/// slicing convention. `base_offset` is the file-relative position that
-/// corresponds to `input[0]`, so a token at `input` position `p` gets parsed
-/// offset `base_offset + p` — this is how the caller (`Pdf`, in `reader.rs`)
-/// converts this function's body-relative token positions into the
-/// file-relative coordinate system the qpdf `getParsedOffset` contract uses.
-///
-/// Applies the same "empty object recovered as null" and top-level
-/// bare-reference recovery as [`parse_qpdf_direct_object`] (object-stream
-/// members use this same recovery mode without any `endobj` check, matching
-/// that function's own doc).
-///
-/// # Errors
-///
-/// Returns [`Error::Parse`] under the same conditions as
-/// [`Parser::object_handle`]. This function's error offset is body-relative
-/// (relative to `input`, not yet shifted by `base_offset`); the caller shifts
-/// it with `Error::rebase_offset`, the same way `reader.rs`'s file-object
-/// syntax parser does for [`parse_qpdf_direct_object`].
-/// The caller that resolves an object *for the first time* is the one that
-/// must report its diagnostics; this wrapper is used by `reader.rs`'s
-/// `native_parse_uncompressed_value`, which re-parses an object the legacy
-/// pipeline has already resolved — and already reported the diagnostics of,
-/// through `Pdf::record_file_object_diagnostics`. Surfacing them again here
-/// would emit each warning twice for the same object, so the field is dropped
-/// deliberately rather than overlooked.
-pub(crate) fn parse_qpdf_direct_object_handle(
+/// Handle-producing direct-object parse with the parser diagnostics retained.
+pub(crate) fn parse_qpdf_direct_object_handle_with_diagnostics(
     input: &[u8],
     base_offset: i64,
+    top_level_offset: Option<i64>,
     resolver: &mut dyn HandleResolver,
-) -> Result<(ObjectValue, i64)> {
-    let mut tokenizer = Tokenizer::new(input);
-    let mut parser = Parser::with_tokenizer(&mut tokenizer);
-    parser.top_level_no_reference = true;
-    let token = parser.peek_token()?;
-    if token.is_word_value(b"endobj") {
-        return Ok((ObjectValue::Null, NO_PARSED_OFFSET));
+) -> Result<(ObjectValue, i64, Vec<ParserDiagnostic>)> {
+    let mut input_source = SliceLiveInput::new(input);
+    let mut rebasing_resolver = OffsetHandleResolver {
+        resolver,
+        base_offset,
+        top_level_offset,
+    };
+    let parsed = parse_live_file_object(&mut input_source, &mut rebasing_resolver)?;
+    if parsed.empty.is_some() {
+        return Ok((ObjectValue::Null, NO_PARSED_OFFSET, Vec::new()));
     }
 
-    let handle = parser.object_handle(base_offset, resolver)?;
-    Ok(handle.into_direct_value().expect(
-        "top_level_no_reference forces the outermost integer_or_ref decision to Integer, \
+    let handle = parsed.value;
+    let value = handle.into_direct_value().expect(
+        "the live file parser forces the outermost integer_or_ref decision to Integer, \
          so the top-level handle this function just built is always direct",
-    ))
+    );
+    Ok((value.0, value.1, parsed.diagnostics))
+}
+
+struct OffsetHandleResolver<'a> {
+    resolver: &'a mut dyn HandleResolver,
+    base_offset: i64,
+    top_level_offset: Option<i64>,
+}
+
+impl HandleResolver for OffsetHandleResolver<'_> {
+    fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
+        self.resolver.indirect_handle(object_ref)
+    }
+
+    fn direct_handle(&mut self, value: ObjectValue) -> ObjectHandle {
+        self.resolver.direct_handle(value)
+    }
+
+    fn direct_handle_at(&mut self, value: ObjectValue, offset: i64) -> ObjectHandle {
+        let offset = if self.top_level_offset.is_some() && offset == 0 {
+            self.top_level_offset.unwrap_or(offset)
+        } else {
+            self.base_offset.saturating_add(offset)
+        };
+        self.resolver.direct_handle_at(value, offset)
+    }
+
+    fn description_template(&self) -> Option<String> {
+        self.resolver.description_template()
+    }
 }
 
 pub(crate) fn parse_strict_direct_object(input: &[u8]) -> Result<ParsedDirectObject> {
@@ -1775,17 +1831,10 @@ enum ParserMode {
 pub(crate) const MAX_PARSE_DEPTH: usize = 500;
 
 // `MAX_PARSE_DEPTH` bounds recursion *count* to match qpdf's own limit, not
-// the stack *bytes* 500 levels of `object`/`object_handle` recursion actually
-// cost — that varies by target, build profile, and per-frame size, and is not
-// guaranteed to fit an arbitrary caller's thread stack (measured to exceed
-// the platform-default ~2 MiB spawned-thread stack for the handle-producing
-// path in an unoptimized build). `stacker::maybe_grow` is called at every
-// recursion level in both paths so recursion transparently continues on a
-// freshly allocated segment before the current one is exhausted, rather than
-// requiring every caller (including production `Pdf::resolve`, not just
-// tests) to pre-size its own thread. `STACK_RED_ZONE` mirrors the crate's own
-// documented example; `STACK_GROWTH_SIZE` is comfortably larger than the
-// worst per-frame cost measured across both recursive paths at this depth.
+// the stack bytes each recursive frame costs. The frame size varies with the
+// target and optimization level, so `stacker::maybe_grow` keeps this legacy
+// parser from exhausting a caller's native stack before it returns qpdf's
+// controlled nesting diagnostic.
 const STACK_RED_ZONE: usize = 32 * 1024;
 const STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
@@ -2078,10 +2127,9 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
     // recovers a top-level file-object bare reference as an integer, see
     // `top_level_no_reference`'s own doc) and the three-token backtracking
     // (`unread_token` order matters: the third token is pushed back before
-    // the second, restoring original read order). Both the legacy
-    // `Object`-producing path (`integer_or_ref`) and the handle-producing
-    // path (`integer_or_ref_handle`) call this so a future edit to the
-    // decision can never move one path's output bytes without the other's.
+    // the second, restoring original read order). All parser consumers share
+    // this decision so a future edit cannot move one path's output bytes
+    // without the others.
     fn integer_or_ref_decision(&mut self, first_token: &Token) -> Result<IntegerOrRefDecision> {
         let first = parse_integer_token(first_token)?;
         if self.mode == ParserMode::Content || (self.top_level_no_reference && self.depth == 1) {
@@ -2151,191 +2199,6 @@ impl<'tokenizer, 'input> Parser<'tokenizer, 'input> {
             Ok(())
         }
     }
-
-    // --- Object-mode-only handle-producing path ------------------------
-    //
-    // Parallel to `object`/`object_inner`/`dictionary`/`array`/
-    // `integer_or_ref`/`real_object` above: builds an `ObjectHandle` graph
-    // directly, assigning parsed offsets during node construction instead of
-    // returning a bare `Object` for a later pass to annotate (design,
-    // "Parser" section: no parallel metadata tree, no reparse-for-
-    // provenance). Never invoked from `ParserMode::Content` — content-stream
-    // parsing keeps using `object`/`content_dictionary`/
-    // `parse_content_object` exactly as today, untouched.
-    //
-    // Every token-level decision this path needs (real-literal preservation,
-    // integer-or-reference backtracking including the top-level gate) reads
-    // the same extracted helpers the `Object`-producing path above uses
-    // (`classify_real`, `integer_or_ref_decision`) rather than
-    // reimplementing them. Only the container "shells" (the loops that
-    // build an `ObjectValue::Array`/`Dictionary` instead of
-    // `Object::Array`/`Dictionary`) are duplicated, since they differ
-    // inherently by output type.
-
-    /// Parse one PDF object directly into an [`ObjectHandle`], assigning its
-    /// parsed offset — and every direct child's — from the token positions
-    /// this call observes, never from a second pass over an already-built
-    /// value. `base_offset` is the file-relative position corresponding to
-    /// this parser's own position `0`, so a token at this parser's position
-    /// `p` is recorded as `base_offset + p`.
-    ///
-    /// A nested `N G R` becomes the canonical indirect handle `resolver`
-    /// returns for that reference, left unresolved — never a fresh direct
-    /// value. Bounded by [`MAX_PARSE_DEPTH`], exactly like [`Self::object`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Parse`] under the same conditions as
-    /// [`Self::object`]: a malformed token, an unterminated array or
-    /// dictionary, or nesting past [`MAX_PARSE_DEPTH`].
-    pub(crate) fn object_handle(
-        &mut self,
-        base_offset: i64,
-        resolver: &mut dyn HandleResolver,
-    ) -> Result<ObjectHandle> {
-        // Mirrors `object`'s own depth bookkeeping exactly (same field, same
-        // limit, same error) — see that method's comment for why a
-        // symmetric increment/decrement here is what bounds every nesting
-        // path.
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
-            self.depth -= 1;
-            return Err(Error::parse(self.position(), "object nesting too deep"));
-        }
-        // Same rationale as `object`'s own `maybe_grow` call: this
-        // ObjectHandle-producing recursion costs measurably more stack per
-        // frame than `object`'s (extra `Rc`/`RefCell` allocation bookkeeping
-        // per node), so it needs its own guard against the same default
-        // ~2 MiB caller thread stack, not just `object`'s.
-        let result = stacker::maybe_grow(STACK_RED_ZONE, STACK_GROWTH_SIZE, || {
-            self.object_inner_handle(base_offset, resolver)
-        });
-        self.depth -= 1;
-        result
-    }
-
-    fn object_inner_handle(
-        &mut self,
-        base_offset: i64,
-        resolver: &mut dyn HandleResolver,
-    ) -> Result<ObjectHandle> {
-        let token = self.next_token()?;
-        match token.token_type {
-            TokenType::DictOpen => {
-                let offset = base_offset + token.start as i64;
-                let value = self.dictionary_handle(base_offset, resolver)?;
-                Ok(Self::wrap_direct(value, offset))
-            }
-            TokenType::ArrayOpen => {
-                let offset = base_offset + token.start as i64;
-                let value = self.array_handle(base_offset, resolver)?;
-                Ok(Self::wrap_direct(value, offset))
-            }
-            TokenType::Name => Ok(Self::wrap_direct(
-                ObjectValue::Name(token.value[1..].to_vec()),
-                base_offset + token.start as i64,
-            )),
-            TokenType::String => Ok(Self::wrap_direct(
-                ObjectValue::String(token.value),
-                base_offset + token.start as i64,
-            )),
-            TokenType::Bool => Ok(Self::wrap_direct(
-                ObjectValue::Boolean(token.value == b"true"),
-                base_offset + token.start as i64,
-            )),
-            // qpdf constructs QPDF_Null without assigning a description or
-            // offset (design's Fixed qpdf Facts) — the sentinel stays -1.
-            TokenType::Null => Ok(ObjectHandle::null()),
-            TokenType::Integer => self.integer_or_ref_handle(token, base_offset, resolver),
-            TokenType::Real => self.real_object_handle(token, base_offset),
-            TokenType::Bad => Err(Error::parse(
-                token.error_offset,
-                token
-                    .error_message
-                    .as_deref()
-                    .map(|message| String::from_utf8_lossy(message).into_owned())
-                    .unwrap_or_else(|| "bad token".to_string()),
-            )),
-            TokenType::Eof => Err(Error::parse(token.start, "unexpected EOF")),
-            _ => Err(Error::parse(token.start, "expected PDF object")),
-        }
-    }
-
-    fn dictionary_handle(
-        &mut self,
-        base_offset: i64,
-        resolver: &mut dyn HandleResolver,
-    ) -> Result<ObjectValue> {
-        let mut dict = std::collections::BTreeMap::new();
-        loop {
-            let token = self.next_token()?;
-            if token.token_type == TokenType::DictClose {
-                return Ok(ObjectValue::Dictionary(dict));
-            }
-            if token.token_type != TokenType::Name {
-                return Err(Error::parse(token.start, "expected byte 47"));
-            }
-            let key = token.value[1..].to_vec();
-            let value = self.object_handle(base_offset, resolver)?;
-            dict.insert(key, value);
-        }
-    }
-
-    fn array_handle(
-        &mut self,
-        base_offset: i64,
-        resolver: &mut dyn HandleResolver,
-    ) -> Result<ObjectValue> {
-        let mut values = Vec::new();
-        loop {
-            let token = self.peek_token()?;
-            if token.token_type == TokenType::ArrayClose {
-                let _ = self.next_token()?;
-                return Ok(ObjectValue::Array(values));
-            }
-            if token.token_type == TokenType::Eof {
-                return Err(Error::parse(token.start, "unexpected EOF in array"));
-            }
-            values.push(self.object_handle(base_offset, resolver)?);
-        }
-    }
-
-    fn integer_or_ref_handle(
-        &mut self,
-        first_token: Token,
-        base_offset: i64,
-        resolver: &mut dyn HandleResolver,
-    ) -> Result<ObjectHandle> {
-        let offset = base_offset + first_token.start as i64;
-        match self.integer_or_ref_decision(&first_token)? {
-            IntegerOrRefDecision::Integer(n) => {
-                Ok(Self::wrap_direct(ObjectValue::Integer(n), offset))
-            }
-            // The referenced handle's own offset is populated only when (if
-            // ever) it is itself parsed as a top-level object — a reference
-            // occurrence elsewhere never touches it (design: the parsed
-            // offset belongs to the value, not to every place it is
-            // referenced from).
-            IntegerOrRefDecision::Reference(object_ref) => Ok(resolver.indirect_handle(object_ref)),
-        }
-    }
-
-    fn real_object_handle(&self, token: Token, base_offset: i64) -> Result<ObjectHandle> {
-        let offset = base_offset + token.start as i64;
-        let value = match classify_real(token)? {
-            RealClassification::Canonical(value) => ObjectValue::Real(value),
-            RealClassification::Literal { value, literal } => {
-                ObjectValue::RealLiteral { value, literal }
-            }
-        };
-        Ok(Self::wrap_direct(value, offset))
-    }
-
-    fn wrap_direct(value: ObjectValue, offset: i64) -> ObjectHandle {
-        let handle = ObjectHandle::from_value(value);
-        handle.set_parsed_offset_if_unset(offset);
-        handle
-    }
 }
 
 enum IntegerOrRefDecision {
@@ -2351,8 +2214,8 @@ enum RealClassification {
 // Shared leaf decision (must never be reimplemented a second time): whether
 // a real-number token's source literal must be preserved verbatim for
 // byte-identical unparse. Both the legacy `Object`-producing path
-// (`real_object`) and the handle-producing path (`real_object_handle`) call
-// this instead of recomputing the comparison themselves.
+// (`real_object`) and the canonical live parser call this instead of
+// recomputing the comparison themselves.
 fn classify_real(token: Token) -> Result<RealClassification> {
     let text = std::str::from_utf8(&token.value)
         .map_err(|_| Error::parse(token.start, "real is not utf-8"))?;
@@ -3041,217 +2904,5 @@ mod stream_length_tests {
         assert_eq!(parsed.object, Object::Reference(ObjectRef::new(6, 0)));
         assert_eq!(&b"6 0 R\nendobj"[parsed.next_offset..], b"endobj");
         assert_eq!(parsed.empty_offset, None);
-    }
-}
-
-// Direct, crate-internal comparison between the legacy `Object`-producing
-// path and the handle-producing path this task adds, calling `Parser`
-// directly (not through `Pdf::resolve`/`resolve_object_handle`). This is the
-// real drift tripwire the design calls for: going through the public
-// `Pdf` API alone would never actually exercise the handle path's own
-// error arms for malformed input, since `resolve_object_handle` calls the
-// untouched `resolve_to_cache` engine first and its `?` propagates that
-// failure before the native parse ever runs — proving the two *public*
-// entry points agree would be trivially true by construction, not evidence
-// the handle-producing container shells (`dictionary_handle`/
-// `array_handle`/`object_handle`) independently reproduce the same
-// recovery/depth behavior. Testing `Parser::object`/`Parser::object_handle`
-// side by side here is what actually exercises that.
-#[cfg(test)]
-mod handle_path_parity_tests {
-    use super::{HandleResolver, Parser, MAX_PARSE_DEPTH};
-    use crate::object_handle::ObjectHandle;
-    use crate::tokenizer::Tokenizer;
-    use crate::ObjectRef;
-
-    struct NullResolver;
-
-    impl HandleResolver for NullResolver {
-        fn indirect_handle(&mut self, object_ref: ObjectRef) -> ObjectHandle {
-            ObjectHandle::new_indirect_unresolved(object_ref, -1)
-        }
-    }
-
-    fn legacy_error(input: &[u8]) -> String {
-        let mut tokenizer = Tokenizer::new(input);
-        let mut parser = Parser::with_tokenizer(&mut tokenizer);
-        parser
-            .object()
-            .expect_err("legacy path must reject this input")
-            .to_string()
-    }
-
-    fn native_error(input: &[u8]) -> String {
-        let mut tokenizer = Tokenizer::new(input);
-        let mut parser = Parser::with_tokenizer(&mut tokenizer);
-        let mut resolver = NullResolver;
-        parser
-            .object_handle(0, &mut resolver)
-            .expect_err("native path must reject this input")
-            .to_string()
-    }
-
-    #[test]
-    fn unterminated_dictionary_matches_between_legacy_and_native_paths() {
-        let input = b"<< /A 1";
-        let legacy = legacy_error(input);
-        assert!(
-            legacy.contains("expected byte 47"),
-            "unexpected legacy error: {legacy}"
-        );
-        assert_eq!(legacy, native_error(input));
-    }
-
-    #[test]
-    fn unterminated_array_matches_between_legacy_and_native_paths() {
-        let input = b"[1 2 3";
-        let legacy = legacy_error(input);
-        assert!(
-            legacy.contains("unexpected EOF in array"),
-            "unexpected legacy error: {legacy}"
-        );
-        assert_eq!(legacy, native_error(input));
-    }
-
-    #[test]
-    fn bad_token_matches_between_legacy_and_native_paths() {
-        let input = b"<0g>";
-        let legacy = legacy_error(input);
-        assert!(
-            legacy.contains("invalid character"),
-            "unexpected legacy error: {legacy}"
-        );
-        assert_eq!(legacy, native_error(input));
-    }
-
-    #[test]
-    fn eof_at_top_level_matches_between_legacy_and_native_paths() {
-        let input = b"";
-        let legacy = legacy_error(input);
-        assert!(
-            legacy.contains("unexpected EOF"),
-            "unexpected legacy error: {legacy}"
-        );
-        assert_eq!(legacy, native_error(input));
-    }
-
-    #[test]
-    fn unsupported_token_matches_between_legacy_and_native_paths() {
-        let input = b"foo";
-        let legacy = legacy_error(input);
-        assert!(
-            legacy.contains("expected PDF object"),
-            "unexpected legacy error: {legacy}"
-        );
-        assert_eq!(legacy, native_error(input));
-    }
-
-    /// A nested `N G R` (not at the top-level bare-reference-recovery gate,
-    /// since a fresh `Parser::with_tokenizer` defaults `top_level_no_reference`
-    /// to `false`) resolves through the `HandleResolver` this task adds,
-    /// exercising `integer_or_ref_handle`'s reference arm directly.
-    #[test]
-    fn reference_resolves_through_the_shared_handle_resolver() {
-        let input = b"5 0 R";
-        let mut tokenizer = Tokenizer::new(input);
-        let mut parser = Parser::with_tokenizer(&mut tokenizer);
-        let mut resolver = NullResolver;
-        let handle = parser
-            .object_handle(0, &mut resolver)
-            .expect("reference must parse");
-        assert!(handle.is_indirect());
-        assert_eq!(handle.object_ref(), Some(ObjectRef::new(5, 0)));
-    }
-
-    /// Mirrors `qpdf_direct_object_reports_empty_body_without_consuming_endobj`
-    /// (the legacy free function's own empty-object recovery test) for the
-    /// handle-producing counterpart.
-    #[test]
-    fn parse_qpdf_direct_object_handle_recovers_empty_body_as_null() {
-        let input = b" \nendobj\n";
-        let mut resolver = NullResolver;
-        let (value, offset) = super::parse_qpdf_direct_object_handle(input, 100, &mut resolver)
-            .expect("empty body recovers as null");
-        assert!(matches!(value, crate::object_handle::ObjectValue::Null));
-        assert_eq!(offset, -1);
-    }
-
-    // Constructing `ObjectHandle`/`ObjectValue` recursively measurably costs
-    // more per-frame stack in unoptimized (debug/test) builds than the
-    // legacy `Object`-producing recursion does — the same underlying reason
-    // `Pdf::lift`/`lift_to_handle` (reader.rs) already cap their own,
-    // separate walk at the tighter `MAX_INLINE_DEPTH` rather than
-    // `MAX_PARSE_DEPTH`. This is a debug-build-only cost: `cargo test
-    // --release` at this same depth succeeds even on a 512 KiB thread stack,
-    // confirming the qpdf-parity depth *limit* itself (`MAX_PARSE_DEPTH`,
-    // unchanged and identical between the two paths, as the task requires)
-    // is not the issue — only the *test* needs a dedicated, larger stack to
-    // exercise it without aborting the test process on an unoptimized build.
-    #[test]
-    fn nesting_past_max_parse_depth_matches_between_legacy_and_native_paths() {
-        std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let depth = MAX_PARSE_DEPTH + 1;
-                let mut input = vec![b'['; depth];
-                input.extend(std::iter::repeat_n(b']', depth));
-                let legacy = legacy_error(&input);
-                assert!(
-                    legacy.contains("object nesting too deep"),
-                    "unexpected legacy error: {legacy}"
-                );
-                assert_eq!(legacy, native_error(&input));
-            })
-            .expect("comparison thread must start")
-            .join()
-            .expect("comparison must not overflow the stack");
-    }
-
-    fn assert_native_handle_path_preserves_the_object_nesting_guard() {
-        let depth = MAX_PARSE_DEPTH + 1;
-        let mut input = vec![b'['; depth];
-        input.extend(std::iter::repeat_n(b']', depth));
-        let error = native_error(&input);
-        assert!(
-            error.contains("object nesting too deep"),
-            "unexpected error: {error}"
-        );
-    }
-
-    // Spawns a dedicated thread rather than calling the `assert_*` helper
-    // directly on the default test-harness thread (unlike this file's
-    // `content_mode_preserves_the_object_nesting_guard` sibling), purely so
-    // this and the smaller-stack regression test below share one assertion
-    // helper — not because this path still needs an oversized stack: see
-    // `native_handle_path_fits_the_default_spawned_thread_stack_budget`
-    // below, which pins the actual production-realistic budget.
-    #[test]
-    fn native_handle_path_preserves_the_object_nesting_guard() {
-        std::thread::Builder::new()
-            .stack_size(4 * 1024 * 1024)
-            .spawn(assert_native_handle_path_preserves_the_object_nesting_guard)
-            .expect("nesting-guard test thread must start")
-            .join()
-            .expect("nesting guard must return an error before exhausting the stack");
-    }
-
-    // Regression test for the stack-overflow-abort hazard `object_handle`'s
-    // own `stacker::maybe_grow` call fixes: before that fix, this exact
-    // scenario aborted the whole process (not a recoverable `Err`) on a
-    // default-sized (2 MiB) spawned thread — the stack budget every
-    // production caller actually has, including `Pdf::resolve` on a thread
-    // this crate does not control the size of. `maybe_grow` transparently
-    // switches to a larger heap-backed stack segment once within
-    // `STACK_RED_ZONE` of the end of this one, so recursion to
-    // `MAX_PARSE_DEPTH` completes and returns the normal, controlled
-    // "nesting too deep" `Err` instead of aborting.
-    #[test]
-    fn native_handle_path_fits_the_default_spawned_thread_stack_budget() {
-        std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn(assert_native_handle_path_preserves_the_object_nesting_guard)
-            .expect("nesting-guard test thread must start")
-            .join()
-            .expect("nesting guard must return an error before exhausting the default-sized stack");
     }
 }
