@@ -1134,6 +1134,27 @@ mod tests {
     }
 
     #[test]
+    fn xref_decode_propagates_filter_metadata_errors() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"ASCII85Decode".to_vec()),
+            ]),
+        );
+        dict.insert("DecodeParms", Object::Array(vec![Object::Null]));
+        let mut resolve = |value: &Object| value.clone();
+
+        let error = decode_stream_data_from_xref_context(&dict, b"", &mut resolve).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+    }
+
+    #[test]
     fn decode_stream_data_exposes_plflate_malformed_header_timing() {
         let error = decode_stream_data(&flate_dict(), b"\x78\x00").unwrap_err();
 

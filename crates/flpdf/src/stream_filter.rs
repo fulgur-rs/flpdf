@@ -311,7 +311,24 @@ pub(crate) fn decode_filter_specs_from_object_with_resolver(
                     })
                     .collect()
             }
-            item => vec![Some(item); names.len()],
+            item => {
+                // Keep one resolved scalar object alive while each stage
+                // reduces it to its bounded DecodeParams view. Replicating
+                // the owned Object first would deep-clone a large dictionary
+                // once per filter stage.
+                validate_filter_chain_count(names.len(), max_filter_chain)?;
+                return Ok(names
+                    .into_iter()
+                    .map(|name| FilterSpec {
+                        decode_params: decode_params_from_object_with_resolver(
+                            Some(&item),
+                            &name,
+                            resolve,
+                        ),
+                        name,
+                    })
+                    .collect());
+            }
         },
     };
 
@@ -2050,12 +2067,13 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        decode_filter_specs_from_handle, decode_filter_specs_from_object, decode_flate,
-        decode_flate_chunks, decode_params_from_object, encode_flate, encode_run_length,
-        ignore_codec_warning, ignore_warning, keeps_crypt_name_payload, normalize_filter_name,
-        stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter,
-        DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
-        Pipeline, RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        decode_filter_specs_from_handle, decode_filter_specs_from_object,
+        decode_filter_specs_from_object_with_resolver, decode_flate, decode_flate_chunks,
+        decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
+        ignore_warning, keeps_crypt_name_payload, normalize_filter_name, stream_filter_for,
+        Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter, DecodeParams, FilterSpec,
+        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline,
+        RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
         RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
@@ -2089,6 +2107,37 @@ pub(crate) mod tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].decode_params, replicated);
         assert_eq!(specs[1].decode_params, replicated);
+    }
+
+    #[test]
+    fn resolver_treats_indirect_null_filter_and_decode_parms_as_absent() {
+        let filter_ref = Object::Reference(ObjectRef::new(10, 0));
+        let decode_parms_ref = Object::Reference(ObjectRef::new(11, 0));
+        let flate = Object::Name(b"FlateDecode".to_vec());
+        let mut resolve = |value: &Object| match value {
+            Object::Reference(ObjectRef { number: 10, .. })
+            | Object::Reference(ObjectRef { number: 11, .. }) => Object::Null,
+            _ => value.clone(),
+        };
+
+        let no_filters = decode_filter_specs_from_object_with_resolver(
+            Some(&filter_ref),
+            None,
+            None,
+            &mut resolve,
+        )
+        .unwrap();
+        assert!(no_filters.is_empty());
+
+        let specs = decode_filter_specs_from_object_with_resolver(
+            Some(&flate),
+            Some(&decode_parms_ref),
+            None,
+            &mut resolve,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(specs[0].decode_params.is_absent());
     }
 
     #[test]
