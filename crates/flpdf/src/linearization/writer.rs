@@ -4451,7 +4451,7 @@ mod tests {
 
     fn open_cleartext_metadata_encrypted_three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
         let mut input = Pdf::open(Cursor::new(
-            include_bytes!("../../../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+            include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
         ))
         .expect("three-page fixture should parse");
         let mut params =

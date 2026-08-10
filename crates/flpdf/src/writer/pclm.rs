@@ -205,7 +205,7 @@ mod tests {
 
     fn fixture_pdf() -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(
-            include_bytes!("../../../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+            include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
         ))
         .expect("fixture must open")
     }
@@ -237,7 +237,7 @@ mod tests {
     fn plan_propagates_page_contents_resolution_errors() {
         let mut pdf = Pdf::open(ReadFailingCursor {
             inner: Cursor::new(
-                include_bytes!("../../../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+                include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
             ),
             fail_reads: false,
         })
