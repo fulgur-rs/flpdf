@@ -4,8 +4,8 @@ const LIBJPEG_INCLUDE_DIR: &str = "FLPDF_LIBJPEG_INCLUDE_DIR";
 const LIBJPEG_LIB_DIR: &str = "FLPDF_LIBJPEG_LIB_DIR";
 
 fn main() {
-    println!("cargo:rerun-if-changed=src/jpeg_compat.h");
-    println!("cargo:rerun-if-changed=src/jpeg_compat.c");
+    println!("cargo:rerun-if-changed=csrc/jpeg_compat.h");
+    println!("cargo:rerun-if-changed=csrc/jpeg_compat.c");
     println!("cargo:rerun-if-env-changed={LIBJPEG_INCLUDE_DIR}");
     println!("cargo:rerun-if-env-changed={LIBJPEG_LIB_DIR}");
 
@@ -43,8 +43,8 @@ fn main() {
 
     let mut build = cc::Build::new();
     build
-        .file("src/jpeg_compat.c")
-        .include("src")
+        .file("csrc/jpeg_compat.c")
+        .include("csrc")
         .warnings(true);
     if let Some(directory) = &include_dir {
         build.include(directory);
