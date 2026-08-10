@@ -1,8 +1,48 @@
+use std::cell::RefCell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::process::Command;
+use std::rc::Rc;
 
+use flpdf::pipeline::{Pipeline, PipelineResult};
 use flpdf::{write_pdf, DecodeLevel, ObjectRef, ObjectStreamMode, Pdf, QPDFWriter, StreamDataMode};
+
+#[derive(Clone)]
+struct SharedBytes(Rc<RefCell<Vec<u8>>>);
+
+impl Write for SharedBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct RecordingPipeline {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    writes: Rc<RefCell<usize>>,
+    finishes: Rc<RefCell<usize>>,
+}
+
+impl Pipeline for RecordingPipeline {
+    fn identifier(&self) -> &str {
+        "qpdf-writer-contract"
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        *self.writes.borrow_mut() += 1;
+        self.bytes.borrow_mut().extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        *self.finishes.borrow_mut() += 1;
+        Ok(())
+    }
+}
 
 fn open_minimal_pdf() -> flpdf::Result<Pdf<BufReader<File>>> {
     let file = File::open("../../tests/fixtures/minimal.pdf")?;
@@ -198,5 +238,89 @@ fn writer_result_surface_compiles() -> flpdf::Result<()> {
     let _ = writer.get_renumbered_obj_gen(ObjectRef::new(1, 0));
     let _ = writer.get_written_xref_table();
 
+    Ok(())
+}
+
+#[test]
+fn set_output_file_writes_a_fresh_qpdf_checked_pdf() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    let dir = tempfile::tempdir()?;
+    let output_path = dir.path().join("output-file.pdf");
+    writer.set_output_file(&output_path)?;
+    writer.write()?;
+
+    let output = std::fs::read(&output_path)?;
+    assert!(output.starts_with(b"%PDF-"));
+    assert!(!output.windows(5).any(|window| window == b"/Prev"));
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(&output_path)
+        .output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn set_output_writer_writes_to_an_owned_sink() -> flpdf::Result<()> {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_output_writer(SharedBytes(Rc::clone(&bytes)))?;
+    writer.write()?;
+
+    let output = bytes.borrow();
+    assert!(output.starts_with(b"%PDF-"));
+    assert!(!output.windows(5).any(|window| window == b"/Prev"));
+    Ok(())
+}
+
+#[test]
+fn set_output_pipeline_writes_and_finishes_once() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let writes = Rc::new(RefCell::new(0));
+    let finishes = Rc::new(RefCell::new(0));
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_output_pipeline(RecordingPipeline {
+        bytes: Rc::clone(&bytes),
+        writes: Rc::clone(&writes),
+        finishes: Rc::clone(&finishes),
+    })?;
+    writer.write()?;
+
+    let output = bytes.borrow();
+    assert!(*writes.borrow() >= 1);
+    assert_eq!(*finishes.borrow(), 1);
+    assert!(output.starts_with(b"%PDF-"));
+    assert!(!output.windows(5).any(|window| window == b"/Prev"));
+    let dir = tempfile::tempdir()?;
+    let output_path = dir.path().join("pipeline.pdf");
+    std::fs::write(&output_path, &*output)?;
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(&output_path)
+        .output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()> {
+    for (setter, expected) in [("minimum", "%PDF-1.7"), ("force", "%PDF-1.5")] {
+        let mut pdf = open_minimal_pdf()?;
+        let mut writer = QPDFWriter::new(&mut pdf);
+        match setter {
+            "minimum" => writer.set_minimum_pdf_version("1.7", 0)?,
+            "force" => writer.force_pdf_version("1.5", 0)?,
+            _ => unreachable!(),
+        }
+        writer.set_output_memory()?;
+        writer.write()?;
+        let output = writer.get_buffer()?;
+        assert!(output.starts_with(expected.as_bytes()));
+    }
     Ok(())
 }
