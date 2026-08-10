@@ -2254,7 +2254,9 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct DctSink {
         writes: Vec<Vec<u8>>,
+        write_attempts: usize,
         finishes: usize,
+        finish_attempts: usize,
         fail_write: bool,
         fail_finish: bool,
     }
@@ -2265,6 +2267,7 @@ pub(crate) mod tests {
         }
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.write_attempts += 1;
             if self.fail_write {
                 Err(PipelineError::runtime("dct test write failure"))
             } else {
@@ -2274,6 +2277,7 @@ pub(crate) mod tests {
         }
 
         fn finish(&mut self) -> PipelineResult<()> {
+            self.finish_attempts += 1;
             if self.fail_finish {
                 Err(PipelineError::runtime("dct test finish failure"))
             } else {
@@ -4553,6 +4557,28 @@ pub(crate) mod tests {
         }
         assert!(empty_sink.writes.is_empty());
         assert_eq!(empty_sink.finishes, 1);
+        assert_eq!(empty_sink.finish_attempts, 1);
+
+        let mut empty_error_filter =
+            stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(empty_error_filter.set_decode_params(&DecodeParams::Absent));
+        let mut empty_error_sink = DctSink {
+            fail_finish: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = empty_error_filter
+                .decode_pipeline(&mut empty_error_sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .finish()
+                .expect_err("empty finish failure must be returned")
+        };
+        assert_eq!(error.to_string(), "dct test finish failure");
+        assert!(empty_error_sink.writes.is_empty());
+        assert_eq!(empty_error_sink.finishes, 0);
+        assert_eq!(empty_error_sink.finish_attempts, 1);
 
         let mut repeated_filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
         assert!(repeated_filter.set_decode_params(&DecodeParams::Absent));
@@ -4567,10 +4593,13 @@ pub(crate) mod tests {
         }
         assert!(repeated_sink.writes.is_empty());
         assert_eq!(repeated_sink.finishes, 2);
+        assert_eq!(repeated_sink.finish_attempts, 2);
     }
 
     #[test]
     fn dct_stage_preserves_codec_error_and_does_not_finish_downstream() {
+        let jpeg = test_jpeg();
+        let truncated = &jpeg[..jpeg.len() / 2];
         let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
         assert!(filter.set_decode_params(&DecodeParams::Absent));
         let mut sink = DctSink::default();
@@ -4579,16 +4608,20 @@ pub(crate) mod tests {
                 .decode_pipeline(&mut sink)
                 .expect("DCT stage construction must succeed")
                 .expect("DCT filter must contribute a decode stage");
-            stage.write(b"not a jpeg").expect("DCT stage buffers input");
+            stage
+                .write(truncated)
+                .expect("DCT stage buffers truncated input");
             stage
                 .finish()
-                .expect_err("malformed JPEG must fail at finish")
+                .expect_err("truncated JPEG must fail at finish")
         };
 
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.to_string(), "DCT decode: unexpected marker: 0xFF6F");
+        assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
         assert!(sink.writes.is_empty());
+        assert_eq!(sink.write_attempts, 0);
         assert_eq!(sink.finishes, 0);
+        assert_eq!(sink.finish_attempts, 0);
     }
 
     #[test]
@@ -4613,7 +4646,9 @@ pub(crate) mod tests {
 
         assert_eq!(error.to_string(), "dct test write failure");
         assert!(sink.writes.is_empty());
+        assert_eq!(sink.write_attempts, 1);
         assert_eq!(sink.finishes, 0);
+        assert_eq!(sink.finish_attempts, 0);
     }
 
     #[test]
@@ -4639,7 +4674,9 @@ pub(crate) mod tests {
         assert_eq!(error.to_string(), "dct test finish failure");
         assert_eq!(sink.writes.len(), 2);
         assert!(sink.writes.iter().all(|write| write.len() == 6));
+        assert_eq!(sink.write_attempts, 2);
         assert_eq!(sink.finishes, 0);
+        assert_eq!(sink.finish_attempts, 1);
     }
 
     /// qpdf's `filter_factories` (`QPDF_Stream.cc:85-94`) holds `/Crypt`
