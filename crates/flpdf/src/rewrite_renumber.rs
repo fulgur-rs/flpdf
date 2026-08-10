@@ -109,7 +109,7 @@ impl CatalogFirstRenumber {
         pdf: &mut Pdf<R>,
         skip_length: bool,
     ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, false, &BTreeSet::new())
+        Self::build_with_visibility(pdf, skip_length, false, false, &BTreeSet::new())
     }
 
     /// Compute Catalog-first numbering with qpdf's null-aware dictionary
@@ -128,13 +128,30 @@ impl CatalogFirstRenumber {
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, true, removed_refs)
+        Self::build_with_visibility(pdf, skip_length, true, false, removed_refs)
+    }
+
+    /// Compute qpdf-visible Catalog-first numbering while preserving every
+    /// live source object before the normal trailer seeds.
+    ///
+    /// This mirrors `QPDFWriter::enqueueObjectsStandard`: qpdf first enqueues
+    /// `getAllObjects()` in source/object-reference order, then enqueues
+    /// `/Root` and the trimmed trailer values. `live_object_refs()` supplies
+    /// the corresponding source order while excluding free, missing, deleted,
+    /// and reserved entries; `removed_refs` keeps explicit deletions excluded.
+    pub(crate) fn build_qpdf_preserving_unreferenced_excluding<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        skip_length: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<Self> {
+        Self::build_with_visibility(pdf, skip_length, true, true, removed_refs)
     }
 
     fn build_with_visibility<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
         qpdf_visibility: bool,
+        preserve_unreferenced_objects: bool,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<Self> {
         let mut old_to_new: HashMap<ObjectRef, ObjectRef> = HashMap::new();
@@ -146,7 +163,15 @@ impl CatalogFirstRenumber {
         let root = pdf
             .root_ref()
             .ok_or_else(|| Error::Unsupported("plain rewrite: trailer has no /Root".to_string()))?;
-        let mut seeds: Vec<ObjectRef> = vec![root];
+        let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
+            pdf.live_object_refs()
+                .into_iter()
+                .filter(|object_ref| !removed_refs.contains(object_ref))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        seeds.push(root);
         let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
         let trailer_entries = if qpdf_visibility {
             crate::qpdf_null::visible_entries(pdf, trailer_entries)?

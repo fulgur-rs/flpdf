@@ -362,6 +362,14 @@ pub struct WriteOptions {
     /// path that simply appends to the source bytes ignores it.
     pub object_streams: ObjectStreamMode,
 
+    /// Preserve source objects that are not reachable from the trailer roots.
+    ///
+    /// This is a temporary migration field for the qpdf-shaped [`QPDFWriter`]
+    /// bridge. The plain writer currently honors it only with
+    /// [`ObjectStreamMode::Disable`]; object-stream membership for Preserve and
+    /// Generate remains a bounded follow-up.
+    pub preserve_unreferenced_objects: bool,
+
     /// Stream compression policy for the full-rewrite path.
     ///
     /// [`CompressStreams::Yes`] (the default) decodes each stream and

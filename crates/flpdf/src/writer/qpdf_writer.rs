@@ -305,8 +305,6 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     pub fn validate_supported_settings(&self) -> Result<()> {
         let unsupported = if self.settings.content_normalization {
             Some("content normalization")
-        } else if self.settings.preserve_unreferenced_objects {
-            Some("preserving unreferenced objects")
         } else if self.settings.decode_level != DecodeLevel::Generalized {
             Some("non-generalized decode levels")
         } else if !self.settings.extra_header_text.is_empty() {

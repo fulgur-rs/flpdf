@@ -57,8 +57,19 @@ impl PlainWritePlan {
 
         let placement = match options.object_streams {
             ObjectStreamMode::Disable => {
-                let renumber =
-                    CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?;
+                // Task 3A intentionally changes only the plain Disable path.
+                // Preserve/Generate ObjStm membership for this setting remains
+                // a follow-up; do not imply that their packing semantics are
+                // solved by the source-object seed set below.
+                let renumber = if options.preserve_unreferenced_objects {
+                    CatalogFirstRenumber::build_qpdf_preserving_unreferenced_excluding(
+                        pdf,
+                        true,
+                        &explicitly_removed,
+                    )?
+                } else {
+                    CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?
+                };
                 let mut placement = build_sources_from_catalog_first(renumber);
                 placement.removed_refs = explicitly_removed;
                 placement

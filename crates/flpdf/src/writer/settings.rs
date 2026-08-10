@@ -97,6 +97,7 @@ impl WriterSettings {
             // route, even though WriteOptions still contains that old field.
             full_rewrite: true,
             object_streams: self.object_stream_mode,
+            preserve_unreferenced_objects: self.preserve_unreferenced_objects,
             compress_streams: if self.compress_streams {
                 CompressStreams::Yes
             } else {

@@ -68,6 +68,39 @@ fn qpdf_11_9_0() -> flpdf::Result<()> {
     Ok(())
 }
 
+fn synthetic_unreferenced_object_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Count 0 /Kids [] >>".as_slice(),
+        b"<< /Marker (unreferenced-marker) >>".as_slice(),
+    ];
+    let mut offsets = Vec::with_capacity(objects.len());
+
+    for (number, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", number + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 #[test]
 fn write_before_output_returns_err() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
@@ -173,6 +206,43 @@ fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Res
         .arg(&output_path)
         .output()?;
     assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let source = synthetic_unreferenced_object_pdf();
+    let marker = b"unreferenced-marker";
+
+    let mut default_pdf = Pdf::open(Cursor::new(source.clone()))?;
+    let mut default_writer = QPDFWriter::new(&mut default_pdf);
+    default_writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    default_writer.set_output_memory()?;
+    default_writer.write()?;
+    let default_output = default_writer.get_buffer()?;
+    assert!(!contains_bytes(&default_output, marker));
+
+    let mut preserved_pdf = Pdf::open(Cursor::new(source))?;
+    let mut preserved_writer = QPDFWriter::new(&mut preserved_pdf);
+    preserved_writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    preserved_writer.set_preserve_unreferenced_objects(true);
+    preserved_writer.set_static_id(true);
+    preserved_writer.set_output_memory()?;
+    preserved_writer.write()?;
+    let preserved_output = preserved_writer.get_buffer()?;
+    assert!(contains_bytes(&preserved_output, marker));
+    assert!(!contains_bytes(&preserved_output, b"/Prev"));
+
+    let dir = tempfile::tempdir()?;
+    let output_path = dir.path().join("preserved-unreferenced.pdf");
+    std::fs::write(&output_path, preserved_output)?;
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(&output_path)
+        .output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+
     Ok(())
 }
 
