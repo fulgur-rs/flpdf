@@ -256,8 +256,9 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     /// Write one fresh PDF output and finish the configured sink once.
     ///
-    /// `write_started` is consumed before emission; any failure is permanently
-    /// one-shot and cannot be retried.
+    /// Validation errors occur before `write_started` is consumed and may be
+    /// corrected and retried. Once emission begins, an emission or sink failure
+    /// is permanently one-shot and cannot be retried.
     pub fn write(&mut self) -> Result<()> {
         if self.write_started {
             return Err(Error::Unsupported(
