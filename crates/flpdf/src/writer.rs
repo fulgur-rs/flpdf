@@ -1554,7 +1554,7 @@ pub(crate) fn build_encryption_context(
 /// tail. OS-RNG failure is surfaced as [`crate::Error::Unsupported`] rather
 /// than panicking (mirrors the AES-IV generation in the stream pass).
 fn generate_v5r6_secrets(
-    _options: &WriteOptions,
+    _options: &WriterOptions,
 ) -> Result<crate::security::standard::V5R6Secrets> {
     #[cfg(any(test, feature = "qpdf-zlib-compat"))]
     if let Some(randomness) = _options.v5_randomness {
@@ -6137,8 +6137,7 @@ mod tests {
         let fixture = build_string_and_stream_fixture();
         let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open fixture");
         let mut out = Vec::new();
-        let options = WriteOptions {
-            full_rewrite: true,
+        let options = WriterOptions {
             static_id: true,
             static_aes_iv: true,
             compress_streams: CompressStreams::No,
@@ -6146,9 +6145,9 @@ mod tests {
             v5_randomness: Some(V5Randomness::from_bytes(std::array::from_fn(|index| {
                 0x80u8.wrapping_add(index as u8)
             }))),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
-        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=5 encrypted write");
+        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=5 encrypted write");
 
         let mut reopened = Pdf::open_with_options(
             Cursor::new(out.clone()),

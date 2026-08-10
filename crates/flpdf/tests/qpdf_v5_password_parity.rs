@@ -1,6 +1,6 @@
 //! qpdf parity tests for the V=5 reader/writer password boundary.
 
-use flpdf::{write_pdf_with_options, EncryptParams, Pdf, PdfOpenOptions, WriteOptions};
+use flpdf::{EncryptParams, Pdf, PdfOpenOptions, PdfWriter};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -48,17 +48,15 @@ fn qpdf_available() -> bool {
 
 fn flpdf_encrypted(input: &[u8], user_password: &[u8], r5: bool) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(input.to_vec())).expect("open plaintext fixture");
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.encrypt = Some(if r5 {
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_encryption_parameters(if r5 {
         EncryptParams::v5_r5(user_password.to_vec(), b"owner".to_vec())
     } else {
         EncryptParams::v5_r6(user_password.to_vec(), b"owner".to_vec())
     });
-
-    let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).expect("write V=5 fixture");
-    output
+    writer.set_output_memory().expect("configure memory output");
+    writer.write().expect("write V=5 fixture");
+    writer.get_buffer().expect("take V=5 fixture output")
 }
 
 fn qpdf_check(path: &Path, password: &[u8]) -> Output {
