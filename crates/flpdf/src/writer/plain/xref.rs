@@ -270,12 +270,11 @@ fn written_xref_table(
     size: u32,
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let mut result = BTreeMap::new();
-    result.insert(ObjectRef::new(0, 65535), XrefEntry::Free { next: 0 });
     for number in 1..size {
         match layout.uncompressed.get(&number) {
-            Some(&(generation, offset)) => {
+            Some(&(_generation, offset)) => {
                 result.insert(
-                    ObjectRef::new(number, generation),
+                    ObjectRef::new(number, 0),
                     XrefEntry::Uncompressed {
                         offset: u64::try_from(offset).map_err(|_| {
                             crate::Error::Unsupported("xref offset does not fit u64".to_string())
@@ -283,9 +282,7 @@ fn written_xref_table(
                     },
                 );
             }
-            None => {
-                result.insert(ObjectRef::new(number, 0), XrefEntry::Free { next: 0 });
-            }
+            None => {}
         }
     }
     Ok(result)
@@ -301,20 +298,19 @@ fn written_xref_stream(
         .checked_add(1)
         .ok_or_else(|| crate::Error::Unsupported("plain writer /Size overflows u32".into()))?;
     let mut result = BTreeMap::new();
-    result.insert(ObjectRef::new(0, 65535), XrefEntry::Free { next: 0 });
     for number in 1..size {
         if number == xref_ref.number {
             result.insert(
-                xref_ref,
+                ObjectRef::new(xref_ref.number, 0),
                 XrefEntry::Uncompressed {
                     offset: u64::try_from(xref_offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
                     })?,
                 },
             );
-        } else if let Some(&(generation, offset)) = layout.uncompressed.get(&number) {
+        } else if let Some(&(_generation, offset)) = layout.uncompressed.get(&number) {
             result.insert(
-                ObjectRef::new(number, generation),
+                ObjectRef::new(number, 0),
                 XrefEntry::Uncompressed {
                     offset: u64::try_from(offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
@@ -329,8 +325,6 @@ fn written_xref_stream(
                     index: location.index,
                 },
             );
-        } else {
-            result.insert(ObjectRef::new(number, 0), XrefEntry::Free { next: 0 });
         }
     }
     Ok(result)
@@ -384,11 +378,9 @@ mod tests {
             1,
             "only the object-0 row carries generation 65535"
         );
-        assert_eq!(
-            result.get(&ObjectRef::new(2, 0)),
-            Some(&XrefEntry::Free { next: 0 })
-        );
+        assert!(!result.contains_key(&ObjectRef::new(2, 0)));
         assert!(!result.contains_key(&ObjectRef::new(2, 65535)));
+        assert!(result.keys().all(|object_ref| object_ref.generation == 0));
     }
 
     #[test]

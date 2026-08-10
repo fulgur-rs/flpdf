@@ -46,7 +46,7 @@ fn write_planned<R: Read + Seek, W: Write>(
             layout.uncompressed.contains_key(&output.number)
                 || layout.compressed.contains_key(&output.number)
         })
-        .map(|(&source, &output)| (source, output))
+        .map(|(&source, &output)| (source, ObjectRef::new(output.number, 0)))
         .collect::<BTreeMap<ObjectRef, ObjectRef>>();
     Ok(WriterResult::new(old_to_new, written_xref))
 }

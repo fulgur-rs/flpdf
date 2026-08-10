@@ -1194,10 +1194,11 @@ fn writer_result_surface_compiles() -> flpdf::Result<()> {
         Some(ObjectRef::new(2, 0))
     );
     let xref = writer.get_written_xref_table()?;
-    assert_eq!(
-        xref.get(&ObjectRef::new(0, 65535)),
-        Some(&XrefEntry::Free { next: 0 })
-    );
+    assert!(!xref.keys().any(|object_ref| object_ref.number == 0));
+    assert!(!xref
+        .values()
+        .any(|entry| matches!(entry, XrefEntry::Free { .. })));
+    assert!(xref.keys().all(|object_ref| object_ref.generation == 0));
     for number in [1_u32, 2] {
         let entry = xref
             .get(&ObjectRef::new(number, 0))

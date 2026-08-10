@@ -4098,7 +4098,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
-        emitted_old_to_new.insert(*old_ref, emit_ref);
+        emitted_old_to_new.insert(*old_ref, ObjectRef::new(emit_ref.number, 0));
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -4131,7 +4131,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             let new = renumber.new_for_original(old).ok_or_else(|| {
                 crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
             })?;
-            emitted_old_to_new.insert(old, new);
+            emitted_old_to_new.insert(old, ObjectRef::new(new.number, 0));
             resolved.push((new, obj));
         }
         let emitted = object_streams::emit_objstm_body_from_resolved_with_writer(
@@ -4210,13 +4210,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
                 }
             }
-            written_xref.insert(ObjectRef::new(0, 65535), XrefEntry::Free { next: 0 });
             for number in 1..object_count {
                 let object_number = number as u32;
                 match offsets.get(&object_number) {
-                    Some(&(generation, offset)) => {
+                    Some(&(_generation, offset)) => {
                         written_xref.insert(
-                            ObjectRef::new(object_number, generation),
+                            ObjectRef::new(object_number, 0),
                             XrefEntry::Uncompressed {
                                 offset: u64::try_from(offset).map_err(|_| {
                                     crate::Error::Unsupported(
@@ -4226,12 +4225,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                             },
                         );
                     }
-                    None => {
-                        written_xref.insert(
-                            ObjectRef::new(object_number, 65535),
-                            XrefEntry::Free { next: 0 },
-                        );
-                    }
+                    None => {}
                 }
             }
 
@@ -4390,8 +4384,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     },
                 ),
             );
-            for (&number, &(generation, entry)) in &xref_entries {
-                written_xref.insert(ObjectRef::new(number, generation), entry);
+            for (&number, &(_generation, entry)) in &xref_entries {
+                if number != 0 && !matches!(entry, XrefEntry::Free { .. }) {
+                    written_xref.insert(ObjectRef::new(number, 0), entry);
+                }
             }
 
             // The entries are now contiguous `[0, final_object_count)`, so a
