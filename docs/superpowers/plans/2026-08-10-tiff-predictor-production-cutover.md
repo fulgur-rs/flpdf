@@ -56,4 +56,4 @@
 - [x] Run the focused flpdf tests, `cargo test -p flpdf`, workspace all-feature clippy, and workspace `cargo test`.
 - [x] Run fresh changed-line coverage and confirm 100% executable-line coverage for the patch.
 - [x] Inspect `git diff` and `git status`, stage only scoped files, commit, and push the feature branch.
-- [ ] Open the PR with qpdf source references and validation results, then mark it ready for review.
+- [x] Open the PR with qpdf source references and validation results, then mark it ready for review.
