@@ -1,5 +1,6 @@
-//! qpdf correspondence: `Pl_TIFFPredictor.cc` incremental horizontal
-//! differencing, row buffering, packed samples, and finish-time padding.
+//! qpdf correspondence: `Pl_TIFFPredictor.cc` incremental TIFF predictor.
+//! It covers horizontal differencing, row buffering, packed samples, and
+//! finish-time padding.
 
 use super::{Pipeline, PipelineError, PipelineResult};
 use crate::bit_stream::{BitStream, BitStreamError};
