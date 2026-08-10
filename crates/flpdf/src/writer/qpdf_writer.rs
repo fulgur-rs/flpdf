@@ -161,16 +161,20 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
                 self.settings.compress_streams = true;
             }
         }
+        self.settings.decode_level_set = true;
+        self.settings.compress_streams_set = true;
     }
 
     pub fn set_compress_streams(&mut self, value: bool) {
         // QPDFWriter::setCompressStreams changes only this flag. In
         // particular, it must not raise the initial decode level from none.
         self.settings.compress_streams = value;
+        self.settings.compress_streams_set = true;
     }
 
     pub fn set_decode_level(&mut self, level: DecodeLevel) {
         self.settings.decode_level = level;
+        self.settings.decode_level_set = true;
     }
 
     pub fn set_recompress_flate(&mut self, value: bool) {

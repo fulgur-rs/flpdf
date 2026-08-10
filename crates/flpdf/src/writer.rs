@@ -128,12 +128,13 @@ pub enum StreamDataMode {
 ///
 /// # Priority
 ///
-/// 1. QDF mode (`options.qdf`) always returns `Some(CompressStreams::No)` —
-///    QDF requires fully decoded streams regardless of `stream_data`.
+/// 1. Legacy QDF mode (`options.qdf`) returns `Some(CompressStreams::No)` —
+///    QDF requires fully decoded streams regardless of `stream_data`. The
+///    QPDFWriter bridge precomputes qpdf's setter-aware QDF defaults instead.
 /// 2. `options.stream_data = Some(mode)` overrides `options.compress_streams`.
 /// 3. `options.stream_data = None` falls back to `options.compress_streams`.
 pub(crate) fn effective_stream_policy(options: &WriteOptions) -> Option<CompressStreams> {
-    if options.qdf {
+    if options.qdf && !options.qdf_stream_policy_precomputed {
         return Some(CompressStreams::No);
     }
     match options.stream_data {
@@ -440,6 +441,11 @@ pub struct WriteOptions {
     /// [`RunLengthDecode`]: https://pdf.pizza/spec/7.4.5
     /// [`compress_streams`]: WriteOptions::compress_streams
     pub qdf: bool,
+
+    /// Whether the private QPDFWriter bridge already applied qpdf's
+    /// setter-aware QDF stream defaults. Legacy free-API callers leave this
+    /// false, preserving their existing unconditional QDF decode policy.
+    pub(crate) qdf_stream_policy_precomputed: bool,
 
     /// Higher-level stream data policy (qpdf `--stream-data={preserve,uncompress,compress}`).
     ///
@@ -4501,11 +4507,13 @@ fn apply_stream_compress_policy_with_decode_level(
         return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
     }
 
-    // Decode the stream through whatever filters are declared in its dict.
-    // `decode_stream_data` is also the single owner of `/DecodeParms` shape
-    // alignment and per-filter parameter validation. Keep that validation in
-    // the existing decoder instead of duplicating QPDF_Stream::filterable's
-    // parser here; any resulting Err takes the raw-preservation fallback below.
+    // A filter above the selected level has already returned through the raw
+    // chain-preservation branch above, matching qpdf's all-or-nothing gate.
+    // For an in-level chain, `decode_stream_data` is the single owner of
+    // `/DecodeParms` shape alignment and per-filter parameter validation (the
+    // responsibility corresponding to QPDF_Stream::filterable). Keep that
+    // validation in the existing decoder instead of duplicating its parser
+    // here; any resulting Err takes the raw-preservation fallback below.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
         Ok(d) => d,
         Err(_) => {
@@ -4591,6 +4599,7 @@ fn filter_chain_is_decodable(
         return true;
     };
     let filters = match filter {
+        Object::Null => return true,
         Object::Name(_) => std::slice::from_ref(filter),
         Object::Array(filters) => filters.as_slice(),
         _ => return false,

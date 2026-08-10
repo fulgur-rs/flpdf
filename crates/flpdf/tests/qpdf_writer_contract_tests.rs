@@ -198,6 +198,40 @@ fn synthetic_flate_contents_pdf(filter_as_array: bool) -> Vec<u8> {
     bytes
 }
 
+/// Build the same one-page shape with an explicit null `/Filter`. qpdf treats
+/// null exactly like an absent filter and may therefore apply output
+/// compression to the raw stream data.
+fn synthetic_null_filter_contents_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << >> /Contents 4 0 R >>"
+            .as_slice(),
+    ];
+    let mut offsets = Vec::with_capacity(4);
+    for (number, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", number + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    offsets.push(bytes.len());
+    bytes.extend_from_slice(
+        b"4 0 obj\n<< /Length 3 /Filter null >>\nstream\nABC\nendstream\nendobj\n",
+    );
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn assert_qpdf_check(bytes: &[u8]) -> flpdf::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("qpdf-writer-contract.pdf");
@@ -724,6 +758,116 @@ fn qpdf_writer_set_compress_streams_false_preserves_generalized_flate_source() -
 }
 
 #[test]
+fn qpdf_writer_qdf_defaults_decode_generalized_streams_without_compression() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, data) = runlength_contents_snapshot(output);
+    assert_eq!(filter, None);
+    assert_eq!(data, b"ABC");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_preserves_explicit_none_decode_level() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let source = synthetic_flate_contents_pdf(false);
+    let (source_filter, source_data) = runlength_contents_snapshot(source.clone());
+    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_decode_level(DecodeLevel::None);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, data) = runlength_contents_snapshot(output);
+    assert_eq!(filter, source_filter);
+    assert_eq!(data, source_data);
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_preserves_explicit_compression_setting() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_compress_streams(true);
+    writer.set_recompress_flate(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, decoded) = decoded_runlength_snapshot(output)?;
+    assert_eq!(filter, Some(Object::Name(b"FlateDecode".to_vec())));
+    assert_eq!(decoded, b"ABC");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_treats_null_filter_as_unfiltered_stream() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_null_filter_contents_pdf()))?;
+    // The reader normalizes a parsed null dictionary value to the same lookup
+    // result as an absent key. Reinsert the explicit null on the resolved
+    // stream so this contract also exercises QPDFWriter's filter gate with
+    // `Some(Object::Null)`.
+    let root_ref = pdf.root_ref().expect("catalog reference");
+    let pages_ref = pdf
+        .resolve(root_ref)?
+        .as_dict()
+        .expect("catalog dictionary")
+        .get_ref("Pages")
+        .expect("pages reference");
+    let pages = pdf.resolve(pages_ref)?.clone();
+    let page_ref = pages
+        .as_dict()
+        .expect("pages dictionary")
+        .get("Kids")
+        .and_then(Object::as_array)
+        .and_then(|kids| kids.first())
+        .and_then(Object::as_ref_id)
+        .expect("page reference");
+    let page = pdf.resolve(page_ref)?.clone();
+    let contents_ref = page
+        .as_dict()
+        .expect("page dictionary")
+        .get_ref("Contents")
+        .expect("contents reference");
+    let mut contents = pdf
+        .resolve(contents_ref)?
+        .as_stream()
+        .expect("contents stream")
+        .clone();
+    contents.dict.insert("Filter", Object::Null);
+    pdf.set_object(contents_ref, Object::Stream(contents));
+
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, decoded) = decoded_runlength_snapshot(output)?;
+    assert_eq!(filter, Some(Object::Name(b"FlateDecode".to_vec())));
+    assert_eq!(decoded, b"ABC");
+    Ok(())
+}
+
+#[test]
 fn public_compress_no_decodes_runlength_source() {
     let mut dict = Dictionary::new();
     dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
@@ -738,6 +882,26 @@ fn public_compress_no_decodes_runlength_source() {
     assert_eq!(output.dict.get("DecodeParms"), None);
     assert_eq!(output.dict.get("Length"), Some(&Object::Integer(3)));
     assert_eq!(output.data, b"ABC");
+}
+
+#[test]
+fn public_compress_policy_treats_null_filter_as_no_filters() {
+    let mut dict = Dictionary::new();
+    dict.insert("Filter", Object::Null);
+    dict.insert("Length", Object::Integer(3));
+    let source = Stream::new(dict, b"ABC".to_vec());
+
+    let Object::Stream(output) = apply_stream_compress_policy(&source, CompressStreams::Yes) else {
+        panic!("stream compression policy must return a stream");
+    };
+
+    assert_eq!(
+        output.dict.get("Filter"),
+        Some(&Object::Name(b"FlateDecode".to_vec()))
+    );
+    let decoded = flpdf::filters::decode_stream_data(&output.dict, &output.data)
+        .expect("compressed null-filter source must decode");
+    assert_eq!(decoded, b"ABC");
 }
 
 #[test]

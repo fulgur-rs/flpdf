@@ -36,7 +36,9 @@ pub(crate) struct WriterSettings {
     pub(crate) object_stream_mode: ObjectStreamMode,
     pub(crate) stream_data_mode: Option<StreamDataMode>,
     pub(crate) compress_streams: bool,
+    pub(crate) compress_streams_set: bool,
     pub(crate) decode_level: DecodeLevel,
+    pub(crate) decode_level_set: bool,
     pub(crate) recompress_flate: bool,
     pub(crate) content_normalization: bool,
     pub(crate) qdf_mode: bool,
@@ -64,7 +66,9 @@ impl Default for WriterSettings {
             object_stream_mode: ObjectStreamMode::Preserve,
             stream_data_mode: None,
             compress_streams: true,
+            compress_streams_set: false,
             decode_level: DecodeLevel::None,
+            decode_level_set: false,
             recompress_flate: false,
             content_normalization: false,
             qdf_mode: false,
@@ -92,24 +96,40 @@ impl WriterSettings {
     /// Convert the qpdf-shaped settings into the legacy emitter's private
     /// option representation for this temporary full-rewrite slice.
     pub(crate) fn to_write_options(&self) -> WriteOptions {
+        // QPDFWriter applies QDF defaults during write setup, after all public
+        // setters have run. Only values that were never explicitly set are
+        // replaced: QDF disables compression and raises the decode level to
+        // generalized (QPDFWriter.cc:2078-2087).
+        let compress_streams = if self.qdf_mode && !self.compress_streams_set {
+            false
+        } else {
+            self.compress_streams
+        };
+        let decode_level = if self.qdf_mode && !self.decode_level_set {
+            DecodeLevel::Generalized
+        } else {
+            self.decode_level
+        };
+
         let mut options = WriteOptions {
             // The compatibility bridge must never select the incremental
             // route, even though WriteOptions still contains that old field.
             full_rewrite: true,
             object_streams: self.object_stream_mode,
             preserve_unreferenced_objects: self.preserve_unreferenced_objects,
-            compress_streams: if self.compress_streams {
+            compress_streams: if compress_streams {
                 CompressStreams::Yes
             } else {
                 CompressStreams::No
             },
-            decode_level: self.decode_level,
+            decode_level,
             // QPDFWriter translates set_stream_data_mode into compress/decode
             // state. Keep this bridge field clear so the legacy effective
             // policy cannot override the qpdf setter ordering.
             stream_data: self.stream_data_mode,
             recompress_flate: self.recompress_flate,
             qdf: self.qdf_mode,
+            qdf_stream_policy_precomputed: true,
             newline_before_endstream: if self.newline_before_endstream {
                 NewlineBeforeEndstream::Yes
             } else {
