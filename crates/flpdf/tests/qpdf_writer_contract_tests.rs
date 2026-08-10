@@ -805,6 +805,178 @@ fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> fl
 }
 
 #[test]
+fn qpdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -> flpdf::Result<()>
+{
+    qpdf_11_9_0()?;
+    let password = b"donor-user";
+
+    let mut donor_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut donor_options = WriteOptions::default();
+    donor_options.full_rewrite = true;
+    donor_options.object_streams = ObjectStreamMode::Disable;
+    donor_options.compress_streams = CompressStreams::No;
+    donor_options.static_id = true;
+    donor_options.static_aes_iv = true;
+    let mut params = EncryptParams::v4_aes128(password.to_vec(), password.to_vec());
+    params.encrypt_metadata = true;
+    donor_options.encrypt = Some(params);
+    let mut donor_bytes = Vec::new();
+    write_pdf_with_options(&mut donor_input, &mut donor_bytes, &donor_options)?;
+
+    let mut donor = Pdf::open_with_options(
+        Cursor::new(donor_bytes),
+        PdfOpenOptions {
+            password: password.to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut copy_source = copy_encryption_source_from_donor(&mut donor);
+    copy_source.encrypt_dict.remove("EncryptMetadata");
+
+    let target_metadata = b"target encrypted metadata";
+    let mut target = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    attach_plain_metadata(&mut target, target_metadata);
+    let mut copy_options = WriteOptions::default();
+    copy_options.full_rewrite = true;
+    copy_options.object_streams = ObjectStreamMode::Disable;
+    copy_options.compress_streams = CompressStreams::No;
+    copy_options.static_aes_iv = true;
+    copy_options.copy_encryption = Some(copy_source);
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut target, &mut output, &copy_options)?;
+
+    assert!(
+        !contains_bytes(&output, target_metadata),
+        "absent /EncryptMetadata must encrypt the metadata payload"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let encrypted_path = dir.path().join("copied-encrypted-metadata.pdf");
+    let decrypted_path = dir.path().join("copied-encrypted-metadata-decrypted.pdf");
+    std::fs::write(&encrypted_path, &output)?;
+    let check = Command::new("qpdf")
+        .arg("--password=donor-user")
+        .arg("--check")
+        .arg(&encrypted_path)
+        .output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    let decrypt = Command::new("qpdf")
+        .arg("--password=donor-user")
+        .arg("--decrypt")
+        .arg(&encrypted_path)
+        .arg(&decrypted_path)
+        .output()?;
+    assert!(
+        decrypt.status.success(),
+        "qpdf --decrypt failed: {decrypt:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_standard_encryption_false_keeps_metadata_cleartext() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let password = b"standard-user";
+    let metadata_payload = b"standard cleartext metadata";
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    attach_plain_metadata(&mut pdf, metadata_payload);
+
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_static_aes_iv(true);
+    let mut params = EncryptParams::v4_aes128(password.to_vec(), password.to_vec());
+    params.encrypt_metadata = false;
+    writer.set_encryption_parameters(params);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    assert!(contains_bytes(&output, b"/EncryptMetadata false"));
+    assert!(
+        contains_bytes(&output, metadata_payload),
+        "standard encryption must leave metadata payload cleartext"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let encrypted_path = dir.path().join("standard-encrypted-metadata.pdf");
+    std::fs::write(&encrypted_path, &output)?;
+    let check = Command::new("qpdf")
+        .arg("--password=standard-user")
+        .arg("--check")
+        .arg(&encrypted_path)
+        .output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+
+    let mut reopened = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: password.to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let root_ref = reopened.root_ref().expect("rewritten Catalog reference");
+    let metadata_ref = reopened
+        .resolve(root_ref)?
+        .as_dict()
+        .expect("rewritten Catalog must be a dictionary")
+        .get_ref("Metadata")
+        .expect("rewritten Catalog must reference metadata");
+    let metadata = reopened.resolve(metadata_ref)?.clone();
+    let metadata = metadata.as_stream().expect("metadata must be a stream");
+    assert_eq!(metadata.data, metadata_payload);
+    assert_eq!(
+        metadata.dict.get("Filter"),
+        Some(&Object::Name(b"Crypt".to_vec()))
+    );
+    assert_eq!(
+        metadata.dict.get("DecodeParms"),
+        Some(&Object::Dictionary({
+            let mut dict = Dictionary::new();
+            dict.insert("Name", Object::Name(b"Identity".to_vec()));
+            dict.insert("Type", Object::Name(b"CryptFilterDecodeParms".to_vec()));
+            dict
+        }))
+    );
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_memory_output_checks_indirect_contents_array_fixture() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let file = File::open("../../tests/fixtures/compat/qdf-contents-ref-array.pdf")?;
+    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    assert_qpdf_check(&output)?;
+    let contents_marker = b"%% Contents for page 1\n";
+    assert_eq!(
+        output
+            .windows(contents_marker.len())
+            .filter(|window| *window == contents_marker)
+            .count(),
+        2,
+        "QDF must mark both indirect array-element streams"
+    );
+    assert!(contains_bytes(
+        &output,
+        b"%% Contents for page 1\n%% Original object ID: 6 0\n"
+    ));
+    assert!(contains_bytes(
+        &output,
+        b"%% Contents for page 1\n%% Original object ID: 7 0\n"
+    ));
+    assert!(contains_bytes(&output, b"stream\nA\nendstream"));
+    assert!(contains_bytes(&output, b"stream\nB\nendstream"));
+    Ok(())
+}
+
+#[test]
 fn qpdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let source = synthetic_unreferenced_object_pdf();
