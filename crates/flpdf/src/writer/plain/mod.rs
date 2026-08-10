@@ -4,7 +4,9 @@ use std::io::{Read, Seek, Write};
 #[cfg(test)]
 use std::cell::Cell;
 
-use crate::{ObjectStreamMode, Pdf, WriteOptions};
+use crate::writer::WriterResult;
+use crate::{ObjectRef, ObjectStreamMode, Pdf, WriteOptions};
+use std::collections::BTreeMap;
 
 pub(crate) mod body;
 pub(crate) mod plan;
@@ -19,7 +21,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
     options: &WriteOptions,
-) -> crate::Result<()> {
+) -> crate::Result<WriterResult> {
     #[cfg(test)]
     PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
 
@@ -32,12 +34,21 @@ fn write_planned<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriteOptions,
     plan: &plan::PlainWritePlan,
-) -> crate::Result<()> {
+) -> crate::Result<WriterResult> {
     plan.validate()?;
     let (mut bytes, layout) = body::emit_bodies(pdf, options, plan)?;
-    xref::append_xref_and_trailer(&mut bytes, &layout, &plan.trailer)?;
+    let written_xref = xref::append_xref_and_trailer(&mut bytes, &layout, &plan.trailer)?;
     out.write_all(&bytes)?;
-    Ok(())
+    let old_to_new = plan
+        .old_to_new
+        .iter()
+        .filter(|(_, output)| {
+            layout.uncompressed.contains_key(&output.number)
+                || layout.compressed.contains_key(&output.number)
+        })
+        .map(|(&source, &output)| (source, output))
+        .collect::<BTreeMap<ObjectRef, ObjectRef>>();
+    Ok(WriterResult::new(old_to_new, written_xref))
 }
 
 pub(crate) fn eligible(

@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 
 use crate::writer::{serialize::xref_stream, write_deterministic_id_inline};
-use crate::{Dictionary, Object, ObjectRef, XrefForm};
+use crate::{Dictionary, Object, ObjectRef, XrefEntry, XrefForm};
 
 /// Location of an object encoded inside an object-stream container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +65,7 @@ pub(crate) fn append_xref_and_trailer(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
-) -> crate::Result<()> {
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     layout.validate()?;
 
     match trailer.form {
@@ -83,7 +83,7 @@ fn append_xref_stream_and_trailer(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
-) -> crate::Result<()> {
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let xref_offset = bytes.len();
     let max_number = layout.max_number();
     let xref_number = max_number.checked_add(1).ok_or_else(|| {
@@ -190,7 +190,7 @@ fn append_xref_stream_and_trailer(
         }
     }
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-    Ok(())
+    written_xref_stream(layout, xref_ref, xref_offset)
 }
 
 fn materialized_id(dictionary: &Dictionary) -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -214,7 +214,7 @@ fn append_classic_xref_and_trailer(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
-) -> crate::Result<()> {
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let xref_offset = bytes.len();
     let size = layout
         .max_number()
@@ -262,7 +262,78 @@ fn append_classic_xref_and_trailer(
         }
     }
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-    Ok(())
+    written_xref_table(layout, size)
+}
+
+fn written_xref_table(
+    layout: &BodyLayout,
+    size: u32,
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+    let mut result = BTreeMap::new();
+    result.insert(ObjectRef::new(0, 65535), XrefEntry::Free { next: 0 });
+    for number in 1..size {
+        match layout.uncompressed.get(&number) {
+            Some(&(generation, offset)) => {
+                result.insert(
+                    ObjectRef::new(number, generation),
+                    XrefEntry::Uncompressed {
+                        offset: u64::try_from(offset).map_err(|_| {
+                            crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                        })?,
+                    },
+                );
+            }
+            None => {
+                result.insert(ObjectRef::new(number, 0), XrefEntry::Free { next: 0 });
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn written_xref_stream(
+    layout: &BodyLayout,
+    xref_ref: ObjectRef,
+    xref_offset: usize,
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+    let size = xref_ref
+        .number
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("plain writer /Size overflows u32".into()))?;
+    let mut result = BTreeMap::new();
+    result.insert(ObjectRef::new(0, 65535), XrefEntry::Free { next: 0 });
+    for number in 1..size {
+        if number == xref_ref.number {
+            result.insert(
+                xref_ref,
+                XrefEntry::Uncompressed {
+                    offset: u64::try_from(xref_offset).map_err(|_| {
+                        crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                    })?,
+                },
+            );
+        } else if let Some(&(generation, offset)) = layout.uncompressed.get(&number) {
+            result.insert(
+                ObjectRef::new(number, generation),
+                XrefEntry::Uncompressed {
+                    offset: u64::try_from(offset).map_err(|_| {
+                        crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                    })?,
+                },
+            );
+        } else if let Some(location) = layout.compressed.get(&number) {
+            result.insert(
+                ObjectRef::new(number, 0),
+                XrefEntry::Compressed {
+                    stream: location.container,
+                    index: location.index,
+                },
+            );
+        } else {
+            result.insert(ObjectRef::new(number, 0), XrefEntry::Free { next: 0 });
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

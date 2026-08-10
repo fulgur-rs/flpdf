@@ -11,7 +11,7 @@ use flpdf::{
     apply_stream_compress_policy, pages, write_pdf, write_pdf_with_options, write_qdf,
     CompressStreams, CopyEncryptionSource, DecodeLevel, Dictionary, EncryptParams, Object,
     ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, QPDFWriter, Stream,
-    StreamDataMode, WriteOptions,
+    StreamDataMode, WriteOptions, XrefEntry,
 };
 
 #[derive(Clone)]
@@ -1176,11 +1176,81 @@ fn qpdf_setter_surface_compiles() -> flpdf::Result<()> {
 fn writer_result_surface_compiles() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
     let mut writer = QPDFWriter::new(&mut pdf);
+
+    assert!(writer.get_renumbered_obj_gen(ObjectRef::new(1, 0)).is_err());
+    assert!(writer.get_written_xref_table().is_err());
+
     writer.set_output_memory()?;
     writer.write()?;
 
-    let _ = writer.get_renumbered_obj_gen(ObjectRef::new(1, 0));
-    let _ = writer.get_written_xref_table();
+    let output = writer.get_buffer()?;
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(1, 0))?,
+        Some(ObjectRef::new(1, 0))
+    );
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(2, 0))?,
+        Some(ObjectRef::new(2, 0))
+    );
+    let xref = writer.get_written_xref_table()?;
+    assert_eq!(
+        xref.get(&ObjectRef::new(0, 65535)),
+        Some(&XrefEntry::Free { next: 0 })
+    );
+    for number in [1_u32, 2] {
+        let entry = xref
+            .get(&ObjectRef::new(number, 0))
+            .expect("emitted object must have a result xref entry");
+        let XrefEntry::Uncompressed { offset } = entry else {
+            panic!("minimal object {number} must be uncompressed: {entry:?}");
+        };
+        let marker = format!("{number} 0 obj\n");
+        assert_eq!(
+            &output[*offset as usize..][..marker.len()],
+            marker.as_bytes()
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn writer_result_reports_generated_object_stream_members_and_xref_object() -> flpdf::Result<()> {
+    let source = synthetic_unreferenced_object_pdf();
+    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    let catalog = writer
+        .get_renumbered_obj_gen(ObjectRef::new(1, 0))?
+        .expect("catalog must be emitted");
+    let pages = writer
+        .get_renumbered_obj_gen(ObjectRef::new(2, 0))?
+        .expect("pages must be emitted");
+    let xref = writer.get_written_xref_table()?;
+    for member in [catalog, pages] {
+        assert!(matches!(
+            xref.get(&member),
+            Some(XrefEntry::Compressed { stream, .. }) if *stream != 0
+        ));
+    }
+    let xref_object = xref.iter().find_map(|(object_ref, entry)| match entry {
+        XrefEntry::Uncompressed { offset }
+            if output[*offset as usize..]
+                .starts_with(format!("{} 0 obj\n", object_ref.number).as_bytes())
+                && contains_bytes(&output[*offset as usize..], b"/Type /XRef") =>
+        {
+            Some(*object_ref)
+        }
+        _ => None,
+    });
+    assert!(
+        xref_object.is_some(),
+        "result must include synthetic xref object"
+    );
 
     Ok(())
 }

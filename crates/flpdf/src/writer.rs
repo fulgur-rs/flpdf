@@ -27,6 +27,29 @@ use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefEntry, Xref
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek, Write};
 
+/// Result data produced by a completed full-rewrite emitter.
+///
+/// Both maps are assembled while writing the output. They deliberately do not
+/// consult the source xref table: the caller observes the objects and xref
+/// records that this emitter actually placed in the new file.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WriterResult {
+    pub(crate) old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+    pub(crate) written_xref: BTreeMap<ObjectRef, XrefEntry>,
+}
+
+impl WriterResult {
+    pub(crate) fn new(
+        old_to_new: BTreeMap<ObjectRef, ObjectRef>,
+        written_xref: BTreeMap<ObjectRef, XrefEntry>,
+    ) -> Self {
+        Self {
+            old_to_new,
+            written_xref,
+        }
+    }
+}
+
 /// Controls whether the full-rewrite path applies FlateDecode compression to
 /// output streams.
 ///
@@ -1030,7 +1053,8 @@ pub fn write_pdf_with_options<R: Read + Seek, W: Write>(
     options: &WriteOptions,
 ) -> Result<()> {
     if options.full_rewrite {
-        return write_pdf_full_rewrite(pdf, out, options);
+        write_pdf_full_rewrite(pdf, out, options)?;
+        return Ok(());
     }
     if options.deterministic_id {
         // The deterministic /ID is an MD5 over the rewritten body, which only
@@ -3179,7 +3203,7 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
     options: &WriteOptions,
-) -> Result<()> {
+) -> Result<WriterResult> {
     // Snapshot the source Catalog AND its dirty-flag state BEFORE any ADBE
     // injection / strip mutates them, so those output-only mutations do not
     // leak into the caller's Pdf handle. Restored below regardless of whether
@@ -3244,7 +3268,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
     options: &WriteOptions,
-) -> Result<()> {
+) -> Result<WriterResult> {
     if options.deterministic_id && options.static_id {
         return Err(crate::Error::Unsupported(
             "deterministic_id and static_id are mutually exclusive".to_string(),
@@ -3825,6 +3849,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     }
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
+    let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
 
     for (new_ref, old_ref) in &renumbered {
         // Never emit object 0 or any free/deleted entry as a body object (qpdf
@@ -4073,6 +4098,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
+        emitted_old_to_new.insert(*old_ref, emit_ref);
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -4105,6 +4131,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             let new = renumber.new_for_original(old).ok_or_else(|| {
                 crate::Error::Unsupported("ObjStm member absent from renumber map".to_string())
             })?;
+            emitted_old_to_new.insert(old, new);
             resolved.push((new, obj));
         }
         let emitted = object_streams::emit_objstm_body_from_resolved_with_writer(
@@ -4170,6 +4197,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             crate::Error::Unsupported("full-rewrite: object count does not fit in u32".to_string())
         })?;
 
+    let mut written_xref = BTreeMap::<ObjectRef, XrefEntry>::new();
     match effective_xref_form {
         XrefForm::Table => {
             // Classic xref table.
@@ -4180,6 +4208,30 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     Some((generation, offset)) => bytes
                         .extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes()),
                     None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+                }
+            }
+            written_xref.insert(ObjectRef::new(0, 65535), XrefEntry::Free { next: 0 });
+            for number in 1..object_count {
+                let object_number = number as u32;
+                match offsets.get(&object_number) {
+                    Some(&(generation, offset)) => {
+                        written_xref.insert(
+                            ObjectRef::new(object_number, generation),
+                            XrefEntry::Uncompressed {
+                                offset: u64::try_from(offset).map_err(|_| {
+                                    crate::Error::Unsupported(
+                                        "xref offset does not fit u64".to_string(),
+                                    )
+                                })?,
+                            },
+                        );
+                    }
+                    None => {
+                        written_xref.insert(
+                            ObjectRef::new(object_number, 65535),
+                            XrefEntry::Free { next: 0 },
+                        );
+                    }
                 }
             }
 
@@ -4338,6 +4390,9 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                     },
                 ),
             );
+            for (&number, &(generation, entry)) in &xref_entries {
+                written_xref.insert(ObjectRef::new(number, generation), entry);
+            }
 
             // The entries are now contiguous `[0, final_object_count)`, so a
             // single Index range suffices.
@@ -4475,7 +4530,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     }
 
     out.write_all(&bytes)?;
-    Ok(())
+    Ok(WriterResult::new(emitted_old_to_new, written_xref))
 }
 
 /// Apply the stream compression policy to a single stream object.

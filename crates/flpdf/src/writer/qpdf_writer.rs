@@ -10,7 +10,9 @@ use crate::pipeline::Pipeline;
 use crate::{Error, ObjectRef, Pdf, Result, XrefEntry};
 
 use super::settings::{DecodeLevel, WriterSettings};
-use super::{effective_pdf_version, write_pdf_full_rewrite, ObjectStreamMode, StreamDataMode};
+use super::{
+    effective_pdf_version, write_pdf_full_rewrite, ObjectStreamMode, StreamDataMode, WriterResult,
+};
 
 enum WriterOutput {
     Memory(Option<Vec<u8>>),
@@ -61,6 +63,7 @@ pub struct QPDFWriter<'pdf, R: Read + Seek + 'static> {
     output: Option<WriterOutput>,
     write_started: bool,
     write_succeeded: bool,
+    result: Option<WriterResult>,
 }
 
 impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
@@ -72,6 +75,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             output: None,
             write_started: false,
             write_succeeded: false,
+            result: None,
         }
     }
 
@@ -304,30 +308,38 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
         let options = self.settings.to_write_options();
         let mut bytes = Vec::new();
-        write_pdf_full_rewrite(self.pdf, &mut bytes, &options)?;
+        let result = write_pdf_full_rewrite(self.pdf, &mut bytes, &options)?;
 
         self.output
             .as_mut()
             .expect("output was checked before writing")
             .write_complete(bytes)?;
+        self.result = Some(result);
         self.write_succeeded = true;
         Ok(())
     }
 
-    /// Query the temporary result surface after a successful write.
-    pub fn get_renumbered_obj_gen(&self, _source: ObjectRef) -> Result<Option<ObjectRef>> {
+    /// Return the output identity actually assigned to a source object.
+    pub fn get_renumbered_obj_gen(&self, source: ObjectRef) -> Result<Option<ObjectRef>> {
         self.ensure_write_succeeded()?;
-        Err(Error::Unsupported(
-            "renumbered object generation results are temporarily not implemented".into(),
-        ))
+        Ok(self
+            .result
+            .as_ref()
+            .expect("successful writes retain their result")
+            .old_to_new
+            .get(&source)
+            .copied())
     }
 
-    /// Query the temporary result surface after a successful write.
+    /// Return the xref records actually written by the completed emitter.
     pub fn get_written_xref_table(&self) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
         self.ensure_write_succeeded()?;
-        Err(Error::Unsupported(
-            "written xref table results are temporarily not implemented".into(),
-        ))
+        Ok(self
+            .result
+            .as_ref()
+            .expect("successful writes retain their result")
+            .written_xref
+            .clone())
     }
 
     /// Reject qpdf settings that the temporary emitter bridge cannot honor.
