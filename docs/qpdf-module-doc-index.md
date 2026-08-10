@@ -115,6 +115,7 @@
 | `crates/flpdf/src/pipeline/stream_codecs_oracle.rs` | correspondence | live differential instrumentation for Pl_ASCII85Decoder.cc, Pl_ASCIIHexDecoder.cc, and Pl_RunLength.cc |
 | `crates/flpdf/src/pipeline/string.rs` | correspondence | Pl_String.cc accumulation, optional pass-through, and finish forwarding |
 | `crates/flpdf/src/pipeline/test_support.rs` | correspondence | flpdf-only test instrumentation for observable Pipeline downstream calls and failures |
+| `crates/flpdf/src/pipeline/tiff_predictor.rs` | correspondence | \`Pl_TIFFPredictor.cc\` incremental TIFF predictor |
 | `crates/flpdf/src/qdf_fix.rs` | correspondence | qpdf/fix-qdf.cc tool behavior outside libqpdf |
 | `crates/flpdf/src/qpdf_null.rs` | correspondence | QPDFObjectHandle.cc isNull resolution plus QPDFWriter.cc null-valued dictionary visibility |
 | `crates/flpdf/src/reader.rs` | correspondence | QPDF.cc object resolution, recovery, diagnostics, and authentication responsibilities |
