@@ -13,8 +13,16 @@ fn qpdf_11_9_0() -> flpdf::Result<()> {
     let output = Command::new("qpdf").arg("--version").output()?;
     assert!(output.status.success(), "qpdf --version failed: {output:?}");
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("11.9.0"),
+    let version_line = text
+        .lines()
+        .find(|line| line.starts_with("qpdf version "))
+        .expect("qpdf --version must report a standard version line");
+    let reported_version = version_line
+        .split_whitespace()
+        .nth(2)
+        .expect("qpdf version line must contain a version token");
+    assert_eq!(
+        reported_version, "11.9.0",
         "unexpected qpdf version output: {text}"
     );
     Ok(())
