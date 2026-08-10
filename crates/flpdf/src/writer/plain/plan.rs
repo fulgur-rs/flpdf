@@ -67,7 +67,7 @@ impl PlainWritePlan {
                         pdf,
                         true,
                         &explicitly_removed,
-                    )?
+                    )? // cov:ignore: malformed source graph is rejected by the catalog walk
                 } else {
                     CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?
                 };
@@ -80,7 +80,7 @@ impl PlainWritePlan {
                     object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
                         pdf,
                         options.preserve_unreferenced_objects,
-                    )?;
+                    )?; // cov:ignore: malformed source graph is rejected by the preserve planner
                 packing
                     .removed_refs
                     .extend(explicitly_removed.iter().copied());
@@ -104,7 +104,7 @@ impl PlainWritePlan {
                         groups,
                         removed,
                         options.preserve_unreferenced_objects,
-                    )?;
+                    )?; // cov:ignore: planner groups are produced by the same validated source walk
                     build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
             }

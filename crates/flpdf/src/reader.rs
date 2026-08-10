@@ -8254,4 +8254,27 @@ mod tests {
         );
         assert_eq!(dict.get("B"), Some(&Object::Integer(3)));
     }
+
+    #[test]
+    fn writer_copy_encryption_source_returns_none_for_plaintext() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open plaintext fixture");
+
+        assert!(pdf
+            .writer_copy_encryption_source()
+            .expect("plaintext copy source lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn writer_copy_encryption_source_rejects_authenticated_state_without_encrypt_dict() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        *pdf.encryption.borrow_mut() = Some(explicit_rc4_encryption_state());
+
+        let error = pdf
+            .writer_copy_encryption_source()
+            .expect_err("an authenticated state without /Encrypt must be rejected");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message == "authenticated input has no /Encrypt dictionary"));
+    }
 }

@@ -278,6 +278,7 @@ fn written_xref_table(
                 XrefEntry::Uncompressed {
                     offset: u64::try_from(offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                        // cov:ignore: usize always fits into u64
                     })?,
                 },
             );
@@ -303,6 +304,7 @@ fn written_xref_stream(
                 XrefEntry::Uncompressed {
                     offset: u64::try_from(xref_offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                        // cov:ignore: usize always fits into u64
                     })?,
                 },
             );
@@ -312,6 +314,7 @@ fn written_xref_stream(
                 XrefEntry::Uncompressed {
                     offset: u64::try_from(offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                        // cov:ignore: usize always fits into u64
                     })?,
                 },
             );

@@ -3116,7 +3116,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
     if options.pclm {
-        bytes.extend_from_slice(b"%PCLm 1.0\n");
+        bytes.extend_from_slice(b"%PCLm 1.0\n"); // cov:ignore: PCLm returns through write_pclm before this coordinator
     } else {
         bytes.extend_from_slice(QPDF_BINARY_MARKER);
     }
@@ -3498,9 +3498,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                         ObjectRef::new(object_number, 0),
                         XrefEntry::Uncompressed {
                             offset: u64::try_from(offset).map_err(|_| {
+                                // cov:ignore-start: usize always fits into u64
                                 crate::Error::Unsupported(
                                     "xref offset does not fit u64".to_string(),
                                 )
+                                // cov:ignore-end
                             })?,
                         },
                     );
@@ -4126,7 +4128,7 @@ fn normalize_direct_content_value(value: &mut Object, options: &WriterOptions) {
             let (normalized, _) =
                 reencode_stream_for_compress(stream.clone(), options, false, None, true, false);
             let Object::Stream(normalized) = normalized else {
-                unreachable!("stream compression always returns a stream")
+                unreachable!("stream compression always returns a stream") // cov:ignore: stream normalization always returns a stream object
             };
             *stream = normalized;
         }
@@ -7674,5 +7676,193 @@ mod tests {
                 .all(|(member, container)| *container > member.number),
             "source encryption must keep the legacy containers-above-members route: {compressed:?}"
         );
+    }
+
+    #[test]
+    fn progress_reporter_debug_uses_qpdf_writer_shape() {
+        let reporter = ProgressReporter::new(Box::new(|_| {}));
+
+        assert_eq!(format!("{reporter:?}"), "ProgressReporter(..)");
+    }
+
+    #[test]
+    fn xref_stream_bytes_reject_overflow_and_missing_entries() {
+        let overflow = build_xref_stream_bytes(&BTreeMap::new(), &[(u32::MAX, 1)])
+            .expect_err("a range ending past u32::MAX must be rejected");
+        assert!(matches!(overflow, crate::Error::Unsupported(message)
+            if message == "xref stream range does not fit u32"));
+
+        let offsets = BTreeMap::from([(1_u32, (0_u16, XrefEntry::Uncompressed { offset: 0 }))]);
+        let missing = build_xref_stream_bytes(&offsets, &[(1, 2)])
+            .expect_err("a range with a missing object entry must be rejected");
+        assert!(matches!(missing, crate::Error::Unsupported(message)
+            if message == "xref stream is missing object entry"));
+    }
+
+    fn copy_encryption_dictionary(version: i64, revision: i64, length: i64) -> Dictionary {
+        let mut dict = Dictionary::new();
+        dict.insert("V", Object::Integer(version));
+        dict.insert("R", Object::Integer(revision));
+        dict.insert("Length", Object::Integer(length));
+        dict
+    }
+
+    fn copy_encryption_source(
+        dict: Dictionary,
+        file_key_len: usize,
+    ) -> crate::CopyEncryptionSource {
+        crate::CopyEncryptionSource {
+            encrypt_dict: dict,
+            file_key: vec![0; file_key_len],
+            id0: vec![0; 16],
+            object_key_alg: crate::ObjectKeyAlg::Rc4,
+        }
+    }
+
+    #[test]
+    fn canonical_copy_encryption_rejects_invalid_standard_handler_shapes() {
+        let mut version_out_of_range = copy_encryption_dictionary(i64::from(i32::MAX) + 1, 2, 40);
+        version_out_of_range.insert("P", Object::Integer(-4));
+        let error = canonical_copy_encryption(&copy_encryption_source(version_out_of_range, 5))
+            .expect_err("an out-of-range /V must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("/V is out of range")));
+
+        let revision_out_of_range = copy_encryption_dictionary(1, i64::from(i32::MAX) + 1, 40);
+        let error = canonical_copy_encryption(&copy_encryption_source(revision_out_of_range, 5))
+            .expect_err("an out-of-range /R must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("/R is out of range")));
+
+        let invalid_length = copy_encryption_dictionary(2, 3, 41);
+        let error = canonical_copy_encryption(&copy_encryption_source(invalid_length, 16))
+            .expect_err("a non-byte-aligned /Length must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("/Length is invalid")));
+
+        let unsupported_v5 = copy_encryption_dictionary(5, 4, 256);
+        let error = canonical_copy_encryption(&copy_encryption_source(unsupported_v5, 32))
+            .expect_err("an unsupported V=5 revision must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("unsupported copy-encryption Standard handler V=5")));
+
+        let unsupported_legacy = copy_encryption_dictionary(3, 3, 128);
+        let error = canonical_copy_encryption(&copy_encryption_source(unsupported_legacy, 16))
+            .expect_err("an unsupported legacy handler must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message.contains("unsupported copy-encryption Standard handler V=3")));
+    }
+
+    #[test]
+    fn canonical_copy_encryption_rejects_missing_required_values() {
+        let missing_version = Dictionary::new();
+        let error = canonical_copy_encryption(&copy_encryption_source(missing_version, 5))
+            .expect_err("missing /V must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message == "copy-encryption /V must be an integer"));
+
+        let mut missing_owner = copy_encryption_dictionary(1, 2, 40);
+        missing_owner.insert("P", Object::Integer(-4));
+        let error = canonical_copy_encryption(&copy_encryption_source(missing_owner, 5))
+            .expect_err("missing /O must be rejected");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message == "copy-encryption /O must be a string"));
+    }
+
+    #[test]
+    fn filter_chain_classification_covers_qpdf_aliases_and_malformed_values() {
+        let malformed = Object::Integer(1);
+        assert!(!filter_chain_is_decodable(
+            Some(&malformed),
+            CompressStreams::Yes,
+            DecodeLevel::All,
+            false
+        ));
+
+        let malformed_item = Object::Array(vec![Object::Integer(1)]);
+        assert!(!filter_chain_is_decodable(
+            Some(&malformed_item),
+            CompressStreams::Yes,
+            DecodeLevel::All,
+            false
+        ));
+
+        for alias in [
+            b"Fl".as_slice(),
+            b"LZW".as_slice(),
+            b"A85".as_slice(),
+            b"AHx".as_slice(),
+        ] {
+            let filter = Object::Name(alias.to_vec());
+            assert!(filter_chain_is_decodable(
+                Some(&filter),
+                CompressStreams::Yes,
+                DecodeLevel::None,
+                false
+            ));
+        }
+
+        let run_length = Object::Name(b"RL".to_vec());
+        assert!(filter_chain_is_decodable(
+            Some(&run_length),
+            CompressStreams::No,
+            DecodeLevel::Specialized,
+            false
+        ));
+
+        let unknown = Object::Name(b"UnknownDecode".to_vec());
+        assert!(!filter_chain_is_decodable(
+            Some(&unknown),
+            CompressStreams::Yes,
+            DecodeLevel::All,
+            false
+        ));
+    }
+
+    #[test]
+    fn content_helpers_ignore_non_container_values() {
+        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).expect("open fixture");
+        pdf.set_object(ObjectRef::new(3, 0), Object::Integer(42));
+        let mut containers = BTreeSet::new();
+        collect_content_container_refs(&mut pdf, ObjectRef::new(3, 0), &mut containers)
+            .expect("a non-dictionary page value is ignored");
+        assert!(containers.is_empty());
+
+        let mut scalar = Object::Integer(42);
+        normalize_direct_content_values(&mut scalar, &WriterOptions::default());
+        assert_eq!(scalar, Object::Integer(42));
+    }
+
+    #[test]
+    fn pclm_writes_extra_header_and_deterministic_id() {
+        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).expect("open fixture");
+        let options = WriterOptions {
+            deterministic_id: true,
+            extra_header_text: "% PCLm extra".to_string(),
+            pclm: true,
+            ..WriterOptions::default()
+        };
+        let mut output = Vec::new();
+        emit_canonical_pdf(&mut pdf, &mut output, &options).expect("PCLm rewrite");
+
+        assert!(output.starts_with(b"%PDF-1.4\n%PCLm 1.0\n% PCLm extra\n"));
+        assert!(output
+            .windows(b"/ID [<".len())
+            .any(|window| window == b"/ID [<"));
+    }
+
+    #[test]
+    fn pclm_rejects_conflicting_id_modes() {
+        let mut pdf = crate::Pdf::open_mem_owned(build_partition_fixture()).expect("open fixture");
+        let options = WriterOptions {
+            deterministic_id: true,
+            static_id: true,
+            pclm: true,
+            ..WriterOptions::default()
+        };
+        let error = emit_canonical_pdf(&mut pdf, Vec::new(), &options)
+            .expect_err("PCLm must reject deterministic-id plus static-id");
+        assert!(matches!(error, crate::Error::Unsupported(message)
+            if message == "deterministic_id and static_id are mutually exclusive"));
     }
 }

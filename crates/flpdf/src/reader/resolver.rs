@@ -8749,7 +8749,7 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(recovered_objstm_member_pdf()).expect("open fixture");
         let stream_offset = match pdf.resolver.xref_entry(stream_ref) {
             Some(XrefEntry::Uncompressed { offset }) => offset,
-            other => panic!("object stream must have a type-1 xref entry, got {other:?}"),
+            other => panic!("object stream must have a type-1 xref entry, got {other:?}"), // cov:ignore: fixture invariant is asserted by this test
         };
         let root_ref = pdf.root_ref().expect("catalog ref");
         let mut root = pdf

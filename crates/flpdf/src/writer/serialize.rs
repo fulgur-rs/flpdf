@@ -1056,6 +1056,7 @@ pub(crate) mod xref_stream {
 mod tests {
     use super::*;
     use crate::writer::object_streams::ObjStmBody;
+    use crate::ObjectRef;
 
     #[test]
     fn raw_objstm_uses_qpdf_fixed_key_order() {
@@ -1094,5 +1095,34 @@ mod tests {
             b"payload",
             NewlineBeforeEndstream::Never
         ));
+    }
+
+    #[test]
+    fn xref_stream_id_writer_emits_encrypt_reference_after_id() {
+        let dict = xref_stream::XrefStreamDict {
+            filtered: false,
+            widths: [1, 1, 1],
+            index: None,
+            info: None,
+            root: Some(ObjectRef::new(1, 0)),
+            size: 2,
+            prev: None,
+            trailer: None,
+            id: None,
+            encrypt: Some(ObjectRef::new(7, 0)),
+        };
+        let mut output = Vec::new();
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<00><11>]");
+
+        xref_stream::write_object_with_id_writer(
+            &mut output,
+            ObjectRef::new(8, 0),
+            &dict,
+            &[0, 1],
+            &mut id_writer,
+        );
+
+        let output = String::from_utf8(output).expect("xref stream output is ASCII");
+        assert!(output.contains("/ID [<00><11>] /Encrypt 7 0 R"));
     }
 }

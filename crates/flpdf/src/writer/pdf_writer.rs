@@ -498,3 +498,67 @@ fn encryption_shape(options: &WriterOptions) -> Option<(i64, i64, bool)> {
     let revision = source.encrypt_dict.get("R")?.as_integer()?;
     Some((version, revision, version >= 4))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encrypt_setup::{EncryptMethod, EncryptParams};
+
+    fn options_for(method: EncryptMethod) -> WriterOptions {
+        let params = match method {
+            EncryptMethod::V1Rc440 | EncryptMethod::V2Rc4128 | EncryptMethod::V4Rc4128 => {
+                EncryptParams::rc4(method, b"user", b"owner")
+            }
+            EncryptMethod::V4Aes128 => EncryptParams::v4_aes128(b"user", b"owner"),
+            EncryptMethod::V5R5Aes256 => EncryptParams::v5_r5(b"user", b"owner"),
+            EncryptMethod::V5R6Aes256 => EncryptParams::v5_r6(b"user", b"owner"),
+        };
+        WriterOptions {
+            encrypt: Some(params),
+            ..WriterOptions::default()
+        }
+    }
+
+    #[test]
+    fn encryption_shape_covers_the_full_standard_handler_matrix() {
+        let expected = [
+            (EncryptMethod::V1Rc440, (1, 2, false)),
+            (EncryptMethod::V2Rc4128, (2, 3, false)),
+            (EncryptMethod::V4Rc4128, (4, 4, false)),
+            (EncryptMethod::V4Aes128, (4, 4, true)),
+            (EncryptMethod::V5R5Aes256, (5, 5, true)),
+            (EncryptMethod::V5R6Aes256, (5, 6, true)),
+        ];
+
+        for (method, shape) in expected {
+            assert_eq!(encryption_shape(&options_for(method)), Some(shape));
+        }
+    }
+
+    #[test]
+    fn forced_version_disables_each_incompatible_encryption_floor() {
+        let mut options = options_for(EncryptMethod::V1Rc440);
+        options.force_version = Some("1.2".to_string());
+        assert!(forced_version_disables_encryption(&options));
+
+        let mut options = options_for(EncryptMethod::V2Rc4128);
+        options.force_version = Some("1.3".to_string());
+        assert!(forced_version_disables_encryption(&options));
+
+        let mut options = options_for(EncryptMethod::V4Rc4128);
+        options.force_version = Some("1.4".to_string());
+        assert!(forced_version_disables_encryption(&options));
+
+        let mut options = options_for(EncryptMethod::V4Aes128);
+        options.force_version = Some("1.5".to_string());
+        assert!(forced_version_disables_encryption(&options));
+
+        let mut options = options_for(EncryptMethod::V5R6Aes256);
+        options.force_version = Some("1.7".to_string());
+        options.force_extension_level = Some(2);
+        assert!(forced_version_disables_encryption(&options));
+
+        options.force_extension_level = Some(3);
+        assert!(!forced_version_disables_encryption(&options));
+    }
+}

@@ -3478,11 +3478,13 @@ fn write_linearized_impl<R: Read + Seek>(
             Some(ctx)
         } else if let Some(source) = options.copy_encryption.as_ref() {
             let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
+                // cov:ignore-start: a supported in-memory PDF cannot contain 2^32 objects
                 crate::Error::Unsupported(
                     "linearization writer: object count overflows u32 for /Encrypt slot \
                      reservation"
                         .to_string(),
                 )
+                // cov:ignore-end
             })?;
             let encrypt_metadata = source
                 .encrypt_dict
@@ -4306,9 +4308,11 @@ fn write_linearized_impl<R: Read + Seek>(
         .collect::<BTreeMap<_, _>>();
     if !objstm_layout.is_empty() {
         let first_xref_offset = final_first_page_xref_offset.ok_or_else(|| {
+            // cov:ignore-start: every ObjStm layout pass records its first-page xref offset
             crate::Error::Unsupported(
                 "linearization result: missing first-page xref offset".to_string(),
             )
+            // cov:ignore-end
         })?;
         written_xref.insert(
             ObjectRef::new(relocation.first_xref_slot, 0),
@@ -4433,6 +4437,31 @@ mod tests {
         Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse")
     }
 
+    fn open_encrypted_three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let bytes = std::fs::read(&path).expect("encrypted three-page fixture must exist");
+        Pdf::open(Cursor::new(bytes)).expect("encrypted three-page PDF should parse")
+    }
+
+    fn open_cleartext_metadata_encrypted_three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut input = Pdf::open(Cursor::new(
+            include_bytes!("../../../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+        ))
+        .expect("three-page fixture should parse");
+        let mut params =
+            crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec());
+        params.encrypt_metadata = false;
+        let options = WriterOptions {
+            encrypt: Some(params),
+            ..WriterOptions::default()
+        };
+        let mut encrypted = Vec::new();
+        crate::writer::emit_canonical_pdf(&mut input, &mut encrypted, &options)
+            .expect("cleartext-metadata encrypted donor should write");
+        Pdf::open(Cursor::new(encrypted)).expect("generated donor should parse")
+    }
+
     /// Minimal one-page PDF whose catalog contains a direct `/Outlines`
     /// dictionary. qpdf's optimization prefix makes it indirect before both
     /// planning and writing.
@@ -4494,6 +4523,90 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn canonical_linearized_copy_encryption_covers_objstm() {
+        let mut pdf = open_encrypted_three_page_pdf();
+        let source = pdf
+            .writer_copy_encryption_source()
+            .expect("authenticated donor snapshot")
+            .expect("encrypted fixture must provide copy parameters");
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            copy_encryption: Some(source),
+            ..WriterOptions::default()
+        };
+
+        let (mut document, _) = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect("canonical linearized copy-encryption write");
+        document.back_patch().expect("back-patch final document");
+
+        assert!(
+            document
+                .bytes
+                .windows(b"/Type /ObjStm".len())
+                .any(|window| { window == b"/Type /ObjStm" }),
+            "generated copy-encrypted linearization must contain an object stream"
+        );
+        assert!(
+            document
+                .bytes
+                .windows(b"/Encrypt".len())
+                .any(|window| window == b"/Encrypt"),
+            "copy-encrypted linearization must carry the trailer encryption reference"
+        );
+    }
+
+    #[test]
+    fn canonical_linearized_copy_encryption_covers_cleartext_metadata_branch() {
+        let mut pdf = open_cleartext_metadata_encrypted_three_page_pdf();
+        let source = pdf
+            .writer_copy_encryption_source()
+            .expect("authenticated donor snapshot")
+            .expect("encrypted fixture must provide copy parameters");
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            copy_encryption: Some(source),
+            ..WriterOptions::default()
+        };
+
+        let (mut document, _) = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect("canonical cleartext-metadata copy-encryption write");
+        document.back_patch().expect("back-patch final document");
+
+        assert!(
+            document
+                .bytes
+                .windows(b"/EncryptMetadata false".len())
+                .any(|window| window == b"/EncryptMetadata false"),
+            "copy-encrypted linearization must preserve /EncryptMetadata false"
+        );
+        assert!(
+            document
+                .bytes
+                .windows(b"/Type /ObjStm".len())
+                .any(|window| window == b"/Type /ObjStm"),
+            "cleartext-metadata copy-encrypted linearization must contain ObjStm"
+        );
+    }
+
+    #[test]
+    fn canonical_linearized_copy_encryption_propagates_shape_errors() {
+        let mut pdf = open_tiny_pdf();
+        let options = WriterOptions {
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriterOptions::default()
+        };
+
+        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect_err("invalid copy-encryption dictionary must fail");
+        assert!(matches!(error, crate::Error::Unsupported(_)));
     }
 
     fn write_linearized_with_pass1_file_mode(

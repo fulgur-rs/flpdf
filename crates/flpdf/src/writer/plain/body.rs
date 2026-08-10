@@ -351,6 +351,52 @@ mod tests {
             if message.contains("reference 2 0 R absent from renumber map")));
     }
 
+    #[test]
+    fn source_objstm_extends_must_be_present_in_the_renumber_map() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Preserve,
+            ..WriterOptions::default()
+        };
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let container_source = plan
+            .objects
+            .iter()
+            .find_map(|object| match object {
+                PlannedIndirectObject::ObjectStream {
+                    origin:
+                        crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source),
+                    ..
+                } => Some(*source),
+                PlannedIndirectObject::Source { .. }
+                | PlannedIndirectObject::ObjectStream {
+                    origin: crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic,
+                    ..
+                } => None,
+            })
+            .expect("preserve plan must retain a source-backed ObjStm");
+
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        dict.insert("N", Object::Integer(0));
+        dict.insert("First", Object::Integer(0));
+        dict.insert("Length", Object::Integer(0));
+        dict.insert("Extends", Object::Reference(ObjectRef::new(99_999, 0)));
+        pdf.set_object(
+            container_source,
+            Object::Stream(Stream {
+                dict,
+                data: Vec::new(),
+            }),
+        );
+
+        let error = emit_bodies(&mut pdf, &options, &plan).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message.contains("/Extends 99999 0 R is absent from renumber map")));
+    }
+
     fn assert_invalid_planned_member_is_rejected(invalid: Object, expected_kind: &str) {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
