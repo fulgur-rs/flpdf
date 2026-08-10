@@ -1,9 +1,6 @@
 //! Integration tests for [`flpdf::extract_page`] / [`flpdf::extract_pages`].
 
-use flpdf::{
-    extract_page, extract_pages, pages, write_pdf_with_options, Object, ObjectRef, Pdf,
-    WriteOptions,
-};
+use flpdf::{extract_page, extract_pages, pages, Object, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -521,9 +518,7 @@ fn extracted_doc_has_no_unrelated_objects() {
     // Sanity: the pruned document still writes and reopens to a single page,
     // with no orphan /Pages reappearing.
     let mut bytes = Vec::new();
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    write_pdf_with_options(&mut out, &mut bytes, &opts).unwrap();
+    write_default(&mut out, &mut bytes).unwrap();
     let mut rt = Pdf::open_mem_owned(bytes).unwrap();
     assert_eq!(pages::page_refs(&mut rt).unwrap().len(), 1);
     assert_eq!(
@@ -532,6 +527,10 @@ fn extracted_doc_has_no_unrelated_objects() {
         "no orphan /Pages after round-trip"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};
 
 #[test]
 fn extracted_contents_match_source_page() {

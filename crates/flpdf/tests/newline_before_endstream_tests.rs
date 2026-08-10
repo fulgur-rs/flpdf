@@ -24,8 +24,7 @@
 //! End-to-end / CLI matrix tests are the responsibility of flpdf-9hc.12.8.
 
 use flpdf::{
-    write_pdf_with_options, write_qdf, write_stream_to_buf, Dictionary, NewlineBeforeEndstream,
-    Object, Pdf, Stream, WriteOptions,
+    write_stream_to_buf, Dictionary, NewlineBeforeEndstream, Object, Pdf, QPDFWriter, Stream,
 };
 use std::io::Cursor;
 
@@ -325,13 +324,12 @@ fn run_round_trip_test(policy: NewlineBeforeEndstream) {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.compress_streams = flpdf::CompressStreams::No; // keep data unmodified
     options.newline_before_endstream = policy;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Re-open the rewritten PDF. Output is renumbered Catalog-first, so
     // navigate to the stream via the Catalog's /Metadata reference.
@@ -391,14 +389,13 @@ fn qdf_wraps_endstream_on_own_line_regardless_of_caller_policy() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.compress_streams = flpdf::CompressStreams::No;
     options.newline_before_endstream = NewlineBeforeEndstream::Never;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Line-anchored endstream: the payload is followed by `\nendstream`, NOT
     // adjacent to the payload. Under No-promotion for this non-EOL payload the
@@ -434,14 +431,13 @@ fn round_trip_qdf(raw: &[u8], policy: NewlineBeforeEndstream) -> Vec<u8> {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.compress_streams = flpdf::CompressStreams::No;
     options.newline_before_endstream = policy;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     resolve_metadata_stream(&mut reopened).data
@@ -479,8 +475,11 @@ fn write_qdf_wrapper_respects_no_promotion_via_public_api() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut output = Vec::new();
-    write_qdf(&mut pdf, &mut output).unwrap();
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_qdf_mode(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
 
     let framed = b"write_qdf wrapper payload\nendstream";
     assert!(
@@ -519,8 +518,7 @@ fn qdf_bare_cr_payload_gets_added_newline() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.compress_streams = flpdf::CompressStreams::No;
     // Never → No promotion inside QDF; this exercises the No branch that
@@ -528,7 +526,7 @@ fn qdf_bare_cr_payload_gets_added_newline() {
     options.newline_before_endstream = NewlineBeforeEndstream::Never;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let framed = b"payload with bare cr\r\nendstream";
     assert!(
@@ -548,14 +546,13 @@ fn qdf_honors_explicit_newline_before_endstream_yes() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.compress_streams = flpdf::CompressStreams::No;
     options.newline_before_endstream = NewlineBeforeEndstream::Yes;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let framed = b"already lf-ending payload\n\nendstream";
     assert!(
@@ -578,13 +575,12 @@ fn e2e_yes_mode_endstream_preceded_by_exactly_one_newline_and_length_correct() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.compress_streams = flpdf::CompressStreams::No;
     options.newline_before_endstream = NewlineBeforeEndstream::Yes;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Find all occurrences of `endstream` and check each one.
     let mut pos = 0;
@@ -696,13 +692,12 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.compress_streams = flpdf::CompressStreams::Yes;
     options.newline_before_endstream = NewlineBeforeEndstream::Yes;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Verify every `endstream` is preceded by `\n`.
     let mut pos = 0;
@@ -726,3 +721,7 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
         "ObjStm output must have at least 2 endstream keywords (ObjStm + xref); got {count}"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_with_settings, WriterTestSettings};

@@ -9,8 +9,8 @@
 //! are parsed directly), so they run on every build and cover the
 //! generate-multipage writer / plan / renumber / hint-reconciliation paths.
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{filters, Object, ObjectStreamMode, Pdf, WriteOptions};
+use flpdf::linearization::{LinearizationPlan, RenumberMap};
+use flpdf::{filters, Object, ObjectStreamMode, Pdf};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -23,19 +23,10 @@ fn linearize_generate(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-
-    let mut opts = WriteOptions::default();
+    let mut opts = WriterTestSettings::default();
     opts.object_streams = ObjectStreamMode::Generate;
     opts.deterministic_id = true;
-
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
 /// Parse the `/E` (end-of-first-page) value from the linearization parameter
@@ -850,24 +841,22 @@ fn ineligible_od_stream_routes_to_part4_open_document_plain() {
     )
     .unwrap();
     let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-    let mut opts = WriteOptions::default();
+    let mut opts = WriterTestSettings::default();
     opts.object_streams = ObjectStreamMode::Generate;
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
+    let bytes = write_linearized_with_settings(&mut pdf2, &opts).unwrap();
 
     // Verify the plain Form XObject stream appears before any ObjStm in the
     // output.  The Form XObject (ap_stream = obj 8 original) is written as a
     // plain (uncompressed) object; its stream dictionary contains /Subtype /Form.
     // ObjStm content is DEFLATE-compressed, so /Subtype /Form in raw bytes can
     // only be the plain form xobject.  We look for this marker rather than the
-    // "N 0 obj" header because write_linearized re-numbers objects internally
+    // "N 0 obj" header because the qpdf writer re-numbers objects internally
     // via place_objstm_members_per_half, and the resulting new number differs
     // from what RenumberMap::from_plan assigned.
     let _ = renumber
         .new_for_original(ap_stream)
         .expect("AP stream must have a new number");
     let plain_marker = b"/Subtype /Form";
-    let bytes = &doc.bytes;
     let plain_pos = bytes
         .windows(plain_marker.len())
         .position(|w| w == plain_marker.as_slice())
@@ -1154,21 +1143,16 @@ fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &s
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, mode).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-
-    let mut opts = WriteOptions::default();
+    let mut opts = WriterTestSettings::default();
     opts.object_streams = mode;
     opts.deterministic_id = true;
     opts.force_version = Some(force.to_string());
-
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_linearized_with_settings, WriterTestSettings};
 
 /// Linearize `fixture` with `--object-streams=generate` AND a forced version.
 fn linearize_generate_force_version(fixture: &str, force: &str) -> Vec<u8> {

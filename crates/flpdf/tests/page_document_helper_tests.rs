@@ -5,8 +5,7 @@
 //! `pages::page_refs` or touching raw [`Object`] values directly.
 
 use flpdf::{
-    write_pdf_with_options, Dictionary, Object, ObjectHandle, ObjectRef, PageDocumentHelper,
-    PageInput, Pdf, Stream, WriteOptions,
+    Dictionary, Object, ObjectHandle, ObjectRef, PageDocumentHelper, PageInput, Pdf, Stream,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -562,10 +561,11 @@ fn helper_flatten_annotations_uses_qpdf_flag_contract_and_removes_acroform() {
 
     if Command::new("qpdf").arg("--version").output().is_ok() {
         let mut input = Vec::new();
-        let mut options = WriteOptions::default();
-        options.full_rewrite = true;
-        options.static_id = true;
-        write_pdf_with_options(&mut pdf, &mut input, &options).unwrap();
+        let options = WriterTestSettings {
+            static_id: true,
+            ..WriterTestSettings::default()
+        };
+        write_with_settings(&mut pdf, &mut input, &options).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let input_path = dir.path().join("flags-input.pdf");
         let output_path = dir.path().join("flags-qpdf.pdf");
@@ -1994,10 +1994,11 @@ fn helper_resource_pruning_keeps_form_and_page_resources_for_unresolved_form_nam
 
     if Command::new("qpdf").arg("--version").output().is_ok() {
         let mut input = Vec::new();
-        let mut options = WriteOptions::default();
-        options.full_rewrite = true;
-        options.static_id = true;
-        write_pdf_with_options(&mut pdf, &mut input, &options).unwrap();
+        let options = WriterTestSettings {
+            static_id: true,
+            ..WriterTestSettings::default()
+        };
+        write_with_settings(&mut pdf, &mut input, &options).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let input_path = dir.path().join("unresolved-form.pdf");
         let output_path = dir.path().join("qpdf-output.pdf");
@@ -2050,6 +2051,10 @@ fn helper_resource_pruning_keeps_form_and_page_resources_for_unresolved_form_nam
     assert!(page_fonts.get("P1").is_some());
     assert!(page_fonts.get("P2").is_some());
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};
 
 #[test]
 fn helper_resource_pruning_handles_form_local_resource_variants() {

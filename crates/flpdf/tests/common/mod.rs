@@ -132,6 +132,20 @@ pub fn write_with_settings<R: Read + Seek + 'static, W: Write>(
     Ok(())
 }
 
+/// Emit one linearized PDF through the canonical qpdf writer for integration
+/// tests.
+pub fn write_linearized_with_settings<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    settings: &WriterTestSettings,
+) -> Result<Vec<u8>> {
+    let mut writer = QPDFWriter::new(pdf);
+    settings.apply(&mut writer)?;
+    writer.set_linearization(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    writer.get_buffer()
+}
+
 /// Emit one fresh PDF with qpdf writer defaults.
 pub fn write_default<R: Read + Seek + 'static, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<()> {
     write_with_settings(pdf, out, &WriterTestSettings::default())

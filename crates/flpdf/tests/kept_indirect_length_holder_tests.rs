@@ -18,11 +18,7 @@
 
 use std::io::Cursor;
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{
-    write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, StreamDataMode,
-    WriteOptions,
-};
+use flpdf::{NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, QPDFWriter, StreamDataMode};
 
 /// Build a PDF whose image XObject (obj 5) declares `/Filter /DCTDecode` (which
 /// flpdf cannot decode, so it is a passthrough) and carries an indirect
@@ -148,12 +144,11 @@ fn keep_holder_is_live_integer(out: &[u8]) -> bool {
 #[test]
 fn flat_rewrite_directizes_kept_holder_passthrough_length() {
     let mut pdf = Pdf::open(Cursor::new(build_kept_holder_pdf())).expect("open");
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.static_id = true;
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).expect("flat rewrite");
+    write_with_settings(&mut pdf, &mut out, &opts).expect("flat rewrite");
 
     assert_eq!(
         image_length(&out),
@@ -175,13 +170,12 @@ fn preserve_directizes_kept_holder_passthrough_length() {
     // reference. Guards the preserve arm of `reencode_stream_for_compress` under
     // the default Pure-Rust deflate (byte parity lives in the gated cmp suite).
     let mut pdf = Pdf::open(Cursor::new(build_kept_holder_pdf())).expect("open");
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.static_id = true;
     opts.stream_data = Some(StreamDataMode::Preserve);
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).expect("preserve rewrite");
+    write_with_settings(&mut pdf, &mut out, &opts).expect("preserve rewrite");
 
     assert_eq!(
         image_length(&out),
@@ -197,25 +191,26 @@ fn preserve_directizes_kept_holder_passthrough_length() {
 #[test]
 fn linearize_directizes_kept_holder_passthrough_length() {
     let src = build_kept_holder_pdf();
-    let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("open");
-    let plan = LinearizationPlan::from_pdf(&mut pdf, true).expect("plan");
-    let renumber = RenumberMap::from_plan(&plan);
-    let mut pdf2 = Pdf::open(Cursor::new(src)).expect("re-open for write");
-
-    let mut opts = WriteOptions::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).expect("linearize");
-    doc.back_patch().expect("back_patch");
+    let mut pdf = Pdf::open(Cursor::new(src)).expect("open");
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_deterministic_id(true);
+    writer.set_linearization(true);
+    writer.set_output_memory().expect("memory output");
+    writer.write().expect("linearize");
+    let output = writer.get_buffer().expect("linearized output");
 
     assert_eq!(
-        image_length(&doc.bytes),
+        image_length(&output),
         Object::Integer(IMAGE_DATA_LEN),
         "linearization must directize the DCTDecode stream's /Length to the raw byte count"
     );
     assert!(
-        keep_holder_is_live_integer(&doc.bytes),
+        keep_holder_is_live_integer(&output),
         "the length holder is referenced elsewhere, so it must survive directization"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_with_settings, WriterTestSettings};

@@ -12,8 +12,7 @@
 //!   array element: object-0 / missing-xref ref -> inline `null` (Layer A; qpdf
 //!   resurrects a null object for the missing-xref array case — flpdf-0gyq).
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{Object, Pdf, WriteOptions};
+use flpdf::{Object, ObjectStreamMode, Pdf};
 use std::io::{Cursor, Read, Seek};
 
 /// Build a classic xref-table PDF from `objs` (object number, body bytes).
@@ -99,15 +98,17 @@ fn two_page(catalog_extra: &str, page1_extra: &str) -> Vec<u8> {
 /// Linearize `src` via the public API (mirrors the CLI `--linearize` path).
 fn linearize(src: &[u8], use_generate: bool) -> flpdf::Result<Vec<u8>> {
     let mut pdf = Pdf::open(Cursor::new(src.to_vec()))?;
-    let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate)?;
-    let renumber = RenumberMap::from_plan(&plan);
-    let mut pdf2 = Pdf::open(Cursor::new(src.to_vec()))?;
-    let mut opts = WriteOptions::default();
+    let mut opts = WriterTestSettings::default();
     opts.deterministic_id = true;
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts)?;
-    doc.back_patch()?;
-    Ok(doc.bytes)
+    if use_generate {
+        opts.object_streams = ObjectStreamMode::Generate;
+    }
+    write_linearized_with_settings(&mut pdf, &opts)
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_linearized_with_settings, WriterTestSettings};
 
 /// Resolve the first page leaf (Catalog -> Pages -> Kids[0]) of a linearized doc.
 fn first_page<R: Read + Seek>(pdf: &mut Pdf<R>) -> Object {

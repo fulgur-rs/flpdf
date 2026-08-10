@@ -1,9 +1,6 @@
 //! Integration tests for [`flpdf::merge_documents`].
 
-use flpdf::{
-    merge_documents, pages, write_pdf, write_pdf_with_options, MergeInput, Object, ObjectRef, Pdf,
-    WriteOptions,
-};
+use flpdf::{merge_documents, pages, MergeInput, Object, ObjectRef, Pdf};
 use std::collections::BTreeMap;
 
 /// Build a PDF from `(number, body)` object definitions plus a `/Root` number.
@@ -194,15 +191,17 @@ fn merge_single_input_round_trips() {
     }];
     let mut doc = merge_documents(&mut inputs).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
     let mut out: Vec<u8> = Vec::new();
-    write_pdf_with_options(&mut doc, &mut out, &options).unwrap();
+    write_with_settings(&mut doc, &mut out, &WriterTestSettings::default()).unwrap();
 
     let mut reopened = Pdf::open_mem_owned(out).unwrap();
     let refs = pages::page_refs(&mut reopened).unwrap();
     assert_eq!(refs.len(), 2, "round-tripped doc must keep both pages");
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};
 
 // Empty input slice is rejected (merge requires at least one input).
 #[test]
@@ -241,7 +240,7 @@ fn merge_two_inputs_concatenates_in_order() {
     assert_eq!(leaf_base_font(&mut doc, 1), b"Courier".to_vec());
     // Round-trip valid.
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -540,7 +539,7 @@ fn merge_inter_page_dest_remapped_and_removed_nulled() {
 
     // The merged document round-trips.
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -631,7 +630,7 @@ fn merge_indirect_annots_nulls_removed_dest_and_ignores_pageless_dests() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -805,7 +804,7 @@ fn merge_nulls_removed_page_via_next_array_and_sd() {
 
     // The merged document round-trips.
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -874,7 +873,7 @@ fn merge_bead_p_removed_page_is_nulled() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -998,7 +997,7 @@ fn merge_tolerates_malformed_carrier_shapes() {
     assert_eq!(refs.len(), 3, "all selected pages survive the merge");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -1238,7 +1237,7 @@ fn merge_inherits_primary_outline_only() {
     assert!(!np1_null, "surviving named dest must not be nulled");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -1338,7 +1337,7 @@ fn merge_primary_outline_dest_to_removed_page_is_nulled() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -1504,7 +1503,7 @@ fn merge_inline_openaction_goto_sd_retained_with_removed_page_nulled() {
     assert_eq!(d_ref, refs[0], "/D remaps to copied page0");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok(), "merged doc round-trips");
 }
 
@@ -1560,7 +1559,7 @@ fn merge_inline_openaction_goto_sd_only_retains_null_page_boundary() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok(), "merged doc round-trips");
 }
 
@@ -1789,7 +1788,7 @@ fn merge_inherits_inline_doc_level_carriers() {
     assert!(oad_null, "inline /OpenAction GoTo to removed page nulled");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -1938,7 +1937,7 @@ fn merge_outline_nested_child_cyclic_and_malformed() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2022,7 +2021,7 @@ fn merge_inherits_inline_dests_root() {
     assert!(db_null, "removed named dest target must resolve to null");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2064,7 +2063,7 @@ fn merge_tolerates_empty_outline_root() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2479,7 +2478,7 @@ fn merge_inline_open_action_next_chain_remapped() {
     assert_eq!(next_ref, page1, "/OpenAction /Next /D[0] remaps to page1");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2564,7 +2563,7 @@ fn merge_inline_open_action_next_array_remapped() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2732,7 +2731,7 @@ fn merge_renames_colliding_form_fields() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2829,7 +2828,7 @@ fn merge_drops_orphan_field_of_unselected_page() {
     assert_eq!(acroform_field_names(&mut doc), vec![b"f1".to_vec()]);
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -2941,7 +2940,7 @@ fn merge_primary_acroform_seed_does_not_leak_into_secondary() {
 
     // The merged output round-trips.
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3131,7 +3130,7 @@ fn merge_appends_unnamed_secondary_field() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3373,7 +3372,7 @@ fn merge_trims_nonterminal_field_kids_to_selected_pages() {
     assert_eq!(refs.len(), 1, "only the selected page is in /Kids");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3405,7 +3404,7 @@ fn merge_prunes_nested_subfield_with_all_unselected_widgets() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3480,7 +3479,7 @@ fn merge_keeps_and_trims_nested_subfield_with_surviving_widget() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3554,7 +3553,7 @@ fn merge_drops_top_level_field_with_no_surviving_widget() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3703,7 +3702,7 @@ fn merge_trims_and_renames_secondary_nonterminal_field() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3753,7 +3752,7 @@ fn merge_empty_page_selection_for_an_input_contributes_no_pages() {
     assert_eq!(count_font_objects(&mut doc, b"Courier"), 0);
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3796,7 +3795,7 @@ fn merge_duplicate_page_selection_clones_dict_shares_children() {
     assert_eq!(count_font_objects(&mut doc, b"Helvetica"), 1);
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3844,7 +3843,7 @@ fn merge_empty_primary_starts_from_blank_base() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -3960,7 +3959,7 @@ fn merge_shared_goto_action_resolves_to_single_correct_page() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4030,7 +4029,7 @@ fn merge_inline_annot_removed_dest_nulled() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4109,7 +4108,7 @@ fn merge_dr_resource_named_p_survives() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4173,7 +4172,7 @@ fn merge_inline_open_action_js_operand_folded_and_remapped() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4249,7 +4248,7 @@ fn merge_keeps_pless_widget_in_selected_page_annots() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4342,7 +4341,7 @@ fn merge_inline_open_action_no_s_dest_dict_remapped_and_nulled() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc2, &mut out).unwrap();
+    write_default(&mut doc2, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4405,7 +4404,7 @@ fn merge_inline_non_goto_open_action_d_remapped_not_nulled() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4478,7 +4477,7 @@ fn merge_trims_field_via_p_fallback_when_widgets_absent_from_annots() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4591,7 +4590,7 @@ fn merge_inherits_inline_dests_kids_root() {
     assert!(db_null, "removed named dest target must resolve to null");
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4676,7 +4675,7 @@ fn merge_inline_open_action_indirect_next_array_remapped() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
@@ -4754,7 +4753,7 @@ fn merge_multihop_indirect_annots_nulls_removed_dest() {
     );
 
     let mut out = Vec::new();
-    write_pdf(&mut doc, &mut out).unwrap();
+    write_default(&mut doc, &mut out).unwrap();
     assert!(Pdf::open_mem_owned(out).is_ok());
 }
 
