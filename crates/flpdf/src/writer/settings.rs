@@ -64,7 +64,7 @@ impl Default for WriterSettings {
             object_stream_mode: ObjectStreamMode::Preserve,
             stream_data_mode: None,
             compress_streams: true,
-            decode_level: DecodeLevel::Generalized,
+            decode_level: DecodeLevel::None,
             recompress_flate: false,
             content_normalization: false,
             qdf_mode: false,

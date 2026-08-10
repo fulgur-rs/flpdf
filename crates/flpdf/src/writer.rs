@@ -4481,7 +4481,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
 /// toggle.
 /// See [`CompressStreams`] for the full policy statement.
 pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
-    apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::Generalized)
+    // This public helper predates QPDFWriter's decode-level setting. Preserve
+    // its contract of decoding every filter implemented by flpdf; only the
+    // private QPDFWriter bridge applies the configured qpdf decode-level gate.
+    apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All)
 }
 
 fn apply_stream_compress_policy_with_decode_level(

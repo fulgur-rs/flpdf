@@ -164,6 +164,8 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 
     pub fn set_compress_streams(&mut self, value: bool) {
+        // QPDFWriter::setCompressStreams changes only this flag. In
+        // particular, it must not raise the initial decode level from none.
         self.settings.compress_streams = value;
     }
 

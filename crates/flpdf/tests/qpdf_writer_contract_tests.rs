@@ -8,8 +8,8 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineResult};
 use flpdf::{
-    write_pdf, DecodeLevel, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, QPDFWriter,
-    StreamDataMode,
+    apply_stream_compress_policy, write_pdf, CompressStreams, DecodeLevel, Dictionary, Object,
+    ObjectRef, ObjectStreamMode, Pdf, QPDFWriter, Stream, StreamDataMode,
 };
 
 #[derive(Clone)]
@@ -699,6 +699,45 @@ fn qpdf_writer_none_level_still_recompresses_generalized_filter_when_compressing
         "compress=true must filter generalized streams even at decode level none"
     );
     Ok(())
+}
+
+#[test]
+fn qpdf_writer_set_compress_streams_false_preserves_generalized_flate_source() -> flpdf::Result<()>
+{
+    qpdf_11_9_0()?;
+    let source = synthetic_flate_contents_pdf(false);
+    let (source_filter, source_data) = runlength_contents_snapshot(source.clone());
+
+    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_compress_streams(false);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, data) = runlength_contents_snapshot(output);
+    assert_eq!(filter, source_filter);
+    assert_eq!(data, source_data);
+    Ok(())
+}
+
+#[test]
+fn public_compress_no_decodes_runlength_source() {
+    let mut dict = Dictionary::new();
+    dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
+    dict.insert("Length", Object::Integer(5));
+    let source = Stream::new(dict, vec![0x02, b'A', b'B', b'C', 0x80]);
+
+    let Object::Stream(output) = apply_stream_compress_policy(&source, CompressStreams::No) else {
+        panic!("stream compression policy must return a stream");
+    };
+
+    assert_eq!(output.dict.get("Filter"), None);
+    assert_eq!(output.dict.get("DecodeParms"), None);
+    assert_eq!(output.dict.get("Length"), Some(&Object::Integer(3)));
+    assert_eq!(output.data, b"ABC");
 }
 
 #[test]
