@@ -4159,7 +4159,7 @@ mod tests {
         )
         .expect_err("a truncated stream cannot satisfy strict xref-stream framing");
 
-        assert!(error.to_string().contains("stream data exceeds input"));
+        assert!(error.to_string().contains("expected endstream"));
         assert!(diagnostics
             .entries()
             .iter()
@@ -4176,9 +4176,7 @@ mod tests {
             XrefReadContextSpec::ActiveSection,
         )
         .expect_err("the no-sink read failure must retain its parse error");
-        assert!(no_sink_error
-            .to_string()
-            .contains("stream data exceeds input"));
+        assert!(no_sink_error.to_string().contains("expected endstream"));
     }
 
     #[test]
