@@ -625,7 +625,7 @@ fn append_body_object(
 
     let policy = effective_stream_policy(options);
     let (reencoded, source_filter_is_lone_flate) =
-        reencode_stream_for_compress(stream, options, true, recovered_stream_eol);
+        reencode_stream_for_compress(stream, options, true, recovered_stream_eol, false);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.

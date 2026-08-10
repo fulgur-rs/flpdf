@@ -248,6 +248,13 @@ pub struct WriteOptions {
     /// whole, matching QPDF_Stream's all-or-nothing filterability decision.
     pub decode_level: DecodeLevel,
 
+    /// Normalize decoded page-content streams using qpdf token rules.
+    ///
+    /// This applies only to indirect streams referenced by page `/Contents`;
+    /// other streams retain their decoded bytes unchanged. QPDFWriter enables
+    /// it implicitly for QDF output unless the caller explicitly disables it.
+    pub content_normalization: bool,
+
     /// Override the trailer `/ID`'s second element (the changing identifier)
     /// with qpdf's static-id constant — the first 32 hex digits of π. The
     /// first element (the permanent identifier) is preserved from the input
@@ -2992,9 +2999,9 @@ pub(crate) fn encrypt_stream_payload_with_iv(
 ///   preserve/decode/re-encode decision. The reader records it only while an
 ///   `endstream` scan remains authoritative.
 /// * `CompressStreams::Yes` on an already-lone-`/FlateDecode` source (and no
-///   `/F` external-data entry, no `--recompress-flate`) is **preserved verbatim**
-///   — qpdf does not decode + re-encode it — with `/Length` normalized to the raw
-///   data length.
+///   `/F` external-data entry, no `--recompress-flate`, and no content
+///   normalization) is **preserved verbatim** — qpdf does not decode +
+///   re-encode it — with `/Length` normalized to the raw data length.
 /// * any other `Yes`/`No` policy decodes and re-encodes via
 ///   [`apply_stream_compress_policy`].
 /// * preserve mode (`None`) passes the dict + raw bytes through unchanged.
@@ -3007,6 +3014,7 @@ pub(crate) fn reencode_stream_for_compress(
     options: &WriteOptions,
     qpdf_plain_empty_refilter: bool,
     recovered_stream_eol: Option<&[u8]>,
+    normalize_content: bool,
 ) -> (Object, bool) {
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
@@ -3026,6 +3034,7 @@ pub(crate) fn reencode_stream_for_compress(
         Some(CompressStreams::Yes)
             if source_filter_is_lone_flate
                 && !options.recompress_flate
+                && !normalize_content
                 && stream.dict.get("F").is_none() =>
         {
             let mut stream = stream;
@@ -3037,6 +3046,7 @@ pub(crate) fn reencode_stream_for_compress(
             &stream,
             compress_policy,
             options.decode_level,
+            normalize_content,
         ),
         // Preserve mode: keep the raw bytes verbatim (no decode/re-encode), but
         // still normalize /Length to a direct integer of the raw byte count.
@@ -3687,10 +3697,12 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     //                                   be a lone reference or an array of
     //                                   references, and every element shares the
     //                                   same page number.
-    // Maps are keyed on ORIGINAL ObjectRefs (matching how the emit loop compares
-    // via `old_ref`). These markers ride ahead of "%% Original object ID:" and
-    // are NOT suppressed by no_original_object_ids — qpdf keeps them even under
-    // `--no-original-object-ids`. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
+    // The contents map also selects exactly the indirect page-content streams
+    // eligible for qpdf content normalization. Maps are keyed on ORIGINAL
+    // ObjectRefs (matching how the emit loop compares via `old_ref`). Page
+    // markers are populated and emitted only in QDF mode. They ride ahead of
+    // "%% Original object ID:" and are NOT suppressed by
+    // no_original_object_ids. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
     //
     // Small local enum: describe the /Contents shape without cloning the
     // resolved Object graph (Stream bodies, direct dict/array subtrees).
@@ -3699,13 +3711,15 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         DirectRefArray(Vec<ObjectRef>),
     }
     let (page_seq, contents_seq): (HashMap<ObjectRef, u32>, HashMap<ObjectRef, u32>) =
-        if options.qdf {
+        if options.qdf || options.content_normalization {
             let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
             let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
             let page_refs = crate::pages::page_refs(pdf)?;
             for (idx, page_ref) in page_refs.iter().enumerate() {
                 let seq = (idx as u32).saturating_add(1);
-                page_seq.insert(*page_ref, seq);
+                if options.qdf {
+                    page_seq.insert(*page_ref, seq);
+                }
                 // Extract /Contents while cloning only the reference structure
                 // we actually need (a single ObjectRef, or a Vec of ObjectRefs).
                 // Never clone an Object::Stream body or non-Reference Array
@@ -3921,6 +3935,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 options,
                 qpdf_null_visibility,
                 pdf.recovered_stream_eol(*old_ref),
+                options.content_normalization && contents_seq.contains_key(old_ref),
             );
 
             // flpdf-9hc.4.9: encrypt the stream payload AFTER any filter
@@ -4490,15 +4505,21 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
     // This public helper predates QPDFWriter's decode-level setting. Preserve
     // its contract of decoding every filter implemented by flpdf; only the
     // private QPDFWriter bridge applies the configured qpdf decode-level gate.
-    apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All)
+    apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::All, false)
 }
 
 fn apply_stream_compress_policy_with_decode_level(
     stream: &crate::Stream,
     policy: CompressStreams,
     decode_level: DecodeLevel,
+    normalize_content: bool,
 ) -> Object {
-    if !filter_chain_is_decodable(stream.dict.get("Filter"), policy, decode_level) {
+    if !filter_chain_is_decodable(
+        stream.dict.get("Filter"),
+        policy,
+        decode_level,
+        normalize_content,
+    ) {
         let mut dict = stream.dict.clone();
         dict.insert(
             "Length",
@@ -4534,6 +4555,11 @@ fn apply_stream_compress_policy_with_decode_level(
             );
             return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
         }
+    };
+    let decoded = if normalize_content {
+        crate::normalize_content_stream(&decoded).into_bytes()
+    } else {
+        decoded
     };
 
     // Build a new dict: strip all filter-related keys, update /Length.
@@ -4586,14 +4612,15 @@ fn apply_stream_compress_policy_with_decode_level(
 /// filter it cannot filter, makes the complete chain non-filterable.
 ///
 /// `QPDF_Stream.cc:504-512,537-542` makes one important distinction: a
-/// compress request supplies `qpdf_ef_compress`, so generalized filters are
-/// filterable even at decode level `none`; an uncompress request at `none`
-/// preserves them. Specialized filters remain gated by the selected level in
-/// either policy.
+/// compress or content-normalization request supplies an encode flag, so
+/// generalized filters are filterable even at decode level `none`; a plain
+/// uncompress request at `none` preserves them. Specialized filters remain
+/// gated by the selected level in every policy.
 fn filter_chain_is_decodable(
     filter: Option<&Object>,
     policy: CompressStreams,
     decode_level: DecodeLevel,
+    normalize_content: bool,
 ) -> bool {
     let Some(filter) = filter else {
         return true;
@@ -4619,7 +4646,9 @@ fn filter_chain_is_decodable(
         };
         match name {
             b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode" | b"ASCIIHexDecode" => {
-                !matches!(decode_level, DecodeLevel::None) || policy == CompressStreams::Yes
+                !matches!(decode_level, DecodeLevel::None)
+                    || policy == CompressStreams::Yes
+                    || normalize_content
             }
             b"RunLengthDecode" => {
                 matches!(decode_level, DecodeLevel::Specialized | DecodeLevel::All)

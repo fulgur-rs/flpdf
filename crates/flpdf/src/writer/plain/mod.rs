@@ -49,6 +49,7 @@ pub(crate) fn eligible(
         && !options.qdf
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
+        && !options.content_normalization
         && !pdf_is_encrypted
 }
 

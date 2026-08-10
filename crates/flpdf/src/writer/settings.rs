@@ -41,6 +41,7 @@ pub(crate) struct WriterSettings {
     pub(crate) decode_level_set: bool,
     pub(crate) recompress_flate: bool,
     pub(crate) content_normalization: bool,
+    pub(crate) content_normalization_set: bool,
     pub(crate) qdf_mode: bool,
     pub(crate) preserve_unreferenced_objects: bool,
     pub(crate) newline_before_endstream: bool,
@@ -71,6 +72,7 @@ impl Default for WriterSettings {
             decode_level_set: false,
             recompress_flate: false,
             content_normalization: false,
+            content_normalization_set: false,
             qdf_mode: false,
             preserve_unreferenced_objects: false,
             newline_before_endstream: false,
@@ -98,8 +100,11 @@ impl WriterSettings {
     pub(crate) fn to_write_options(&self) -> WriteOptions {
         // QPDFWriter applies QDF defaults during write setup, after all public
         // setters have run. Only values that were never explicitly set are
-        // replaced: QDF disables compression and raises the decode level to
-        // generalized (QPDFWriter.cc:2078-2087).
+        // replaced: QDF enables content normalization, disables compression,
+        // and raises the decode level to generalized
+        // (QPDFWriter.cc:2078-2087).
+        let content_normalization =
+            self.content_normalization || (self.qdf_mode && !self.content_normalization_set);
         let compress_streams = if self.qdf_mode && !self.compress_streams_set {
             false
         } else {
@@ -128,6 +133,7 @@ impl WriterSettings {
             // policy cannot override the qpdf setter ordering.
             stream_data: self.stream_data_mode,
             recompress_flate: self.recompress_flate,
+            content_normalization,
             qdf: self.qdf_mode,
             qdf_stream_policy_precomputed: true,
             newline_before_endstream: if self.newline_before_endstream {

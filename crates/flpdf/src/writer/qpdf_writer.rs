@@ -183,6 +183,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     pub fn set_content_normalization(&mut self, value: bool) {
         self.settings.content_normalization = value;
+        self.settings.content_normalization_set = true;
     }
 
     pub fn set_qdf_mode(&mut self, value: bool) {
@@ -331,9 +332,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     /// Reject qpdf settings that the temporary emitter bridge cannot honor.
     pub fn validate_supported_settings(&self) -> Result<()> {
-        let unsupported = if self.settings.content_normalization {
-            Some("content normalization")
-        } else if !self.settings.extra_header_text.is_empty() {
+        let unsupported = if !self.settings.extra_header_text.is_empty() {
             Some("extra header text")
         } else if self.settings.linearization
             || self.settings.linearization_pass1_filename.is_some()

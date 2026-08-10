@@ -149,11 +149,15 @@ fn synthetic_runlength_contents_pdf() -> Vec<u8> {
 /// mutates the resolved stream after open so the reader can establish the
 /// object graph before the writer exercises malformed `/DecodeParms` handling.
 fn synthetic_flate_contents_pdf(filter_as_array: bool) -> Vec<u8> {
+    synthetic_flate_contents_pdf_with_payload(filter_as_array, b"ABC")
+}
+
+fn synthetic_flate_contents_pdf_with_payload(filter_as_array: bool, payload: &[u8]) -> Vec<u8> {
     // Use a stored zlib block so recompression with the writer's default
     // compression has an observable raw-byte effect.
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
     encoder
-        .write_all(b"ABC")
+        .write_all(payload)
         .expect("zlib encoder accepts fixture data");
     let compressed = encoder.finish().expect("zlib encoder finishes");
 
@@ -760,7 +764,9 @@ fn qpdf_writer_set_compress_streams_false_preserves_generalized_flate_source() -
 #[test]
 fn qpdf_writer_qdf_defaults_decode_generalized_streams_without_compression() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
-    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
     let mut writer = QPDFWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
@@ -771,16 +777,73 @@ fn qpdf_writer_qdf_defaults_decode_generalized_streams_without_compression() -> 
 
     let (filter, data) = runlength_contents_snapshot(output);
     assert_eq!(filter, None);
-    assert_eq!(data, b"ABC");
+    assert_eq!(data, b"A\nB");
     Ok(())
 }
 
 #[test]
-fn qpdf_writer_qdf_preserves_explicit_none_decode_level() -> flpdf::Result<()> {
+fn qpdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
-    let source = synthetic_flate_contents_pdf(false);
-    let (source_filter, source_data) = runlength_contents_snapshot(source.clone());
-    let mut pdf = Pdf::open(Cursor::new(source))?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
+
+    let metadata_ref = ObjectRef::new(5, 0);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
+    encoder.write_all(b"M\rN")?;
+    let metadata_data = encoder.finish()?;
+    let mut metadata_dict = Dictionary::new();
+    metadata_dict.insert("Type", Object::Name(b"Metadata".to_vec()));
+    metadata_dict.insert("Subtype", Object::Name(b"XML".to_vec()));
+    metadata_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    metadata_dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(metadata_data.len()).expect("small fixture")),
+    );
+    pdf.set_object(
+        metadata_ref,
+        Object::Stream(Stream::new(metadata_dict, metadata_data)),
+    );
+    let root_ref = pdf.root_ref().expect("catalog reference");
+    let mut catalog = pdf.resolve(root_ref)?.clone();
+    catalog
+        .as_dict_mut()
+        .expect("catalog dictionary")
+        .insert("Metadata", Object::Reference(metadata_ref));
+    pdf.set_object(root_ref, catalog);
+
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (_, contents) = runlength_contents_snapshot(output.clone());
+    assert_eq!(contents, b"A\nB");
+
+    let mut rewritten = Pdf::open(Cursor::new(output))?;
+    let root_ref = rewritten.root_ref().expect("catalog reference");
+    let metadata_ref = rewritten
+        .resolve(root_ref)?
+        .as_dict()
+        .expect("catalog dictionary")
+        .get_ref("Metadata")
+        .expect("metadata reference");
+    let metadata = rewritten.resolve(metadata_ref)?.clone();
+    let metadata = metadata.as_stream().expect("metadata stream");
+    let decoded = flpdf::filters::decode_stream_data(&metadata.dict, &metadata.data)?;
+    assert_eq!(decoded, b"M\rN");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_normalization_filters_at_explicit_none_decode_level() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
     let mut writer = QPDFWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
@@ -791,8 +854,49 @@ fn qpdf_writer_qdf_preserves_explicit_none_decode_level() -> flpdf::Result<()> {
     assert_qpdf_check(&output)?;
 
     let (filter, data) = runlength_contents_snapshot(output);
-    assert_eq!(filter, source_filter);
-    assert_eq!(data, source_data);
+    assert_eq!(filter, None);
+    assert_eq!(data, b"A\nB");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_explicit_false_suppresses_content_normalization() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_content_normalization(false);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, data) = runlength_contents_snapshot(output);
+    assert_eq!(filter, None);
+    assert_eq!(data, b"A\rB");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_explicit_content_normalization_applies_without_qdf() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_content_normalization(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, decoded) = decoded_runlength_snapshot(output)?;
+    assert_eq!(filter, Some(Object::Name(b"FlateDecode".to_vec())));
+    assert_eq!(decoded, b"A\nB");
     Ok(())
 }
 

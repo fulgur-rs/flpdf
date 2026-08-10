@@ -52,6 +52,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                             options,
                             true,
                             pdf.recovered_stream_eol(*source),
+                            false,
                         );
                         write_reencoded_object(
                             &mut bytes,
