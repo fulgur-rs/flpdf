@@ -1,3 +1,5 @@
+//! qpdf correspondence: QPDFWriter.cc writer-setting state and conversion to emission options.
+//!
 //! Private qpdf-shaped settings used by [`super::PdfWriter`].
 
 use std::path::PathBuf;

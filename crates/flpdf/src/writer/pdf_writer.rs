@@ -1,3 +1,5 @@
+//! qpdf correspondence: QPDFWriter.cc writer lifecycle, output configuration, and qpdf-shaped setting validation.
+//!
 //! The public qpdf-shaped PDF writer lifecycle.
 
 use std::collections::BTreeMap;
