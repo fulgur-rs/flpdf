@@ -649,7 +649,8 @@ mod tests {
             object_key_alg: ObjectKeyAlg::Aes,
         };
 
-        let context = build_copy_encryption_context(&source, &WriteOptions::default(), 10).unwrap();
+        let context =
+            build_copy_encryption_context(&source, &WriteOptions::default(), 10, None).unwrap();
 
         assert_eq!((context.encryption_v, context.encryption_r), (4, 4));
     }

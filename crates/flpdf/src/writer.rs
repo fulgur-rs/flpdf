@@ -2567,6 +2567,7 @@ pub(crate) fn build_copy_encryption_context(
     src: &crate::encrypt_setup::CopyEncryptionSource,
     options: &WriteOptions,
     existing_max: u32,
+    metadata_ref: Option<ObjectRef>,
 ) -> Result<EncryptionContext> {
     if src.file_key.len() != 16 {
         return Err(crate::Error::Unsupported(format!(
@@ -2581,6 +2582,8 @@ pub(crate) fn build_copy_encryption_context(
         )
     })?;
 
+    let encrypt_metadata = copy_encryption_encrypts_metadata(src);
+
     Ok(EncryptionContext {
         encrypt_dict: src.encrypt_dict.clone(),
         file_key: src.file_key.clone(),
@@ -2592,12 +2595,19 @@ pub(crate) fn build_copy_encryption_context(
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
-        // --copy-encryption-from re-encrypts every stream with the donor's
-        // scheme; cleartext-metadata exemption for the copy path is out of
-        // scope here (flpdf-9hc.4.9.6 covers the --encrypt path).
-        encrypt_metadata: true,
-        metadata_ref: None,
+        encrypt_metadata,
+        metadata_ref: if encrypt_metadata { None } else { metadata_ref },
     })
+}
+
+/// Return the donor's metadata-encryption policy using qpdf's default. qpdf
+/// only changes its default when `/EncryptMetadata` is present and boolean;
+/// an absent or otherwise unusable entry means metadata remains encrypted.
+fn copy_encryption_encrypts_metadata(src: &crate::encrypt_setup::CopyEncryptionSource) -> bool {
+    src.encrypt_dict
+        .get("EncryptMetadata")
+        .and_then(Object::as_bool)
+        .unwrap_or(true)
 }
 
 /// Append the lowercase-hex encoding of `bytes` to `out` via a table lookup,
@@ -3025,26 +3035,25 @@ pub(crate) fn reencode_stream_for_compress(
     }
     // qpdf's QPDFWriter always writes cleartext `/Type /Metadata` streams
     // through the uncompress path (QPDFWriter.cc:1251-1281), even when the
-    // global writer requested compression or stream-data preservation. Limit
-    // this override to the QPDFWriter/legacy-QDF bridge; the plain and
-    // linearization callers retain their established metadata refiltering
-    // path. Metadata is not page content, so it must never receive
-    // content-token normalization. The encryption layer applies any
-    // requested payload encryption after this decision; the cleartext metadata
-    // exemption is handled there.
+    // global writer requested compression or stream-data preservation. Copy
+    // encryption is a full-rewrite-only QPDFWriter route, so it needs the same
+    // override even when it did not come through the setter-aware bridge.
+    // Metadata is not page content, so it must never receive content-token
+    // normalization. The encryption layer applies any requested payload
+    // encryption after this decision; the cleartext metadata exemption is
+    // handled there.
     let metadata_is_cleartext = options
         .encrypt
         .as_ref()
         .is_none_or(|params| !params.encrypt_metadata)
-        && options.copy_encryption.as_ref().is_none_or(|source| {
-            source
-                .encrypt_dict
-                .get("EncryptMetadata")
-                .and_then(Object::as_bool)
-                .is_none_or(|encrypt_metadata| !encrypt_metadata)
-        });
+        && options
+            .copy_encryption
+            .as_ref()
+            .is_none_or(|source| !copy_encryption_encrypts_metadata(source));
     let is_metadata_stream = metadata_is_cleartext
-        && (options.qdf || options.qdf_stream_policy_precomputed)
+        && (options.qdf
+            || options.qdf_stream_policy_precomputed
+            || options.copy_encryption.is_some())
         && matches!(
             stream.dict.get("Type"),
             Some(Object::Name(name)) if name.as_slice() == b"Metadata"
@@ -3585,6 +3594,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         .encrypt
         .as_ref()
         .is_some_and(|p| !p.encrypt_metadata)
+        || options
+            .copy_encryption
+            .as_ref()
+            .is_some_and(|source| !copy_encryption_encrypts_metadata(source))
     {
         resolve_metadata_stream_ref(pdf)
     } else {
@@ -3722,6 +3735,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             src,
             options,
             base_for_encrypt,
+            metadata_ref,
         )?)
     } else {
         None
@@ -3967,14 +3981,18 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 if emit_ref != ctx.encrypt_ref {
                     if let Object::Stream(ref mut s) = reencoded {
                         if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*old_ref) {
-                            // --cleartext-metadata: leave the /Metadata XMP
-                            // stream in the clear and prepend /Crypt /Identity so
-                            // readers know not to decrypt it (flpdf-9hc.4.9.6).
+                            // Explicit --cleartext-metadata uses qpdf's
+                            // `/Crypt /Identity` marker. A copied donor with
+                            // `/EncryptMetadata false` already carries the
+                            // donor's cleartext policy and qpdf does not add
+                            // that marker on the rewritten stream.
+                            if options.copy_encryption.is_none() {
+                                crate::security::standard::prepend_crypt_filter_to_stream_dict(
+                                    &mut s.dict,
+                                    b"Identity",
+                                );
+                            }
                             // /Length stays as the un-encrypted byte count.
-                            crate::security::standard::prepend_crypt_filter_to_stream_dict(
-                                &mut s.dict,
-                                b"Identity",
-                            );
                         } else {
                             encrypt_stream_payload_for_writer(emit_ref, s, ctx)?;
                         }
