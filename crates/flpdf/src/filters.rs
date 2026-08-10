@@ -23,6 +23,44 @@ use crate::{Dictionary, Error, Object, Result};
 /// The encode path (writer output, not untrusted) is not capped.
 const MAX_FILTER_CHAIN_LEN: usize = 16;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamFilterCapabilities {
+    pub(crate) specialized_compression: bool,
+    pub(crate) lossy_compression: bool,
+}
+
+/// Return qpdf-compatible filterability and compression classification for a
+/// registered flpdf stream-filter chain.
+///
+/// QPDF_Stream::filterable (libqpdf/QPDF_Stream.cc:386-482) validates the
+/// filter chain and its /DecodeParms, then reports specialized and lossy
+/// compression to pipeStreamData (libqpdf/QPDF_Stream.cc:504-512). The JSON
+/// writer needs that classification before deciding whether a successful
+/// decode may remove /Filter and /DecodeParms.
+///
+/// None means the stream is not filterable through flpdf's registered
+/// filters. The caller preserves the raw payload, matching qpdf for an
+/// unsupported filter and for compression outside the requested decode level.
+pub(crate) fn stream_filter_capabilities(dict: &Dictionary) -> Option<StreamFilterCapabilities> {
+    let specs = decode_filter_specs_from_object(
+        dict.get("Filter"),
+        dict.get("DecodeParms"),
+        Some(MAX_FILTER_CHAIN_LEN),
+    )
+    .ok()?;
+
+    let mut capabilities = StreamFilterCapabilities::default();
+    for spec in specs {
+        let mut filter = stream_filter_for(spec.normalized_name())?;
+        if !filter.set_decode_params(&spec.decode_params) {
+            return None;
+        }
+        capabilities.specialized_compression |= filter.is_specialized_compression();
+        capabilities.lossy_compression |= filter.is_lossy_compression();
+    }
+    Some(capabilities)
+}
+
 pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
     validate_filter_chain_count(filters.len(), Some(MAX_FILTER_CHAIN_LEN))
 }
