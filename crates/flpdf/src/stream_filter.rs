@@ -2271,7 +2271,9 @@ pub(crate) mod tests {
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
     use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
     use std::cell::{Cell, RefCell};
-    use std::io::Cursor;
+    use std::fs;
+    use std::io::{Cursor, ErrorKind};
+    use std::process::Command;
     use std::rc::Rc;
 
     fn test_jpeg() -> Vec<u8> {
@@ -2285,6 +2287,87 @@ pub(crate) mod tests {
             libjpeg_turbo_rs::Subsampling::S444,
         )
         .expect("test JPEG must encode")
+    }
+
+    fn dct_qpdf_fixture(jpeg: &[u8]) -> tempfile::TempDir {
+        let mut pdf = b"%PDF-1.3\n%\xff\xff\xff\xff\n".to_vec();
+        let mut object_offsets = Vec::new();
+        let mut append_object = |object_number: u32, body: &[u8]| {
+            object_offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            if !body.ends_with(b"\n") {
+                pdf.push(b'\n');
+            }
+            pdf.extend_from_slice(b"endobj\n");
+        };
+
+        append_object(1, b"<< /Type /Catalog /Pages 2 0 R >>\n");
+        append_object(2, b"<< /Type /Pages /Kids [] /Count 0 >>\n");
+        let mut image = format!(
+            "<< /Type /XObject /Subtype /Image /Filter /DCTDecode /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        image.extend_from_slice(jpeg);
+        image.extend_from_slice(b"\nendstream\n");
+        append_object(3, &image);
+
+        assert_eq!(object_offsets.len(), 3);
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in &object_offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
+        let startxref_value_start = pdf.len();
+        pdf.extend_from_slice(xref_offset.to_string().as_bytes());
+        let startxref_value_end = pdf.len();
+        pdf.extend_from_slice(b"\n%%EOF\n");
+
+        assert!(pdf
+            .windows(b"/Root 1 0 R".len())
+            .any(|window| window == b"/Root 1 0 R"));
+        assert!(pdf[xref_offset..].starts_with(b"xref\n0 4\n"));
+        for (index, offset) in object_offsets.iter().enumerate() {
+            let header = format!("{} 0 obj\n", index + 1);
+            assert!(pdf[*offset..].starts_with(header.as_bytes()));
+        }
+        let recorded_startxref =
+            std::str::from_utf8(&pdf[startxref_value_start..startxref_value_end])
+                .expect("startxref must be ASCII")
+                .parse::<usize>()
+                .expect("startxref must be a decimal offset");
+        assert_eq!(recorded_startxref, xref_offset);
+
+        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+        fs::write(directory.path().join("dct-image.pdf"), pdf)
+            .expect("write deterministic DCT qpdf fixture");
+        directory
+    }
+
+    fn canonical_dct_bytes(jpeg: &[u8]) -> Vec<u8> {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(jpeg).expect("canonical DCT write must succeed");
+            stage.finish().expect("canonical DCT finish must succeed");
+        }
+
+        sink.writes.into_iter().flatten().collect()
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
@@ -4653,6 +4736,62 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(sink.finishes, 1);
+    }
+
+    /// qpdf 11.9.0 consumes `/DCTDecode` at `decode-level=all`:
+    /// `SF_DCTDecode` (`SF_DCTDecode.hh:8-40`) constructs `Pl_DCT`, whose
+    /// `decompress` path (`Pl_DCT.cc:298-326`) writes libjpeg scanline bytes to
+    /// the next pipeline. The real-PDF probe below pins that source/behavior
+    /// boundary against the canonical Rust stage.
+    #[test]
+    fn dct_qpdf_filtered_stream_data_matches_decode_pipeline_exactly() {
+        let jpeg = test_jpeg();
+        let directory = dct_qpdf_fixture(&jpeg);
+        let fixture = directory.path().join("dct-image.pdf");
+        let output = match Command::new("qpdf")
+            .arg("--show-object=3")
+            .arg("--filtered-stream-data")
+            .arg(&fixture)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                eprintln!("qpdf not available; skipping DCT differential");
+                return;
+            }
+            Err(error) => panic!("failed to invoke qpdf DCT differential: {error}"),
+        };
+        let canonical = canonical_dct_bytes(&jpeg);
+        let qpdf_stdout_hex = hex_bytes(&output.stdout);
+        let qpdf_stderr_hex = hex_bytes(&output.stderr);
+        let canonical_hex = hex_bytes(&canonical);
+
+        assert!(
+            output.status.success(),
+            "qpdf DCT differential failed: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+            output.status,
+            output.stdout.len(),
+            qpdf_stdout_hex,
+            output.stderr.len(),
+            qpdf_stderr_hex,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "qpdf DCT differential wrote stderr: length={} hex={} text={:?}",
+            output.stderr.len(),
+            qpdf_stderr_hex,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            output.stdout,
+            canonical,
+            "qpdf DCT differential mismatch\nqpdf stdout length={} hex={}\ncanonical DctSink length={} hex={}",
+            output.stdout.len(),
+            qpdf_stdout_hex,
+            canonical.len(),
+            canonical_hex,
+        );
     }
 
     #[test]
