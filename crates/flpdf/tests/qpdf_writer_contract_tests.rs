@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::process::Command;
 use std::rc::Rc;
 
+use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineResult};
@@ -1232,10 +1233,43 @@ fn writer_result_reports_generated_object_stream_members_and_xref_object() -> fl
         .expect("pages must be emitted");
     let xref = writer.get_written_xref_table()?;
     for member in [catalog, pages] {
-        assert!(matches!(
-            xref.get(&member),
-            Some(XrefEntry::Compressed { stream, .. }) if *stream != 0
-        ));
+        let Some(XrefEntry::Compressed { stream, index }) = xref.get(&member) else {
+            panic!("{member:?} must have a type-2 xref entry");
+        };
+        let Some(XrefEntry::Uncompressed { offset }) = xref.get(&ObjectRef::new(*stream, 0)) else {
+            panic!("type-2 container {stream} must have a type-1 xref entry");
+        };
+        let container = &output[*offset as usize..];
+        let stream_start = container
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .expect("ObjStm must have a stream payload")
+            + b"stream\n".len();
+        let stream_end = container
+            .windows(b"\nendstream".len())
+            .position(|window| window == b"\nendstream")
+            .expect("ObjStm stream must terminate");
+        let first = container[..stream_start]
+            .windows(b"/First ".len())
+            .position(|window| window == b"/First ")
+            .and_then(|start| {
+                std::str::from_utf8(&container[start + b"/First ".len()..stream_start])
+                    .ok()?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .expect("ObjStm dictionary must declare /First");
+        let mut decoded = Vec::new();
+        ZlibDecoder::new(&container[stream_start..stream_end]).read_to_end(&mut decoded)?;
+        let header = std::str::from_utf8(&decoded[..first]).expect("ObjStm header is ASCII");
+        let object_numbers: Vec<u32> = header
+            .split_whitespace()
+            .step_by(2)
+            .map(|number| number.parse().expect("ObjStm header object number"))
+            .collect();
+        assert_eq!(object_numbers[*index as usize], member.number);
     }
     let xref_object = xref.iter().find_map(|(object_ref, entry)| match entry {
         XrefEntry::Uncompressed { offset }
@@ -1250,6 +1284,42 @@ fn writer_result_reports_generated_object_stream_members_and_xref_object() -> fl
     assert!(
         xref_object.is_some(),
         "result must include synthetic xref object"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn writer_result_reports_qdf_length_holders() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_qdf_mode(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    let mapped: std::collections::BTreeSet<_> = (1..=4)
+        .filter_map(|number| {
+            writer
+                .get_renumbered_obj_gen(ObjectRef::new(number, 0))
+                .transpose()
+        })
+        .collect::<flpdf::Result<_>>()?;
+    let xref = writer.get_written_xref_table()?;
+    let has_length_holder = xref.iter().any(|(object_ref, entry)| {
+        !mapped.contains(object_ref)
+            && matches!(entry, XrefEntry::Uncompressed { offset }
+                if output[*offset as usize..].starts_with(
+                    format!("{} 0 obj\n", object_ref.number).as_bytes(),
+                )
+                && output[*offset as usize..]
+                    .splitn(3, |byte| *byte == b'\n')
+                    .nth(1)
+                    .is_some_and(|body| body.iter().all(u8::is_ascii_digit)))
+    });
+    assert!(
+        has_length_holder,
+        "QDF result must include a /Length holder"
     );
 
     Ok(())

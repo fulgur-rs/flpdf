@@ -236,7 +236,7 @@ fn append_classic_xref_and_trailer(
         if let Some(&(generation, offset)) = layout.uncompressed.get(&number) {
             bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
         } else {
-            bytes.extend_from_slice(b"0000000000 00000 f \n");
+            bytes.extend_from_slice(b"0000000000 65535 f \n");
         }
     }
 
@@ -284,7 +284,7 @@ fn written_xref_table(
                 );
             }
             None => {
-                result.insert(ObjectRef::new(number, 0), XrefEntry::Free { next: 0 });
+                result.insert(ObjectRef::new(number, 65535), XrefEntry::Free { next: 0 });
             }
         }
     }
@@ -364,6 +364,31 @@ mod tests {
               trailer << /Root 1 0 R /Size 2 >>\n\
               startxref\n4\n%%EOF\n"
         );
+    }
+
+    #[test]
+    fn classic_xref_free_gap_uses_generation_65535_in_bytes_and_result() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        layout.uncompressed.insert(3, (0, 2));
+
+        let result = append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table))
+            .expect("classic xref emission succeeds");
+
+        assert_eq!(
+            bytes
+                .windows(b"0000000000 65535 f \n".len())
+                .filter(|window| *window == b"0000000000 65535 f \n")
+                .count(),
+            2,
+            "the object-0 row and the free gap must both carry generation 65535"
+        );
+        assert_eq!(
+            result.get(&ObjectRef::new(2, 65535)),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+        assert!(!result.contains_key(&ObjectRef::new(2, 0)));
     }
 
     #[test]
