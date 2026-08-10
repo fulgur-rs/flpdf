@@ -1,0 +1,22 @@
+[package]
+name = "flpdf-libjpeg-compat"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Explicit system-libjpeg compatibility wrapper for flpdf's qpdf DCT pipeline."
+
+[features]
+default = []
+system-libjpeg = []
+
+[build-dependencies]
+cc.workspace = true
+
+[[test]]
+name = "api"
+path = "tests/api.rs"
+required-features = ["system-libjpeg"]

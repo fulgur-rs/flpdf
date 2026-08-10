@@ -79,8 +79,8 @@
 //!   dictionary. The `outlines` section uses qpdf JSON v2's key layout.
 
 // Mechanically enforce threat-model guarantee (a): no undefined behaviour.
-// The explicit system-libjpeg compatibility backend confines its FFI unsafe
-// code to one private module with a local allow.
+// The explicit system-libjpeg compatibility backend lives in the optional
+// flpdf-libjpeg-compat crate; this crate keeps unsafe code denied.
 #![deny(unsafe_code)]
 
 pub mod acroform_document_helper;

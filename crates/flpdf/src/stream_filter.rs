@@ -2897,6 +2897,7 @@ pub(crate) mod tests {
         finish_attempts: usize,
         fail_write: bool,
         fail_finish: bool,
+        panic_write: bool,
     }
 
     impl Pipeline for DctSink {
@@ -2906,6 +2907,9 @@ pub(crate) mod tests {
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
             self.write_attempts += 1;
+            if self.panic_write {
+                panic!("dct test downstream panic");
+            }
             if self.fail_write {
                 Err(PipelineError::runtime("dct test write failure"))
             } else {
@@ -5407,7 +5411,10 @@ pub(crate) mod tests {
             #[cfg(not(feature = "qpdf-libjpeg-compat"))]
             assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
             #[cfg(feature = "qpdf-libjpeg-compat")]
-            assert_eq!(error.to_string(), "DCT decode: Premature end of input file");
+            assert_eq!(
+                error.to_string(),
+                "DCT decode: invalid jpeg data reading from buffer"
+            );
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
@@ -5441,7 +5448,10 @@ pub(crate) mod tests {
         // already-decoded scanlines.
         assert!(!sink.writes.is_empty());
         assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.to_string(), "DCT decode: Premature end of input file");
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: invalid jpeg data reading from buffer"
+        );
         assert_eq!(sink.finishes, 0);
     }
 
@@ -5467,6 +5477,36 @@ pub(crate) mod tests {
 
         assert_eq!(error.to_string(), "dct test write failure");
         assert!(sink.writes.is_empty());
+        assert_eq!(sink.write_attempts, 1);
+        assert_eq!(sink.finishes, 0);
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn dct_compat_contains_downstream_panic_at_callback_boundary() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink {
+            panic_write: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(&jpeg).expect("DCT stage buffers input");
+            stage
+                .finish()
+                .expect_err("downstream panic must become a pipeline error")
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: downstream pipeline panicked"
+        );
         assert_eq!(sink.write_attempts, 1);
         assert_eq!(sink.finishes, 0);
         assert_eq!(sink.finish_attempts, 0);
@@ -5550,6 +5590,7 @@ pub(crate) mod tests {
         assert_eq!(sink.finish_attempts, 0);
     }
 
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     #[test]
     fn dct_stage_rejects_unknown_component_count() {
         let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
@@ -5574,6 +5615,29 @@ pub(crate) mod tests {
         );
         assert!(sink.writes.is_empty());
         assert_eq!(sink.finish_attempts, 0);
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn dct_compat_accepts_unknown_component_count_like_qpdf() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&test_unknown_component_jpeg())
+                .expect("unknown-component JPEG must buffer");
+            stage
+                .finish()
+                .expect("qpdf-compatible backend must preserve output components");
+        }
+        assert_eq!(sink.writes.len(), 1);
+        assert_eq!(sink.writes[0].len(), 2);
+        assert_eq!(sink.finishes, 1);
     }
 
     /// qpdf's `filter_factories` (`QPDF_Stream.cc:85-94`) holds `/Crypt`

@@ -9,12 +9,17 @@
 #include <stdint.h>
 #include <string.h>
 
+#if !defined(BITS_IN_JSAMPLE)
+#error "flpdf requires a libjpeg header that declares BITS_IN_JSAMPLE"
+#endif
+
 #if BITS_IN_JSAMPLE != 8
 #error "flpdf requires an 8-bit system libjpeg build"
 #endif
 
-#if !defined(JPEG_LIB_VERSION) || (JPEG_LIB_VERSION < 80)
-#error "flpdf requires libjpeg API version 80 or newer"
+/* qpdf Pl_DCT uses only the API subset already present in libjpeg 6b. */
+#if !defined(JPEG_LIB_VERSION) || (JPEG_LIB_VERSION < 62)
+#error "flpdf requires the libjpeg 6b-compatible API surface"
 #endif
 
 enum {
@@ -35,6 +40,38 @@ struct flpdf_jpeg_source {
 };
 
 static void
+flpdf_copy_error_message(char *destination, size_t destination_len, const char *message)
+{
+    size_t message_len;
+    size_t copy_len;
+
+    if ((destination == NULL) || (destination_len == 0)) {
+        return;
+    }
+
+    message_len = strlen(message);
+    copy_len = message_len;
+    if (copy_len >= destination_len) {
+        copy_len = destination_len - 1;
+    }
+    memcpy(destination, message, copy_len);
+    destination[copy_len] = '\0';
+}
+
+static void
+flpdf_jpeg_abort_with_message(j_decompress_ptr cinfo, const char *message)
+{
+    struct flpdf_jpeg_error_manager *error_manager =
+        (struct flpdf_jpeg_error_manager *)cinfo->err;
+
+    flpdf_copy_error_message(
+        error_manager->error_message,
+        error_manager->error_message_len,
+        message);
+    longjmp(error_manager->jump_buffer, 1);
+}
+
+static void
 flpdf_jpeg_init_source(j_decompress_ptr cinfo)
 {
     (void)cinfo;
@@ -43,25 +80,37 @@ flpdf_jpeg_init_source(j_decompress_ptr cinfo)
 static boolean
 flpdf_jpeg_fill_input_buffer(j_decompress_ptr cinfo)
 {
-    ERREXIT(cinfo, JERR_INPUT_EOF);
-    return FALSE;
+    /* qpdf's whole-buffer source reports this exact error instead of adding an EOI marker. */
+    flpdf_jpeg_abort_with_message(cinfo, "invalid jpeg data reading from buffer");
+    return TRUE;
 }
 
 static void
 flpdf_jpeg_skip_input_data(j_decompress_ptr cinfo, long num_bytes)
 {
+    size_t available;
+
     if (num_bytes < 0) {
-        ERREXIT(cinfo, JERR_INPUT_EOF);
+        flpdf_jpeg_abort_with_message(
+            cinfo,
+            "reading jpeg: jpeg library requested skipping a negative number of bytes");
         return;
     }
 
-    size_t skip = (size_t)num_bytes;
-    if (skip > cinfo->src->bytes_in_buffer) {
-        ERREXIT(cinfo, JERR_INPUT_EOF);
+    available = cinfo->src->bytes_in_buffer;
+    if ((size_t)num_bytes > available) {
+        /* Match qpdf: consume the remaining buffer and let the next fill report EOF. */
+        if (available != 0) {
+            cinfo->src->next_input_byte += available;
+        }
+        cinfo->src->bytes_in_buffer = 0;
         return;
     }
-    cinfo->src->next_input_byte += skip;
-    cinfo->src->bytes_in_buffer -= skip;
+
+    if (num_bytes != 0) {
+        cinfo->src->next_input_byte += (size_t)num_bytes;
+    }
+    cinfo->src->bytes_in_buffer -= (size_t)num_bytes;
 }
 
 static void
@@ -93,25 +142,6 @@ flpdf_jpeg_buffer_src(
 }
 
 static void
-flpdf_copy_error_message(char *destination, size_t destination_len, const char *message)
-{
-    size_t message_len;
-    size_t copy_len;
-
-    if ((destination == NULL) || (destination_len == 0)) {
-        return;
-    }
-
-    message_len = strlen(message);
-    copy_len = message_len;
-    if (copy_len >= destination_len) {
-        copy_len = destination_len - 1;
-    }
-    memcpy(destination, message, copy_len);
-    destination[copy_len] = '\0';
-}
-
-static void
 flpdf_jpeg_format_error(
     j_common_ptr common,
     char *destination,
@@ -120,12 +150,6 @@ flpdf_jpeg_format_error(
     char diagnostic[JMSG_LENGTH_MAX];
 
     switch (common->err->msg_code) {
-    case JERR_INPUT_EOF:
-        flpdf_copy_error_message(
-            destination,
-            destination_len,
-            "Premature end of input file");
-        return;
     case JERR_NO_IMAGE:
         flpdf_copy_error_message(
             destination,
@@ -238,20 +262,6 @@ flpdf_jpeg_decode_scanlines(
     flpdf_jpeg_buffer_src(&cinfo, data, data_len);
     (void)jpeg_read_header(&cinfo, TRUE);
     (void)jpeg_calc_output_dimensions(&cinfo);
-
-    if ((cinfo.num_components != 1) && (cinfo.num_components != 3) &&
-        (cinfo.num_components != 4)) {
-        char diagnostic[64];
-
-        (void)snprintf(
-            diagnostic,
-            sizeof(diagnostic),
-            "unsupported JPEG component count %d",
-            cinfo.num_components);
-        flpdf_copy_error_message(error_message, error_message_len, diagnostic);
-        jpeg_destroy_decompress(&cinfo);
-        return FLPDF_JPEG_CODEC_ERROR;
-    }
 
     if ((cinfo.output_components <= 0) ||
         ((size_t)cinfo.output_width > SIZE_MAX / (size_t)cinfo.output_components)) {
