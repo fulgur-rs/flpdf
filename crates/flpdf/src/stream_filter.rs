@@ -1220,13 +1220,13 @@ impl FlateLzwStreamFilter {
 /// qpdf's literals.
 ///
 /// **These five are retained whatever the filter is named, and that is not
-/// laziness.** [`predictor_encode_geometry`] builds a `FlateLzwStreamFilter` for
-/// whichever name `filters::encode_stream_data` hands it and feeds that filter
-/// this same [`DecodeParams`], so dropping the geometry under a non-Flate name
-/// would change what the public encode path does with, say, `/Filter
-/// [/ASCII85Decode]` carrying `/Predictor 12`. The keys beyond these five have
-/// no such second consumer, which is why they are kept per-filter — under
-/// `Crypt` and nowhere else.
+/// laziness.** The encode path validates each registered filter's
+/// `set_decode_params` contract before applying a codec: Flate/LZW consume the
+/// predictor geometry, while ASCII85/ASCIIHex/RunLength reject a present
+/// `/DecodeParms` just as qpdf's default filter does. Dropping the geometry
+/// before that validation would turn a non-null parameter dictionary into an
+/// absent one. The keys beyond these five have no such second consumer, which
+/// is why they are kept per-filter — under `Crypt` and nowhere else.
 ///
 /// This is *per key*, not per filter, within that set: `EarlyChange` survives
 /// under `/FlateDecode` even though `set_decode_params` consults it only for
@@ -2127,6 +2127,25 @@ fn predictor_encode_geometry(
     filter_name: &[u8],
     decode_params: &DecodeParams,
 ) -> Result<Option<PredictorGeometry>> {
+    // qpdf's default QPDFStreamFilter::setDecodeParms accepts only a null
+    // object. ASCII85, ASCIIHex, and RunLength inherit that contract; only
+    // SF_FlateLzwDecode consumes predictor parameters. Validate the registered
+    // non-Flate filter here so encoding cannot produce bytes for a stream that
+    // the inverse decode path rejects.
+    if !matches!(filter_name, b"FlateDecode" | b"LZWDecode") {
+        let Some(mut filter) = stream_filter_for(filter_name) else {
+            // Let the codec encoder report an unknown or passthrough filter.
+            return Ok(None);
+        };
+        if !filter.set_decode_params(decode_params) {
+            return Err(Error::Unsupported(format!(
+                "stream filter {} does not support supplied /DecodeParms",
+                String::from_utf8_lossy(filter_name)
+            )));
+        }
+        return Ok(None);
+    }
+
     let mut filter = FlateLzwStreamFilter::new(filter_name == b"LZWDecode");
     if !filter.set_decode_params(decode_params) {
         return Err(Error::Unsupported(format!(

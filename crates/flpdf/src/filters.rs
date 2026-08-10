@@ -956,7 +956,8 @@ fn encode_stream_data_from_specs(specs: Vec<FilterSpec>, stream_data: &[u8]) -> 
     Ok(encoded)
 }
 
-/// Apply the PNG predictor selected by `/DecodeParms`, if any.
+/// Apply the predictor selected by `/DecodeParms`, if any, and validate the
+/// target filter's DecodeParms contract before encoding.
 fn apply_encode_params(
     filter_name: &[u8],
     decode_params: &DecodeParams,
@@ -2775,6 +2776,20 @@ mod tests {
         assert_eq!(
             encode_stream_data(&dict, b"abc").unwrap_err().to_string(),
             "unsupported PDF feature: stream filter ASCIIHexDecode does not support supplied /DecodeParms"
+        );
+    }
+
+    #[test]
+    fn encoding_rejects_tiff_predictor_params_for_ascii85() {
+        let mut parms = Dictionary::new();
+        parms.insert("Predictor", Object::Integer(2));
+        parms.insert("Columns", Object::Integer(4));
+        let mut dict = ascii85_dict();
+        dict.insert("DecodeParms", Object::Dictionary(parms));
+
+        assert_eq!(
+            encode_stream_data(&dict, b"data").unwrap_err().to_string(),
+            "unsupported PDF feature: stream filter ASCII85Decode does not support supplied /DecodeParms"
         );
     }
 
