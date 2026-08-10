@@ -40,6 +40,7 @@ path = "src/lib.rs"
 [features]
 default = []
 qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
+qpdf-libjpeg-compat = ["flpdf/qpdf-libjpeg-compat"]
 
 [dependencies]
 flpdf = { path = "../flpdf", features = ["qtest-driver"] }

@@ -31,6 +31,7 @@ default = []
 # end-to-end byte-identical CLI tests (cli_byte_identical); production builds
 # stay Pure Rust (miniz_oxide). Forwards to flpdf's own `qpdf-zlib-compat`.
 qpdf-zlib-compat = ["flpdf/qpdf-zlib-compat"]
+qpdf-libjpeg-compat = ["flpdf/qpdf-libjpeg-compat"]
 
 [dependencies]
 clap.workspace = true
