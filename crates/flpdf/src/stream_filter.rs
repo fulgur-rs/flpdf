@@ -49,6 +49,7 @@ use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85::Ascii85Decoder;
 use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
+use crate::pipeline::dct::PlDct;
 use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
 use crate::pipeline::lzw::LzwDecoder;
 use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
@@ -1772,6 +1773,42 @@ impl StreamFilter for RunLengthStreamFilter {
     }
 }
 
+struct DctStreamFilter;
+
+impl StreamFilter for DctStreamFilter {
+    /// Mirrors `SF_DCTDecode::getDecodePipeline`
+    /// (`libqpdf/qpdf/SF_DCTDecode.hh:14-19`), a single `Pl_DCT` decode stage.
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(Some(Box::new(PlDct::new("DCT decode", next))))
+    }
+
+    // The whole-buffer route remains the existing passthrough route for this
+    // bounded streaming migration. The qpdf-shaped stage above is exercised by
+    // the streaming caller and does not alter the writer/legacy decode route.
+    fn pipe_decode_recovering(
+        &mut self,
+        _data: &[u8],
+        _max_output: Option<usize>,
+        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
+    ) -> Result<FilterDecodeOutcome> {
+        Err(Error::Unsupported(
+            "passthrough codec DCTDecode: image/binary stream data is not decoded by flpdf (preserved verbatim)"
+                .to_string(),
+        ))
+    }
+
+    fn is_specialized_compression(&self) -> bool {
+        true
+    }
+
+    fn is_lossy_compression(&self) -> bool {
+        true
+    }
+}
+
 /// Port of the anonymous-namespace `SF_Crypt` in `libqpdf/QPDF_Stream.cc:27-58`.
 ///
 /// It decodes nothing. Its whole contribution is deciding filterability from
@@ -2002,11 +2039,9 @@ impl StreamFilter for PostPreflightFailure {
 /// a library user add a factory at run time; flpdf exposes no counterpart, and
 /// adding one would mean replacing this `match`.
 ///
-/// The container is equivalent; the entry sets are not. qpdf registers a
-/// `/DCTDecode` factory (`QPDF_Stream.cc:91`) and this `match` has no arm for
-/// it, so a `/DCTDecode` stream is refused on the decode path with
-/// `filters::undecodable_filter_error`'s passthrough wording. That is the
-/// missing `Pl_DCT`, not the container.
+/// The container and qpdf's registered production codecs are represented here;
+/// the DCT stage itself is the qpdf-shaped streaming primitive while the
+/// existing whole-buffer route remains passthrough-only for now.
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"Crypt" => Some(Box::new(CryptStreamFilter)),
@@ -2015,6 +2050,7 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
         b"ASCII85Decode" => Some(Box::new(Ascii85StreamFilter)),
         b"ASCIIHexDecode" => Some(Box::new(AsciiHexStreamFilter)),
         b"RunLengthDecode" => Some(Box::new(RunLengthStreamFilter)),
+        b"DCTDecode" => Some(Box::new(DctStreamFilter)),
         #[cfg(test)]
         b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
         #[cfg(test)]
@@ -2249,6 +2285,65 @@ pub(crate) mod tests {
             libjpeg_turbo_rs::Subsampling::S444,
         )
         .expect("test JPEG must encode")
+    }
+
+    fn test_grayscale_jpeg() -> Vec<u8> {
+        libjpeg_turbo_rs::compress(
+            &[64u8, 192],
+            2,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("grayscale test JPEG must encode")
+    }
+
+    fn test_cmyk_jpeg() -> Vec<u8> {
+        libjpeg_turbo_rs::compress(
+            &[0u8, 64, 128, 255],
+            1,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Cmyk,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("CMYK test JPEG must encode")
+    }
+
+    fn test_12_bit_jpeg() -> Vec<u8> {
+        libjpeg_turbo_rs::compress_12bit(
+            &[2048i16],
+            1,
+            1,
+            1,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("12-bit test JPEG must encode")
+    }
+
+    fn test_unknown_component_jpeg() -> Vec<u8> {
+        let mut jpeg = libjpeg_turbo_rs::compress(
+            &[128u8],
+            1,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("unknown-component test JPEG must encode");
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .expect("baseline JPEG must contain SOF0");
+        let segment_length = u16::from_be_bytes([jpeg[sof + 2], jpeg[sof + 3]]);
+        assert_eq!(segment_length, 11);
+        jpeg[sof + 9] = 2;
+        jpeg[sof + 2..sof + 4].copy_from_slice(&(segment_length + 3).to_be_bytes());
+        let second_component = sof + 2 + usize::from(segment_length);
+        jpeg.splice(second_component..second_component, [2, 0x11, 0]);
+        jpeg
     }
 
     #[derive(Default)]
@@ -4493,10 +4588,11 @@ pub(crate) mod tests {
         assert!(filter.is_lossy_compression());
 
         let mut sink = DctSink::default();
-        assert!(filter
+        let stage = filter
             .decode_pipeline(&mut sink)
             .expect("DCT stage construction must succeed")
-            .is_some());
+            .expect("DCT filter must contribute a decode stage");
+        assert_eq!(stage.identifier(), "DCT decode");
     }
 
     #[test]
@@ -4706,10 +4802,80 @@ pub(crate) mod tests {
         assert_eq!(sink.finish_attempts, 1);
     }
 
+    #[test]
+    fn dct_stage_uses_default_component_widths() {
+        for (jpeg, expected_row_length) in [(test_grayscale_jpeg(), 2), (test_cmyk_jpeg(), 4)] {
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage.write(&jpeg).expect("component JPEG must buffer");
+                stage.finish().expect("component JPEG must decode");
+            }
+            assert_eq!(sink.writes.len(), 1);
+            assert_eq!(sink.writes[0].len(), expected_row_length);
+            assert_eq!(sink.finishes, 1);
+        }
+    }
+
+    #[test]
+    fn dct_stage_rejects_non_eight_bit_precision() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&test_12_bit_jpeg())
+                .expect("12-bit JPEG must buffer");
+            stage.finish().expect_err("12-bit JPEG must be rejected")
+        };
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: sample precision 12 (only 8-bit supported)"
+        );
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
+    #[test]
+    fn dct_stage_rejects_unknown_component_count() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&test_unknown_component_jpeg())
+                .expect("unknown-component JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("unknown component count must be rejected")
+        };
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: unsupported JPEG component count 2"
+        );
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
     /// qpdf's `filter_factories` (`QPDF_Stream.cc:85-94`) holds `/Crypt`
-    /// alongside six codecs, so [`stream_filter_for`] holds it too — beside
-    /// the five that table's codecs reduce to here, `/DCTDecode` being a
-    /// passthrough in flpdf rather than a registered filter.
+    /// alongside six codecs, so [`stream_filter_for`] holds it too. DCTDecode
+    /// contributes the streaming stage; its legacy whole-buffer route remains
+    /// passthrough-only until that route is cut over.
     ///
     /// The registration is not reached by a production decode:
     /// `filters::prepare_decode_filters` routes a `Crypt` spec to
