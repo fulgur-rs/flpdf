@@ -559,6 +559,27 @@ impl ObjectStreamRenumber {
         skip_length: bool,
         removed_refs: &BTreeSet<ObjectRef>,
     ) -> crate::Result<Self> {
+        Self::build_with_seed_policy(pdf, groups, skip_length, removed_refs, false)
+    }
+
+    /// Compute object-stream numbering after qpdf has seeded the queue with
+    /// every source object for `preserveUnreferencedObjects`.
+    pub(crate) fn build_preserving_unreferenced<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        groups: &[ObjectStreamGroup],
+        skip_length: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<Self> {
+        Self::build_with_seed_policy(pdf, groups, skip_length, removed_refs, true)
+    }
+
+    fn build_with_seed_policy<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        groups: &[ObjectStreamGroup],
+        skip_length: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
+        preserve_unreferenced_objects: bool,
+    ) -> crate::Result<Self> {
         let mut member_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut source_to_group: HashMap<ObjectRef, usize> = HashMap::new();
         let mut groups_sorted: Vec<Vec<ObjectRef>> = Vec::with_capacity(groups.len());
@@ -612,7 +633,15 @@ impl ObjectStreamRenumber {
         let root = pdf.root_ref().ok_or_else(|| {
             Error::Unsupported("object-stream renumber: trailer has no /Root".to_string())
         })?;
-        let mut seeds: Vec<ObjectRef> = vec![root];
+        let mut seeds: Vec<ObjectRef> = if preserve_unreferenced_objects {
+            pdf.live_object_refs()
+                .into_iter()
+                .filter(|object_ref| !removed_refs.contains(object_ref))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        seeds.push(root);
         let trailer_entries = crate::qpdf_null::snapshot_entries(pdf.trailer(), false);
         let trailer_entries = crate::qpdf_null::visible_entries(pdf, trailer_entries)?;
         for (key, value) in trailer_entries {

@@ -5,10 +5,12 @@
 
 #![allow(dead_code)]
 
+use flpdf::ObjectRef;
 use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
     ObjectStreamMode, Pdf, QPDFWriter, Result, StreamDataMode,
 };
+use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 /// Test-only settings used while the integration corpus migrates to the
@@ -36,6 +38,7 @@ pub struct WriterTestSettings {
     pub recompress_flate: bool,
     pub encrypt: Option<EncryptParams>,
     pub copy_encryption: Option<CopyEncryptionSource>,
+    pub preserve_encryption: bool,
     pub pclm: bool,
 }
 
@@ -62,6 +65,7 @@ impl Default for WriterTestSettings {
             recompress_flate: false,
             encrypt: None,
             copy_encryption: None,
+            preserve_encryption: true,
             pclm: false,
         }
     }
@@ -109,6 +113,7 @@ impl WriterTestSettings {
         } else if let Some(source) = self.copy_encryption.clone() {
             writer.copy_encryption_parameters(source);
         }
+        writer.set_preserve_encryption(self.preserve_encryption);
         if let Some(mode) = self.stream_data {
             writer.set_stream_data_mode(mode);
         }
@@ -130,6 +135,33 @@ pub fn write_with_settings<R: Read + Seek + 'static, W: Write>(
     let mut out = out;
     out.write_all(&bytes)?;
     Ok(())
+}
+
+/// Emit through the canonical writer and return the final identities for the
+/// supplied source objects. Full rewrite intentionally renumbers objects, so
+/// tests that inspect ObjStm members must use this mapping rather than assume
+/// source object numbers survive.
+pub fn write_with_settings_and_mapping<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    settings: &WriterTestSettings,
+    source_refs: &[ObjectRef],
+) -> Result<(Vec<u8>, BTreeMap<ObjectRef, ObjectRef>)> {
+    let mut writer = QPDFWriter::new(pdf);
+    settings.apply(&mut writer)?;
+    writer.set_output_memory()?;
+    writer.write()?;
+    let mapping = source_refs
+        .iter()
+        .filter_map(|source| {
+            writer
+                .get_renumbered_obj_gen(*source)
+                .ok()
+                .flatten()
+                .map(|output| (*source, output))
+        })
+        .collect();
+    let bytes = writer.get_buffer()?;
+    Ok((bytes, mapping))
 }
 
 /// Emit one linearized PDF through the canonical qpdf writer for integration

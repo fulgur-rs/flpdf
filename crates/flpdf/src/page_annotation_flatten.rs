@@ -906,7 +906,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 mod tests {
     use super::*;
     use crate::pages::{page_content_bytes, page_refs};
-    use crate::writer::write_pdf;
+    use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::io::Cursor;
 
@@ -1491,10 +1491,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test: write_pdf round-trip — output is valid parseable PDF
+    // Test: qpdf writer round-trip — output is valid parseable PDF
     // -----------------------------------------------------------------------
     #[test]
-    fn write_pdf_round_trip_is_valid() {
+    fn qpdf_writer_round_trip_is_valid() {
         let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"0.5 g 0 0 100 20 re f");
         let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
         let (n4, obj4_bytes) = obj_dict(
@@ -1509,8 +1509,7 @@ mod tests {
         flatten_annotations_on_page(&mut pdf, page_ref, FlattenMode::All).unwrap();
 
         // Write and re-open the PDF.
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
         let pages = page_refs(&mut pdf2).unwrap();

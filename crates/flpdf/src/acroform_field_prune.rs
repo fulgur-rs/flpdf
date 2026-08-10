@@ -502,7 +502,7 @@ mod tests {
     use crate::check::check_reader;
     use crate::page_tree_rebuild::rebuild_page_tree;
     use crate::pages::page_refs;
-    use crate::writer::write_pdf;
+    use crate::writer::write_qpdf_to_memory;
     use crate::Pdf;
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -899,7 +899,7 @@ mod tests {
         assert!(prune_acroform_after_subset(&mut pdf, &result).is_ok());
     }
 
-    /// Round-trip: after rebuild + prune, write_pdf and reopen, check_reader clean.
+    /// Round-trip: after rebuild + prune, qpdf writer output reopens cleanly.
     #[test]
     fn round_trip_valid_pdf_after_prune() {
         let mut pdf = open(build_acroform_pdf());
@@ -907,8 +907,7 @@ mod tests {
         let result = rebuild_page_tree(&mut pdf, &sel).unwrap();
         prune_acroform_after_subset(&mut pdf, &result).unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         let mut pdf2 = Pdf::open(Cursor::new(out.clone())).expect("rebuilt PDF should parse");
         let refs = page_refs(&mut pdf2).expect("page tree should walk");

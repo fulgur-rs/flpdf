@@ -264,10 +264,28 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
 pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<ObjectStreamPlan> {
+    plan_qpdf_preserve_object_streams_with_unreferenced(pdf, false)
+}
+
+/// Reconstruct source ObjStm grouping with qpdf's
+/// `preserveUnreferencedObjects` policy. qpdf keeps every source ObjStm
+/// member in the source container map in this mode; reachability filtering is
+/// applied only when the setting is disabled.
+pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
+    R: std::io::Read + std::io::Seek,
+>(
+    pdf: &mut crate::Pdf<R>,
+    preserve_unreferenced: bool,
+) -> crate::Result<ObjectStreamPlan> {
     let ctx = eligibility_context(pdf)?;
     let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
-    let compressible = compressible_objgens_qpdf_plan(pdf)?;
-    let eligible: BTreeSet<ObjectRef> = compressible.eligible.iter().copied().collect();
+    let compressible = (!preserve_unreferenced)
+        .then(|| compressible_objgens_qpdf_plan(pdf))
+        .transpose()?;
+    let eligible: BTreeSet<ObjectRef> = compressible
+        .as_ref()
+        .map(|plan| plan.eligible.iter().copied().collect())
+        .unwrap_or_default();
     let mut by_container: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
 
     for (member, entry) in pdf.source_xref_entries() {
@@ -283,7 +301,9 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
     for (source, members) in by_container {
         let mut retained = Vec::new();
         for member in members {
-            if length_exclusions.contains(&member) || !eligible.contains(&member) {
+            if length_exclusions.contains(&member)
+                || (!preserve_unreferenced && !eligible.contains(&member))
+            {
                 continue;
             }
             let eligible_for_objstm = {
@@ -305,7 +325,9 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
 
     Ok(ObjectStreamPlan {
         groups,
-        removed_refs: compressible.removed_refs,
+        removed_refs: compressible
+            .map(|plan| plan.removed_refs)
+            .unwrap_or_default(),
     })
 }
 

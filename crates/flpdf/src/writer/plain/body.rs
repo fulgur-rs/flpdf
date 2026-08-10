@@ -34,9 +34,6 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
         match planned {
             PlannedIndirectObject::Source { source, output } => {
                 let mut object = pdf.resolve(*source)?;
-                if crate::writer::is_source_structural_container(&object) {
-                    continue;
-                }
                 let offset = bytes.len();
                 bytes.extend_from_slice(
                     format!("{} {} obj\n", output.number, output.generation).as_bytes(),
@@ -74,7 +71,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                     .insert(output.number, (output.generation, offset));
             }
             PlannedIndirectObject::ObjectStream {
-                output, members, ..
+                origin,
+                output,
+                members,
             } => {
                 let mut resolved = Vec::with_capacity(members.len());
                 for member in members {
@@ -97,11 +96,35 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 } else {
                     CompressStreams::No
                 };
-                serialize::write_objstm_stream(
+                let extends = match origin {
+                    crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
+                        let object = pdf.resolve(*source)?;
+                        let Some(stream) = object.as_stream() else {
+                            return Err(crate::Error::Unsupported(format!(
+                                "plain writer: source ObjStm {} {} R is not a stream",
+                                source.number, source.generation
+                            )));
+                        };
+                        match stream.dict.get("Extends") {
+                            Some(Object::Reference(extends)) => Some(
+                                plan.old_to_new.get(extends).copied().ok_or_else(|| {
+                                    crate::Error::Unsupported(format!(
+                                        "plain writer: source ObjStm /Extends {} {} R is absent from renumber map",
+                                        extends.number, extends.generation
+                                    ))
+                                })?,
+                            ),
+                            _ => None,
+                        }
+                    }
+                    crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
+                };
+                serialize::write_objstm_stream_with_extends(
                     &mut bytes,
                     &body,
                     structural_compress,
                     options.newline_before_endstream,
+                    extends,
                 )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
                 bytes.extend_from_slice(b"\nendobj\n");
                 layout
@@ -288,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn disable_emission_does_not_serialize_reachable_source_objstm_container() {
+    fn disable_emission_serializes_reachable_source_objstm_container() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let root = pdf.root_ref().unwrap();
@@ -305,8 +328,8 @@ mod tests {
 
         let (bytes, layout) = emit_bodies(&mut pdf, &options, &plan).unwrap();
 
-        assert!(!layout.uncompressed.contains_key(&output_objstm.number));
-        assert!(!bytes
+        assert!(layout.uncompressed.contains_key(&output_objstm.number));
+        assert!(bytes
             .windows(b"/Type /ObjStm".len())
             .any(|window| window == b"/Type /ObjStm"));
     }

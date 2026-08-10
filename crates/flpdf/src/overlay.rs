@@ -1080,7 +1080,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // [`--qdf --no-original-object-ids`] against a subset of the overlay
 // goldens used here (the version-floor / encrypted-source / annotation-
 // copy families remain library-only for now), catching CLI-layer wiring
-// divergences (argv parsing, `WriteOptions` assembly, defaults) that
+// divergences (argv parsing, QPDFWriter setting assembly, defaults) that
 // library-only gates cannot see.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
@@ -1091,7 +1091,8 @@ mod byte_gate {
     use crate::page_form_xobject::import_page_as_form_xobject;
     use crate::page_range::PageRange;
     use crate::pages::page_refs;
-    use crate::{write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions};
+    use crate::{Pdf, QPDFWriter};
+    use std::io::{Read, Seek};
     use std::path::Path;
 
     fn fixture(name: &str) -> Pdf<std::io::BufReader<std::fs::File>> {
@@ -1100,6 +1101,18 @@ mod byte_gate {
             .join(name);
         let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
         Pdf::open(std::io::BufReader::new(file)).unwrap()
+    }
+
+    fn write_qpdf<R, F>(dest: &mut Pdf<R>, configure: F) -> Vec<u8>
+    where
+        R: Read + Seek + 'static,
+        F: FnOnce(&mut QPDFWriter<'_, R>),
+    {
+        let mut writer = QPDFWriter::new(dest);
+        configure(&mut writer);
+        writer.set_output_memory().unwrap();
+        writer.write().unwrap();
+        writer.get_buffer().unwrap()
     }
 
     fn golden(name: &str) -> Vec<u8> {
@@ -1115,16 +1128,8 @@ mod byte_gate {
     }
 
     /// Write `dest` through the `flpdf rewrite --static-id` recipe.
-    fn write_static_id<R: std::io::Read + std::io::Seek>(dest: &mut Pdf<R>) -> Vec<u8> {
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..Default::default()
-        };
-        let mut out = Vec::new();
-        write_pdf_with_options(dest, &mut out, &opts).unwrap();
-        out
+    fn write_static_id<R: Read + Seek + 'static>(dest: &mut Pdf<R>) -> Vec<u8> {
+        write_qpdf(dest, |writer| writer.set_static_id(true))
     }
 
     /// Write `dest` through the `flpdf rewrite --static-id --qdf --no-original-object-ids`
@@ -1132,17 +1137,12 @@ mod byte_gate {
     /// promotes only `Never` to `No` internally (so `endstream` stays
     /// line-anchored) — we leave `newline_before_endstream` at its default
     /// (`Never`) and rely on that promotion.
-    fn write_qdf_nooid<R: std::io::Read + std::io::Seek>(dest: &mut Pdf<R>) -> Vec<u8> {
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            ..Default::default()
-        };
-        let mut out = Vec::new();
-        write_pdf_with_options(dest, &mut out, &opts).unwrap();
-        out
+    fn write_qdf_nooid<R: Read + Seek + 'static>(dest: &mut Pdf<R>) -> Vec<u8> {
+        write_qpdf(dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+        })
     }
 
     /// Report the first differing byte offset for a readable failure message.
@@ -1201,15 +1201,7 @@ mod byte_gate {
         .unwrap();
 
         // Write through the same recipe as `flpdf rewrite --static-id`.
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..Default::default()
-        };
-
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_static_id(&mut dest);
 
         let expected = golden("three-page-overlay-one-page.pdf");
         if let Some(off) = first_diff(&actual, &expected) {
@@ -1453,17 +1445,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-copy-annotations.pdf");
     }
 
@@ -1495,17 +1482,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-source-p-and-inline.pdf");
     }
 
@@ -1529,17 +1511,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-link-annot-no-acroform.pdf");
     }
 
@@ -1569,17 +1546,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-onto-indirect-fields.pdf");
     }
 
@@ -1601,17 +1573,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-source-direct-dr.pdf");
     }
 
@@ -1643,17 +1610,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-onto-existing-acroform.pdf");
     }
 
@@ -1711,17 +1673,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
     }
     // cov:ignore-end
@@ -1753,17 +1710,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "overlay-copy-annotations-with-defaults.pdf");
     }
 
@@ -1788,17 +1740,12 @@ mod byte_gate {
             repeat: Some(pr("1")),
         }];
         apply_overlay_specs(&mut dest, &mut specs).unwrap();
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            qdf: true,
-            no_original_object_ids: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            ..Default::default()
-        };
-        let mut actual = Vec::new();
-        write_pdf_with_options(&mut dest, &mut actual, &opts).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
         assert_byte_identical(&actual, "underlay-copy-annotations.pdf");
     }
 
@@ -1984,10 +1931,8 @@ mod byte_gate {
     // These gates prove the writer half of qpdf's cross-source version rule
     // in isolation from the CLI. The CLI wires the same accumulation into
     // its overlay/underlay pipeline; here the test mirrors it explicitly so
-    // WriteOptions.min_version / min_extension_level are the sole inputs
+    // QPDFWriter minimum-version and extension-level setters are the sole inputs
     // exercised at the library boundary.
-    use std::io::{Read, Seek};
-
     /// Return `(max_pdf_version, max_extension_level)` over two open PDFs
     /// using qpdf's pairwise rule: the higher version wins outright, and a
     /// higher version RESETS the extension level (only equal versions merge
@@ -2052,16 +1997,10 @@ mod byte_gate {
         }];
         apply_overlay_specs(&mut dest, &mut specs).expect("apply overlay");
 
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..Default::default()
-        };
-        let mut out = Vec::new();
-        write_pdf_with_options(&mut dest, &mut out, &opts).expect("write");
+        let out = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
 
         if let Some(off) = first_diff(&out, &golden) {
             let lo = off.saturating_sub(24);
@@ -2115,16 +2054,10 @@ mod byte_gate {
         }];
         apply_overlay_specs(&mut dest, &mut specs).expect("apply overlay");
 
-        let opts = WriteOptions {
-            full_rewrite: true,
-            static_id: true,
-            min_version: Some(version),
-            min_extension_level: (max_ext > 0).then_some(max_ext),
-            newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..Default::default()
-        };
-        let mut out = Vec::new();
-        write_pdf_with_options(&mut dest, &mut out, &opts).expect("write");
+        let out = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
 
         if let Some(off) = first_diff(&out, &golden) {
             let lo = off.saturating_sub(24);

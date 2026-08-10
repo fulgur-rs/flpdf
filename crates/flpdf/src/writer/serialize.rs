@@ -72,11 +72,24 @@ pub(crate) fn framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) 
 }
 
 /// Serialize an object-stream container with qpdf's fixed dictionary key order.
+#[allow(dead_code)]
 pub(crate) fn write_objstm_stream(
     out: &mut Vec<u8>,
     body: &object_streams::ObjStmBody,
     compress: CompressStreams,
     policy: NewlineBeforeEndstream,
+) -> crate::Result<()> {
+    write_objstm_stream_with_extends(out, body, compress, policy, None)
+}
+
+/// Serialize an object-stream container, preserving qpdf's source `/Extends`
+/// edge when this is a source-backed Preserve group.
+pub(crate) fn write_objstm_stream_with_extends(
+    out: &mut Vec<u8>,
+    body: &object_streams::ObjStmBody,
+    compress: CompressStreams,
+    policy: NewlineBeforeEndstream,
+    extends: Option<crate::ObjectRef>,
 ) -> crate::Result<()> {
     let stream = object_streams::wrap_objstm_body(body, compress)?;
     out.extend_from_slice(b"<< /Type /ObjStm /Length ");
@@ -85,8 +98,14 @@ pub(crate) fn write_objstm_stream(
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(
-        format!(" /N {} /First {} >>", body.n_members, body.first_offset).as_bytes(),
+        format!(" /N {} /First {}", body.n_members, body.first_offset).as_bytes(),
     );
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b" >>");
     write_stream_payload(out, &stream.data, policy);
     Ok(())
 }

@@ -22,6 +22,22 @@ use serialize::{
 };
 pub use settings::DecodeLevel;
 
+/// Test-only convenience for exercising the canonical qpdf writer lifecycle
+/// from crate-internal unit suites. This deliberately has no public alias for
+/// the removed free writer routes.
+#[cfg(test)]
+pub(crate) fn write_qpdf_to_memory<R, F>(pdf: &mut Pdf<R>, configure: F) -> Result<Vec<u8>>
+where
+    R: Read + Seek + 'static,
+    F: FnOnce(&mut QPDFWriter<'_, R>),
+{
+    let mut writer = QPDFWriter::new(pdf);
+    configure(&mut writer);
+    writer.set_output_memory()?;
+    writer.write()?;
+    writer.get_buffer()
+}
+
 use crate::parser::Parser;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::tokenizer::Tokenizer;

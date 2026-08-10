@@ -642,8 +642,15 @@ mod tests {
 
     #[test]
     fn copied_v4_aes_context_records_v4_r4() {
+        let mut encrypt_dict = Dictionary::new();
+        encrypt_dict.insert("V", Object::Integer(4));
+        encrypt_dict.insert("R", Object::Integer(4));
+        encrypt_dict.insert("Length", Object::Integer(128));
+        encrypt_dict.insert("P", Object::Integer(-4));
+        encrypt_dict.insert("O", Object::String(vec![0x4f; 32]));
+        encrypt_dict.insert("U", Object::String(vec![0x55; 32]));
         let source = CopyEncryptionSource {
-            encrypt_dict: Dictionary::new(),
+            encrypt_dict,
             file_key: vec![0x31; 16],
             id0: b"0123456789abcdef".to_vec(),
             object_key_alg: ObjectKeyAlg::Aes,

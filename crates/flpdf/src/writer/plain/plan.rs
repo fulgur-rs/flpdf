@@ -75,7 +75,11 @@ impl PlainWritePlan {
                 placement
             }
             ObjectStreamMode::Preserve => {
-                let mut packing = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
+                let mut packing =
+                    object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                        pdf,
+                        options.preserve_unreferenced_objects,
+                    )?;
                 packing
                     .removed_refs
                     .extend(explicitly_removed.iter().copied());
@@ -94,7 +98,12 @@ impl PlainWritePlan {
                 } else {
                     let groups = &packing.groups;
                     let removed = &packing.removed_refs;
-                    let renumber = renumber_plain(pdf, groups, removed)?;
+                    let renumber = renumber_plain(
+                        pdf,
+                        groups,
+                        removed,
+                        options.preserve_unreferenced_objects,
+                    )?;
                     build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
             }
@@ -113,7 +122,7 @@ impl PlainWritePlan {
                     .map(|members| ObjectStreamGroup::Synthetic { members })
                     .collect();
                 let removed = &compressible.removed_refs;
-                let renumber = renumber_plain(pdf, &renumber_groups, removed)?;
+                let renumber = renumber_plain(pdf, &renumber_groups, removed, false)?;
                 build_container_aware(renumber, renumber_groups, compressible.removed_refs)?
             }
         };
@@ -360,8 +369,13 @@ fn renumber_plain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     groups: &[ObjectStreamGroup],
     removed_refs: &BTreeSet<ObjectRef>,
+    preserve_unreferenced_objects: bool,
 ) -> crate::Result<ObjectStreamRenumber> {
-    ObjectStreamRenumber::build(pdf, groups, true, removed_refs)
+    if preserve_unreferenced_objects {
+        ObjectStreamRenumber::build_preserving_unreferenced(pdf, groups, true, removed_refs)
+    } else {
+        ObjectStreamRenumber::build(pdf, groups, true, removed_refs)
+    }
 }
 
 fn build_container_aware(

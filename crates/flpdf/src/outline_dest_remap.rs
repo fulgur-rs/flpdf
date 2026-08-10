@@ -902,7 +902,7 @@ mod tests {
     use super::*;
     use crate::check::check_reader;
     use crate::page_tree_rebuild::rebuild_page_tree;
-    use crate::writer::write_pdf;
+    use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -1437,8 +1437,7 @@ mod tests {
         let result = rebuild_page_tree(&mut pdf, &pages).unwrap();
         remap_outline_and_dests(&mut pdf, &result).unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         let report = check_reader(Cursor::new(out)).expect("check should run");
         assert!(

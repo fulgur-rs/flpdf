@@ -2,10 +2,12 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
+mod common;
+
+use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
 use flpdf::{
-    write_pdf_with_options, CompressStreams, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, Pdf, PdfOpenOptions, StreamDataMode, WriteOptions,
+    CompressStreams, NewlineBeforeEndstream, Object, ObjectRef, ObjectStreamMode, Pdf,
+    PdfOpenOptions, StreamDataMode,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -63,17 +65,18 @@ fn single_member_objstm_fixture(member: &[u8], trailer_extras: &str) -> Vec<u8> 
 
 fn preserve_fixture(
     fixture: &[u8],
-    configure: impl FnOnce(&mut WriteOptions),
+    configure: impl FnOnce(&mut WriterTestSettings),
 ) -> flpdf::Result<Vec<u8>> {
     let mut pdf = Pdf::open_mem(Arc::from(fixture))?;
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Preserve;
-    options.static_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
-    configure(&mut options);
+    let mut settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+    configure(&mut settings);
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    write_with_settings(&mut pdf, &mut out, &settings)?;
     Ok(out)
 }
 
@@ -101,16 +104,17 @@ fn rewrite_mode_with_policy_and_id(
         .join("../../tests/fixtures/compat")
         .join(fixture);
     let mut pdf = Pdf::open(BufReader::new(File::open(path).unwrap())).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = mode;
-    options.stream_data = stream_data;
-    options.compress_streams = compress_streams;
-    options.static_id = !deterministic_id;
-    options.deterministic_id = deterministic_id;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let settings = WriterTestSettings {
+        object_streams: mode,
+        stream_data,
+        compress_streams,
+        static_id: !deterministic_id,
+        deterministic_id,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+    write_with_settings(&mut pdf, &mut out, &settings).unwrap();
     out
 }
 
@@ -136,42 +140,14 @@ fn linearize_mode_result(
         .join(fixture);
 
     let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap()))?;
-    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, mode)?;
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let mut pdf = Pdf::open(BufReader::new(File::open(&path).unwrap()))?;
-    let mut options = WriteOptions::default();
-    options.object_streams = mode;
-    options.stream_data = stream_data;
-    options.deterministic_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
-    let mut document = write_linearized(&plan, &renumber, &mut pdf, &options)?;
-    document.back_patch()?;
-    Ok(document.bytes)
-}
-
-fn linearize_legacy_bool_result(
-    fixture: &str,
-    use_generate_objstm: bool,
-    writer_mode: Option<ObjectStreamMode>,
-) -> flpdf::Result<Vec<u8>> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/compat")
-        .join(fixture);
-    let mut pdf = Pdf::open(BufReader::new(File::open(&path)?))?;
-    let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate_objstm)?;
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let mut pdf = Pdf::open(BufReader::new(File::open(&path)?))?;
-    let mut options = WriteOptions::default();
-    if let Some(mode) = writer_mode {
-        options.object_streams = mode;
-    }
-    options.deterministic_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
-    let mut document = write_linearized(&plan, &renumber, &mut pdf, &options)?;
-    document.back_patch()?;
-    Ok(document.bytes)
+    let settings = WriterTestSettings {
+        object_streams: mode,
+        stream_data,
+        deterministic_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &settings)
 }
 
 fn linearize_encrypted_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
@@ -179,25 +155,17 @@ fn linearize_encrypted_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8> {
         .join("../../tests/fixtures/compat")
         .join(fixture);
     let open_options = PdfOpenOptions::default();
-    let mut pdf = Pdf::open_with_options(
-        BufReader::new(File::open(&path).unwrap()),
-        open_options.clone(),
-    )
-    .expect("encrypted source must authenticate");
-    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, mode).expect("plan");
-    let renumber = RenumberMap::from_plan(&plan);
-
     let mut pdf = Pdf::open_with_options(BufReader::new(File::open(&path).unwrap()), open_options)
         .expect("encrypted source must authenticate");
-    let mut options = WriteOptions::default();
-    options.object_streams = mode;
-    options.stream_data = Some(StreamDataMode::Preserve);
-    options.deterministic_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
-    let mut document =
-        write_linearized(&plan, &renumber, &mut pdf, &options).expect("linearized write");
-    document.back_patch().expect("linearized back-patch");
-    document.bytes
+    let settings = WriterTestSettings {
+        object_streams: mode,
+        stream_data: Some(StreamDataMode::Preserve),
+        deterministic_id: true,
+        preserve_encryption: false,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &settings).expect("linearized write")
 }
 
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
@@ -284,13 +252,14 @@ fn generate_direct_trailer_array_rewrites_removed_generation_to_null() {
     fixture.extend_from_slice(&source[trailer_offset + trailer.len()..]);
 
     let mut pdf = Pdf::open(Cursor::new(fixture)).expect("fixture must open");
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Generate;
-    options.static_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options)
+    write_with_settings(&mut pdf, &mut output, &settings)
         .expect("generate rewrite must remap direct trailer values");
     let rewritten = Pdf::open(Cursor::new(output)).expect("generated output must reopen");
 
@@ -552,23 +521,19 @@ fn linearize_generate_stale_generation_inlines_null_without_body() {
 }
 
 #[test]
-fn linearize_generate_drops_stale_live_generation_from_plan() {
+fn linearize_generate_handles_replaced_objstm_source() {
     let source = include_bytes!("../../../tests/fixtures/compat/null-visible-stale-generation.pdf");
     let mut pdf = Pdf::open(Cursor::new(source.as_slice())).expect("fixture must open");
     pdf.set_object(ObjectRef::new(4, 0), Object::Dictionary(Default::default()));
 
-    let plan =
-        LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, ObjectStreamMode::Generate)
-            .expect("generate plan");
-    let renumber = RenumberMap::from_plan(&plan);
-    let mut options = WriteOptions::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.deterministic_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
-
-    let mut document = write_linearized(&plan, &renumber, &mut pdf, &options)
+    let settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &settings)
         .expect("stale live generation must be directized before duplicate-generation rejection");
-    document.back_patch().expect("back-patch linearized output");
 }
 
 #[test]
@@ -594,31 +559,6 @@ fn linearize_preserve_source_objstm_removes_only_stale_generation() {
         ),
         "null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf",
     );
-}
-
-#[test]
-fn legacy_disable_plan_with_default_preserve_rebuilds_to_qpdf_layout() {
-    let actual =
-        linearize_legacy_bool_result("null-visible-stale-generation-objstm.pdf", false, None)
-            .expect("writer must reconcile the legacy disable plan with default Preserve");
-    assert_golden(
-        &actual,
-        "null-visible-stale-generation-objstm/linearize-objstm-preserve.pdf",
-    );
-}
-
-#[test]
-fn legacy_bool_plans_matching_explicit_writer_modes_remain_stable() {
-    for (use_generate, mode) in [
-        (false, ObjectStreamMode::Disable),
-        (true, ObjectStreamMode::Generate),
-    ] {
-        let actual =
-            linearize_legacy_bool_result("three-page-objstm.pdf", use_generate, Some(mode))
-                .expect("legacy plan with matching writer mode");
-        let expected = linearize_mode("three-page-objstm.pdf", mode);
-        assert_eq!(actual, expected, "{mode:?} legacy/mode-aware drift");
-    }
 }
 
 #[test]
@@ -881,7 +821,7 @@ fn preserve_empty_qpdf_plan_does_not_repack_signature() {
                         Some(Object::Name(name)) if name.as_slice() == b"ObjStm"
                     )
             )),
-        "an empty qpdf Preserve plan is authoritative; the legacy planner must not repack /Sig"
+        "an empty qpdf Preserve plan is authoritative; the writer must not repack /Sig"
     );
     assert!(
         reopened
@@ -1009,12 +949,13 @@ fn preserve_explicit_structural_deletion_keeps_source_container_over_100_members
     // ObjStm members.
     pdf.delete_object(ObjectRef::new(107, 0));
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Preserve;
-    options.static_id = true;
+    let settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+    write_with_settings(&mut pdf, &mut out, &settings).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let mut member_counts = Vec::new();
