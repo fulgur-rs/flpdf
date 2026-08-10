@@ -7552,8 +7552,9 @@ mod tests {
 
     /// With `encrypt_metadata = false` the `/Catalog`'s
     /// `/Metadata` stream is left UNENCRYPTED (its bytes survive in the clear)
-    /// and tagged `/Crypt`, and the `/Encrypt` dict carries `/EncryptMetadata
-    /// false` — whereas the default (`encrypt_metadata = true`) ciphers it.
+    /// without a `/Crypt` filter, and the `/Encrypt` dict carries
+    /// `/EncryptMetadata false` — whereas the default (`encrypt_metadata = true`)
+    /// ciphers it.
     #[test]
     fn cleartext_metadata_exempts_metadata_stream_from_encryption() {
         use std::io::Cursor;
@@ -7586,8 +7587,8 @@ mod tests {
             "default encrypt must cipher the /Metadata stream"
         );
 
-        // --cleartext-metadata: the XMP marker survives in the clear, the dict
-        // emits /EncryptMetadata false, and the stream is tagged /Crypt.
+        // --cleartext-metadata: the XMP marker survives in the clear and the
+        // dict emits /EncryptMetadata false without adding a /Crypt filter.
         let ct = encrypt(false);
         assert!(
             contains(&ct, MARKER),
@@ -7598,8 +7599,8 @@ mod tests {
             "the /Encrypt dict must carry /EncryptMetadata false"
         );
         assert!(
-            contains(&ct, b"/Crypt"),
-            "the exempt /Metadata stream must be tagged with a /Crypt filter"
+            !contains(&ct, b"/Crypt"),
+            "cleartext /Metadata must not be tagged with a /Crypt filter"
         );
     }
 
