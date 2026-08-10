@@ -8,8 +8,10 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineResult};
 use flpdf::{
-    apply_stream_compress_policy, pages, write_pdf, write_qdf, CompressStreams, DecodeLevel,
-    Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, QPDFWriter, Stream, StreamDataMode,
+    apply_stream_compress_policy, pages, write_pdf, write_pdf_with_options, write_qdf,
+    CompressStreams, CopyEncryptionSource, DecodeLevel, Dictionary, EncryptParams, Object,
+    ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, QPDFWriter, Stream,
+    StreamDataMode, WriteOptions,
 };
 
 #[derive(Clone)]
@@ -236,10 +238,13 @@ fn synthetic_null_filter_contents_pdf() -> Vec<u8> {
     bytes
 }
 
-fn direct_content_stream() -> Stream {
+fn direct_content_stream(payload: &[u8]) -> Stream {
     let mut dict = Dictionary::new();
-    dict.insert("Length", Object::Integer(3));
-    Stream::new(dict, b"A\rB".to_vec())
+    dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(payload.len()).expect("small direct content stream")),
+    );
+    Stream::new(dict, payload.to_vec())
 }
 
 fn page_object(contents: Object) -> Object {
@@ -262,12 +267,11 @@ fn page_object(contents: Object) -> Object {
 
 fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
-    let direct_stream = direct_content_stream();
 
     // Page 3: direct /Contents Stream.
     pdf.set_object(
         ObjectRef::new(3, 0),
-        page_object(Object::Stream(direct_stream.clone())),
+        page_object(Object::Stream(direct_content_stream(b"P3\rD"))),
     );
 
     // Page 5: direct /Contents array whose element is ref -> ref -> Stream.
@@ -281,12 +285,17 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
         ObjectRef::new(11, 0),
         Object::Reference(ObjectRef::new(12, 0)),
     );
-    pdf.set_object(ObjectRef::new(12, 0), Object::Stream(direct_stream.clone()));
+    pdf.set_object(
+        ObjectRef::new(12, 0),
+        Object::Stream(direct_content_stream(b"P5\rR")),
+    );
 
     // Page 6: direct /Contents array containing a direct Stream.
     pdf.set_object(
         ObjectRef::new(6, 0),
-        page_object(Object::Array(vec![Object::Stream(direct_stream.clone())])),
+        page_object(Object::Array(vec![Object::Stream(direct_content_stream(
+            b"P6\rD",
+        ))])),
     );
 
     // Page 4: /Contents ref -> ref -> Stream.
@@ -298,7 +307,10 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
         ObjectRef::new(8, 0),
         Object::Reference(ObjectRef::new(9, 0)),
     );
-    pdf.set_object(ObjectRef::new(9, 0), Object::Stream(direct_stream.clone()));
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Stream(direct_content_stream(b"P4\rR")),
+    );
 
     // Page 7: /Contents ref -> ref -> Array containing a direct Stream and
     // an array element ref -> ref -> Stream.
@@ -308,16 +320,23 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
     );
     pdf.set_object(
         ObjectRef::new(13, 0),
-        Object::Array(vec![
-            Object::Stream(direct_stream.clone()),
-            Object::Reference(ObjectRef::new(14, 0)),
-        ]),
+        Object::Reference(ObjectRef::new(14, 0)),
     );
     pdf.set_object(
         ObjectRef::new(14, 0),
-        Object::Reference(ObjectRef::new(15, 0)),
+        Object::Array(vec![
+            Object::Stream(direct_content_stream(b"P7\rD")),
+            Object::Reference(ObjectRef::new(15, 0)),
+        ]),
     );
-    pdf.set_object(ObjectRef::new(15, 0), Object::Stream(direct_stream));
+    pdf.set_object(
+        ObjectRef::new(15, 0),
+        Object::Reference(ObjectRef::new(16, 0)),
+    );
+    pdf.set_object(
+        ObjectRef::new(16, 0),
+        Object::Stream(direct_content_stream(b"P7\rR")),
+    );
 
     let pages_ref = ObjectRef::new(2, 0);
     let mut pages = pdf.resolve(pages_ref)?.clone();
@@ -363,6 +382,58 @@ fn attach_flate_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> Obje
         .insert("Metadata", Object::Reference(metadata_ref));
     pdf.set_object(root_ref, catalog);
     metadata_ref
+}
+
+fn attach_plain_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> ObjectRef {
+    let metadata_ref = ObjectRef::new(20, 0);
+    let mut metadata_dict = Dictionary::new();
+    metadata_dict.insert("Type", Object::Name(b"Metadata".to_vec()));
+    metadata_dict.insert("Subtype", Object::Name(b"XML".to_vec()));
+    metadata_dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(payload.len()).expect("small metadata fixture")),
+    );
+    pdf.set_object(
+        metadata_ref,
+        Object::Stream(Stream::new(metadata_dict, payload.to_vec())),
+    );
+    let root_ref = pdf.root_ref().expect("catalog reference");
+    let mut catalog = pdf.resolve(root_ref).expect("catalog must resolve").clone();
+    catalog
+        .as_dict_mut()
+        .expect("catalog dictionary")
+        .insert("Metadata", Object::Reference(metadata_ref));
+    pdf.set_object(root_ref, catalog);
+    metadata_ref
+}
+
+fn copy_encryption_source_from_donor(donor: &mut Pdf<Cursor<Vec<u8>>>) -> CopyEncryptionSource {
+    let encrypt_ref = donor
+        .trailer()
+        .get_ref("Encrypt")
+        .expect("encrypted donor must have /Encrypt");
+    let encrypt_dict = donor
+        .resolve(encrypt_ref)
+        .expect("donor /Encrypt must resolve")
+        .as_dict()
+        .expect("donor /Encrypt must be a dictionary")
+        .clone();
+    let id0 = donor
+        .trailer()
+        .get("ID")
+        .and_then(Object::as_array)
+        .and_then(|ids| ids.first())
+        .and_then(Object::as_string)
+        .expect("encrypted donor must have /ID[0]")
+        .to_vec();
+    CopyEncryptionSource {
+        encrypt_dict,
+        file_key: donor
+            .encryption_file_key()
+            .expect("authenticated donor must expose file key"),
+        id0,
+        object_key_alg: ObjectKeyAlg::Aes,
+    }
 }
 
 fn metadata_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
@@ -601,7 +672,7 @@ fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     assert_eq!(terminal_refs[1], vec![Some(ObjectRef::new(9, 0))]);
     assert_eq!(terminal_refs[2], vec![Some(ObjectRef::new(12, 0))]);
     assert_eq!(terminal_refs[3], vec![None]);
-    assert_eq!(terminal_refs[4], vec![None, Some(ObjectRef::new(15, 0))]);
+    assert_eq!(terminal_refs[4], vec![None, Some(ObjectRef::new(16, 0))]);
 
     let mut writer = QPDFWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
@@ -613,14 +684,123 @@ fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     // cannot be reopened by qpdf as indirect PDF stream objects. Inspect the
     // emitted QDF bytes here; the ordinary indirect fixture tests above and
     // below retain qpdf --check coverage for valid serialized PDFs.
-    assert!(!contains_bytes(&output, b"A\rB"));
-    assert_eq!(
-        output
-            .windows(3)
-            .filter(|window| *window == b"A\nB")
-            .count(),
-        6
+    for (shape, normalized) in [
+        ("direct Stream", b"P3\nD".as_slice()),
+        ("ref -> ref -> Stream", b"P4\nR".as_slice()),
+        ("array element ref -> ref -> Stream", b"P5\nR".as_slice()),
+        ("direct array element Stream", b"P6\nD".as_slice()),
+        ("ref -> ref -> Array direct Stream", b"P7\nD".as_slice()),
+        (
+            "ref -> ref -> Array element ref -> ref -> Stream",
+            b"P7\nR".as_slice(),
+        ),
+    ] {
+        assert!(
+            contains_bytes(&output, normalized),
+            "{shape} must be normalized independently"
+        );
+    }
+    assert!(!contains_bytes(&output, b"\r"));
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let password = b"donor-user";
+
+    let mut donor_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    attach_plain_metadata(&mut donor_input, b"donor cleartext metadata");
+    let mut donor_options = WriteOptions::default();
+    donor_options.full_rewrite = true;
+    donor_options.object_streams = ObjectStreamMode::Disable;
+    donor_options.compress_streams = CompressStreams::No;
+    donor_options.static_id = true;
+    donor_options.static_aes_iv = true;
+    let mut params = EncryptParams::v4_aes128(password.to_vec(), password.to_vec());
+    params.encrypt_metadata = false;
+    donor_options.encrypt = Some(params);
+    let mut donor_bytes = Vec::new();
+    write_pdf_with_options(&mut donor_input, &mut donor_bytes, &donor_options)?;
+
+    let mut donor = Pdf::open_with_options(
+        Cursor::new(donor_bytes),
+        PdfOpenOptions {
+            password: password.to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    assert!(
+        !donor
+            .encryption_info()?
+            .expect("donor must be encrypted")
+            .encrypt_metadata
     );
+    let copy_source = copy_encryption_source_from_donor(&mut donor);
+
+    let target_metadata = b"target cleartext metadata";
+    let mut target = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    attach_plain_metadata(&mut target, target_metadata);
+    let mut copy_options = WriteOptions::default();
+    copy_options.full_rewrite = true;
+    copy_options.object_streams = ObjectStreamMode::Disable;
+    copy_options.compress_streams = CompressStreams::No;
+    copy_options.static_aes_iv = true;
+    copy_options.copy_encryption = Some(copy_source);
+    let mut output = Vec::new();
+    write_pdf_with_options(&mut target, &mut output, &copy_options)?;
+
+    assert!(contains_bytes(&output, b"/EncryptMetadata false"));
+    assert!(
+        contains_bytes(&output, target_metadata),
+        "the Catalog /Metadata payload must remain cleartext"
+    );
+    assert!(
+        !contains_bytes(&output, b"/Crypt"),
+        "copy-encryption cleartext metadata must not acquire an Identity Crypt filter"
+    );
+
+    let dir = tempfile::tempdir()?;
+    let encrypted_path = dir.path().join("copied-cleartext-metadata.pdf");
+    let decrypted_path = dir.path().join("copied-cleartext-metadata-decrypted.pdf");
+    std::fs::write(&encrypted_path, &output)?;
+    let check = Command::new("qpdf")
+        .arg("--password=donor-user")
+        .arg("--check")
+        .arg(&encrypted_path)
+        .output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    let decrypt = Command::new("qpdf")
+        .arg("--password=donor-user")
+        .arg("--decrypt")
+        .arg(&encrypted_path)
+        .arg(&decrypted_path)
+        .output()?;
+    assert!(
+        decrypt.status.success(),
+        "qpdf --decrypt failed: {decrypt:?}"
+    );
+
+    let mut reopened = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: password.to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    assert!(reopened.is_encrypted());
+    let rewritten_root_ref = reopened.root_ref().expect("rewritten Catalog reference");
+    let rewritten_metadata_ref = reopened
+        .resolve(rewritten_root_ref)?
+        .as_dict()
+        .expect("rewritten Catalog must be a dictionary")
+        .get_ref("Metadata")
+        .expect("rewritten Catalog must reference metadata");
+    let metadata = reopened.resolve(rewritten_metadata_ref)?.clone();
+    let metadata = metadata.as_stream().expect("metadata must be a stream");
+    assert_eq!(metadata.data, target_metadata);
+    assert_eq!(metadata.dict.get("Filter"), None);
+    assert_eq!(metadata.dict.get("DecodeParms"), None);
     Ok(())
 }
 
