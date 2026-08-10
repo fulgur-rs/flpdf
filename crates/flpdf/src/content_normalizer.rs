@@ -1,7 +1,9 @@
 //! Mirrors qpdf 11.9.0 libqpdf/ContentNormalizer.cc.
 
 use crate::{
-    pipeline::{buffer::Buffer, qpdf_tokenizer::QpdfTokenizer, Pipeline, PipelineResult},
+    pipeline::{
+        buffer::Buffer, qpdf_tokenizer::QpdfTokenizer, Pipeline, PipelineRef, PipelineResult,
+    },
     token_filter::{TokenFilter, TokenFilterOutput},
     tokenizer::{Token, TokenType},
 };
@@ -52,6 +54,89 @@ impl ContentNormalization {
 struct ContentNormalizer {
     any_bad_tokens: bool,
     last_token_was_bad: bool,
+}
+
+/// The qpdf output normalizer as an owned pipeline stage.
+///
+/// `Pl_QPDFTokenizer` keeps a filter instance alive beside its stage in qpdf.
+/// Rust keeps the same relationship inside this stage: the tokenizer is
+/// created for the accumulated input during `finish`, while the normalizer
+/// state and downstream ownership live in one value. This is the output-side
+/// stage used by `ObjectHandle::pipe_stream_data`; the public helper below
+/// remains the small whole-buffer convenience API.
+#[allow(dead_code)]
+pub(crate) struct ContentNormalizerPipeline<'a> {
+    identifier: String,
+    next: PipelineRef<'a>,
+    normalizer: ContentNormalizer,
+    data: Vec<u8>,
+    warning_callback: Option<NormalizerWarningCallback>,
+    finished: bool,
+}
+
+type NormalizerWarningCallback = Box<dyn FnMut(&str) -> PipelineResult<()> + 'static>;
+
+#[allow(dead_code, clippy::type_complexity)]
+impl<'a> ContentNormalizerPipeline<'a> {
+    pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
+        Self {
+            identifier: identifier.into(),
+            next: next.into(),
+            normalizer: ContentNormalizer::default(),
+            data: Vec::new(),
+            warning_callback: None,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn set_warning_callback(&mut self, callback: NormalizerWarningCallback) {
+        self.warning_callback = Some(callback);
+    }
+
+    fn report_warnings(&mut self) -> PipelineResult<()> {
+        if !self.normalizer.any_bad_tokens {
+            return Ok(());
+        }
+        let Some(callback) = self.warning_callback.as_mut() else {
+            return Ok(());
+        };
+        callback("content normalization encountered bad tokens")?;
+        if self.normalizer.last_token_was_bad {
+            callback(
+                "normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents",
+            )?;
+        } // cov:ignore: control-flow marker; the warning branch above is exercised by the owned pipeline test
+        callback(
+            "Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
+        )
+    }
+}
+
+impl Pipeline for ContentNormalizerPipeline<'_> {
+    fn identifier(&self) -> &str {
+        &self.identifier
+    }
+
+    fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+        self.data.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> PipelineResult<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let input = std::mem::take(&mut self.data);
+        let mut tokenizer = QpdfTokenizer::new(
+            self.identifier.clone(),
+            &mut self.normalizer,
+            Some(&mut self.next),
+        );
+        tokenizer.write(&input)?;
+        tokenizer.finish()?;
+        self.report_warnings()
+    }
 }
 
 impl ContentNormalizer {
@@ -156,6 +241,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::Path;
     use std::process::Command;
+    use std::{cell::RefCell, rc::Rc};
     #[cfg(unix)]
     use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -350,6 +436,27 @@ mod tests {
             filter.0,
             vec![TokenType::Word, TokenType::Eof, TokenType::BraceOpen]
         );
+    }
+
+    #[test]
+    fn owned_pipeline_reports_terminal_bad_tokens_and_finishes_only_once() {
+        let mut output = Buffer::new("normalized", None);
+        let warnings = Rc::new(RefCell::new(Vec::new()));
+        let mut normalizer = ContentNormalizerPipeline::new("owned normalizer", &mut output);
+        let warning_sink = Rc::clone(&warnings);
+        normalizer.set_warning_callback(Box::new(move |message| {
+            warning_sink.borrow_mut().push(message.to_owned());
+            Ok(())
+        }));
+
+        assert_eq!(normalizer.identifier(), "owned normalizer");
+        normalizer.write(b"<0g").unwrap();
+        normalizer.finish().unwrap();
+        normalizer.finish().unwrap();
+        drop(normalizer);
+
+        assert_eq!(output.take_buffer().unwrap(), b"<0g");
+        assert_eq!(warnings.borrow().len(), 3);
     }
 
     #[test]

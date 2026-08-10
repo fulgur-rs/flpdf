@@ -1,6 +1,6 @@
 //! qpdf correspondence: Pl_RunLength.cc incremental encode and decode state, output, error, and finish semantics.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RunLengthAction {
@@ -17,7 +17,7 @@ enum State {
 
 pub(crate) struct RunLength<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     action: RunLengthAction,
     state: State,
     length: usize,
@@ -27,12 +27,12 @@ pub(crate) struct RunLength<'a> {
 impl<'a> RunLength<'a> {
     pub(crate) fn new(
         identifier: impl Into<String>,
-        next: &'a mut dyn Pipeline,
+        next: impl Into<PipelineRef<'a>>,
         action: RunLengthAction,
     ) -> Self {
         Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             action,
             state: State::Top,
             length: 0,

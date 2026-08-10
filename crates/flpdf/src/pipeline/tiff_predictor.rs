@@ -2,7 +2,7 @@
 //! It covers horizontal differencing, row buffering, packed samples, and
 //! finish-time padding.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::bit_stream::{BitStream, BitStreamError};
 use crate::bit_writer::BitWriter;
 
@@ -15,7 +15,7 @@ pub(crate) enum TiffPredictorAction {
 /// Incremental TIFF horizontal predictor stage for `/Predictor 2`.
 pub(crate) struct TiffPredictor<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     action: TiffPredictorAction,
     columns: u32,
     bytes_per_row: usize,
@@ -31,7 +31,7 @@ impl<'a> TiffPredictor<'a> {
     /// 32-bit-wrapping row geometry.
     pub(crate) fn new(
         identifier: impl Into<String>,
-        next: &'a mut dyn Pipeline,
+        next: impl Into<PipelineRef<'a>>,
         action: TiffPredictorAction,
         columns: u32,
         samples_per_pixel: u32,
@@ -61,7 +61,7 @@ impl<'a> TiffPredictor<'a> {
 
         Ok(Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             action,
             columns,
             bytes_per_row: bytes_per_row as usize,
@@ -79,7 +79,7 @@ impl<'a> TiffPredictor<'a> {
 
         if self.bits_per_sample != 8 {
             let mut input = BitStream::new(&self.cur_row);
-            let mut writer = BitWriter::new(self.next);
+            let mut writer = BitWriter::new(&mut self.next);
             for _ in 0..self.columns {
                 for previous in &mut self.previous {
                     let sample = input

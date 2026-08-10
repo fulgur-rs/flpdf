@@ -1,6 +1,6 @@
 //! qpdf correspondence: Pl_PNGFilter.cc row geometry, buffer rotation, per-filter decoding, hard-coded Up encoding, partial-row finish, and constructor validation.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PngFilterAction {
@@ -15,7 +15,7 @@ pub(crate) enum PngFilterAction {
 /// decoding, and always emits the Up filter when encoding.
 pub(crate) struct PngFilter<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     action: PngFilterAction,
     bytes_per_row: usize,
     bytes_per_pixel: usize,
@@ -38,7 +38,7 @@ impl<'a> PngFilter<'a> {
     /// additional `> UINT_MAX - 1` guard is unreachable.
     pub(crate) fn new(
         identifier: impl Into<String>,
-        next: &'a mut dyn Pipeline,
+        next: impl Into<PipelineRef<'a>>,
         action: PngFilterAction,
         columns: u32,
         samples_per_pixel: u32,
@@ -78,7 +78,7 @@ impl<'a> PngFilter<'a> {
 
         Ok(Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             action,
             bytes_per_row,
             bytes_per_pixel: bytes_per_pixel as usize,
@@ -160,7 +160,7 @@ impl<'a> PngFilter<'a> {
         } else {
             (&self.buf2, &self.buf1)
         };
-        let next = &mut *self.next;
+        let next = &mut self.next;
 
         next.write(&[2])?;
         if has_prev {

@@ -1,10 +1,10 @@
 //! qpdf correspondence: Pl_ASCIIHexDecoder.cc incremental decode state, output, error, and finish semantics.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 
 pub(crate) struct AsciiHexDecoder<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     inbuf: [u8; 2],
     pos: usize,
     eod: bool,
@@ -12,10 +12,10 @@ pub(crate) struct AsciiHexDecoder<'a> {
 
 #[allow(dead_code)]
 impl<'a> AsciiHexDecoder<'a> {
-    pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
+    pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             inbuf: *b"00",
             pos: 0,
             eod: false,
