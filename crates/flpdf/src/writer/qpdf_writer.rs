@@ -138,7 +138,29 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 
     pub fn set_stream_data_mode(&mut self, mode: StreamDataMode) {
-        self.settings.stream_data_mode = Some(mode);
+        // QPDFWriter's stream-data setters are state transitions, not a
+        // late override layered on top of setDecodeLevel/setCompressStreams.
+        // QPDFWriter.cc raises the decode floor for uncompress/compress,
+        // clears it for preserve, and toggles compression at the same time.
+        // Keep the translated state in the ordinary settings fields so setter
+        // order has the same observable result as qpdf.
+        self.settings.stream_data_mode = None;
+        match mode {
+            StreamDataMode::Preserve => {
+                self.settings.decode_level = DecodeLevel::None;
+                self.settings.compress_streams = false;
+            }
+            StreamDataMode::Uncompress => {
+                self.settings.decode_level =
+                    self.settings.decode_level.max(DecodeLevel::Generalized);
+                self.settings.compress_streams = false;
+            }
+            StreamDataMode::Compress => {
+                self.settings.decode_level =
+                    self.settings.decode_level.max(DecodeLevel::Generalized);
+                self.settings.compress_streams = true;
+            }
+        }
     }
 
     pub fn set_compress_streams(&mut self, value: bool) {
@@ -305,8 +327,6 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     pub fn validate_supported_settings(&self) -> Result<()> {
         let unsupported = if self.settings.content_normalization {
             Some("content normalization")
-        } else if self.settings.decode_level != DecodeLevel::Generalized {
-            Some("non-generalized decode levels")
         } else if !self.settings.extra_header_text.is_empty() {
             Some("extra header text")
         } else if self.settings.linearization

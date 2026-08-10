@@ -13,7 +13,7 @@ use super::{
 /// This is the writer setting counterpart to qpdf's stream decode level. It
 /// is intentionally distinct from the JSON inspection enum with the same
 /// qpdf spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum DecodeLevel {
     /// Keep stream data encoded.
     None,
@@ -103,6 +103,10 @@ impl WriterSettings {
             } else {
                 CompressStreams::No
             },
+            decode_level: self.decode_level,
+            // QPDFWriter translates set_stream_data_mode into compress/decode
+            // state. Keep this bridge field clear so the legacy effective
+            // policy cannot override the qpdf setter ordering.
             stream_data: self.stream_data_mode,
             recompress_flate: self.recompress_flate,
             qdf: self.qdf_mode,

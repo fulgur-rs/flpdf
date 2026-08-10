@@ -240,6 +240,13 @@ impl V5Randomness {
 #[non_exhaustive]
 #[derive(Debug, Default, Clone)]
 pub struct WriteOptions {
+    /// Stream decode level used by the qpdf-shaped writer bridge.
+    ///
+    /// The legacy free APIs retain qpdf's generalized default.  A filter
+    /// chain that is not wholly decodable at this level is preserved as a
+    /// whole, matching QPDF_Stream's all-or-nothing filterability decision.
+    pub decode_level: DecodeLevel,
+
     /// Override the trailer `/ID`'s second element (the changing identifier)
     /// with qpdf's static-id constant — the first 32 hex digits of π. The
     /// first element (the permanent identifier) is preserved from the input
@@ -3020,7 +3027,11 @@ pub(crate) fn reencode_stream_for_compress(
             stream.dict.insert("Length", Object::Integer(len));
             Object::Stream(stream)
         }
-        Some(compress_policy) => apply_stream_compress_policy(&stream, compress_policy),
+        Some(compress_policy) => apply_stream_compress_policy_with_decode_level(
+            &stream,
+            compress_policy,
+            options.decode_level,
+        ),
         // Preserve mode: keep the raw bytes verbatim (no decode/re-encode), but
         // still normalize /Length to a direct integer of the raw byte count.
         // qpdf direct-izes EVERY stream's /Length even under --stream-data=preserve
@@ -4470,7 +4481,28 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
 /// toggle.
 /// See [`CompressStreams`] for the full policy statement.
 pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStreams) -> Object {
+    apply_stream_compress_policy_with_decode_level(stream, policy, DecodeLevel::Generalized)
+}
+
+fn apply_stream_compress_policy_with_decode_level(
+    stream: &crate::Stream,
+    policy: CompressStreams,
+    decode_level: DecodeLevel,
+) -> Object {
+    if !filter_chain_is_decodable(stream.dict.get("Filter"), policy, decode_level) {
+        let mut dict = stream.dict.clone();
+        dict.insert(
+            "Length",
+            Object::Integer(i64::try_from(stream.data.len()).unwrap_or(i64::MAX)),
+        );
+        return Object::Stream(crate::Stream::new(dict, stream.data.clone()));
+    }
+
     // Decode the stream through whatever filters are declared in its dict.
+    // `decode_stream_data` is also the single owner of `/DecodeParms` shape
+    // alignment and per-filter parameter validation. Keep that validation in
+    // the existing decoder instead of duplicating QPDF_Stream::filterable's
+    // parser here; any resulting Err takes the raw-preservation fallback below.
     let decoded = match filters::decode_stream_data(&stream.dict, &stream.data) {
         Ok(d) => d,
         Err(_) => {
@@ -4538,17 +4570,59 @@ pub fn apply_stream_compress_policy(stream: &crate::Stream, policy: CompressStre
     }
 }
 
-/// Whether a stream's `/Filter` value is a lone `/FlateDecode` — either the
-/// bare name `/FlateDecode` or a single-element array `[ /FlateDecode ]`. PDF
-/// permits both forms (ISO 32000-1 §7.3.8.2), and qpdf preserves such streams
-/// (does not re-filter them), so the stream-dict key ordering must treat both
-/// the same way.
+/// Apply qpdf's decode-level gate to the entire filter chain. qpdf does not
+/// partially decode a chain: one filter above the selected level, or one
+/// filter it cannot filter, makes the complete chain non-filterable.
+///
+/// `QPDF_Stream.cc:504-512,537-542` makes one important distinction: a
+/// compress request supplies `qpdf_ef_compress`, so generalized filters are
+/// filterable even at decode level `none`; an uncompress request at `none`
+/// preserves them. Specialized filters remain gated by the selected level in
+/// either policy.
+fn filter_chain_is_decodable(
+    filter: Option<&Object>,
+    policy: CompressStreams,
+    decode_level: DecodeLevel,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let filters = match filter {
+        Object::Name(_) => std::slice::from_ref(filter),
+        Object::Array(filters) => filters.as_slice(),
+        _ => return false,
+    };
+
+    filters.iter().all(|filter| {
+        let Some(name) = filter.as_name() else {
+            return false;
+        };
+        let name = match name {
+            b"Fl" => b"FlateDecode".as_slice(),
+            b"LZW" => b"LZWDecode".as_slice(),
+            b"A85" => b"ASCII85Decode".as_slice(),
+            b"AHx" => b"ASCIIHexDecode".as_slice(),
+            b"RL" => b"RunLengthDecode".as_slice(),
+            name => name,
+        };
+        match name {
+            b"FlateDecode" | b"LZWDecode" | b"ASCII85Decode" | b"ASCIIHexDecode" => {
+                !matches!(decode_level, DecodeLevel::None) || policy == CompressStreams::Yes
+            }
+            b"RunLengthDecode" => {
+                matches!(decode_level, DecodeLevel::Specialized | DecodeLevel::All)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Whether a stream's `/Filter` value is a lone `/FlateDecode` bare name.
+/// qpdf's `QPDFWriter.cc:1265-1269` fast path recognizes the name form
+/// (including qpdf's `/Fl` abbreviation), but not a single-element array.
 pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
     match filter {
-        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode",
-        Some(Object::Array(items)) => {
-            matches!(items.as_slice(), [Object::Name(name)] if name.as_slice() == b"FlateDecode")
-        }
+        Some(Object::Name(name)) => name.as_slice() == b"FlateDecode" || name.as_slice() == b"Fl",
         _ => false,
     }
 }
