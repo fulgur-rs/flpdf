@@ -2338,8 +2338,8 @@ pub(crate) struct EncryptionContext {
     /// Whether the `/Metadata` stream is encrypted alongside the rest of the
     /// document (mirrors [`crate::EncryptParams::encrypt_metadata`]). When `false`
     /// (qpdf `--cleartext-metadata`, V=4/V=5 only), the `/Metadata` stream in
-    /// [`metadata_ref`](Self::metadata_ref) is left in the clear and tagged
-    /// with `/Crypt /Identity` instead of being run through the cipher.
+    /// [`metadata_ref`](Self::metadata_ref) is left in the clear instead of
+    /// being run through the cipher.
     pub(crate) encrypt_metadata: bool,
     /// Indirect reference of the document `/Catalog`'s `/Metadata` stream, when
     /// one exists AND `encrypt_metadata` is `false`. Used by the emission loop
@@ -3981,17 +3981,6 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 if emit_ref != ctx.encrypt_ref {
                     if let Object::Stream(ref mut s) = reencoded {
                         if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*old_ref) {
-                            // Explicit --cleartext-metadata uses qpdf's
-                            // `/Crypt /Identity` marker. A copied donor with
-                            // `/EncryptMetadata false` already carries the
-                            // donor's cleartext policy and qpdf does not add
-                            // that marker on the rewritten stream.
-                            if options.copy_encryption.is_none() {
-                                crate::security::standard::prepend_crypt_filter_to_stream_dict(
-                                    &mut s.dict,
-                                    b"Identity",
-                                );
-                            }
                             // /Length stays as the un-encrypted byte count.
                         } else {
                             encrypt_stream_payload_for_writer(emit_ref, s, ctx)?;

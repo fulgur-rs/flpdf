@@ -924,19 +924,8 @@ fn qpdf_writer_standard_encryption_false_keeps_metadata_cleartext() -> flpdf::Re
     let metadata = reopened.resolve(metadata_ref)?.clone();
     let metadata = metadata.as_stream().expect("metadata must be a stream");
     assert_eq!(metadata.data, metadata_payload);
-    assert_eq!(
-        metadata.dict.get("Filter"),
-        Some(&Object::Name(b"Crypt".to_vec()))
-    );
-    assert_eq!(
-        metadata.dict.get("DecodeParms"),
-        Some(&Object::Dictionary({
-            let mut dict = Dictionary::new();
-            dict.insert("Name", Object::Name(b"Identity".to_vec()));
-            dict.insert("Type", Object::Name(b"CryptFilterDecodeParms".to_vec()));
-            dict
-        }))
-    );
+    assert_eq!(metadata.dict.get("Filter"), None);
+    assert_eq!(metadata.dict.get("DecodeParms"), None);
     Ok(())
 }
 
