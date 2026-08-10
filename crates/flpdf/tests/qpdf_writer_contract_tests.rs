@@ -292,7 +292,7 @@ fn set_output_pipeline_writes_and_finishes_once() -> flpdf::Result<()> {
     writer.write()?;
 
     let output = bytes.borrow();
-    assert!(*writes.borrow() >= 1);
+    assert_eq!(*writes.borrow(), 1);
     assert_eq!(*finishes.borrow(), 1);
     assert!(output.starts_with(b"%PDF-"));
     assert!(!output.windows(5).any(|window| window == b"/Prev"));
