@@ -2,8 +2,7 @@
 
 use flpdf::{
     acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
-    signature_rewrite_impact, strip_signature_values, write_pdf, write_pdf_with_options, Object,
-    ObjectRef, Pdf, SignatureWriteMode, WriteOptions, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+    strip_signature_values, Object, ObjectRef, Pdf, QPDFWriter, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
     SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 use std::collections::BTreeMap;
@@ -436,49 +435,12 @@ fn sig_flags_absent_without_acroform() {
 }
 
 #[test]
-fn impact_surfaces_sig_flags_and_append_only() {
-    let mut pdf = open(build_signed_acroform_pdf());
-
-    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::Incremental).unwrap();
-
-    assert_eq!(impact.sig_flags, Some(3));
-    assert!(impact.signatures_exist());
-    assert!(impact.append_only());
-}
-
-#[test]
-fn impact_without_acroform_has_no_sig_flags() {
-    let mut pdf = open(build_unsigned_pdf());
-
-    let impact = signature_rewrite_impact(&mut pdf, SignatureWriteMode::FullRewrite).unwrap();
-
-    assert_eq!(impact.sig_flags, None);
-    assert!(!impact.signatures_exist());
-    assert!(!impact.append_only());
-}
-
-#[test]
 fn full_rewrite_round_trip_preserves_sig_flags() {
     let mut pdf = open(build_signed_acroform_pdf());
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    // The full-rewrite path proceeds on signed PDFs (qpdf-compatible; the
-    // signed-rewrite refusal was removed pre-v1.0). This exercises the
-    // SigFlags-preservation path through that rewrite.
-
-    let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
-
-    let mut reopened = open(out);
-    assert_eq!(acroform_sig_flags(&mut reopened).unwrap(), Some(3));
-}
-
-#[test]
-fn incremental_round_trip_preserves_sig_flags() {
-    let mut pdf = open(build_signed_acroform_pdf());
-
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let out = writer.get_buffer().unwrap();
 
     let mut reopened = open(out);
     assert_eq!(acroform_sig_flags(&mut reopened).unwrap(), Some(3));

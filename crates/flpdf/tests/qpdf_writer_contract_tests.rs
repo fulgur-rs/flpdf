@@ -9,11 +9,13 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineResult};
 use flpdf::{
-    apply_stream_compress_policy, pages, write_pdf, write_pdf_with_options, write_qdf,
-    CompressStreams, CopyEncryptionSource, DecodeLevel, Dictionary, EncryptParams, Object,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf, PdfOpenOptions, QPDFWriter, Stream,
-    StreamDataMode, WriteOptions, XrefEntry,
+    apply_stream_compress_policy, pages, CompressStreams, CopyEncryptionSource, DecodeLevel,
+    Dictionary, EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf,
+    PdfOpenOptions, QPDFWriter, Stream, StreamDataMode, XrefEntry,
 };
+
+mod common;
+use common::{write_with_settings, WriterTestSettings};
 
 #[derive(Clone)]
 struct SharedBytes(Rc<RefCell<Vec<u8>>>);
@@ -840,15 +842,16 @@ fn qpdf_writer_linearization_preserves_authenticated_source_encryption() -> flpd
     qpdf_11_9_0()?;
     let password = b"linearize-source".to_vec();
     let mut source_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
-    let mut source_options = WriteOptions::default();
-    source_options.full_rewrite = true;
-    source_options.object_streams = ObjectStreamMode::Disable;
-    source_options.compress_streams = CompressStreams::No;
-    source_options.static_id = true;
-    source_options.static_aes_iv = true;
-    source_options.encrypt = Some(EncryptParams::v4_aes128(password.clone(), password.clone()));
+    let source_settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        static_id: true,
+        static_aes_iv: true,
+        encrypt: Some(EncryptParams::v4_aes128(password.clone(), password.clone())),
+        ..WriterTestSettings::default()
+    };
     let mut encrypted_source = Vec::new();
-    write_pdf_with_options(&mut source_input, &mut encrypted_source, &source_options)?;
+    write_with_settings(&mut source_input, &mut encrypted_source, &source_settings)?;
     let mut source = Pdf::open_with_options(
         Cursor::new(encrypted_source),
         PdfOpenOptions {
@@ -924,13 +927,37 @@ fn qpdf_writer_linearization_supports_encryption_with_object_streams() -> flpdf:
 #[test]
 fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
-    let source = std::fs::read("../../tests/fixtures/minimal.pdf")?;
-    let mut incremental_pdf = Pdf::open(Cursor::new(source))?;
-    let root_ref = incremental_pdf.root_ref().expect("minimal.pdf has /Root");
-    let root = incremental_pdf.resolve(root_ref)?;
-    incremental_pdf.set_object(root_ref, root);
-    let mut incremental = Vec::new();
-    write_pdf(&mut incremental_pdf, &mut incremental)?;
+    // Build the source revision directly. qpdf has no incremental writer, so
+    // this test must not use the removed flpdf append-only route merely to
+    // manufacture a `/Prev` chain.
+    let mut incremental = std::fs::read("../../tests/fixtures/minimal.pdf")?;
+    let marker = b"startxref\n";
+    let marker_offset = incremental
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+        .expect("minimal.pdf has startxref");
+    let previous_xref: u64 = std::str::from_utf8(
+        &incremental[marker_offset + marker.len()..]
+            .split(|byte| *byte == b'\n')
+            .next()
+            .expect("minimal.pdf has startxref value"),
+    )
+    .map_err(|error| flpdf::Error::Unsupported(format!("invalid fixture startxref: {error}")))?
+    .trim()
+    .parse()
+    .map_err(|error| flpdf::Error::Unsupported(format!("invalid fixture startxref: {error}")))?;
+    if !incremental.ends_with(b"\n") {
+        incremental.push(b'\n');
+    }
+    let root_offset = incremental.len();
+    incremental.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let xref_offset = incremental.len();
+    incremental.extend_from_slice(
+        format!(
+            "xref\n1 1\n{root_offset:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
     assert!(incremental.windows(5).any(|window| window == b"/Prev"));
 
     let mut rewritten_pdf = Pdf::open(Cursor::new(incremental))?;
@@ -953,13 +980,18 @@ fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Res
 }
 
 #[test]
-fn legacy_write_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
+fn qpdf_writer_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
     )))?;
     let mut output = Vec::new();
-    write_qdf(&mut pdf, &mut output)?;
+    let settings = WriterTestSettings {
+        qdf: true,
+        object_streams: ObjectStreamMode::Disable,
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings)?;
     assert_qpdf_check(&output)?;
 
     let (filter, data) = runlength_contents_snapshot(output);
@@ -1048,17 +1080,18 @@ fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> fl
 
     let mut donor_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     attach_plain_metadata(&mut donor_input, b"donor cleartext metadata");
-    let mut donor_options = WriteOptions::default();
-    donor_options.full_rewrite = true;
-    donor_options.object_streams = ObjectStreamMode::Disable;
-    donor_options.compress_streams = CompressStreams::No;
-    donor_options.static_id = true;
-    donor_options.static_aes_iv = true;
+    let mut donor_settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        static_id: true,
+        static_aes_iv: true,
+        ..WriterTestSettings::default()
+    };
     let mut params = EncryptParams::v4_aes128(password.to_vec(), password.to_vec());
     params.encrypt_metadata = false;
-    donor_options.encrypt = Some(params);
+    donor_settings.encrypt = Some(params);
     let mut donor_bytes = Vec::new();
-    write_pdf_with_options(&mut donor_input, &mut donor_bytes, &donor_options)?;
+    write_with_settings(&mut donor_input, &mut donor_bytes, &donor_settings)?;
 
     let mut donor = Pdf::open_with_options(
         Cursor::new(donor_bytes),
@@ -1078,14 +1111,15 @@ fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> fl
     let target_metadata = b"target cleartext metadata";
     let mut target = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     attach_plain_metadata(&mut target, target_metadata);
-    let mut copy_options = WriteOptions::default();
-    copy_options.full_rewrite = true;
-    copy_options.object_streams = ObjectStreamMode::Disable;
-    copy_options.compress_streams = CompressStreams::No;
-    copy_options.static_aes_iv = true;
-    copy_options.copy_encryption = Some(copy_source);
+    let copy_settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        static_aes_iv: true,
+        copy_encryption: Some(copy_source),
+        ..WriterTestSettings::default()
+    };
     let mut output = Vec::new();
-    write_pdf_with_options(&mut target, &mut output, &copy_options)?;
+    write_with_settings(&mut target, &mut output, &copy_settings)?;
 
     assert!(contains_bytes(&output, b"/EncryptMetadata false"));
     assert!(
@@ -1401,17 +1435,21 @@ fn qpdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -
     let password = b"donor-user";
 
     let mut donor_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
-    let mut donor_options = WriteOptions::default();
-    donor_options.full_rewrite = true;
-    donor_options.object_streams = ObjectStreamMode::Disable;
-    donor_options.compress_streams = CompressStreams::No;
-    donor_options.static_id = true;
-    donor_options.static_aes_iv = true;
+    let donor_settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        static_id: true,
+        static_aes_iv: true,
+        ..WriterTestSettings::default()
+    };
     let mut params = EncryptParams::v4_aes128(password.to_vec(), password.to_vec());
     params.encrypt_metadata = true;
-    donor_options.encrypt = Some(params);
+    let donor_settings = WriterTestSettings {
+        encrypt: Some(params),
+        ..donor_settings
+    };
     let mut donor_bytes = Vec::new();
-    write_pdf_with_options(&mut donor_input, &mut donor_bytes, &donor_options)?;
+    write_with_settings(&mut donor_input, &mut donor_bytes, &donor_settings)?;
 
     let mut donor = Pdf::open_with_options(
         Cursor::new(donor_bytes),
@@ -1426,14 +1464,15 @@ fn qpdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -
     let target_metadata = b"target encrypted metadata";
     let mut target = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     attach_plain_metadata(&mut target, target_metadata);
-    let mut copy_options = WriteOptions::default();
-    copy_options.full_rewrite = true;
-    copy_options.object_streams = ObjectStreamMode::Disable;
-    copy_options.compress_streams = CompressStreams::No;
-    copy_options.static_aes_iv = true;
-    copy_options.copy_encryption = Some(copy_source);
+    let copy_settings = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        compress_streams: CompressStreams::No,
+        static_aes_iv: true,
+        copy_encryption: Some(copy_source),
+        ..WriterTestSettings::default()
+    };
     let mut output = Vec::new();
-    write_pdf_with_options(&mut target, &mut output, &copy_options)?;
+    write_with_settings(&mut target, &mut output, &copy_settings)?;
 
     assert!(
         !contains_bytes(&output, target_metadata),

@@ -7,13 +7,16 @@
 //! production-generated document.
 
 use flpdf::{
-    encode_utf16be, format_pdf_date, md5_checksum, write_pdf, Dictionary, EmbeddedFileStream,
-    Error, FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
+    encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error,
+    FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 use std::rc::Rc;
+
+mod common;
+use common::{write_with_settings_and_mapping, WriterTestSettings};
 
 // ── Minimal PDF builder ───────────────────────────────────────────────────────
 
@@ -336,13 +339,19 @@ fn filespec_factory_indirectizes_a_direct_embedded_stream() {
 #[test]
 fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     // This fails if a direct Filespec child needs a document-wide owner scan:
-    // object 7 is malformed but unrelated to the owner at object 8. qpdf
-    // mutates the shared direct child without touching it.
+    // object 7 is malformed but unrelated to the reachable owner at object 8.
+    // qpdf mutates the shared direct child without touching it.
     let mut pdf = open(attachment_pdf_with_malformed_unrelated_object());
     let owner_ref = ObjectRef::new(8, 0);
     let mut owner_dict = Dictionary::new();
     owner_dict.insert("Filespec", Object::Dictionary(Dictionary::new()));
     pdf.set_object(owner_ref, Object::Dictionary(owner_dict));
+    let catalog_ref = pdf.root_ref().expect("fixture has a catalog");
+    let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("fixture catalog must be a dictionary");
+    };
+    catalog.insert("TestOwner", Object::Reference(owner_ref));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     let owner = pdf.get_object_handle(owner_ref);
     pdf.resolve_object_handle(&owner).unwrap();
     let direct_filespec = owner.get_key(b"Filespec");
@@ -351,11 +360,16 @@ fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     filespec.set_description("new description").unwrap();
     drop(filespec);
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).expect("incremental write");
+    let settings = WriterTestSettings {
+        object_streams: flpdf::ObjectStreamMode::Disable,
+        ..WriterTestSettings::default()
+    };
+    let (out, mapping) = write_with_settings_and_mapping(&mut pdf, &settings, &[owner_ref])
+        .expect("qpdf writer output");
+    let owner_output = mapping[&owner_ref];
 
     let mut reopened = open(out);
-    let Object::Dictionary(owner) = reopened.resolve(owner_ref).unwrap() else {
+    let Object::Dictionary(owner) = reopened.resolve(owner_output).unwrap() else {
         panic!("expected owner dictionary");
     };
     let Some(Object::Dictionary(filespec)) = owner.get("Filespec") else {
@@ -1727,9 +1741,36 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
         .build(&mut pdf)
         .expect("build()");
 
-    // Serialize the whole document to PDF bytes.
-    let mut serialized: Vec<u8> = Vec::new();
-    flpdf::writer::write_pdf(&mut pdf, &mut serialized).expect("write_pdf()");
+    // The qpdf-style full rewrite emits reachable objects. Attach the
+    // builder result to the catalog just as a caller would through the
+    // embedded-files name tree before writing the document.
+    let catalog_ref = pdf.root_ref().expect("minimal fixture has a catalog");
+    let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref).unwrap() else {
+        panic!("minimal fixture catalog must be a dictionary");
+    };
+    let mut embedded_files = Dictionary::new();
+    embedded_files.insert(
+        "Names",
+        Object::Array(vec![
+            Object::String(b"nested.pdf".to_vec()),
+            Object::Reference(filespec_ref),
+        ]),
+    );
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Dictionary(embedded_files));
+    catalog.insert("Names", Object::Dictionary(names));
+    pdf.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    // Serialize the whole document to PDF bytes. Keep object streams disabled
+    // so the name token itself is visible in the output bytes.
+    let settings = WriterTestSettings {
+        object_streams: flpdf::ObjectStreamMode::Disable,
+        ..WriterTestSettings::default()
+    };
+    let (serialized, mapping) =
+        write_with_settings_and_mapping(&mut pdf, &settings, &[filespec_ref])
+            .expect("qpdf writer output");
+    let filespec_output = mapping[&filespec_ref];
 
     // The escaped name must appear literally in the byte stream, and the
     // unescaped form must NOT (which would mean the `/` split the token).
@@ -1741,7 +1782,7 @@ fn builder_mimetype_with_slash_round_trips_through_pdf_serialization() {
 
     // Reopen the serialized bytes and read /Subtype back.
     let mut pdf2 = open(serialized);
-    let mut fs = FileSpec::new(pdf2.get_object_handle(filespec_ref), &mut pdf2).unwrap();
+    let mut fs = FileSpec::new(pdf2.get_object_handle(filespec_output), &mut pdf2).unwrap();
     let ef = fs
         .embedded_file()
         .expect("embedded_file()")

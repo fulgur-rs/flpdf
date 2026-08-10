@@ -14,11 +14,14 @@
 
 use flpdf::{
     drop_struct_elem_dangling_pg, merge_documents, rebuild_page_tree, remap_outline_and_dests,
-    write_pdf, LabelRange, LabelStyle, MergeInput, Object, ObjectRef, Pdf,
+    LabelRange, LabelStyle, MergeInput, Object, ObjectRef, Pdf,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::sync::Arc;
+
+mod common;
+use common::{remap_object_refs, write_with_settings_and_mapping, WriterTestSettings};
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
 ///
@@ -134,8 +137,13 @@ fn deep_outline_round_trip_through_write_pdf() {
     let before = before_tree.preorder().count();
     assert_eq!(before, 51, "helper view stops at qpdf's depth boundary");
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let (out, mapping) = write_with_settings_and_mapping(
+        &mut pdf,
+        &WriterTestSettings::default(),
+        &[ObjectRef::new(3, 0)],
+    )
+    .unwrap();
+    let mapped_page = mapping[&ObjectRef::new(3, 0)];
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let tree = reopened.outline().get_tree().unwrap();
@@ -154,7 +162,7 @@ fn deep_outline_round_trip_through_write_pdf() {
         assert_eq!(item.title, format!("L{depth}"));
         assert_eq!(
             item.dest_page(),
-            Object::Reference(ObjectRef::new(3, 0)),
+            Object::Reference(mapped_page),
             "level {depth} must keep its /Dest after the round trip"
         );
         match item.kids.first() {
@@ -249,8 +257,19 @@ fn raw_outline_policy_keys_survive_write_round_trip() {
     let legacy_before = dict_value(&mut pdf, catalog_ref, "Dests");
     let names_before = dict_value(&mut pdf, catalog_ref, "Names");
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let (out, mapping) = write_with_settings_and_mapping(
+        &mut pdf,
+        &WriterTestSettings::default(),
+        &[
+            ObjectRef::new(8, 0),
+            ObjectRef::new(9, 0),
+            ObjectRef::new(20, 0),
+            ObjectRef::new(30, 0),
+        ],
+    )
+    .unwrap();
+    let mapped_policy = mapping[&ObjectRef::new(20, 0)];
+    let mapped_struct_elem = mapping[&ObjectRef::new(30, 0)];
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
     let reopened_catalog_ref = reopened.root_ref().unwrap();
@@ -258,16 +277,20 @@ fn raw_outline_policy_keys_survive_write_round_trip() {
     let names_after = dict_value(&mut reopened, reopened_catalog_ref, "Names");
 
     assert_eq!(
-        legacy_before, legacy_after,
+        legacy_after,
+        Object::Reference(mapping[&ObjectRef::new(8, 0)]),
         "ordinary rewriting must preserve raw /Dests"
     );
     assert_eq!(
-        names_before, names_after,
+        names_after,
+        Object::Reference(mapping[&ObjectRef::new(9, 0)]),
         "ordinary rewriting must preserve raw /Names"
     );
+    assert!(matches!(legacy_before, Object::Reference(_)));
+    assert!(matches!(names_before, Object::Reference(_)));
     assert_eq!(
-        dict_value(&mut reopened, ObjectRef::new(20, 0), "SE"),
-        Object::Reference(ObjectRef::new(30, 0)),
+        dict_value(&mut reopened, mapped_policy, "SE"),
+        Object::Reference(mapped_struct_elem),
         "ordinary rewriting must preserve raw /SE even though no outline /SE policy API remains"
     );
 }
@@ -298,25 +321,31 @@ fn action_chain_pdf() -> Vec<u8> {
 fn action_chain_with_next_round_trips_through_write_pdf() {
     let mut pdf = Pdf::open(Cursor::new(action_chain_pdf())).unwrap();
     let action_refs = [
+        ObjectRef::new(3, 0),
         ObjectRef::new(10, 0),
         ObjectRef::new(11, 0),
         ObjectRef::new(12, 0),
     ];
-    let before: Vec<Object> = action_refs
+    let before: Vec<Object> = action_refs[1..]
         .iter()
         .map(|&reference| pdf.resolve(reference).unwrap())
         .collect();
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let (out, mapping) =
+        write_with_settings_and_mapping(&mut pdf, &WriterTestSettings::default(), &action_refs)
+            .unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let after: Vec<Object> = action_refs
+    let after: Vec<Object> = action_refs[1..]
         .iter()
-        .map(|&reference| reopened.resolve(reference).unwrap())
+        .map(|reference| reopened.resolve(mapping[reference]).unwrap())
         .collect();
+    let mut expected = before.clone();
+    for value in &mut expected {
+        remap_object_refs(value, &mapping);
+    }
     assert_eq!(
-        before, after,
+        expected, after,
         "the raw action dictionaries and /Next links must survive a write_pdf round trip"
     );
 }
@@ -456,8 +485,23 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
         "7 top-level siblings: deep chain root + 5 action items + /SE item"
     );
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let (out, mapping) = write_with_settings_and_mapping(
+        &mut pdf,
+        &WriterTestSettings::default(),
+        &[
+            ObjectRef::new(3, 0),
+            ObjectRef::new(4, 0),
+            ObjectRef::new(8, 0),
+            ObjectRef::new(9, 0),
+            ObjectRef::new(10, 0),
+            ObjectRef::new(50, 0),
+            ObjectRef::new(51, 0),
+            ObjectRef::new(52, 0),
+            ObjectRef::new(61, 0),
+        ],
+    )
+    .unwrap();
+    let mapped_page = mapping[&ObjectRef::new(3, 0)];
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
 
     // -- Deep chain (20 levels) preserved --
@@ -504,7 +548,7 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     }
     assert_eq!(
         action_dict(0).get("D").unwrap().as_array().unwrap()[0],
-        Object::Reference(ObjectRef::new(3, 0))
+        Object::Reference(mapped_page)
     );
     assert_eq!(
         action_dict(1).get("F"),
@@ -548,11 +592,11 @@ fn combined_fixture_round_trips_every_area_through_write_pdf() {
     let catalog_ref = reopened.root_ref().unwrap();
     assert_eq!(
         dict_value(&mut reopened, catalog_ref, "Dests"),
-        Object::Reference(ObjectRef::new(50, 0))
+        Object::Reference(mapping[&ObjectRef::new(50, 0)])
     );
     assert_eq!(
         dict_value(&mut reopened, catalog_ref, "Names"),
-        Object::Reference(ObjectRef::new(51, 0))
+        Object::Reference(mapping[&ObjectRef::new(51, 0)])
     );
 
     // -- /PageLabels preserved --
