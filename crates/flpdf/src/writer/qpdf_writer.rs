@@ -14,6 +14,7 @@ use super::{
     effective_pdf_version, report_progress, write_pdf_full_rewrite, ObjectStreamMode,
     ProgressReporter, StreamDataMode, WriterResult,
 };
+use crate::linearization::writer::write_linearized_for_qpdf_writer;
 
 enum WriterOutput {
     Memory(Option<Vec<u8>>),
@@ -328,10 +329,21 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             ));
         }
         self.validate_supported_settings()?;
-        let options = self.prepared_write_options()?;
+        let mut options = self.prepared_write_options()?;
         self.write_started = true;
-        let mut bytes = Vec::new();
-        let result = write_pdf_full_rewrite(self.pdf, &mut bytes, &options)?;
+        report_progress(&options, 0);
+        let (bytes, result) = if self.settings.linearization {
+            options.qdf = false;
+            let pass1_path = self.settings.linearization_pass1_filename.as_deref();
+            let (mut document, result) =
+                write_linearized_for_qpdf_writer(self.pdf, &options, pass1_path)?;
+            document.back_patch()?;
+            (document.bytes, result)
+        } else {
+            let mut bytes = Vec::new();
+            let result = write_pdf_full_rewrite(self.pdf, &mut bytes, &options)?;
+            (bytes, result)
+        };
 
         self.output
             .as_mut()
@@ -366,22 +378,10 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             .clone())
     }
 
-    /// Reject qpdf settings that the temporary emitter bridge cannot honor.
+    /// Validate the configured qpdf writer state before consuming the output
+    /// lifecycle. Setter combinations that qpdf resolves by precedence are
+    /// normalized in [`Self::prepared_write_options`].
     pub fn validate_supported_settings(&self) -> Result<()> {
-        let unsupported = if self.settings.linearization
-            || self.settings.linearization_pass1_filename.is_some()
-        {
-            Some("linearization")
-        } else {
-            None
-        };
-
-        if let Some(setting) = unsupported {
-            return Err(Error::Unsupported(format!(
-                "{setting} is temporarily not implemented by QPDFWriter"
-            )));
-        }
-
         Ok(())
     }
 
@@ -396,6 +396,11 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     /// `get_final_version` and `write` observe the same plan.
     fn prepared_write_options(&mut self) -> Result<WriteOptions> {
         let mut options = self.settings.to_write_options();
+        if self.settings.linearization {
+            // QPDFWriter::doWriteSetup clears QDF before selecting the
+            // linearized two-pass writer (QPDFWriter.cc:2036-2038).
+            options.qdf = false;
+        }
         if options.pclm {
             // QPDFWriter::doWriteSetup makes PCLm a cleartext, unfiltered
             // output mode before source-encryption preservation is considered.

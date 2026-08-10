@@ -162,6 +162,7 @@ fn append_xref_stream_and_trailer(
         prev: None,
         trailer: Some(&dictionary),
         id: None,
+        encrypt: None,
     };
     let xref_ref = ObjectRef::new(xref_number, 0);
     match &trailer.id {

@@ -742,6 +742,186 @@ fn qpdf_checks_qpdf_writer_memory_output() -> flpdf::Result<()> {
 }
 
 #[test]
+fn qpdf_writer_linearization_is_a_canonical_output_route() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
+    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    assert!(output
+        .windows(b"/Linearized".len())
+        .any(|window| window == b"/Linearized"));
+    let dir = tempfile::tempdir()?;
+    let output_path = dir.path().join("linearized.pdf");
+    std::fs::write(&output_path, output)?;
+    let check = Command::new("qpdf")
+        .arg("--check-linearization")
+        .arg(&output_path)
+        .output()?;
+    assert!(
+        check.status.success(),
+        "qpdf --check-linearization failed: {check:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_linearization_places_extra_header_after_parameter_dictionary() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
+    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_extra_header_text("% linearized-extra");
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let linearized = output
+        .windows(b"/Linearized".len())
+        .position(|window| window == b"/Linearized")
+        .expect("linearization parameter dictionary must be present");
+    let extra = output
+        .windows(b"% linearized-extra\n".len())
+        .position(|window| window == b"% linearized-extra\n")
+        .expect("extra header text must be emitted with a trailing newline");
+    assert!(extra > linearized);
+
+    let dir = tempfile::tempdir()?;
+    let output_path = dir.path().join("linearized-extra-header.pdf");
+    std::fs::write(&output_path, output)?;
+    let check = Command::new("qpdf")
+        .arg("--check-linearization")
+        .arg(&output_path)
+        .output()?;
+    assert!(
+        check.status.success(),
+        "qpdf --check-linearization failed: {check:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_linearization_owns_pass1_and_result_metadata() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
+    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let dir = tempfile::tempdir()?;
+    let pass1_path = dir.path().join("pass1.pdf");
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_linearization_pass1_filename(&pass1_path);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    assert!(!std::fs::read(&pass1_path)?.is_empty());
+    let root = writer
+        .get_renumbered_obj_gen(ObjectRef::new(1, 0))?
+        .expect("linearized Catalog must be present in the result map");
+    let xref = writer.get_written_xref_table()?;
+    let XrefEntry::Uncompressed { offset } = xref
+        .get(&root)
+        .expect("linearized Catalog must have a written xref entry")
+    else {
+        panic!("linearized Catalog must be uncompressed");
+    };
+    assert!(output[*offset as usize..].starts_with(format!("{} 0 obj\n", root.number).as_bytes()));
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_linearization_preserves_authenticated_source_encryption() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let password = b"linearize-source".to_vec();
+    let mut source_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut source_options = WriteOptions::default();
+    source_options.full_rewrite = true;
+    source_options.object_streams = ObjectStreamMode::Disable;
+    source_options.compress_streams = CompressStreams::No;
+    source_options.static_id = true;
+    source_options.static_aes_iv = true;
+    source_options.encrypt = Some(EncryptParams::v4_aes128(password.clone(), password.clone()));
+    let mut encrypted_source = Vec::new();
+    write_pdf_with_options(&mut source_input, &mut encrypted_source, &source_options)?;
+    let mut source = Pdf::open_with_options(
+        Cursor::new(encrypted_source),
+        PdfOpenOptions {
+            password: password.clone(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut writer = QPDFWriter::new(&mut source);
+    writer.set_linearization(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let rewritten = Pdf::open_with_options(
+        Cursor::new(output.clone()),
+        PdfOpenOptions {
+            password: password.clone(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    assert!(rewritten.is_encrypted());
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("linearized-encrypted.pdf");
+    std::fs::write(&path, output)?;
+    let check = Command::new("qpdf")
+        .arg("--password=linearize-source")
+        .arg("--check-linearization")
+        .arg(&path)
+        .output()?;
+    assert!(check.status.success(), "qpdf check failed: {check:?}");
+    assert!(rewritten.root_ref().is_some());
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_linearization_supports_encryption_with_object_streams() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let password = b"linearize-encrypt".to_vec();
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_object_stream_mode(ObjectStreamMode::Generate);
+    writer.set_static_id(true);
+    writer.set_static_aes_iv(true);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(password.clone(), password.clone()));
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let rewritten = Pdf::open_with_options(
+        Cursor::new(output.clone()),
+        PdfOpenOptions {
+            password: password.clone(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    assert!(rewritten.is_encrypted());
+    assert!(output
+        .windows(b"/Type /ObjStm".len())
+        .any(|window| window == b"/Type /ObjStm"));
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("linearized-encrypted-objstm.pdf");
+    std::fs::write(&path, output)?;
+    let check = Command::new("qpdf")
+        .arg("--password=linearize-encrypt")
+        .arg("--check-linearization")
+        .arg(&path)
+        .output()?;
+    assert!(check.status.success(), "qpdf check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
 fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let source = std::fs::read("../../tests/fixtures/minimal.pdf")?;
@@ -1838,6 +2018,28 @@ fn qpdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
     assert_eq!(events.last(), Some(&100));
     assert!(events.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(events.iter().all(|percent| *percent <= 100));
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_linearization_reports_progress_before_sink_completion() -> flpdf::Result<()> {
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
+    let mut pdf = Pdf::open(BufReader::new(file))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let events = events.borrow();
+    assert_eq!(events.first(), Some(&0));
+    assert_eq!(events.last(), Some(&100));
+    assert!(events.iter().any(|percent| (1..=99).contains(percent)));
+    assert!(events.windows(2).all(|pair| pair[0] <= pair[1]));
     Ok(())
 }
 
