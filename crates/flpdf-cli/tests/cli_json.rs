@@ -1411,6 +1411,50 @@ fn one_page_pdf_with_flate_stream(content: &[u8]) -> Vec<u8> {
     pdf
 }
 
+/// One-page PDF whose content stream (object `4 0 R`) is RunLengthDecode-
+/// wrapped. qpdf classifies RunLengthDecode as specialized compression, so
+/// the default generalized JSON decode level must keep the raw bytes and
+/// original filter dictionary.
+fn one_page_pdf_with_run_length_stream(content: &[u8]) -> Vec<u8> {
+    let mut d = Dictionary::new();
+    d.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
+    let encoded = filters::encode_stream_data(&d, content).expect("encode RunLength stream");
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let off1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let off2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+    let off3 = pdf.len();
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>\nendobj\n",
+    );
+    let off4 = pdf.len();
+    pdf.extend_from_slice(
+        format!(
+            "4 0 obj\n<< /Length {} /Filter /RunLengthDecode >>\nstream\n",
+            encoded.len()
+        )
+        .as_bytes(),
+    );
+    pdf.extend_from_slice(&encoded);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    let xref_start = pdf.len();
+    let xref = format!(
+        "xref\n0 5\n\
+         0000000000 65535 f \n\
+         {off1:010} 00000 n \n\
+         {off2:010} 00000 n \n\
+         {off3:010} 00000 n \n\
+         {off4:010} 00000 n \n"
+    );
+    pdf.extend_from_slice(xref.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
 fn one_page_pdf_with_unsupported_stream(content: &[u8]) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let off1 = pdf.len();
@@ -1571,6 +1615,22 @@ fn file_stream_to_dev_full_matches_qpdf_success_and_complete_json() {
 fn filtered_file_stream_json_and_payload_are_qpdf_exact() {
     assert_stream_json_is_qpdf_exact(
         &one_page_pdf_with_flate_stream(b"qpdf filtered file bytes"),
+        "file",
+    );
+}
+
+#[test]
+fn specialized_filter_falls_back_at_generalized_decode_level_json_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_run_length_stream(b"qpdf specialized fallback bytes"),
+        "inline",
+    );
+}
+
+#[test]
+fn specialized_filter_file_falls_back_at_generalized_decode_level_json_exact() {
+    assert_stream_json_is_qpdf_exact(
+        &one_page_pdf_with_run_length_stream(b"qpdf specialized file fallback bytes"),
         "file",
     );
 }

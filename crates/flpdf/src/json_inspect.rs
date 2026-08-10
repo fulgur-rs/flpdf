@@ -939,14 +939,15 @@ impl DecodeLevel {
 ///
 /// - [`DecodeLevel::None`] → the raw filter-encoded bytes, verbatim.
 /// - Any other level → the filter-decoded content, computed via
-///   [`crate::filters::decode_stream_data`].
+///   crate::filters::decode_stream_data when qpdf's filterability and
+///   decode-level gate permit a filter path implemented by flpdf.
 ///
-/// flpdf only implements generalized filters, so `Generalized`, `Specialized`
-/// and `All` are equivalent here (qpdf treats `specialized`/`all` as supersets
-/// of `generalized`). When the filter pipeline cannot decode a stream — e.g. an
-/// unsupported filter such as `DCTDecode` — this falls back to the raw bytes
+/// qpdf leaves specialized and lossy streams raw until the requested decode
+/// level includes them. When the filter pipeline cannot decode a stream — e.g.
+/// an unsupported filter such as DCTDecode — this falls back to the raw bytes
 /// rather than erroring, matching qpdf, which emits the raw payload for filters
-/// it does not decode rather than failing the whole document.
+/// it does not decode rather than failing the whole document. qpdf filter types
+/// not implemented by flpdf, such as DCTDecode, remain raw even at All.
 ///
 /// Returns a [`Cow`] so the raw-bytes paths ([`DecodeLevel::None`] and the
 /// decode-error fallback) borrow `stream.data` instead of copying it — only the
@@ -967,23 +968,44 @@ pub(crate) fn stream_payload_with_decode_status(
     stream: &Stream,
     decode_level: DecodeLevel,
 ) -> StreamPayload<'_> {
-    match decode_level {
-        DecodeLevel::None => StreamPayload {
+    if matches!(decode_level, DecodeLevel::None) {
+        return StreamPayload {
+            bytes: Cow::Borrowed(&stream.data),
+            decode_succeeded: false,
+        };
+    }
+
+    let Some(capabilities) = crate::filters::stream_filter_capabilities(&stream.dict) else {
+        return StreamPayload {
+            bytes: Cow::Borrowed(&stream.data),
+            decode_succeeded: false,
+        };
+    };
+    let can_filter = if decode_level == DecodeLevel::Generalized {
+        !capabilities.specialized_compression && !capabilities.lossy_compression
+    } else if decode_level == DecodeLevel::Specialized {
+        !capabilities.lossy_compression
+    } else {
+        // DecodeLevel::None returned above, so this remaining level is All.
+        true
+    };
+
+    if !can_filter {
+        return StreamPayload {
+            bytes: Cow::Borrowed(&stream.data),
+            decode_succeeded: false,
+        };
+    }
+
+    match crate::filters::decode_stream_data(&stream.dict, &stream.data) {
+        Ok(decoded) => StreamPayload {
+            bytes: Cow::Owned(decoded),
+            decode_succeeded: true,
+        },
+        Err(_) => StreamPayload {
             bytes: Cow::Borrowed(&stream.data),
             decode_succeeded: false,
         },
-        DecodeLevel::Generalized | DecodeLevel::Specialized | DecodeLevel::All => {
-            match crate::filters::decode_stream_data(&stream.dict, &stream.data) {
-                Ok(decoded) => StreamPayload {
-                    bytes: Cow::Owned(decoded),
-                    decode_succeeded: true,
-                },
-                Err(_) => StreamPayload {
-                    bytes: Cow::Borrowed(&stream.data),
-                    decode_succeeded: false,
-                },
-            }
-        }
     }
 }
 
@@ -11167,6 +11189,45 @@ mod tests {
         );
     }
 
+    fn assert_decode_level_none_dict_is_normalized(inner: &[(String, serde_json::Value)]) {
+        let dict = inner
+            .iter()
+            .find(|(key, _)| key == "dict")
+            .map(|(_, value)| value)
+            .expect("stream dict");
+        let pairs = object_pairs(dict);
+        assert!(
+            !pairs.iter().any(|(key, _)| key == "/Length"),
+            "payload emission must remove /Length at DecodeLevel::None"
+        );
+        assert!(
+            pairs.iter().any(|(key, _)| key == "/Filter"),
+            "DecodeLevel::None must preserve /Filter"
+        );
+    }
+
+    #[test]
+    fn stream_data_mode_inline_decode_level_none_normalizes_dict() {
+        let mut pdf = load_one_page_pdf();
+        let inner = get_obj7_stream_inner(&mut pdf, DecodeLevel::None, &StreamDataMode::Inline);
+
+        assert_decode_level_none_dict_is_normalized(&inner);
+    }
+
+    #[test]
+    fn stream_data_mode_file_decode_level_none_normalizes_dict() {
+        let mut pdf = load_one_page_pdf();
+        let temp = tempfile::tempdir().unwrap();
+        let prefix = temp.path().join("out").to_string_lossy().into_owned();
+        let inner = get_obj7_stream_inner(
+            &mut pdf,
+            DecodeLevel::None,
+            &StreamDataMode::File { prefix },
+        );
+
+        assert_decode_level_none_dict_is_normalized(&inner);
+    }
+
     // ── Test 2b: Inline + DecodeLevel::Generalized emits the filter-decoded
     //            content — matching `qpdf --decode-level=generalized`. ───────
 
@@ -11405,6 +11466,74 @@ mod tests {
             &*payload, raw_payload,
             "an undecodable filter must fall back to the raw stream bytes"
         );
+    }
+
+    #[test]
+    fn stream_payload_specialized_filter_obeys_decode_level() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"RunLengthDecode".to_vec()));
+        let raw_payload = b"specialized decode level";
+        let encoded = crate::filters::encode_stream_data(&dict, raw_payload).expect("encode");
+        let stream = Stream::new(dict, encoded.clone());
+
+        let generalized = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        assert!(
+            matches!(generalized.bytes, Cow::Borrowed(_)),
+            "generalized decoding must preserve raw bytes for a specialized stream"
+        );
+        assert!(!generalized.decode_succeeded);
+        assert_eq!(&*generalized.bytes, encoded.as_slice());
+
+        let specialized = stream_payload_with_decode_status(&stream, DecodeLevel::Specialized);
+        assert!(
+            matches!(specialized.bytes, Cow::Owned(_)),
+            "specialized decoding must decode RunLengthDecode"
+        );
+        assert!(specialized.decode_succeeded);
+        assert_eq!(&*specialized.bytes, raw_payload);
+
+        let all = stream_payload_with_decode_status(&stream, DecodeLevel::All);
+        assert!(
+            matches!(all.bytes, Cow::Owned(_)),
+            "all decoding must include specialized filters"
+        );
+        assert!(all.decode_succeeded);
+        assert_eq!(&*all.bytes, raw_payload);
+    }
+
+    #[test]
+    fn stream_payload_decode_error_falls_back_to_raw() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let raw_payload = b"not a deflate stream";
+        let stream = Stream::new(dict, raw_payload.to_vec());
+
+        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        assert!(
+            matches!(payload.bytes, Cow::Borrowed(_)),
+            "a registered filter decode error must borrow the raw bytes"
+        );
+        assert!(!payload.decode_succeeded);
+        assert_eq!(&*payload.bytes, raw_payload);
+    }
+
+    #[test]
+    fn stream_payload_invalid_decode_params_falls_back_to_raw() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(9));
+        dict.insert("DecodeParms", Object::Dictionary(decode_params));
+        let raw_payload = b"not a deflate stream";
+        let stream = Stream::new(dict, raw_payload.to_vec());
+
+        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        assert!(
+            matches!(payload.bytes, Cow::Borrowed(_)),
+            "an unfilterable decode-parameter set must borrow raw bytes"
+        );
+        assert!(!payload.decode_succeeded);
+        assert_eq!(&*payload.bytes, raw_payload);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
