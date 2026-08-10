@@ -1165,7 +1165,7 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// A linearized file repeats `/ID` across the first-page xref-stream dict and
 /// the main xref-stream dict; a file identifier is file-scoped, so both must
 /// carry the *same* value. This function does **not** compute the identifier:
-/// `id0`/`id1` are precomputed by [`write_linearized`] from a digest over a
+/// `id0`/`id1` are precomputed by [`write_linearized_for_pdf_writer`] from a digest over a
 /// reconstruction of qpdf's first write pass (the `det_id` computation; the
 /// pass-1 buffer is built by [`build_pass1_part1`] with qpdf's `writePad`
 /// length-stabilisation). That reconstruction is what reproduces qpdf's
@@ -2804,13 +2804,13 @@ struct CatalogAdbeStatus {
     /// case safely: it mutates the Catalog and THEN builds its
     /// `CatalogFirstRenumber` from the SAME (now-mutated) handle
     /// (`writer.rs:3154-3238`), so a dropped object simply never gets a
-    /// slot. [`write_linearized`] cannot: its `plan`/`renumber` are built
+    /// slot. [`write_linearized_for_pdf_writer`] cannot: its `plan`/`renumber` are built
     /// by the CALLER from a SEPARATE `Pdf` handle BEFORE this function ever
     /// runs (see the doc above the `Optimization::prepare_for_linearized_write`
     /// call below), so an object dropped this way is already counted in
     /// that frozen `plan` and would still be walked and emitted — with its
     /// STALE, now-orphaned, pre-mutation content — a genuine byte
-    /// divergence from qpdf, not a cosmetic one. [`write_linearized`]
+    /// divergence from qpdf, not a cosmetic one. [`write_linearized_for_pdf_writer`]
     /// checks this so any such case is rejected loudly (`Unsupported`)
     /// instead of silently producing wrong bytes.
     orphans_indirect_object: bool,

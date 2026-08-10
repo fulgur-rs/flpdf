@@ -1339,7 +1339,7 @@ pub(crate) enum WriteCipher {
 /// [`WriterOptions::copy_encryption`] is set. Built once via
 /// [`build_encryption_context`] or [`build_copy_encryption_context`] — at the
 /// top of [`emit_canonical_pdf`] for the full-rewrite path, or inside
-/// [`crate::linearization::writer::write_linearized`] for linearized output
+/// [`crate::linearization::writer::write_linearized_for_pdf_writer`] for linearized output
 /// (`--encrypt` only; donor-copy/automatic source preservation are not yet
 /// supported there) —
 /// and consumed by the per-object emission loop + the trailer-build step.
@@ -1385,7 +1385,7 @@ pub(crate) struct EncryptionContext {
 /// Used to exempt the XMP metadata stream from encryption under
 /// `--cleartext-metadata`.
 ///
-/// `pub(crate)`: also used by [`crate::linearization::writer::write_linearized`],
+/// `pub(crate)`: also used by [`crate::linearization::writer::write_linearized_for_pdf_writer`],
 /// which needs the same `--cleartext-metadata` exemption for linearized output.
 pub(crate) fn resolve_metadata_stream_ref<R: Read + Seek>(pdf: &mut Pdf<R>) -> Option<ObjectRef> {
     let root = pdf.root_ref()?;
