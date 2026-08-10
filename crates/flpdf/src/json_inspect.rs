@@ -981,13 +981,13 @@ pub(crate) fn stream_payload_with_decode_status(
             decode_succeeded: false,
         };
     };
-    let can_filter = match decode_level {
-        DecodeLevel::None => false,
-        DecodeLevel::Generalized => {
-            !capabilities.specialized_compression && !capabilities.lossy_compression
-        }
-        DecodeLevel::Specialized => !capabilities.lossy_compression,
-        DecodeLevel::All => true,
+    let can_filter = if decode_level == DecodeLevel::Generalized {
+        !capabilities.specialized_compression && !capabilities.lossy_compression
+    } else if decode_level == DecodeLevel::Specialized {
+        !capabilities.lossy_compression
+    } else {
+        // DecodeLevel::None returned above, so this remaining level is All.
+        true
     };
 
     if !can_filter {
@@ -11491,6 +11491,49 @@ mod tests {
         );
         assert!(specialized.decode_succeeded);
         assert_eq!(&*specialized.bytes, raw_payload);
+
+        let all = stream_payload_with_decode_status(&stream, DecodeLevel::All);
+        assert!(
+            matches!(all.bytes, Cow::Owned(_)),
+            "all decoding must include specialized filters"
+        );
+        assert!(all.decode_succeeded);
+        assert_eq!(&*all.bytes, raw_payload);
+    }
+
+    #[test]
+    fn stream_payload_decode_error_falls_back_to_raw() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let raw_payload = b"not a deflate stream";
+        let stream = Stream::new(dict, raw_payload.to_vec());
+
+        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        assert!(
+            matches!(payload.bytes, Cow::Borrowed(_)),
+            "a registered filter decode error must borrow the raw bytes"
+        );
+        assert!(!payload.decode_succeeded);
+        assert_eq!(&*payload.bytes, raw_payload);
+    }
+
+    #[test]
+    fn stream_payload_invalid_decode_params_falls_back_to_raw() {
+        let mut dict = Dictionary::new();
+        dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(9));
+        dict.insert("DecodeParms", Object::Dictionary(decode_params));
+        let raw_payload = b"not a deflate stream";
+        let stream = Stream::new(dict, raw_payload.to_vec());
+
+        let payload = stream_payload_with_decode_status(&stream, DecodeLevel::Generalized);
+        assert!(
+            matches!(payload.bytes, Cow::Borrowed(_)),
+            "an unfilterable decode-parameter set must borrow raw bytes"
+        );
+        assert!(!payload.decode_succeeded);
+        assert_eq!(&*payload.bytes, raw_payload);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
