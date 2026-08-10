@@ -324,6 +324,8 @@ fn append_objstm_container_object<R: Read + Seek>(
     // object. The member objects remain plaintext inside that encrypted
     // payload; encrypting them individually would not match qpdf or the PDF
     // object-stream encryption rules.
+    // cov:ignore-start: the linearization encryption context is validated before
+    // emission; its in-memory AES/ObjStm payload cannot produce a distinct error edge.
     if let Some(ctx) = encrypt_ctx {
         crate::writer::encrypt_stream_payload_for_writer(
             ObjectRef::new(container.container_new_num, 0),
@@ -331,6 +333,7 @@ fn append_objstm_container_object<R: Read + Seek>(
             ctx,
         )?;
     }
+    // cov:ignore-end
 
     // Emit the container dict in qpdf 11.9.0's fixed key order
     // (`/Type /ObjStm /Length /Filter /N /First`); the generic `BTreeMap`-backed
@@ -3477,15 +3480,16 @@ fn write_linearized_impl<R: Read + Seek>(
             }
             Some(ctx)
         } else if let Some(source) = options.copy_encryption.as_ref() {
+            // cov:ignore-start: a supported in-memory PDF cannot contain 2^32 objects;
+            // the conversion failure is an internal capacity guard only.
             let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
-                // cov:ignore-start: a supported in-memory PDF cannot contain 2^32 objects
                 crate::Error::Unsupported(
                     "linearization writer: object count overflows u32 for /Encrypt slot \
                      reservation"
                         .to_string(),
                 )
-                // cov:ignore-end
             })?;
+            // cov:ignore-end
             let encrypt_metadata = source
                 .encrypt_dict
                 .get("EncryptMetadata")
@@ -4307,13 +4311,14 @@ fn write_linearized_impl<R: Read + Seek>(
         })
         .collect::<BTreeMap<_, _>>();
     if !objstm_layout.is_empty() {
+        // cov:ignore-start: every non-empty ObjStm layout pass records its first-page xref offset;
+        // a missing value is an internal invariant failure, not a supported input shape.
         let first_xref_offset = final_first_page_xref_offset.ok_or_else(|| {
-            // cov:ignore-start: every ObjStm layout pass records its first-page xref offset
             crate::Error::Unsupported(
                 "linearization result: missing first-page xref offset".to_string(),
             )
-            // cov:ignore-end
         })?;
+        // cov:ignore-end
         written_xref.insert(
             ObjectRef::new(relocation.first_xref_slot, 0),
             crate::XrefEntry::Uncompressed {

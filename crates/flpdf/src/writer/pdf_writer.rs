@@ -561,4 +561,18 @@ mod tests {
         options.force_extension_level = Some(3);
         assert!(!forced_version_disables_encryption(&options));
     }
+
+    #[test]
+    fn minimum_pdf_version_keeps_the_highest_version_and_extension() {
+        let mut pdf = crate::Pdf::empty().expect("empty PDF");
+        let mut writer = PdfWriter::new(&mut pdf);
+
+        writer.set_minimum_pdf_version("1.4", 0);
+        writer.set_minimum_pdf_version("1.3", 99);
+        writer.set_minimum_pdf_version("1.4", 0);
+        writer.set_minimum_pdf_version("1.4", 1);
+        writer.set_minimum_pdf_version("1.5", 0);
+
+        assert_eq!(writer.get_final_version().unwrap(), "1.5");
+    }
 }

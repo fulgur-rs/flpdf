@@ -360,8 +360,12 @@ mod tests {
             ..WriterOptions::default()
         };
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
-        let container_source = plan
-            .objects
+        let mut candidates = vec![PlannedIndirectObject::Source {
+            source: ObjectRef::new(0, 0),
+            output: ObjectRef::new(0, 0),
+        }];
+        candidates.extend(plan.objects.iter().cloned());
+        let container_source = candidates
             .iter()
             .find_map(|object| match object {
                 PlannedIndirectObject::ObjectStream {

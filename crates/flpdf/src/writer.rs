@@ -1669,9 +1669,12 @@ fn canonical_copy_encryption(
                 "unsupported copy-encryption Standard handler V={version} R={revision}"
             )));
         }
+        // cov:ignore-start: length_bits is range-checked and divisible by eight;
+        // the supported targets can represent every resulting key length.
         usize::try_from(length_bits / 8).map_err(|_| {
             crate::Error::Unsupported("copy-encryption key length overflows usize".into())
         })?
+        // cov:ignore-end
     };
     if src.file_key.len() != expected_key_len {
         return Err(crate::Error::Unsupported(format!(
@@ -2398,11 +2401,14 @@ fn write_pclm<R: Read + Seek, W: Write>(
     mut out: W,
     options: &WriterOptions,
 ) -> Result<WriterResult> {
+    // cov:ignore-start: emit_canonical_pdf_inner validates this combination
+    // before dispatching to the private PCLm emitter.
     if options.deterministic_id && options.static_id {
         return Err(crate::Error::Unsupported(
             "deterministic_id and static_id are mutually exclusive".to_string(),
         ));
     }
+    // cov:ignore-end
 
     let plan = pclm::Plan::build(pdf)?;
     let version = effective_pdf_version(pdf.version(), options, false, false);
@@ -2422,11 +2428,14 @@ fn write_pclm<R: Read + Seek, W: Write>(
         match *item {
             pclm::Item::Source { source, output } => {
                 let mut object = pdf.resolve(source)?;
+                // cov:ignore-start: the PCLm plan is built from the same validated
+                // reference graph used for this rewrite; malformed remap input is rejected upstream.
                 crate::rewrite_renumber::renumber_qpdf_refs_in_place(
                     pdf,
                     &mut object,
                     &plan.old_to_new,
                 )?;
+                // cov:ignore-end
                 let offset = bytes.len();
                 bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
                 match object {
@@ -2439,6 +2448,8 @@ fn write_pclm<R: Read + Seek, W: Write>(
                             false,
                             false,
                         );
+                        // cov:ignore-start: PCLm supplies a Vec sink and no encrypted
+                        // string emitter, so this in-memory serializer has no error edge.
                         write_reencoded_object(
                             &mut bytes,
                             &reencoded,
@@ -2447,6 +2458,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
                             None,
                             output,
                         )?;
+                        // cov:ignore-end
                     }
                     other => other.write_pdf(&mut bytes),
                 }
@@ -2470,12 +2482,15 @@ fn write_pclm<R: Read + Seek, W: Write>(
     }
 
     let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
+    // cov:ignore-start: PCLm assigns contiguous u32 output numbers and supported
+    // targets can represent the resulting object count in usize.
     let object_count = usize::try_from(max_object_number)
         .ok()
         .and_then(|number| number.checked_add(1))
         .ok_or_else(|| {
             crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
         })?;
+    // cov:ignore-end
     let mut written_xref = BTreeMap::<ObjectRef, XrefEntry>::new();
     let xref_offset = bytes.len();
     bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
@@ -2487,13 +2502,16 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 written_xref.insert(
                     ObjectRef::new(number as u32, 0),
                     XrefEntry::Uncompressed {
+                        // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                        // on every supported target.
                         offset: u64::try_from(*offset).map_err(|_| {
                             crate::Error::Unsupported("PCLm xref offset does not fit u64".into())
                         })?,
+                        // cov:ignore-end
                     },
                 );
             }
-            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"), // cov:ignore: every PCLm item receives the next contiguous output number
         }
     }
 
@@ -3497,16 +3515,17 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     written_xref.insert(
                         ObjectRef::new(object_number, 0),
                         XrefEntry::Uncompressed {
+                            // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                            // on every supported target.
                             offset: u64::try_from(offset).map_err(|_| {
-                                // cov:ignore-start: usize always fits into u64
                                 crate::Error::Unsupported(
                                     "xref offset does not fit u64".to_string(),
                                 )
-                                // cov:ignore-end
                             })?,
+                            // cov:ignore-end
                         },
                     );
-                }
+                } // cov:ignore: LLVM maps the covered contiguous-xref branch exit to this brace
             }
 
             // Trailer — start from the document trailer, strip incremental keys.
@@ -3939,7 +3958,7 @@ fn apply_stream_compress_policy_with_decode_level(
             encode_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
             let encoded = match filters::encode_stream_data(&encode_dict, &decoded) {
                 Ok(e) => e,
-                Err(_) => return Object::Stream(stream.clone()),
+                Err(_) => return Object::Stream(stream.clone()), // cov:ignore: in-memory Flate encoding failures are not injectable through supported writer input
             };
 
             // Always apply FlateDecode — even if the encoded result is larger

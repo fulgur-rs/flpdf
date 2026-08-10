@@ -276,10 +276,12 @@ fn written_xref_table(
             result.insert(
                 ObjectRef::new(number, 0),
                 XrefEntry::Uncompressed {
+                    // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                    // on every supported target.
                     offset: u64::try_from(offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
-                        // cov:ignore: usize always fits into u64
                     })?,
+                    // cov:ignore-end
                 },
             );
         }
@@ -302,20 +304,24 @@ fn written_xref_stream(
             result.insert(
                 ObjectRef::new(xref_ref.number, 0),
                 XrefEntry::Uncompressed {
+                    // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                    // on every supported target.
                     offset: u64::try_from(xref_offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
-                        // cov:ignore: usize always fits into u64
                     })?,
+                    // cov:ignore-end
                 },
             );
         } else if let Some(&(_generation, offset)) = layout.uncompressed.get(&number) {
             result.insert(
                 ObjectRef::new(number, 0),
                 XrefEntry::Uncompressed {
+                    // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                    // on every supported target.
                     offset: u64::try_from(offset).map_err(|_| {
                         crate::Error::Unsupported("xref offset does not fit u64".to_string())
-                        // cov:ignore: usize always fits into u64
                     })?,
+                    // cov:ignore-end
                 },
             );
         } else if let Some(location) = layout.compressed.get(&number) {

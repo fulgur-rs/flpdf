@@ -43,7 +43,7 @@ impl Plan {
 
             let page_object = builder.resolve_terminal(Object::Reference(page))?;
             let Some(page_dict) = page_object.as_dict() else {
-                continue;
+                continue; // cov:ignore: page_refs yields only dictionary /Type /Page leaves
             };
 
             if let Some(contents) = page_dict.get("Contents") {
@@ -264,6 +264,9 @@ mod tests {
         let mut resources = crate::Dictionary::new();
         resources.insert("XObject", Object::Dictionary(xobjects));
         page_dict.insert("Resources", Object::Dictionary(resources));
+        let mut contents = crate::Dictionary::new();
+        contents.insert("Marker", Object::Integer(1));
+        page_dict.insert("Contents", Object::Dictionary(contents));
         pdf.set_object(page, Object::Dictionary(page_dict));
         pdf.set_object(
             ObjectRef::new(99, 0),
