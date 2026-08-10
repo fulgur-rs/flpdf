@@ -128,6 +128,15 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
     out
 }
 
+/// qpdf's `truncate_password_V5` (`QPDF_encryption.cc:171-174`).
+///
+/// V=5 password truncation belongs to the reader-side authentication call
+/// sites (`QPDF_encryption.cc:520-529`, `:569-579`, and `:665-689`), not to
+/// the shared hash primitive used by the writer.
+fn truncate_password_v5(password: &[u8]) -> &[u8] {
+    &password[..password.len().min(127)]
+}
+
 /// Validate `inputs` fields that are in scope for V=1/V=2.
 ///
 /// Only the V/R/Length combinations that this module's Algorithms 2/6/7
@@ -223,7 +232,6 @@ fn validate_v4_inputs(inputs: &StandardHandlerInputs<'_>) -> Result<usize> {
 /// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
 /// (`Pl_SHA2.cc:53,63`).
 fn r5_salted_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> Result<[u8; 32]> {
-    let password = &password[..password.len().min(127)];
     let mut hash = PlSha2::new("sha2", None, 256)?;
     hash.write(password)?;
     hash.write(salt)?;
@@ -272,7 +280,6 @@ fn decrypt_r5_file_key(
 /// request, mirroring the `std::logic_error` qpdf's `Pl_SHA2` raises
 /// (`Pl_SHA2.cc:53,63`).
 fn r6_password_hash(password: &[u8], salt: &[u8], extra: &[u8]) -> Result<[u8; 32]> {
-    let password = &password[..password.len().min(127)];
     // qpdf computes this SHA-256 once in `hash_V5` and only then branches on the
     // revision, so Algorithm 2.B's round 0 is exactly the R<6 value
     // (`QPDF_encryption.cc:245-258`).
@@ -515,7 +522,7 @@ pub(crate) fn check_user_password_r5(
     password: &[u8],
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_r5_file_key(password, inputs.u, inputs.ue, &[])
+    decrypt_r5_file_key(truncate_password_v5(password), inputs.u, inputs.ue, &[])
 }
 
 /// Authenticate an owner password for legacy V=5 R=5 and return the 32-byte file key.
@@ -526,7 +533,12 @@ pub(crate) fn check_owner_password_r5(
     password: &[u8],
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_r5_file_key(password, inputs.o, inputs.oe, inputs.u)
+    decrypt_r5_file_key(
+        truncate_password_v5(password),
+        inputs.o,
+        inputs.oe,
+        inputs.u,
+    )
 }
 
 /// Authenticate a user password for V=5 R=6 and return the 32-byte file key.
@@ -537,7 +549,7 @@ pub(crate) fn check_user_password_r6(
     password: &[u8],
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_r6_file_key(password, inputs.u, inputs.ue, &[])
+    decrypt_r6_file_key(truncate_password_v5(password), inputs.u, inputs.ue, &[])
 }
 
 /// Authenticate an owner password for V=5 R=6 and return the 32-byte file key.
@@ -548,7 +560,12 @@ pub(crate) fn check_owner_password_r6(
     password: &[u8],
     inputs: &StandardHandlerR5Inputs<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_r6_file_key(password, inputs.o, inputs.oe, inputs.u)
+    decrypt_r6_file_key(
+        truncate_password_v5(password),
+        inputs.o,
+        inputs.oe,
+        inputs.u,
+    )
 }
 
 /// Select the [`CryptFilter`] for a given use-site name from the `/CF` table.
@@ -1231,8 +1248,9 @@ pub(crate) fn compute_o_oe_r6(
 /// caller is responsible for running [`crate::security::password::normalize_password`]
 /// with `PasswordMode::Unicode` before invoking this builder.
 pub(crate) struct V5R6EncryptParams<'a> {
-    /// SASLprep'd user password bytes (truncated to 127 bytes by Algorithm 2.B
-    /// inside `r6_password_hash`).
+    /// SASLprep'd user password bytes. Writer-side Algorithm 2.B consumes all
+    /// supplied bytes; the reader-side authentication entry points apply the
+    /// qpdf 127-byte prefix rule before hashing.
     pub user_password: &'a [u8],
     /// SASLprep'd owner password bytes. Unlike V<5 there is no empty-owner
     /// fallback to the user password — the caller decides what to pass.
@@ -3140,6 +3158,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn check_user_and_owner_password_r5_truncate_at_the_auth_boundary() {
+        let secrets = fixture_v5_secrets();
+        let user_password = vec![b'u'; 127];
+        let owner_password = vec![b'o'; 127];
+        let (u_entry, ue_entry) = compute_u_ue_r5(
+            &user_password,
+            &secrets.file_key,
+            &secrets.user_validation_salt,
+            &secrets.user_key_salt,
+        )
+        .unwrap();
+        let (o_entry, oe_entry) = compute_o_oe_r5(
+            &owner_password,
+            &u_entry,
+            &secrets.file_key,
+            &secrets.owner_validation_salt,
+            &secrets.owner_key_salt,
+        )
+        .unwrap();
+        let inputs = StandardHandlerR5Inputs {
+            u: &u_entry,
+            o: &o_entry,
+            ue: &ue_entry,
+            oe: &oe_entry,
+        };
+
+        let mut long_user_password = user_password;
+        long_user_password.extend_from_slice(b"-suffix");
+        let mut long_owner_password = owner_password;
+        long_owner_password.extend_from_slice(b"-suffix");
+
+        assert_eq!(
+            check_user_password_r5(&long_user_password, &inputs).unwrap(),
+            secrets.file_key.to_vec()
+        );
+        assert_eq!(
+            check_owner_password_r5(&long_owner_password, &inputs).unwrap(),
+            secrets.file_key.to_vec()
+        );
+    }
+
     // ── V=5 R=6 key derivation ───────────────────────────────────────────────
     // R=6 vectors generated by a Python hashlib + OpenSSL AES reference that
     // mirrors qpdf's ISO 32000-2 Algorithm 2.B interpretation. File key is
@@ -3204,14 +3264,14 @@ mod tests {
     }
 
     #[test]
-    fn r5_salted_hash_truncates_password_to_127_bytes() {
+    fn r5_salted_hash_uses_the_full_password() {
         let salt = from_hex("0102030405060708");
         let mut password = vec![b'a'; 127];
         password.extend_from_slice(b"zzz");
 
         assert_eq!(
             r5_salted_hash(&password, &salt, b"extra").unwrap(),
-            hex32("eb379d8ff1ba98ac43e50cad80b867521a50cc7f9e1173c4bc1aa887c88b29ba")
+            hex32("4d7d5043fb7ade76898ee2eec41e80d6ba38143444196f17ce5e055c1cac3011")
         );
     }
 
@@ -3235,14 +3295,14 @@ mod tests {
     }
 
     #[test]
-    fn r6_password_hash_truncates_password_to_127_bytes() {
+    fn r6_password_hash_uses_the_full_password() {
         let salt = from_hex("0102030405060708");
         let mut password = vec![b'a'; 127];
         password.extend_from_slice(b"zzz");
 
         assert_eq!(
             r6_password_hash(&password, &salt, b"extra").unwrap(),
-            hex32("87d58b9b16c2aacf4cb477fa9b5cb57b4b7f6b34d6cfb051b5b35c92a772e723")
+            hex32("5c8f88a3a1eafd441d5fba85420b1c4c9c9dcefd41ef062d1b5302a336ad2e6e")
         );
     }
 
@@ -3279,6 +3339,48 @@ mod tests {
                 crate::error::Error::Encrypted(crate::error::EncryptedError::BadPassword)
             ),
             "expected BadPassword for wrong R=6 user password, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn check_user_and_owner_password_r6_truncate_at_the_auth_boundary() {
+        let secrets = fixture_v5_secrets();
+        let user_password = vec![b'u'; 127];
+        let owner_password = vec![b'o'; 127];
+        let (u_entry, ue_entry) = compute_u_ue_r6(
+            &user_password,
+            &secrets.file_key,
+            &secrets.user_validation_salt,
+            &secrets.user_key_salt,
+        )
+        .unwrap();
+        let (o_entry, oe_entry) = compute_o_oe_r6(
+            &owner_password,
+            &u_entry,
+            &secrets.file_key,
+            &secrets.owner_validation_salt,
+            &secrets.owner_key_salt,
+        )
+        .unwrap();
+        let inputs = StandardHandlerR5Inputs {
+            u: &u_entry,
+            o: &o_entry,
+            ue: &ue_entry,
+            oe: &oe_entry,
+        };
+
+        let mut long_user_password = user_password;
+        long_user_password.extend_from_slice(b"-suffix");
+        let mut long_owner_password = owner_password;
+        long_owner_password.extend_from_slice(b"-suffix");
+
+        assert_eq!(
+            check_user_password_r6(&long_user_password, &inputs).unwrap(),
+            secrets.file_key.to_vec()
+        );
+        assert_eq!(
+            check_owner_password_r6(&long_owner_password, &inputs).unwrap(),
+            secrets.file_key.to_vec()
         );
     }
 

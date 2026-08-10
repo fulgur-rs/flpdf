@@ -1,4 +1,4 @@
-//! qpdf correspondence: QPDF_encryption.cc password normalization and revision-specific truncation.
+//! qpdf correspondence: QPDF_encryption.cc password normalization.
 //! Password input mode handling and normalization for Standard security handler.
 //!
 //! qpdf exposes `--password-mode={auto,bytes,hex-bytes,unicode}` to control how
@@ -31,9 +31,11 @@ pub enum PasswordMode {
 /// Normalize a CLI-supplied password byte string for a Standard handler of the
 /// given encryption revision.
 ///
-/// For V=5 R=5/R=6 the bytes are interpreted as UTF-8, run through SASLprep,
-/// and truncated at 127 bytes per ISO 32000-2 §7.6.4.3.3. Hex-bytes mode
-/// decodes the input first; bytes mode passes the input through unchanged.
+/// For V=5 R=5/R=6 the bytes are interpreted as UTF-8 and run through SASLprep.
+/// The Standard security handler applies qpdf's 127-byte V=5 truncation at its
+/// reader-side authentication boundary; this normalization helper does not
+/// apply that encryption-specific rule. Hex-bytes mode decodes the input
+/// first; bytes mode passes the input through unchanged.
 pub(crate) fn normalize_password(raw: &[u8], mode: PasswordMode, revision: i64) -> Result<Vec<u8>> {
     let resolved = match mode {
         PasswordMode::Auto => {
@@ -53,11 +55,7 @@ pub(crate) fn normalize_password(raw: &[u8], mode: PasswordMode, revision: i64) 
         PasswordMode::Auto => unreachable!("Auto resolved above"),
     };
 
-    if revision >= 5 {
-        Ok(truncate_to(bytes, 127))
-    } else {
-        Ok(bytes)
-    }
+    Ok(bytes)
 }
 
 fn decode_hex(raw: &[u8]) -> Result<Vec<u8>> {
@@ -90,13 +88,6 @@ fn unicode_password(raw: &[u8], revision: i64) -> Result<Vec<u8>> {
         reason: format!("--password-mode=unicode: SASLprep rejected the password ({err})"),
     })?;
     Ok(prepped.into_owned().into_bytes())
-}
-
-fn truncate_to(mut bytes: Vec<u8>, max: usize) -> Vec<u8> {
-    if bytes.len() > max {
-        bytes.truncate(max);
-    }
-    bytes
 }
 
 #[cfg(test)]
@@ -153,10 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn r5_truncates_to_127_bytes() {
+    fn r5_preserves_password_bytes() {
         let raw = vec![b'a'; 200];
         let out = normalize_password(&raw, PasswordMode::Bytes, 6).unwrap();
-        assert_eq!(out.len(), 127);
+        assert_eq!(out.len(), 200);
         assert!(out.iter().all(|&b| b == b'a'));
     }
 
