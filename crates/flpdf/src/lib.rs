@@ -9,9 +9,9 @@
 //! - [`pages`], [`outline`], and [`fonts`] are traversal helpers built on top of
 //!   `Pdf`. They mirror the read-only inspection surface that `qpdf --show-pages`,
 //!   `--show-outline`, and `--show-fonts` provide.
-//! - [`write_pdf`] performs an incremental rewrite (preserving the source bytes and
-//!   appending an updated xref/trailer) and [`write_qdf`] produces a flat, qdf-style
-//!   dump of every resolved object.
+//! - [`QPDFWriter`] configures one fresh full-rewrite output with qpdf-shaped
+//!   settings. The older free-function writer surface remains temporarily for
+//!   consumer migration.
 //! - [`check_reader`] reports diagnostics gathered during parsing/repair, returning a
 //!   [`CheckReport`] of [`Diagnostic`]s.
 //!
@@ -20,7 +20,7 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, write_pdf, Pdf};
+//! use flpdf::{pages, Pdf, QPDFWriter};
 //!
 //! let file = BufReader::new(File::open("input.pdf")?);
 //! let mut pdf = Pdf::open(file)?;
@@ -29,8 +29,9 @@
 //!     println!("page: {object_ref}");
 //! }
 //!
-//! let mut out = File::create("output.pdf")?;
-//! write_pdf(&mut pdf, &mut out)?;
+//! let mut writer = QPDFWriter::new(&mut pdf);
+//! writer.set_output_file("output.pdf")?;
+//! writer.write()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -284,8 +285,8 @@ pub use thread_bead_p::drop_thread_bead_dangling_p;
 pub use writer::V5Randomness;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, write_pdf, write_pdf_with_options,
-    write_qdf, write_stream_to_buf, CompressStreams, NewlineBeforeEndstream, ObjectStreamMode,
-    StreamDataMode, WriteOptions,
+    write_qdf, write_stream_to_buf, CompressStreams, DecodeLevel, NewlineBeforeEndstream,
+    ObjectStreamMode, QPDFWriter, StreamDataMode, WriteOptions,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,

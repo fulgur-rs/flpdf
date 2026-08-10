@@ -7,14 +7,18 @@ pub(crate) mod encryption_state;
 pub(crate) mod object_streams;
 #[path = "writer/plain/mod.rs"]
 pub(crate) mod plain;
+mod qpdf_writer;
 #[path = "writer/serialize.rs"]
 pub(crate) mod serialize;
+mod settings;
 pub use object_streams::ObjectStreamMode;
+pub use qpdf_writer::QPDFWriter;
 pub use serialize::write_stream_to_buf;
 use serialize::{
     framing_adds_newline as stream_framing_adds_newline, write_stream_payload,
     write_stream_with_id_writer as write_stream_to_buf_with_id_writer,
 };
+pub use settings::DecodeLevel;
 
 use crate::parser::Parser;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
