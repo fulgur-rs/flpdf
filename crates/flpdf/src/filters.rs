@@ -50,8 +50,8 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
 /// honoring any `/DecodeParms`.
 ///
-/// PNG predictors (`/Predictor 10` through `/Predictor 15`) are applied as part
-/// of the chain. The TIFF predictor (`/Predictor 2`) is rejected.
+/// PNG predictors (`/Predictor 10` through `/Predictor 15`) and the TIFF
+/// predictor (`/Predictor 2`) are applied as part of the chain.
 ///
 /// # Errors
 ///
@@ -63,10 +63,11 @@ pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
 ///   cap, which rejects pathological multiplicative-expansion chains).
 /// - `/DecodeParms` selects a `/Predictor` outside `1`, `2`, and `10..=15`, or
 ///   gives a non-integer value for a parameter the filter reads.
-/// - `/Predictor` is `2`, which selects the unsupported TIFF predictor.
 /// - a predictor's row geometry is invalid: a negative `/Columns`, `/Colors`, or
-///   `/BitsPerComponent`, a `/BitsPerComponent` outside `1`, `2`, `4`, `8`, and
-///   `16`, or a row width that is zero.
+///   `/BitsPerComponent`, a PNG `/BitsPerComponent` outside `1`, `2`, `4`, `8`,
+///   and `16`, or a row width that is zero. TIFF predictor bit widths follow
+///   qpdf's `Pl_TIFFPredictor` constructor accepts widths through `64`; its
+///   `BitStream`/`BitWriter` processing limit is `32` bits, as in qpdf.
 /// - an implemented codec fails on malformed input — corrupt deflate, LZW,
 ///   ASCII85, ASCIIHex, or RunLength data.
 pub fn decode_stream_data(dict: &Dictionary, stream_data: &[u8]) -> Result<Vec<u8>> {
@@ -343,7 +344,9 @@ pub fn decode_stream_data_with_limits(
 /// Every PNG predictor encodes with the Up row filter, so `/Predictor 10`
 /// through `/Predictor 15` produce identical output. The predictor number is
 /// still recorded in the dictionary and the result decodes correctly, because
-/// decoding selects a filter per row from the row's own leading byte.
+/// decoding selects a filter per row from the row's own leading byte. The TIFF
+/// predictor (`/Predictor 2`) uses incremental horizontal differencing with the
+/// same row geometry on encode and decode.
 ///
 /// # Errors
 ///
@@ -959,15 +962,7 @@ fn apply_encode_params(
     decode_params: &DecodeParams,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    match crate::stream_filter::png_encode_geometry(filter_name, decode_params)? {
-        None => Ok(stream_data.to_vec()),
-        Some((columns, colors, bits_per_component)) => crate::stream_filter::encode_png_predictor(
-            stream_data,
-            columns,
-            colors,
-            bits_per_component,
-        ),
-    }
+    crate::stream_filter::encode_predictor(stream_data, filter_name, decode_params)
 }
 
 /// Apply a single encode filter to `stream_data`.
@@ -2798,13 +2793,14 @@ mod tests {
     }
 
     #[test]
-    fn encoding_reports_the_tiff_predictor_restriction() {
-        assert_eq!(
-            encode_stream_data(&png_predictor_dict(2, 4), b"data")
-                .unwrap_err()
-                .to_string(),
-            "unsupported PDF feature: /DecodeParms /Predictor 2 is not supported for this stream type"
-        );
+    fn encode_stream_data_tiff_predictor_2_round_trip() {
+        let dict = png_predictor_dict(2, 4);
+        let raw = sample_raw_4x2();
+
+        let encoded = encode_stream_data(&dict, &raw).unwrap();
+        let decoded = decode_stream_data(&dict, &encoded).unwrap();
+
+        assert_eq!(decoded, raw);
     }
 
     #[test]

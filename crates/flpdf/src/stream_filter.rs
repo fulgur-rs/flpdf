@@ -53,6 +53,7 @@ use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
 use crate::pipeline::lzw::LzwDecoder;
 use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
 use crate::pipeline::run_length::{RunLength, RunLengthAction};
+use crate::pipeline::tiff_predictor::{TiffPredictor, TiffPredictorAction};
 use crate::pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 use crate::{Error, Object, Result};
 use std::cell::Cell;
@@ -1165,6 +1166,26 @@ struct FlateLzwStreamFilter {
     early_code_change: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictorKind {
+    Png,
+    Tiff,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PredictorGeometry {
+    kind: PredictorKind,
+    columns: u32,
+    colors: u32,
+    bits_per_component: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictorAction {
+    Encode,
+    Decode,
+}
+
 impl FlateLzwStreamFilter {
     /// Construct with the PDF specification defaults qpdf uses.
     fn new(lzw: bool) -> Self {
@@ -1199,7 +1220,7 @@ impl FlateLzwStreamFilter {
 /// qpdf's literals.
 ///
 /// **These five are retained whatever the filter is named, and that is not
-/// laziness.** [`png_encode_geometry`] builds a `FlateLzwStreamFilter` for
+/// laziness.** [`predictor_encode_geometry`] builds a `FlateLzwStreamFilter` for
 /// whichever name `filters::encode_stream_data` hands it and feeds that filter
 /// this same [`DecodeParams`], so dropping the geometry under a non-Flate name
 /// would change what the public encode path does with, say, `/Filter
@@ -1294,7 +1315,7 @@ const RETAINED_DECODE_PARAM_KEYS: [&[u8]; 5] = [
 /// `StreamFilter::set_decode_params` reads only `is_absent()`,
 /// `FlateLzwStreamFilter::set_decode_params` asks `isInteger`-shaped questions
 /// of [`RETAINED_DECODE_PARAM_KEYS`] and lets every other key fall through its
-/// `_ => {}` arm, and [`png_encode_geometry`] reaches the parameters through
+/// `_ => {}` arm, and [`predictor_encode_geometry`] reaches the parameters through
 /// that same filter.
 ///
 /// **This is a per-stage residual, not parity, and it is not a bound on the
@@ -1468,17 +1489,9 @@ impl StreamFilter for FlateLzwStreamFilter {
     }
 
     fn preflight_decode_pipeline(&self) -> Result<()> {
-        if let Some((columns, colors, bits_per_component)) = self.decode_predictor_geometry()? {
+        if let Some(geometry) = self.decode_predictor_geometry()? {
             let mut sink = OutputBuffer::new(None);
-            PngFilter::new(
-                "png decode",
-                &mut sink,
-                PngFilterAction::Decode,
-                columns,
-                colors,
-                bits_per_component,
-            )
-            .map_err(map_pipeline_error)?;
+            let _predictor = make_predictor_pipeline(geometry, &mut sink, PredictorAction::Decode)?;
         }
         Ok(())
     }
@@ -1493,18 +1506,7 @@ impl StreamFilter for FlateLzwStreamFilter {
         next: &'a mut dyn Pipeline,
     ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
         let next: PipelineRef<'a> = match self.decode_predictor_geometry()? {
-            Some((columns, colors, bits_per_component)) => {
-                let predictor = PngFilter::new(
-                    "png decode",
-                    next,
-                    PngFilterAction::Decode,
-                    columns,
-                    colors,
-                    bits_per_component,
-                )
-                .map_err(map_pipeline_error)?;
-                PipelineRef::Owned(Box::new(predictor))
-            }
+            Some(geometry) => make_predictor_pipeline(geometry, next, PredictorAction::Decode)?,
             None => PipelineRef::Borrowed(next),
         };
         let stage: Box<dyn Pipeline + 'a> = if self.lzw {
@@ -1537,16 +1539,9 @@ impl StreamFilter for FlateLzwStreamFilter {
         // outward, so the predictor stage is constructed before the codec and
         // any construction failure precedes every codec write.
         let error = match geometry {
-            Some((columns, colors, bits_per_component)) => {
-                let mut predictor = PngFilter::new(
-                    "png decode",
-                    &mut sink,
-                    PngFilterAction::Decode,
-                    columns,
-                    colors,
-                    bits_per_component,
-                )
-                .map_err(map_pipeline_error)?;
+            Some(geometry) => {
+                let mut predictor =
+                    make_predictor_pipeline(geometry, &mut sink, PredictorAction::Decode)?;
                 let phase = Some(finish_phase.as_ref());
                 self.pipe_codec(&mut predictor, data, warn, phase, &output_position)?
             }
@@ -1568,23 +1563,23 @@ impl FlateLzwStreamFilter {
     /// This reproduces the failures `SF_FlateLzwDecode::getDecodePipeline`
     /// raises while constructing the chain, so both the preflight and the
     /// decode itself reject exactly the same parameters.
-    fn decode_predictor_geometry(&self) -> Result<Option<(u32, u32, u32)>> {
-        if (10..=15).contains(&self.predictor) {
-            return Ok(Some((
-                to_uint(self.columns)?,
-                to_uint(self.colors)?,
-                to_uint(self.bits_per_component)?,
-            )));
-        }
-        if self.predictor == 2 {
-            // Declared deviation: qpdf builds Pl_TIFFPredictor here. flpdf has
-            // no TIFF predictor component yet and reports the restriction at
-            // qpdf's construction point.
-            return Err(Error::Unsupported(
-                "/DecodeParms /Predictor 2 is not supported for this stream type".to_string(),
-            ));
-        }
-        Ok(None)
+    fn decode_predictor_geometry(&self) -> Result<Option<PredictorGeometry>> {
+        let kind = if (10..=15).contains(&self.predictor) {
+            Some(PredictorKind::Png)
+        } else if self.predictor == 2 {
+            Some(PredictorKind::Tiff)
+        } else {
+            None
+        };
+        kind.map(|kind| {
+            Ok(PredictorGeometry {
+                kind,
+                columns: to_uint(self.columns)?,
+                colors: to_uint(self.colors)?,
+                bits_per_component: to_uint(self.bits_per_component)?,
+            })
+        })
+        .transpose()
     }
 
     /// Run the codec stage of the whole-buffer route over `data`.
@@ -1634,6 +1629,60 @@ impl FlateLzwStreamFilter {
         };
         Ok(error.map(map_stage_error))
     }
+}
+
+fn make_predictor_pipeline<'a>(
+    geometry: PredictorGeometry,
+    next: &'a mut dyn Pipeline,
+    action: PredictorAction,
+) -> Result<PipelineRef<'a>> {
+    let pipeline = match (geometry.kind, action) {
+        (PredictorKind::Png, PredictorAction::Encode) => Box::new(
+            PngFilter::new(
+                "png encode",
+                next,
+                PngFilterAction::Encode,
+                geometry.columns,
+                geometry.colors,
+                geometry.bits_per_component,
+            )
+            .map_err(map_pipeline_error)?,
+        ) as Box<dyn Pipeline + 'a>,
+        (PredictorKind::Png, PredictorAction::Decode) => Box::new(
+            PngFilter::new(
+                "png decode",
+                next,
+                PngFilterAction::Decode,
+                geometry.columns,
+                geometry.colors,
+                geometry.bits_per_component,
+            )
+            .map_err(map_pipeline_error)?,
+        ) as Box<dyn Pipeline + 'a>,
+        (PredictorKind::Tiff, PredictorAction::Encode) => Box::new(
+            TiffPredictor::new(
+                "tiff encode",
+                next,
+                TiffPredictorAction::Encode,
+                geometry.columns,
+                geometry.colors,
+                geometry.bits_per_component,
+            )
+            .map_err(map_pipeline_error)?,
+        ) as Box<dyn Pipeline + 'a>,
+        (PredictorKind::Tiff, PredictorAction::Decode) => Box::new(
+            TiffPredictor::new(
+                "tiff decode",
+                next,
+                TiffPredictorAction::Decode,
+                geometry.columns,
+                geometry.colors,
+                geometry.bits_per_component,
+            )
+            .map_err(map_pipeline_error)?,
+        ) as Box<dyn Pipeline + 'a>,
+    };
+    Ok(PipelineRef::Owned(pipeline))
 }
 
 fn filter_decode_phase(finish_phase: Option<&Cell<bool>>) -> FilterDecodePhase {
@@ -2069,15 +2118,15 @@ pub(crate) fn encode_flate(data: &[u8]) -> Result<Vec<u8>> {
     sink.take_buffer().map_err(map_pipeline_error)
 }
 
-/// Resolve the PNG predictor geometry a writer must apply for `/DecodeParms`.
+/// Resolve the predictor geometry a writer must apply for `/DecodeParms`.
 ///
-/// Returns `Ok(None)` when the parameters select no PNG predictor. The
+/// Returns `Ok(None)` when the parameters select no predictor. The
 /// parameters are validated through the same `SF_FlateLzwDecode` state the
 /// decode path uses, so both directions accept exactly the same dictionaries.
-pub(crate) fn png_encode_geometry(
+fn predictor_encode_geometry(
     filter_name: &[u8],
     decode_params: &DecodeParams,
-) -> Result<Option<(u32, u32, u32)>> {
+) -> Result<Option<PredictorGeometry>> {
     let mut filter = FlateLzwStreamFilter::new(filter_name == b"LZWDecode");
     if !filter.set_decode_params(decode_params) {
         return Err(Error::Unsupported(format!(
@@ -2086,6 +2135,28 @@ pub(crate) fn png_encode_geometry(
         )));
     }
     filter.decode_predictor_geometry()
+}
+
+/// Apply the predictor selected by `/DecodeParms` before a codec's encode step.
+pub(crate) fn encode_predictor(
+    data: &[u8],
+    filter_name: &[u8],
+    decode_params: &DecodeParams,
+) -> Result<Vec<u8>> {
+    let Some(geometry) = predictor_encode_geometry(filter_name, decode_params)? else {
+        return Ok(data.to_vec());
+    };
+    encode_predictor_stage(data, geometry)
+}
+
+fn encode_predictor_stage(data: &[u8], geometry: PredictorGeometry) -> Result<Vec<u8>> {
+    let mut sink = Buffer::new("stream data buffer", None);
+    {
+        let mut predictor = make_predictor_pipeline(geometry, &mut sink, PredictorAction::Encode)?;
+        predictor.write(data).map_err(map_pipeline_error)?;
+        predictor.finish().map_err(map_pipeline_error)?;
+    }
+    sink.take_buffer().map_err(map_pipeline_error)
 }
 
 /// Apply the PNG predictor to unencoded stream data.
@@ -2099,21 +2170,15 @@ pub(crate) fn encode_png_predictor(
     colors: u32,
     bits_per_component: u32,
 ) -> Result<Vec<u8>> {
-    let mut sink = Buffer::new("stream data buffer", None);
-    {
-        let mut stage = PngFilter::new(
-            "png encode",
-            &mut sink,
-            PngFilterAction::Encode,
+    encode_predictor_stage(
+        data,
+        PredictorGeometry {
+            kind: PredictorKind::Png,
             columns,
             colors,
             bits_per_component,
-        )
-        .map_err(map_pipeline_error)?;
-        stage.write(data).map_err(map_pipeline_error)?;
-        stage.finish().map_err(map_pipeline_error)?;
-    }
-    sink.take_buffer().map_err(map_pipeline_error)
+        },
+    )
 }
 
 pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
@@ -4787,45 +4852,51 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tiff_predictor_is_reported_at_pipeline_construction() {
-        let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-        assert!(filter.set_decode_params(&neutral_params(&[
-            ("Predictor", ParamValue::Int(2)),
-            ("Columns", ParamValue::Int(4)),
-        ])));
+    fn tiff_predictor_is_constructed_at_pipeline_construction() {
+        let cases = [
+            (b"FlateDecode".as_slice(), encode_flate(b"A").unwrap()),
+            (b"LZWDecode".as_slice(), vec![0x80, 0x10, 0x60, 0x20]),
+        ];
 
-        let error = filter
-            .pipe_decode(b"", None, &mut ignore_warning)
-            .unwrap_err();
+        for (name, encoded) in cases {
+            let mut filter = stream_filter_for(name).expect("registered filter");
+            assert!(filter.set_decode_params(&neutral_params(&[
+                ("Predictor", ParamValue::Int(2)),
+                ("Columns", ParamValue::Int(1)),
+            ])));
 
-        assert_eq!(
-            error.to_string(),
-            "unsupported PDF feature: /DecodeParms /Predictor 2 is not supported for this stream type"
-        );
+            let decoded = filter
+                .pipe_decode(&encoded, None, &mut ignore_warning)
+                .expect("TIFF predictor decode");
+            assert_eq!(decoded, b"A", "{name:?}");
+        }
     }
 
     #[test]
     fn negative_geometry_is_rejected_when_the_predictor_pipeline_is_built() {
-        for (key, value) in [("Columns", -4), ("Colors", -1), ("BitsPerComponent", -8)] {
-            let mut filter = stream_filter_for(b"FlateDecode").expect("registered Flate filter");
-            assert!(filter.set_decode_params(&neutral_params(&[
-                ("Predictor", ParamValue::Int(12)),
-                ("Columns", ParamValue::Int(4)),
-                (key, ParamValue::Int(value)),
-            ])));
+        for predictor in [2, 12] {
+            for (key, value) in [("Columns", -4), ("Colors", -1), ("BitsPerComponent", -8)] {
+                let mut filter =
+                    stream_filter_for(b"FlateDecode").expect("registered Flate filter");
+                assert!(filter.set_decode_params(&neutral_params(&[
+                    ("Predictor", ParamValue::Int(predictor)),
+                    ("Columns", ParamValue::Int(4)),
+                    (key, ParamValue::Int(value)),
+                ])));
 
-            let error = filter
-                .pipe_decode(b"", None, &mut ignore_warning)
-                .unwrap_err();
+                let error = filter
+                    .pipe_decode(b"", None, &mut ignore_warning)
+                    .unwrap_err();
 
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "unsupported PDF feature: integer out of range converting {value} \
-                     from a 4-byte signed type to a 4-byte unsigned type"
-                ),
-                "{key}"
-            );
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "unsupported PDF feature: integer out of range converting {value} \
+                         from a 4-byte signed type to a 4-byte unsigned type"
+                    ),
+                    "predictor {predictor}, {key}"
+                );
+            }
         }
     }
 

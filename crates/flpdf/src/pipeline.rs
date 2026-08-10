@@ -33,6 +33,8 @@ pub(crate) mod md5;
 
 pub(crate) mod png_filter;
 
+pub(crate) mod tiff_predictor;
+
 pub(crate) mod rc4;
 
 pub(crate) mod qpdf_tokenizer;
