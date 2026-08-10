@@ -2305,7 +2305,7 @@ pub(crate) mod tests {
         };
 
         append_object(1, b"<< /Type /Catalog /Pages 2 0 R >>\n");
-        append_object(2, b"<< /Type /Pages /Kids [] /Count 0 >>\n");
+        append_object(2, b"<< /Type /Pages /Kids [] /Count 0 >>");
         let mut image = format!(
             "<< /Type /XObject /Subtype /Image /Filter /DCTDecode /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
             jpeg.len()
@@ -5149,7 +5149,7 @@ pub(crate) mod tests {
     fn dct_qpdf_filtered_stream_data_matches_decode_pipeline_exactly() {
         let qpdf = match pinned_qpdf_11_9_0() {
             Some(qpdf) => qpdf,
-            None => return,
+            None => return, // cov:ignore: supported oracle tests require the pinned qpdf 11.9.0 executable; absence only skips the external differential check
         };
         let qpdf_display = qpdf.display().to_string();
         eprintln!("DCT qpdf differential using {qpdf_display} ({PINNED_QPDF_VERSION})");
@@ -5217,6 +5217,7 @@ pub(crate) mod tests {
             canonical.len(),
         );
 
+        // cov:ignore-start: external pinned qpdf failure formatting is unobservable when the supported oracle succeeds; retain the assertion and diagnostic.
         assert!(
             output.status.success(),
             "qpdf DCT differential failed for {qpdf_display} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
@@ -5227,6 +5228,8 @@ pub(crate) mod tests {
             qpdf_stderr_hex,
             String::from_utf8_lossy(&output.stderr),
         );
+        // cov:ignore-end
+        // cov:ignore-start: external pinned qpdf stderr failure formatting is unobservable when the supported oracle is silent; retain the assertion and diagnostic.
         assert!(
             output.stderr.is_empty(),
             "qpdf DCT differential wrote stderr for {qpdf_display} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
@@ -5234,6 +5237,8 @@ pub(crate) mod tests {
             qpdf_stderr_hex,
             String::from_utf8_lossy(&output.stderr),
         );
+        // cov:ignore-end
+        // cov:ignore-start: an external qpdf output mismatch is the failure assertion itself; the supported qpdf 11.9.0 oracle exercises only the success path.
         assert_eq!(
             output.stdout,
             canonical,
@@ -5243,6 +5248,7 @@ pub(crate) mod tests {
             canonical.len(),
             canonical_hex,
         );
+        // cov:ignore-end
     }
 
     #[test]
@@ -5250,6 +5256,7 @@ pub(crate) mod tests {
         let mut empty_filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
         assert!(empty_filter.set_decode_params(&DecodeParams::Absent));
         let mut empty_sink = DctSink::default();
+        assert_eq!(empty_sink.identifier(), "dct test sink");
         {
             let mut stage = empty_filter
                 .decode_pipeline(&mut empty_sink)
