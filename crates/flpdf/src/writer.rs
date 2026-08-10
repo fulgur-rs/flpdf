@@ -187,6 +187,47 @@ pub enum NewlineBeforeEndstream {
     Never,
 }
 
+/// Fixed V=5 R=5/R=6 secret material for qpdf-compatible test/helper writes.
+///
+/// This type is compiled only for crate unit tests and the `qpdf-zlib-compat`
+/// test feature. The byte order matches qpdf 11.9.0's four random draws:
+/// 32-byte file key, 16 bytes of `/U` salts, 16 bytes of `/O` salts, and the
+/// 4-byte `/Perms` tail. Production writes do not expose this field and keep
+/// using the OS CSPRNG.
+#[cfg(any(test, feature = "qpdf-zlib-compat"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V5Randomness {
+    /// 32-byte file encryption key.
+    pub file_key: [u8; 32],
+    /// 8-byte user-password validation salt.
+    pub user_validation_salt: [u8; 8],
+    /// 8-byte user-password key-derivation salt.
+    pub user_key_salt: [u8; 8],
+    /// 8-byte owner-password validation salt.
+    pub owner_validation_salt: [u8; 8],
+    /// 8-byte owner-password key-derivation salt.
+    pub owner_key_salt: [u8; 8],
+    /// 4 bytes appended to the `/Perms` plaintext block.
+    pub perms_random_tail: [u8; 4],
+}
+
+#[cfg(any(test, feature = "qpdf-zlib-compat"))]
+impl V5Randomness {
+    /// Split one qpdf-ordered 68-byte random input into the V=5 fields.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; 68]) -> Self {
+        Self {
+            file_key: std::array::from_fn(|index| bytes[index]),
+            user_validation_salt: std::array::from_fn(|index| bytes[32 + index]),
+            user_key_salt: std::array::from_fn(|index| bytes[40 + index]),
+            owner_validation_salt: std::array::from_fn(|index| bytes[48 + index]),
+            owner_key_salt: std::array::from_fn(|index| bytes[56 + index]),
+            perms_random_tail: std::array::from_fn(|index| bytes[64 + index]),
+        }
+    }
+}
+
 /// Options controlling [`write_pdf_with_options`].
 ///
 /// Constructed via `Default::default()` or struct literal. The struct is
@@ -238,6 +279,15 @@ pub struct WriteOptions {
     /// Must never be set in production code; deterministic IVs make AES CBC
     /// completely insecure.
     pub static_aes_iv: bool,
+
+    /// Fixed V=5 security-handler random bytes for qpdf byte-gate helpers.
+    ///
+    /// This field exists only in crate unit tests and builds with the
+    /// `qpdf-zlib-compat` test feature. It is deliberately not a CLI or
+    /// production seed option. `None` preserves the production OS CSPRNG.
+    #[cfg(any(test, feature = "qpdf-zlib-compat"))]
+    #[doc(hidden)]
+    pub v5_randomness: Option<V5Randomness>,
 
     /// Enforce a minimum PDF version in the output header.
     ///
@@ -2323,7 +2373,7 @@ pub(crate) fn build_encryption_context(
             // 8-byte salts + 4-byte /Perms tail). Unlike V<5, /ID[0] does NOT
             // feed the key derivation — the file key is a standalone CSPRNG
             // value, so V=5 output is never byte-identical across runs.
-            let secrets = generate_v5r6_secrets()?;
+            let secrets = generate_v5r6_secrets(options)?;
             let v5 = V5R6EncryptParams {
                 user_password: &params.user_password,
                 owner_password: &params.owner_password,
@@ -2341,7 +2391,7 @@ pub(crate) fn build_encryption_context(
         }
         EncryptMethod::V5R5Aes256 => {
             use crate::security::standard::{build_v5_r5_encrypt_dict, V5R6EncryptParams};
-            let secrets = generate_v5r6_secrets()?;
+            let secrets = generate_v5r6_secrets(options)?;
             let v5 = V5R6EncryptParams {
                 user_password: &params.user_password,
                 owner_password: &params.owner_password,
@@ -2434,7 +2484,21 @@ pub(crate) fn build_encryption_context(
 /// 32-byte file key, four 8-byte password salts, and the 4-byte `/Perms`
 /// tail. OS-RNG failure is surfaced as [`crate::Error::Unsupported`] rather
 /// than panicking (mirrors the AES-IV generation in the stream pass).
-fn generate_v5r6_secrets() -> Result<crate::security::standard::V5R6Secrets> {
+fn generate_v5r6_secrets(
+    _options: &WriteOptions,
+) -> Result<crate::security::standard::V5R6Secrets> {
+    #[cfg(any(test, feature = "qpdf-zlib-compat"))]
+    if let Some(randomness) = _options.v5_randomness {
+        return Ok(crate::security::standard::V5R6Secrets {
+            file_key: randomness.file_key,
+            user_validation_salt: randomness.user_validation_salt,
+            user_key_salt: randomness.user_key_salt,
+            owner_validation_salt: randomness.owner_validation_salt,
+            owner_key_salt: randomness.owner_key_salt,
+            perms_random_tail: randomness.perms_random_tail,
+        });
+    }
+
     let mut buf = [0u8; 68];
     getrandom::fill(&mut buf).map_err(|e| {
         crate::Error::Unsupported(format!(
@@ -6798,6 +6862,107 @@ mod tests {
             other => panic!("/Metadata must be a stream, got {other:?}"),
         };
         (title, stream)
+    }
+
+    #[test]
+    fn v5_randomness_from_qpdf_order_maps_fixed_input() {
+        let bytes = std::array::from_fn(|index| index as u8);
+        let randomness = V5Randomness::from_bytes(bytes);
+
+        assert_eq!(
+            randomness.file_key,
+            std::array::from_fn(|index| index as u8)
+        );
+        assert_eq!(
+            randomness.user_validation_salt,
+            std::array::from_fn(|index| 32 + index as u8)
+        );
+        assert_eq!(
+            randomness.user_key_salt,
+            std::array::from_fn(|index| 40 + index as u8)
+        );
+        assert_eq!(
+            randomness.owner_validation_salt,
+            std::array::from_fn(|index| 48 + index as u8)
+        );
+        assert_eq!(
+            randomness.owner_key_salt,
+            std::array::from_fn(|index| 56 + index as u8)
+        );
+        assert_eq!(
+            randomness.perms_random_tail,
+            std::array::from_fn(|index| 64 + index as u8)
+        );
+    }
+
+    fn fixed_v5_encrypted_output(
+        params: crate::encrypt_setup::EncryptParams,
+        allow_weak_crypto: bool,
+    ) -> Vec<u8> {
+        use crate::PdfOpenOptions;
+        use std::io::Cursor;
+
+        let fixture = build_string_and_stream_fixture();
+        let mut pdf = Pdf::open(Cursor::new(fixture)).expect("open fixture");
+        let mut out = Vec::new();
+        let options = WriteOptions {
+            full_rewrite: true,
+            static_id: true,
+            static_aes_iv: true,
+            compress_streams: CompressStreams::No,
+            encrypt: Some(params),
+            v5_randomness: Some(V5Randomness::from_bytes(std::array::from_fn(|index| {
+                0x80u8.wrapping_add(index as u8)
+            }))),
+            ..WriteOptions::default()
+        };
+        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=5 encrypted write");
+
+        let mut reopened = Pdf::open_with_options(
+            Cursor::new(out.clone()),
+            PdfOpenOptions {
+                password: b"user-pw".to_vec(),
+                allow_weak_crypto,
+                ..PdfOpenOptions::default()
+            },
+        )
+        .expect("fixed V=5 output must authenticate");
+        let (title, stream) = resolve_title_and_stream(&mut reopened);
+        assert_eq!(title, b"TopSecretTitle");
+        assert_eq!(stream, b"hello");
+        out
+    }
+
+    #[test]
+    fn v5_r6_fixed_randomness_is_byte_stable() {
+        let first = fixed_v5_encrypted_output(
+            crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw".to_vec(), b"owner-pw".to_vec()),
+            false,
+        );
+        let second = fixed_v5_encrypted_output(
+            crate::encrypt_setup::EncryptParams::v5_r6(b"user-pw".to_vec(), b"owner-pw".to_vec()),
+            false,
+        );
+        assert_eq!(
+            first, second,
+            "fixed V=5 R=6 input must produce stable bytes"
+        );
+    }
+
+    #[test]
+    fn v5_r5_fixed_randomness_is_byte_stable() {
+        let first = fixed_v5_encrypted_output(
+            crate::encrypt_setup::EncryptParams::v5_r5(b"user-pw".to_vec(), b"owner-pw".to_vec()),
+            true,
+        );
+        let second = fixed_v5_encrypted_output(
+            crate::encrypt_setup::EncryptParams::v5_r5(b"user-pw".to_vec(), b"owner-pw".to_vec()),
+            true,
+        );
+        assert_eq!(
+            first, second,
+            "fixed V=5 R=5 input must produce stable bytes"
+        );
     }
 
     /// Encrypt with V=5 R=6 AES-256, then re-open with flpdf

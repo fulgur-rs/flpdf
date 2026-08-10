@@ -279,6 +279,9 @@ pub use struct_tree_pg::{
 };
 pub use subset_prune::prune_after_subset;
 pub use thread_bead_p::drop_thread_bead_dangling_p;
+#[cfg(any(test, feature = "qpdf-zlib-compat"))]
+#[doc(hidden)]
+pub use writer::V5Randomness;
 pub use writer::{
     apply_stream_compress_policy, effective_pdf_version, write_pdf, write_pdf_with_options,
     write_qdf, write_stream_to_buf, CompressStreams, NewlineBeforeEndstream, ObjectStreamMode,
