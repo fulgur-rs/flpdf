@@ -94,14 +94,13 @@ fn build_two_page_signed_acroform_pdf() -> Vec<u8> {
 }
 
 #[test]
-fn full_rewrite_flag_produces_output() {
+fn rewrite_produces_output() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "../../tests/fixtures/minimal.pdf",
         output.to_str().unwrap(),
     ])
@@ -113,7 +112,7 @@ fn full_rewrite_flag_produces_output() {
 }
 
 #[test]
-fn full_rewrite_output_is_valid_pdf() {
+fn rewrite_output_is_valid_pdf() {
     use flpdf::{check_reader, Pdf};
     use std::io::Cursor;
 
@@ -123,7 +122,6 @@ fn full_rewrite_output_is_valid_pdf() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "../../tests/fixtures/minimal.pdf",
         output.to_str().unwrap(),
     ])
@@ -147,30 +145,29 @@ fn full_rewrite_output_is_valid_pdf() {
 }
 
 #[test]
-fn full_rewrite_and_linearize_are_mutually_exclusive() {
+fn rewrite_and_linearize_produce_output() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "--linearize",
-        "../../tests/fixtures/minimal.pdf",
+        "../../tests/fixtures/compat/one-page.pdf",
         output.to_str().unwrap(),
     ])
     .assert()
-    .failure()
-    .stderr(predicate::str::contains("cannot be used together"));
+    .success();
+    assert!(output.exists());
+    assert!(std::fs::metadata(&output).unwrap().len() > 0);
 }
 
 #[test]
-fn full_rewrite_of_signed_pdf_proceeds_qpdf_compatible() {
-    // qpdf does NOT refuse a full rewrite of a signed PDF — it proceeds, leaving
+fn rewrite_of_signed_pdf_proceeds_qpdf_compatible() {
+    // qpdf does NOT refuse a rewrite of a signed PDF — it proceeds, leaving
     // signatures present-but-invalid (verified, qpdf 11.9.0: exit 0, no warning).
-    // flpdf matches pre-v1.0: the signed-full-rewrite refusal was removed
-    // (flpdf-hn1g.13; signed preserve-by-default protection deferred post-v1.0,
-    // flpdf-hn1g.14). So a plain `rewrite --full-rewrite` of a signed PDF exits 0
+    // flpdf matches qpdf: the signed-rewrite refusal was removed. A plain
+    // rewrite of a signed PDF exits 0
     // and preserves the signature objects (not stripped — that needs the explicit
     // --remove-restrictions opt-in, covered separately below).
     let temp = tempfile::tempdir().unwrap();
@@ -179,14 +176,9 @@ fn full_rewrite_of_signed_pdf_proceeds_qpdf_compatible() {
     std::fs::write(&input, build_signed_acroform_pdf()).unwrap();
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "rewrite",
-        "--full-rewrite",
-        input.to_str().unwrap(),
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success();
+    cmd.args(["rewrite", input.to_str().unwrap(), output.to_str().unwrap()])
+        .assert()
+        .success();
 
     assert!(output.exists());
     // The signature objects survive the full rewrite (present-but-invalid),
@@ -195,7 +187,7 @@ fn full_rewrite_of_signed_pdf_proceeds_qpdf_compatible() {
 }
 
 #[test]
-fn remove_restrictions_allows_signed_full_rewrite() {
+fn remove_restrictions_allows_signed_rewrite() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("signed.pdf");
     let output = temp.path().join("out.pdf");
@@ -204,7 +196,6 @@ fn remove_restrictions_allows_signed_full_rewrite() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "--remove-restrictions",
         input.to_str().unwrap(),
         output.to_str().unwrap(),
@@ -246,7 +237,7 @@ fn remove_restrictions_allows_signed_linearized_rewrite() {
 #[test]
 fn signed_pages_extraction_proceeds_qpdf_compatible() {
     // Direct regression for flpdf-hn1g.13: a signed `--pages` extraction (always
-    // a full rewrite) used to be REFUSED (exit 2) when the signature field was a
+    // a fresh rewrite) used to be REFUSED (exit 2) when the signature field was a
     // retained-page widget. qpdf does not refuse — it proceeds, leaving the
     // signature present-but-invalid. flpdf now matches: exit 0, signature objects
     // preserved. (build_signed_acroform_pdf's sig field is a widget on page 1.)
@@ -304,45 +295,4 @@ fn signed_pages_dropping_signature_page_matches_qpdf() {
     assert!(output.exists());
     // The signature's page was dropped, so the signature is gone — like qpdf.
     assert_signature_count(&output, 0);
-}
-
-#[test]
-fn incremental_rewrite_of_signed_pdf_succeeds_without_warning() {
-    // The incremental-update path appends to the source bytes verbatim, so a
-    // signed input's byte ranges stay intact — the signature is preserved and
-    // still valid, with no warning. `--remove-unreferenced-resources=no` stays on
-    // the incremental path (a plain `rewrite` defaults to `auto`, which forces a
-    // full rewrite — that now proceeds qpdf-compatibly, but it shifts byte
-    // positions and so invalidates the signature, hence this test pins the
-    // incremental path). No --remove-restrictions, so no signatures are stripped.
-    let temp = tempfile::tempdir().unwrap();
-    let input = temp.path().join("signed.pdf");
-    let output = temp.path().join("out.pdf");
-    std::fs::write(&input, build_signed_acroform_pdf()).unwrap();
-
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "rewrite",
-        "--remove-unreferenced-resources=no",
-        input.to_str().unwrap(),
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success()
-    .stderr(predicate::str::contains("refusing full rewrite").not())
-    .stderr(predicate::str::contains("removed signatures").not())
-    .stderr(predicate::str::contains("invalidated").not());
-
-    // The incremental path appends to the source bytes verbatim, so the original
-    // signature dictionary (and its signed /ByteRange) survives untouched.
-    let bytes = std::fs::read(&output).unwrap();
-    let haystack = String::from_utf8_lossy(&bytes);
-    assert!(
-        haystack.contains("/ByteRange"),
-        "incremental rewrite must preserve the signed /ByteRange"
-    );
-    assert!(
-        haystack.contains("/SubFilter /adbe.pkcs7.detached"),
-        "incremental rewrite must preserve the signature dictionary"
-    );
 }

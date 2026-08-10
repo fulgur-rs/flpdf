@@ -46,7 +46,7 @@
 //! this module uses a minimal approach: for each chunk it reopens the source
 //! bytes, mutates the `/Pages` root to contain only the chunk's page refs
 //! (updating `/Count` and `/Kids`), then writes the modified PDF through
-//! [`QPDFWriter`](crate::QPDFWriter). The writer's qpdf reachability pass
+//! [`PdfWriter`]. The writer's qpdf reachability pass
 //! drops objects that are no longer reachable from the chunk's roots.
 //!
 //! ## Known limitation: inheritable attributes
@@ -85,7 +85,7 @@
 //! ```
 
 use crate::pages::page_refs;
-use crate::{Error, Object, ObjectRef, Pdf, QPDFWriter, Result};
+use crate::{Error, Object, ObjectRef, Pdf, PdfWriter, Result};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -404,7 +404,7 @@ impl AsRef<[u8]> for SharedSource {
 ///
 /// Re-opens `src_bytes` as a fresh `Pdf`, mutates the `/Pages` root so that
 /// only the `chunk_refs` pages remain, then emits a fresh PDF via
-/// [`QPDFWriter`]. `chunk_start` (inclusive) and `chunk_end` (exclusive) are
+/// [`PdfWriter`]. `chunk_start` (inclusive) and `chunk_end` (exclusive) are
 /// the chunk's 0-based half-open `[chunk_start, chunk_end)` span in the
 /// *source* document, used to reconstruct `/PageLabels` for the chunk
 /// (qpdf `--split-pages` parity).
@@ -480,7 +480,7 @@ fn write_chunk(
 
     // Every split output is a fresh qpdf writer output. deterministic_id is a
     // writer setting, not a route selector.
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     if deterministic_id {
         writer.set_deterministic_id(true);
     }

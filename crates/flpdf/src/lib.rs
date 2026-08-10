@@ -9,7 +9,7 @@
 //! - [`pages`], [`outline`], and [`fonts`] are traversal helpers built on top of
 //!   `Pdf`. They mirror the read-only inspection surface that `qpdf --show-pages`,
 //!   `--show-outline`, and `--show-fonts` provide.
-//! - [`QPDFWriter`] configures the one fresh full-rewrite output with qpdf-shaped
+//! - [`PdfWriter`] configures the one fresh full-rewrite output with qpdf-shaped
 //!   settings.
 //! - [`check_reader`] reports diagnostics gathered during parsing/repair, returning a
 //!   [`CheckReport`] of [`Diagnostic`]s.
@@ -19,7 +19,7 @@
 //! ```no_run
 //! use std::fs::File;
 //! use std::io::BufReader;
-//! use flpdf::{pages, Pdf, QPDFWriter};
+//! use flpdf::{pages, Pdf, PdfWriter};
 //!
 //! let file = BufReader::new(File::open("input.pdf")?);
 //! let mut pdf = Pdf::open(file)?;
@@ -28,7 +28,7 @@
 //!     println!("page: {object_ref}");
 //! }
 //!
-//! let mut writer = QPDFWriter::new(&mut pdf);
+//! let mut writer = PdfWriter::new(&mut pdf);
 //! writer.set_output_file("output.pdf")?;
 //! writer.write()?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -43,7 +43,7 @@
 //! - **Outline and page-label preservation.** Support scope varies by
 //!   operation:
 //!
-//!   - [`QPDFWriter`] output (with no page selection) preserves both destination
+//!   - [`PdfWriter`] output (with no page selection) preserves both destination
 //!     sources — the legacy catalog `/Dests` dictionary and the modern
 //!     `/Names /Dests` name tree (ISO 32000-2 §7.9.6, §12.3.2.3); deeply
 //!     nested outlines (walks are iterative); all five `/A` action subtypes
@@ -267,10 +267,8 @@ pub use security::password::PasswordMode;
 pub use security::standard::ObjectKeyAlg;
 pub use signatures::{
     acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
-    signature_rewrite_impact, signatures, signatures_with_max_depth, strip_signature_values,
-    would_rewrite_invalidate_signatures, SignatureInfo, SignatureRewriteImpact,
-    SignatureRewriteReason, SignatureWriteMode, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
-    SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
+    signatures, signatures_with_max_depth, strip_signature_values, SignatureInfo,
+    DEFAULT_MAX_SIGNATURE_FIELD_DEPTH, SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 pub use standard_font_metrics::StandardFont;
 pub use struct_tree_pg::{
@@ -283,9 +281,8 @@ pub use thread_bead_p::drop_thread_bead_dangling_p;
 #[doc(hidden)]
 pub use writer::V5Randomness;
 pub use writer::{
-    apply_stream_compress_policy, effective_pdf_version, write_pdf, write_pdf_with_options,
-    write_qdf, write_stream_to_buf, CompressStreams, DecodeLevel, NewlineBeforeEndstream,
-    ObjectStreamMode, QPDFWriter, StreamDataMode, WriteOptions,
+    apply_stream_compress_policy, write_stream_to_buf, CompressStreams, DecodeLevel,
+    NewlineBeforeEndstream, ObjectStreamMode, PdfWriter, StreamDataMode,
 };
 pub use xref::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,

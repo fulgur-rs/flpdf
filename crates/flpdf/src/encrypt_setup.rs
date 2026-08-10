@@ -2,7 +2,7 @@
 //! User-facing encryption parameters for the writer side.
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API
-//! arguments) and pass it through [`crate::WriteOptions::encrypt`]; the
+//! arguments) and pass it through [`crate::PdfWriter::set_encryption_parameters`]; the
 //! writer takes care of resolving `/ID[0]`, deriving the file encryption
 //! key, building the `/Encrypt` dictionary, emitting it as an indirect
 //! object, encrypting every string and stream payload at emission time,
@@ -60,7 +60,7 @@ pub enum EncryptMethod {
 
 /// User-facing encryption parameters for the writer.
 ///
-/// Set via [`crate::WriteOptions::encrypt`]. The CLI populates these from
+/// Set via [`crate::PdfWriter::set_encryption_parameters`]. The CLI populates these from
 /// `--encrypt user-pw owner-pw key-len -- [--print …] [--modify …] [...]`;
 /// library callers can construct one directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,7 +186,7 @@ impl EncryptParams {
 ///
 /// Built by the CLI layer from the donor PDF's on-disk state (opened with
 /// [`crate::Pdf::open_with_options`]) and stored in
-/// [`crate::WriteOptions::copy_encryption`].  The writer uses it to construct
+/// [`crate::PdfWriter::copy_encryption_parameters`]. The writer uses it to construct
 /// an `EncryptionContext` directly, bypassing the normal
 /// password-derivation path.
 ///

@@ -1080,7 +1080,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 // [`--qdf --no-original-object-ids`] against a subset of the overlay
 // goldens used here (the version-floor / encrypted-source / annotation-
 // copy families remain library-only for now), catching CLI-layer wiring
-// divergences (argv parsing, QPDFWriter setting assembly, defaults) that
+// divergences (argv parsing, PdfWriter setting assembly, defaults) that
 // library-only gates cannot see.
 #[cfg(all(test, feature = "qpdf-zlib-compat"))]
 mod byte_gate {
@@ -1091,7 +1091,7 @@ mod byte_gate {
     use crate::page_form_xobject::import_page_as_form_xobject;
     use crate::page_range::PageRange;
     use crate::pages::page_refs;
-    use crate::{Pdf, QPDFWriter};
+    use crate::{Pdf, PdfWriter};
     use std::io::{Read, Seek};
     use std::path::Path;
 
@@ -1106,9 +1106,9 @@ mod byte_gate {
     fn write_qpdf<R, F>(dest: &mut Pdf<R>, configure: F) -> Vec<u8>
     where
         R: Read + Seek + 'static,
-        F: FnOnce(&mut QPDFWriter<'_, R>),
+        F: FnOnce(&mut PdfWriter<'_, R>),
     {
-        let mut writer = QPDFWriter::new(dest);
+        let mut writer = PdfWriter::new(dest);
         configure(&mut writer);
         writer.set_output_memory().unwrap();
         writer.write().unwrap();
@@ -1931,7 +1931,7 @@ mod byte_gate {
     // These gates prove the writer half of qpdf's cross-source version rule
     // in isolation from the CLI. The CLI wires the same accumulation into
     // its overlay/underlay pipeline; here the test mirrors it explicitly so
-    // QPDFWriter minimum-version and extension-level setters are the sole inputs
+    // PdfWriter minimum-version and extension-level setters are the sole inputs
     // exercised at the library boundary.
     /// Return `(max_pdf_version, max_extension_level)` over two open PDFs
     /// using qpdf's pairwise rule: the higher version wins outright, and a

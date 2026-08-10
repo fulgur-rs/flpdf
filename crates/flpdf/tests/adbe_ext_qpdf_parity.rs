@@ -21,14 +21,14 @@ use std::path::Path;
 
 /// STRIP-side WriterTestSettings (plain full rewrite, qpdf-matching newline/id).
 ///
-/// Field-mutation form (not struct-literal) because `WriterTestSettings` is
-/// `#[non_exhaustive]` and E0639 blocks struct-literal construction from
-/// outside the crate even with functional update.
+/// Keep the non-default fields explicit so this parity helper documents the
+/// exact writer settings used by the probe.
 fn strip_options() -> WriterTestSettings {
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    opts
+    WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    }
 }
 
 /// INJECT-side WriterTestSettings: strip_options() + min-version 1.7 with extension

@@ -254,7 +254,7 @@ fn compress_yes_does_not_double_compress_flate_stream() {
 }
 
 // ---------------------------------------------------------------------------
-// Full-rewrite integration: write_pdf_with_options + CompressStreams::No
+// Canonical-writer integration: PdfWriter + CompressStreams::No
 // ---------------------------------------------------------------------------
 
 /// Build a minimal in-memory PDF whose stream uses FlateDecode.
@@ -382,8 +382,10 @@ fn generate_route_matches_qpdf_empty_refilter() {
     use std::io::Cursor;
 
     let mut pdf = Pdf::open(Cursor::new(build_minimal_pdf_with_empty_stream())).unwrap();
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -403,12 +405,12 @@ fn generate_route_matches_qpdf_empty_refilter() {
 
 #[test]
 fn linearized_route_matches_qpdf_empty_refilter() {
-    use flpdf::{Pdf, QPDFWriter};
+    use flpdf::{Pdf, PdfWriter};
     use std::io::Cursor;
 
     let source = build_minimal_pdf_with_empty_stream();
     let mut write_pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut writer = QPDFWriter::new(&mut write_pdf);
+    let mut writer = PdfWriter::new(&mut write_pdf);
     writer.set_linearization(true);
     writer.set_output_memory().unwrap();
     writer.write().unwrap();
@@ -433,13 +435,15 @@ fn output_encryption_route_keeps_encoded_empty_payload() {
     use std::io::Cursor;
 
     let mut pdf = Pdf::open(Cursor::new(build_minimal_pdf_with_empty_stream())).unwrap();
-    let mut options = WriterTestSettings::default();
-    options.static_id = true;
-    options.static_aes_iv = true;
-    options.encrypt = Some(EncryptParams::v4_aes128(
-        b"user".to_vec(),
-        b"owner".to_vec(),
-    ));
+    let options = WriterTestSettings {
+        static_id: true,
+        static_aes_iv: true,
+        encrypt: Some(EncryptParams::v4_aes128(
+            b"user".to_vec(),
+            b"owner".to_vec(),
+        )),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -467,8 +471,10 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
     let (source, original_raw) = build_minimal_pdf_with_flate_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.compress_streams = CompressStreams::No;
+    let options = WriterTestSettings {
+        compress_streams: CompressStreams::No,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -503,8 +509,10 @@ fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
     let (source, original_raw) = build_minimal_pdf_with_flate_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.compress_streams = CompressStreams::Yes;
+    let options = WriterTestSettings {
+        compress_streams: CompressStreams::Yes,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();

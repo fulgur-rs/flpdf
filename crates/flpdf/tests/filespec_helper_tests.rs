@@ -379,7 +379,7 @@ fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     assert_eq!(
         filespec.get("Desc"),
         Some(&Object::String(b"new description".to_vec())),
-        "the direct Filespec mutation must be emitted in the incremental revision"
+        "the direct Filespec mutation must be emitted in the fresh rewrite"
     );
 }
 

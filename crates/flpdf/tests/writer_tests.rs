@@ -344,7 +344,7 @@ fn default_id_random_xref_stream_full_rewrite_resave_preserves_element1() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_flate_object_stream_member_and_recomputes_first() {
+fn pdf_writer_rewrites_flate_object_stream_member_and_recomputes_first() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
 
@@ -466,7 +466,7 @@ fn qpdf_writer_rewrites_flate_object_stream_member_and_recomputes_first() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_members_across_two_object_streams() {
+fn pdf_writer_rewrites_members_across_two_object_streams() {
     let member_2_source = parse_object(b"<< /Stream (first) >>").unwrap();
     let member_3_source = parse_object(b"<< /Stream (second) >>").unwrap();
     let member_5_source = parse_object(b"<< /Stream (third) >>").unwrap();
@@ -560,7 +560,7 @@ fn qpdf_writer_rewrites_members_across_two_object_streams() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_two_members_in_one_object_stream() {
+fn pdf_writer_rewrites_two_members_in_one_object_stream() {
     let member_2_source = parse_object(b"<< /Name /One /Value 1 >>").unwrap();
     let member_3_source = parse_object(b"<< /Name /Two /Value 2 >>").unwrap();
     let member_4_source = parse_object(b"<< /Name /Three /Value 3 >>").unwrap();
@@ -617,7 +617,7 @@ fn qpdf_writer_rewrites_two_members_in_one_object_stream() {
 }
 
 #[test]
-fn qpdf_writer_preserves_reencoded_untouched_object_stream_member_bytes() {
+fn pdf_writer_preserves_reencoded_untouched_object_stream_member_bytes() {
     let member_2_source = parse_object(b"<< /Name /Updated /Value 1 >>").unwrap();
     let member_3_source = parse_object(b"<< /Name /Untouched /Array [1 2 3] >>").unwrap();
     let member_4_source = parse_object(b"<< /Name /AlsoUntouched /Value false >>").unwrap();
@@ -667,7 +667,7 @@ fn qpdf_writer_preserves_reencoded_untouched_object_stream_member_bytes() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_member_declared_in_extended_object_stream() {
+fn pdf_writer_rewrites_member_declared_in_extended_object_stream() {
     let source = objstm_extends_chain_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -730,7 +730,7 @@ fn qpdf_writer_rewrites_member_declared_in_extended_object_stream() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_unresolved_member_declared_in_extended_object_stream() {
+fn pdf_writer_rewrites_unresolved_member_declared_in_extended_object_stream() {
     let source = objstm_extends_chain_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -778,7 +778,7 @@ fn qpdf_writer_rewrites_unresolved_member_declared_in_extended_object_stream() {
 }
 
 #[test]
-fn qpdf_writer_preserves_extends_when_rewriting_extension_stream_member() {
+fn pdf_writer_preserves_extends_when_rewriting_extension_stream_member() {
     let source = objstm_extends_chain_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -831,7 +831,7 @@ fn qpdf_writer_preserves_extends_when_rewriting_extension_stream_member() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_null_object_revision() {
+fn pdf_writer_rewrites_null_object_revision() {
     let mut bytes = b"%PDF-1.7\n".to_vec();
 
     let add_object = |object: &[u8], bytes: &mut Vec<u8>, offsets: &mut Vec<usize>| {
@@ -1151,9 +1151,9 @@ fn writes_qdf_normalizes_object_generations() {
 }
 
 #[test]
-fn qdf_goes_through_canonical_qpdf_writer_serializers() {
+fn qdf_goes_through_canonical_pdf_writer_serializers() {
     // The qpdf-shaped helper must emit the canonical QDF markers built by
-    // QPDFWriter, not the old compact dump. Original-object comments remain
+    // PdfWriter, not the old compact dump. Original-object comments remain
     // enabled unless the qpdf-compatible suppression setting is selected.
     let settings = WriterTestSettings {
         qdf: true,
@@ -2220,7 +2220,7 @@ fn build_pdf_with_multi_filter_stream() -> Vec<u8> {
 }
 
 #[test]
-fn qpdf_writer_minimal_pdf_is_valid() {
+fn pdf_writer_minimal_pdf_is_valid() {
     let source = build_minimal_pdf_with_stream(b"content data");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -2236,7 +2236,7 @@ fn qpdf_writer_minimal_pdf_is_valid() {
 }
 
 #[test]
-fn qpdf_writer_output_has_no_prev_in_trailer() {
+fn pdf_writer_output_has_no_prev_in_trailer() {
     let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -2252,7 +2252,7 @@ fn qpdf_writer_output_has_no_prev_in_trailer() {
 }
 
 #[test]
-fn qpdf_writer_reencodes_single_flatedecode_filter() {
+fn pdf_writer_reencodes_single_flatedecode_filter() {
     let source = build_minimal_pdf_with_stream(b"stream payload data for filter check");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -2287,7 +2287,7 @@ fn qpdf_writer_reencodes_single_flatedecode_filter() {
 }
 
 #[test]
-fn qpdf_writer_decodes_and_reencodes_multi_filter_stream() {
+fn pdf_writer_decodes_and_reencodes_multi_filter_stream() {
     // Input has [ASCII85Decode FlateDecode] — multi-filter chain from ReportLab.
     let source = build_pdf_with_multi_filter_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
@@ -2343,7 +2343,7 @@ fn qpdf_writer_decodes_and_reencodes_multi_filter_stream() {
 }
 
 #[test]
-fn qpdf_writer_rewrites_fixture_to_valid_pdf() {
+fn pdf_writer_rewrites_fixture_to_valid_pdf() {
     let file = File::open("../../tests/fixtures/minimal.pdf").unwrap();
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
 
@@ -2405,7 +2405,7 @@ fn build_minimal_pdf_with_xref_stream() -> Vec<u8> {
 }
 
 #[test]
-fn qpdf_writer_rewrites_xref_stream_input_to_valid_pdf() {
+fn pdf_writer_rewrites_xref_stream_input_to_valid_pdf() {
     // Verify that the qpdf writer handles a PDF whose source uses xref stream
     // form (XrefForm::Stream).
     let source = build_minimal_pdf_with_xref_stream();
@@ -2433,7 +2433,7 @@ fn qpdf_writer_rewrites_xref_stream_input_to_valid_pdf() {
 }
 
 #[test]
-fn qpdf_writer_xref_stream_output_has_no_prev() {
+fn pdf_writer_xref_stream_output_has_no_prev() {
     // /Prev must be absent in the fresh output even when the source used xref
     // stream form.
     let source = build_minimal_pdf_with_xref_stream();
@@ -2451,7 +2451,7 @@ fn qpdf_writer_xref_stream_output_has_no_prev() {
 }
 
 #[test]
-fn qpdf_writer_xref_stream_input_downgrades_under_force_version() {
+fn pdf_writer_xref_stream_input_downgrades_under_force_version() {
     // qpdf treats a forced sub-1.5 header as a hard cap it will not exceed.
     // Cross-reference streams are a PDF 1.5 feature, so qpdf does NOT clamp the
     // header up to 1.5 to keep the inherited stream form — it keeps the forced
@@ -2526,7 +2526,7 @@ fn build_minimal_pdf_with_flate_xref_stream() -> Vec<u8> {
 }
 
 #[test]
-fn qpdf_writer_xref_stream_compress_yes_produces_valid_flate_xref() {
+fn pdf_writer_xref_stream_compress_yes_produces_valid_flate_xref() {
     // Regression / policy test: when the source PDF's xref stream declares
     // `/Filter /FlateDecode` the full-rewrite path used to inherit that key
     // from `pdf.trailer().clone()` while emitting **raw** entry bytes,
@@ -2581,7 +2581,7 @@ fn qpdf_writer_xref_stream_compress_yes_produces_valid_flate_xref() {
 }
 
 #[test]
-fn qpdf_writer_xref_stream_compress_no_strips_all_filter_keys() {
+fn pdf_writer_xref_stream_compress_no_strips_all_filter_keys() {
     // With CompressStreams::No the rebuilt xref bytes are stored raw and no
     // /Filter key should appear in the xref stream dictionary.
     let source = build_minimal_pdf_with_flate_xref_stream();
@@ -2664,7 +2664,7 @@ fn build_pdf_with_external_file_stream() -> Vec<u8> {
 }
 
 #[test]
-fn qpdf_writer_strips_external_file_ref_from_reencoded_stream() {
+fn pdf_writer_strips_external_file_ref_from_reencoded_stream() {
     // Regression: previously /F survived through reencode_stream_flate, so a
     // re-emitted Flate stream still pointed at the (now-stale) external file
     // and readers honoring /F would ignore the embedded payload.
@@ -2737,7 +2737,7 @@ fn build_pdf_with_optional_catalog_version(header: &str, catalog_version: Option
 }
 
 #[test]
-fn qpdf_writer_force_version_sets_header_exactly() {
+fn pdf_writer_force_version_sets_header_exactly() {
     let source = build_pdf_with_optional_catalog_version("1.7", None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -2757,7 +2757,7 @@ fn qpdf_writer_force_version_sets_header_exactly() {
 }
 
 #[test]
-fn qpdf_writer_min_version_raises_header_when_source_lower() {
+fn pdf_writer_min_version_raises_header_when_source_lower() {
     let source = build_pdf_with_optional_catalog_version("1.3", None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -2777,7 +2777,7 @@ fn qpdf_writer_min_version_raises_header_when_source_lower() {
 }
 
 #[test]
-fn qpdf_writer_min_version_is_noop_when_source_already_higher() {
+fn pdf_writer_min_version_is_noop_when_source_already_higher() {
     let source = build_pdf_with_optional_catalog_version("1.7", None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
@@ -2797,7 +2797,7 @@ fn qpdf_writer_min_version_is_noop_when_source_already_higher() {
 }
 
 #[test]
-fn qpdf_writer_preserves_catalog_version_verbatim_under_force_version() {
+fn pdf_writer_preserves_catalog_version_verbatim_under_force_version() {
     // qpdf semantics (verified empirically against qpdf 11.x):
     // `qpdf --force-version=1.4` rewrites only the `%PDF-x.y` line and leaves
     // the Catalog's `/Version` entry untouched, even when it is *higher* than

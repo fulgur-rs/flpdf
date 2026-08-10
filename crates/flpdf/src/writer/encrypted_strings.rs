@@ -220,7 +220,7 @@ mod tests {
     };
     use crate::writer::{
         build_copy_encryption_context, build_encryption_context, EncryptionContext, WriteCipher,
-        WriteOptions,
+        WriterOptions,
     };
     use crate::{Dictionary, Object, ObjectRef};
 
@@ -624,7 +624,7 @@ mod tests {
 
         for (params, expected) in cases {
             let context = build_encryption_context(
-                &WriteOptions::default(),
+                &WriterOptions::default(),
                 &params,
                 10,
                 None,
@@ -657,7 +657,7 @@ mod tests {
         };
 
         let context =
-            build_copy_encryption_context(&source, &WriteOptions::default(), 10, None).unwrap();
+            build_copy_encryption_context(&source, &WriterOptions::default(), 10, None).unwrap();
 
         assert_eq!((context.encryption_v, context.encryption_r), (4, 4));
     }

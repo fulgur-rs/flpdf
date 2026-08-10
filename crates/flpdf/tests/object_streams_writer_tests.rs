@@ -1,4 +1,4 @@
-//! Integration tests for write_pdf_full_rewrite + ObjStm packing planner.
+//! Integration tests for emit_canonical_pdf + ObjStm packing planner.
 //!
 //! Covers cases from flpdf-9hc.5.6 design:
 //!   a. Disable mode emits no ObjStm
@@ -170,8 +170,10 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     let source = build_xref_stream_pdf_with_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Disable;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -221,9 +223,11 @@ fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
         .join("../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf");
     let file = std::fs::File::open(&path).unwrap_or_else(|error| panic!("open {path:?}: {error}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -281,8 +285,10 @@ fn plain_plan_failure_leaves_caller_writer_untouched() {
     source[offset..offset + root_entry.len()].fill(b' ');
     for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
         let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
-        let mut options = WriterTestSettings::default();
-        options.object_streams = mode;
+        let options = WriterTestSettings {
+            object_streams: mode,
+            ..WriterTestSettings::default()
+        };
         let mut output = b"caller-prefix".to_vec();
 
         let error = write_with_settings(&mut pdf, &mut output, &options).unwrap_err();
@@ -303,8 +309,10 @@ fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
     let source = build_xref_stream_pdf_with_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
     pdf.delete_object(ObjectRef::new(2, 0));
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Preserve;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -347,9 +355,11 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
         .join("../../tests/fixtures/compat/three-page-objstm.pdf");
     let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
     pdf.delete_object(ObjectRef::new(4, 0));
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Preserve;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -403,9 +413,11 @@ fn preserve_deleted_source_container_rebuilds_its_surviving_members() {
     }
     pdf.delete_object(ObjectRef::new(1, 0));
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Preserve;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -443,9 +455,11 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
     }
     pdf.set_object(ObjectRef::new(1, 0), Object::Null);
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Preserve;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -477,8 +491,10 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
 fn preserve_xref_stream_without_objstm_downgrades_to_classic_table() {
     let source = build_xref_stream_pdf_no_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Preserve;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -499,8 +515,10 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     let source = build_xref_stream_pdf_no_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -590,8 +608,10 @@ fn generate_mode_on_xref_table_form_upgrades_to_xref_stream() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options)
@@ -644,8 +664,10 @@ fn disable_mode_on_xref_table_form_preserves_classic_table() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Disable;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Disable,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -688,8 +710,10 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
         std::fs::read(fixture_path).unwrap_or_else(|e| panic!("read fixture {fixture_path}: {e}"));
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options)
@@ -848,8 +872,10 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
     let source = pdf_with_eligible_orphan();
     let mut pdf = Pdf::open_mem_owned(source).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     // (a) The write SUCCEEDS (it aborted before the fix).
     let mut output = Vec::new();
@@ -925,7 +951,7 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
 
 // flpdf-zbf9: a plain (non-linearized) full rewrite of an ObjStm-bearing input
 // must drop the source's /Type /ObjStm and /Type /XRef containers rather than
-// re-emit them (write_pdf_full_rewrite's is_source_structural_container skip).
+// re-emit them (emit_canonical_pdf's is_source_structural_container skip).
 // The output is rebuilt cleanly: members are repacked into a fresh container and
 // the xref is regenerated. Default features — no qpdf/zlib required.
 #[test]
@@ -935,8 +961,10 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
     let source = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -997,9 +1025,11 @@ fn generate_force_version_below_1_5_suppresses_object_and_xref_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.force_version = Some("1.4".to_string());
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        force_version: Some("1.4".to_string()),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -1035,9 +1065,11 @@ fn generate_force_version_exactly_1_5_still_emits_object_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.force_version = Some("1.5".to_string());
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        force_version: Some("1.5".to_string()),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -1061,9 +1093,11 @@ fn generate_min_version_below_1_5_still_emits_object_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.min_version = Some("1.4".to_string());
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        min_version: Some("1.4".to_string()),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -1086,10 +1120,12 @@ fn generate_force_below_1_5_overrides_higher_min_version_and_suppresses() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.force_version = Some("1.4".to_string());
-    options.min_version = Some("1.5".to_string());
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        force_version: Some("1.4".to_string()),
+        min_version: Some("1.5".to_string()),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -1112,9 +1148,11 @@ fn generate_invalid_force_version_does_not_suppress_object_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.force_version = Some("not-a-version".to_string());
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        force_version: Some("not-a-version".to_string()),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -1134,10 +1172,12 @@ fn generate_force_version_below_1_5_is_byte_identical_to_disable() {
     // `/ID` so the two writes are comparable.
     let build = |mode: ObjectStreamMode| {
         let mut pdf = Pdf::open(Cursor::new(build_xref_table_pdf())).unwrap();
-        let mut options = WriterTestSettings::default();
-        options.object_streams = mode;
-        options.force_version = Some("1.4".to_string());
-        options.static_id = true;
+        let options = WriterTestSettings {
+            object_streams: mode,
+            force_version: Some("1.4".to_string()),
+            static_id: true,
+            ..WriterTestSettings::default()
+        };
         let mut out = Vec::new();
         write_with_settings(&mut pdf, &mut out, &options).unwrap();
         out
@@ -1161,10 +1201,12 @@ fn generate_force_version_below_1_5_is_byte_identical_to_disable() {
 
 fn build_with_mode_force(mode: ObjectStreamMode, force: &str) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(build_xref_stream_pdf_with_objstm())).unwrap();
-    let mut options = WriterTestSettings::default();
-    options.object_streams = mode;
-    options.force_version = Some(force.to_string());
-    options.static_id = true;
+    let options = WriterTestSettings {
+        object_streams: mode,
+        force_version: Some(force.to_string()),
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &options).unwrap();
     out
@@ -1277,9 +1319,11 @@ fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
     // refs consume no object numbers and are dropped from the trailer.
     let source = info_and_missing_junk_pdf(100);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut options = WriterTestSettings::default();
-    options.object_streams = ObjectStreamMode::Generate;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
@@ -1373,9 +1417,11 @@ fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
     ] {
         let source = single_page_with(catalog_extra, trailer_extra);
         let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-        let mut options = WriterTestSettings::default();
-        options.object_streams = ObjectStreamMode::Generate;
-        options.static_id = true;
+        let options = WriterTestSettings {
+            object_streams: ObjectStreamMode::Generate,
+            static_id: true,
+            ..WriterTestSettings::default()
+        };
         let mut output = Vec::new();
         write_with_settings(&mut pdf, &mut output, &options)
             .unwrap_or_else(|e| panic!("dangling ref ({name}) must not abort generate: {e:?}"));

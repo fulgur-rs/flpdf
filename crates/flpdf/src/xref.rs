@@ -5072,15 +5072,12 @@ mod tests {
         // flpdf-specific (no qpdf counterpart -- qpdf's own writer has no
         // incremental-update mode): `startxref` must become the real,
         // verified position of the recovered candidate, not the original
-        // corrupt `startxref` value (999999). A subsequent incremental write
-        // uses this field as `/Prev`; leaving it at 999999 would produce a
-        // `/Prev` that points nowhere and cannot be reopened.
+        // corrupt `startxref` value (999999), so reader diagnostics and later
+        // xref traversal retain the recovered source position.
         assert_eq!(loaded.startxref, object_offset);
-        // flpdf-specific: `last_xref_form` drives incremental-write shape
-        // (`writer.rs:1018,1072,1082`) -- the verified re-entered section is
-        // a real `/Type /XRef` stream, so a subsequent incremental write
-        // must also emit a stream, not silently downgrade to a classic
-        // table and disable object-stream packing.
+        // flpdf-specific: `last_xref_form` records the verified source form;
+        // the re-entered section is a real `/Type /XRef` stream, so later
+        // reader consumers see the recovered structural form accurately.
         assert_eq!(loaded.last_xref_form, crate::XrefForm::Stream);
     }
 
@@ -5536,8 +5533,8 @@ mod tests {
         );
         // `startxref` becomes the re-entry point (object 15's real offset,
         // the true max), not the trailer-winning candidate's own offset
-        // (object 2) and not the original corrupt value (999999) -- a
-        // subsequent incremental write's `/Prev` must land somewhere real.
+        // (object 2) and not the original corrupt value (999999), so the
+        // recovered source position remains usable for later xref traversal.
         assert_eq!(loaded.startxref, object15_offset);
     }
 

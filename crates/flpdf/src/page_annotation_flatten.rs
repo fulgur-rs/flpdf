@@ -1494,7 +1494,7 @@ mod tests {
     // Test: qpdf writer round-trip — output is valid parseable PDF
     // -----------------------------------------------------------------------
     #[test]
-    fn qpdf_writer_round_trip_is_valid() {
+    fn pdf_writer_round_trip_is_valid() {
         let xobj_body = make_xobj_stream([0.0, 0.0, 100.0, 20.0], b"0.5 g 0 0 100 20 re f");
         let (n5, obj5_bytes) = obj_wrap(5, xobj_body);
         let (n4, obj4_bytes) = obj_dict(

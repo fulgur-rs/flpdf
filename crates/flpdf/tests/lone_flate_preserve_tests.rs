@@ -5,7 +5,7 @@
 //! is a verbatim copy, and a re-encode (the pre-fix behavior) produces different
 //! bytes at flpdf's compression level than the level-9 source.
 
-use flpdf::{CompressStreams, NewlineBeforeEndstream, Pdf, QPDFWriter};
+use flpdf::{CompressStreams, NewlineBeforeEndstream, Pdf, PdfWriter};
 use std::path::Path;
 
 const FIXTURE: &str = "lone-flate-l9.pdf";
@@ -51,10 +51,11 @@ fn plain_rewrite(opts: WriterTestSettings) -> Vec<u8> {
 }
 
 fn base_opts() -> WriterTestSettings {
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    opts
+    WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    }
 }
 
 #[test]
@@ -73,7 +74,7 @@ fn linearized_preserves_lone_flate_verbatim() {
         std::fs::File::open(fixture_path()).unwrap(),
     ))
     .unwrap();
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
     writer.set_deterministic_id(true);
     writer.set_output_memory().unwrap();

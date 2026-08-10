@@ -749,7 +749,7 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// Each source is left unmodified. Each input is copied with
 /// [`copy_objects`]; the result mirrors
 /// [`extract_pages`](crate::extract_pages) for a single input. Write the result
-/// with [`crate::QPDFWriter`] to produce one fresh qpdf-style output.
+/// with [`crate::PdfWriter`] to produce one fresh qpdf-style output.
 ///
 /// An input may select **no pages** (`pages: vec![]`): it contributes nothing
 /// and is not an error. A blank document passed as `inputs[0]` with an empty
@@ -801,7 +801,7 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use flpdf::{merge_documents, MergeInput, Pdf, QPDFWriter};
+/// use flpdf::{merge_documents, MergeInput, Pdf, PdfWriter};
 ///
 /// let mut a = Pdf::open(BufReader::new(File::open("a.pdf")?))?;
 /// let mut b = Pdf::open(BufReader::new(File::open("b.pdf")?))?;
@@ -811,7 +811,7 @@ fn rewrite_field_kids<R: Read + Seek>(
 /// ];
 /// let mut merged = merge_documents(&mut inputs)?;
 ///
-/// let mut writer = QPDFWriter::new(&mut merged);
+/// let mut writer = PdfWriter::new(&mut merged);
 /// writer.set_output_file("merged.pdf")?;
 /// writer.write()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -1118,8 +1118,7 @@ pub fn merge_documents<R: Read + Seek>(
     }
 
     // Drop the copied ancestor /Pages node(s) and any objects only they
-    // referenced: they are unreachable now that each leaf /Parent points at the
-    // fresh root. full_rewrite does NOT garbage-collect, so prune here.
+    // referenced before handing the graph to the canonical writer.
     sweep_unreachable_objects(&mut target)?;
 
     Ok(target)

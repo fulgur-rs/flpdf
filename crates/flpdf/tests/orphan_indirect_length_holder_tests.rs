@@ -67,10 +67,11 @@ fn object_count(out: &[u8]) -> usize {
 /// Base option set: a `--static-id` full rewrite with qpdf's default
 /// no-newline-before-endstream framing.
 fn base_opts() -> WriterTestSettings {
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    opts
+    WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    }
 }
 
 #[test]

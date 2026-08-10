@@ -712,7 +712,7 @@ pub struct LinearizationPlan {
 
     /// Object-stream mode whose traversal and stale-generation rules produced
     /// this plan. The writer reconciles a legacy boolean plan with its final
-    /// [`WriteOptions`](crate::WriteOptions) mode before using the plan's
+    /// [`WriterOptions`](crate::writer::WriterOptions) mode before using the plan's
     /// partitions and renumbering.
     pub(crate) object_stream_mode: crate::writer::ObjectStreamMode,
 }
@@ -6685,7 +6685,7 @@ mod tests {
         // renumber time (before this fix it errored "no entry in RenumberMap").
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = Pdf::open(Cursor::new(bytes)).unwrap();
-        let opts = crate::WriteOptions {
+        let opts = crate::writer::WriterOptions {
             object_streams: crate::ObjectStreamMode::Generate,
             deterministic_id: true,
             newline_before_endstream: crate::NewlineBeforeEndstream::Never,
@@ -6843,7 +6843,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).unwrap();
         let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = crate::WriteOptions {
+        let opts = crate::writer::WriterOptions {
             object_streams: crate::ObjectStreamMode::Generate,
             deterministic_id: true,
             newline_before_endstream: crate::NewlineBeforeEndstream::Never,

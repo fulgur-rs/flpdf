@@ -436,11 +436,8 @@ fn non_linear_collapse_from_qpdf_linearized() {
 
     println!("(b) non-linear collapse from qpdf-linearized: OK");
 
-    // Note: flpdf rewrite uses incremental updates, so the *original* bytes (including any
-    // /Linearized dictionary) are preserved as a prefix; only the incremental update section
-    // appended at the end changes the effective structure.  qpdf correctly reads the most
-    // recent update and reports "is not linearized".  A raw-byte scan of the prefix would
-    // produce a false positive, so we rely on qpdf's semantic check only.
+    // The canonical rewrite emits a fresh non-linearized document. A semantic
+    // qpdf check is used here rather than a raw-byte scan of the input prefix.
 }
 
 // ---------------------------------------------------------------------------

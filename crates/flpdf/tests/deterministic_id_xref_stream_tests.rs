@@ -59,9 +59,11 @@ fn one_page_with_info_fixture() -> Vec<u8> {
 /// exercises the `XrefForm::Stream` writer arm.
 fn write_xref_stream_deterministic(src: &[u8]) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(src.to_vec())).expect("fixture must open");
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.deterministic_id = true;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).expect("deterministic xref-stream write");
     out

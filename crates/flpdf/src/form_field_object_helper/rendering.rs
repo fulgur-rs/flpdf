@@ -1710,7 +1710,7 @@ mod tests {
     use crate::content_stream::{
         parse_content_operations, parse_content_stream_data, ParseControl, ParserCallbacks,
     };
-    use crate::writer::QPDFWriter;
+    use crate::writer::PdfWriter;
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -2294,7 +2294,7 @@ mod tests {
         assert_eq!(rendered, b"Hello World", "Tj does not match field value");
 
         // Write out and re-parse to make sure the PDF structure is sound.
-        let mut writer = QPDFWriter::new(&mut pdf);
+        let mut writer = PdfWriter::new(&mut pdf);
         writer.set_output_memory().expect("memory output");
         writer.write().expect("qpdf writer");
         let xobj_ref2 = writer
@@ -4435,7 +4435,7 @@ mod tests {
             .expect("generate")
             .expect("must produce appearance");
 
-        let mut writer = QPDFWriter::new(&mut pdf);
+        let mut writer = PdfWriter::new(&mut pdf);
         writer.set_output_memory().expect("memory output");
         writer.write().expect("qpdf writer");
         let widget_ref2 = writer
@@ -5100,7 +5100,7 @@ mod tests {
             .expect("generate")
             .expect("must produce appearance");
 
-        let mut writer = QPDFWriter::new(&mut pdf);
+        let mut writer = PdfWriter::new(&mut pdf);
         writer.set_output_memory().expect("memory output");
         writer.write().expect("qpdf writer");
         let widget_ref2 = writer

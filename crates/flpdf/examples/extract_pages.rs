@@ -6,9 +6,9 @@
 mod common;
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 
-use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PagePlan, Pdf, WriteOptions};
+use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PagePlan, Pdf, PdfWriter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A 5-page source document (all pages share one font object).
@@ -25,16 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild the page tree so only the selected pages remain (flattened /Pages).
     rebuild_page_tree(&mut pdf, &selected)?;
 
-    // Write a full (non-incremental) rewrite so unreferenced objects drop out.
-    // `WriteOptions` is `#[non_exhaustive]`, so it must be built from its
-    // `Default` and then mutated rather than via a struct literal.
-    #[allow(clippy::field_reassign_with_default)]
-    let opts = {
-        let mut opts = WriteOptions::default();
-        opts.full_rewrite = true;
-        opts
-    };
-    write_to(&mut pdf, &out_path, &opts)?;
+    // The canonical writer emits one fresh PDF and drops unreachable objects.
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(&out_path)?;
+    writer.write()?;
 
     // Re-open the output and verify it has exactly 3 pages.
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;
@@ -48,15 +42,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(out_pdf);
     let _ = std::fs::remove_file(&src_path);
     let _ = std::fs::remove_file(&out_path);
-    Ok(())
-}
-
-fn write_to(
-    pdf: &mut Pdf<BufReader<File>>,
-    path: &std::path::Path,
-    opts: &WriteOptions,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let out = BufWriter::new(File::create(path)?);
-    flpdf::write_pdf_with_options(pdf, out, opts)?;
     Ok(())
 }

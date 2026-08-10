@@ -2,7 +2,7 @@
 
 use flpdf::{
     acroform_sig_flags, clear_sig_flags, disable_digital_signatures, remove_security_restrictions,
-    strip_signature_values, Object, ObjectRef, Pdf, QPDFWriter, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
+    strip_signature_values, Object, ObjectRef, Pdf, PdfWriter, DEFAULT_MAX_SIGNATURE_FIELD_DEPTH,
     SIG_FLAGS_APPEND_ONLY, SIG_FLAGS_SIGNATURES_EXIST,
 };
 use std::collections::BTreeMap;
@@ -437,7 +437,7 @@ fn sig_flags_absent_without_acroform() {
 #[test]
 fn full_rewrite_round_trip_preserves_sig_flags() {
     let mut pdf = open(build_signed_acroform_pdf());
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory().unwrap();
     writer.write().unwrap();
     let out = writer.get_buffer().unwrap();

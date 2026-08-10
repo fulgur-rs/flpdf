@@ -136,8 +136,10 @@ fn one_page_non16_id0_fixture() -> Vec<u8> {
 
 fn write_deterministic(fixture: &[u8]) -> Vec<u8> {
     let mut pdf = Pdf::open_mem(Arc::from(fixture)).expect("fixture must open");
-    let mut opts = WriterTestSettings::default();
-    opts.deterministic_id = true;
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).expect("deterministic write");
     out

@@ -24,7 +24,7 @@ fn roundtrip(data: &[u8]) {
     // a shared handle would feed it a post-write document — a sequence no real
     // consumer produces). Mirrors `fuzz/fuzz_targets/roundtrip.rs`.
     if let Ok(mut pdf) = flpdf::Pdf::open_mem(Arc::clone(&shared)) {
-        let mut writer = flpdf::QPDFWriter::new(&mut pdf);
+        let mut writer = flpdf::PdfWriter::new(&mut pdf);
         if writer.set_output_memory().is_ok() && writer.write().is_ok() {
             let _ = writer.get_buffer();
         }

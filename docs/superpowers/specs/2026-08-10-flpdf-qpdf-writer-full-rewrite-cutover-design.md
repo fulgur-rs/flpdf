@@ -6,9 +6,11 @@ Owner: `flpdf-25kg.6.2`
 
 ## Decision
 
-flpdf will model qpdf 11.9.0's `QPDFWriter` as the only PDF document-output
-writer. The writer will always create a new full-rewrite output and will not
-provide an incremental-update output route.
+flpdf's `PdfWriter` will model qpdf 11.9.0's `QPDFWriter` responsibility as the
+only PDF document-output writer. The local name is intentionally `PdfWriter`;
+`QPDFWriter` in this document denotes qpdf's source-oracle class only. The
+writer will always create a new full-rewrite output and will not provide an
+incremental-update output route.
 
 This is a qpdf-convergence change, not a compatibility-preserving change.
 The existing flpdf free-function surface and options are not retained merely
@@ -74,12 +76,12 @@ rg -n "QPDFWriter|incremental|writeStandard|writeLinearized" \
 
 | Responsibility | qpdf 11.9.0 owner | Current flpdf route | Decision |
 |---|---|---|---|
-| New PDF output | `QPDFWriter::write` | `write_pdf_full_rewrite_inner` plus specialized writer paths | Make the canonical writer object and route all consumers through it |
+| New PDF output | qpdf `QPDFWriter::write` | `emit_canonical_pdf_inner` plus specialized writer paths | Make `PdfWriter` the canonical object and route all consumers through it |
 | Incremental PDF output | None | `write_pdf_incremental` and its object/xref/trailer helpers | Delete |
 | Existing incremental input | `QPDF::read_xref` and `/Prev` traversal | `reader.rs` / `xref.rs` | Keep |
 | ObjStm and xref form | `QPDFWriter` planner and emitters | plain writer plus legacy writer/object-stream modules | Keep only the qpdf-responsibility paths; converge duplicated emitters in bounded slices |
 | Signature inspection | qpdf object/document inspection | `signatures.rs` | Keep read-only inspection |
-| Signature-preserving PDF output | No `QPDFWriter` incremental route | `SignatureWriteMode::Incremental` and append-only checks | Delete writer-preservation semantics; full rewrite invalidation matches qpdf |
+| Signature-preserving PDF output | No qpdf incremental writer route | `SignatureWriteMode::Incremental` and append-only checks | Delete writer-preservation semantics; full rewrite invalidation matches qpdf |
 | JSON/Pipeline incremental delivery | qpdf JSON/pipeline writers | `json`, `json_inspect`, and `pipeline` modules | Keep; it is not PDF incremental output |
 
 The current public default is documented as incremental in
@@ -91,7 +93,8 @@ remove.
 
 ### Writer lifecycle
 
-The public writer will have the same conceptual lifecycle as `QPDFWriter`:
+The public `PdfWriter` will have the same conceptual lifecycle as qpdf's
+`QPDFWriter`:
 
 1. Construct a writer around a live `Pdf`.
 2. Configure output and qpdf writer settings.

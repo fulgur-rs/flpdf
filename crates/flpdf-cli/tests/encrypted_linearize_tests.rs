@@ -1,10 +1,8 @@
-//! Regression coverage for flpdf-4ea: `flpdf rewrite --linearize` (and the
-//! top-level `flpdf --linearize INPUT OUTPUT` shorthand) must refuse to run
-//! against an encrypted input until the decrypt → linearize → back-patch
-//! pipeline is exercised end-to-end. The reject was added in d8d665e because
-//! the linearization writer historically packaged the still-encrypted streams
-//! verbatim, producing a structurally-valid-looking PDF that silently broke
-//! every content stream.
+//! qpdf parity coverage for `flpdf rewrite --linearize` (and the top-level
+//! `flpdf --linearize INPUT OUTPUT` shorthand) on encrypted inputs. The
+//! encrypted fixtures in this file intentionally have no pages; qpdf 11.9.0
+//! reports the same "no pages found while calculating linearization data"
+//! diagnostic before it can emit an output.
 
 use assert_cmd::Command;
 use std::path::{Path, PathBuf};
@@ -27,26 +25,24 @@ fn rewrite_linearize_into(out: &Path, fixture_name: &str, password: &str) -> Com
 }
 
 #[test]
-fn rewrite_linearize_rejects_encrypted_input_with_actionable_error() {
+fn rewrite_linearize_encrypted_no_page_input_matches_qpdf_error() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out.pdf");
     rewrite_linearize_into(&out, "v5-aes-256-r6.pdf", "user-v5-r6")
         .assert()
         .failure()
         .stderr(predicates::str::contains(
-            "encrypted PDF output is not supported",
-        ))
-        .stderr(predicates::str::contains(
-            "use plain rewrite to produce decrypted plaintext",
+            "no pages found while calculating linearization data",
         ));
-    assert!(
-        !out.exists(),
-        "rewrite --linearize must not leave a partial output behind"
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().len(),
+        0,
+        "qpdf leaves a zero-byte output placeholder on this planning error"
     );
 }
 
 #[test]
-fn rewrite_linearize_rejects_all_encrypted_fixture_variants() {
+fn rewrite_linearize_encrypted_fixture_errors_match_qpdf() {
     let cases = [
         ("v1-rc4-40-r2.pdf", "user-v1"),
         ("v2-rc4-128-r3.pdf", "user-v2"),
@@ -62,36 +58,33 @@ fn rewrite_linearize_rejects_all_encrypted_fixture_variants() {
             .assert()
             .failure()
             .stderr(predicates::str::contains(
-                "encrypted PDF output is not supported",
-            ))
-            .stderr(predicates::str::contains(
-                "use plain rewrite to produce decrypted plaintext",
+                "no pages found while calculating linearization data",
             ));
-        assert!(
-            !out.exists(),
-            "{file_name}: --linearize must not leave a partial output behind"
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            0,
+            "{file_name}: qpdf leaves a zero-byte output placeholder on this planning error"
         );
     }
 }
 
 #[test]
-fn top_level_linearize_shorthand_also_rejects_encrypted_input() {
+fn top_level_linearize_encrypted_no_page_input_matches_qpdf_error() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("out.pdf");
     // `flpdf --linearize INPUT OUTPUT` (no `rewrite` subcommand) is the qpdf-
-    // style top-level alias; it must reject too.
+    // style top-level alias and must surface the same qpdf error.
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.arg("--linearize")
         .arg("--password=user-v5-r6")
         .arg(fixture("v5-aes-256-r6.pdf"))
         .arg(&out);
-    cmd.assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "encrypted PDF output is not supported",
-        ))
-        .stderr(predicates::str::contains(
-            "use plain rewrite to produce decrypted plaintext",
-        ));
-    assert!(!out.exists());
+    cmd.assert().failure().stderr(predicates::str::contains(
+        "no pages found while calculating linearization data",
+    ));
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().len(),
+        0,
+        "qpdf leaves a zero-byte output placeholder on this planning error"
+    );
 }

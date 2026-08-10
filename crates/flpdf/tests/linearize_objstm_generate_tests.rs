@@ -23,9 +23,11 @@ fn linearize_generate(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.deterministic_id = true;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
@@ -841,8 +843,10 @@ fn ineligible_od_stream_routes_to_part4_open_document_plain() {
     )
     .unwrap();
     let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Generate;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
     let bytes = write_linearized_with_settings(&mut pdf2, &opts).unwrap();
 
     // Verify the plain Form XObject stream appears before any ObjStm in the
@@ -1143,10 +1147,12 @@ fn linearize_mode_force_version(fixture: &str, mode: ObjectStreamMode, force: &s
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = mode;
-    opts.deterministic_id = true;
-    opts.force_version = Some(force.to_string());
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        deterministic_id: true,
+        force_version: Some(force.to_string()),
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 

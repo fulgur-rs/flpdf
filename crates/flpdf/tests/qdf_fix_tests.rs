@@ -408,9 +408,11 @@ fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
 
     let source = read("../compat/three-page.pdf");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.qdf = true;
-    opts.static_id = true;
+    let opts = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut qdf = Vec::new();
     write_with_settings(&mut pdf, &mut qdf, &opts).unwrap();
 
@@ -938,9 +940,11 @@ fn writer_indirect_length_qdf_round_trips() {
     // Streams are clean Flate so `qpdf --check` stays warning-free.
     let source = read("../compat/objstm-lin-od-indirect-length-flate.pdf");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.qdf = true;
-    opts.static_id = true;
+    let opts = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut qdf = Vec::new();
     write_with_settings(&mut pdf, &mut qdf, &opts).unwrap();
 

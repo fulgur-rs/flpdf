@@ -11,10 +11,11 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 
 use flpdf::{
-    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef, Pdf,
+    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef,
+    Pdf, PdfWriter,
 };
 
 /// Resolve a page's `/Resources /Font /F1` indirect reference.
@@ -55,10 +56,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a_len = page_refs(&mut a)?.len();
     splice_pages(&mut a, a_len..a_len, &copied)?;
 
-    // A plain write keeps existing objects; we only append pages, so the
-    // unreferenced-object pruning of `full_rewrite` (see extract_pages) is unnecessary.
-    let out = BufWriter::new(File::create(&out_path)?);
-    flpdf::write_pdf(&mut a, out)?;
+    // The canonical writer emits one fresh qpdf-style document.
+    let mut writer = PdfWriter::new(&mut a);
+    writer.set_output_file(&out_path)?;
+    writer.write()?;
 
     // Verify on the output: merged doc has 4 pages, and the two merged-in pages
     // reference a single shared font object.

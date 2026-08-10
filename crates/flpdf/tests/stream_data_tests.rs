@@ -106,9 +106,10 @@ fn full_rewrite(src: &[u8], opts: &WriterTestSettings) -> Vec<u8> {
 }
 
 fn base_opts() -> WriterTestSettings {
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts
+    WriterTestSettings {
+        static_id: true,
+        ..WriterTestSettings::default()
+    }
 }
 
 // ---------------------------------------------------------------------------

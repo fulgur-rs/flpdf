@@ -34,8 +34,10 @@ fn fixture(rel: &str) -> Vec<u8> {
 fn encrypt_to_bytes(input: &[u8], params: EncryptParams) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(input.to_vec())).expect("open plaintext input");
     let mut out = Vec::new();
-    let mut options = WriterTestSettings::default();
-    options.encrypt = Some(params);
+    let options = WriterTestSettings {
+        encrypt: Some(params),
+        ..WriterTestSettings::default()
+    };
     write_with_settings(&mut pdf, &mut out, &options).expect("encrypted write");
     out
 }
@@ -127,11 +129,12 @@ fn fixture_from_objects(objects: &[Vec<u8>], info_number: u32) -> Vec<u8> {
 }
 
 fn encrypted_options() -> WriterTestSettings {
-    let mut options = WriterTestSettings::default();
-    options.static_id = true;
-    options.static_aes_iv = true;
-    options.encrypt = Some(EncryptParams::v4_aes128(Vec::new(), Vec::new()));
-    options
+    WriterTestSettings {
+        static_id: true,
+        static_aes_iv: true,
+        encrypt: Some(EncryptParams::v4_aes128(Vec::new(), Vec::new())),
+        ..WriterTestSettings::default()
+    }
 }
 
 fn rewrite_fixture(input: &[u8], options: &WriterTestSettings) -> Vec<u8> {
@@ -680,10 +683,12 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
     for qdf in [false, true] {
         let mut pdf = Pdf::open(Cursor::new(input.clone())).expect("open copy-encryption fixture");
         let mut output = Vec::new();
-        let mut options = WriterTestSettings::default();
-        options.qdf = qdf;
-        options.static_id = true;
-        options.static_aes_iv = true;
+        let mut options = WriterTestSettings {
+            qdf,
+            static_id: true,
+            static_aes_iv: true,
+            ..WriterTestSettings::default()
+        };
         let mut encrypt_dict = Dictionary::new();
         encrypt_dict.insert("V", Object::Integer(4));
         encrypt_dict.insert("R", Object::Integer(4));
@@ -718,13 +723,15 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
 #[test]
 fn rc4_128_printable_ciphertext_uses_literal_string_syntax() {
     let input = rc4_printable_ciphertext_fixture();
-    let mut options = WriterTestSettings::default();
-    options.static_id = true;
-    options.encrypt = Some(EncryptParams::rc4(
-        EncryptMethod::V4Rc4128,
-        Vec::new(),
-        Vec::new(),
-    ));
+    let options = WriterTestSettings {
+        static_id: true,
+        encrypt: Some(EncryptParams::rc4(
+            EncryptMethod::V4Rc4128,
+            Vec::new(),
+            Vec::new(),
+        )),
+        ..WriterTestSettings::default()
+    };
 
     let bytes = rewrite_fixture(&input, &options);
     let repeated = rewrite_fixture(&input, &options);
@@ -802,12 +809,14 @@ fn v4_aes128_preserve_drops_orphan_length_holder() {
     let input = fixture("tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
     let mut pdf = Pdf::open(Cursor::new(input)).expect("open plaintext input");
     let mut out = Vec::new();
-    let mut options = WriterTestSettings::default();
-    options.stream_data = Some(StreamDataMode::Preserve);
-    options.encrypt = Some(EncryptParams::v4_aes128(
-        b"user-pw".to_vec(),
-        b"owner-pw".to_vec(),
-    ));
+    let options = WriterTestSettings {
+        stream_data: Some(StreamDataMode::Preserve),
+        encrypt: Some(EncryptParams::v4_aes128(
+            b"user-pw".to_vec(),
+            b"owner-pw".to_vec(),
+        )),
+        ..WriterTestSettings::default()
+    };
     write_with_settings(&mut pdf, &mut out, &options).expect("encrypted preserve write");
 
     let mut pdf = open_encrypted(&out, b"user-pw");

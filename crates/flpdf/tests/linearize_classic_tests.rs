@@ -2,7 +2,7 @@
 //! `qpdf-zlib-compat`, covering the outline section-routing fix (flpdf-vvjr.2).
 //!
 //! These tests drive the public `write_linearized` API with default
-//! `WriteOptions` (classic xref-table path, no ObjStm containers) and assert
+//! `WriterOptions` (classic xref-table path, no ObjStm containers) and assert
 //! structural properties of the back-patched bytes directly, so they run on
 //! every build. Byte-identity against qpdf goldens is gated on `qpdf-zlib-compat`
 //! in `cmp_linearize_tests.rs`.
@@ -12,7 +12,7 @@ use flpdf::Pdf;
 use std::io::Cursor;
 use std::path::Path;
 
-/// Linearize `fixture` with default `WriteOptions` (classic xref-table, no ObjStm)
+/// Linearize `fixture` with default `WriterOptions` (classic xref-table, no ObjStm)
 /// via the public API and return the complete back-patched bytes.
 fn linearize_classic(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -21,8 +21,10 @@ fn linearize_classic(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.deterministic_id = true;
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 

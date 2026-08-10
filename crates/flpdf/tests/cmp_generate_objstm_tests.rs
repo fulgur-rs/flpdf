@@ -36,11 +36,13 @@ fn generate_qpdf_equivalent(fixture: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.static_id = true;
-    // qpdf's default output writes no newline before endstream.
-    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        static_id: true,
+        // qpdf's default output writes no newline before endstream.
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     // compress_streams defaults to Yes (decode + re-encode to single FlateDecode).
 
     let mut out = Vec::new();
@@ -122,11 +124,13 @@ fn generate_force_qpdf_equivalent(fixture: &str, force: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.force_version = Some(force.to_string());
-    opts.static_id = true;
-    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        force_version: Some(force.to_string()),
+        static_id: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).unwrap();

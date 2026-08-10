@@ -2,7 +2,7 @@
 //!
 //! Mirrors the library-level `lone_flate_preserve_tests.rs`: a fixture whose
 //! page content stream is an already-lone `/FlateDecode` is rewritten through
-//! the CLI's full-rewrite path, and the largest `stream ... endstream` payload
+//! the CLI's canonical writer, and the largest `stream ... endstream` payload
 //! of the output is compared against the source.
 //!
 //!   default (no --recompress-flate) → payload preserved verbatim (qpdf parity)
@@ -56,15 +56,14 @@ fn output_payload(out: &[u8]) -> Vec<u8> {
 }
 
 /// Run `flpdf rewrite <base args> <extra> <in> <out>` and return the output PDF
-/// bytes. The full-rewrite path is forced via `--full-rewrite` so the lone-Flate
-/// preserve gate (which lives in the full-rewrite writer) is active. The two
-/// invocations differ only by `extra_args`, keeping the `!=` assertion honest.
+/// bytes. Both invocations use the canonical writer and differ only by
+/// `extra_args`, keeping the `!=` assertion honest.
 fn rewrite(extra_args: &[&str]) -> Vec<u8> {
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("out.pdf");
 
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.arg("rewrite").arg("--full-rewrite").arg("--static-id");
+    cmd.arg("rewrite").arg("--static-id");
     for a in extra_args {
         cmd.arg(a);
     }
@@ -73,7 +72,7 @@ fn rewrite(extra_args: &[&str]) -> Vec<u8> {
     std::fs::read(&out_path).unwrap()
 }
 
-/// Default full rewrite preserves an already-lone `/FlateDecode` stream verbatim.
+/// Default canonical rewrite preserves an already-lone `/FlateDecode` stream verbatim.
 #[test]
 fn cli_full_rewrite_preserves_lone_flate_verbatim() {
     let out = rewrite(&[]);
@@ -102,16 +101,13 @@ fn cli_recompress_flate_reencodes_lone_flate() {
     );
 }
 
-/// Regression: `--recompress-flate` must take effect even when nothing else
-/// forces a full rewrite. `--remove-unreferenced-resources=no` disables the
-/// auto full-rewrite promotion, and no `--full-rewrite`/`--qdf`/`--deterministic-id`
-/// is passed, so without the flag's own full-rewrite promotion the write would
-/// take the incremental path and copy the stream verbatim — silently ignoring
-/// `--recompress-flate`. Here the stream must be re-encoded (payload differs from
-/// the level-9 source). Only the stream payload is compared, so no `--static-id`
-/// is needed.
+/// Regression: `--recompress-flate` must take effect even when no other
+/// mutation flag is present. `--remove-unreferenced-resources=no` must not
+/// bypass the canonical writer, and the stream must be re-encoded (payload
+/// differs from the level-9 source). Only the stream payload is compared, so
+/// no `--static-id` is needed.
 #[test]
-fn cli_recompress_flate_promotes_to_full_rewrite_when_not_otherwise_forced() {
+fn cli_recompress_flate_works_without_otherwise_forcing_rewrite() {
     let temp = tempfile::tempdir().unwrap();
     let out_path = temp.path().join("out.pdf");
     Command::cargo_bin("flpdf")
@@ -127,7 +123,6 @@ fn cli_recompress_flate_promotes_to_full_rewrite_when_not_otherwise_forced() {
     assert_ne!(
         output_payload(&out),
         source_payload(),
-        "--recompress-flate must re-encode the stream even without an explicit \
-         full-rewrite trigger (it should promote to a full rewrite)"
+        "--recompress-flate must re-encode the stream without another mutation flag"
     );
 }

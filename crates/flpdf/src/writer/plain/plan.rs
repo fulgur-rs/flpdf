@@ -8,7 +8,8 @@ use crate::pdf_version::{parse_pdf_version, PDF_1_5};
 use crate::rewrite_renumber::{CatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber};
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::xref::{IdPlan, TrailerPlan};
-use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefEntry, XrefForm};
+use crate::writer::WriterOptions;
+use crate::{CompressStreams, Object, ObjectRef, Pdf, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -48,7 +49,7 @@ pub(crate) struct PlainWritePlan {
 impl PlainWritePlan {
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
-        options: &WriteOptions,
+        options: &WriterOptions,
     ) -> crate::Result<Self> {
         let source_root = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
         let source_had_compressed_objects = source_has_compressed_entries(pdf);
@@ -165,7 +166,7 @@ impl PlainWritePlan {
         }
 
         let mut dictionary = pdf.trailer().clone();
-        crate::writer::strip_incremental_trailer_keys(&mut dictionary);
+        crate::writer::strip_writer_trailer_history_keys(&mut dictionary);
         crate::writer::remap_qpdf_trailer_refs_with_removed(
             pdf,
             &mut dictionary,
@@ -540,7 +541,8 @@ mod tests {
 
     use crate::writer::object_streams::ObjectStreamMode;
     use crate::writer::plain::xref::{IdPlan, TrailerPlan};
-    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, Pdf, WriteOptions, XrefForm};
+    use crate::writer::WriterOptions;
+    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, Pdf, XrefForm};
 
     fn fixture_path(fixture: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -548,13 +550,12 @@ mod tests {
             .join(fixture)
     }
 
-    fn write_options(mode: ObjectStreamMode) -> WriteOptions {
-        WriteOptions {
-            full_rewrite: true,
+    fn write_options(mode: ObjectStreamMode) -> WriterOptions {
+        WriterOptions {
             object_streams: mode,
             static_id: true,
             newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         }
     }
 

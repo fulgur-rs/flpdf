@@ -1,4 +1,4 @@
-//! Private qpdf-shaped settings used by [`super::QPDFWriter`].
+//! Private qpdf-shaped settings used by [`super::PdfWriter`].
 
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
 
 use super::{
     CompressStreams, NewlineBeforeEndstream, ObjectStreamMode, ProgressReporter, StreamDataMode,
-    WriteOptions,
+    WriterOptions,
 };
 
 /// Controls how much stream decoding a writer setting requests.
@@ -27,11 +27,11 @@ pub enum DecodeLevel {
     All,
 }
 
-/// The private settings state owned by [`super::QPDFWriter`].
+/// The private settings state owned by [`super::PdfWriter`].
 ///
-/// The current emitter still consumes [`WriteOptions`]. `to_write_options`
-/// is a temporary, private Task 2A bridge; it always enables the emitter's
-/// full-rewrite branch and does not expose that selector on this object.
+/// The current emitter consumes [`WriterOptions`]. `to_write_options` keeps
+/// the qpdf-shaped public setter state separate from the emitter's internal
+/// option representation.
 #[allow(dead_code)]
 pub(crate) struct WriterSettings {
     pub(crate) object_stream_mode: ObjectStreamMode,
@@ -45,7 +45,7 @@ pub(crate) struct WriterSettings {
     pub(crate) content_normalization_set: bool,
     pub(crate) qdf_mode: bool,
     pub(crate) preserve_unreferenced_objects: bool,
-    pub(crate) newline_before_endstream: bool,
+    pub(crate) newline_before_endstream: NewlineBeforeEndstream,
     pub(crate) minimum_pdf_version: Option<(String, i64)>,
     pub(crate) forced_pdf_version: Option<(String, i64)>,
     pub(crate) extra_header_text: String,
@@ -76,7 +76,7 @@ impl Default for WriterSettings {
             content_normalization_set: false,
             qdf_mode: false,
             preserve_unreferenced_objects: false,
-            newline_before_endstream: false,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
             minimum_pdf_version: None,
             forced_pdf_version: None,
             extra_header_text: String::new(),
@@ -96,17 +96,22 @@ impl Default for WriterSettings {
 }
 
 impl WriterSettings {
-    /// Convert the qpdf-shaped settings into the legacy emitter's private
-    /// option representation for this temporary full-rewrite slice.
-    pub(crate) fn to_write_options(&self) -> WriteOptions {
-        // QPDFWriter applies QDF defaults during write setup, after all public
+    /// Convert the qpdf-shaped settings into the canonical emitter's private
+    /// option representation.
+    pub(crate) fn to_write_options(&self) -> WriterOptions {
+        // PdfWriter applies qpdf's QDF defaults during write setup, after all public
         // setters have run. Only values that were never explicitly set are
         // replaced: QDF enables content normalization, disables compression,
         // and raises the decode level to generalized
         // (QPDFWriter.cc:2078-2087).
         let content_normalization =
             self.content_normalization || (self.qdf_mode && !self.content_normalization_set);
-        let compress_streams = if self.qdf_mode && !self.compress_streams_set {
+        // qpdf's QDF serializer never emits compressed stream bodies:
+        // QPDFWriter.cc uses `compress_streams && !qdf_mode` at the emission
+        // boundary, so even an explicit setCompressStreams(true) is ignored
+        // while QDF mode is active. Keep the effective emitter option aligned
+        // with that observable rule rather than preserving the setter bit.
+        let compress_streams = if self.qdf_mode {
             false
         } else {
             self.compress_streams
@@ -117,10 +122,7 @@ impl WriterSettings {
             self.decode_level
         };
 
-        let mut options = WriteOptions {
-            // The compatibility bridge must never select the incremental
-            // route, even though WriteOptions still contains that old field.
-            full_rewrite: true,
+        let mut options = WriterOptions {
             object_streams: self.object_stream_mode,
             preserve_unreferenced_objects: self.preserve_unreferenced_objects,
             compress_streams: if compress_streams {
@@ -129,20 +131,14 @@ impl WriterSettings {
                 CompressStreams::No
             },
             decode_level,
-            // QPDFWriter translates set_stream_data_mode into compress/decode
-            // state. Keep this bridge field clear so the legacy effective
-            // policy cannot override the qpdf setter ordering.
+            // PdfWriter translates set_stream_data_mode into compress/decode
+            // state. Keep this field aligned with that setter ordering.
             stream_data: self.stream_data_mode,
             recompress_flate: self.recompress_flate,
             content_normalization,
             qdf: self.qdf_mode,
             qdf_stream_policy_precomputed: true,
-            newline_before_endstream: if self.newline_before_endstream {
-                NewlineBeforeEndstream::Yes
-            } else {
-                // qpdf's false setting is the existing Never default.
-                NewlineBeforeEndstream::Never
-            },
+            newline_before_endstream: self.newline_before_endstream,
             static_id: self.static_id,
             deterministic_id: self.deterministic_id,
             static_aes_iv: self.static_aes_iv,
@@ -151,7 +147,7 @@ impl WriterSettings {
             copy_encryption: self.copy_encryption.clone(),
             pclm: self.pclm,
             progress_reporter: self.progress_reporter.clone(),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
 
         options.min_version = self

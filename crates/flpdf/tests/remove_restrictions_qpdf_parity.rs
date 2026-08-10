@@ -54,9 +54,11 @@ fn remove_restrictions_qpdf_equivalent(fixture: &str) -> Vec<u8> {
 
     disable_digital_signatures(&mut pdf).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).unwrap();

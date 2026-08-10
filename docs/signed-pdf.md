@@ -36,17 +36,16 @@ collecting any field whose (inherited) `/FT` is `/Sig` or that carries a
 strip/preserve decision, and there is no enforcement layer that
 rejects non-append modifications on its basis.
 
-There are three outcomes, depending on the operation and flags:
+There are two outcomes, depending on the operation and flags:
 
-### 1. Full rewrite — proceed (default, qpdf-compatible)
+### 1. Fresh rewrite — proceed (default, qpdf-compatible)
 
 A **full rewrite** of a signed PDF proceeds. Renumbering and re-serializing
 objects relocates the signed byte ranges, so the existing signature no longer
 validates; the signature objects themselves are preserved (present-but-invalid),
-matching qpdf. No diagnostic is printed and the command exits 0. The
-[`signature_rewrite_impact`] query API still reports that a full rewrite *would*
-invalidate signatures, for callers that want to make their own decision, but the
-writer no longer refuses on that basis.
+matching qpdf. No diagnostic is printed and the command exits 0. There is no
+signature-preserving PDF output route: qpdf has no incremental PDF writer, and
+flpdf's canonical writer always emits a fresh document.
 
 ### 2. Strip (explicit opt-in)
 
@@ -72,37 +71,10 @@ fields' `/V` and `/SigFlags`. It does **not** bypass authentication — an
 auth-requiring input without a working `--password` is rejected exactly as a
 plain `rewrite` would reject it.
 
-### 3. Preserve (incremental update)
-
-To modify a signed PDF *without* invalidating the existing signatures, use
-the incremental-update path, which appends a new xref/trailer section and
-leaves the original signed bytes (and their `/ByteRange`) untouched.
-
-The incremental path is taken when a full rewrite is *not* forced. The full
-rewrite is forced by the default `--remove-unreferenced-resources=auto`, so
-to stay on the signature-preserving incremental path, disable it:
-
-```bash
-flpdf rewrite --remove-unreferenced-resources=no input.pdf output.pdf
-```
-
-(On a plain rewrite this flag does not actually remove any `/Resources`
-entries — matching qpdf, which prunes resource entries only during page
-operations. Its only plain-rewrite effect is this full-rewrite/incremental
-toggle.)
-
-This succeeds on a signed input without emitting the "removed signatures"
-warning, because the signed byte ranges are preserved. This behaviour is
-covered by the `incremental_rewrite_of_signed_pdf_succeeds_without_warning`
-test in `crates/flpdf-cli/tests/cli_full_rewrite.rs`.
-
 ## Summary
 
 | Operation                                                    | Signatures                  |
 | ------------------------------------------------------------ | --------------------------- |
-| `flpdf rewrite` (full rewrite, default)                      | **Preserved, invalidated**  |
-| `flpdf rewrite --remove-restrictions`                        | Stripped (warned)           |
-| `flpdf rewrite --remove-unreferenced-resources=no`           | **Preserved, valid**        |
-| Signature generation                                         | Not supported               |
-
-[`signature_rewrite_impact`]: https://docs.rs/flpdf/latest/flpdf/fn.signature_rewrite_impact.html
+| `flpdf rewrite` (fresh canonical rewrite)                     | **Preserved, invalidated**  |
+| `flpdf rewrite --remove-restrictions`                         | Stripped (warned)           |
+| Signature generation                                          | Not supported               |

@@ -136,9 +136,9 @@ fn padded_two_page_pdf(padding: usize) -> Vec<u8> {
 ///
 /// - `Pdf::open` reads the entire input into a `Vec` while loading the xref
 ///   (`xref::load_xref_state_with_repair` → `Read::read_to_end`), once per open.
-/// - The incremental writer starts each chunk from `Pdf::source_bytes`, which
-///   materialises the whole source again; it grows that buffer from empty, so
-///   the allocation it ends on is the next power of two — **two** documents'
+/// - Each chunk is emitted through the canonical writer after reopening the
+///   source, so the source and output allocations coexist; the output buffer
+///   grows from empty and ends at the next power of two — **two** documents'
 ///   worth for a document that is not one already.
 ///
 /// Those two coexist, so three documents' worth of growth is expected and

@@ -7,14 +7,14 @@ use std::path::{Path, PathBuf};
 
 use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
 use crate::pipeline::Pipeline;
-use crate::{Error, ObjectRef, Pdf, Result, WriteOptions, XrefEntry};
+use crate::{Error, ObjectRef, Pdf, Result, XrefEntry};
 
 use super::settings::{DecodeLevel, WriterSettings};
 use super::{
-    effective_pdf_version, report_progress, write_pdf_full_rewrite, ObjectStreamMode,
-    ProgressReporter, StreamDataMode, WriterResult,
+    effective_pdf_version, emit_canonical_pdf, report_progress, ObjectStreamMode, ProgressReporter,
+    StreamDataMode, WriterOptions, WriterResult,
 };
-use crate::linearization::writer::write_linearized_for_qpdf_writer;
+use crate::linearization::writer::write_linearized_for_pdf_writer;
 
 enum WriterOutput {
     Memory(Option<Vec<u8>>),
@@ -56,10 +56,9 @@ impl WriterOutput {
 
 /// A qpdf-shaped writer for producing one fresh PDF output.
 ///
-/// This first slice exposes the lifecycle and settings surface while using
-/// flpdf's existing private full-rewrite emitter internally. The legacy free
-/// functions remain available temporarily for consumer migration.
-pub struct QPDFWriter<'pdf, R: Read + Seek + 'static> {
+/// This lifecycle owns the complete canonical full-rewrite pipeline and its
+/// qpdf-compatible settings.
+pub struct PdfWriter<'pdf, R: Read + Seek + 'static> {
     pdf: &'pdf mut Pdf<R>,
     settings: WriterSettings,
     output: Option<WriterOutput>,
@@ -68,7 +67,7 @@ pub struct QPDFWriter<'pdf, R: Read + Seek + 'static> {
     result: Option<WriterResult>,
 }
 
-impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
+impl<'pdf, R: Read + Seek + 'static> PdfWriter<'pdf, R> {
     /// Create a writer around a live PDF document.
     pub fn new(pdf: &'pdf mut Pdf<R>) -> Self {
         Self {
@@ -84,7 +83,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     fn ensure_output_unconfigured(&self) -> Result<()> {
         if self.output.is_some() || self.write_started {
             return Err(Error::Unsupported(
-                "QPDFWriter output can be configured only once".into(),
+                "PdfWriter output can be configured only once".into(),
             ));
         }
         Ok(())
@@ -144,7 +143,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 
     pub fn set_stream_data_mode(&mut self, mode: StreamDataMode) {
-        // QPDFWriter's stream-data setters are state transitions, not a
+        // PdfWriter's stream-data setters are state transitions, not a
         // late override layered on top of setDecodeLevel/setCompressStreams.
         // QPDFWriter.cc raises the decode floor for uncompress/compress,
         // clears it for preserve, and toggles compression at the same time.
@@ -172,7 +171,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 
     pub fn set_compress_streams(&mut self, value: bool) {
-        // QPDFWriter::setCompressStreams changes only this flag. In
+        // qpdf's setCompressStreams changes only this flag. In
         // particular, it must not raise the initial decode level from none.
         self.settings.compress_streams = value;
         self.settings.compress_streams_set = true;
@@ -201,6 +200,17 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 
     pub fn set_newline_before_endstream(&mut self, value: bool) {
+        self.settings.newline_before_endstream = if value {
+            super::NewlineBeforeEndstream::Yes
+        } else {
+            super::NewlineBeforeEndstream::Never
+        };
+    }
+
+    /// Set qpdf's three-state endstream framing policy used by the CLI and
+    /// byte-parity tests. `Never` is qpdf's default; `No` adds a newline only
+    /// when the payload does not already end in one.
+    pub fn set_newline_before_endstream_mode(&mut self, value: super::NewlineBeforeEndstream) {
         self.settings.newline_before_endstream = value;
     }
 
@@ -308,12 +318,12 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     pub fn write(&mut self) -> Result<()> {
         if self.write_started {
             return Err(Error::Unsupported(
-                "QPDFWriter::write may be called only once".into(),
+                "PdfWriter::write may be called only once".into(),
             ));
         }
         if self.output.is_none() {
             return Err(Error::Unsupported(
-                "QPDFWriter::write requires an output sink".into(),
+                "PdfWriter::write requires an output sink".into(),
             ));
         }
         self.validate_supported_settings()?;
@@ -324,12 +334,12 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             options.qdf = false;
             let pass1_path = self.settings.linearization_pass1_filename.as_deref();
             let (mut document, result) =
-                write_linearized_for_qpdf_writer(self.pdf, &options, pass1_path)?;
+                write_linearized_for_pdf_writer(self.pdf, &options, pass1_path)?;
             document.back_patch()?;
             (document.bytes, result)
         } else {
             let mut bytes = Vec::new();
-            let result = write_pdf_full_rewrite(self.pdf, &mut bytes, &options)?;
+            let result = emit_canonical_pdf(self.pdf, &mut bytes, &options)?;
             (bytes, result)
         };
 
@@ -368,7 +378,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     /// Validate the configured qpdf writer state before consuming the output
     /// lifecycle. Setter combinations that qpdf resolves by precedence are
-    /// normalized in [`Self::prepared_write_options`].
+    /// normalized during the writer's private preparation phase.
     pub fn validate_supported_settings(&self) -> Result<()> {
         Ok(())
     }
@@ -382,15 +392,15 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     /// preservation; and a forced header version can disable an otherwise
     /// valid encryption scheme. Keeping the preparation in one method makes
     /// `get_final_version` and `write` observe the same plan.
-    fn prepared_write_options(&mut self) -> Result<WriteOptions> {
+    fn prepared_write_options(&mut self) -> Result<WriterOptions> {
         let mut options = self.settings.to_write_options();
         if self.settings.linearization {
-            // QPDFWriter::doWriteSetup clears QDF before selecting the
+            // qpdf's doWriteSetup clears QDF before selecting the
             // linearized two-pass writer (QPDFWriter.cc:2036-2038).
             options.qdf = false;
         }
         if options.pclm {
-            // QPDFWriter::doWriteSetup makes PCLm a cleartext, unfiltered
+            // qpdf's doWriteSetup makes PCLm a cleartext, unfiltered
             // output mode before source-encryption preservation is considered.
             options.encrypt = None;
             options.copy_encryption = None;
@@ -430,11 +440,11 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 }
 
-/// qpdf `QPDFWriter::disableIncompatibleEncryption` for the writer options
+/// qpdf's `disableIncompatibleEncryption` for the writer options
 /// that have reached this bridge. A valid forced version is a hard cap: when
 /// it cannot represent the selected Standard security handler, qpdf silently
 /// drops encryption and writes the rewritten objects in cleartext.
-fn forced_version_disables_encryption(options: &WriteOptions) -> bool {
+fn forced_version_disables_encryption(options: &WriterOptions) -> bool {
     let Some(forced) = options
         .force_version
         .as_deref()
@@ -468,7 +478,7 @@ fn forced_version_disables_encryption(options: &WriteOptions) -> bool {
         && (version >= 5 || revision >= 5)
 }
 
-fn encryption_shape(options: &WriteOptions) -> Option<(i64, i64, bool)> {
+fn encryption_shape(options: &WriterOptions) -> Option<(i64, i64, bool)> {
     if let Some(params) = options.encrypt.as_ref() {
         use crate::encrypt_setup::EncryptMethod;
         return Some(match params.method {

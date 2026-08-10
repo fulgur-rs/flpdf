@@ -225,7 +225,7 @@ impl Part1Bytes {
     ///
     /// `pdf_version` is the effective PDF version string to emit in the header
     /// (e.g. `"1.3"`, `"1.7"`).  Callers should compute this via
-    /// [`crate::writer::effective_pdf_version`] before calling `build`.
+    /// [`crate::PdfWriter::get_final_version`] before calling `build`.
     pub fn build(_plan: &LinearizationPlan, renumber: &RenumberMap, pdf_version: &str) -> Self {
         // The param-dict slot must still hold its sentinel — overwriting it
         // would cause the writer to emit a duplicate object definition on the

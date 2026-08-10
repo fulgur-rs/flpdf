@@ -98,8 +98,10 @@ fn two_page(catalog_extra: &str, page1_extra: &str) -> Vec<u8> {
 /// Linearize `src` via the public API (mirrors the CLI `--linearize` path).
 fn linearize(src: &[u8], use_generate: bool) -> flpdf::Result<Vec<u8>> {
     let mut pdf = Pdf::open(Cursor::new(src.to_vec()))?;
-    let mut opts = WriterTestSettings::default();
-    opts.deterministic_id = true;
+    let mut opts = WriterTestSettings {
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     if use_generate {
         opts.object_streams = ObjectStreamMode::Generate;
     }

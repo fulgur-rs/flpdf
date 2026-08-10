@@ -990,39 +990,12 @@ impl<R: Read + Seek> Pdf<R> {
         self.lift_to_handle_bounded(object, 0, crate::parser::MAX_PARSE_DEPTH)
     }
 
-    pub(crate) fn startxref(&self) -> u64 {
-        self.startxref
-    }
-
-    pub(crate) fn previous_xref_offset(&self) -> u64 {
-        self.startxref()
-    }
-
     pub(crate) fn last_xref_form(&self) -> XrefForm {
         self.last_xref_form
     }
 
-    pub(crate) fn source_xref_offsets(&self) -> Vec<(ObjectRef, u64)> {
-        // qpdf's QPDFWriter derives unchanged-object offsets from `m->xref_table`
-        // which is always the live (post-reconstruction) table.  Return offsets
-        // from the resolver's live entries so that incremental-write output
-        // reflects the reconstructed state rather than the original damaged table.
-        self.resolver
-            .xref_entries()
-            .into_iter()
-            .filter_map(|(object_ref, entry)| match entry {
-                crate::XrefEntry::Uncompressed { offset } => Some((object_ref, offset)),
-                _ => None,
-            })
-            .collect()
-    }
-
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.resolver.xref_entries()
-    }
-
-    pub(crate) fn source_header_offset(&self) -> usize {
-        self.resolver.header_offset()
     }
 
     /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
@@ -1195,9 +1168,9 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// Replace `object_ref` with `object` in the in-memory object cache.
     ///
-    /// The original on-disk bytes are not touched; an incremental rewrite via
-    /// [`crate::write_pdf`] will see the updated value when it walks the cache and emit
-    /// a new revision for the touched object. Subsequent [`Pdf::resolve`]/
+    /// The original on-disk bytes are not touched; [`crate::PdfWriter`] will
+    /// see the updated value when it walks the cache and emit it in the fresh
+    /// output. Subsequent [`Pdf::resolve`]/
     /// [`Pdf::resolve_borrowed`] calls for `object_ref` observe `object`
     /// immediately.
     pub fn set_object(&mut self, object_ref: ObjectRef, object: Object) {
@@ -1352,10 +1325,6 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.insert(object_ref);
     }
 
-    pub(crate) fn source_bytes(&mut self) -> Result<Vec<u8>> {
-        self.resolver.read_physical_input()
-    }
-
     /// Number of objects currently resolved in the cache. Useful when you want to
     /// confirm that lazy resolution actually deferred work.
     pub fn resolved_count(&self) -> usize {
@@ -1366,6 +1335,7 @@ impl<R: Read + Seek> Pdf<R> {
         self.cache.deleted_refs()
     }
 
+    #[cfg(test)]
     pub(crate) fn dirty_object_refs(&self) -> Vec<ObjectRef> {
         self.dirty_object_refs.iter().copied().collect()
     }
@@ -1624,10 +1594,10 @@ impl<R: Read + Seek> Pdf<R> {
         // state, and `prepare_qpdf_json_objects` recognizes its resolved
         // cache-miss handles directly; materializing here would duplicate a
         // direct stream's payload into the legacy `Object` cache.
-        // A new object left out of the dirty set would never get its own
-        // body or xref entry written by a default incremental write,
-        // leaving any reference to it dangling — see `mark_object_dirty`'s
-        // own doc comment for the full explanation.
+        // A new object left out of the dirty set would never get its own body
+        // or xref entry in the canonical output, leaving any reference to it
+        // dangling — see `mark_object_dirty`'s own doc comment for the full
+        // explanation.
         self.mark_object_dirty(new_ref);
         Ok(indirect)
     }
@@ -1683,8 +1653,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.foreign_object_maps.insert(source_id, map);
     }
 
-    /// Mark `object_ref` dirty, so the next default (incremental) call to
-    /// [`crate::write_pdf`] includes an updated body and xref entry for it.
+    /// Mark `object_ref` dirty so canonical writer preparation and other live
+    /// document consumers observe an in-place handle mutation.
     ///
     /// [`Self::set_object`] and [`Self::delete_object`] already do this
     /// internally. Calling this after an in-place [`ObjectHandle`] mutation
@@ -3721,7 +3691,6 @@ mod tests {
     use crate::pages::page_refs;
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
-    use crate::write_pdf;
     use crate::Stream;
     use std::io::{Cursor, SeekFrom};
     use std::rc::Rc;
@@ -3834,7 +3803,7 @@ mod tests {
     #[test]
     fn object_handle_as_string_decrypts_canonical_parsed_encrypted_strings() {
         use crate::encrypt_setup::EncryptParams;
-        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+        use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
         use std::io::Cursor;
 
         // A minimal Catalog/Pages/Info fixture: /Info (trailer-reachable,
@@ -3866,16 +3835,15 @@ mod tests {
 
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
         let mut out = Vec::new();
-        let options = WriteOptions {
-            full_rewrite: true,
+        let options = WriterOptions {
             compress_streams: CompressStreams::No,
             encrypt: Some(EncryptParams::v4_aes128(
                 b"user-pw".to_vec(),
                 b"owner-pw".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
-        write_pdf_with_options(&mut pdf, &mut out, &options).expect("V=4 AES128 encrypted write");
+        emit_canonical_pdf(&mut pdf, &mut out, &options).expect("V=4 AES128 encrypted write");
 
         let mut rt = Pdf::open_with_options(
             Cursor::new(out),
@@ -5246,13 +5214,9 @@ mod tests {
     }
 
     #[test]
-    fn make_indirect_object_handle_survives_a_default_incremental_write() {
-        // Regression test: the new object must be registered as dirty, or
-        // the incremental writer's `collect_touched_object_refs` (which
-        // seeds emission exclusively from `Pdf::dirty_object_refs`) never
-        // writes its body or xref entry, leaving the reference below
-        // dangling (resolving to `Object::Null` on reopen).
-        use crate::write_pdf;
+    fn make_indirect_object_handle_survives_a_full_rewrite() {
+        // The new object is reachable through the mutated Catalog and must be
+        // included by the canonical qpdf-style reachability walk.
 
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let new_object = pdf
@@ -5269,8 +5233,14 @@ mod tests {
         root_dict.insert("Extra", Object::Reference(new_ref));
         pdf.set_object(root_ref, Object::Dictionary(root_dict));
 
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).expect("incremental write");
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let emitted_ref = writer
+            .get_renumbered_obj_gen(new_ref)
+            .expect("query new-object mapping")
+            .expect("new object must be emitted");
+        let out = writer.get_buffer().expect("take full-rewrite output");
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let resolved_root = reopened
@@ -5280,11 +5250,11 @@ mod tests {
             .into_dict()
             .and_then(|d| d.get("Extra").cloned())
             .expect("root has /Extra");
-        assert_eq!(extra_ref, Object::Reference(new_ref));
+        assert_eq!(extra_ref, Object::Reference(emitted_ref));
         assert_eq!(
-            reopened.resolve(new_ref).expect("resolve new object"),
+            reopened.resolve(emitted_ref).expect("resolve new object"),
             Object::Integer(777),
-            "new object must not be dangling after an incremental write"
+            "new object must not be dangling after a full rewrite"
         );
     }
 
@@ -5344,13 +5314,11 @@ mod tests {
     }
 
     #[test]
-    fn mark_object_dirty_makes_a_replace_key_mutation_survive_a_default_incremental_write() {
+    fn mark_object_dirty_makes_a_replace_key_mutation_survive_a_full_rewrite() {
         // Regression test: ObjectHandle::replace_key mutates the live
         // handle graph directly and has no path back to Pdf's dirty
         // bookkeeping. Without an explicit `mark_object_dirty` call, the
-        // incremental writer's `collect_touched_object_refs` never sees
-        // the mutated ref and silently drops the change from the output.
-        use crate::write_pdf;
+        // canonical full-rewrite walk must observe the live handle graph.
 
         let page_ref = ObjectRef::new(3, 0);
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
@@ -5359,8 +5327,10 @@ mod tests {
         page.replace_key(b"Rotate", ObjectHandle::integer(90));
         pdf.mark_object_dirty(page_ref);
 
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).expect("incremental write");
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let out = writer.get_buffer().expect("take full-rewrite output");
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let resolved_page = reopened
@@ -5371,7 +5341,7 @@ mod tests {
         assert_eq!(
             resolved_page.get("Rotate"),
             Some(&Object::Integer(90)),
-            "replace_key mutation must survive a default incremental write once marked dirty"
+            "replace_key mutation must survive a full rewrite once marked dirty"
         );
     }
 
@@ -6250,18 +6220,19 @@ mod tests {
         pdf.mark_object_handle_dirty(&child).unwrap();
 
         assert!(!pdf.is_dirty(owner_ref));
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).expect("incremental write");
-        assert!(out.starts_with(&bytes));
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let out = writer.get_buffer().expect("take full-rewrite output");
         assert_eq!(
             out.windows(b"1 0 obj\n".len())
                 .filter(|window| *window == b"1 0 obj\n")
                 .count(),
             1,
-            "the detached child's former owner must not be appended again"
+            "the detached child's former owner must be emitted only once"
         );
 
-        let mut reopened = Pdf::open_mem_owned(out).expect("reopen incremental output");
+        let mut reopened = Pdf::open_mem_owned(out).expect("reopen full-rewrite output");
         let reopened_owner = reopened.get_object_handle(owner_ref);
         reopened.resolve_object_handle(&reopened_owner).unwrap();
         assert_eq!(
@@ -6328,6 +6299,10 @@ mod tests {
     {
         let object_ref = ObjectRef::new(1, 0);
         let bytes = classic_pdf_with_bodies(&[b"1 0 obj\n[2147483648 0 R]\nendobj\n"], object_ref);
+        let xref_offset = bytes
+            .windows(b"xref\n".len())
+            .position(|window| window == b"xref\n")
+            .expect("xref marker") as u64;
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             PdfOpenOptions {
@@ -6337,18 +6312,11 @@ mod tests {
         )
         .expect("open repair fixture");
 
-        // Simulate the compatibility state produced when a canonical caller
-        // has already resolved the handle but the legacy cache still contains
-        // a stale source offset. The legacy parser must fail first, then the
-        // repair path may expose the canonical value without reparsing it.
+        // Simulate a stale cache offset after a canonical caller has already
+        // resolved the handle. The compatibility parser must fail first, then
+        // the repair path may expose the canonical value without reparsing it.
         let handle = pdf.get_object_handle(object_ref);
         handle.set_resolved(ObjectValue::Integer(42));
-        let xref_offset = pdf
-            .source_bytes()
-            .expect("read fixture bytes")
-            .windows(b"xref\n".len())
-            .position(|window| window == b"xref\n")
-            .expect("xref marker") as u64;
         pdf.cache.set_unresolved(object_ref, xref_offset);
 
         assert_eq!(

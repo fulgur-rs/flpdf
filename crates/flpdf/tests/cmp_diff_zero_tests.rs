@@ -45,11 +45,13 @@ fn rewrite_qpdf_equivalent_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = mode;
-    opts.static_id = true;
-    // qpdf's default output writes no newline before endstream.
-    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        static_id: true,
+        // qpdf's default output writes no newline before endstream.
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     // compress_streams defaults to Yes (decode + re-encode to single FlateDecode).
 
     let mut out = Vec::new();
@@ -118,11 +120,13 @@ fn rewrite_mode_force_qpdf_equivalent(
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = mode;
-    opts.force_version = Some(force.to_string());
-    opts.static_id = true;
-    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        force_version: Some(force.to_string()),
+        static_id: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).unwrap();
@@ -147,10 +151,12 @@ fn rewrite_preserve_qpdf_equivalent(fixture: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.stream_data = Some(StreamDataMode::Preserve);
-    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        static_id: true,
+        stream_data: Some(StreamDataMode::Preserve),
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).unwrap();

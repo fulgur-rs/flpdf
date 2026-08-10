@@ -20,11 +20,11 @@
 //!       payload's last byte).
 //!
 //! Unit tests (a–c) exercise `write_stream_to_buf` directly so they need no
-//! on-disk fixture.  Integration tests (d–f) use `write_pdf_with_options`.
+//! on-disk fixture.  Integration tests (d–f) use [`PdfWriter`].
 //! End-to-end / CLI matrix tests are the responsibility of flpdf-9hc.12.8.
 
 use flpdf::{
-    write_stream_to_buf, Dictionary, NewlineBeforeEndstream, Object, Pdf, QPDFWriter, Stream,
+    write_stream_to_buf, Dictionary, NewlineBeforeEndstream, Object, Pdf, PdfWriter, Stream,
 };
 use std::io::Cursor;
 
@@ -56,7 +56,7 @@ fn rfind(buf: &[u8], needle: &[u8]) -> Option<usize> {
 ///
 /// Returns `(pdf_bytes, raw_payload)`.
 /// The content stream is written with raw (unfiltered) payload so that
-/// `write_pdf_with_options` with `compress_streams = No` can round-trip it.
+/// [`PdfWriter`] with compression disabled can round-trip it.
 fn build_minimal_pdf(payload: &[u8]) -> Vec<u8> {
     let mut bytes = b"%PDF-1.4\n".to_vec();
 
@@ -324,9 +324,11 @@ fn run_round_trip_test(policy: NewlineBeforeEndstream) {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.compress_streams = flpdf::CompressStreams::No; // keep data unmodified
-    options.newline_before_endstream = policy;
+    let options = WriterTestSettings {
+        compress_streams: flpdf::CompressStreams::No, // keep data unmodified
+        newline_before_endstream: policy,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -389,10 +391,12 @@ fn qdf_wraps_endstream_on_own_line_regardless_of_caller_policy() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.qdf = true;
-    options.compress_streams = flpdf::CompressStreams::No;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let options = WriterTestSettings {
+        qdf: true,
+        compress_streams: flpdf::CompressStreams::No,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -431,10 +435,12 @@ fn round_trip_qdf(raw: &[u8], policy: NewlineBeforeEndstream) -> Vec<u8> {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.qdf = true;
-    options.compress_streams = flpdf::CompressStreams::No;
-    options.newline_before_endstream = policy;
+    let options = WriterTestSettings {
+        qdf: true,
+        compress_streams: flpdf::CompressStreams::No,
+        newline_before_endstream: policy,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -460,31 +466,30 @@ fn round_trip_qdf_never_mode() {
     );
 }
 
-/// Regression guard: the [`write_qdf`] convenience wrapper must go through
-/// the same `write_pdf_with_options` promotion that upgrades `Never` to `No`
-/// for QDF form. If a future refactor gives `write_qdf` its own emission path
-/// that bypasses the promotion, the output would carry adjacent `endstream`
+/// Regression guard: the public [`PdfWriter`] QDF route must apply qpdf's
+/// framing policy. If a future refactor gives QDF its own emission path that
+/// bypasses the policy, the output would carry adjacent `endstream`
 /// framing for non-EOL-ending payloads and `flpdf::fix_qdf` / qpdf's `fix-qdf`
 /// would fail on hand edits. The library default `NewlineBeforeEndstream::Never`
-/// makes this the exact state the caller reaches with `WriteOptions::default()`.
+/// makes this the exact state the caller reaches without an explicit setter.
 /// The payload deliberately does not end in `\n`, so under `No` the writer
 /// still inserts exactly one framing `\n` before `endstream`.
 #[test]
-fn write_qdf_wrapper_respects_no_promotion_via_public_api() {
-    let raw: &[u8] = b"write_qdf wrapper payload";
+fn pdf_writer_qdf_frames_non_eol_payload() {
+    let raw: &[u8] = b"qdf writer payload";
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_qdf_mode(true);
     writer.set_output_memory().unwrap();
     writer.write().unwrap();
     let output = writer.get_buffer().unwrap();
 
-    let framed = b"write_qdf wrapper payload\nendstream";
+    let framed = b"qdf writer payload\nendstream";
     assert!(
         output.windows(framed.len()).any(|w| w == framed),
-        "write_qdf must emit `\\nendstream` framing (single `\\n`) regardless of \
+        "PdfWriter QDF must emit `\\nendstream` framing (single `\\n`) regardless of \
          the library default (`Never`) — the QDF No-promotion applies to all \
          public entry points"
     );
@@ -518,12 +523,14 @@ fn qdf_bare_cr_payload_gets_added_newline() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.qdf = true;
-    options.compress_streams = flpdf::CompressStreams::No;
-    // Never → No promotion inside QDF; this exercises the No branch that
-    // adds `\n` when the payload does not end in exactly `\n`.
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let options = WriterTestSettings {
+        qdf: true,
+        compress_streams: flpdf::CompressStreams::No,
+        // Never → No promotion inside QDF; this exercises the No branch that
+        // adds `\n` when the payload does not end in exactly `\n`.
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -546,10 +553,12 @@ fn qdf_honors_explicit_newline_before_endstream_yes() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.qdf = true;
-    options.compress_streams = flpdf::CompressStreams::No;
-    options.newline_before_endstream = NewlineBeforeEndstream::Yes;
+    let options = WriterTestSettings {
+        qdf: true,
+        compress_streams: flpdf::CompressStreams::No,
+        newline_before_endstream: NewlineBeforeEndstream::Yes,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -575,9 +584,11 @@ fn e2e_yes_mode_endstream_preceded_by_exactly_one_newline_and_length_correct() {
     let source = build_minimal_pdf(raw);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.compress_streams = flpdf::CompressStreams::No;
-    options.newline_before_endstream = NewlineBeforeEndstream::Yes;
+    let options = WriterTestSettings {
+        compress_streams: flpdf::CompressStreams::No,
+        newline_before_endstream: NewlineBeforeEndstream::Yes,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();
@@ -692,9 +703,11 @@ fn e2e_objstm_path_yes_mode_all_endstreams_preceded_by_newline() {
 
     let mut pdf = Pdf::open(Cursor::new(bytes)).unwrap();
 
-    let mut options = WriterTestSettings::default();
-    options.compress_streams = flpdf::CompressStreams::Yes;
-    options.newline_before_endstream = NewlineBeforeEndstream::Yes;
+    let options = WriterTestSettings {
+        compress_streams: flpdf::CompressStreams::Yes,
+        newline_before_endstream: NewlineBeforeEndstream::Yes,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
     write_with_settings(&mut pdf, &mut output, &options).unwrap();

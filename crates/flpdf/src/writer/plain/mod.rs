@@ -4,8 +4,9 @@ use std::io::{Read, Seek, Write};
 #[cfg(test)]
 use std::cell::Cell;
 
+use crate::writer::WriterOptions;
 use crate::writer::WriterResult;
-use crate::{ObjectRef, ObjectStreamMode, Pdf, WriteOptions};
+use crate::{ObjectRef, ObjectStreamMode, Pdf};
 use std::collections::BTreeMap;
 
 pub(crate) mod body;
@@ -20,7 +21,7 @@ thread_local! {
 pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     out: W,
-    options: &WriteOptions,
+    options: &WriterOptions,
 ) -> crate::Result<WriterResult> {
     #[cfg(test)]
     PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -32,7 +33,7 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
 fn write_planned<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
-    options: &WriteOptions,
+    options: &WriterOptions,
     plan: &plan::PlainWritePlan,
 ) -> crate::Result<WriterResult> {
     plan.validate()?;
@@ -53,7 +54,7 @@ fn write_planned<R: Read + Seek, W: Write>(
 
 pub(crate) fn eligible(
     pdf_is_encrypted: bool,
-    options: &WriteOptions,
+    options: &WriterOptions,
     mode: ObjectStreamMode,
 ) -> bool {
     mode == options.object_streams
@@ -79,15 +80,14 @@ pub(crate) fn reset_pipeline_calls() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        write_pdf_with_options, Dictionary, Object, ObjectStreamMode, Pdf, Stream, WriteOptions,
-    };
+    use crate::writer::{emit_canonical_pdf, WriterOptions};
+    use crate::{Dictionary, Object, ObjectStreamMode, Pdf, Stream};
     use std::io::Cursor;
 
-    fn write_with(options: &WriteOptions) {
+    fn write_with(options: &WriterOptions) {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        write_pdf_with_options(&mut pdf, Vec::new(), options).unwrap();
+        emit_canonical_pdf(&mut pdf, Vec::new(), options).unwrap();
     }
 
     #[test]
@@ -98,11 +98,10 @@ mod tests {
             ObjectStreamMode::Generate,
         ] {
             reset_pipeline_calls();
-            write_with(&WriteOptions {
-                full_rewrite: true,
+            write_with(&WriterOptions {
                 object_streams,
                 static_id: true,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             });
             assert_eq!(pipeline_calls(), 1);
         }
@@ -113,18 +112,16 @@ mod tests {
             ObjectStreamMode::Generate,
         ] {
             reset_pipeline_calls();
-            write_with(&WriteOptions {
-                full_rewrite: true,
+            write_with(&WriterOptions {
                 object_streams,
                 qdf: true,
                 static_id: true,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             });
             assert_eq!(pipeline_calls(), 0);
 
             reset_pipeline_calls();
-            write_with(&WriteOptions {
-                full_rewrite: true,
+            write_with(&WriterOptions {
                 object_streams,
                 encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
                     b"user".to_vec(),
@@ -132,7 +129,7 @@ mod tests {
                 )),
                 static_id: true,
                 static_aes_iv: true,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             });
             assert_eq!(pipeline_calls(), 0);
         }
@@ -141,11 +138,10 @@ mod tests {
     #[test]
     fn generate_uses_shared_plain_pipeline() {
         reset_pipeline_calls();
-        write_with(&WriteOptions {
-            full_rewrite: true,
+        write_with(&WriterOptions {
             object_streams: ObjectStreamMode::Generate,
             static_id: true,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         });
         assert_eq!(pipeline_calls(), 1);
     }
@@ -154,12 +150,11 @@ mod tests {
     fn requested_preserve_and_generate_forced_below_1_5_stay_legacy() {
         for object_streams in [ObjectStreamMode::Preserve, ObjectStreamMode::Generate] {
             reset_pipeline_calls();
-            write_with(&WriteOptions {
-                full_rewrite: true,
+            write_with(&WriterOptions {
                 object_streams,
                 force_version: Some("1.4".into()),
                 static_id: true,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             });
             assert_eq!(pipeline_calls(), 0);
         }
@@ -171,11 +166,10 @@ mod tests {
 
         std::thread::spawn(|| {
             reset_pipeline_calls();
-            write_with(&WriteOptions {
-                full_rewrite: true,
+            write_with(&WriterOptions {
                 object_streams: ObjectStreamMode::Disable,
                 static_id: true,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             });
             assert_eq!(pipeline_calls(), 1);
         })
@@ -192,14 +186,14 @@ mod tests {
             ObjectStreamMode::Preserve,
             ObjectStreamMode::Generate,
         ] {
-            let options = WriteOptions {
+            let options = WriterOptions {
                 object_streams: mode,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             };
             assert!(eligible(false, &options, mode));
             assert!(!eligible(true, &options, mode));
 
-            let copy_options = WriteOptions {
+            let copy_options = WriterOptions {
                 object_streams: mode,
                 copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
                     encrypt_dict: crate::Dictionary::new(),
@@ -207,7 +201,7 @@ mod tests {
                     id0: Vec::new(),
                     object_key_alg: crate::ObjectKeyAlg::Aes,
                 }),
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             };
             assert!(!eligible(false, &copy_options, mode));
         }
@@ -217,9 +211,9 @@ mod tests {
     fn invalid_prebuilt_member_leaves_caller_writer_unchanged() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams: ObjectStreamMode::Generate,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let plan = plan::PlainWritePlan::build(&mut pdf, &options).unwrap();
         let members: Vec<_> = plan

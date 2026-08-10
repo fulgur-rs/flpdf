@@ -2,7 +2,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions, QPDFWriter,
+    Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions, PdfWriter,
     XrefEntry, XrefForm,
 };
 use std::collections::BTreeMap;
@@ -1935,7 +1935,7 @@ fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
     assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
 
     pdf.set_object(root, Object::Boolean(false));
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory().expect("memory output");
     writer.write().expect("qpdf full rewrite");
     let output_root = writer
@@ -3891,7 +3891,7 @@ fn candidate_recovery_can_be_full_rewritten_without_prev() {
     let mut pdf =
         Pdf::open_with_repair(Cursor::new(bytes)).expect("candidate recovery recovers the trailer");
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory().expect("memory output");
     writer.write().expect("qpdf full rewrite succeeds");
     let out = writer.get_buffer().expect("writer buffer");

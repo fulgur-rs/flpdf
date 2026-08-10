@@ -18,7 +18,7 @@
 
 use std::io::Cursor;
 
-use flpdf::{NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, QPDFWriter, StreamDataMode};
+use flpdf::{NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, PdfWriter, StreamDataMode};
 
 /// Build a PDF whose image XObject (obj 5) declares `/Filter /DCTDecode` (which
 /// flpdf cannot decode, so it is a passthrough) and carries an indirect
@@ -144,9 +144,11 @@ fn keep_holder_is_live_integer(out: &[u8]) -> bool {
 #[test]
 fn flat_rewrite_directizes_kept_holder_passthrough_length() {
     let mut pdf = Pdf::open(Cursor::new(build_kept_holder_pdf())).expect("open");
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).expect("flat rewrite");
 
@@ -170,10 +172,12 @@ fn preserve_directizes_kept_holder_passthrough_length() {
     // reference. Guards the preserve arm of `reencode_stream_for_compress` under
     // the default Pure-Rust deflate (byte parity lives in the gated cmp suite).
     let mut pdf = Pdf::open(Cursor::new(build_kept_holder_pdf())).expect("open");
-    let mut opts = WriterTestSettings::default();
-    opts.static_id = true;
-    opts.stream_data = Some(StreamDataMode::Preserve);
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        static_id: true,
+        stream_data: Some(StreamDataMode::Preserve),
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).expect("preserve rewrite");
 
@@ -192,7 +196,7 @@ fn preserve_directizes_kept_holder_passthrough_length() {
 fn linearize_directizes_kept_holder_passthrough_length() {
     let src = build_kept_holder_pdf();
     let mut pdf = Pdf::open(Cursor::new(src)).expect("open");
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Generate);
     writer.set_deterministic_id(true);
     writer.set_linearization(true);

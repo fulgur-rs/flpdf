@@ -11,7 +11,7 @@ use flpdf::pipeline::{Pipeline, PipelineResult};
 use flpdf::{
     apply_stream_compress_policy, pages, CompressStreams, CopyEncryptionSource, DecodeLevel,
     Dictionary, EncryptParams, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, Pdf,
-    PdfOpenOptions, QPDFWriter, Stream, StreamDataMode, XrefEntry,
+    PdfOpenOptions, PdfWriter, Stream, StreamDataMode, XrefEntry,
 };
 
 mod common;
@@ -472,7 +472,7 @@ fn rewrite_valid_contents_holder_shape(
     assert_qpdf_check(&source)?;
 
     let mut pdf = Pdf::open(Cursor::new(source.clone()))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_static_id(true);
@@ -644,7 +644,7 @@ fn rewrite_runlength_contents(
     stream_data_mode: Option<StreamDataMode>,
 ) -> flpdf::Result<Vec<u8>> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_runlength_contents_pdf()))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     if let Some(level) = decode_level {
         writer.set_decode_level(level);
@@ -669,7 +669,7 @@ fn decoded_runlength_snapshot(bytes: Vec<u8>) -> flpdf::Result<(Option<Object>, 
 #[test]
 fn write_before_output_returns_err() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     assert!(writer.write().is_err());
     Ok(())
 }
@@ -677,7 +677,7 @@ fn write_before_output_returns_err() -> flpdf::Result<()> {
 #[test]
 fn get_buffer_before_write_returns_err() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     assert!(writer.get_buffer().is_err());
     Ok(())
@@ -686,7 +686,7 @@ fn get_buffer_before_write_returns_err() -> flpdf::Result<()> {
 #[test]
 fn output_configuration_can_happen_only_once() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     assert!(writer.set_output_memory().is_err());
     Ok(())
@@ -695,7 +695,7 @@ fn output_configuration_can_happen_only_once() -> flpdf::Result<()> {
 #[test]
 fn write_can_happen_only_once() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     writer.write()?;
     assert!(writer.write().is_err());
@@ -705,7 +705,7 @@ fn write_can_happen_only_once() -> flpdf::Result<()> {
 #[test]
 fn get_buffer_from_non_memory_writer_returns_err() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_writer(Cursor::new(Vec::new()))?;
     writer.write()?;
     assert!(writer.get_buffer().is_err());
@@ -715,7 +715,7 @@ fn get_buffer_from_non_memory_writer_returns_err() -> flpdf::Result<()> {
 #[test]
 fn get_buffer_after_first_retrieval_returns_err() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     writer.write()?;
     let _ = writer.get_buffer()?;
@@ -724,10 +724,10 @@ fn get_buffer_after_first_retrieval_returns_err() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_checks_qpdf_writer_memory_output() -> flpdf::Result<()> {
+fn qpdf_checks_pdf_writer_memory_output() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     writer.write()?;
     let buffer = writer.get_buffer()?;
@@ -744,11 +744,11 @@ fn qpdf_checks_qpdf_writer_memory_output() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_linearization_is_a_canonical_output_route() -> flpdf::Result<()> {
+fn pdf_writer_linearization_is_a_canonical_output_route() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
     let mut pdf = Pdf::open(BufReader::new(file))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
     writer.set_output_memory()?;
     writer.write()?;
@@ -772,11 +772,11 @@ fn qpdf_writer_linearization_is_a_canonical_output_route() -> flpdf::Result<()> 
 }
 
 #[test]
-fn qpdf_writer_linearization_places_extra_header_after_parameter_dictionary() -> flpdf::Result<()> {
+fn pdf_writer_linearization_places_extra_header_after_parameter_dictionary() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
     let mut pdf = Pdf::open(BufReader::new(file))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
     writer.set_object_stream_mode(ObjectStreamMode::Generate);
     writer.set_extra_header_text("% linearized-extra");
@@ -809,13 +809,13 @@ fn qpdf_writer_linearization_places_extra_header_after_parameter_dictionary() ->
 }
 
 #[test]
-fn qpdf_writer_linearization_owns_pass1_and_result_metadata() -> flpdf::Result<()> {
+fn pdf_writer_linearization_owns_pass1_and_result_metadata() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
     let mut pdf = Pdf::open(BufReader::new(file))?;
     let dir = tempfile::tempdir()?;
     let pass1_path = dir.path().join("pass1.pdf");
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
     writer.set_linearization_pass1_filename(&pass1_path);
     writer.set_output_memory()?;
@@ -838,7 +838,7 @@ fn qpdf_writer_linearization_owns_pass1_and_result_metadata() -> flpdf::Result<(
 }
 
 #[test]
-fn qpdf_writer_linearization_preserves_authenticated_source_encryption() -> flpdf::Result<()> {
+fn pdf_writer_linearization_preserves_authenticated_source_encryption() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let password = b"linearize-source".to_vec();
     let mut source_input = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
@@ -859,7 +859,7 @@ fn qpdf_writer_linearization_preserves_authenticated_source_encryption() -> flpd
             ..PdfOpenOptions::default()
         },
     )?;
-    let mut writer = QPDFWriter::new(&mut source);
+    let mut writer = PdfWriter::new(&mut source);
     writer.set_linearization(true);
     writer.set_output_memory()?;
     writer.write()?;
@@ -887,11 +887,11 @@ fn qpdf_writer_linearization_preserves_authenticated_source_encryption() -> flpd
 }
 
 #[test]
-fn qpdf_writer_linearization_supports_encryption_with_object_streams() -> flpdf::Result<()> {
+fn pdf_writer_linearization_supports_encryption_with_object_streams() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let password = b"linearize-encrypt".to_vec();
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
     writer.set_object_stream_mode(ObjectStreamMode::Generate);
     writer.set_static_id(true);
@@ -925,7 +925,7 @@ fn qpdf_writer_linearization_supports_encryption_with_object_streams() -> flpdf:
 }
 
 #[test]
-fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Result<()> {
+fn pdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     // Build the source revision directly. qpdf has no incremental writer, so
     // this test must not use the removed flpdf append-only route merely to
@@ -937,7 +937,7 @@ fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Res
         .rposition(|window| window == marker)
         .expect("minimal.pdf has startxref");
     let previous_xref: u64 = std::str::from_utf8(
-        &incremental[marker_offset + marker.len()..]
+        incremental[marker_offset + marker.len()..]
             .split(|byte| *byte == b'\n')
             .next()
             .expect("minimal.pdf has startxref value"),
@@ -961,7 +961,7 @@ fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Res
     assert!(incremental.windows(5).any(|window| window == b"/Prev"));
 
     let mut rewritten_pdf = Pdf::open(Cursor::new(incremental))?;
-    let mut writer = QPDFWriter::new(&mut rewritten_pdf);
+    let mut writer = PdfWriter::new(&mut rewritten_pdf);
     writer.set_output_memory()?;
     writer.write()?;
     let output = writer.get_buffer()?;
@@ -980,7 +980,7 @@ fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Res
 }
 
 #[test]
-fn qpdf_writer_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
+fn pdf_writer_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
@@ -1001,7 +1001,7 @@ fn qpdf_writer_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
+fn pdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = synthetic_content_holder_shapes_pdf()?;
 
@@ -1023,7 +1023,7 @@ fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     assert_eq!(terminal_refs[3], vec![None]);
     assert_eq!(terminal_refs[4], vec![None, Some(ObjectRef::new(16, 0))]);
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_output_memory()?;
@@ -1056,7 +1056,7 @@ fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_qdf_normalizes_qpdf_checked_direct_contents_array() -> flpdf::Result<()> {
+fn pdf_writer_qdf_normalizes_qpdf_checked_direct_contents_array() -> flpdf::Result<()> {
     let (_source, output) =
         rewrite_valid_contents_holder_shape(ValidContentsHolderShape::DirectArray)?;
     assert_qpdf_check(&output)?;
@@ -1065,7 +1065,7 @@ fn qpdf_writer_qdf_normalizes_qpdf_checked_direct_contents_array() -> flpdf::Res
 }
 
 #[test]
-fn qpdf_writer_qdf_normalizes_qpdf_checked_contents_ref_array() -> flpdf::Result<()> {
+fn pdf_writer_qdf_normalizes_qpdf_checked_contents_ref_array() -> flpdf::Result<()> {
     let (_source, output) =
         rewrite_valid_contents_holder_shape(ValidContentsHolderShape::RefArray)?;
     assert_qpdf_check(&output)?;
@@ -1074,7 +1074,7 @@ fn qpdf_writer_qdf_normalizes_qpdf_checked_contents_ref_array() -> flpdf::Result
 }
 
 #[test]
-fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> flpdf::Result<()> {
+fn pdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let password = b"donor-user";
 
@@ -1176,7 +1176,7 @@ fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> fl
 }
 
 #[test]
-fn qpdf_writer_preserves_v4_aes_encryption_for_encrypted_input() -> flpdf::Result<()> {
+fn pdf_writer_preserves_v4_aes_encryption_for_encrypted_input() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut source = Pdf::open_with_options(
         BufReader::new(File::open(
@@ -1193,7 +1193,7 @@ fn qpdf_writer_preserves_v4_aes_encryption_for_encrypted_input() -> flpdf::Resul
     assert!(source.is_encrypted());
     assert!(source.user_password_matched());
 
-    let mut writer = QPDFWriter::new(&mut source);
+    let mut writer = PdfWriter::new(&mut source);
     writer.set_output_memory()?;
     writer.write()?;
     let output = writer.get_buffer()?;
@@ -1227,7 +1227,7 @@ fn qpdf_writer_preserves_v4_aes_encryption_for_encrypted_input() -> flpdf::Resul
 }
 
 #[test]
-fn qpdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::Result<()> {
+fn pdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut source = Pdf::open_with_options(
         BufReader::new(File::open(
@@ -1238,7 +1238,7 @@ fn qpdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::
             ..PdfOpenOptions::default()
         },
     )?;
-    let mut writer = QPDFWriter::new(&mut source);
+    let mut writer = PdfWriter::new(&mut source);
     writer.set_pclm(true);
     writer.set_output_memory()?;
     writer.write()?;
@@ -1257,7 +1257,7 @@ fn qpdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::
 }
 
 #[test]
-fn qpdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()> {
+fn pdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let cases = [
         ("v1-rc4-40-r2.pdf", b"user-v1".as_slice(), true, "none"),
@@ -1297,7 +1297,7 @@ fn qpdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()
         let source_info = source
             .encryption_info()?
             .expect("encrypted fixture must expose encryption parameters");
-        let mut writer = QPDFWriter::new(&mut source);
+        let mut writer = PdfWriter::new(&mut source);
         writer.set_object_stream_mode(ObjectStreamMode::Disable);
         writer.set_output_memory()?;
         writer.write()?;
@@ -1340,7 +1340,7 @@ fn qpdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()
 }
 
 #[test]
-fn qpdf_writer_forced_incompatible_version_drops_preserved_encryption() -> flpdf::Result<()> {
+fn pdf_writer_forced_incompatible_version_drops_preserved_encryption() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut source = Pdf::open_with_options(
         BufReader::new(File::open(
@@ -1351,7 +1351,7 @@ fn qpdf_writer_forced_incompatible_version_drops_preserved_encryption() -> flpdf
             ..PdfOpenOptions::default()
         },
     )?;
-    let mut writer = QPDFWriter::new(&mut source);
+    let mut writer = PdfWriter::new(&mut source);
     writer.force_pdf_version("1.5", 0);
     writer.set_output_memory()?;
     writer.write()?;
@@ -1364,7 +1364,7 @@ fn qpdf_writer_forced_incompatible_version_drops_preserved_encryption() -> flpdf
 }
 
 #[test]
-fn qpdf_writer_preserve_controls_and_transforms_disable_source_encryption() -> flpdf::Result<()> {
+fn pdf_writer_preserve_controls_and_transforms_disable_source_encryption() -> flpdf::Result<()> {
     for transform in ["preserve-false", "decode-generalized", "qdf"] {
         let mut source = Pdf::open_with_options(
             BufReader::new(File::open(
@@ -1375,7 +1375,7 @@ fn qpdf_writer_preserve_controls_and_transforms_disable_source_encryption() -> f
                 ..PdfOpenOptions::default()
             },
         )?;
-        let mut writer = QPDFWriter::new(&mut source);
+        let mut writer = PdfWriter::new(&mut source);
         match transform {
             "preserve-false" => writer.set_preserve_encryption(false),
             "decode-generalized" => writer.set_decode_level(DecodeLevel::Generalized),
@@ -1395,8 +1395,7 @@ fn qpdf_writer_preserve_controls_and_transforms_disable_source_encryption() -> f
 }
 
 #[test]
-fn qpdf_writer_explicit_encryption_takes_precedence_over_source_preservation() -> flpdf::Result<()>
-{
+fn pdf_writer_explicit_encryption_takes_precedence_over_source_preservation() -> flpdf::Result<()> {
     let mut source = Pdf::open_with_options(
         BufReader::new(File::open(
             "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
@@ -1406,7 +1405,7 @@ fn qpdf_writer_explicit_encryption_takes_precedence_over_source_preservation() -
             ..PdfOpenOptions::default()
         },
     )?;
-    let mut writer = QPDFWriter::new(&mut source);
+    let mut writer = PdfWriter::new(&mut source);
     writer.set_encryption_parameters(EncryptParams::v4_aes128(
         b"replacement-user".to_vec(),
         b"replacement-owner".to_vec(),
@@ -1429,8 +1428,7 @@ fn qpdf_writer_explicit_encryption_takes_precedence_over_source_preservation() -
 }
 
 #[test]
-fn qpdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -> flpdf::Result<()>
-{
+fn pdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let password = b"donor-user";
 
@@ -1503,14 +1501,14 @@ fn qpdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -
 }
 
 #[test]
-fn qpdf_writer_standard_encryption_false_keeps_metadata_cleartext() -> flpdf::Result<()> {
+fn pdf_writer_standard_encryption_false_keeps_metadata_cleartext() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let password = b"standard-user";
     let metadata_payload = b"standard cleartext metadata";
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     attach_plain_metadata(&mut pdf, metadata_payload);
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_static_aes_iv(true);
     let mut params = EncryptParams::v4_aes128(password.to_vec(), password.to_vec());
@@ -1559,11 +1557,11 @@ fn qpdf_writer_standard_encryption_false_keeps_metadata_cleartext() -> flpdf::Re
 }
 
 #[test]
-fn qpdf_writer_qdf_memory_output_checks_indirect_contents_array_fixture() -> flpdf::Result<()> {
+fn pdf_writer_qdf_memory_output_checks_indirect_contents_array_fixture() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let file = File::open("../../tests/fixtures/compat/qdf-contents-ref-array.pdf")?;
     let mut pdf = Pdf::open(BufReader::new(file))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_static_id(true);
@@ -1595,13 +1593,13 @@ fn qpdf_writer_qdf_memory_output_checks_indirect_contents_array_fixture() -> flp
 }
 
 #[test]
-fn qpdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Result<()> {
+fn pdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let source = synthetic_unreferenced_object_pdf();
     let marker = b"unreferenced-marker";
 
     let mut default_pdf = Pdf::open(Cursor::new(source.clone()))?;
-    let mut default_writer = QPDFWriter::new(&mut default_pdf);
+    let mut default_writer = PdfWriter::new(&mut default_pdf);
     default_writer.set_object_stream_mode(ObjectStreamMode::Disable);
     default_writer.set_output_memory()?;
     default_writer.write()?;
@@ -1609,7 +1607,7 @@ fn qpdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Resu
     assert!(!contains_bytes(&default_output, marker));
 
     let mut preserved_pdf = Pdf::open(Cursor::new(source))?;
-    let mut preserved_writer = QPDFWriter::new(&mut preserved_pdf);
+    let mut preserved_writer = PdfWriter::new(&mut preserved_pdf);
     preserved_writer.set_object_stream_mode(ObjectStreamMode::Disable);
     preserved_writer.set_preserve_unreferenced_objects(true);
     preserved_writer.set_static_id(true);
@@ -1634,7 +1632,7 @@ fn qpdf_writer_preserves_unreferenced_objects_only_when_enabled() -> flpdf::Resu
 #[test]
 fn memory_full_rewrite_has_fresh_output() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_memory()?;
     writer.set_static_id(true);
     writer.write()?;
@@ -1649,7 +1647,7 @@ fn memory_full_rewrite_has_fresh_output() -> flpdf::Result<()> {
 #[test]
 fn final_version_is_available_before_write() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     let version = writer.get_final_version()?;
     writer.set_output_memory()?;
     writer.write()?;
@@ -1665,7 +1663,7 @@ fn final_version_is_available_before_write() -> flpdf::Result<()> {
 #[test]
 fn qpdf_setter_surface_compiles() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_stream_data_mode(StreamDataMode::Preserve);
     writer.set_decode_level(DecodeLevel::Generalized);
@@ -1686,7 +1684,7 @@ fn qpdf_setter_surface_compiles() -> flpdf::Result<()> {
 #[test]
 fn writer_result_surface_compiles() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
 
     assert!(writer.get_renumbered_obj_gen(ObjectRef::new(1, 0)).is_err());
     assert!(writer.get_written_xref_table().is_err());
@@ -1730,7 +1728,7 @@ fn writer_result_surface_compiles() -> flpdf::Result<()> {
 fn writer_result_reports_generated_object_stream_members_and_xref_object() -> flpdf::Result<()> {
     let source = synthetic_unreferenced_object_pdf();
     let mut pdf = Pdf::open(Cursor::new(source))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Generate);
     writer.set_output_memory()?;
     writer.write()?;
@@ -1803,7 +1801,7 @@ fn writer_result_reports_generated_object_stream_members_and_xref_object() -> fl
 #[test]
 fn writer_result_reports_qdf_length_holders() -> flpdf::Result<()> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_qdf_mode(true);
     writer.set_output_memory()?;
     writer.write()?;
@@ -1840,7 +1838,7 @@ fn writer_result_reports_qdf_length_holders() -> flpdf::Result<()> {
 fn set_output_file_writes_a_fresh_qpdf_checked_pdf() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     let dir = tempfile::tempdir()?;
     let output_path = dir.path().join("output-file.pdf");
     writer.set_output_file(&output_path)?;
@@ -1861,7 +1859,7 @@ fn set_output_file_writes_a_fresh_qpdf_checked_pdf() -> flpdf::Result<()> {
 fn set_output_writer_writes_to_an_owned_sink() -> flpdf::Result<()> {
     let bytes = Rc::new(RefCell::new(Vec::new()));
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_writer(SharedBytes(Rc::clone(&bytes)))?;
     writer.write()?;
 
@@ -1878,7 +1876,7 @@ fn set_output_pipeline_writes_and_finishes_once() -> flpdf::Result<()> {
     let writes = Rc::new(RefCell::new(0));
     let finishes = Rc::new(RefCell::new(0));
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_output_pipeline(RecordingPipeline {
         bytes: Rc::clone(&bytes),
         writes: Rc::clone(&writes),
@@ -1906,7 +1904,7 @@ fn set_output_pipeline_writes_and_finishes_once() -> flpdf::Result<()> {
 fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()> {
     for (setter, expected) in [("minimum", "%PDF-1.7"), ("force", "%PDF-1.5")] {
         let mut pdf = open_minimal_pdf()?;
-        let mut writer = QPDFWriter::new(&mut pdf);
+        let mut writer = PdfWriter::new(&mut pdf);
         match setter {
             "minimum" => writer.set_minimum_pdf_version("1.7", 0),
             "force" => writer.force_pdf_version("1.5", 0),
@@ -1921,9 +1919,9 @@ fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()>
 }
 
 #[test]
-fn qpdf_writer_preserves_forced_pdf_extension_pair() -> flpdf::Result<()> {
+fn pdf_writer_preserves_forced_pdf_extension_pair() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.force_pdf_version("1.7", 8);
     writer.set_output_memory()?;
     writer.write()?;
@@ -1936,9 +1934,9 @@ fn qpdf_writer_preserves_forced_pdf_extension_pair() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_emits_extra_header_text_after_qpdf_header() -> flpdf::Result<()> {
+fn pdf_writer_emits_extra_header_text_after_qpdf_header() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_extra_header_text("% flpdf-extra");
     writer.set_output_memory()?;
     writer.write()?;
@@ -1955,10 +1953,10 @@ fn qpdf_writer_emits_extra_header_text_after_qpdf_header() -> flpdf::Result<()> 
 }
 
 #[test]
-fn qpdf_writer_emits_pclm_header_and_a_qpdf_checked_pdf() -> flpdf::Result<()> {
+fn pdf_writer_emits_pclm_header_and_a_qpdf_checked_pdf() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_pclm(true);
     writer.set_output_memory()?;
     writer.write()?;
@@ -1976,9 +1974,9 @@ fn qpdf_writer_emits_pclm_header_and_a_qpdf_checked_pdf() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_pclm_uses_page_strip_fifo_and_synthetic_transforms() -> flpdf::Result<()> {
+fn pdf_writer_pclm_uses_page_strip_fifo_and_synthetic_transforms() -> flpdf::Result<()> {
     let mut pdf = Pdf::open(Cursor::new(synthetic_pclm_image_pdf()))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_pclm(true);
     writer.set_output_memory()?;
     writer.write()?;
@@ -2040,10 +2038,10 @@ fn qpdf_writer_pclm_uses_page_strip_fifo_and_synthetic_transforms() -> flpdf::Re
 }
 
 #[test]
-fn qpdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
+fn pdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
     let events = Rc::new(RefCell::new(Vec::<u8>::new()));
     let mut pdf = open_minimal_pdf()?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
         events_for_reporter.borrow_mut().push(percent);
@@ -2061,11 +2059,11 @@ fn qpdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_linearization_reports_progress_before_sink_completion() -> flpdf::Result<()> {
+fn pdf_writer_linearization_reports_progress_before_sink_completion() -> flpdf::Result<()> {
     let events = Rc::new(RefCell::new(Vec::<u8>::new()));
     let file = File::open("../../tests/fixtures/compat/one-page.pdf")?;
     let mut pdf = Pdf::open(BufReader::new(file))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_linearization(true);
     let events_for_reporter = Rc::clone(&events);
     writer.register_progress_reporter(Box::new(move |percent| {
@@ -2083,7 +2081,7 @@ fn qpdf_writer_linearization_reports_progress_before_sink_completion() -> flpdf:
 }
 
 #[test]
-fn qpdf_writer_default_and_generalized_levels_preserve_runlength_source() -> flpdf::Result<()> {
+fn pdf_writer_default_and_generalized_levels_preserve_runlength_source() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let expected_filter = Some(Object::Name(b"RunLengthDecode".to_vec()));
     let expected_data = vec![0x02, b'A', b'B', b'C', 0x80];
@@ -2113,7 +2111,7 @@ fn qpdf_writer_default_and_generalized_levels_preserve_runlength_source() -> flp
 }
 
 #[test]
-fn qpdf_writer_specialized_decodes_runlength_before_default_compression() -> flpdf::Result<()> {
+fn pdf_writer_specialized_decodes_runlength_before_default_compression() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let output = rewrite_runlength_contents(Some(DecodeLevel::Specialized), None)?;
     assert_qpdf_check(&output)?;
@@ -2125,7 +2123,7 @@ fn qpdf_writer_specialized_decodes_runlength_before_default_compression() -> flp
 }
 
 #[test]
-fn qpdf_writer_uncompress_uses_generalized_floor_for_runlength() -> flpdf::Result<()> {
+fn pdf_writer_uncompress_uses_generalized_floor_for_runlength() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let output = rewrite_runlength_contents(None, Some(StreamDataMode::Uncompress))?;
     assert_qpdf_check(&output)?;
@@ -2137,12 +2135,12 @@ fn qpdf_writer_uncompress_uses_generalized_floor_for_runlength() -> flpdf::Resul
 }
 
 #[test]
-fn qpdf_writer_stream_data_setter_order_preserves_decode_level_semantics() -> flpdf::Result<()> {
+fn pdf_writer_stream_data_setter_order_preserves_decode_level_semantics() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
 
     for decode_first in [true, false] {
         let mut pdf = Pdf::open(Cursor::new(synthetic_runlength_contents_pdf()))?;
-        let mut writer = QPDFWriter::new(&mut pdf);
+        let mut writer = PdfWriter::new(&mut pdf);
         writer.set_object_stream_mode(ObjectStreamMode::Disable);
         if decode_first {
             writer.set_decode_level(DecodeLevel::Specialized);
@@ -2161,7 +2159,7 @@ fn qpdf_writer_stream_data_setter_order_preserves_decode_level_semantics() -> fl
     }
 
     let mut pdf = Pdf::open(Cursor::new(synthetic_runlength_contents_pdf()))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_decode_level(DecodeLevel::Specialized);
     writer.set_stream_data_mode(StreamDataMode::Preserve);
@@ -2174,7 +2172,7 @@ fn qpdf_writer_stream_data_setter_order_preserves_decode_level_semantics() -> fl
     assert_eq!(data, vec![0x02, b'A', b'B', b'C', 0x80]);
 
     let mut pdf = Pdf::open(Cursor::new(synthetic_runlength_contents_pdf()))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_stream_data_mode(StreamDataMode::Preserve);
     writer.set_decode_level(DecodeLevel::Specialized);
@@ -2190,7 +2188,7 @@ fn qpdf_writer_stream_data_setter_order_preserves_decode_level_semantics() -> fl
 }
 
 #[test]
-fn qpdf_writer_none_level_still_recompresses_generalized_filter_when_compressing(
+fn pdf_writer_none_level_still_recompresses_generalized_filter_when_compressing(
 ) -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let source = synthetic_flate_contents_pdf(false);
@@ -2198,7 +2196,7 @@ fn qpdf_writer_none_level_still_recompresses_generalized_filter_when_compressing
     assert_eq!(source_filter, Some(Object::Name(b"FlateDecode".to_vec())));
 
     let mut pdf = Pdf::open(Cursor::new(source))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_decode_level(DecodeLevel::None);
     writer.set_compress_streams(true);
@@ -2220,14 +2218,13 @@ fn qpdf_writer_none_level_still_recompresses_generalized_filter_when_compressing
 }
 
 #[test]
-fn qpdf_writer_set_compress_streams_false_preserves_generalized_flate_source() -> flpdf::Result<()>
-{
+fn pdf_writer_set_compress_streams_false_preserves_generalized_flate_source() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let source = synthetic_flate_contents_pdf(false);
     let (source_filter, source_data) = runlength_contents_snapshot(source.clone());
 
     let mut pdf = Pdf::open(Cursor::new(source))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_compress_streams(false);
     writer.set_output_memory()?;
@@ -2242,12 +2239,12 @@ fn qpdf_writer_set_compress_streams_false_preserves_generalized_flate_source() -
 }
 
 #[test]
-fn qpdf_writer_qdf_defaults_decode_generalized_streams_without_compression() -> flpdf::Result<()> {
+fn pdf_writer_qdf_defaults_decode_generalized_streams_without_compression() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
     )))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_output_memory()?;
@@ -2262,7 +2259,7 @@ fn qpdf_writer_qdf_defaults_decode_generalized_streams_without_compression() -> 
 }
 
 #[test]
-fn qpdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
+fn pdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
@@ -2292,7 +2289,7 @@ fn qpdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
         .insert("Metadata", Object::Reference(metadata_ref));
     pdf.set_object(root_ref, catalog);
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_output_memory()?;
@@ -2319,12 +2316,12 @@ fn qpdf_writer_qdf_normalizes_only_page_contents() -> flpdf::Result<()> {
 }
 
 #[test]
-fn qpdf_writer_qdf_normalization_filters_at_explicit_none_decode_level() -> flpdf::Result<()> {
+fn pdf_writer_qdf_normalization_filters_at_explicit_none_decode_level() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
     )))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_decode_level(DecodeLevel::None);
@@ -2340,12 +2337,12 @@ fn qpdf_writer_qdf_normalization_filters_at_explicit_none_decode_level() -> flpd
 }
 
 #[test]
-fn qpdf_writer_qdf_explicit_false_suppresses_content_normalization() -> flpdf::Result<()> {
+fn pdf_writer_qdf_explicit_false_suppresses_content_normalization() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
     )))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_content_normalization(false);
@@ -2361,12 +2358,12 @@ fn qpdf_writer_qdf_explicit_false_suppresses_content_normalization() -> flpdf::R
 }
 
 #[test]
-fn qpdf_writer_explicit_content_normalization_applies_without_qdf() -> flpdf::Result<()> {
+fn pdf_writer_explicit_content_normalization_applies_without_qdf() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
         false, b"A\rB",
     )))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_content_normalization(true);
     writer.set_output_memory()?;
@@ -2381,10 +2378,10 @@ fn qpdf_writer_explicit_content_normalization_applies_without_qdf() -> flpdf::Re
 }
 
 #[test]
-fn qpdf_writer_qdf_preserves_explicit_compression_setting() -> flpdf::Result<()> {
+fn pdf_writer_qdf_ignores_explicit_compression_setting() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_compress_streams(true);
@@ -2395,13 +2392,13 @@ fn qpdf_writer_qdf_preserves_explicit_compression_setting() -> flpdf::Result<()>
     assert_qpdf_check(&output)?;
 
     let (filter, decoded) = decoded_runlength_snapshot(output)?;
-    assert_eq!(filter, Some(Object::Name(b"FlateDecode".to_vec())));
+    assert_eq!(filter, None);
     assert_eq!(decoded, b"ABC");
     Ok(())
 }
 
 #[test]
-fn qpdf_writer_qdf_explicit_compression_uncompresses_metadata_without_normalizing(
+fn pdf_writer_qdf_explicit_compression_uncompresses_metadata_without_normalizing(
 ) -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
@@ -2409,7 +2406,7 @@ fn qpdf_writer_qdf_explicit_compression_uncompresses_metadata_without_normalizin
     )))?;
     attach_flate_metadata(&mut pdf, b"M\rN");
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_qdf_mode(true);
     writer.set_compress_streams(true);
@@ -2425,12 +2422,12 @@ fn qpdf_writer_qdf_explicit_compression_uncompresses_metadata_without_normalizin
 }
 
 #[test]
-fn qpdf_writer_treats_null_filter_as_unfiltered_stream() -> flpdf::Result<()> {
+fn pdf_writer_treats_null_filter_as_unfiltered_stream() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_null_filter_contents_pdf()))?;
     // The reader normalizes a parsed null dictionary value to the same lookup
     // result as an absent key. Reinsert the explicit null on the resolved
-    // stream so this contract also exercises QPDFWriter's filter gate with
+    // stream so this contract also exercises PdfWriter's filter gate with
     // `Some(Object::Null)`.
     let root_ref = pdf.root_ref().expect("catalog reference");
     let pages_ref = pdf
@@ -2462,7 +2459,7 @@ fn qpdf_writer_treats_null_filter_as_unfiltered_stream() -> flpdf::Result<()> {
     contents.dict.insert("Filter", Object::Null);
     pdf.set_object(contents_ref, Object::Stream(contents));
 
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_output_memory()?;
     writer.write()?;
@@ -2513,7 +2510,7 @@ fn public_compress_policy_treats_null_filter_as_no_filters() {
 }
 
 #[test]
-fn qpdf_writer_does_not_apply_lone_flate_fast_path_to_array_form() -> flpdf::Result<()> {
+fn pdf_writer_does_not_apply_lone_flate_fast_path_to_array_form() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let source = synthetic_flate_contents_pdf(true);
     let (source_filter, source_data) = runlength_contents_snapshot(source.clone());
@@ -2523,7 +2520,7 @@ fn qpdf_writer_does_not_apply_lone_flate_fast_path_to_array_form() -> flpdf::Res
     );
 
     let mut pdf = Pdf::open(Cursor::new(source))?;
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_output_memory()?;
     writer.write()?;
@@ -2542,7 +2539,7 @@ fn qpdf_writer_does_not_apply_lone_flate_fast_path_to_array_form() -> flpdf::Res
 }
 
 #[test]
-fn qpdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Result<()> {
+fn pdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
     let root_ref = pdf.root_ref().expect("catalog reference");
@@ -2581,7 +2578,7 @@ fn qpdf_writer_preserves_source_when_decode_parms_shape_is_invalid() -> flpdf::R
         .dict
         .insert("DecodeParms", invalid_decode_parms.clone());
     pdf.set_object(contents_ref, Object::Stream(stream));
-    let mut writer = QPDFWriter::new(&mut pdf);
+    let mut writer = PdfWriter::new(&mut pdf);
     writer.set_object_stream_mode(ObjectStreamMode::Disable);
     writer.set_recompress_flate(true);
     writer.set_output_memory()?;

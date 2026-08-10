@@ -382,8 +382,8 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
     // regardless of how it is referenced; flpdf's page-driven null-out does too.
     // A destination-following null-out left the page live behind the indirection.
     //
-    // The page-op pipeline always full-rewrites (`flpdf --pages` forces
-    // `full_rewrite=true`), so the removed page is emitted as `N 0 obj null` and
+    // The page-op pipeline always uses the canonical writer (`flpdf --pages`),
+    // so the removed page is emitted as `N 0 obj null` and
     // its original `/Secret` bytes never reach the output.
     let opts = WriterTestSettings::default();
     for obj40 in ["4 0 R", "<< /X 4 0 R >>"] {

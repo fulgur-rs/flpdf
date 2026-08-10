@@ -30,9 +30,11 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.deterministic_id = true;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
@@ -53,9 +55,11 @@ fn flpdf_linearized_objstm_preserve(fixture: &str) -> Vec<u8> {
         .join(fixture);
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = ObjectStreamMode::Preserve;
-    opts.deterministic_id = true;
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
@@ -1692,10 +1696,12 @@ fn flpdf_linearized_objstm_mode_force(
         .join(fixture);
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.object_streams = mode;
-    opts.deterministic_id = true;
-    opts.force_version = Some(force.to_string());
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        deterministic_id: true,
+        force_version: Some(force.to_string()),
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 

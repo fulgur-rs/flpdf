@@ -8,14 +8,14 @@
 use flpdf::ObjectRef;
 use flpdf::{
     CompressStreams, CopyEncryptionSource, DecodeLevel, EncryptParams, NewlineBeforeEndstream,
-    ObjectStreamMode, Pdf, QPDFWriter, Result, StreamDataMode,
+    ObjectStreamMode, Pdf, PdfWriter, Result, StreamDataMode,
 };
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 
 /// Test-only settings used while the integration corpus migrates to the
 /// public qpdf-shaped writer. This deliberately has no PDF route selector:
-/// [`write_with_settings`] always emits a fresh QPDFWriter output.
+/// [`write_with_settings`] always emits a fresh PdfWriter output.
 #[derive(Debug, Clone)]
 pub struct WriterTestSettings {
     pub decode_level: DecodeLevel,
@@ -72,9 +72,9 @@ impl Default for WriterTestSettings {
 }
 
 impl WriterTestSettings {
-    fn apply<R: Read + Seek + 'static>(&self, writer: &mut QPDFWriter<'_, R>) -> Result<()> {
+    fn apply<R: Read + Seek + 'static>(&self, writer: &mut PdfWriter<'_, R>) -> Result<()> {
         writer.set_object_stream_mode(self.object_streams);
-        // QPDFWriter applies these defaults during qdf write setup only when
+        // PdfWriter applies these defaults during qdf write setup only when
         // the caller did not set the corresponding knobs. Keep the migration
         // adapter's qdf defaults unset so QDF remains editable even for source
         // streams that are already lone Flate streams.
@@ -127,7 +127,7 @@ pub fn write_with_settings<R: Read + Seek + 'static, W: Write>(
     out: W,
     settings: &WriterTestSettings,
 ) -> Result<()> {
-    let mut writer = QPDFWriter::new(pdf);
+    let mut writer = PdfWriter::new(pdf);
     settings.apply(&mut writer)?;
     writer.set_output_memory()?;
     writer.write()?;
@@ -146,7 +146,7 @@ pub fn write_with_settings_and_mapping<R: Read + Seek + 'static>(
     settings: &WriterTestSettings,
     source_refs: &[ObjectRef],
 ) -> Result<(Vec<u8>, BTreeMap<ObjectRef, ObjectRef>)> {
-    let mut writer = QPDFWriter::new(pdf);
+    let mut writer = PdfWriter::new(pdf);
     settings.apply(&mut writer)?;
     writer.set_output_memory()?;
     writer.write()?;
@@ -170,7 +170,7 @@ pub fn write_linearized_with_settings<R: Read + Seek + 'static>(
     pdf: &mut Pdf<R>,
     settings: &WriterTestSettings,
 ) -> Result<Vec<u8>> {
-    let mut writer = QPDFWriter::new(pdf);
+    let mut writer = PdfWriter::new(pdf);
     settings.apply(&mut writer)?;
     writer.set_linearization(true);
     writer.set_output_memory()?;
@@ -197,7 +197,7 @@ pub fn write_qdf_output<R: Read + Seek + 'static, W: Write>(
 }
 
 /// Rewrite indirect references in a test-side object according to a writer
-/// renumbering map. QPDFWriter is a full-rewrite API, so byte-for-byte object
+/// renumbering map. PdfWriter is a full-rewrite API, so byte-for-byte object
 /// identity comparisons must account for the new object numbers while still
 /// comparing the complete dictionary/array shape.
 pub fn remap_object_refs(value: &mut flpdf::Object, mapping: &BTreeMap<ObjectRef, ObjectRef>) {

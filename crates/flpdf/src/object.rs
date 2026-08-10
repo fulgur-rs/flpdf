@@ -1127,8 +1127,7 @@ impl Dictionary {
     /// This function backs two internal paths that keep `/ID` (and, when
     /// present, `/Encrypt`) at their plain lexicographic position instead of
     /// forcing them last the way [`write_pdf_trailer`](Self::write_pdf_trailer)
-    /// does: the incremental-update trailer, and the full-rewrite
-    /// `XrefForm::Stream` cross-reference stream dictionary. For a real
+    /// does: the `XrefForm::Stream` cross-reference stream dictionary. For a real
     /// qpdf-produced cross-reference stream, `writeTrailer`
     /// (`QPDFWriter.cc:1160-1236`) still runs (with `xref_stream=true`) and
     /// applies the *same* `/ID`-and-`/Encrypt`-last special-casing as the

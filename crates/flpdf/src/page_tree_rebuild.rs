@@ -198,7 +198,7 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 /// value lists exactly the selected pages, each with inheritable attributes
 /// materialized and `/Parent` repointed at that root. An indirect root keeps
 /// its object reference; a direct catalog root remains direct. Serialize the
-/// result with [`crate::QPDFWriter`].
+/// result with [`crate::PdfWriter`].
 ///
 /// The `selected` refs it consumes are produced by
 /// [`PagePlan`](crate::page_plan::PagePlan) (single document) or a single-input

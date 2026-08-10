@@ -5,7 +5,7 @@
 //! but runs the actual `flpdf` binary through `rewrite --static-id [--qdf
 //! --no-original-object-ids] DEST --overlay SRC [--from=..] [--to=..] [--repeat=..]
 //! -- OUT`. This exercises the whole CLI path — raw-argv pre-split (`extract_overlay_groups`),
-//! `WriteOptions` assembly (incl. the `overlay-presence ⇒ full_rewrite=true` promotion),
+//! canonical writer configuration (including overlay mutation handling),
 //! CLI defaults (`NewlineBeforeEndstream::Never`), and the write pipeline — so a
 //! divergence introduced by the CLI layer (not just the library) is caught.
 //!
@@ -283,9 +283,9 @@ fn cli_swapped_box_r90_overlay_self_is_byte_identical() {
 // ── QDF variants: --qdf --no-original-object-ids ─────────────────────────────
 //
 // Mirrors the library `overlay::byte_gate::write_qdf_nooid` recipe. The
-// full-rewrite promotion still comes from overlay-presence; --qdf adds the
-// QDF writer path (uncompressed streams, object-number relaying, xref table
-// form) and --no-original-object-ids reissues object numbers sequentially.
+// canonical writer handles the overlay; --qdf adds its QDF mode
+// (uncompressed streams, object-number relaying, xref table form) and
+// --no-original-object-ids reissues object numbers sequentially.
 
 const QDF: &[&str] = &["--qdf", "--no-original-object-ids"];
 

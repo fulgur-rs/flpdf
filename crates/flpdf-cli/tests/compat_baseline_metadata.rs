@@ -1,9 +1,9 @@
 //! Metadata-preservation baseline test: Info dict byte-equality between
-//! `flpdf rewrite --full-rewrite` and `qpdf <in> <out>`.
+//! the canonical `flpdf rewrite` and `qpdf <in> <out>`.
 //!
 //! For each unencrypted fixture:
 //! 1. Run `qpdf <input> qpdf-out.pdf` (plain, no flags).
-//! 2. Run `flpdf rewrite --full-rewrite --static-id <input> flpdf-out.pdf`.
+//! 2. Run `flpdf rewrite --static-id <input> flpdf-out.pdf`.
 //! 3. Open each output with `flpdf::Pdf::open`, resolve the `/Info` object
 //!    referenced from the trailer, serialize it with `Object::write_pdf`, and
 //!    assert the two serialized forms are byte-equal.
@@ -113,11 +113,10 @@ fn info_dict_preserved_under_full_rewrite() {
             String::from_utf8_lossy(&qpdf_status.stderr)
         );
 
-        // 2. Run flpdf rewrite --full-rewrite --static-id.
+        // 2. Run flpdf rewrite --static-id.
         let flpdf_status = CargoCommand::cargo_bin("flpdf")
             .expect("flpdf binary must exist")
             .arg("rewrite")
-            .arg("--full-rewrite")
             .arg("--static-id")
             .arg(fixture_path.to_str().unwrap())
             .arg(flpdf_out.to_str().unwrap())

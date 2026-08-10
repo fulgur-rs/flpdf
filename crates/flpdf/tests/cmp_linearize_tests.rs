@@ -32,12 +32,14 @@ fn flpdf_linearized(fixture: &str) -> Vec<u8> {
 
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.deterministic_id = true;
-    // qpdf's default output writes no newline before endstream; the linearized
-    // body content streams honour this option (see the plain-path sibling in
-    // `cmp_diff_zero_tests`).
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        // qpdf's default output writes no newline before endstream; the linearized
+        // body content streams honour this option (see the plain-path sibling in
+        // `cmp_diff_zero_tests`).
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
@@ -52,9 +54,11 @@ fn flpdf_linearized_repair(fixture: &str) -> Vec<u8> {
 
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open_with_repair(std::io::BufReader::new(file)).unwrap();
-    let mut opts = WriterTestSettings::default();
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
@@ -662,10 +666,12 @@ fn plain_rewrite_one_page() -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriterTestSettings::default();
-    opts.deterministic_id = true;
-    // Same framing the linearized path uses, so the content-stream bytes line up.
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        // Same framing the linearized path uses, so the content-stream bytes line up.
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
     write_with_settings(&mut pdf, &mut out, &opts).unwrap();

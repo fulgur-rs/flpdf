@@ -13,7 +13,7 @@ const ENCRYPTED_FIXTURES: &[(&str, &str, bool)] = &[
 ];
 
 #[test]
-fn encrypted_fixtures_rewrite_to_plaintext_matching_qpdf_decrypt_objects() {
+fn encrypted_fixtures_rewrite_preserves_encryption_matching_qpdf_objects() {
     if !ensure_qpdf_or_skip() {
         return;
     }
@@ -21,22 +21,22 @@ fn encrypted_fixtures_rewrite_to_plaintext_matching_qpdf_decrypt_objects() {
     let tmp = tempfile::tempdir().unwrap();
     for (file_name, password, allow_weak_crypto) in ENCRYPTED_FIXTURES {
         let input = encrypted_fixture(file_name);
-        let qpdf_plaintext = tmp.path().join(format!("qpdf-{file_name}"));
-        let flpdf_plaintext = tmp.path().join(format!("flpdf-{file_name}"));
+        let qpdf_output = tmp.path().join(format!("qpdf-{file_name}"));
+        let flpdf_output = tmp.path().join(format!("flpdf-{file_name}"));
 
-        run_qpdf_decrypt(&input, password, *allow_weak_crypto, &qpdf_plaintext);
-        run_flpdf_rewrite(&input, password, *allow_weak_crypto, &flpdf_plaintext);
+        run_qpdf_rewrite(&input, password, *allow_weak_crypto, &qpdf_output);
+        run_flpdf_rewrite(&input, password, *allow_weak_crypto, &flpdf_output);
 
-        assert_plaintext_pdf_is_readable(&flpdf_plaintext, file_name);
+        assert_encrypted_pdf_is_readable(&flpdf_output, file_name, password);
 
-        // Byte equality is intentionally not required: flpdf rewrites plaintext
-        // with its own incidental serialization. Compare qpdf's object JSON
-        // instead, with static IDs to remove trailer-ID churn from the oracle.
-        let qpdf_objects = qpdf_objects_json(&qpdf_plaintext);
-        let flpdf_objects = qpdf_objects_json(&flpdf_plaintext);
+        // Byte equality is intentionally not required: AES output contains
+        // incidental IVs. Compare qpdf's decrypted object JSON instead, with
+        // static IDs to remove trailer-ID churn from the oracle.
+        let qpdf_objects = qpdf_objects_json(&qpdf_output, password, *allow_weak_crypto);
+        let flpdf_objects = qpdf_objects_json(&flpdf_output, password, *allow_weak_crypto);
         assert_eq!(
             flpdf_objects, qpdf_objects,
-            "{file_name}: plaintext rewrite differs from qpdf --decrypt under qpdf --json=1 --json-key=objects"
+            "{file_name}: encrypted rewrite differs from qpdf under qpdf --json=1 --json-key=objects"
         );
     }
 }
@@ -58,44 +58,49 @@ fn run_flpdf_rewrite(input: &Path, password: &str, allow_weak_crypto: bool, outp
     cmd.arg(input).arg(output).assert().success();
 }
 
-fn run_qpdf_decrypt(input: &Path, password: &str, allow_weak_crypto: bool, output: &Path) {
+fn run_qpdf_rewrite(input: &Path, password: &str, allow_weak_crypto: bool, output: &Path) {
     let mut cmd = ShellCommand::new("qpdf");
     cmd.arg(format!("--password={password}"));
     if allow_weak_crypto {
         cmd.arg("--allow-weak-crypto");
     }
     cmd.arg("--static-id");
-    let result = cmd
-        .arg("--decrypt")
-        .arg(input)
-        .arg(output)
-        .output()
-        .unwrap();
+    let result = cmd.arg(input).arg(output).output().unwrap();
     assert!(
         result.status.success(),
-        "qpdf --decrypt failed for {}: {}",
+        "qpdf rewrite failed for {}: {}",
         input.display(),
         String::from_utf8_lossy(&result.stderr)
     );
 }
 
-fn assert_plaintext_pdf_is_readable(output: &Path, file_name: &str) {
-    let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.arg("check")
-        .arg(output)
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("File is not encrypted\n"));
-
+fn assert_encrypted_pdf_is_readable(output: &Path, file_name: &str, password: &str) {
     let bytes = std::fs::read(output).unwrap();
     assert!(
-        !bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
-        "{file_name}: plaintext rewrite must not contain /Encrypt"
+        bytes.windows(b"/Encrypt".len()).any(|w| w == b"/Encrypt"),
+        "{file_name}: preserved rewrite must contain /Encrypt"
+    );
+
+    let check = ShellCommand::new("qpdf")
+        .arg(format!("--password={password}"))
+        .arg("--check")
+        .arg(output)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{file_name}: qpdf could not authenticate/check preserved output: {}",
+        String::from_utf8_lossy(&check.stderr)
     );
 }
 
-fn qpdf_objects_json(path: &Path) -> Vec<u8> {
-    let result = ShellCommand::new("qpdf")
+fn qpdf_objects_json(path: &Path, password: &str, allow_weak_crypto: bool) -> Vec<u8> {
+    let mut cmd = ShellCommand::new("qpdf");
+    cmd.arg(format!("--password={password}"));
+    if allow_weak_crypto {
+        cmd.arg("--allow-weak-crypto");
+    }
+    let result = cmd
         .args(["--json=1", "--json-key=objects"])
         .arg(path)
         .output()
@@ -112,13 +117,12 @@ fn qpdf_objects_json(path: &Path) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // flpdf-9hc.3.18: `rewrite --remove-restrictions`
 //
-// `--remove-restrictions` adds no new decryption logic: a plaintext rewrite of
-// an authenticated encrypted input already strips /Encrypt and the advisory
-// permission bits live only inside /Encrypt /P, so the output is inherently
-// unrestricted. These tests pin the acceptance criteria: the flag de-restricts
-// an encrypted+restricted fixture (one-line diagnostic, no /Encrypt,
-// `show-encryption` reports "File is not encrypted"), it does NOT bypass
-// authentication, and it is a no-op exit-0 rewrite on unencrypted input.
+// `--remove-restrictions` explicitly disables the normal rewrite's source
+// encryption preservation. These tests pin the acceptance criteria: the flag
+// de-restricts an encrypted+restricted fixture (one-line diagnostic, no
+// /Encrypt, `show-encryption` reports "File is not encrypted"), it does NOT
+// bypass authentication, and it is a no-op exit-0 rewrite on unencrypted
+// input.
 // ---------------------------------------------------------------------------
 
 const UNENCRYPTED_FIXTURE: &str = "../../tests/fixtures/minimal.pdf";
@@ -224,11 +228,10 @@ fn remove_restrictions_on_unencrypted_input_is_a_noop_rewrite() {
 // flpdf-9hc.4.10: `--decrypt`
 //
 // `--decrypt` is the silent qpdf-compatible alias of `--remove-restrictions`
-// on the current rewrite path: both flags drop /Encrypt entirely, and on
-// flpdf's plaintext-by-default writer that's a no-op vs. the implicit
-// behavior. The flag exists so that qtest cases (`unrecognized: --decrypt`,
-// 4 cases) parse and so that the eventual `--encrypt` flag (flpdf-9hc.4.9)
-// has a documented inverse. These tests pin the silence + no-op semantics.
+// on the current rewrite path: both flags explicitly disable source-encryption
+// preservation and drop /Encrypt entirely. The flag exists so qtest cases can
+// use qpdf's silent decryption spelling. These tests pin the silence + no-op
+// semantics.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -445,7 +448,7 @@ fn ensure_qpdf_or_skip() -> bool {
     let on_ci = std::env::var_os("CI").is_some();
     if on_ci {
         panic!(
-            "qpdf is required for encrypted plaintext rewrite tests on CI; install qpdf before running this test suite"
+            "qpdf is required for encrypted rewrite tests on CI; install qpdf before running this test suite"
         );
     }
     eprintln!(
