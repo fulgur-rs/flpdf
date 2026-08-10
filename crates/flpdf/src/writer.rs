@@ -5,6 +5,8 @@ pub(crate) mod encrypted_strings;
 pub(crate) mod encryption_state;
 #[path = "writer/object_streams.rs"]
 pub(crate) mod object_streams;
+#[path = "writer/pclm.rs"]
+pub(crate) mod pclm;
 #[path = "writer/plain/mod.rs"]
 pub(crate) mod plain;
 mod qpdf_writer;
@@ -24,8 +26,11 @@ use crate::parser::Parser;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::tokenizer::Tokenizer;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::io::{Read, Seek, Write};
+use std::rc::Rc;
 
 /// Result data produced by a completed full-rewrite emitter.
 ///
@@ -256,6 +261,34 @@ impl V5Randomness {
     }
 }
 
+/// Shared callback storage used by the qpdf-shaped writer lifecycle.
+///
+/// `WriteOptions` is cloneable because the full-rewrite preflight creates
+/// short-lived option snapshots. Keeping the callback behind shared interior
+/// mutability preserves that property while still allowing each snapshot to
+/// report to the one registered qpdf progress reporter.
+type ProgressCallback = Box<dyn FnMut(u8) + 'static>;
+type SharedProgressCallback = Rc<RefCell<ProgressCallback>>;
+
+#[derive(Clone)]
+pub(crate) struct ProgressReporter(SharedProgressCallback);
+
+impl ProgressReporter {
+    pub(crate) fn new(reporter: Box<dyn FnMut(u8) + 'static>) -> Self {
+        Self(Rc::new(RefCell::new(reporter)))
+    }
+
+    pub(crate) fn report(&self, percent: u8) {
+        (self.0.borrow_mut())(percent);
+    }
+}
+
+impl fmt::Debug for ProgressReporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProgressReporter(..)")
+    }
+}
+
 /// Options controlling [`write_pdf_with_options`].
 ///
 /// Constructed via `Default::default()` or struct literal. The struct is
@@ -363,6 +396,19 @@ pub struct WriteOptions {
     ///
     /// Mirrors `qpdf --force-version`.
     pub force_version: Option<String>,
+
+    /// Adobe extension level paired with [`Self::force_version`].
+    ///
+    /// qpdf treats the version and extension level as one forced pair when
+    /// deciding whether encryption remains compatible and when reconciling
+    /// the Catalog's `/Extensions /ADBE` entry.
+    pub force_extension_level: Option<i64>,
+
+    /// Text written immediately after qpdf's binary or PCLm header marker.
+    ///
+    /// [`QPDFWriter::set_extra_header_text`](crate::QPDFWriter::set_extra_header_text)
+    /// normalizes this value to end in one newline, matching qpdf.
+    pub extra_header_text: String,
 
     /// When `true`, suppress the `%% Original object ID: N M` comments that the
     /// QDF writer would otherwise emit before each object.
@@ -560,6 +606,30 @@ pub struct WriteOptions {
     /// V=1/V=2 RC4, V=4 AESV2, and V=5 R=5/R=6 AESV3 donors are supported by
     /// the full-rewrite writer. CLI donor validation is migrated separately.
     pub copy_encryption: Option<crate::encrypt_setup::CopyEncryptionSource>,
+
+    /// Emit qpdf's PCLm-oriented object order and header.
+    pub pclm: bool,
+
+    /// qpdf progress callback shared by the lifecycle bridge and the emitter.
+    pub(crate) progress_reporter: Option<ProgressReporter>,
+}
+
+pub(crate) fn report_progress(options: &WriteOptions, percent: u8) {
+    if let Some(reporter) = options.progress_reporter.as_ref() {
+        reporter.report(percent);
+    }
+}
+
+pub(crate) fn report_progress_event(
+    options: &WriteOptions,
+    events_seen: &mut usize,
+    events_expected: usize,
+) {
+    *events_seen = events_seen.saturating_add(1);
+    let expected = events_expected.max(1);
+    let scaled = events_seen.saturating_mul(100) / expected;
+    let percent = 1_u8.saturating_add(u8::try_from(scaled.min(98)).unwrap_or(98));
+    report_progress(options, percent);
 }
 
 /// True when `--force-version` pins the output header below PDF 1.5.
@@ -779,13 +849,8 @@ pub fn effective_pdf_version_and_ext<'a>(
     let min_parsed = options.min_version.as_deref().and_then(parse_pdf_version);
     // `--force-version` returns the forced value verbatim from
     // `effective_pdf_version`. qpdf treats a valid `--force-version` as an
-    // exact version with extension level 0: neither the source nor the
-    // caller-supplied `--min-extension-level` should propagate an ext to
-    // the header, even when the forced major/minor happens to equal source
-    // or min_v. Gate both contributions on the forced flag so a forced
-    // version zeroes the extension regardless of the tie. (Explicit
-    // per-force extension specification is not part of the current API;
-    // if introduced, this is where the exception would go.)
+    // exact version/extension pair: neither the source nor the caller-
+    // supplied minimum extension level propagates across it.
     let forced = options
         .force_version
         .as_deref()
@@ -814,7 +879,11 @@ pub fn effective_pdf_version_and_ext<'a>(
     if enc_contributes {
         ext = ext.max(enc_ext);
     }
-    (ver, ext)
+    if forced {
+        (ver, options.force_extension_level.unwrap_or(0))
+    } else {
+        (ver, ext)
+    }
 }
 
 /// Ensure the destination Catalog carries
@@ -3396,6 +3465,153 @@ fn write_pdf_full_rewrite<R: Read + Seek, W: Write>(
     result
 }
 
+/// Emit qpdf's page-oriented PCLm queue.
+///
+/// PCLm is intentionally kept out of the ordinary plain pipeline: qpdf
+/// reserves numbers in a different order and inserts one synthetic transform
+/// stream after every page-strip image. The output is otherwise a normal
+/// full rewrite with a classic xref table and the usual trailer/ID handling.
+fn write_pclm<R: Read + Seek, W: Write>(
+    pdf: &mut Pdf<R>,
+    mut out: W,
+    options: &WriteOptions,
+) -> Result<WriterResult> {
+    if options.deterministic_id && options.static_id {
+        return Err(crate::Error::Unsupported(
+            "deterministic_id and static_id are mutually exclusive".to_string(),
+        ));
+    }
+
+    let plan = pclm::Plan::build(pdf)?;
+    let version = effective_pdf_version(pdf.version(), options, false, false);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(format!("%PDF-{version}\n%PCLm 1.0\n").as_bytes());
+    bytes.extend_from_slice(options.extra_header_text.as_bytes());
+    if !options.extra_header_text.is_empty() && !options.extra_header_text.ends_with('\n') {
+        bytes.push(b'\n');
+    }
+
+    let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
+    let expected = plan.items.len().max(1);
+    let mut events = 0_usize;
+    let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
+
+    for item in &plan.items {
+        match *item {
+            pclm::Item::Source { source, output } => {
+                let mut object = pdf.resolve(source)?;
+                crate::rewrite_renumber::renumber_qpdf_refs_in_place(
+                    pdf,
+                    &mut object,
+                    &plan.old_to_new,
+                )?;
+                let offset = bytes.len();
+                bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
+                match object {
+                    Object::Stream(stream) => {
+                        let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
+                            stream,
+                            options,
+                            true,
+                            pdf.recovered_stream_eol(source),
+                            false,
+                            false,
+                        );
+                        write_reencoded_object(
+                            &mut bytes,
+                            &reencoded,
+                            source_filter_is_lone_flate,
+                            options,
+                            None,
+                            output,
+                        )?;
+                    }
+                    other => other.write_pdf(&mut bytes),
+                }
+                bytes.extend_from_slice(b"\nendobj\n");
+                offsets.insert(output.number, (0, offset));
+                emitted_old_to_new.insert(source, output);
+            }
+            pclm::Item::Synthetic { output } => {
+                let payload = b"q /image Do Q\n".to_vec();
+                let mut dict = Dictionary::new();
+                dict.insert("Length", Object::Integer(payload.len() as i64));
+                let stream = crate::Stream::new(dict, payload);
+                let offset = bytes.len();
+                bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
+                write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
+                bytes.extend_from_slice(b"\nendobj\n");
+                offsets.insert(output.number, (0, offset));
+            }
+        }
+        report_progress_event(options, &mut events, expected);
+    }
+
+    let max_object_number = offsets.keys().next_back().copied().unwrap_or(0);
+    let object_count = usize::try_from(max_object_number)
+        .ok()
+        .and_then(|number| number.checked_add(1))
+        .ok_or_else(|| {
+            crate::Error::Unsupported("PCLm object count does not fit in usize".to_string())
+        })?;
+    let mut written_xref = BTreeMap::<ObjectRef, XrefEntry>::new();
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(format!("xref\n0 {object_count}\n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..object_count {
+        match offsets.get(&(number as u32)) {
+            Some((generation, offset)) => {
+                bytes.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+                written_xref.insert(
+                    ObjectRef::new(number as u32, 0),
+                    XrefEntry::Uncompressed {
+                        offset: u64::try_from(*offset).map_err(|_| {
+                            crate::Error::Unsupported("PCLm xref offset does not fit u64".into())
+                        })?,
+                    },
+                );
+            }
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+
+    let mut trailer = pdf.trailer().clone();
+    strip_incremental_trailer_keys(&mut trailer);
+    trailer.remove("Encrypt");
+    let removed: BTreeSet<_> = pdf.deleted_object_refs().into_iter().collect();
+    remap_qpdf_trailer_refs_with_removed(pdf, &mut trailer, &plan.old_to_new, &removed)?;
+    trailer.insert("Size", Object::Integer(object_count as i64));
+    trailer.insert("Root", Object::Reference(plan.root));
+    let generated_id = if options.deterministic_id {
+        None
+    } else {
+        Some(generate_id_array(
+            pdf.trailer().get("ID"),
+            options.static_id,
+        ))
+    };
+    if options.deterministic_id {
+        apply_deterministic_id_placeholder(&mut trailer);
+    } else if let Some(id) = generated_id {
+        trailer.insert("ID", id);
+    }
+
+    bytes.extend_from_slice(b"trailer ");
+    if options.deterministic_id {
+        let source_id0 = source_permanent_id(pdf.trailer());
+        let info_suffix = deterministic_id_info_suffix(pdf);
+        let mut id_writer = |out: &mut Vec<u8>| {
+            write_deterministic_id_inline(out, &info_suffix, source_id0.as_deref())
+        };
+        trailer.write_pdf_trailer(&mut bytes, Some(&mut id_writer));
+    } else {
+        trailer.write_pdf_trailer(&mut bytes, None);
+    }
+    bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out.write_all(&bytes)?;
+    Ok(WriterResult::new(emitted_old_to_new, written_xref))
+}
+
 fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     pdf: &mut Pdf<R>,
     mut out: W,
@@ -3406,6 +3622,8 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             "deterministic_id and static_id are mutually exclusive".to_string(),
         ));
     }
+
+    report_progress(options, 0);
 
     // A forced sub-1.5 header suppresses object-stream generation: object
     // streams are a PDF 1.5 feature and qpdf will not emit them under a forced
@@ -3494,6 +3712,10 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             // developer prefixes intact.
             strip_adbe_extension(pdf)?;
         }
+    }
+
+    if options.pclm {
+        return write_pclm(pdf, out, options);
     }
 
     if plain::eligible(
@@ -3962,13 +4184,25 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         new_root
     };
 
+    let progress_expected = renumbered
+        .len()
+        .saturating_add(plan.batches.len())
+        .saturating_add(usize::from(encrypt_ctx.is_some()))
+        .max(1);
+    let mut progress_events = 0_usize;
+
     let mut bytes = Vec::new();
     bytes.extend_from_slice(format!("%PDF-{version}\n").as_bytes());
-    bytes.extend_from_slice(QPDF_BINARY_MARKER);
+    if options.pclm {
+        bytes.extend_from_slice(b"%PCLm 1.0\n");
+    } else {
+        bytes.extend_from_slice(QPDF_BINARY_MARKER);
+    }
     if options.qdf {
         bytes.extend_from_slice(b"%QDF-1.0\n");
         bytes.extend_from_slice(b"\n");
     }
+    bytes.extend_from_slice(options.extra_header_text.as_bytes());
 
     let mut offsets = BTreeMap::<u32, (u16, usize)>::new();
     let mut emitted_old_to_new = BTreeMap::<ObjectRef, ObjectRef>::new();
@@ -4221,6 +4455,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
         }
         offsets.insert(emit_ref.number, (emit_ref.generation, emit_offset));
         emitted_old_to_new.insert(*old_ref, ObjectRef::new(emit_ref.number, 0));
+        report_progress_event(options, &mut progress_events, progress_expected);
 
         // QDF: emit the length-holder object IMMEDIATELY after its stream's
         // endobj + blank line, numbered in sequential emission order so that
@@ -4286,6 +4521,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(container_ref.number, (0, emit_offset));
+        report_progress_event(options, &mut progress_events, progress_expected);
     }
 
     // ── flpdf-9hc.4.9: emit the /Encrypt dictionary as a plaintext indirect
@@ -4301,6 +4537,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             bytes.push(b'\n');
         }
         offsets.insert(ctx.encrypt_ref.number, (0, emit_offset));
+        report_progress_event(options, &mut progress_events, progress_expected);
     }
 
     // Build xref / trailer matching the input's xref form.

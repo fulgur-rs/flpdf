@@ -103,6 +103,44 @@ fn synthetic_unreferenced_object_pdf() -> Vec<u8> {
     bytes
 }
 
+fn synthetic_pclm_image_pdf() -> Vec<u8> {
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    let bodies: &[(u32, &[u8])] = &[
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+        (2, b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>"),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /Resources 4 0 R /Contents 5 0 R >>",
+        ),
+        (4, b"<< /XObject << /Im1 6 0 R /Im2 7 0 R >> >>"),
+        (5, b"<< /Length 5 >>\nstream\nBT ET\nendstream"),
+    ];
+    for (number, body) in bodies {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    for (number, data) in [(6, 0_u8), (7, 1_u8)] {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!(
+            "{number} 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n"
+        ).as_bytes());
+        bytes.push(data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    bytes
+}
+
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -975,6 +1013,36 @@ fn qpdf_writer_preserves_v4_aes_encryption_for_encrypted_input() -> flpdf::Resul
 }
 
 #[test]
+fn qpdf_writer_pclm_disables_source_encryption_and_stream_rewriting() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut source = Pdf::open_with_options(
+        BufReader::new(File::open(
+            "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
+        )?),
+        PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut writer = QPDFWriter::new(&mut source);
+    writer.set_pclm(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let mut rewritten = Pdf::open(Cursor::new(output.clone()))?;
+    assert!(!rewritten.is_encrypted());
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("pclm-clear.pdf");
+    std::fs::write(&path, output)?;
+    let check = Command::new("qpdf").arg("--check").arg(&path).output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    let root = rewritten.root_ref().expect("PCLm output must have a root");
+    assert!(rewritten.resolve(root)?.as_dict().is_some());
+    Ok(())
+}
+
+#[test]
 fn qpdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()> {
     qpdf_11_9_0()?;
     let cases = [
@@ -1630,6 +1698,146 @@ fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()>
         let output = writer.get_buffer()?;
         assert!(output.starts_with(expected.as_bytes()));
     }
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_preserves_forced_pdf_extension_pair() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.force_pdf_version("1.7", 8)?;
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    assert!(output.starts_with(b"%PDF-1.7\n"));
+    assert!(contains_bytes(&output, b"/BaseVersion /1.7"));
+    assert!(contains_bytes(&output, b"/ExtensionLevel 8"));
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_emits_extra_header_text_after_qpdf_header() -> flpdf::Result<()> {
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_extra_header_text("% flpdf-extra");
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    let marker = b"%\xbf\xf7\xa2\xfe\n";
+    let marker_end = output
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .map(|offset| offset + marker.len())
+        .expect("qpdf binary marker must be present");
+    assert_eq!(&output[marker_end..][..14], b"% flpdf-extra\n");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_emits_pclm_header_and_a_qpdf_checked_pdf() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    assert!(output.starts_with(b"%PDF-1.7\n%PCLm 1.0\n"));
+    assert!(!output.starts_with(b"%PDF-1.7\n%\xbf\xf7\xa2\xfe\n"));
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("pclm.pdf");
+    std::fs::write(&path, output)?;
+    let check = Command::new("qpdf").arg("--check").arg(&path).output()?;
+    assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_pclm_uses_page_strip_fifo_and_synthetic_transforms() -> flpdf::Result<()> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_pclm_image_pdf()))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_pclm(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let output = writer.get_buffer()?;
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(3, 0))?,
+        Some(ObjectRef::new(1, 0))
+    );
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(5, 0))?,
+        Some(ObjectRef::new(2, 0))
+    );
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(6, 0))?,
+        Some(ObjectRef::new(3, 0))
+    );
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(7, 0))?,
+        Some(ObjectRef::new(5, 0))
+    );
+    assert_eq!(
+        writer.get_renumbered_obj_gen(ObjectRef::new(1, 0))?,
+        Some(ObjectRef::new(7, 0))
+    );
+    assert_eq!(
+        output
+            .windows(b"q /image Do Q\n".len())
+            .filter(|window| *window == b"q /image Do Q\n")
+            .count(),
+        2
+    );
+    let body_end = output
+        .windows(b"xref\n".len())
+        .position(|window| window == b"xref\n")
+        .expect("PCLm output must have an xref table");
+    let headings = [
+        b"1 0 obj\n".as_slice(),
+        b"2 0 obj\n".as_slice(),
+        b"3 0 obj\n".as_slice(),
+        b"4 0 obj\n".as_slice(),
+        b"5 0 obj\n".as_slice(),
+        b"6 0 obj\n".as_slice(),
+        b"7 0 obj\n".as_slice(),
+        b"8 0 obj\n".as_slice(),
+        b"9 0 obj\n".as_slice(),
+    ];
+    let positions: Vec<usize> = headings
+        .iter()
+        .map(|heading| {
+            output[..body_end]
+                .windows(heading.len())
+                .position(|window| window == *heading)
+                .expect("every PCLm output object must be present")
+        })
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_progress_finishes_after_the_output_sink() -> flpdf::Result<()> {
+    let events = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let mut pdf = open_minimal_pdf()?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    let events_for_reporter = Rc::clone(&events);
+    writer.register_progress_reporter(Box::new(move |percent| {
+        events_for_reporter.borrow_mut().push(percent);
+    }));
+    writer.set_output_memory()?;
+    writer.write()?;
+
+    let events = events.borrow();
+    assert!(!events.is_empty());
+    assert_eq!(events.first(), Some(&0));
+    assert_eq!(events.last(), Some(&100));
+    assert!(events.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(events.iter().all(|percent| *percent <= 100));
     Ok(())
 }
 

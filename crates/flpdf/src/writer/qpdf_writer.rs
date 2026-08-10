@@ -11,7 +11,8 @@ use crate::{Error, ObjectRef, Pdf, Result, WriteOptions, XrefEntry};
 
 use super::settings::{DecodeLevel, WriterSettings};
 use super::{
-    effective_pdf_version, write_pdf_full_rewrite, ObjectStreamMode, StreamDataMode, WriterResult,
+    effective_pdf_version, report_progress, write_pdf_full_rewrite, ObjectStreamMode,
+    ProgressReporter, StreamDataMode, WriterResult,
 };
 
 enum WriterOutput {
@@ -209,7 +210,21 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     ) -> Result<()> {
         let version = version.into();
         validate_pdf_version(&version)?;
-        self.settings.minimum_pdf_version = Some((version, extension_level));
+        match self.settings.minimum_pdf_version.as_mut() {
+            None => self.settings.minimum_pdf_version = Some((version, extension_level)),
+            Some((current_version, current_extension_level)) => {
+                let current = crate::pdf_version::parse_pdf_version(current_version)
+                    .expect("validated minimum PDF version remains parseable");
+                let candidate = crate::pdf_version::parse_pdf_version(&version)
+                    .expect("validated minimum PDF version is parseable");
+                if candidate > current
+                    || (candidate == current && extension_level > *current_extension_level)
+                {
+                    *current_version = version;
+                    *current_extension_level = extension_level;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -225,7 +240,11 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     }
 
     pub fn set_extra_header_text(&mut self, text: impl Into<String>) {
-        self.settings.extra_header_text = text.into();
+        let mut text = text.into();
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        self.settings.extra_header_text = text;
     }
 
     pub fn set_deterministic_id(&mut self, value: bool) {
@@ -260,6 +279,9 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     pub fn set_linearization(&mut self, value: bool) {
         self.settings.linearization = value;
+        if value {
+            self.settings.pclm = false;
+        }
     }
 
     pub fn set_linearization_pass1_filename(&mut self, path: impl Into<PathBuf>) {
@@ -268,10 +290,13 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     pub fn set_pclm(&mut self, value: bool) {
         self.settings.pclm = value;
+        if value {
+            self.settings.linearization = false;
+        }
     }
 
     pub fn register_progress_reporter(&mut self, reporter: Box<dyn FnMut(u8) + 'static>) {
-        self.settings.progress_reporter = Some(reporter);
+        self.settings.progress_reporter = Some(ProgressReporter::new(reporter));
     }
 
     /// Return the effective header version before writing.
@@ -312,6 +337,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             .as_mut()
             .expect("output was checked before writing")
             .write_complete(bytes)?;
+        report_progress(&options, 100);
         self.result = Some(result);
         self.write_succeeded = true;
         Ok(())
@@ -342,16 +368,10 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     /// Reject qpdf settings that the temporary emitter bridge cannot honor.
     pub fn validate_supported_settings(&self) -> Result<()> {
-        let unsupported = if !self.settings.extra_header_text.is_empty() {
-            Some("extra header text")
-        } else if self.settings.linearization
+        let unsupported = if self.settings.linearization
             || self.settings.linearization_pass1_filename.is_some()
         {
             Some("linearization")
-        } else if self.settings.pclm {
-            Some("PCLm output")
-        } else if self.settings.progress_reporter.is_some() {
-            Some("progress reporting")
         } else {
             None
         };
@@ -376,6 +396,18 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     /// `get_final_version` and `write` observe the same plan.
     fn prepared_write_options(&mut self) -> Result<WriteOptions> {
         let mut options = self.settings.to_write_options();
+        if options.pclm {
+            // QPDFWriter::doWriteSetup makes PCLm a cleartext, unfiltered
+            // output mode before source-encryption preservation is considered.
+            options.encrypt = None;
+            options.copy_encryption = None;
+            options.qdf = false;
+            options.content_normalization = false;
+            options.decode_level = DecodeLevel::None;
+            options.compress_streams = crate::CompressStreams::No;
+            options.stream_data = None;
+            options.object_streams = ObjectStreamMode::Disable;
+        }
         let can_preserve = self.settings.preserve_encryption
             && self.pdf.is_encrypted()
             && options.encrypt.is_none()
@@ -448,7 +480,8 @@ fn forced_version_disables_encryption(options: &WriteOptions) -> bool {
         return true;
     }
     let v = crate::pdf_version::PdfVersion::new(1, 7, 0);
-    forced <= v && (version >= 5 || revision >= 5)
+    (forced < v || (forced == v && options.force_extension_level.unwrap_or(0) < 3))
+        && (version >= 5 || revision >= 5)
 }
 
 fn encryption_shape(options: &WriteOptions) -> Option<(i64, i64, bool)> {

@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
 
 use super::{
-    CompressStreams, NewlineBeforeEndstream, ObjectStreamMode, StreamDataMode, WriteOptions,
+    CompressStreams, NewlineBeforeEndstream, ObjectStreamMode, ProgressReporter, StreamDataMode,
+    WriteOptions,
 };
 
 /// Controls how much stream decoding a writer setting requests.
@@ -58,7 +59,7 @@ pub(crate) struct WriterSettings {
     pub(crate) linearization: bool,
     pub(crate) linearization_pass1_filename: Option<PathBuf>,
     pub(crate) pclm: bool,
-    pub(crate) progress_reporter: Option<Box<dyn FnMut(u8) + 'static>>,
+    pub(crate) progress_reporter: Option<ProgressReporter>,
 }
 
 impl Default for WriterSettings {
@@ -148,6 +149,8 @@ impl WriterSettings {
             no_original_object_ids: self.suppress_original_object_ids,
             encrypt: self.encryption_parameters.clone(),
             copy_encryption: self.copy_encryption.clone(),
+            pclm: self.pclm,
+            progress_reporter: self.progress_reporter.clone(),
             ..WriteOptions::default()
         };
 
@@ -163,6 +166,11 @@ impl WriterSettings {
             .forced_pdf_version
             .as_ref()
             .map(|(version, _)| version.clone());
+        options.force_extension_level = self
+            .forced_pdf_version
+            .as_ref()
+            .map(|(_, extension_level)| *extension_level);
+        options.extra_header_text = self.extra_header_text.clone();
 
         options
     }

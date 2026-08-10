@@ -28,6 +28,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     bytes.extend_from_slice(QPDF_BINARY_MARKER);
 
     let mut layout = BodyLayout::default();
+    let expected = plan.objects.len().max(1);
+    let mut events = 0_usize;
     for planned in &plan.objects {
         match planned {
             PlannedIndirectObject::Source { source, output } => {
@@ -116,6 +118,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 }
             }
         }
+        crate::writer::report_progress_event(options, &mut events, expected);
     }
 
     Ok((bytes, layout))

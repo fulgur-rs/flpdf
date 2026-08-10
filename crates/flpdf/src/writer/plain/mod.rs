@@ -58,6 +58,8 @@ pub(crate) fn eligible(
 ) -> bool {
     mode == options.object_streams
         && !options.qdf
+        && !options.pclm
+        && options.extra_header_text.is_empty()
         && options.encrypt.is_none()
         && options.copy_encryption.is_none()
         && !options.content_normalization
