@@ -24,7 +24,7 @@ use crate::parser::Parser;
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
 use crate::tokenizer::Tokenizer;
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Seek, Write};
 
 /// Controls whether the full-rewrite path applies FlateDecode compression to
@@ -250,9 +250,10 @@ pub struct WriteOptions {
 
     /// Normalize decoded page-content streams using qpdf token rules.
     ///
-    /// This applies only to indirect streams referenced by page `/Contents`;
-    /// other streams retain their decoded bytes unchanged. QPDFWriter enables
-    /// it implicitly for QDF output unless the caller explicitly disables it.
+    /// This applies to direct streams in a page `/Contents` value and terminal
+    /// indirect streams reached from page `/Contents`; other streams retain
+    /// their decoded bytes unchanged. QPDFWriter enables it implicitly for QDF
+    /// output unless the caller explicitly disables it.
     pub content_normalization: bool,
 
     /// Override the trailer `/ID`'s second element (the changing identifier)
@@ -3029,15 +3030,16 @@ pub(crate) fn reencode_stream_for_compress(
     qpdf_plain_empty_refilter: bool,
     recovered_stream_eol: Option<&[u8]>,
     normalize_content: bool,
+    apply_full_rewrite_metadata_policy: bool,
 ) -> (Object, bool) {
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
     }
     // qpdf's QPDFWriter always writes cleartext `/Type /Metadata` streams
     // through the uncompress path (QPDFWriter.cc:1251-1281), even when the
-    // global writer requested compression or stream-data preservation. Copy
-    // encryption is a full-rewrite-only QPDFWriter route, so it needs the same
-    // override even when it did not come through the setter-aware bridge.
+    // global writer requested compression or stream-data preservation. This
+    // is QPDFWriter's standard full-rewrite policy, not the shared helper's
+    // plain or linearized route policy; those callers opt out explicitly.
     // Metadata is not page content, so it must never receive content-token
     // normalization. The encryption layer applies any requested payload
     // encryption after this decision; the cleartext metadata exemption is
@@ -3050,10 +3052,8 @@ pub(crate) fn reencode_stream_for_compress(
             .copy_encryption
             .as_ref()
             .is_none_or(|source| !copy_encryption_encrypts_metadata(source));
-    let is_metadata_stream = metadata_is_cleartext
-        && (options.qdf
-            || options.qdf_stream_policy_precomputed
-            || options.copy_encryption.is_some())
+    let is_metadata_stream = apply_full_rewrite_metadata_policy
+        && metadata_is_cleartext
         && matches!(
             stream.dict.get("Type"),
             Some(Object::Name(name)) if name.as_slice() == b"Metadata"
@@ -3967,6 +3967,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
                 qpdf_null_visibility,
                 pdf.recovered_stream_eol(*old_ref),
                 options.content_normalization && contents_seq.contains_key(old_ref),
+                true,
             );
 
             // flpdf-9hc.4.9: encrypt the stream payload AFTER any filter
@@ -4745,24 +4746,26 @@ fn collect_content_array_holder_refs<R: Read + Seek>(
     start: ObjectRef,
     containers: &mut BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    let mut current = start;
-    for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
-        let next = match pdf.resolve_borrowed(current)? {
-            Object::Reference(next) => Some(*next),
+    let mut pending = VecDeque::from([(start, 0_usize)]);
+    let mut visited = BTreeSet::new();
+
+    while let Some((current, depth)) = pending.pop_front() {
+        if depth >= crate::ref_chain::MAX_REF_CHAIN_DEPTH || !visited.insert(current) {
+            continue;
+        }
+        match pdf.resolve_borrowed(current)? {
+            Object::Reference(next) => pending.push_back((*next, depth + 1)),
             Object::Array(items) => {
-                if !containers.insert(current) {
-                    return Ok(());
-                }
-                let refs: Vec<ObjectRef> = items.iter().filter_map(Object::as_ref_id).collect();
-                for reference in refs {
-                    collect_content_array_holder_refs(pdf, reference, containers)?;
-                }
-                return Ok(());
+                containers.insert(current);
+                pending.extend(
+                    items
+                        .iter()
+                        .filter_map(Object::as_ref_id)
+                        .map(|reference| (reference, depth + 1)),
+                );
             }
-            Object::Stream(_) => return Ok(()),
-            _ => return Ok(()),
-        };
-        current = next.expect("reference arm always returns a next ref");
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -4792,7 +4795,7 @@ fn normalize_direct_content_value(value: &mut Object, options: &WriteOptions) {
     match value {
         Object::Stream(stream) => {
             let (normalized, _) =
-                reencode_stream_for_compress(stream.clone(), options, false, None, true);
+                reencode_stream_for_compress(stream.clone(), options, false, None, true, false);
             let Object::Stream(normalized) = normalized else {
                 unreachable!("stream compression always returns a stream")
             };
@@ -4912,6 +4915,35 @@ mod tests {
     use crate::rewrite_renumber::CatalogFirstRenumber;
     use std::io::Cursor;
     use std::sync::Arc;
+
+    #[test]
+    fn content_array_holder_collection_uses_one_cumulative_ref_depth_budget() {
+        let mut pdf =
+            crate::Pdf::open_mem_owned(build_partition_fixture()).expect("fixture must open");
+        let refs: Vec<ObjectRef> = (0..=crate::ref_chain::MAX_REF_CHAIN_DEPTH)
+            .map(|i| ObjectRef::new(10_000 + i as u32, 0))
+            .collect();
+
+        for (index, reference) in refs.iter().enumerate() {
+            let value = if let Some(next) = refs.get(index + 1) {
+                Object::Reference(*next)
+            } else {
+                Object::Stream(crate::Stream::new(Dictionary::new(), b"q\rQ\n".to_vec()))
+            };
+            pdf.set_object(*reference, Object::Array(vec![value]));
+        }
+
+        let mut containers = BTreeSet::new();
+        collect_content_array_holder_refs(&mut pdf, refs[0], &mut containers)
+            .expect("bounded holder traversal must succeed");
+
+        assert_eq!(containers.len(), crate::ref_chain::MAX_REF_CHAIN_DEPTH);
+        assert!(containers.contains(&refs[0]));
+        assert!(
+            !containers.contains(refs.last().expect("non-empty chain")),
+            "the terminal holder beyond the shared reference-depth budget must not be visited"
+        );
+    }
 
     #[test]
     fn remap_trailer_refs_remaps_live_and_drops_deleted() {
