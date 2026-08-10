@@ -244,16 +244,20 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     /// Return the effective header version before writing.
     pub fn get_final_version(&mut self) -> Result<String> {
         let options = self.settings.to_write_options();
+        // The exact qpdf output-plan floor for preserve mode is a later task.
         Ok(effective_pdf_version(
             self.pdf.version(),
             &options,
             self.settings.linearization,
-            false,
+            matches!(self.settings.object_stream_mode, ObjectStreamMode::Generate),
         )
         .to_owned())
     }
 
     /// Write one fresh PDF output and finish the configured sink once.
+    ///
+    /// `write_started` is consumed before emission; any failure is permanently
+    /// one-shot and cannot be retried.
     pub fn write(&mut self) -> Result<()> {
         if self.write_started {
             return Err(Error::Unsupported(
@@ -265,6 +269,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
                 "QPDFWriter::write requires an output sink".into(),
             ));
         }
+        self.validate_supported_settings()?;
         self.write_started = true;
 
         let options = self.settings.to_write_options();
@@ -282,13 +287,58 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
     /// Query the temporary result surface after a successful write.
     pub fn get_renumbered_obj_gen(&self, _source: ObjectRef) -> Result<Option<ObjectRef>> {
         self.ensure_write_succeeded()?;
-        Ok(None)
+        Err(Error::Unsupported(
+            "renumbered object generation results are temporarily not implemented".into(),
+        ))
     }
 
     /// Query the temporary result surface after a successful write.
     pub fn get_written_xref_table(&self) -> Result<BTreeMap<ObjectRef, XrefEntry>> {
         self.ensure_write_succeeded()?;
-        Ok(BTreeMap::new())
+        Err(Error::Unsupported(
+            "written xref table results are temporarily not implemented".into(),
+        ))
+    }
+
+    /// Reject qpdf settings that the temporary emitter bridge cannot honor.
+    pub fn validate_supported_settings(&self) -> Result<()> {
+        let unsupported = if self.settings.content_normalization {
+            Some("content normalization")
+        } else if self.settings.preserve_unreferenced_objects {
+            Some("preserving unreferenced objects")
+        } else if self.settings.decode_level != DecodeLevel::Generalized {
+            Some("non-generalized decode levels")
+        } else if !self.settings.extra_header_text.is_empty() {
+            Some("extra header text")
+        } else if self.settings.linearization
+            || self.settings.linearization_pass1_filename.is_some()
+        {
+            Some("linearization")
+        } else if self.settings.pclm {
+            Some("PCLm output")
+        } else if self.settings.progress_reporter.is_some() {
+            Some("progress reporting")
+        } else {
+            None
+        };
+
+        if let Some(setting) = unsupported {
+            return Err(Error::Unsupported(format!(
+                "{setting} is temporarily not implemented by QPDFWriter"
+            )));
+        }
+
+        if self.pdf.is_encrypted()
+            && self.settings.preserve_encryption
+            && self.settings.encryption_parameters.is_none()
+            && self.settings.copy_encryption.is_none()
+        {
+            return Err(Error::Unsupported(
+                "preserving encryption for encrypted input is temporarily not implemented by QPDFWriter".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn ensure_write_succeeded(&self) -> Result<()> {
