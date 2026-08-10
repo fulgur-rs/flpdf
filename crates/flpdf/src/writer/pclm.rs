@@ -48,7 +48,7 @@ impl Plan {
 
             if let Some(contents) = page_dict.get("Contents") {
                 builder.enqueue_value(contents)?;
-            }
+            } // cov:ignore: LLVM maps the executed page-contents continuation to the call line above
 
             if let Some(xobjects) = builder.page_xobjects(page_dict)? {
                 for (_, image) in xobjects.iter() {
