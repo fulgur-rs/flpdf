@@ -924,6 +924,229 @@ fn qpdf_writer_copy_encryption_preserves_donor_cleartext_metadata_policy() -> fl
 }
 
 #[test]
+fn qpdf_writer_preserves_v4_aes_encryption_for_encrypted_input() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut source = Pdf::open_with_options(
+        BufReader::new(File::open(
+            "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
+        )?),
+        PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let source_info = source
+        .encryption_info()?
+        .expect("encrypted fixture must expose encryption parameters");
+    assert!(source.is_encrypted());
+    assert!(source.user_password_matched());
+
+    let mut writer = QPDFWriter::new(&mut source);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let mut rewritten = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let output_info = rewritten
+        .encryption_info()?
+        .expect("rewritten PDF must remain encrypted");
+    assert!(rewritten.is_encrypted());
+    assert!(rewritten.user_password_matched());
+    assert_eq!(output_info.v, source_info.v);
+    assert_eq!(output_info.r, source_info.r);
+    assert_eq!(output_info.length_bits, source_info.length_bits);
+    assert_eq!(output_info.filter, source_info.filter);
+    assert_eq!(output_info.permissions, source_info.permissions);
+    assert_eq!(output_info.encrypt_metadata, source_info.encrypt_metadata);
+    assert_eq!(output_info.stream_method, source_info.stream_method);
+    assert_eq!(output_info.string_method, source_info.string_method);
+    assert_eq!(output_info.eff_method, source_info.eff_method);
+    assert_eq!(
+        output_info.named_crypt_filters,
+        source_info.named_crypt_filters
+    );
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_preserves_all_standard_encryption_revisions() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let cases = [
+        ("v1-rc4-40-r2.pdf", b"user-v1".as_slice(), true, "none"),
+        ("v2-rc4-128-r3.pdf", b"user-v2".as_slice(), true, "none"),
+        (
+            "v4-rc4-128-r4.pdf",
+            b"user-v4-rc4".as_slice(),
+            true,
+            "AESv2",
+        ),
+        (
+            "v4-aes-128-r4.pdf",
+            b"user-v4-aes".as_slice(),
+            false,
+            "AESv2",
+        ),
+        ("v5-aes-256-r5.pdf", b"user-v5-r5".as_slice(), true, "AESv3"),
+        (
+            "v5-aes-256-r6.pdf",
+            b"user-v5-r6".as_slice(),
+            false,
+            "AESv3",
+        ),
+    ];
+
+    for (fixture, password, allow_weak_crypto, expected_method) in cases {
+        let mut source = Pdf::open_with_options(
+            BufReader::new(File::open(format!(
+                "../../tests/fixtures/encrypted/{fixture}"
+            ))?),
+            PdfOpenOptions {
+                password: password.to_vec(),
+                allow_weak_crypto,
+                ..PdfOpenOptions::default()
+            },
+        )?;
+        let source_info = source
+            .encryption_info()?
+            .expect("encrypted fixture must expose encryption parameters");
+        let mut writer = QPDFWriter::new(&mut source);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_output_memory()?;
+        writer.write()?;
+        let output = writer.get_buffer()?;
+
+        let mut rewritten = Pdf::open_with_options(
+            Cursor::new(output.clone()),
+            PdfOpenOptions {
+                password: password.to_vec(),
+                allow_weak_crypto,
+                ..PdfOpenOptions::default()
+            },
+        )?;
+        let output_info = rewritten
+            .encryption_info()?
+            .expect("rewritten PDF must remain encrypted");
+        assert_eq!(output_info.v, source_info.v, "{fixture} /V changed");
+        assert_eq!(output_info.r, source_info.r, "{fixture} /R changed");
+        assert_eq!(output_info.length_bits, source_info.length_bits);
+        assert_eq!(output_info.permissions, source_info.permissions);
+        assert_eq!(output_info.encrypt_metadata, source_info.encrypt_metadata);
+        assert_eq!(output_info.stream_method, expected_method, "{fixture}");
+        assert_eq!(output_info.string_method, expected_method, "{fixture}");
+        assert_eq!(output_info.eff_method, expected_method, "{fixture}");
+
+        let dir = tempfile::tempdir()?;
+        let output_path = dir.path().join(fixture);
+        std::fs::write(&output_path, output)?;
+        let check = Command::new("qpdf")
+            .arg(format!("--password={}", String::from_utf8_lossy(password)))
+            .arg("--check")
+            .arg(&output_path)
+            .output()?;
+        assert!(
+            check.status.success(),
+            "qpdf --check failed for {fixture}: {check:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_forced_incompatible_version_drops_preserved_encryption() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut source = Pdf::open_with_options(
+        BufReader::new(File::open(
+            "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
+        )?),
+        PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut writer = QPDFWriter::new(&mut source);
+    writer.force_pdf_version("1.5", 0)?;
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert!(output.starts_with(b"%PDF-1.5\n"));
+
+    let rewritten = Pdf::open(Cursor::new(output))?;
+    assert!(!rewritten.is_encrypted());
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_preserve_controls_and_transforms_disable_source_encryption() -> flpdf::Result<()> {
+    for transform in ["preserve-false", "decode-generalized", "qdf"] {
+        let mut source = Pdf::open_with_options(
+            BufReader::new(File::open(
+                "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
+            )?),
+            PdfOpenOptions {
+                password: b"user-v4-aes".to_vec(),
+                ..PdfOpenOptions::default()
+            },
+        )?;
+        let mut writer = QPDFWriter::new(&mut source);
+        match transform {
+            "preserve-false" => writer.set_preserve_encryption(false),
+            "decode-generalized" => writer.set_decode_level(DecodeLevel::Generalized),
+            "qdf" => writer.set_qdf_mode(true),
+            _ => unreachable!(),
+        }
+        writer.set_output_memory()?;
+        writer.write()?;
+        let output = writer.get_buffer()?;
+        let rewritten = Pdf::open(Cursor::new(output))?;
+        assert!(
+            !rewritten.is_encrypted(),
+            "{transform} must disable preservation"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_explicit_encryption_takes_precedence_over_source_preservation() -> flpdf::Result<()>
+{
+    let mut source = Pdf::open_with_options(
+        BufReader::new(File::open(
+            "../../tests/fixtures/encrypted/v4-aes-128-r4.pdf",
+        )?),
+        PdfOpenOptions {
+            password: b"user-v4-aes".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    let mut writer = QPDFWriter::new(&mut source);
+    writer.set_encryption_parameters(EncryptParams::v4_aes128(
+        b"replacement-user".to_vec(),
+        b"replacement-owner".to_vec(),
+    ));
+    writer.set_static_aes_iv(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+
+    let rewritten = Pdf::open_with_options(
+        Cursor::new(output),
+        PdfOpenOptions {
+            password: b"replacement-user".to_vec(),
+            ..PdfOpenOptions::default()
+        },
+    )?;
+    assert!(rewritten.is_encrypted());
+    assert!(rewritten.user_password_matched());
+    Ok(())
+}
+
+#[test]
 fn qpdf_writer_copy_encryption_defaults_absent_encrypt_metadata_to_encrypted() -> flpdf::Result<()>
 {
     qpdf_11_9_0()?;

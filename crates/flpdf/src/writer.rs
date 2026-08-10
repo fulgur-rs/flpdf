@@ -543,20 +543,22 @@ pub struct WriteOptions {
     ///   QDF layout while their encrypted bytes remain ciphertext.
     pub encrypt: Option<crate::encrypt_setup::EncryptParams>,
 
-    /// Copy the `/Encrypt` dictionary verbatim from a donor PDF and re-use its
-    /// file encryption key (qpdf `--copy-encryption-from` equivalent).
+    /// Copy the authenticated encryption parameters from a donor PDF and
+    /// re-use its file encryption key (qpdf `--copy-encryption-from`
+    /// equivalent).
     ///
     /// When set the writer bypasses the normal password-derivation path and
     /// constructs an `EncryptionContext` directly from the pre-recovered file
-    /// key, the donor's `/Encrypt` dict, and the donor's `/ID[0]`.  The output
-    /// can therefore be decrypted with the donor's user and owner passwords.
+    /// key, the donor's Standard handler values, and the donor's `/ID[0]`.
+    /// qpdf's canonical copy rules are applied: V4 is emitted as AESV2 even
+    /// when the donor used RC4, and V5 is emitted as AESV3.
     ///
     /// Exactly one of `encrypt` and `copy_encryption` may be set; the CLI
     /// enforces mutual exclusion via `conflicts_with`.  The writer asserts this
     /// invariant at the top of the full-rewrite path.
     ///
-    /// **Scope:** Only V=4 AES-128 donors are currently supported; other schemes
-    /// are rejected by the CLI before this field is populated.
+    /// V=1/V=2 RC4, V=4 AESV2, and V=5 R=5/R=6 AESV3 donors are supported by
+    /// the full-rewrite writer. CLI donor validation is migrated separately.
     pub copy_encryption: Option<crate::encrypt_setup::CopyEncryptionSource>,
 }
 
@@ -705,11 +707,10 @@ pub fn effective_pdf_version<'a>(
 /// | V=4 R=4 RC4-128              | (1.5, 0)             |
 /// | V=2 R=3 RC4-128              | (1.4, 0)             |
 /// | V=1 R=2 RC4-40               | (1.3, 0)             |
-/// | `copy_encryption` (V=4 AES)  | (1.6, 0)             |
+/// | `copy_encryption`             | derived from copied V/R and AES mode |
 ///
-/// `copy_encryption` only supports V=4 AES-128 donors in the current release
-/// (see [`crate::encrypt_setup::CopyEncryptionSource`] docs), so the copy path
-/// returns the AES-128 floor unconditionally.
+/// qpdf's copy path forces AES for V>=4, so a copied V=4 source has the AESV2
+/// floor even when the donor used RC4.
 fn encryption_version_floor(options: &WriteOptions) -> Option<PdfVersion> {
     use crate::encrypt_setup::EncryptMethod;
     if let Some(ref enc) = options.encrypt {
@@ -722,8 +723,21 @@ fn encryption_version_floor(options: &WriteOptions) -> Option<PdfVersion> {
             EncryptMethod::V1Rc440 => PdfVersion::new(1, 3, 0),
         });
     }
-    if options.copy_encryption.is_some() {
-        return Some(PdfVersion::new(1, 6, 0));
+    if let Some(source) = options.copy_encryption.as_ref() {
+        let version = source.encrypt_dict.get("V")?.as_integer()?;
+        let revision = source.encrypt_dict.get("R")?.as_integer()?;
+        return Some(if version >= 5 || revision >= 6 {
+            PdfVersion::new(1, 7, 8)
+        } else if version >= 5 || revision >= 5 {
+            PdfVersion::new(1, 7, 3)
+        } else if version == 4 || revision >= 4 {
+            // copyEncryptionParameters forces AES for all V>=4.
+            PdfVersion::new(1, 6, 0)
+        } else if revision >= 3 || version == 2 {
+            PdfVersion::new(1, 4, 0)
+        } else {
+            PdfVersion::new(1, 3, 0)
+        });
     }
     None
 }
@@ -2303,9 +2317,11 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
 ///   ObjStm containers back into the regular sequence; they are simply skipped.
 ///   A dedicated "renumber + pack into ObjStm" pass is not yet implemented.
 ///
-/// - **Encrypted documents**: authenticated inputs are rewritten as plaintext
-///   by default; pass [`WriteOptions::encrypt`] to produce encrypted output
-///   instead (currently V=4 AES-128 only).
+/// - **Encrypted documents**: the legacy free-function API rewrites
+///   authenticated inputs as plaintext by default; pass
+///   [`WriteOptions::encrypt`] or [`WriteOptions::copy_encryption`] to
+///   produce encrypted output. [`crate::QPDFWriter`] follows qpdf and
+///   preserves authenticated source encryption by default.
 ///
 /// Returns [`crate::Error::Missing`] if the input has no `/Root`.
 mod _writer_doc_anchor {} // keeps the `write_pdf_full_rewrite` docstring above attached to its function.
@@ -2333,7 +2349,8 @@ pub(crate) enum WriteCipher {
 /// [`build_encryption_context`] or [`build_copy_encryption_context`] — at the
 /// top of [`write_pdf_full_rewrite`] for the full-rewrite path, or inside
 /// [`crate::linearization::writer::write_linearized`] for linearized output
-/// (`--encrypt` only; `--copy-encryption-from` is not yet supported there) —
+/// (`--encrypt` only; donor-copy/automatic source preservation are not yet
+/// supported there) —
 /// and consumed by the per-object emission loop + the trailer-build step.
 pub(crate) struct EncryptionContext {
     /// Built `/Encrypt` dictionary (from a 4.1/4.2/4.3 builder).
@@ -2579,27 +2596,22 @@ fn generate_v5r6_secrets(
 }
 
 /// Build an [`EncryptionContext`] from a donor [`crate::CopyEncryptionSource`]
-/// (the `--copy-encryption-from` path).
+/// (the `--copy-encryption-from` path or QPDFWriter's source-preservation
+/// path).
 ///
-/// Unlike [`build_encryption_context`], this function does **not** derive a
-/// file key from passwords: it takes the donor's already-recovered file key
-/// verbatim, copies the donor's `/Encrypt` dictionary wholesale, and pins
-/// `/ID[0]` to the donor's permanent identifier.  The output can then be
-/// decrypted with the donor's original user or owner password because all the
-/// ingredients of Algorithm 2 (key-length, `/O`, `/P`, `/ID[0]`) are
-/// reproduced exactly.
+/// qpdf does not copy the donor dictionary byte-for-byte. It passes the
+/// authenticated donor values through `setEncryptionParametersInternal`:
+/// V<4 remains RC4, V4 is always rewritten to AESV2, and V5 is rewritten to
+/// AESV3 while retaining the donor's recovered file key. Rebuild the same
+/// canonical dictionary here so a V4 RC4 donor has the same observable result
+/// as qpdf's copy path.
 pub(crate) fn build_copy_encryption_context(
     src: &crate::encrypt_setup::CopyEncryptionSource,
     options: &WriteOptions,
     existing_max: u32,
     metadata_ref: Option<ObjectRef>,
 ) -> Result<EncryptionContext> {
-    if src.file_key.len() != 16 {
-        return Err(crate::Error::Unsupported(format!(
-            "copy-encryption V=4 AES-128 file key must be 16 bytes; got {}",
-            src.file_key.len()
-        )));
-    }
+    let (encrypt_dict, encryption_v, encryption_r, cipher) = canonical_copy_encryption(src)?;
 
     let encrypt_num = existing_max.checked_add(1).ok_or_else(|| {
         crate::Error::Unsupported(
@@ -2607,16 +2619,14 @@ pub(crate) fn build_copy_encryption_context(
         )
     })?;
 
-    let encrypt_metadata = copy_encryption_encrypts_metadata(src);
+    let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&encrypt_dict);
 
     Ok(EncryptionContext {
-        encrypt_dict: src.encrypt_dict.clone(),
+        encrypt_dict,
         file_key: src.file_key.clone(),
-        // --copy-encryption-from only supports V=4 AES-128 donors today, so the
-        // donor's per-object key alg maps straight onto the per-object cipher.
-        cipher: WriteCipher::PerObject(src.object_key_alg),
-        encryption_v: 4,
-        encryption_r: 4,
+        cipher,
+        encryption_v,
+        encryption_r,
         encrypt_ref: ObjectRef::new(encrypt_num, 0),
         id0: src.id0.clone(),
         static_aes_iv: options.static_aes_iv,
@@ -2625,12 +2635,134 @@ pub(crate) fn build_copy_encryption_context(
     })
 }
 
+/// Rebuild the dictionary qpdf emits from `copyEncryptionParameters` and
+/// select the corresponding object-key cipher.
+fn canonical_copy_encryption(
+    src: &crate::encrypt_setup::CopyEncryptionSource,
+) -> Result<(Dictionary, i32, i32, WriteCipher)> {
+    use crate::security::standard::ObjectKeyAlg;
+
+    let version = copy_integer(&src.encrypt_dict, "V")?;
+    let revision = copy_integer(&src.encrypt_dict, "R")?;
+    let version_i32 = i32::try_from(version).map_err(|_| {
+        crate::Error::Unsupported(format!("copy-encryption /V is out of range: {version}"))
+    })?;
+    let revision_i32 = i32::try_from(revision).map_err(|_| {
+        crate::Error::Unsupported(format!("copy-encryption /R is out of range: {revision}"))
+    })?;
+    let length_bits = if version == 1 {
+        40
+    } else {
+        copy_integer(&src.encrypt_dict, "Length")?
+    };
+    if !(40..=256).contains(&length_bits) || length_bits % 8 != 0 {
+        return Err(crate::Error::Unsupported(format!(
+            "copy-encryption /Length is invalid: {length_bits} bits"
+        )));
+    }
+
+    let expected_key_len = if version >= 5 {
+        if version != 5 || !matches!(revision, 5 | 6) || length_bits != 256 {
+            return Err(crate::Error::Unsupported(format!(
+                "unsupported copy-encryption Standard handler V={version} R={revision} Length={length_bits}"
+            )));
+        }
+        32
+    } else {
+        if !matches!(version, 1 | 2 | 4)
+            || (version == 1 && revision != 2)
+            || (version == 2 && !matches!(revision, 2 | 3))
+            || (version == 4 && revision != 4)
+        {
+            return Err(crate::Error::Unsupported(format!(
+                "unsupported copy-encryption Standard handler V={version} R={revision}"
+            )));
+        }
+        usize::try_from(length_bits / 8).map_err(|_| {
+            crate::Error::Unsupported("copy-encryption key length overflows usize".into())
+        })?
+    };
+    if src.file_key.len() != expected_key_len {
+        return Err(crate::Error::Unsupported(format!(
+            "copy-encryption V={version} R={revision} file key must be {expected_key_len} bytes; got {}",
+            src.file_key.len()
+        )));
+    }
+
+    let p = copy_integer(&src.encrypt_dict, "P")?;
+    let o = copy_string(&src.encrypt_dict, "O")?;
+    let u = copy_string(&src.encrypt_dict, "U")?;
+    let encrypt_metadata = copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict);
+
+    let mut dict = Dictionary::new();
+    dict.insert("Filter", Object::Name(b"Standard".to_vec()));
+    dict.insert("V", Object::Integer(version));
+    dict.insert("Length", Object::Integer(length_bits));
+    dict.insert("R", Object::Integer(revision));
+    dict.insert("P", Object::Integer(p));
+    dict.insert("O", Object::String(o));
+    dict.insert("U", Object::String(u));
+
+    let cipher = if version >= 5 {
+        let oe = copy_string(&src.encrypt_dict, "OE")?;
+        let ue = copy_string(&src.encrypt_dict, "UE")?;
+        let perms = copy_string(&src.encrypt_dict, "Perms")?;
+        dict.insert("OE", Object::String(oe));
+        dict.insert("UE", Object::String(ue));
+        dict.insert("Perms", Object::String(perms));
+        insert_standard_crypt_filter(&mut dict, b"AESV3", 32);
+        WriteCipher::FileKeyAes256
+    } else if version == 4 {
+        // QPDFWriter::copyEncryptionParameters explicitly enables AES for all
+        // V>=4 donors, even when the source /CFM was /V2.
+        insert_standard_crypt_filter(&mut dict, b"AESV2", 16);
+        WriteCipher::PerObject(ObjectKeyAlg::Aes)
+    } else {
+        WriteCipher::PerObject(ObjectKeyAlg::Rc4)
+    };
+
+    if revision >= 4 && !encrypt_metadata {
+        dict.insert("EncryptMetadata", Object::Boolean(false));
+    }
+    Ok((dict, version_i32, revision_i32, cipher))
+}
+
+fn copy_integer(dict: &Dictionary, key: &str) -> Result<i64> {
+    dict.get(key).and_then(Object::as_integer).ok_or_else(|| {
+        crate::Error::Unsupported(format!("copy-encryption /{key} must be an integer"))
+    })
+}
+
+fn copy_string(dict: &Dictionary, key: &str) -> Result<Vec<u8>> {
+    dict.get(key)
+        .and_then(Object::as_string)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            crate::Error::Unsupported(format!("copy-encryption /{key} must be a string"))
+        })
+}
+
+fn insert_standard_crypt_filter(dict: &mut Dictionary, cfm: &[u8], length: i64) {
+    let mut std_cf = Dictionary::new();
+    std_cf.insert("AuthEvent", Object::Name(b"DocOpen".to_vec()));
+    std_cf.insert("CFM", Object::Name(cfm.to_vec()));
+    std_cf.insert("Length", Object::Integer(length));
+    let mut cf = Dictionary::new();
+    cf.insert("StdCF", Object::Dictionary(std_cf));
+    dict.insert("CF", Object::Dictionary(cf));
+    dict.insert("StmF", Object::Name(b"StdCF".to_vec()));
+    dict.insert("StrF", Object::Name(b"StdCF".to_vec()));
+}
+
 /// Return the donor's metadata-encryption policy using qpdf's default. qpdf
 /// only changes its default when `/EncryptMetadata` is present and boolean;
 /// an absent or otherwise unusable entry means metadata remains encrypted.
 fn copy_encryption_encrypts_metadata(src: &crate::encrypt_setup::CopyEncryptionSource) -> bool {
-    src.encrypt_dict
-        .get("EncryptMetadata")
+    copy_encryption_encrypts_metadata_from_dict(&src.encrypt_dict)
+}
+
+fn copy_encryption_encrypts_metadata_from_dict(dict: &Dictionary) -> bool {
+    dict.get("EncryptMetadata")
         .and_then(Object::as_bool)
         .unwrap_or(true)
 }
@@ -3479,12 +3611,7 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // object-stream planning: encrypted output keeps the Catalog plain, while
     // linearized output also keeps page dictionaries plain. This legacy route
     // does not produce linearized output, so only output encryption applies.
-    object_streams::filter_objstm_batches_for_output(
-        pdf,
-        &mut plan.batches,
-        false,
-        options.encrypt.is_some(),
-    )?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
+    object_streams::filter_objstm_batches_for_output(pdf, &mut plan.batches, false, encrypting)?; // cov:ignore: legacy route validates /Root above and disables page traversal, so this helper cannot fail here
 
     // Xref form selection: ObjStm-resident objects need type-2 xref entries,
     // which can only live in xref streams.  When the planner emits any batch
@@ -3541,24 +3668,19 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // to 1.7.  For a classic-table source with no ObjStm batches the bump does
     // not fire at all, making this floor the only mechanism that prevents e.g.
     // a 1.4 input encrypted as V=4 from emitting a spec-violating 1.4 header.
-    // /V 1 (R=2) ⇒ 1.1, /V 2 ⇒ 1.4, /V 4 ⇒ 1.5, /V 5 ⇒ 1.7.
+    // /V 1 (R=2) ⇒ 1.3, /V 2/R=3 ⇒ 1.4, /V 4/R=4 ⇒ 1.5 or 1.6
+    // depending on the crypt filter, /V 5 ⇒ 1.7.
     if let Some(params) = options.encrypt.as_ref() {
         use crate::encrypt_setup::EncryptMethod;
         let floor = match params.method {
-            EncryptMethod::V1Rc440 => PdfVersion::new(1, 1, 0),
+            EncryptMethod::V1Rc440 => PdfVersion::new(1, 3, 0),
             EncryptMethod::V2Rc4128 => PdfVersion::new(1, 4, 0),
-            EncryptMethod::V4Aes128 | EncryptMethod::V4Rc4128 => PDF_1_5,
+            EncryptMethod::V4Aes128 => PdfVersion::new(1, 6, 0),
+            EncryptMethod::V4Rc4128 => PDF_1_5,
             EncryptMethod::V5R6Aes256 | EncryptMethod::V5R5Aes256 => PdfVersion::new(1, 7, 0),
         };
         if parse_pdf_version(&version).is_none_or(|current| current < floor) {
             version = floor.get_version().0;
-        }
-    } else if options.copy_encryption.is_some() {
-        // --copy-encryption-from only supports V=4 AES-128 donors today, which
-        // carry /V 4 and therefore require the same >= 1.5 header floor as the
-        // --encrypt V=4 path. (encrypt / copy_encryption are mutually exclusive.)
-        if parse_pdf_version(&version).is_none_or(|current| current < PDF_1_5) {
-            version = "1.5".to_string();
         }
     }
 

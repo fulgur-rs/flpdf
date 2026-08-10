@@ -687,8 +687,12 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
         options.qdf = qdf;
         options.static_id = true;
         options.static_aes_iv = true;
+        let mut encrypt_dict = Dictionary::new();
+        encrypt_dict.insert("V", Object::Integer(4));
+        encrypt_dict.insert("R", Object::Integer(4));
+        encrypt_dict.insert("Length", Object::Integer(128));
         options.copy_encryption = Some(CopyEncryptionSource {
-            encrypt_dict: Dictionary::new(),
+            encrypt_dict,
             file_key: vec![0x31; 15],
             id0: b"0123456789abcdef".to_vec(),
             object_key_alg: ObjectKeyAlg::Aes,
@@ -700,7 +704,7 @@ fn copy_encryption_rejects_short_public_file_key_in_compact_and_qdf() {
             error,
             flpdf::Error::Unsupported(message)
                 if message
-                    == "copy-encryption V=4 AES-128 file key must be 16 bytes; got 15"
+                    == "copy-encryption V=4 R=4 file key must be 16 bytes; got 15"
         ));
         assert!(
             output.is_empty(),

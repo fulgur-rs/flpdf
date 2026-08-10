@@ -7,6 +7,7 @@ use self::file_object::{
     PendingFileObject, RecoveryPolicy, ResolvedStreamLength,
 };
 use crate::cache::CacheEntry;
+use crate::encrypt_setup::CopyEncryptionSource;
 use crate::error::EncryptedError;
 use crate::object::collect_qpdf_object_references;
 use crate::object_handle::ObjectValue;
@@ -22,8 +23,8 @@ use crate::security::password::{normalize_password, PasswordMode};
 use crate::security::standard::{
     check_owner_password, check_owner_password_r5, check_owner_password_r6,
     check_owner_password_v4, check_user_password, check_user_password_r5, check_user_password_r6,
-    check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, StandardHandlerInputs,
-    StandardHandlerR5Inputs, StringCipher,
+    check_user_password_v4, decrypt_cipher_bytes, decrypt_strings_in_object, ObjectKeyAlg,
+    StandardHandlerInputs, StandardHandlerR5Inputs, StringCipher,
 };
 use crate::tokenizer::Tokenizer;
 use crate::{
@@ -580,6 +581,42 @@ impl<R: Read + Seek> Pdf<R> {
             .borrow()
             .as_ref()
             .map(|encryption| encryption.file_key.clone())
+    }
+
+    /// Build the qpdf `copyEncryptionParameters` source for a writer attached
+    /// to this already-authenticated document.
+    ///
+    /// The writer must not depend on reader implementation details such as
+    /// `EncryptionState` or `EncryptionMode`. Keep that boundary here: the
+    /// helper snapshots the authenticated file key, the source `/Encrypt`
+    /// dictionary, and the permanent `/ID[0]`; the writer then applies qpdf's
+    /// canonical copy rules (including forcing AES for V>=4).
+    pub(crate) fn writer_copy_encryption_source(&mut self) -> Result<Option<CopyEncryptionSource>> {
+        let (file_key, encryption_v) = {
+            let guard = self.encryption.borrow();
+            let Some(encryption) = guard.as_ref() else {
+                return Ok(None);
+            };
+            (encryption.file_key.clone(), encryption.encryption_v)
+        };
+        let encrypt_dict = self.encrypt_dictionary()?.ok_or_else(|| {
+            Error::Unsupported("authenticated input has no /Encrypt dictionary".into())
+        })?;
+        let id0 = first_file_id(self.trailer())?.to_vec();
+
+        Ok(Some(CopyEncryptionSource {
+            encrypt_dict,
+            file_key,
+            id0,
+            // qpdf's copy path forces AES for V>=4. The field remains part of
+            // the public donor surface for the explicit copy route; the
+            // canonical builder also validates/chooses from /V itself.
+            object_key_alg: if encryption_v >= 4 {
+                ObjectKeyAlg::Aes
+            } else {
+                ObjectKeyAlg::Rc4
+            },
+        }))
     }
 
     /// Read-only snapshot of the `/Encrypt` parameters for the

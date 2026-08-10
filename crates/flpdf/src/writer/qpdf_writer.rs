@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::encrypt_setup::{CopyEncryptionSource, EncryptParams};
 use crate::pipeline::Pipeline;
-use crate::{Error, ObjectRef, Pdf, Result, XrefEntry};
+use crate::{Error, ObjectRef, Pdf, Result, WriteOptions, XrefEntry};
 
 use super::settings::{DecodeLevel, WriterSettings};
 use super::{
@@ -276,8 +276,7 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
 
     /// Return the effective header version before writing.
     pub fn get_final_version(&mut self) -> Result<String> {
-        let options = self.settings.to_write_options();
-        // The exact qpdf output-plan floor for preserve mode is a later task.
+        let options = self.prepared_write_options()?;
         Ok(effective_pdf_version(
             self.pdf.version(),
             &options,
@@ -304,9 +303,8 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             ));
         }
         self.validate_supported_settings()?;
+        let options = self.prepared_write_options()?;
         self.write_started = true;
-
-        let options = self.settings.to_write_options();
         let mut bytes = Vec::new();
         let result = write_pdf_full_rewrite(self.pdf, &mut bytes, &options)?;
 
@@ -364,17 +362,37 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
             )));
         }
 
-        if self.pdf.is_encrypted()
-            && self.settings.preserve_encryption
-            && self.settings.encryption_parameters.is_none()
-            && self.settings.copy_encryption.is_none()
-        {
-            return Err(Error::Unsupported(
-                "preserving encryption for encrypted input is temporarily not implemented by QPDFWriter".into(),
-            ));
+        Ok(())
+    }
+
+    /// Translate the qpdf-shaped settings into the one immutable option set
+    /// consumed by the full-rewrite emitter.
+    ///
+    /// qpdf performs this part of setup after all public setters have run:
+    /// explicit encryption/copy parameters win over preservation; qdf,
+    /// content normalization, non-none decoding, and PCLm disable source
+    /// preservation; and a forced header version can disable an otherwise
+    /// valid encryption scheme. Keeping the preparation in one method makes
+    /// `get_final_version` and `write` observe the same plan.
+    fn prepared_write_options(&mut self) -> Result<WriteOptions> {
+        let mut options = self.settings.to_write_options();
+        let can_preserve = self.settings.preserve_encryption
+            && self.pdf.is_encrypted()
+            && options.encrypt.is_none()
+            && options.copy_encryption.is_none()
+            && !options.qdf
+            && !options.content_normalization
+            && options.decode_level == DecodeLevel::None
+            && !self.settings.pclm;
+        if can_preserve {
+            options.copy_encryption = self.pdf.writer_copy_encryption_source()?;
         }
 
-        Ok(())
+        if forced_version_disables_encryption(&options) {
+            options.encrypt = None;
+            options.copy_encryption = None;
+        }
+        Ok(options)
     }
 
     fn ensure_write_succeeded(&self) -> Result<()> {
@@ -394,4 +412,60 @@ fn validate_pdf_version(version: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// qpdf `QPDFWriter::disableIncompatibleEncryption` for the writer options
+/// that have reached this bridge. A valid forced version is a hard cap: when
+/// it cannot represent the selected Standard security handler, qpdf silently
+/// drops encryption and writes the rewritten objects in cleartext.
+fn forced_version_disables_encryption(options: &WriteOptions) -> bool {
+    let Some(forced) = options
+        .force_version
+        .as_deref()
+        .and_then(crate::pdf_version::parse_pdf_version)
+    else {
+        return false;
+    };
+
+    let Some((version, revision, use_aes)) = encryption_shape(options) else {
+        return false;
+    };
+
+    let v = crate::pdf_version::PdfVersion::new(1, 3, 0);
+    if forced < v {
+        return true;
+    }
+    let v = crate::pdf_version::PdfVersion::new(1, 4, 0);
+    if forced < v && (version > 1 || revision > 2) {
+        return true;
+    }
+    let v = crate::pdf_version::PdfVersion::new(1, 5, 0);
+    if forced < v && (version > 2 || revision > 3) {
+        return true;
+    }
+    let v = crate::pdf_version::PdfVersion::new(1, 6, 0);
+    if forced < v && use_aes {
+        return true;
+    }
+    let v = crate::pdf_version::PdfVersion::new(1, 7, 0);
+    forced <= v && (version >= 5 || revision >= 5)
+}
+
+fn encryption_shape(options: &WriteOptions) -> Option<(i64, i64, bool)> {
+    if let Some(params) = options.encrypt.as_ref() {
+        use crate::encrypt_setup::EncryptMethod;
+        return Some(match params.method {
+            EncryptMethod::V1Rc440 => (1, 2, false),
+            EncryptMethod::V2Rc4128 => (2, 3, false),
+            EncryptMethod::V4Rc4128 => (4, 4, false),
+            EncryptMethod::V4Aes128 => (4, 4, true),
+            EncryptMethod::V5R5Aes256 => (5, 5, true),
+            EncryptMethod::V5R6Aes256 => (5, 6, true),
+        });
+    }
+
+    let source = options.copy_encryption.as_ref()?;
+    let version = source.encrypt_dict.get("V")?.as_integer()?;
+    let revision = source.encrypt_dict.get("R")?.as_integer()?;
+    Some((version, revision, version >= 4))
 }
