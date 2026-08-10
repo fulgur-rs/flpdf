@@ -4598,30 +4598,57 @@ pub(crate) mod tests {
 
     #[test]
     fn dct_stage_preserves_codec_error_and_does_not_finish_downstream() {
-        let jpeg = test_jpeg();
-        let truncated = &jpeg[..jpeg.len() / 2];
-        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
-        assert!(filter.set_decode_params(&DecodeParams::Absent));
-        let mut sink = DctSink::default();
-        let error = {
-            let mut stage = filter
-                .decode_pipeline(&mut sink)
-                .expect("DCT stage construction must succeed")
-                .expect("DCT filter must contribute a decode stage");
-            stage
-                .write(truncated)
-                .expect("DCT stage buffers truncated input");
-            stage
-                .finish()
-                .expect_err("truncated JPEG must fail at finish")
-        };
+        {
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            let error = {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage
+                    .write(b"not a jpeg")
+                    .expect("DCT stage buffers malformed input");
+                stage
+                    .finish()
+                    .expect_err("malformed JPEG must fail at finish")
+            };
 
-        assert!(matches!(error, PipelineError::Runtime(_)));
-        assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
-        assert!(sink.writes.is_empty());
-        assert_eq!(sink.write_attempts, 0);
-        assert_eq!(sink.finishes, 0);
-        assert_eq!(sink.finish_attempts, 0);
+            assert!(matches!(error, PipelineError::Runtime(_)));
+            assert_eq!(error.to_string(), "DCT decode: unexpected marker: 0xFF6F");
+            assert!(sink.writes.is_empty());
+            assert_eq!(sink.write_attempts, 0);
+            assert_eq!(sink.finishes, 0);
+            assert_eq!(sink.finish_attempts, 0);
+        }
+
+        {
+            let jpeg = test_jpeg();
+            let truncated = &jpeg[..jpeg.len() / 2];
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            let error = {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage
+                    .write(truncated)
+                    .expect("DCT stage buffers truncated input");
+                stage
+                    .finish()
+                    .expect_err("truncated JPEG must fail at finish")
+            };
+
+            assert!(matches!(error, PipelineError::Runtime(_)));
+            assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
+            assert!(sink.writes.is_empty());
+            assert_eq!(sink.write_attempts, 0);
+            assert_eq!(sink.finishes, 0);
+            assert_eq!(sink.finish_attempts, 0);
+        }
     }
 
     #[test]
