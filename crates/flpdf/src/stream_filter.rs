@@ -2223,8 +2223,8 @@ pub(crate) mod tests {
         decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
         ignore_warning, keeps_crypt_name_payload, normalize_filter_name, stream_filter_for,
         Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter, DecodeParams, FilterSpec,
-        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline,
-        RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline, PipelineError,
+        PipelineResult, RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
         RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
@@ -2237,6 +2237,51 @@ pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
     use std::io::Cursor;
     use std::rc::Rc;
+
+    fn test_jpeg() -> Vec<u8> {
+        let pixels = [0u8, 32, 64, 96, 128, 160, 192, 224, 255, 240, 120, 8];
+        libjpeg_turbo_rs::compress(
+            &pixels,
+            2,
+            2,
+            libjpeg_turbo_rs::PixelFormat::Rgb,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("test JPEG must encode")
+    }
+
+    #[derive(Default)]
+    struct DctSink {
+        writes: Vec<Vec<u8>>,
+        finishes: usize,
+        fail_write: bool,
+        fail_finish: bool,
+    }
+
+    impl Pipeline for DctSink {
+        fn identifier(&self) -> &str {
+            "dct test sink"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            if self.fail_write {
+                Err(PipelineError::runtime("dct test write failure"))
+            } else {
+                self.writes.push(data.to_vec());
+                Ok(())
+            }
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            if self.fail_finish {
+                Err(PipelineError::runtime("dct test finish failure"))
+            } else {
+                self.finishes += 1;
+                Ok(())
+            }
+        }
+    }
 
     #[test]
     fn run_length_encoder_uses_qpdf_two_byte_run() {
@@ -4433,6 +4478,168 @@ pub(crate) mod tests {
         ] {
             assert!(stream_filter_for(name).is_some(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn dct_factory_is_registered_and_classified() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        assert!(filter.is_specialized_compression());
+        assert!(filter.is_lossy_compression());
+
+        let mut sink = DctSink::default();
+        assert!(filter
+            .decode_pipeline(&mut sink)
+            .expect("DCT stage construction must succeed")
+            .is_some());
+    }
+
+    #[test]
+    fn dct_factory_accepts_only_absent_decode_params() {
+        let mut absent = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(absent.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        assert!(absent
+            .decode_pipeline(&mut sink)
+            .expect("DCT stage construction must succeed")
+            .is_some());
+
+        let mut present = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(!present.set_decode_params(&DecodeParams::Present(Vec::new())));
+    }
+
+    #[test]
+    fn dct_stage_decodes_chunked_input_one_scanline_per_write() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+
+        {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            for chunk in jpeg.chunks(5) {
+                stage.write(chunk).expect("chunked JPEG write must succeed");
+            }
+            stage.finish().expect("JPEG finish must succeed");
+        }
+
+        assert_eq!(sink.writes.len(), 2, "one downstream write per scanline");
+        assert!(sink.writes.iter().all(|write| write.len() == 6));
+        assert_eq!(
+            sink.writes,
+            vec![
+                vec![0, 52, 132, 113, 99, 90],
+                vec![210, 196, 187, 255, 139, 34],
+            ]
+        );
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
+    fn dct_stage_empty_and_repeated_finish_forward_finish() {
+        let mut empty_filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(empty_filter.set_decode_params(&DecodeParams::Absent));
+        let mut empty_sink = DctSink::default();
+        {
+            let mut stage = empty_filter
+                .decode_pipeline(&mut empty_sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.finish().expect("empty JPEG finish must succeed");
+        }
+        assert!(empty_sink.writes.is_empty());
+        assert_eq!(empty_sink.finishes, 1);
+
+        let mut repeated_filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(repeated_filter.set_decode_params(&DecodeParams::Absent));
+        let mut repeated_sink = DctSink::default();
+        {
+            let mut stage = repeated_filter
+                .decode_pipeline(&mut repeated_sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.finish().expect("first finish must succeed");
+            stage.finish().expect("repeated finish must succeed");
+        }
+        assert!(repeated_sink.writes.is_empty());
+        assert_eq!(repeated_sink.finishes, 2);
+    }
+
+    #[test]
+    fn dct_stage_preserves_codec_error_and_does_not_finish_downstream() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(b"not a jpeg").expect("DCT stage buffers input");
+            stage
+                .finish()
+                .expect_err("malformed JPEG must fail at finish")
+        };
+
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.to_string(), "DCT decode: unexpected marker: 0xFF6F");
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finishes, 0);
+    }
+
+    #[test]
+    fn dct_stage_preserves_downstream_write_error() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink {
+            fail_write: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(&jpeg).expect("DCT stage buffers input");
+            stage
+                .finish()
+                .expect_err("downstream write failure must be returned")
+        };
+
+        assert_eq!(error.to_string(), "dct test write failure");
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finishes, 0);
+    }
+
+    #[test]
+    fn dct_stage_preserves_downstream_finish_error() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink {
+            fail_finish: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(&jpeg).expect("JPEG write must succeed");
+            stage
+                .finish()
+                .expect_err("downstream finish failure must be returned")
+        };
+
+        assert_eq!(error.to_string(), "dct test finish failure");
+        assert_eq!(sink.writes.len(), 2);
+        assert!(sink.writes.iter().all(|write| write.len() == 6));
+        assert_eq!(sink.finishes, 0);
     }
 
     /// qpdf's `filter_factories` (`QPDF_Stream.cc:85-94`) holds `/Crypt`
