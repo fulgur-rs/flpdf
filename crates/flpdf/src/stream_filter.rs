@@ -2274,7 +2274,7 @@ pub(crate) mod tests {
     use std::env;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::rc::Rc;
 
@@ -2372,14 +2372,281 @@ pub(crate) mod tests {
             .join(" ")
     }
 
+    #[test]
+    fn qpdf_candidates_select_explicit_override_without_environment() {
+        let override_path = Path::new("/tmp/qpdf-override");
+        assert_eq!(
+            qpdf_candidates_for(Some(override_path)),
+            vec![override_path.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn qpdf_candidates_ignore_empty_override_and_use_default_order() {
+        let candidates = qpdf_candidates_for(Some(Path::new("")));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from(PINNED_QPDF_BINARY), PathBuf::from("qpdf")]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(candidates, vec![PathBuf::from("qpdf")]);
+    }
+
+    #[test]
+    fn qpdf_candidates_use_pinned_linux_then_path_without_override() {
+        let candidates = qpdf_candidates_for(None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from(PINNED_QPDF_BINARY), PathBuf::from("qpdf")]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(candidates, vec![PathBuf::from("qpdf")]);
+    }
+
+    #[test]
+    fn qpdf_version_not_found_tries_the_next_candidate() {
+        assert_eq!(
+            classify_qpdf_version(Path::new("/usr/bin/qpdf"), true, QpdfVersionProbe::NotFound,),
+            QpdfVersionDecision::TryNext
+        );
+    }
+
+    #[test]
+    fn qpdf_version_not_found_reports_skip_for_the_last_candidate() {
+        assert_eq!(
+            classify_qpdf_version(Path::new("qpdf"), false, QpdfVersionProbe::NotFound,),
+            QpdfVersionDecision::Skip(
+                "qpdf unavailable; skipping DCT differential for qpdf version 11.9.0".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_launch_failure_is_not_a_skip() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::LaunchError("permission denied".to_owned()),
+            ),
+            QpdfVersionDecision::Fail(
+                "failed to invoke /bad/qpdf --version for qpdf version 11.9.0: permission denied"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_status_failure_preserves_diagnostic_fields() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: false,
+                    status: "exit status: 1".to_owned(),
+                    stdout: b"bad".to_vec(),
+                    stderr: b"diagnostic\n".to_vec(),
+                },
+            ),
+            QpdfVersionDecision::Fail(
+                "/bad/qpdf --version failed while checking qpdf version 11.9.0: status=exit status: 1\nstdout length=3 hex=62 61 64\nstderr length=11 hex=64 69 61 67 6e 6f 73 74 69 63 0a text=\"diagnostic\\n\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_stderr_failure_preserves_diagnostic_fields() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"qpdf version 11.9.0\n".to_vec(),
+                    stderr: b"noise\n".to_vec(),
+                },
+            ),
+            QpdfVersionDecision::Fail(
+                "/bad/qpdf --version wrote stderr while checking qpdf version 11.9.0: length=6 hex=6e 6f 69 73 65 0a text=\"noise\\n\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_mismatch_preserves_stdout_diagnostic() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"qpdf version 12.0.0\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            ),
+            QpdfVersionDecision::Fail(
+                "/bad/qpdf reported an unexpected qpdf version; expected qpdf version 11.9.0, stdout length=20 hex=71 70 64 66 20 76 65 72 73 69 6f 6e 20 31 32 2e 30 2e 30 0a text=\"qpdf version 12.0.0\\n\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_accepts_pinned_first_line_and_ignores_qpdf_footer() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/usr/bin/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"qpdf version 11.9.0\nRun qpdf --copyright for details.\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            ),
+            QpdfVersionDecision::Select
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_falls_back_after_not_found_and_selects_next_candidate() {
+        let candidates = vec![PathBuf::from("/usr/bin/qpdf"), PathBuf::from("qpdf")];
+        let mut probes = vec![
+            QpdfVersionProbe::NotFound,
+            QpdfVersionProbe::Output {
+                status_success: true,
+                status: "exit status: 0".to_owned(),
+                stdout: b"qpdf version 11.9.0\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        ]
+        .into_iter();
+        assert_eq!(
+            resolve_qpdf_candidates(&candidates, |_| probes.next().expect("probe fixture")),
+            QpdfResolution::Selected(PathBuf::from("qpdf"))
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_returns_skip_for_final_not_found() {
+        let candidates = vec![PathBuf::from("qpdf")];
+        assert_eq!(
+            resolve_qpdf_candidates(&candidates, |_| QpdfVersionProbe::NotFound),
+            QpdfResolution::Skip(
+                "qpdf unavailable; skipping DCT differential for qpdf version 11.9.0".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_returns_failure_without_fallback() {
+        let candidates = vec![PathBuf::from("qpdf"), PathBuf::from("other-qpdf")];
+        assert_eq!(
+            resolve_qpdf_candidates(&candidates, |_| {
+                QpdfVersionProbe::LaunchError("permission denied".to_owned())
+            }),
+            QpdfResolution::Fail(
+                "failed to invoke qpdf --version for qpdf version 11.9.0: permission denied"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_reports_empty_candidate_list() {
+        assert_eq!(
+            resolve_qpdf_candidates(&[], |_| QpdfVersionProbe::NotFound),
+            QpdfResolution::NoCandidate
+        );
+    }
+
+    #[test]
+    fn qpdf_version_probe_reports_missing_binary_without_fixture_side_effects() {
+        assert_eq!(
+            qpdf_version_probe(Path::new(
+                "/this/path/does/not/exist/flpdf-qpdf-missing-binary",
+            )),
+            QpdfVersionProbe::NotFound
+        );
+    }
+
+    #[test]
+    fn qpdf_version_probe_reports_command_input_failure() {
+        let probe = qpdf_version_probe(Path::new("qpdf\0"));
+        assert!(matches!(probe, QpdfVersionProbe::LaunchError(message) if !message.is_empty()));
+    }
+
+    #[test]
+    fn qpdf_resolution_selected_returns_the_binary_path() {
+        assert_eq!(
+            qpdf_resolution_to_option(QpdfResolution::Selected(PathBuf::from("qpdf"))),
+            Some(PathBuf::from("qpdf"))
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_skip_returns_none_after_diagnostic() {
+        assert_eq!(
+            qpdf_resolution_to_option(QpdfResolution::Skip("missing qpdf".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "version mismatch")]
+    fn qpdf_resolution_failure_panics_after_diagnostic() {
+        qpdf_resolution_to_option(QpdfResolution::Fail("version mismatch".to_owned()));
+    }
+
+    #[test]
+    #[should_panic(expected = "candidate list must not be empty")]
+    fn qpdf_resolution_empty_candidate_result_panics() {
+        qpdf_resolution_to_option(QpdfResolution::NoCandidate);
+    }
+
     const FLPDF_QPDF_BIN: &str = "FLPDF_QPDF_BIN";
     const PINNED_QPDF_BINARY: &str = "/usr/bin/qpdf";
     const PINNED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 
-    fn qpdf_candidates() -> Vec<PathBuf> {
-        if let Some(path) = env::var_os(FLPDF_QPDF_BIN) {
-            if !path.is_empty() {
-                return vec![PathBuf::from(path)];
+    #[derive(Debug, PartialEq, Eq)]
+    enum QpdfVersionProbe {
+        NotFound,
+        LaunchError(String),
+        Output {
+            status_success: bool,
+            status: String,
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum QpdfVersionDecision {
+        TryNext,
+        Skip(String),
+        Fail(String),
+        Select,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum QpdfResolution {
+        Selected(PathBuf),
+        Skip(String),
+        Fail(String),
+        NoCandidate,
+    }
+
+    fn qpdf_candidates_for(override_path: Option<&Path>) -> Vec<PathBuf> {
+        if let Some(path) = override_path {
+            if !path.as_os_str().is_empty() {
+                return vec![path.to_path_buf()];
             }
         }
 
@@ -2390,58 +2657,115 @@ pub(crate) mod tests {
         candidates
     }
 
+    fn qpdf_candidates() -> Vec<PathBuf> {
+        let override_path = env::var_os(FLPDF_QPDF_BIN);
+        qpdf_candidates_for(override_path.as_deref().map(Path::new))
+    }
+
+    fn classify_qpdf_version(
+        candidate: &Path,
+        has_next_candidate: bool,
+        probe: QpdfVersionProbe,
+    ) -> QpdfVersionDecision {
+        let candidate_display = candidate.display().to_string();
+        match probe {
+            QpdfVersionProbe::NotFound => {
+                if has_next_candidate {
+                    QpdfVersionDecision::TryNext
+                } else {
+                    QpdfVersionDecision::Skip(format!(
+                        "{candidate_display} unavailable; skipping DCT differential for {PINNED_QPDF_VERSION}"
+                    ))
+                }
+            }
+            QpdfVersionProbe::LaunchError(error) => QpdfVersionDecision::Fail(format!(
+                "failed to invoke {candidate_display} --version for {PINNED_QPDF_VERSION}: {error}"
+            )),
+            QpdfVersionProbe::Output {
+                status_success,
+                status,
+                stdout,
+                stderr,
+            } => {
+                if !status_success {
+                    return QpdfVersionDecision::Fail(format!(
+                        "{candidate_display} --version failed while checking {PINNED_QPDF_VERSION}: status={status}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+                        stdout.len(),
+                        hex_bytes(&stdout),
+                        stderr.len(),
+                        hex_bytes(&stderr),
+                        String::from_utf8_lossy(&stderr),
+                    ));
+                }
+                if !stderr.is_empty() {
+                    return QpdfVersionDecision::Fail(format!(
+                        "{candidate_display} --version wrote stderr while checking {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+                        stderr.len(),
+                        hex_bytes(&stderr),
+                        String::from_utf8_lossy(&stderr),
+                    ));
+                }
+                let version_stdout = String::from_utf8_lossy(&stdout);
+                let first_line = version_stdout.lines().next().unwrap_or_default();
+                if first_line != PINNED_QPDF_VERSION {
+                    return QpdfVersionDecision::Fail(format!(
+                        "{candidate_display} reported an unexpected qpdf version; expected {PINNED_QPDF_VERSION}, stdout length={} hex={} text={version_stdout:?}",
+                        stdout.len(),
+                        hex_bytes(&stdout),
+                    ));
+                }
+                QpdfVersionDecision::Select
+            }
+        }
+    }
+
+    fn resolve_qpdf_candidates<Probe>(candidates: &[PathBuf], mut probe: Probe) -> QpdfResolution
+    where
+        Probe: FnMut(&Path) -> QpdfVersionProbe,
+    {
+        for (index, candidate) in candidates.iter().enumerate() {
+            match classify_qpdf_version(candidate, index + 1 < candidates.len(), probe(candidate)) {
+                QpdfVersionDecision::TryNext => continue,
+                QpdfVersionDecision::Skip(message) => return QpdfResolution::Skip(message),
+                QpdfVersionDecision::Fail(message) => return QpdfResolution::Fail(message),
+                QpdfVersionDecision::Select => {
+                    return QpdfResolution::Selected(candidate.clone());
+                }
+            }
+        }
+        QpdfResolution::NoCandidate
+    }
+
+    fn qpdf_version_probe(candidate: &Path) -> QpdfVersionProbe {
+        match Command::new(candidate).arg("--version").output() {
+            Ok(version) => QpdfVersionProbe::Output {
+                status_success: version.status.success(),
+                status: format!("{:?}", version.status),
+                stdout: version.stdout,
+                stderr: version.stderr,
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => QpdfVersionProbe::NotFound,
+            Err(error) => QpdfVersionProbe::LaunchError(error.to_string()),
+        }
+    }
+
+    fn qpdf_resolution_to_option(resolution: QpdfResolution) -> Option<PathBuf> {
+        match resolution {
+            QpdfResolution::Selected(candidate) => Some(candidate),
+            QpdfResolution::Skip(message) => {
+                eprintln!("{message}");
+                None
+            }
+            QpdfResolution::Fail(message) => panic!("{message}"),
+            QpdfResolution::NoCandidate => {
+                unreachable!("candidate list must not be empty")
+            }
+        }
+    }
+
     fn pinned_qpdf_11_9_0() -> Option<PathBuf> {
         let candidates = qpdf_candidates();
-        for (index, candidate) in candidates.iter().enumerate() {
-            let candidate_display = candidate.display().to_string();
-            let version = match Command::new(candidate).arg("--version").output() {
-                Ok(version) => version,
-                Err(error)
-                    if error.kind() == ErrorKind::NotFound && index + 1 < candidates.len() =>
-                {
-                    continue;
-                }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    eprintln!(
-                        "{candidate_display} unavailable; skipping DCT differential for {PINNED_QPDF_VERSION}"
-                    );
-                    return None;
-                }
-                Err(error) => panic!(
-                    "failed to invoke {candidate_display} --version for {PINNED_QPDF_VERSION}: {error}"
-                ),
-            };
-
-            assert!(
-                version.status.success(),
-                "{candidate_display} --version failed while checking {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
-                version.status,
-                version.stdout.len(),
-                hex_bytes(&version.stdout),
-                version.stderr.len(),
-                hex_bytes(&version.stderr),
-                String::from_utf8_lossy(&version.stderr),
-            );
-            assert!(
-                version.stderr.is_empty(),
-                "{candidate_display} --version wrote stderr while checking {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
-                version.stderr.len(),
-                hex_bytes(&version.stderr),
-                String::from_utf8_lossy(&version.stderr),
-            );
-            let version_stdout = String::from_utf8_lossy(&version.stdout);
-            let first_line = version_stdout.lines().next().unwrap_or_default();
-            assert_eq!(
-                first_line,
-                PINNED_QPDF_VERSION,
-                "{candidate_display} reported an unexpected qpdf version; expected {PINNED_QPDF_VERSION}, stdout length={} hex={} text={version_stdout:?}",
-                version.stdout.len(),
-                hex_bytes(&version.stdout),
-            );
-            return Some(candidate.clone());
-        }
-
-        unreachable!("qpdf candidate list must contain at least the PATH qpdf candidate")
+        qpdf_resolution_to_option(resolve_qpdf_candidates(&candidates, qpdf_version_probe))
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
@@ -4836,11 +5160,15 @@ pub(crate) mod tests {
             .arg("--check")
             .arg(&fixture)
             .output()
+            // cov:ignore-start: external pinned qpdf launch failure is unobservable in the successful oracle test; the diagnostic is retained.
             .unwrap_or_else(|error| {
                 panic!("failed to invoke {qpdf_display} --check for {PINNED_QPDF_VERSION}: {error}")
-            });
+            })
+            // cov:ignore-end
+            ;
         let check_stdout_hex = hex_bytes(&check.stdout);
         let check_stderr_hex = hex_bytes(&check.stderr);
+        // cov:ignore-start: external pinned qpdf failure diagnostics are unobservable in the successful oracle test; the exact status assertion is retained.
         assert!(
             check.status.success(),
             "qpdf --check failed for {qpdf_display} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
@@ -4851,6 +5179,8 @@ pub(crate) mod tests {
             check_stderr_hex,
             String::from_utf8_lossy(&check.stderr),
         );
+        // cov:ignore-end
+        // cov:ignore-start: external pinned qpdf failure diagnostics are unobservable in the successful oracle test; the exact stderr assertion is retained.
         assert!(
             check.stderr.is_empty(),
             "qpdf --check wrote stderr for {qpdf_display} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
@@ -4858,16 +5188,20 @@ pub(crate) mod tests {
             check_stderr_hex,
             String::from_utf8_lossy(&check.stderr),
         );
+        // cov:ignore-end
         let output = Command::new(&qpdf)
             .arg("--show-object=3")
             .arg("--filtered-stream-data")
             .arg(&fixture)
             .output()
+            // cov:ignore-start: external pinned qpdf launch failure is unobservable in the successful oracle test; the diagnostic is retained.
             .unwrap_or_else(|error| {
                 panic!(
                     "failed to invoke {qpdf_display} DCT differential for {PINNED_QPDF_VERSION}: {error}"
                 )
-            });
+            })
+            // cov:ignore-end
+            ;
         let canonical = canonical_dct_bytes(&jpeg);
         let qpdf_stdout_hex = hex_bytes(&output.stdout);
         let qpdf_stderr_hex = hex_bytes(&output.stderr);
