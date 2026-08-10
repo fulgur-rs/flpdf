@@ -62,3 +62,5 @@ ar_archive_writer = "=0.5.2"
 # default ~2 MiB a spawned thread gets, which some builds/paths measurably
 # do not have enough per-frame headroom to survive at the full depth).
 stacker = "0.1.24"
+libjpeg-turbo-rs = "=0.8.0"
+cc = "1"

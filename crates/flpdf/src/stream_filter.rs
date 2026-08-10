@@ -49,6 +49,7 @@ use crate::object_handle::ObjectHandle;
 use crate::pipeline::ascii85::Ascii85Decoder;
 use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
+use crate::pipeline::dct::PlDct;
 use crate::pipeline::flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE};
 use crate::pipeline::lzw::LzwDecoder;
 use crate::pipeline::png_filter::{PngFilter, PngFilterAction};
@@ -1772,6 +1773,42 @@ impl StreamFilter for RunLengthStreamFilter {
     }
 }
 
+struct DctStreamFilter;
+
+impl StreamFilter for DctStreamFilter {
+    /// Mirrors `SF_DCTDecode::getDecodePipeline`
+    /// (`libqpdf/qpdf/SF_DCTDecode.hh:14-19`), a single `Pl_DCT` decode stage.
+    fn decode_pipeline<'a>(
+        &mut self,
+        next: &'a mut dyn Pipeline,
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        Ok(Some(Box::new(PlDct::new("DCT decode", next))))
+    }
+
+    // The whole-buffer route remains the existing passthrough route for this
+    // bounded streaming migration. The qpdf-shaped stage above is exercised by
+    // the streaming caller and does not alter the writer/legacy decode route.
+    fn pipe_decode_recovering(
+        &mut self,
+        _data: &[u8],
+        _max_output: Option<usize>,
+        _warn: &mut dyn FnMut(&str, i32, usize, FilterDecodePhase) -> PipelineResult<()>,
+    ) -> Result<FilterDecodeOutcome> {
+        Err(Error::Unsupported(
+            "passthrough codec DCTDecode: image/binary stream data is not decoded by flpdf (preserved verbatim)"
+                .to_string(),
+        ))
+    }
+
+    fn is_specialized_compression(&self) -> bool {
+        true
+    }
+
+    fn is_lossy_compression(&self) -> bool {
+        true
+    }
+}
+
 /// Port of the anonymous-namespace `SF_Crypt` in `libqpdf/QPDF_Stream.cc:27-58`.
 ///
 /// It decodes nothing. Its whole contribution is deciding filterability from
@@ -2002,11 +2039,9 @@ impl StreamFilter for PostPreflightFailure {
 /// a library user add a factory at run time; flpdf exposes no counterpart, and
 /// adding one would mean replacing this `match`.
 ///
-/// The container is equivalent; the entry sets are not. qpdf registers a
-/// `/DCTDecode` factory (`QPDF_Stream.cc:91`) and this `match` has no arm for
-/// it, so a `/DCTDecode` stream is refused on the decode path with
-/// `filters::undecodable_filter_error`'s passthrough wording. That is the
-/// missing `Pl_DCT`, not the container.
+/// The container and qpdf's registered production codecs are represented here;
+/// the DCT stage itself is the qpdf-shaped streaming primitive while the
+/// existing whole-buffer route remains passthrough-only for now.
 pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilter>> {
     match filter_name {
         b"Crypt" => Some(Box::new(CryptStreamFilter)),
@@ -2015,6 +2050,7 @@ pub(crate) fn stream_filter_for(filter_name: &[u8]) -> Option<Box<dyn StreamFilt
         b"ASCII85Decode" => Some(Box::new(Ascii85StreamFilter)),
         b"ASCIIHexDecode" => Some(Box::new(AsciiHexStreamFilter)),
         b"RunLengthDecode" => Some(Box::new(RunLengthStreamFilter)),
+        b"DCTDecode" => Some(Box::new(DctStreamFilter)),
         #[cfg(test)]
         b"TestRejectDecode" => Some(Box::new(TestStreamFilter)),
         #[cfg(test)]
@@ -2223,8 +2259,8 @@ pub(crate) mod tests {
         decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
         ignore_warning, keeps_crypt_name_payload, normalize_filter_name, stream_filter_for,
         Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter, DecodeParams, FilterSpec,
-        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline,
-        RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
+        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline, PipelineError,
+        PipelineResult, RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
         RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
@@ -2235,8 +2271,613 @@ pub(crate) mod tests {
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
     use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
     use std::cell::{Cell, RefCell};
-    use std::io::Cursor;
+    use std::env;
+    use std::fs;
+    use std::io::{Cursor, ErrorKind};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::rc::Rc;
+
+    fn test_jpeg() -> Vec<u8> {
+        let pixels = [0u8, 32, 64, 96, 128, 160, 192, 224, 255, 240, 120, 8];
+        libjpeg_turbo_rs::compress(
+            &pixels,
+            2,
+            2,
+            libjpeg_turbo_rs::PixelFormat::Rgb,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("test JPEG must encode")
+    }
+
+    fn dct_qpdf_fixture(jpeg: &[u8]) -> tempfile::TempDir {
+        let mut pdf = b"%PDF-1.3\n%\xff\xff\xff\xff\n".to_vec();
+        let mut object_offsets = Vec::new();
+        let mut append_object = |object_number: u32, body: &[u8]| {
+            object_offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+            pdf.extend_from_slice(body);
+            if !body.ends_with(b"\n") {
+                pdf.push(b'\n');
+            }
+            pdf.extend_from_slice(b"endobj\n");
+        };
+
+        append_object(1, b"<< /Type /Catalog /Pages 2 0 R >>\n");
+        append_object(2, b"<< /Type /Pages /Kids [] /Count 0 >>");
+        let mut image = format!(
+            "<< /Type /XObject /Subtype /Image /Filter /DCTDecode /Width 2 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {} >>\nstream\n",
+            jpeg.len()
+        )
+        .into_bytes();
+        image.extend_from_slice(jpeg);
+        image.extend_from_slice(b"\nendstream\n");
+        append_object(3, &image);
+
+        assert_eq!(object_offsets.len(), 3);
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for offset in &object_offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n");
+        let startxref_value_start = pdf.len();
+        pdf.extend_from_slice(xref_offset.to_string().as_bytes());
+        let startxref_value_end = pdf.len();
+        pdf.extend_from_slice(b"\n%%EOF\n");
+
+        assert!(pdf
+            .windows(b"/Root 1 0 R".len())
+            .any(|window| window == b"/Root 1 0 R"));
+        assert!(pdf[xref_offset..].starts_with(b"xref\n0 4\n"));
+        for (index, offset) in object_offsets.iter().enumerate() {
+            let header = format!("{} 0 obj\n", index + 1);
+            assert!(pdf[*offset..].starts_with(header.as_bytes()));
+        }
+        let recorded_startxref =
+            std::str::from_utf8(&pdf[startxref_value_start..startxref_value_end])
+                .expect("startxref must be ASCII")
+                .parse::<usize>()
+                .expect("startxref must be a decimal offset");
+        assert_eq!(recorded_startxref, xref_offset);
+
+        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+        fs::write(directory.path().join("dct-image.pdf"), pdf)
+            .expect("write deterministic DCT qpdf fixture");
+        directory
+    }
+
+    fn canonical_dct_bytes(jpeg: &[u8]) -> Vec<u8> {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(jpeg).expect("canonical DCT write must succeed");
+            stage.finish().expect("canonical DCT finish must succeed");
+        }
+
+        sink.writes.into_iter().flatten().collect()
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn qpdf_candidates_select_explicit_override_without_environment() {
+        let override_path = Path::new("/tmp/qpdf-override");
+        assert_eq!(
+            qpdf_candidates_for(Some(override_path)),
+            vec![override_path.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn qpdf_candidates_ignore_empty_override_and_use_default_order() {
+        let candidates = qpdf_candidates_for(Some(Path::new("")));
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from(PINNED_QPDF_BINARY), PathBuf::from("qpdf")]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(candidates, vec![PathBuf::from("qpdf")]);
+    }
+
+    #[test]
+    fn qpdf_candidates_use_pinned_linux_then_path_without_override() {
+        let candidates = qpdf_candidates_for(None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            candidates,
+            vec![PathBuf::from(PINNED_QPDF_BINARY), PathBuf::from("qpdf")]
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(candidates, vec![PathBuf::from("qpdf")]);
+    }
+
+    #[test]
+    fn qpdf_version_not_found_tries_the_next_candidate() {
+        assert_eq!(
+            classify_qpdf_version(Path::new("/usr/bin/qpdf"), true, QpdfVersionProbe::NotFound,),
+            QpdfVersionDecision::TryNext
+        );
+    }
+
+    #[test]
+    fn qpdf_version_not_found_reports_skip_for_the_last_candidate() {
+        assert_eq!(
+            classify_qpdf_version(Path::new("qpdf"), false, QpdfVersionProbe::NotFound,),
+            QpdfVersionDecision::Skip(
+                "qpdf unavailable; skipping DCT differential for qpdf version 11.9.0".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_launch_failure_is_not_a_skip() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::LaunchError("permission denied".to_owned()),
+            ),
+            QpdfVersionDecision::Fail(
+                "failed to invoke /bad/qpdf --version for qpdf version 11.9.0: permission denied"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_status_failure_preserves_diagnostic_fields() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: false,
+                    status: "exit status: 1".to_owned(),
+                    stdout: b"bad".to_vec(),
+                    stderr: b"diagnostic\n".to_vec(),
+                },
+            ),
+            QpdfVersionDecision::Fail(
+                "/bad/qpdf --version failed while checking qpdf version 11.9.0: status=exit status: 1\nstdout length=3 hex=62 61 64\nstderr length=11 hex=64 69 61 67 6e 6f 73 74 69 63 0a text=\"diagnostic\\n\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_stderr_failure_preserves_diagnostic_fields() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"qpdf version 11.9.0\n".to_vec(),
+                    stderr: b"noise\n".to_vec(),
+                },
+            ),
+            QpdfVersionDecision::Fail(
+                "/bad/qpdf --version wrote stderr while checking qpdf version 11.9.0: length=6 hex=6e 6f 69 73 65 0a text=\"noise\\n\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_mismatch_preserves_stdout_diagnostic() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/bad/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"qpdf version 12.0.0\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            ),
+            QpdfVersionDecision::Fail(
+                "/bad/qpdf reported an unexpected qpdf version; expected qpdf version 11.9.0, stdout length=20 hex=71 70 64 66 20 76 65 72 73 69 6f 6e 20 31 32 2e 30 2e 30 0a text=\"qpdf version 12.0.0\\n\""
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_version_accepts_pinned_first_line_and_ignores_qpdf_footer() {
+        assert_eq!(
+            classify_qpdf_version(
+                Path::new("/usr/bin/qpdf"),
+                false,
+                QpdfVersionProbe::Output {
+                    status_success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"qpdf version 11.9.0\nRun qpdf --copyright for details.\n".to_vec(),
+                    stderr: Vec::new(),
+                },
+            ),
+            QpdfVersionDecision::Select
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_falls_back_after_not_found_and_selects_next_candidate() {
+        let candidates = vec![PathBuf::from("/usr/bin/qpdf"), PathBuf::from("qpdf")];
+        let mut probes = vec![
+            QpdfVersionProbe::NotFound,
+            QpdfVersionProbe::Output {
+                status_success: true,
+                status: "exit status: 0".to_owned(),
+                stdout: b"qpdf version 11.9.0\n".to_vec(),
+                stderr: Vec::new(),
+            },
+        ]
+        .into_iter();
+        assert_eq!(
+            resolve_qpdf_candidates(&candidates, |_| probes.next().expect("probe fixture")),
+            QpdfResolution::Selected(PathBuf::from("qpdf"))
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_returns_skip_for_final_not_found() {
+        let candidates = vec![PathBuf::from("qpdf")];
+        assert_eq!(
+            resolve_qpdf_candidates(&candidates, |_| QpdfVersionProbe::NotFound),
+            QpdfResolution::Skip(
+                "qpdf unavailable; skipping DCT differential for qpdf version 11.9.0".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_returns_failure_without_fallback() {
+        let candidates = vec![PathBuf::from("qpdf"), PathBuf::from("other-qpdf")];
+        assert_eq!(
+            resolve_qpdf_candidates(&candidates, |_| {
+                QpdfVersionProbe::LaunchError("permission denied".to_owned())
+            }),
+            QpdfResolution::Fail(
+                "failed to invoke qpdf --version for qpdf version 11.9.0: permission denied"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_reports_empty_candidate_list() {
+        assert_eq!(
+            resolve_qpdf_candidates(&[], |_| QpdfVersionProbe::NotFound),
+            QpdfResolution::NoCandidate
+        );
+    }
+
+    #[test]
+    fn qpdf_version_probe_reports_missing_binary_without_fixture_side_effects() {
+        assert_eq!(
+            qpdf_version_probe(Path::new(
+                "/this/path/does/not/exist/flpdf-qpdf-missing-binary",
+            )),
+            QpdfVersionProbe::NotFound
+        );
+    }
+
+    #[test]
+    fn qpdf_version_probe_reports_command_input_failure() {
+        let probe = qpdf_version_probe(Path::new("qpdf\0"));
+        assert!(matches!(probe, QpdfVersionProbe::LaunchError(message) if !message.is_empty()));
+    }
+
+    #[test]
+    fn qpdf_resolution_selected_returns_the_binary_path() {
+        assert_eq!(
+            qpdf_resolution_to_option(QpdfResolution::Selected(PathBuf::from("qpdf"))),
+            Some(PathBuf::from("qpdf"))
+        );
+    }
+
+    #[test]
+    fn qpdf_resolution_skip_returns_none_after_diagnostic() {
+        assert_eq!(
+            qpdf_resolution_to_option(QpdfResolution::Skip("missing qpdf".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "version mismatch")]
+    fn qpdf_resolution_failure_panics_after_diagnostic() {
+        qpdf_resolution_to_option(QpdfResolution::Fail("version mismatch".to_owned()));
+    }
+
+    #[test]
+    #[should_panic(expected = "candidate list must not be empty")]
+    fn qpdf_resolution_empty_candidate_result_panics() {
+        qpdf_resolution_to_option(QpdfResolution::NoCandidate);
+    }
+
+    const FLPDF_QPDF_BIN: &str = "FLPDF_QPDF_BIN";
+    const PINNED_QPDF_BINARY: &str = "/usr/bin/qpdf";
+    const PINNED_QPDF_VERSION: &str = "qpdf version 11.9.0";
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum QpdfVersionProbe {
+        NotFound,
+        LaunchError(String),
+        Output {
+            status_success: bool,
+            status: String,
+            stdout: Vec<u8>,
+            stderr: Vec<u8>,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum QpdfVersionDecision {
+        TryNext,
+        Skip(String),
+        Fail(String),
+        Select,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum QpdfResolution {
+        Selected(PathBuf),
+        Skip(String),
+        Fail(String),
+        NoCandidate,
+    }
+
+    fn qpdf_candidates_for(override_path: Option<&Path>) -> Vec<PathBuf> {
+        if let Some(path) = override_path {
+            if !path.as_os_str().is_empty() {
+                return vec![path.to_path_buf()];
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        let candidates = vec![PathBuf::from(PINNED_QPDF_BINARY), PathBuf::from("qpdf")];
+        #[cfg(not(target_os = "linux"))]
+        let candidates = vec![PathBuf::from("qpdf")];
+        candidates
+    }
+
+    fn qpdf_candidates() -> Vec<PathBuf> {
+        let override_path = env::var_os(FLPDF_QPDF_BIN);
+        qpdf_candidates_for(override_path.as_deref().map(Path::new))
+    }
+
+    fn classify_qpdf_version(
+        candidate: &Path,
+        has_next_candidate: bool,
+        probe: QpdfVersionProbe,
+    ) -> QpdfVersionDecision {
+        let candidate_display = candidate.display().to_string();
+        match probe {
+            QpdfVersionProbe::NotFound => {
+                if has_next_candidate {
+                    QpdfVersionDecision::TryNext
+                } else {
+                    QpdfVersionDecision::Skip(format!(
+                        "{candidate_display} unavailable; skipping DCT differential for {PINNED_QPDF_VERSION}"
+                    ))
+                }
+            }
+            QpdfVersionProbe::LaunchError(error) => QpdfVersionDecision::Fail(format!(
+                "failed to invoke {candidate_display} --version for {PINNED_QPDF_VERSION}: {error}"
+            )),
+            QpdfVersionProbe::Output {
+                status_success,
+                status,
+                stdout,
+                stderr,
+            } => {
+                if !status_success {
+                    return QpdfVersionDecision::Fail(format!(
+                        "{candidate_display} --version failed while checking {PINNED_QPDF_VERSION}: status={status}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+                        stdout.len(),
+                        hex_bytes(&stdout),
+                        stderr.len(),
+                        hex_bytes(&stderr),
+                        String::from_utf8_lossy(&stderr),
+                    ));
+                }
+                if !stderr.is_empty() {
+                    return QpdfVersionDecision::Fail(format!(
+                        "{candidate_display} --version wrote stderr while checking {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+                        stderr.len(),
+                        hex_bytes(&stderr),
+                        String::from_utf8_lossy(&stderr),
+                    ));
+                }
+                let version_stdout = String::from_utf8_lossy(&stdout);
+                let first_line = version_stdout.lines().next().unwrap_or_default();
+                if first_line != PINNED_QPDF_VERSION {
+                    return QpdfVersionDecision::Fail(format!(
+                        "{candidate_display} reported an unexpected qpdf version; expected {PINNED_QPDF_VERSION}, stdout length={} hex={} text={version_stdout:?}",
+                        stdout.len(),
+                        hex_bytes(&stdout),
+                    ));
+                }
+                QpdfVersionDecision::Select
+            }
+        }
+    }
+
+    fn resolve_qpdf_candidates<Probe>(candidates: &[PathBuf], mut probe: Probe) -> QpdfResolution
+    where
+        Probe: FnMut(&Path) -> QpdfVersionProbe,
+    {
+        for (index, candidate) in candidates.iter().enumerate() {
+            match classify_qpdf_version(candidate, index + 1 < candidates.len(), probe(candidate)) {
+                QpdfVersionDecision::TryNext => continue,
+                QpdfVersionDecision::Skip(message) => return QpdfResolution::Skip(message),
+                QpdfVersionDecision::Fail(message) => return QpdfResolution::Fail(message),
+                QpdfVersionDecision::Select => {
+                    return QpdfResolution::Selected(candidate.clone());
+                }
+            }
+        }
+        QpdfResolution::NoCandidate
+    }
+
+    fn qpdf_version_probe(candidate: &Path) -> QpdfVersionProbe {
+        match Command::new(candidate).arg("--version").output() {
+            Ok(version) => QpdfVersionProbe::Output {
+                status_success: version.status.success(),
+                status: format!("{:?}", version.status),
+                stdout: version.stdout,
+                stderr: version.stderr,
+            },
+            Err(error) if error.kind() == ErrorKind::NotFound => QpdfVersionProbe::NotFound,
+            Err(error) => QpdfVersionProbe::LaunchError(error.to_string()),
+        }
+    }
+
+    fn qpdf_resolution_to_option(resolution: QpdfResolution) -> Option<PathBuf> {
+        match resolution {
+            QpdfResolution::Selected(candidate) => Some(candidate),
+            QpdfResolution::Skip(message) => {
+                eprintln!("{message}");
+                None
+            }
+            QpdfResolution::Fail(message) => panic!("{message}"),
+            QpdfResolution::NoCandidate => {
+                unreachable!("candidate list must not be empty")
+            }
+        }
+    }
+
+    fn pinned_qpdf_11_9_0() -> Option<PathBuf> {
+        let candidates = qpdf_candidates();
+        qpdf_resolution_to_option(resolve_qpdf_candidates(&candidates, qpdf_version_probe))
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    fn test_late_truncated_jpeg() -> Vec<u8> {
+        let pixels: Vec<u8> = (0..(16 * 16 * 3))
+            .map(|value| (value % 256) as u8)
+            .collect();
+        libjpeg_turbo_rs::compress(
+            &pixels,
+            16,
+            16,
+            libjpeg_turbo_rs::PixelFormat::Rgb,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("late-truncation test JPEG must encode")
+    }
+
+    fn test_grayscale_jpeg() -> Vec<u8> {
+        libjpeg_turbo_rs::compress(
+            &[64u8, 192],
+            2,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("grayscale test JPEG must encode")
+    }
+
+    fn test_cmyk_jpeg() -> Vec<u8> {
+        libjpeg_turbo_rs::compress(
+            &[0u8, 64, 128, 255],
+            1,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Cmyk,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("CMYK test JPEG must encode")
+    }
+
+    fn test_12_bit_jpeg() -> Vec<u8> {
+        libjpeg_turbo_rs::compress_12bit(
+            &[2048i16],
+            1,
+            1,
+            1,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("12-bit test JPEG must encode")
+    }
+
+    fn test_unknown_component_jpeg() -> Vec<u8> {
+        let mut jpeg = libjpeg_turbo_rs::compress(
+            &[128u8],
+            1,
+            1,
+            libjpeg_turbo_rs::PixelFormat::Grayscale,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("unknown-component test JPEG must encode");
+        let sof = jpeg
+            .windows(2)
+            .position(|marker| marker == [0xff, 0xc0])
+            .expect("baseline JPEG must contain SOF0");
+        let segment_length = u16::from_be_bytes([jpeg[sof + 2], jpeg[sof + 3]]);
+        assert_eq!(segment_length, 11);
+        jpeg[sof + 9] = 2;
+        jpeg[sof + 2..sof + 4].copy_from_slice(&(segment_length + 3).to_be_bytes());
+        let second_component = sof + 2 + usize::from(segment_length);
+        jpeg.splice(second_component..second_component, [2, 0x11, 0]);
+        jpeg
+    }
+
+    #[derive(Default)]
+    struct DctSink {
+        writes: Vec<Vec<u8>>,
+        write_attempts: usize,
+        finishes: usize,
+        finish_attempts: usize,
+        fail_write: bool,
+        fail_finish: bool,
+    }
+
+    impl Pipeline for DctSink {
+        fn identifier(&self) -> &str {
+            "dct test sink"
+        }
+
+        fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
+            self.write_attempts += 1;
+            if self.fail_write {
+                Err(PipelineError::runtime("dct test write failure"))
+            } else {
+                self.writes.push(data.to_vec());
+                Ok(())
+            }
+        }
+
+        fn finish(&mut self) -> PipelineResult<()> {
+            self.finish_attempts += 1;
+            if self.fail_finish {
+                Err(PipelineError::runtime("dct test finish failure"))
+            } else {
+                self.finishes += 1;
+                Ok(())
+            }
+        }
+    }
 
     #[test]
     fn run_length_encoder_uses_qpdf_two_byte_run() {
@@ -4435,10 +5076,464 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn dct_factory_is_registered_and_classified() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        assert!(filter.is_specialized_compression());
+        assert!(filter.is_lossy_compression());
+
+        let mut sink = DctSink::default();
+        let stage = filter
+            .decode_pipeline(&mut sink)
+            .expect("DCT stage construction must succeed")
+            .expect("DCT filter must contribute a decode stage");
+        assert_eq!(stage.identifier(), "DCT decode");
+    }
+
+    #[test]
+    fn dct_factory_accepts_only_absent_decode_params() {
+        let mut absent = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(absent.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        assert!(absent
+            .decode_pipeline(&mut sink)
+            .expect("DCT stage construction must succeed")
+            .is_some());
+
+        let mut present = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(!present.set_decode_params(&DecodeParams::Present(Vec::new())));
+    }
+
+    #[test]
+    fn dct_stage_decodes_chunked_input_one_scanline_per_write() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+
+        {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            for chunk in jpeg.chunks(5) {
+                stage.write(chunk).expect("chunked JPEG write must succeed");
+            }
+            stage.finish().expect("JPEG finish must succeed");
+        }
+
+        assert_eq!(sink.writes.len(), 2, "one downstream write per scanline");
+        assert!(sink.writes.iter().all(|write| write.len() == 6));
+        assert_eq!(
+            sink.writes,
+            vec![
+                vec![0, 52, 132, 113, 99, 90],
+                vec![210, 196, 187, 255, 139, 34],
+            ]
+        );
+        assert_eq!(sink.finishes, 1);
+    }
+
+    /// The oracle is qpdf 11.9.0. On Linux the resolver prefers the pinned
+    /// `/usr/bin/qpdf`, otherwise it uses PATH `qpdf`; `FLPDF_QPDF_BIN` is an
+    /// explicit override. Every selected executable is checked with
+    /// `--version` before the real-PDF probe, and only an absent candidate skips
+    /// this test. qpdf 11.9.0 consumes `/DCTDecode` at `decode-level=all`:
+    /// `SF_DCTDecode` (`SF_DCTDecode.hh:8-40`) constructs `Pl_DCT`, whose
+    /// `decompress` path (`Pl_DCT.cc:298-326`) writes libjpeg scanline bytes to
+    /// the next pipeline. The real-PDF probe below pins that source/behavior
+    /// boundary against the canonical Rust stage.
+    #[test]
+    fn dct_qpdf_filtered_stream_data_matches_decode_pipeline_exactly() {
+        let qpdf = match pinned_qpdf_11_9_0() {
+            Some(qpdf) => qpdf,
+            None => return, // cov:ignore: supported oracle tests require the pinned qpdf 11.9.0 executable; absence only skips the external differential check
+        };
+        let qpdf_display = qpdf.display().to_string();
+        eprintln!("DCT qpdf differential using {qpdf_display} ({PINNED_QPDF_VERSION})");
+        let jpeg = test_jpeg();
+        let directory = dct_qpdf_fixture(&jpeg);
+        let fixture = directory.path().join("dct-image.pdf");
+        let check = Command::new(&qpdf)
+            .arg("--check")
+            .arg(&fixture)
+            .output()
+            // cov:ignore-start: external pinned qpdf launch failure is unobservable in the successful oracle test; the diagnostic is retained.
+            .unwrap_or_else(|error| {
+                panic!("failed to invoke {qpdf_display} --check for {PINNED_QPDF_VERSION}: {error}")
+            })
+            // cov:ignore-end
+            ;
+        let check_stdout_hex = hex_bytes(&check.stdout);
+        let check_stderr_hex = hex_bytes(&check.stderr);
+        // cov:ignore-start: external pinned qpdf failure diagnostics are unobservable in the successful oracle test; the exact status assertion is retained.
+        assert!(
+            check.status.success(),
+            "qpdf --check failed for {qpdf_display} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+            check.status,
+            check.stdout.len(),
+            check_stdout_hex,
+            check.stderr.len(),
+            check_stderr_hex,
+            String::from_utf8_lossy(&check.stderr),
+        );
+        // cov:ignore-end
+        // cov:ignore-start: external pinned qpdf failure diagnostics are unobservable in the successful oracle test; the exact stderr assertion is retained.
+        assert!(
+            check.stderr.is_empty(),
+            "qpdf --check wrote stderr for {qpdf_display} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+            check.stderr.len(),
+            check_stderr_hex,
+            String::from_utf8_lossy(&check.stderr),
+        );
+        // cov:ignore-end
+        let output = Command::new(&qpdf)
+            .arg("--show-object=3")
+            .arg("--filtered-stream-data")
+            .arg(&fixture)
+            .output()
+            // cov:ignore-start: external pinned qpdf launch failure is unobservable in the successful oracle test; the diagnostic is retained.
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to invoke {qpdf_display} DCT differential for {PINNED_QPDF_VERSION}: {error}"
+                )
+            })
+            // cov:ignore-end
+            ;
+        let canonical = canonical_dct_bytes(&jpeg);
+        let qpdf_stdout_hex = hex_bytes(&output.stdout);
+        let qpdf_stderr_hex = hex_bytes(&output.stderr);
+        let canonical_hex = hex_bytes(&canonical);
+        eprintln!(
+            "DCT qpdf probe {qpdf_display} ({PINNED_QPDF_VERSION}): --check status={:?} stdout={} stderr={}; filtered status={:?} stdout={} stderr={}; canonical={}",
+            check.status,
+            check.stdout.len(),
+            check.stderr.len(),
+            output.status,
+            output.stdout.len(),
+            output.stderr.len(),
+            canonical.len(),
+        );
+
+        // cov:ignore-start: external pinned qpdf failure formatting is unobservable when the supported oracle succeeds; retain the assertion and diagnostic.
+        assert!(
+            output.status.success(),
+            "qpdf DCT differential failed for {qpdf_display} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+            output.status,
+            output.stdout.len(),
+            qpdf_stdout_hex,
+            output.stderr.len(),
+            qpdf_stderr_hex,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // cov:ignore-end
+        // cov:ignore-start: external pinned qpdf stderr failure formatting is unobservable when the supported oracle is silent; retain the assertion and diagnostic.
+        assert!(
+            output.stderr.is_empty(),
+            "qpdf DCT differential wrote stderr for {qpdf_display} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+            output.stderr.len(),
+            qpdf_stderr_hex,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // cov:ignore-end
+        // cov:ignore-start: an external qpdf output mismatch is the failure assertion itself; the supported qpdf 11.9.0 oracle exercises only the success path.
+        assert_eq!(
+            output.stdout,
+            canonical,
+            "qpdf DCT differential mismatch for {qpdf_display} {PINNED_QPDF_VERSION}\nqpdf stdout length={} hex={}\ncanonical DctSink length={} hex={}",
+            output.stdout.len(),
+            qpdf_stdout_hex,
+            canonical.len(),
+            canonical_hex,
+        );
+        // cov:ignore-end
+    }
+
+    #[test]
+    fn dct_stage_empty_and_repeated_finish_forward_finish() {
+        let mut empty_filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(empty_filter.set_decode_params(&DecodeParams::Absent));
+        let mut empty_sink = DctSink::default();
+        assert_eq!(empty_sink.identifier(), "dct test sink");
+        {
+            let mut stage = empty_filter
+                .decode_pipeline(&mut empty_sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.finish().expect("empty JPEG finish must succeed");
+        }
+        assert!(empty_sink.writes.is_empty());
+        assert_eq!(empty_sink.finishes, 1);
+        assert_eq!(empty_sink.finish_attempts, 1);
+
+        let mut empty_error_filter =
+            stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(empty_error_filter.set_decode_params(&DecodeParams::Absent));
+        let mut empty_error_sink = DctSink {
+            fail_finish: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = empty_error_filter
+                .decode_pipeline(&mut empty_error_sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .finish()
+                .expect_err("empty finish failure must be returned")
+        };
+        assert_eq!(error.to_string(), "dct test finish failure");
+        assert!(empty_error_sink.writes.is_empty());
+        assert_eq!(empty_error_sink.finishes, 0);
+        assert_eq!(empty_error_sink.finish_attempts, 1);
+
+        let mut repeated_filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(repeated_filter.set_decode_params(&DecodeParams::Absent));
+        let mut repeated_sink = DctSink::default();
+        {
+            let mut stage = repeated_filter
+                .decode_pipeline(&mut repeated_sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.finish().expect("first finish must succeed");
+            stage.finish().expect("repeated finish must succeed");
+        }
+        assert!(repeated_sink.writes.is_empty());
+        assert_eq!(repeated_sink.finishes, 2);
+        assert_eq!(repeated_sink.finish_attempts, 2);
+    }
+
+    #[test]
+    fn dct_stage_preserves_codec_error_and_does_not_finish_downstream() {
+        {
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            let error = {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage
+                    .write(b"not a jpeg")
+                    .expect("DCT stage buffers malformed input");
+                stage
+                    .finish()
+                    .expect_err("malformed JPEG must fail at finish")
+            };
+
+            assert!(matches!(error, PipelineError::Runtime(_)));
+            #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+            assert_eq!(error.to_string(), "DCT decode: unexpected marker: 0xFF6F");
+            #[cfg(feature = "qpdf-libjpeg-compat")]
+            assert_eq!(
+                error.to_string(),
+                "DCT decode: Not a JPEG file: starts with 0x6e 6f"
+            );
+            assert!(sink.writes.is_empty());
+            assert_eq!(sink.write_attempts, 0);
+            assert_eq!(sink.finishes, 0);
+            assert_eq!(sink.finish_attempts, 0);
+        }
+
+        {
+            let jpeg = test_jpeg();
+            let truncated = &jpeg[..jpeg.len() / 2];
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            let error = {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage
+                    .write(truncated)
+                    .expect("DCT stage buffers truncated input");
+                stage
+                    .finish()
+                    .expect_err("truncated JPEG must fail at finish")
+            };
+
+            assert!(matches!(error, PipelineError::Runtime(_)));
+            #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+            assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
+            #[cfg(feature = "qpdf-libjpeg-compat")]
+            assert_eq!(error.to_string(), "DCT decode: Premature end of input file");
+            assert!(sink.writes.is_empty());
+            assert_eq!(sink.write_attempts, 0);
+            assert_eq!(sink.finishes, 0);
+            assert_eq!(sink.finish_attempts, 0);
+        }
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn dct_compat_rejects_late_truncation_after_scanline_output() {
+        let jpeg = test_late_truncated_jpeg();
+        assert_eq!(&jpeg[jpeg.len() - 2..], [0xff, 0xd9]);
+
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&jpeg[..jpeg.len() - 2])
+                .expect("late-truncated JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("missing EOI must be a codec error")
+        };
+
+        // The C source must report EOF only after libjpeg has emitted its
+        // already-decoded scanlines.
+        assert!(!sink.writes.is_empty());
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.to_string(), "DCT decode: Premature end of input file");
+        assert_eq!(sink.finishes, 0);
+    }
+
+    #[test]
+    fn dct_stage_preserves_downstream_write_error() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink {
+            fail_write: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(&jpeg).expect("DCT stage buffers input");
+            stage
+                .finish()
+                .expect_err("downstream write failure must be returned")
+        };
+
+        assert_eq!(error.to_string(), "dct test write failure");
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.write_attempts, 1);
+        assert_eq!(sink.finishes, 0);
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
+    #[test]
+    fn dct_stage_preserves_downstream_finish_error() {
+        let jpeg = test_jpeg();
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink {
+            fail_finish: true,
+            ..DctSink::default()
+        };
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage.write(&jpeg).expect("JPEG write must succeed");
+            stage
+                .finish()
+                .expect_err("downstream finish failure must be returned")
+        };
+
+        assert_eq!(error.to_string(), "dct test finish failure");
+        assert_eq!(sink.writes.len(), 2);
+        assert!(sink.writes.iter().all(|write| write.len() == 6));
+        assert_eq!(sink.write_attempts, 2);
+        assert_eq!(sink.finishes, 0);
+        assert_eq!(sink.finish_attempts, 1);
+    }
+
+    #[test]
+    fn dct_stage_uses_default_component_widths() {
+        for (jpeg, expected_row_length) in [(test_grayscale_jpeg(), 2), (test_cmyk_jpeg(), 4)] {
+            let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+            assert!(filter.set_decode_params(&DecodeParams::Absent));
+            let mut sink = DctSink::default();
+            {
+                let mut stage = filter
+                    .decode_pipeline(&mut sink)
+                    .expect("DCT stage construction must succeed")
+                    .expect("DCT filter must contribute a decode stage");
+                stage.write(&jpeg).expect("component JPEG must buffer");
+                stage.finish().expect("component JPEG must decode");
+            }
+            assert_eq!(sink.writes.len(), 1);
+            assert_eq!(sink.writes[0].len(), expected_row_length);
+            assert_eq!(sink.finishes, 1);
+        }
+    }
+
+    #[test]
+    fn dct_stage_rejects_non_eight_bit_precision() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&test_12_bit_jpeg())
+                .expect("12-bit JPEG must buffer");
+            stage.finish().expect_err("12-bit JPEG must be rejected")
+        };
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        #[cfg(not(feature = "qpdf-libjpeg-compat"))]
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: sample precision 12 (only 8-bit supported)"
+        );
+        #[cfg(feature = "qpdf-libjpeg-compat")]
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: Unsupported JPEG data precision 12"
+        );
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
+    #[test]
+    fn dct_stage_rejects_unknown_component_count() {
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&test_unknown_component_jpeg())
+                .expect("unknown-component JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("unknown component count must be rejected")
+        };
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: unsupported JPEG component count 2"
+        );
+        assert!(sink.writes.is_empty());
+        assert_eq!(sink.finish_attempts, 0);
+    }
+
     /// qpdf's `filter_factories` (`QPDF_Stream.cc:85-94`) holds `/Crypt`
-    /// alongside six codecs, so [`stream_filter_for`] holds it too — beside
-    /// the five that table's codecs reduce to here, `/DCTDecode` being a
-    /// passthrough in flpdf rather than a registered filter.
+    /// alongside six codecs, so [`stream_filter_for`] holds it too. DCTDecode
+    /// contributes the streaming stage; its legacy whole-buffer route remains
+    /// passthrough-only until that route is cut over.
     ///
     /// The registration is not reached by a production decode:
     /// `filters::prepare_decode_filters` routes a `Crypt` spec to

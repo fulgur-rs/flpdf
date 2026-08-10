@@ -22,6 +22,8 @@ pub mod ostream;
 
 pub(crate) mod count;
 
+pub(crate) mod dct;
+
 pub(crate) mod flate;
 
 pub(crate) mod lzw;

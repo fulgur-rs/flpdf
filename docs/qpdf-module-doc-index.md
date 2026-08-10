@@ -100,6 +100,7 @@
 | `crates/flpdf/src/pipeline/buffer.rs` | correspondence | Pl_Buffer.cc accumulation, optional pass-through, finish readiness, and getBuffer reset ownership; Rust take_buffer returns the moved Vec directly |
 | `crates/flpdf/src/pipeline/concatenate.rs` | correspondence | Pl_Concatenate.cc forwards writes while suppressing ordinary finish calls |
 | `crates/flpdf/src/pipeline/count.rs` | correspondence | Pl_Count.cc byte-count, last-byte, forwarding, and finish responsibilities |
+| `crates/flpdf/src/pipeline/dct.rs` | correspondence | \`Pl_DCT\` buffers compressed input and decodes it on \`finish\`, emitting one decoded scanline at a time to the next pipeline |
 | `crates/flpdf/src/pipeline/discard.rs` | correspondence | include/qpdf/Pl_Discard.hh:22-38 and libqpdf/Pl_Discard.cc:5-22 — terminal identifier, no-op writes and finishes, and reuse after finish |
 | `crates/flpdf/src/pipeline/flate.rs` | correspondence | Pl_Flate.cc streaming inflate, deflate, warning callback, compression-level, and finish responsibilities via flate2 |
 | `crates/flpdf/src/pipeline/lzw.rs` | correspondence | Pl_LZWDecoder.cc bit accumulation, table growth, code-width transitions, end-of-data latching, output boundaries, and error text |

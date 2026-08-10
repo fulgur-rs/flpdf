@@ -31,6 +31,10 @@ stacker.workspace = true
 # unless some member's manifest actually inherits it (verified: `cargo
 # update -p ar_archive_writer --precise 0.5.2` succeeds without this line).
 ar_archive_writer.workspace = true
+libjpeg-turbo-rs.workspace = true
+
+[build-dependencies]
+cc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -42,6 +46,7 @@ default = []
 # Internal cross-crate hooks used only by the qpdf test-driver compatibility
 # binary. Normal library builds do not expose or compile this oracle plumbing.
 qtest-driver = []
+qpdf-libjpeg-compat = []
 # Opt-in: link classic libz (zlib1g) via libz-sys so flate2's deflate output
 # matches qpdf's compress2() at level 6 byte-for-byte. Used by bytes-identical
 # tests only — production builds stay Pure Rust (miniz_oxide).

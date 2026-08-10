@@ -78,9 +78,10 @@
 //!   `{first, prefix, style}` fields instead of qpdf JSON v2's raw page-label
 //!   dictionary. The `outlines` section uses qpdf JSON v2's key layout.
 
-// Mechanically enforce threat-model guarantee (a): no undefined behaviour. The
-// crate contains no `unsafe` blocks, so this attribute keeps it that way.
-#![forbid(unsafe_code)]
+// Mechanically enforce threat-model guarantee (a): no undefined behaviour.
+// The explicit system-libjpeg compatibility backend confines its FFI unsafe
+// code to one private module with a local allow.
+#![deny(unsafe_code)]
 
 pub mod acroform_document_helper;
 pub mod acroform_field_prune;
