@@ -206,6 +206,36 @@ fn split_outputs(dir: &Path) -> Vec<String> {
     names
 }
 
+fn assert_qpdf_cleartext_chunk(path: &Path) {
+    let check = Shell::new(QPDF)
+        .args(["--check", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "qpdf --check should accept {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let encryption = Shell::new(QPDF)
+        .args(["--show-encryption", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        encryption.status.success(),
+        "qpdf should inspect {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&encryption.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&encryption.stdout).trim(),
+        "File is not encrypted",
+        "split chunk {} should be cleartext",
+        path.display()
+    );
+}
+
 // ===========================================================================
 // --pages : page-selection parity
 // ===========================================================================
@@ -772,6 +802,137 @@ fn split_pages_leading_dot_template_matches_qpdf() {
         "--split-pages=2",
     ]);
     assert_eq!(split_outputs(fdir.path()), vec!["-1-2.pdf", "-3-3.pdf"]);
+}
+
+#[test]
+fn split_pages_encrypted_primary_matches_qpdf_cleartext_chunks() {
+    // qpdf 11.9.0 builds a fresh empty output document for every split chunk;
+    // source-encryption preservation therefore does not carry into the
+    // chunks. The intermediate handed to flpdf's split loop must likewise be
+    // cleartext so the loop never reopens encrypted bytes without a password.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let qtemplate = qdir.path().join("o.pdf");
+    let ftemplate = fdir.path().join("o.pdf");
+
+    let (qpdf_ok, _) = run_qpdf(&[
+        "--password=secretpw",
+        enc.to_str().unwrap(),
+        "--split-pages=1",
+        qtemplate.to_str().unwrap(),
+    ]);
+    assert!(qpdf_ok, "qpdf encrypted split should succeed");
+    assert_eq!(
+        split_outputs(qdir.path()),
+        vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"]
+    );
+
+    for name in ["o-1.pdf", "o-2.pdf", "o-3.pdf"] {
+        assert_qpdf_cleartext_chunk(&qdir.path().join(name));
+    }
+
+    let wrong_output = fdir.path().join("wrong.pdf");
+    let wrong = Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            enc.to_str().unwrap(),
+            "--password=wrong",
+            wrong_output.to_str().unwrap(),
+            "--split-pages=1",
+        ])
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success(), "wrong password must fail");
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("incorrect password"),
+        "wrong password should report authentication failure: {}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+    assert!(
+        split_outputs(fdir.path()).is_empty(),
+        "wrong-password split must not emit chunks"
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            enc.to_str().unwrap(),
+            "--password=secretpw",
+            ftemplate.to_str().unwrap(),
+            "--split-pages=1",
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        split_outputs(fdir.path()),
+        vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"]
+    );
+    for name in ["o-1.pdf", "o-2.pdf", "o-3.pdf"] {
+        let path = fdir.path().join(name);
+        assert_eq!(npages_of(&path), 1, "flpdf chunk {name} should be readable");
+        assert_qpdf_cleartext_chunk(&path);
+    }
+}
+
+#[test]
+fn pages_then_split_encrypted_primary_matches_qpdf_cleartext_chunks() {
+    // The --pages consumer reaches the same canonical split_pages boundary
+    // after rebuilding the selected page tree. qpdf still creates fresh,
+    // cleartext split chunks for the encrypted primary input.
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
+        return;
+    };
+    let qdir = tempfile::tempdir().unwrap();
+    let fdir = tempfile::tempdir().unwrap();
+    let qtemplate = qdir.path().join("o.pdf");
+    let ftemplate = fdir.path().join("o.pdf");
+
+    let (qpdf_ok, _) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--pages",
+        ".",
+        "1-3",
+        "--",
+        "--split-pages=1",
+        qtemplate.to_str().unwrap(),
+    ]);
+    assert!(qpdf_ok, "qpdf encrypted pages+split should succeed");
+    assert_eq!(
+        split_outputs(qdir.path()),
+        vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"]
+    );
+
+    Command::cargo_bin("flpdf")
+        .unwrap()
+        .args([
+            enc.to_str().unwrap(),
+            "--password=secretpw",
+            "--pages",
+            ".",
+            "1-3",
+            "--",
+            "--split-pages=1",
+            ftemplate.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        split_outputs(fdir.path()),
+        vec!["o-1.pdf", "o-2.pdf", "o-3.pdf"]
+    );
+    for name in ["o-1.pdf", "o-2.pdf", "o-3.pdf"] {
+        let path = fdir.path().join(name);
+        assert_eq!(npages_of(&path), 1, "flpdf chunk {name} should be readable");
+        assert_qpdf_cleartext_chunk(&path);
+    }
 }
 
 // ===========================================================================
