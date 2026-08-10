@@ -8,7 +8,7 @@
 //! byte-identity. The `/Length` *value* (deflate backend dependent) is out of
 //! scope here; only the key ordering is asserted.
 
-use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+use flpdf::Pdf;
 use std::fs::File;
 use std::io::BufReader;
 
@@ -16,10 +16,9 @@ fn full_rewrite_bytes(fixture: &str) -> Vec<u8> {
     let path = format!("../../tests/fixtures/compat/{fixture}");
     let file = File::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true; // compress_streams defaults to Yes (re-filter)
+    let opts = WriterTestSettings::default();
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
@@ -94,3 +93,7 @@ fn already_flate_source_keeps_length_last() {
         "already-Flate content stream was wrongly emitted in re-filtered /Length-first order"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

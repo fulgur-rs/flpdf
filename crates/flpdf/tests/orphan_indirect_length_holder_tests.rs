@@ -14,19 +14,16 @@
 
 use std::io::Cursor;
 
-use flpdf::{
-    write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, StreamDataMode,
-    WriteOptions,
-};
+use flpdf::{NewlineBeforeEndstream, Object, ObjectStreamMode, Pdf, StreamDataMode};
 
 const FIXTURE: &[u8] =
     include_bytes!("../../../tests/fixtures/compat/objstm-lin-od-indirect-length.pdf");
 
 /// Full-rewrite the fixture with `opts` and return the output bytes.
-fn rewrite(opts: &WriteOptions) -> Vec<u8> {
+fn rewrite(opts: &WriterTestSettings) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(FIXTURE)).expect("open fixture");
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, opts).expect("write");
+    write_with_settings(&mut pdf, &mut out, opts).expect("write");
     out
 }
 
@@ -69,9 +66,8 @@ fn object_count(out: &[u8]) -> usize {
 
 /// Base option set: a `--static-id` full rewrite with qpdf's default
 /// no-newline-before-endstream framing.
-fn base_opts() -> WriteOptions {
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+fn base_opts() -> WriterTestSettings {
+    let mut opts = WriterTestSettings::default();
     opts.static_id = true;
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
     opts
@@ -190,7 +186,7 @@ fn plain_rewrite_keeps_length_holder_referenced_from_direct_trailer_dict() {
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &base_opts()).expect("write");
+    write_with_settings(&mut pdf, &mut out, &base_opts()).expect("write");
 
     // The holder is kept (referenced from the trailer), so the live set is the 5
     // graph objects — none orphaned, no dangling trailer reference.
@@ -215,3 +211,7 @@ fn plain_rewrite_keeps_length_holder_referenced_from_direct_trailer_dict() {
         "the trailer /Held nested ref must point to the kept holder (value 16), not dangle"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

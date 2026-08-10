@@ -1318,7 +1318,7 @@ fn qpdf_writer_forced_incompatible_version_drops_preserved_encryption() -> flpdf
         },
     )?;
     let mut writer = QPDFWriter::new(&mut source);
-    writer.force_pdf_version("1.5", 0)?;
+    writer.force_pdf_version("1.5", 0);
     writer.set_output_memory()?;
     writer.write()?;
     let output = writer.get_buffer()?;
@@ -1869,8 +1869,8 @@ fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()>
         let mut pdf = open_minimal_pdf()?;
         let mut writer = QPDFWriter::new(&mut pdf);
         match setter {
-            "minimum" => writer.set_minimum_pdf_version("1.7", 0)?,
-            "force" => writer.force_pdf_version("1.5", 0)?,
+            "minimum" => writer.set_minimum_pdf_version("1.7", 0),
+            "force" => writer.force_pdf_version("1.5", 0),
             _ => unreachable!(),
         }
         writer.set_output_memory()?;
@@ -1885,7 +1885,7 @@ fn pdf_version_setters_are_reflected_in_the_output_header() -> flpdf::Result<()>
 fn qpdf_writer_preserves_forced_pdf_extension_pair() -> flpdf::Result<()> {
     let mut pdf = open_minimal_pdf()?;
     let mut writer = QPDFWriter::new(&mut pdf);
-    writer.force_pdf_version("1.7", 8)?;
+    writer.force_pdf_version("1.7", 8);
     writer.set_output_memory()?;
     writer.write()?;
 

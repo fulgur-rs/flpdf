@@ -21,7 +21,10 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, ObjectStreamMode, Pdf, WriteOptions};
+mod common;
+
+use common::{write_with_settings, WriterTestSettings};
+use flpdf::{ObjectStreamMode, Pdf};
 use std::path::Path;
 
 /// Full-rewrite `fixture` with `--object-streams=generate --static-id` (the
@@ -33,16 +36,15 @@ fn generate_qpdf_equivalent(fixture: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.object_streams = ObjectStreamMode::Generate;
     opts.static_id = true;
     // qpdf's default output writes no newline before endstream.
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
     // compress_streams defaults to Yes (decode + re-encode to single FlateDecode).
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
@@ -120,15 +122,14 @@ fn generate_force_qpdf_equivalent(fixture: &str, force: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.object_streams = ObjectStreamMode::Generate;
     opts.force_version = Some(force.to_string());
     opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    opts.newline_before_endstream = flpdf::NewlineBeforeEndstream::Never;
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 

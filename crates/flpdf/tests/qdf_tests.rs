@@ -22,8 +22,8 @@
 //!   (n) qdf=false: no "%% Original object ID:" lines regardless of flag.
 
 use flpdf::{
-    check_reader, filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef,
-    ObjectStreamMode, Pdf, Stream, WriteOptions,
+    check_reader, filters, CompressStreams, Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf,
+    Stream,
 };
 use std::io::Cursor;
 
@@ -172,12 +172,11 @@ fn qdf_mode_strips_filter_from_flate_stream() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // QDF output now uses indirect /Length (flpdf-9hc.6.12) which flpdf's
     // parser cannot yet re-read (flpdf-m41), so introspect the bytes.
@@ -222,12 +221,11 @@ fn qdf_mode_keeps_dct_stream_verbatim() {
     let (source, _) = build_minimal_pdf_with_stream(b"DCTDecode", fake_jpeg, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Indirect /Length (flpdf-9hc.6.12); parser re-read gated on flpdf-m41.
     let s = parse_qdf_stream(&output, metadata_stream_number(&output));
@@ -265,12 +263,11 @@ fn qdf_mode_length_matches_decoded_bytes() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // flpdf-9hc.6.12: /Length is now an INDIRECT `H 0 R` plus a separate
     // bare-integer holder object — qpdf 11.9.0 --qdf + flpdf::fix_qdf parity.
@@ -325,19 +322,17 @@ fn qdf_mode_round_trip_content_preserved() {
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
     // First pass: QDF rewrite.
-    let mut qdf_options = WriteOptions::default();
-    qdf_options.full_rewrite = true;
+    let mut qdf_options = WriterTestSettings::default();
     qdf_options.qdf = true;
     let mut qdf_output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut qdf_output, &qdf_options).unwrap();
+    write_with_settings(&mut pdf, &mut qdf_output, &qdf_options).unwrap();
 
     // Second pass: full-rewrite (CompressStreams::Yes) of the QDF output.
     let mut pdf2 = Pdf::open(Cursor::new(qdf_output)).unwrap();
-    let mut compress_options = WriteOptions::default();
-    compress_options.full_rewrite = true;
+    let mut compress_options = WriterTestSettings::default();
     compress_options.compress_streams = CompressStreams::Yes;
     let mut final_output = Vec::new();
-    write_pdf_with_options(&mut pdf2, &mut final_output, &compress_options).unwrap();
+    write_with_settings(&mut pdf2, &mut final_output, &compress_options).unwrap();
 
     // Re-open and decode the stream — content must match original. Objects are
     // renumbered Catalog-first, so navigate via the Catalog's /Metadata ref.
@@ -377,8 +372,7 @@ fn qdf_of_qdf_reuses_length_holders_and_is_byte_stable() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.qdf = true;
     // Suppress "%% Original object ID: N G": those comments record each object's
     // number in the *input* file, which differs between pass 1 (original) and
@@ -391,7 +385,7 @@ fn qdf_of_qdf_reuses_length_holders_and_is_byte_stable() {
 
     // Pass 1: qdf rewrite introduces `/Length H 0 R` indirect holder objects.
     let mut pass1 = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut pass1, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut pass1, &opts).unwrap();
     assert!(
         check_reader(Cursor::new(pass1.clone())).is_ok(),
         "pass 1 qdf output must be structurally valid"
@@ -403,7 +397,7 @@ fn qdf_of_qdf_reuses_length_holders_and_is_byte_stable() {
     // integer objects — yielding byte-identical output.
     let mut pdf2 = Pdf::open(Cursor::new(pass1.clone())).unwrap();
     let mut pass2 = Vec::new();
-    write_pdf_with_options(&mut pdf2, &mut pass2, &opts).unwrap();
+    write_with_settings(&mut pdf2, &mut pass2, &opts).unwrap();
 
     assert_eq!(
         pass1, pass2,
@@ -424,12 +418,11 @@ fn qdf_mode_strips_filter_from_lzw_stream() {
     let (source, _) = build_minimal_pdf_with_stream(b"LZWDecode", lzw_data, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Indirect /Length (flpdf-9hc.6.12); parser re-read gated on flpdf-m41.
     let s = parse_qdf_stream(&output, metadata_stream_number(&output));
@@ -597,12 +590,11 @@ fn qdf_mode_decomposes_objstm_no_objstm_in_output() {
     let source = build_pdf_with_objstm_for_qdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Output must be a structurally valid PDF.
     let report = check_reader(Cursor::new(output.clone())).unwrap();
@@ -657,12 +649,11 @@ fn qdf_header_contains_qdf_marker() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Must contain "%QDF-1.0" somewhere in the output.
     assert!(
@@ -703,12 +694,11 @@ fn non_qdf_header_has_no_qdf_marker_but_has_binary_marker() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = false;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Must NOT contain "%QDF-1.0".
     assert!(
@@ -735,13 +725,12 @@ fn qdf_overrides_generate_mode_no_objstm() {
     let source = build_pdf_with_objstm_for_qdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Output must be valid.
     let report = check_reader(Cursor::new(output.clone())).unwrap();
@@ -800,13 +789,12 @@ fn qdf_original_object_id_comments_emitted_when_flag_false() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.no_original_object_ids = false; // default, but set explicitly
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Helper: assert the comment+obj pair appears contiguously. Objects are
     // renumbered Catalog-first (flpdf-9hc.32), so the comment carries the
@@ -862,13 +850,12 @@ fn qdf_original_object_id_comments_suppressed_when_flag_true() {
     let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.no_original_object_ids = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let comment_marker = b"%% Original object ID:";
     let comment_count = output
@@ -921,12 +908,11 @@ fn qdf_mode_forces_xref_table_when_source_has_xref_stream() {
 
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Classic xref table marker (leading newline avoids matching "startxref\n").
     assert!(
@@ -987,12 +973,11 @@ fn qdf_mode_keeps_xref_table_when_source_has_classic_table() {
 
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         output.windows(b"\nxref\n".len()).any(|w| w == b"\nxref\n"),
@@ -1024,13 +1009,12 @@ fn qdf_mode_forces_xref_table_with_generate_override() {
     let source = build_pdf_with_objstm_for_qdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Classic xref table must be present.
     assert!(
@@ -1090,13 +1074,12 @@ fn non_qdf_never_emits_original_object_id_comments() {
         let (source, _) = build_minimal_pdf_with_stream(b"FlateDecode", &compressed, None);
         let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-        let mut options = WriteOptions::default();
-        options.full_rewrite = true;
+        let mut options = WriterTestSettings::default();
         options.qdf = false;
         options.no_original_object_ids = flag;
 
         let mut output = Vec::new();
-        write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+        write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
         let count = output
             .windows(comment_marker.len())
@@ -1137,12 +1120,11 @@ fn non_qdf_never_emits_original_object_id_comments() {
 
 fn qdf_rewrite(source: &[u8]) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(source.to_vec())).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
     options.static_id = true;
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
     output
 }
 
@@ -1525,12 +1507,11 @@ fn passthrough_dct_stream_is_byte_identical_after_rewrite() {
     let (source, _) = build_minimal_pdf_with_stream(b"DCTDecode", fake_jpeg, None);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
@@ -1562,12 +1543,11 @@ fn passthrough_ccitt_stream_with_decode_parms_is_byte_identical_after_rewrite() 
     );
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let s = parse_qdf_stream(&output, metadata_stream_number(&output));
 
@@ -1595,12 +1575,11 @@ fn non_qdf_output_keeps_compact_dict_form() {
     // classic trailer matches qpdf (dict on the `trailer ` line, /ID last).
     let source = std::fs::read("../../tests/fixtures/minimal.pdf").unwrap();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.qdf = false;
     options.static_id = true;
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
     let text = String::from_utf8_lossy(&output);
 
     assert!(
@@ -1627,3 +1606,7 @@ fn non_qdf_output_keeps_compact_dict_form() {
         "non-qdf trailer must emit /ID last (after /Size), matching qpdf"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

@@ -9,10 +9,7 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::ObjectStreamMode;
-use flpdf::{
-    check_reader, load_xref_and_trailer, write_pdf_with_options, Object, ObjectRef, Pdf,
-    WriteOptions, XrefEntry,
-};
+use flpdf::{check_reader, load_xref_and_trailer, Object, ObjectRef, Pdf, XrefEntry};
 use std::io::{Cursor, Write};
 
 // ── Fixture builders ─────────────────────────────────────────────────────────
@@ -173,12 +170,11 @@ fn roundtrip_disable_mode_emits_no_objstm() {
     let source = build_xref_stream_pdf_with_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Disable;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Verify output is a valid PDF.
     let report = check_reader(Cursor::new(output.clone())).unwrap();
@@ -225,13 +221,12 @@ fn nostream_130_generate_has_two_66_member_containers_with_dense_indices() {
         .join("../../tests/fixtures/compat/objstm-gen-nostream-130rev.pdf");
     let file = std::fs::File::open(&path).unwrap_or_else(|error| panic!("open {path:?}: {error}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.static_id = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut containers = Vec::new();
@@ -286,12 +281,11 @@ fn plain_plan_failure_leaves_caller_writer_untouched() {
     source[offset..offset + root_entry.len()].fill(b' ');
     for mode in [ObjectStreamMode::Disable, ObjectStreamMode::Preserve] {
         let mut pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
-        let mut options = WriteOptions::default();
-        options.full_rewrite = true;
+        let mut options = WriterTestSettings::default();
         options.object_streams = mode;
         let mut output = b"caller-prefix".to_vec();
 
-        let error = write_pdf_with_options(&mut pdf, &mut output, &options).unwrap_err();
+        let error = write_with_settings(&mut pdf, &mut output, &options).unwrap_err();
 
         assert!(
             matches!(error, flpdf::Error::Missing("/Root")),
@@ -309,12 +303,11 @@ fn preserve_empty_surviving_container_uses_table_without_dangling_entries() {
     let source = build_xref_stream_pdf_with_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
     pdf.delete_object(ObjectRef::new(2, 0));
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Preserve;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         output
@@ -354,13 +347,12 @@ fn preserve_explicit_deleted_member_becomes_null_without_dangling_xref() {
         .join("../../tests/fixtures/compat/three-page-objstm.pdf");
     let mut pdf = Pdf::open(std::io::BufReader::new(std::fs::File::open(path).unwrap())).unwrap();
     pdf.delete_object(ObjectRef::new(4, 0));
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Preserve;
     options.static_id = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
@@ -411,13 +403,12 @@ fn preserve_deleted_source_container_rebuilds_its_surviving_members() {
     }
     pdf.delete_object(ObjectRef::new(1, 0));
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Preserve;
     options.static_id = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
@@ -452,13 +443,12 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
     }
     pdf.set_object(ObjectRef::new(1, 0), Object::Null);
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Preserve;
     options.static_id = true;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
@@ -487,12 +477,11 @@ fn preserve_null_replaced_source_container_rebuilds_its_surviving_members() {
 fn preserve_xref_stream_without_objstm_downgrades_to_classic_table() {
     let source = build_xref_stream_pdf_no_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Preserve;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(output
         .windows(b"\nxref\n".len())
@@ -510,12 +499,11 @@ fn roundtrip_generate_mode_packs_eligible_objects() {
     let source = build_xref_stream_pdf_no_objstm();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Verify output is valid.
     let report = check_reader(Cursor::new(output.clone())).unwrap();
@@ -602,12 +590,11 @@ fn generate_mode_on_xref_table_form_upgrades_to_xref_stream() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options)
+    write_with_settings(&mut pdf, &mut output, &options)
         .expect("Generate mode on xref-table input must upgrade silently to xref stream");
 
     // The output must be re-readable AND structurally valid — a Report with
@@ -657,12 +644,11 @@ fn disable_mode_on_xref_table_form_preserves_classic_table() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Disable;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Validate the output before asserting on its byte structure — otherwise a
     // malformed file that happens to contain "\nxref\n" somewhere in a stream
@@ -702,12 +688,11 @@ fn assert_generate_roundtrip_structurally_valid(fixture_path: &str, expected_pag
         std::fs::read(fixture_path).unwrap_or_else(|e| panic!("read fixture {fixture_path}: {e}"));
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options)
+    write_with_settings(&mut pdf, &mut output, &options)
         .unwrap_or_else(|e| panic!("write {fixture_path}: {e:?}"));
 
     let report = check_reader(Cursor::new(output.clone()))
@@ -863,13 +848,12 @@ fn generate_mode_full_rewrite_drops_eligible_orphan() {
     let source = pdf_with_eligible_orphan();
     let mut pdf = Pdf::open_mem_owned(source).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
 
     // (a) The write SUCCEEDS (it aborted before the fix).
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options)
+    write_with_settings(&mut pdf, &mut output, &options)
         .expect("full-rewrite + Generate must succeed when an eligible orphan is present");
 
     // Output must be a valid PDF.
@@ -951,12 +935,11 @@ fn full_rewrite_objstm_input_drops_source_structural_containers() {
     let source = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let report = check_reader(Cursor::new(output.clone())).unwrap();
     assert!(
@@ -1014,13 +997,12 @@ fn generate_force_version_below_1_5_suppresses_object_and_xref_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.force_version = Some("1.4".to_string());
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         output.starts_with(b"%PDF-1.4\n"),
@@ -1053,13 +1035,12 @@ fn generate_force_version_exactly_1_5_still_emits_object_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.force_version = Some("1.5".to_string());
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         output.starts_with(b"%PDF-1.5\n"),
@@ -1080,13 +1061,12 @@ fn generate_min_version_below_1_5_still_emits_object_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.min_version = Some("1.4".to_string());
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         output.starts_with(b"%PDF-1.5\n"),
@@ -1106,14 +1086,13 @@ fn generate_force_below_1_5_overrides_higher_min_version_and_suppresses() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.force_version = Some("1.4".to_string());
     options.min_version = Some("1.5".to_string());
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         output.starts_with(b"%PDF-1.4\n"),
@@ -1133,13 +1112,12 @@ fn generate_invalid_force_version_does_not_suppress_object_streams() {
     let source = build_xref_table_pdf();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.force_version = Some("not-a-version".to_string());
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     assert!(
         rendered(&output).contains("/Type /ObjStm"),
@@ -1156,13 +1134,12 @@ fn generate_force_version_below_1_5_is_byte_identical_to_disable() {
     // `/ID` so the two writes are comparable.
     let build = |mode: ObjectStreamMode| {
         let mut pdf = Pdf::open(Cursor::new(build_xref_table_pdf())).unwrap();
-        let mut options = WriteOptions::default();
-        options.full_rewrite = true;
+        let mut options = WriterTestSettings::default();
         options.object_streams = mode;
         options.force_version = Some("1.4".to_string());
         options.static_id = true;
         let mut out = Vec::new();
-        write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+        write_with_settings(&mut pdf, &mut out, &options).unwrap();
         out
     };
     assert_eq!(
@@ -1184,13 +1161,12 @@ fn generate_force_version_below_1_5_is_byte_identical_to_disable() {
 
 fn build_with_mode_force(mode: ObjectStreamMode, force: &str) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(build_xref_stream_pdf_with_objstm())).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = mode;
     options.force_version = Some(force.to_string());
     options.static_id = true;
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &options).unwrap();
+    write_with_settings(&mut pdf, &mut out, &options).unwrap();
     out
 }
 
@@ -1301,12 +1277,11 @@ fn generate_drops_missing_trailer_refs_from_objstm_and_body() {
     // refs consume no object numbers and are dropped from the trailer.
     let source = info_and_missing_junk_pdf(100);
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
+    let mut options = WriterTestSettings::default();
     options.object_streams = ObjectStreamMode::Generate;
     options.static_id = true;
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let mut objstm_ns: Vec<i64> = Vec::new();
@@ -1398,12 +1373,11 @@ fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
     ] {
         let source = single_page_with(catalog_extra, trailer_extra);
         let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-        let mut options = WriteOptions::default();
-        options.full_rewrite = true;
+        let mut options = WriterTestSettings::default();
         options.object_streams = ObjectStreamMode::Generate;
         options.static_id = true;
         let mut output = Vec::new();
-        write_pdf_with_options(&mut pdf, &mut output, &options)
+        write_with_settings(&mut pdf, &mut output, &options)
             .unwrap_or_else(|e| panic!("dangling ref ({name}) must not abort generate: {e:?}"));
         // The output must reopen and still resolve the four real objects.
         let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
@@ -1414,3 +1388,7 @@ fn generate_does_not_error_on_dangling_ref_outside_top_level_trailer() {
         );
     }
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

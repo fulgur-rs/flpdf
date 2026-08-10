@@ -11,7 +11,10 @@
 //! `/ID` words were captured from the writer on the exact fixture and pin
 //! byte-stability across changes.
 
-use flpdf::{write_pdf_with_options, ObjectStreamMode, Pdf, WriteOptions};
+mod common;
+
+use common::{write_with_settings, WriterTestSettings};
+use flpdf::{ObjectStreamMode, Pdf};
 #[cfg(not(feature = "qpdf-zlib-compat"))]
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
@@ -56,12 +59,11 @@ fn one_page_with_info_fixture() -> Vec<u8> {
 /// exercises the `XrefForm::Stream` writer arm.
 fn write_xref_stream_deterministic(src: &[u8]) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(src.to_vec())).expect("fixture must open");
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.object_streams = ObjectStreamMode::Generate;
     opts.deterministic_id = true;
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).expect("deterministic xref-stream write");
+    write_with_settings(&mut pdf, &mut out, &opts).expect("deterministic xref-stream write");
     out
 }
 

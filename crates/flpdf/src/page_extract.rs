@@ -7,7 +7,7 @@
 //! convenience form. This mirrors the qpdf *library* pattern of
 //! `QPDF::emptyPDF()` followed by `QPDFPageDocumentHelper::addPage()`: a
 //! **new** document object is constructed and populated here, then written
-//! by a separate writer (`write_pdf` / `write_pdf_with_options`). It is
+//! by a separate [`crate::QPDFWriter`]. It is
 //! deliberately distinct from [`crate::PageDocumentHelper`], whose
 //! `add_page` mutates an already-open document, and from [`crate::pages`],
 //! which owns page-tree traversal.
@@ -107,10 +107,8 @@ impl InheritedAttrs {
 ///
 /// The returned document is already minimal: copied ancestor `/Pages` nodes
 /// left over from the closure are pruned (mark-and-sweep from the new
-/// catalog) before returning. Write it with [`write_pdf`](crate::write_pdf)
-/// or [`write_pdf_with_options`](crate::write_pdf_with_options); enabling
-/// [`WriteOptions::full_rewrite`](crate::WriteOptions::full_rewrite) is
-/// recommended for compaction but is not required for correctness.
+/// catalog) before returning. Write it with [`crate::QPDFWriter`], which always
+/// emits a fresh qpdf-style document rewrite.
 ///
 /// `source` is not modified. See also [`extract_page`] for the single-page
 /// form, and the [module documentation](self) for how references to removed
@@ -121,7 +119,7 @@ impl InheritedAttrs {
 /// ```no_run
 /// use std::fs::File;
 /// use std::io::BufReader;
-/// use flpdf::{extract_pages, write_pdf_with_options, Pdf, WriteOptions};
+/// use flpdf::{extract_pages, Pdf, QPDFWriter};
 ///
 /// let file = BufReader::new(File::open("input.pdf")?);
 /// let mut pdf = Pdf::open(file)?;
@@ -129,10 +127,9 @@ impl InheritedAttrs {
 /// // First and third page (0-based), in selection order.
 /// let mut extracted = extract_pages(&mut pdf, &[0, 2])?;
 ///
-/// let mut options = WriteOptions::default();
-/// options.full_rewrite = true;
-/// let mut out = File::create("extracted.pdf")?;
-/// write_pdf_with_options(&mut extracted, &mut out, &options)?;
+/// let mut writer = QPDFWriter::new(&mut extracted);
+/// writer.set_output_file("extracted.pdf")?;
+/// writer.write()?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///

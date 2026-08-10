@@ -77,13 +77,12 @@ fn build_n_page_pdf(n: u32) -> Vec<u8> {
 /// Serialise a PDF with the canonical full-rewrite + static-id settings so two
 /// independently-constructed (but isomorphic) graphs are byte-comparable.
 fn write_canonical<R: std::io::Read + std::io::Seek>(pdf: &mut flpdf::Pdf<R>) -> Vec<u8> {
-    // `WriteOptions` is `#[non_exhaustive]`, so it cannot be built with a
+    // `WriterTestSettings` is `#[non_exhaustive]`, so it cannot be built with a
     // struct literal from outside the crate; mutate a default instead.
-    let mut opts = flpdf::WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.static_id = true;
     let mut buf = Vec::new();
-    flpdf::write_pdf_with_options(pdf, &mut buf, &opts).expect("write_canonical");
+    write_with_settings(pdf, &mut buf, &opts).expect("write_canonical");
     buf
 }
 
@@ -966,3 +965,7 @@ fn attachment_delete_embedded_file_matches_manual_empty_tree() {
         },
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

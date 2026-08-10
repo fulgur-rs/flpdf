@@ -5,8 +5,7 @@
 //! is a verbatim copy, and a re-encode (the pre-fix behavior) produces different
 //! bytes at flpdf's compression level than the level-9 source.
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{write_pdf_with_options, CompressStreams, NewlineBeforeEndstream, Pdf, WriteOptions};
+use flpdf::{CompressStreams, NewlineBeforeEndstream, Pdf, QPDFWriter};
 use std::path::Path;
 
 const FIXTURE: &str = "lone-flate-l9.pdf";
@@ -41,19 +40,18 @@ fn source_payload() -> Vec<u8> {
     largest_stream_payload(&std::fs::read(fixture_path()).unwrap())
 }
 
-fn plain_rewrite(opts: WriteOptions) -> Vec<u8> {
+fn plain_rewrite(opts: WriterTestSettings) -> Vec<u8> {
     let mut pdf = Pdf::open(std::io::BufReader::new(
         std::fs::File::open(fixture_path()).unwrap(),
     ))
     .unwrap();
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
-fn base_opts() -> WriteOptions {
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+fn base_opts() -> WriterTestSettings {
+    let mut opts = WriterTestSettings::default();
     opts.static_id = true;
     opts.newline_before_endstream = NewlineBeforeEndstream::Never;
     opts
@@ -75,19 +73,14 @@ fn linearized_preserves_lone_flate_verbatim() {
         std::fs::File::open(fixture_path()).unwrap(),
     ))
     .unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(
-        std::fs::File::open(fixture_path()).unwrap(),
-    ))
-    .unwrap();
-    let mut opts = WriteOptions::default();
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_linearization(true);
+    writer.set_deterministic_id(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
     assert_eq!(
-        largest_stream_payload(&doc.bytes),
+        largest_stream_payload(&output),
         source_payload(),
         "linearized output must preserve a lone /FlateDecode stream verbatim"
     );
@@ -128,3 +121,7 @@ fn recompress_flate_reencodes_lone_flate() {
         "re-encoded stream must still declare a single /FlateDecode filter"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

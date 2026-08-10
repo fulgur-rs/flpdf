@@ -21,7 +21,7 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::{Pdf, WriteOptions};
+use flpdf::Pdf;
 use std::sync::Arc;
 
 /// A minimal one-page classic-xref PDF with NO streams and an `/Info`
@@ -136,11 +136,10 @@ fn one_page_non16_id0_fixture() -> Vec<u8> {
 
 fn write_deterministic(fixture: &[u8]) -> Vec<u8> {
     let mut pdf = Pdf::open_mem(Arc::from(fixture)).expect("fixture must open");
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let mut opts = WriterTestSettings::default();
     opts.deterministic_id = true;
     let mut out = Vec::new();
-    flpdf::write_pdf_with_options(&mut pdf, &mut out, &opts).expect("deterministic write");
+    write_with_settings(&mut pdf, &mut out, &opts).expect("deterministic write");
     out
 }
 
@@ -334,3 +333,7 @@ fn deterministic_id_non16_id0_matches_live_qpdf_when_available() {
          byte-identical to qpdf 11.9.0"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

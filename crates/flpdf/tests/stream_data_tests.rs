@@ -13,8 +13,8 @@
 //!       the existing `compress_streams` path (no regression).
 
 use flpdf::{
-    check_reader, filters, write_pdf_with_options, CompressStreams, Dictionary, Object, ObjectRef,
-    Pdf, Stream, StreamDataMode, WriteOptions,
+    check_reader, filters, CompressStreams, Dictionary, Object, ObjectRef, Pdf, Stream,
+    StreamDataMode,
 };
 use std::io::Cursor;
 
@@ -98,16 +98,15 @@ fn extract_stream_obj(pdf_bytes: &[u8]) -> Stream {
 }
 
 /// Run a full rewrite with the given options.
-fn full_rewrite(src: &[u8], opts: &WriteOptions) -> Vec<u8> {
+fn full_rewrite(src: &[u8], opts: &WriterTestSettings) -> Vec<u8> {
     let mut pdf = Pdf::open(Cursor::new(src.to_vec())).expect("open for rewrite");
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, opts).expect("write");
+    write_with_settings(&mut pdf, &mut out, opts).expect("write");
     out
 }
 
-fn base_opts() -> WriteOptions {
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+fn base_opts() -> WriterTestSettings {
+    let mut opts = WriterTestSettings::default();
     opts.static_id = true;
     opts
 }
@@ -300,3 +299,7 @@ fn stream_data_none_falls_back_to_compress_streams() {
          must agree on stream data"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

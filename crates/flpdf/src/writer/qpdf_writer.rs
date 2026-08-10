@@ -204,13 +204,8 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
         self.settings.newline_before_endstream = value;
     }
 
-    pub fn set_minimum_pdf_version(
-        &mut self,
-        version: impl Into<String>,
-        extension_level: i64,
-    ) -> Result<()> {
+    pub fn set_minimum_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
         let version = version.into();
-        validate_pdf_version(&version)?;
         match self.settings.minimum_pdf_version.as_mut() {
             None => self.settings.minimum_pdf_version = Some((version, extension_level)),
             Some((current_version, current_extension_level)) => {
@@ -226,18 +221,11 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
                 }
             }
         }
-        Ok(())
     }
 
-    pub fn force_pdf_version(
-        &mut self,
-        version: impl Into<String>,
-        extension_level: i64,
-    ) -> Result<()> {
+    pub fn force_pdf_version(&mut self, version: impl Into<String>, extension_level: i64) {
         let version = version.into();
-        validate_pdf_version(&version)?;
         self.settings.forced_pdf_version = Some((version, extension_level));
-        Ok(())
     }
 
     pub fn set_extra_header_text(&mut self, text: impl Into<String>) {
@@ -440,15 +428,6 @@ impl<'pdf, R: Read + Seek + 'static> QPDFWriter<'pdf, R> {
         }
         Ok(())
     }
-}
-
-fn validate_pdf_version(version: &str) -> Result<()> {
-    if crate::pdf_version::parse_pdf_version(version).is_none() {
-        return Err(Error::Unsupported(format!(
-            "invalid PDF version: {version}"
-        )));
-    }
-    Ok(())
 }
 
 /// qpdf `QPDFWriter::disableIncompatibleEncryption` for the writer options

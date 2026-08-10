@@ -9,9 +9,8 @@
 //! - [`pages`], [`outline`], and [`fonts`] are traversal helpers built on top of
 //!   `Pdf`. They mirror the read-only inspection surface that `qpdf --show-pages`,
 //!   `--show-outline`, and `--show-fonts` provide.
-//! - [`QPDFWriter`] configures one fresh full-rewrite output with qpdf-shaped
-//!   settings. The older free-function writer surface remains temporarily for
-//!   consumer migration.
+//! - [`QPDFWriter`] configures the one fresh full-rewrite output with qpdf-shaped
+//!   settings.
 //! - [`check_reader`] reports diagnostics gathered during parsing/repair, returning a
 //!   [`CheckReport`] of [`Diagnostic`]s.
 //!
@@ -44,7 +43,7 @@
 //! - **Outline and page-label preservation.** Support scope varies by
 //!   operation:
 //!
-//!   - [`write_pdf`] (with no page selection) preserves both destination
+//!   - [`QPDFWriter`] output (with no page selection) preserves both destination
 //!     sources — the legacy catalog `/Dests` dictionary and the modern
 //!     `/Names /Dests` name tree (ISO 32000-2 §7.9.6, §12.3.2.3); deeply
 //!     nested outlines (walks are iterative); all five `/A` action subtypes
