@@ -57,12 +57,12 @@ Run:
 ```bash
 test ! -e crates/flpdf-cli/tests/incremental_matrix_tests.rs
 test ! -e docs/superpowers/plans/2026-08-10-flpdf-25kg-6-2-incremental-matrix.md
-rg -n "incremental_matrix_tests|flpdf-25kg-6-2-incremental-matrix" crates docs || true
+rg -n "incremental_matrix_tests|flpdf-25kg-6-2-incremental-matrix" crates || true
 git diff --check
 git status --short
 ```
 
-Expected: both `test` commands succeed; `rg` produces no matches for the deleted paths; `git diff --check` succeeds; status lists only the two deletions plus this implementation plan and the design commit's tracked files as applicable.
+Expected: both `test` commands succeed; the consumer/source tree under `crates` has no matches for the deleted paths; historical references in the cleanup design and implementation plan are intentionally outside this scan; `git diff --check` succeeds; status lists only the two deletions plus this implementation plan and the design commit's tracked files as applicable.
 
 - [ ] **Step 4: Commit the focused cleanup**
 
@@ -73,7 +73,7 @@ git add crates/flpdf-cli/tests/incremental_matrix_tests.rs docs/superpowers/plan
 git commit -m "test: remove stale incremental matrix"
 ```
 
-Expected: the commit contains only the two stale deletions and this implementation plan; no production API or writer implementation changes are present.
+Expected: Task 1's cleanup commit contains only the two stale deletions; the cleanup design and implementation plan are separate earlier commits; no production API or writer implementation changes are present.
 
 ### Task 2: Run the replacement verification gates and prepare the PR
 
