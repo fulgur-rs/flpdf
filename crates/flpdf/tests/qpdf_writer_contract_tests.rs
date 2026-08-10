@@ -355,6 +355,104 @@ fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> 
     Ok(pdf)
 }
 
+// qpdf 11.9.0 accepts the direct-array and ref-to-array fixtures below.
+// Separate raw fixtures for ref -> ref -> stream and ref -> ref -> array were
+// probed during this follow-up; qpdf --check rejects both with `expected
+// endobj` and reports that the page Contents is neither a stream nor an array.
+// Those invalid graphs remain covered by synthetic_content_holder_shapes_pdf,
+// whose output is intentionally inspected as bytes without qpdf --check.
+#[derive(Clone, Copy)]
+enum ValidContentsHolderShape {
+    DirectArray,
+    RefArray,
+}
+
+fn valid_contents_holder_shape_pdf(shape: ValidContentsHolderShape) -> Vec<u8> {
+    let (page_contents, extra_objects): (&[u8], Vec<Vec<u8>>) = match shape {
+        ValidContentsHolderShape::DirectArray => (
+            b"[4 0 R 5 0 R]",
+            vec![
+                b"<< /Length 3 >>\nstream\nA\rB\nendstream".to_vec(),
+                b"<< /Length 3 >>\nstream\nC\rD\nendstream".to_vec(),
+            ],
+        ),
+        ValidContentsHolderShape::RefArray => (
+            b"4 0 R",
+            vec![
+                b"[5 0 R 6 0 R]".to_vec(),
+                b"<< /Length 3 >>\nstream\nA\rB\nendstream".to_vec(),
+                b"<< /Length 3 >>\nstream\nC\rD\nendstream".to_vec(),
+            ],
+        ),
+    };
+
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Count 1 /Kids [3 0 R] >>".to_vec(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1 1] /Resources << >> /Contents {} >>",
+            String::from_utf8(page_contents.to_vec()).expect("literal PDF reference syntax")
+        )
+        .into_bytes(),
+    ];
+    objects.extend(extra_objects);
+
+    let mut offsets = Vec::with_capacity(objects.len());
+    for (number, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", number + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+
+    let xref_offset = bytes.len();
+    bytes.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
+fn rewrite_valid_contents_holder_shape(
+    shape: ValidContentsHolderShape,
+) -> flpdf::Result<(Vec<u8>, Vec<u8>)> {
+    qpdf_11_9_0()?;
+    let source = valid_contents_holder_shape_pdf(shape);
+    assert_qpdf_check(&source)?;
+
+    let mut pdf = Pdf::open(Cursor::new(source.clone()))?;
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_static_id(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    Ok((source, writer.get_buffer()?))
+}
+
+fn assert_normalized_content_payloads(output: &[u8], shape: &str) {
+    for payload in [b"A\nB".as_slice(), b"C\nD".as_slice()] {
+        assert!(
+            contains_bytes(output, payload),
+            "{shape} must contain normalized payload {payload:?}"
+        );
+    }
+    assert!(
+        !contains_bytes(output, b"A\rB") && !contains_bytes(output, b"C\rD"),
+        "{shape} must not retain CRLF payloads"
+    );
+}
+
 fn attach_flate_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> ObjectRef {
     let metadata_ref = ObjectRef::new(15, 0);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
@@ -681,9 +779,11 @@ fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
     writer.write()?;
     let output = writer.get_buffer()?;
     // Direct Stream values are valid in flpdf's in-memory Object graph but
-    // cannot be reopened by qpdf as indirect PDF stream objects. Inspect the
-    // emitted QDF bytes here; the ordinary indirect fixture tests above and
-    // below retain qpdf --check coverage for valid serialized PDFs.
+    // cannot be reopened by qpdf as indirect PDF stream objects. This
+    // synthetic graph therefore covers direct streams/arrays and the
+    // ref -> ref -> stream/array cases as byte-level normalization checks;
+    // the ordinary indirect fixture tests above and below retain qpdf
+    // --check coverage for valid serialized PDFs.
     for (shape, normalized) in [
         ("direct Stream", b"P3\nD".as_slice()),
         ("ref -> ref -> Stream", b"P4\nR".as_slice()),
@@ -701,6 +801,24 @@ fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
         );
     }
     assert!(!contains_bytes(&output, b"\r"));
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_normalizes_qpdf_checked_direct_contents_array() -> flpdf::Result<()> {
+    let (_source, output) =
+        rewrite_valid_contents_holder_shape(ValidContentsHolderShape::DirectArray)?;
+    assert_qpdf_check(&output)?;
+    assert_normalized_content_payloads(&output, "direct /Contents array");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_normalizes_qpdf_checked_contents_ref_array() -> flpdf::Result<()> {
+    let (_source, output) =
+        rewrite_valid_contents_holder_shape(ValidContentsHolderShape::RefArray)?;
+    assert_qpdf_check(&output)?;
+    assert_normalized_content_payloads(&output, "/Contents ref -> array");
     Ok(())
 }
 
