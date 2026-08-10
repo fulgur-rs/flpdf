@@ -2271,8 +2271,10 @@ pub(crate) mod tests {
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
     use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
     use std::cell::{Cell, RefCell};
+    use std::env;
     use std::fs;
     use std::io::{Cursor, ErrorKind};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::rc::Rc;
 
@@ -2370,49 +2372,76 @@ pub(crate) mod tests {
             .join(" ")
     }
 
+    const FLPDF_QPDF_BIN: &str = "FLPDF_QPDF_BIN";
     const PINNED_QPDF_BINARY: &str = "/usr/bin/qpdf";
     const PINNED_QPDF_VERSION: &str = "qpdf version 11.9.0";
 
-    fn pinned_qpdf_11_9_0() -> Option<&'static str> {
-        let version = match Command::new(PINNED_QPDF_BINARY).arg("--version").output() {
-            Ok(version) => version,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                eprintln!(
-                    "{PINNED_QPDF_BINARY} unavailable; skipping DCT differential for {PINNED_QPDF_VERSION}"
-                );
-                return None;
+    fn qpdf_candidates() -> Vec<PathBuf> {
+        if let Some(path) = env::var_os(FLPDF_QPDF_BIN) {
+            if !path.is_empty() {
+                return vec![PathBuf::from(path)];
             }
-            Err(error) => panic!("failed to invoke {PINNED_QPDF_BINARY} --version: {error}"),
-        };
-        assert!(
-            version.status.success(),
-            "{PINNED_QPDF_BINARY} --version failed: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
-            version.status,
-            version.stdout.len(),
-            hex_bytes(&version.stdout),
-            version.stderr.len(),
-            hex_bytes(&version.stderr),
-            String::from_utf8_lossy(&version.stderr),
-        );
-        assert!(
-            version.stderr.is_empty(),
-            "{PINNED_QPDF_BINARY} --version wrote stderr: length={} hex={} text={:?}",
-            version.stderr.len(),
-            hex_bytes(&version.stderr),
-            String::from_utf8_lossy(&version.stderr),
-        );
-        let first_line = String::from_utf8_lossy(&version.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_owned();
-        assert_eq!(
-            first_line,
-            PINNED_QPDF_VERSION,
-            "{PINNED_QPDF_BINARY} reported an unexpected qpdf version; stdout={:?}",
-            String::from_utf8_lossy(&version.stdout),
-        );
-        Some(PINNED_QPDF_BINARY)
+        }
+
+        #[cfg(target_os = "linux")]
+        let candidates = vec![PathBuf::from(PINNED_QPDF_BINARY), PathBuf::from("qpdf")];
+        #[cfg(not(target_os = "linux"))]
+        let candidates = vec![PathBuf::from("qpdf")];
+        candidates
+    }
+
+    fn pinned_qpdf_11_9_0() -> Option<PathBuf> {
+        let candidates = qpdf_candidates();
+        for (index, candidate) in candidates.iter().enumerate() {
+            let candidate_display = candidate.display().to_string();
+            let version = match Command::new(candidate).arg("--version").output() {
+                Ok(version) => version,
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound && index + 1 < candidates.len() =>
+                {
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    eprintln!(
+                        "{candidate_display} unavailable; skipping DCT differential for {PINNED_QPDF_VERSION}"
+                    );
+                    return None;
+                }
+                Err(error) => panic!(
+                    "failed to invoke {candidate_display} --version for {PINNED_QPDF_VERSION}: {error}"
+                ),
+            };
+
+            assert!(
+                version.status.success(),
+                "{candidate_display} --version failed while checking {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+                version.status,
+                version.stdout.len(),
+                hex_bytes(&version.stdout),
+                version.stderr.len(),
+                hex_bytes(&version.stderr),
+                String::from_utf8_lossy(&version.stderr),
+            );
+            assert!(
+                version.stderr.is_empty(),
+                "{candidate_display} --version wrote stderr while checking {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+                version.stderr.len(),
+                hex_bytes(&version.stderr),
+                String::from_utf8_lossy(&version.stderr),
+            );
+            let version_stdout = String::from_utf8_lossy(&version.stdout);
+            let first_line = version_stdout.lines().next().unwrap_or_default();
+            assert_eq!(
+                first_line,
+                PINNED_QPDF_VERSION,
+                "{candidate_display} reported an unexpected qpdf version; expected {PINNED_QPDF_VERSION}, stdout length={} hex={} text={version_stdout:?}",
+                version.stdout.len(),
+                hex_bytes(&version.stdout),
+            );
+            return Some(candidate.clone());
+        }
+
+        unreachable!("qpdf candidate list must contain at least the PATH qpdf candidate")
     }
 
     #[cfg(feature = "qpdf-libjpeg-compat")]
@@ -4783,10 +4812,11 @@ pub(crate) mod tests {
         assert_eq!(sink.finishes, 1);
     }
 
-    /// The oracle is the pinned `/usr/bin/qpdf` 11.9.0 executable. Its
-    /// `--version` output is asserted before the real-PDF probe; only an absent
-    /// `/usr/bin/qpdf` skips this test. qpdf 11.9.0 consumes `/DCTDecode` at
-    /// `decode-level=all`:
+    /// The oracle is qpdf 11.9.0. On Linux the resolver prefers the pinned
+    /// `/usr/bin/qpdf`, otherwise it uses PATH `qpdf`; `FLPDF_QPDF_BIN` is an
+    /// explicit override. Every selected executable is checked with
+    /// `--version` before the real-PDF probe, and only an absent candidate skips
+    /// this test. qpdf 11.9.0 consumes `/DCTDecode` at `decode-level=all`:
     /// `SF_DCTDecode` (`SF_DCTDecode.hh:8-40`) constructs `Pl_DCT`, whose
     /// `decompress` path (`Pl_DCT.cc:298-326`) writes libjpeg scanline bytes to
     /// the next pipeline. The real-PDF probe below pins that source/behavior
@@ -4797,23 +4827,65 @@ pub(crate) mod tests {
             Some(qpdf) => qpdf,
             None => return,
         };
+        let qpdf_display = qpdf.display().to_string();
+        eprintln!("DCT qpdf differential using {qpdf_display} ({PINNED_QPDF_VERSION})");
         let jpeg = test_jpeg();
         let directory = dct_qpdf_fixture(&jpeg);
         let fixture = directory.path().join("dct-image.pdf");
-        let output = Command::new(qpdf)
+        let check = Command::new(&qpdf)
+            .arg("--check")
+            .arg(&fixture)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("failed to invoke {qpdf_display} --check for {PINNED_QPDF_VERSION}: {error}")
+            });
+        let check_stdout_hex = hex_bytes(&check.stdout);
+        let check_stderr_hex = hex_bytes(&check.stderr);
+        assert!(
+            check.status.success(),
+            "qpdf --check failed for {qpdf_display} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+            check.status,
+            check.stdout.len(),
+            check_stdout_hex,
+            check.stderr.len(),
+            check_stderr_hex,
+            String::from_utf8_lossy(&check.stderr),
+        );
+        assert!(
+            check.stderr.is_empty(),
+            "qpdf --check wrote stderr for {qpdf_display} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+            check.stderr.len(),
+            check_stderr_hex,
+            String::from_utf8_lossy(&check.stderr),
+        );
+        let output = Command::new(&qpdf)
             .arg("--show-object=3")
             .arg("--filtered-stream-data")
             .arg(&fixture)
             .output()
-            .unwrap_or_else(|error| panic!("failed to invoke {qpdf} DCT differential: {error}"));
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to invoke {qpdf_display} DCT differential for {PINNED_QPDF_VERSION}: {error}"
+                )
+            });
         let canonical = canonical_dct_bytes(&jpeg);
         let qpdf_stdout_hex = hex_bytes(&output.stdout);
         let qpdf_stderr_hex = hex_bytes(&output.stderr);
         let canonical_hex = hex_bytes(&canonical);
+        eprintln!(
+            "DCT qpdf probe {qpdf_display} ({PINNED_QPDF_VERSION}): --check status={:?} stdout={} stderr={}; filtered status={:?} stdout={} stderr={}; canonical={}",
+            check.status,
+            check.stdout.len(),
+            check.stderr.len(),
+            output.status,
+            output.stdout.len(),
+            output.stderr.len(),
+            canonical.len(),
+        );
 
         assert!(
             output.status.success(),
-            "qpdf DCT differential failed for {qpdf} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
+            "qpdf DCT differential failed for {qpdf_display} {PINNED_QPDF_VERSION}: status={:?}\nstdout length={} hex={}\nstderr length={} hex={} text={:?}",
             output.status,
             output.stdout.len(),
             qpdf_stdout_hex,
@@ -4823,7 +4895,7 @@ pub(crate) mod tests {
         );
         assert!(
             output.stderr.is_empty(),
-            "qpdf DCT differential wrote stderr for {qpdf} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
+            "qpdf DCT differential wrote stderr for {qpdf_display} {PINNED_QPDF_VERSION}: length={} hex={} text={:?}",
             output.stderr.len(),
             qpdf_stderr_hex,
             String::from_utf8_lossy(&output.stderr),
@@ -4831,7 +4903,7 @@ pub(crate) mod tests {
         assert_eq!(
             output.stdout,
             canonical,
-            "qpdf DCT differential mismatch for {qpdf} {PINNED_QPDF_VERSION}\nqpdf stdout length={} hex={}\ncanonical DctSink length={} hex={}",
+            "qpdf DCT differential mismatch for {qpdf_display} {PINNED_QPDF_VERSION}\nqpdf stdout length={} hex={}\ncanonical DctSink length={} hex={}",
             output.stdout.len(),
             qpdf_stdout_hex,
             canonical.len(),

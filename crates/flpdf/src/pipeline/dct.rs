@@ -1,5 +1,4 @@
-//! qpdf correspondence: `Pl_DCT` buffers compressed input and decodes it on
-//! `finish`, emitting one decoded scanline at a time to the next pipeline.
+//! qpdf correspondence: `Pl_DCT` buffers compressed input and decodes it on `finish`, emitting one decoded scanline at a time to the next pipeline.
 
 use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineResult};
