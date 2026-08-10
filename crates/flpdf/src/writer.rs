@@ -2241,6 +2241,10 @@ pub fn write_qdf<R: Read + Seek, W: Write>(pdf: &mut Pdf<R>, out: W) -> Result<(
     let options = WriteOptions {
         qdf: true,
         full_rewrite: true,
+        // The legacy wrapper bypasses QPDFWriter's setter-aware setup. Keep
+        // qpdf's QDF default explicit here: page /Contents streams are
+        // normalized even when callers use this older free function.
+        content_normalization: true,
         ..WriteOptions::default()
     };
     write_pdf_with_options(pdf, out, &options)
@@ -3019,8 +3023,45 @@ pub(crate) fn reencode_stream_for_compress(
     if let Some(eol) = recovered_stream_eol {
         stream.data.extend_from_slice(eol);
     }
+    // qpdf's QPDFWriter always writes cleartext `/Type /Metadata` streams
+    // through the uncompress path (QPDFWriter.cc:1251-1281), even when the
+    // global writer requested compression or stream-data preservation. Limit
+    // this override to the QPDFWriter/legacy-QDF bridge; the plain and
+    // linearization callers retain their established metadata refiltering
+    // path. Metadata is not page content, so it must never receive
+    // content-token normalization. The encryption layer applies any
+    // requested payload encryption after this decision; the cleartext metadata
+    // exemption is handled there.
+    let metadata_is_cleartext = options
+        .encrypt
+        .as_ref()
+        .is_none_or(|params| !params.encrypt_metadata)
+        && options.copy_encryption.as_ref().is_none_or(|source| {
+            source
+                .encrypt_dict
+                .get("EncryptMetadata")
+                .and_then(Object::as_bool)
+                .is_none_or(|encrypt_metadata| !encrypt_metadata)
+        });
+    let is_metadata_stream = metadata_is_cleartext
+        && (options.qdf || options.qdf_stream_policy_precomputed)
+        && matches!(
+            stream.dict.get("Type"),
+            Some(Object::Name(name)) if name.as_slice() == b"Metadata"
+        );
+    let stream_policy = if is_metadata_stream {
+        Some(CompressStreams::No)
+    } else {
+        effective_stream_policy(options)
+    };
+    let stream_decode_level = if is_metadata_stream {
+        DecodeLevel::All
+    } else {
+        options.decode_level
+    };
+    let stream_normalization = normalize_content && !is_metadata_stream;
     let source_filter_is_lone_flate = is_lone_flate(stream.dict.get("Filter"));
-    let mut reencoded = match effective_stream_policy(options) {
+    let mut reencoded = match stream_policy {
         // qpdf preserves an already-lone-/FlateDecode stream verbatim under the
         // compress policy (no decode + re-encode) unless recompression is
         // explicitly requested. Normalize /Length to the raw data length (a
@@ -3034,7 +3075,8 @@ pub(crate) fn reencode_stream_for_compress(
         Some(CompressStreams::Yes)
             if source_filter_is_lone_flate
                 && !options.recompress_flate
-                && !normalize_content
+                && !stream_normalization
+                && !is_metadata_stream
                 && stream.dict.get("F").is_none() =>
         {
             let mut stream = stream;
@@ -3045,8 +3087,8 @@ pub(crate) fn reencode_stream_for_compress(
         Some(compress_policy) => apply_stream_compress_policy_with_decode_level(
             &stream,
             compress_policy,
-            options.decode_level,
-            normalize_content,
+            stream_decode_level,
+            stream_normalization,
         ),
         // Preserve mode: keep the raw bytes verbatim (no decode/re-encode), but
         // still normalize /Length to a direct integer of the raw byte count.
@@ -3064,7 +3106,8 @@ pub(crate) fn reencode_stream_for_compress(
     };
     if qpdf_plain_empty_refilter
         && !source_filter_is_lone_flate
-        && matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
+        && !is_metadata_stream
+        && matches!(stream_policy, Some(CompressStreams::Yes))
     {
         let reencoded_stream = reencoded
             .as_stream_mut()
@@ -3704,76 +3747,42 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
     // "%% Original object ID:" and are NOT suppressed by
     // no_original_object_ids. Mirrors qpdf 11.9.0 QPDFWriter.cc:1774-1785.
     //
-    // Small local enum: describe the /Contents shape without cloning the
-    // resolved Object graph (Stream bodies, direct dict/array subtrees).
-    enum ContentsForSeq {
-        Indirect(ObjectRef),
-        DirectRefArray(Vec<ObjectRef>),
-    }
-    let (page_seq, contents_seq): (HashMap<ObjectRef, u32>, HashMap<ObjectRef, u32>) =
-        if options.qdf || options.content_normalization {
-            let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
-            let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
-            let page_refs = crate::pages::page_refs(pdf)?;
-            for (idx, page_ref) in page_refs.iter().enumerate() {
-                let seq = (idx as u32).saturating_add(1);
-                if options.qdf {
-                    page_seq.insert(*page_ref, seq);
-                }
-                // Extract /Contents while cloning only the reference structure
-                // we actually need (a single ObjectRef, or a Vec of ObjectRefs).
-                // Never clone an Object::Stream body or non-Reference Array
-                // elements — an inline /Contents Stream can be arbitrarily large
-                // and dropping its data on the floor is fine here because we
-                // only tag INDIRECT streams (a direct/inline Stream has no
-                // ObjectRef to insert into contents_seq).
-                let contents_kind: Option<ContentsForSeq> = match pdf.resolve_borrowed(*page_ref)? {
-                    Object::Dictionary(d) => match d.get("Contents") {
-                        Some(Object::Reference(r)) => Some(ContentsForSeq::Indirect(*r)),
-                        Some(Object::Array(items)) => Some(ContentsForSeq::DirectRefArray(
-                            items
-                                .iter()
-                                .filter_map(|it| match it {
-                                    Object::Reference(r) => Some(*r),
-                                    _ => None,
-                                })
-                                .collect(),
-                        )),
-                        _ => None,
-                    },
-                    _ => None, // cov:ignore: page_refs() only returns refs to Page dicts by construction, so a non-Dictionary resolution is unreachable in valid PDFs; retained as a defensive fallthrough.
-                };
-                match contents_kind {
-                    // Indirect /Contents: resolve the ref borrowed. If it lands
-                    // on an Array, iterate its Reference elements; otherwise
-                    // (Stream / etc.) the outer ref IS the content stream.
-                    Some(ContentsForSeq::Indirect(outer)) => match pdf.resolve_borrowed(outer)? {
-                        Object::Array(items) => {
-                            for item in items {
-                                if let Object::Reference(r) = item {
-                                    contents_seq.insert(*r, seq);
-                                }
-                            }
-                        }
-                        Object::Stream(_) => {
-                            contents_seq.insert(outer, seq);
-                        }
-                        _ => {}
-                    },
-                    // Direct /Contents Array — refs were already extracted
-                    // above (Copy semantics; no Object clone).
-                    Some(ContentsForSeq::DirectRefArray(refs)) => {
-                        for r in refs {
-                            contents_seq.insert(r, seq);
-                        }
-                    }
-                    None => {}
+    // `contents_seq` contains only terminal indirect stream refs returned by
+    // the shared page-content resolver. `content_container_refs` identifies
+    // page dictionaries and indirect array holders that contain direct Stream
+    // values; those values have no ObjectRef of their own and must be
+    // normalized in the containing object during emission.
+    let (page_seq, contents_seq, content_container_refs): (
+        HashMap<ObjectRef, u32>,
+        HashMap<ObjectRef, u32>,
+        BTreeSet<ObjectRef>,
+    ) = if options.qdf || options.content_normalization {
+        let mut page_seq: HashMap<ObjectRef, u32> = HashMap::new();
+        let mut contents_seq: HashMap<ObjectRef, u32> = HashMap::new();
+        let mut content_container_refs = BTreeSet::new();
+        let page_refs = crate::pages::page_refs(pdf)?;
+        for (idx, page_ref) in page_refs.iter().enumerate() {
+            let seq = (idx as u32).saturating_add(1);
+            if options.qdf {
+                page_seq.insert(*page_ref, seq);
+            }
+            // Reuse the page API's full holder-chain traversal for the
+            // terminal `(ObjectRef, Stream)` pairs. This covers a direct
+            // stream, ref -> ref -> stream, direct arrays, and arrays
+            // whose elements themselves use holder chains.
+            for (terminal_ref, _) in
+                crate::pages::page_content_stream_entries_tolerant(pdf, *page_ref)?
+            {
+                if let Some(terminal_ref) = terminal_ref {
+                    contents_seq.insert(terminal_ref, seq);
                 }
             }
-            (page_seq, contents_seq)
-        } else {
-            (HashMap::new(), HashMap::new())
-        };
+            collect_content_container_refs(pdf, *page_ref, &mut content_container_refs)?;
+        }
+        (page_seq, contents_seq, content_container_refs)
+    } else {
+        (HashMap::new(), HashMap::new(), BTreeSet::new())
+    };
 
     // In QDF mode, /Root's ref in the trailer is in emission-space; rebind
     // new_root from the qdf_emission_renumber map so remap_trailer_refs and the
@@ -3843,6 +3852,14 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             crate::rewrite_renumber::renumber_qpdf_refs_in_place(pdf, &mut object, &renumber)?;
         } else {
             crate::rewrite_renumber::renumber_refs_in_place(&mut object, &renumber)?;
+        }
+
+        // Direct `/Contents` streams have no terminal ObjectRef to put in
+        // `contents_seq`. Normalize only the page dictionary or indirect
+        // array holder that owns those direct values; all referenced terminal
+        // streams continue through the exact terminal-ref gate below.
+        if options.content_normalization && content_container_refs.contains(old_ref) {
+            normalize_direct_content_values(&mut object, options);
         }
 
         // Skip xref-stream container objects — we'll rebuild the xref from
@@ -4665,6 +4682,121 @@ pub(crate) fn is_lone_flate(filter: Option<&Object>) -> bool {
     match filter {
         Some(Object::Name(name)) => name.as_slice() == b"FlateDecode" || name.as_slice() == b"Fl",
         _ => false,
+    }
+}
+
+/// Collect indirect objects that can contain direct streams inside a page's
+/// `/Contents` value. Terminal indirect streams are tracked separately by
+/// [`crate::pages::page_content_stream_entries_tolerant`]; this helper only
+/// records page dictionaries and indirect array holders so the emission loop
+/// can replace their direct Stream values in place.
+fn collect_content_container_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+    containers: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    enum ContentsValue {
+        DirectStream,
+        DirectArray(Vec<ObjectRef>),
+        Indirect(ObjectRef),
+    }
+    let contents = match pdf.resolve_borrowed(page_ref)? {
+        Object::Dictionary(dict) => match dict.get("Contents") {
+            Some(Object::Stream(_)) => Some(ContentsValue::DirectStream),
+            Some(Object::Array(items)) => Some(ContentsValue::DirectArray(
+                items.iter().filter_map(Object::as_ref_id).collect(),
+            )),
+            Some(Object::Reference(reference)) => Some(ContentsValue::Indirect(*reference)),
+            _ => None,
+        },
+        _ => None,
+    };
+    match contents {
+        Some(ContentsValue::DirectStream) => {
+            containers.insert(page_ref);
+        }
+        Some(ContentsValue::DirectArray(refs)) => {
+            containers.insert(page_ref);
+            for reference in refs {
+                collect_content_array_holder_refs(pdf, reference, containers)?;
+            }
+        }
+        Some(ContentsValue::Indirect(reference)) => {
+            collect_content_array_holder_refs(pdf, reference, containers)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Follow one `/Contents` holder chain until it reaches an array or stream.
+/// When it reaches an array, retain the array holder and inspect its reference
+/// elements for nested array holders. Direct stream elements are handled when
+/// their containing array object is emitted.
+fn collect_content_array_holder_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    start: ObjectRef,
+    containers: &mut BTreeSet<ObjectRef>,
+) -> Result<()> {
+    let mut current = start;
+    for _ in 0..crate::ref_chain::MAX_REF_CHAIN_DEPTH {
+        let next = match pdf.resolve_borrowed(current)? {
+            Object::Reference(next) => Some(*next),
+            Object::Array(items) => {
+                if !containers.insert(current) {
+                    return Ok(());
+                }
+                let refs: Vec<ObjectRef> = items.iter().filter_map(Object::as_ref_id).collect();
+                for reference in refs {
+                    collect_content_array_holder_refs(pdf, reference, containers)?;
+                }
+                return Ok(());
+            }
+            Object::Stream(_) => return Ok(()),
+            _ => return Ok(()),
+        };
+        current = next.expect("reference arm always returns a next ref");
+    }
+    Ok(())
+}
+
+/// Normalize only direct Stream values in a page `/Contents` dictionary or an
+/// indirect `/Contents` array holder. References are deliberately left alone:
+/// their terminal stream is emitted through `contents_seq`, which keeps
+/// normalization aligned with the shared page resolver.
+fn normalize_direct_content_values(object: &mut Object, options: &WriteOptions) {
+    match object {
+        Object::Dictionary(dict) => {
+            if let Some(mut contents) = dict.remove("Contents") {
+                normalize_direct_content_value(&mut contents, options);
+                dict.insert("Contents", contents);
+            }
+        }
+        Object::Array(items) => {
+            for item in items {
+                normalize_direct_content_value(item, options);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_direct_content_value(value: &mut Object, options: &WriteOptions) {
+    match value {
+        Object::Stream(stream) => {
+            let (normalized, _) =
+                reencode_stream_for_compress(stream.clone(), options, false, None, true);
+            let Object::Stream(normalized) = normalized else {
+                unreachable!("stream compression always returns a stream")
+            };
+            *stream = normalized;
+        }
+        Object::Array(items) => {
+            for item in items {
+                normalize_direct_content_value(item, options);
+            }
+        }
+        _ => {}
     }
 }
 

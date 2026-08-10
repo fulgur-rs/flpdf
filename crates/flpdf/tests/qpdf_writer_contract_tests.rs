@@ -8,8 +8,8 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::pipeline::{Pipeline, PipelineResult};
 use flpdf::{
-    apply_stream_compress_policy, write_pdf, CompressStreams, DecodeLevel, Dictionary, Object,
-    ObjectRef, ObjectStreamMode, Pdf, QPDFWriter, Stream, StreamDataMode,
+    apply_stream_compress_policy, pages, write_pdf, write_qdf, CompressStreams, DecodeLevel,
+    Dictionary, Object, ObjectRef, ObjectStreamMode, Pdf, QPDFWriter, Stream, StreamDataMode,
 };
 
 #[derive(Clone)]
@@ -236,6 +236,154 @@ fn synthetic_null_filter_contents_pdf() -> Vec<u8> {
     bytes
 }
 
+fn direct_content_stream() -> Stream {
+    let mut dict = Dictionary::new();
+    dict.insert("Length", Object::Integer(3));
+    Stream::new(dict, b"A\rB".to_vec())
+}
+
+fn page_object(contents: Object) -> Object {
+    let mut dict = Dictionary::new();
+    dict.insert("Type", Object::Name(b"Page".to_vec()));
+    dict.insert("Parent", Object::Reference(ObjectRef::new(2, 0)));
+    dict.insert(
+        "MediaBox",
+        Object::Array(vec![
+            Object::Integer(0),
+            Object::Integer(0),
+            Object::Integer(1),
+            Object::Integer(1),
+        ]),
+    );
+    dict.insert("Resources", Object::Dictionary(Dictionary::new()));
+    dict.insert("Contents", contents);
+    Object::Dictionary(dict)
+}
+
+fn synthetic_content_holder_shapes_pdf() -> flpdf::Result<Pdf<Cursor<Vec<u8>>>> {
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf(false)))?;
+    let direct_stream = direct_content_stream();
+
+    // Page 3: direct /Contents Stream.
+    pdf.set_object(
+        ObjectRef::new(3, 0),
+        page_object(Object::Stream(direct_stream.clone())),
+    );
+
+    // Page 5: direct /Contents array whose element is ref -> ref -> Stream.
+    pdf.set_object(
+        ObjectRef::new(5, 0),
+        page_object(Object::Array(vec![Object::Reference(ObjectRef::new(
+            11, 0,
+        ))])),
+    );
+    pdf.set_object(
+        ObjectRef::new(11, 0),
+        Object::Reference(ObjectRef::new(12, 0)),
+    );
+    pdf.set_object(ObjectRef::new(12, 0), Object::Stream(direct_stream.clone()));
+
+    // Page 6: direct /Contents array containing a direct Stream.
+    pdf.set_object(
+        ObjectRef::new(6, 0),
+        page_object(Object::Array(vec![Object::Stream(direct_stream.clone())])),
+    );
+
+    // Page 4: /Contents ref -> ref -> Stream.
+    pdf.set_object(
+        ObjectRef::new(4, 0),
+        page_object(Object::Reference(ObjectRef::new(8, 0))),
+    );
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Reference(ObjectRef::new(9, 0)),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), Object::Stream(direct_stream.clone()));
+
+    // Page 7: /Contents ref -> ref -> Array containing a direct Stream and
+    // an array element ref -> ref -> Stream.
+    pdf.set_object(
+        ObjectRef::new(7, 0),
+        page_object(Object::Reference(ObjectRef::new(13, 0))),
+    );
+    pdf.set_object(
+        ObjectRef::new(13, 0),
+        Object::Array(vec![
+            Object::Stream(direct_stream.clone()),
+            Object::Reference(ObjectRef::new(14, 0)),
+        ]),
+    );
+    pdf.set_object(
+        ObjectRef::new(14, 0),
+        Object::Reference(ObjectRef::new(15, 0)),
+    );
+    pdf.set_object(ObjectRef::new(15, 0), Object::Stream(direct_stream));
+
+    let pages_ref = ObjectRef::new(2, 0);
+    let mut pages = pdf.resolve(pages_ref)?.clone();
+    let pages_dict = pages.as_dict_mut().expect("pages dictionary");
+    pages_dict.insert("Count", Object::Integer(5));
+    pages_dict.insert(
+        "Kids",
+        Object::Array(
+            [3, 4, 5, 6, 7]
+                .into_iter()
+                .map(|number| Object::Reference(ObjectRef::new(number, 0)))
+                .collect(),
+        ),
+    );
+    pdf.set_object(pages_ref, pages);
+    Ok(pdf)
+}
+
+fn attach_flate_metadata(pdf: &mut Pdf<Cursor<Vec<u8>>>, payload: &[u8]) -> ObjectRef {
+    let metadata_ref = ObjectRef::new(15, 0);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
+    encoder
+        .write_all(payload)
+        .expect("zlib encoder accepts fixture data");
+    let metadata_data = encoder.finish().expect("zlib encoder finishes");
+    let mut metadata_dict = Dictionary::new();
+    metadata_dict.insert("Type", Object::Name(b"Metadata".to_vec()));
+    metadata_dict.insert("Subtype", Object::Name(b"XML".to_vec()));
+    metadata_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+    metadata_dict.insert(
+        "Length",
+        Object::Integer(i64::try_from(metadata_data.len()).expect("small fixture")),
+    );
+    pdf.set_object(
+        metadata_ref,
+        Object::Stream(Stream::new(metadata_dict, metadata_data)),
+    );
+    let root_ref = pdf.root_ref().expect("catalog reference");
+    let mut catalog = pdf.resolve(root_ref).expect("catalog must resolve").clone();
+    catalog
+        .as_dict_mut()
+        .expect("catalog dictionary")
+        .insert("Metadata", Object::Reference(metadata_ref));
+    pdf.set_object(root_ref, catalog);
+    metadata_ref
+}
+
+fn metadata_snapshot(bytes: Vec<u8>) -> (Option<Object>, Vec<u8>) {
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("rewritten PDF must reopen");
+    let root_ref = pdf.root_ref().expect("catalog reference");
+    let metadata_ref = pdf
+        .resolve(root_ref)
+        .expect("catalog must resolve")
+        .as_dict()
+        .expect("catalog must be a dictionary")
+        .get_ref("Metadata")
+        .expect("catalog must reference metadata");
+    let metadata = pdf
+        .resolve(metadata_ref)
+        .expect("metadata must resolve")
+        .as_stream()
+        .expect("metadata must be a stream")
+        .clone();
+    (metadata.dict.get("Filter").cloned(), metadata.data)
+}
+
 fn assert_qpdf_check(bytes: &[u8]) -> flpdf::Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("qpdf-writer-contract.pdf");
@@ -413,6 +561,66 @@ fn qpdf_writer_full_rewrite_removes_prev_from_incremental_source() -> flpdf::Res
         .arg(&output_path)
         .output()?;
     assert!(check.status.success(), "qpdf --check failed: {check:?}");
+    Ok(())
+}
+
+#[test]
+fn legacy_write_qdf_normalizes_crlf_page_contents() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
+    let mut output = Vec::new();
+    write_qdf(&mut pdf, &mut output)?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, data) = runlength_contents_snapshot(output);
+    assert_eq!(filter, None);
+    assert_eq!(data, b"A\nB");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_normalizes_every_page_contents_shape() -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = synthetic_content_holder_shapes_pdf()?;
+
+    let source_pages = pages::page_refs(&mut pdf)?;
+    let terminal_refs: Vec<_> = source_pages
+        .iter()
+        .map(|page_ref| {
+            pages::page_content_stream_entries_tolerant(&mut pdf, *page_ref).map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(reference, _)| reference)
+                    .collect()
+            })
+        })
+        .collect::<flpdf::Result<Vec<Vec<_>>>>()?;
+    assert_eq!(terminal_refs[0], vec![None]);
+    assert_eq!(terminal_refs[1], vec![Some(ObjectRef::new(9, 0))]);
+    assert_eq!(terminal_refs[2], vec![Some(ObjectRef::new(12, 0))]);
+    assert_eq!(terminal_refs[3], vec![None]);
+    assert_eq!(terminal_refs[4], vec![None, Some(ObjectRef::new(15, 0))]);
+
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    // Direct Stream values are valid in flpdf's in-memory Object graph but
+    // cannot be reopened by qpdf as indirect PDF stream objects. Inspect the
+    // emitted QDF bytes here; the ordinary indirect fixture tests above and
+    // below retain qpdf --check coverage for valid serialized PDFs.
+    assert!(!contains_bytes(&output, b"A\rB"));
+    assert_eq!(
+        output
+            .windows(3)
+            .filter(|window| *window == b"A\nB")
+            .count(),
+        6
+    );
     Ok(())
 }
 
@@ -917,6 +1125,30 @@ fn qpdf_writer_qdf_preserves_explicit_compression_setting() -> flpdf::Result<()>
     let (filter, decoded) = decoded_runlength_snapshot(output)?;
     assert_eq!(filter, Some(Object::Name(b"FlateDecode".to_vec())));
     assert_eq!(decoded, b"ABC");
+    Ok(())
+}
+
+#[test]
+fn qpdf_writer_qdf_explicit_compression_uncompresses_metadata_without_normalizing(
+) -> flpdf::Result<()> {
+    qpdf_11_9_0()?;
+    let mut pdf = Pdf::open(Cursor::new(synthetic_flate_contents_pdf_with_payload(
+        false, b"A\rB",
+    )))?;
+    attach_flate_metadata(&mut pdf, b"M\rN");
+
+    let mut writer = QPDFWriter::new(&mut pdf);
+    writer.set_object_stream_mode(ObjectStreamMode::Disable);
+    writer.set_qdf_mode(true);
+    writer.set_compress_streams(true);
+    writer.set_output_memory()?;
+    writer.write()?;
+    let output = writer.get_buffer()?;
+    assert_qpdf_check(&output)?;
+
+    let (filter, data) = metadata_snapshot(output);
+    assert_eq!(filter, None);
+    assert_eq!(data, b"M\rN");
     Ok(())
 }
 
