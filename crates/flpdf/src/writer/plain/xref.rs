@@ -271,18 +271,15 @@ fn written_xref_table(
 ) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let mut result = BTreeMap::new();
     for number in 1..size {
-        match layout.uncompressed.get(&number) {
-            Some(&(_generation, offset)) => {
-                result.insert(
-                    ObjectRef::new(number, 0),
-                    XrefEntry::Uncompressed {
-                        offset: u64::try_from(offset).map_err(|_| {
-                            crate::Error::Unsupported("xref offset does not fit u64".to_string())
-                        })?,
-                    },
-                );
-            }
-            None => {}
+        if let Some(&(_generation, offset)) = layout.uncompressed.get(&number) {
+            result.insert(
+                ObjectRef::new(number, 0),
+                XrefEntry::Uncompressed {
+                    offset: u64::try_from(offset).map_err(|_| {
+                        crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                    })?,
+                },
+            );
         }
     }
     Ok(result)

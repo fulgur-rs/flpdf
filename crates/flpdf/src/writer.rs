@@ -4212,20 +4212,17 @@ fn write_pdf_full_rewrite_inner<R: Read + Seek, W: Write>(
             }
             for number in 1..object_count {
                 let object_number = number as u32;
-                match offsets.get(&object_number) {
-                    Some(&(_generation, offset)) => {
-                        written_xref.insert(
-                            ObjectRef::new(object_number, 0),
-                            XrefEntry::Uncompressed {
-                                offset: u64::try_from(offset).map_err(|_| {
-                                    crate::Error::Unsupported(
-                                        "xref offset does not fit u64".to_string(),
-                                    )
-                                })?,
-                            },
-                        );
-                    }
-                    None => {}
+                if let Some(&(_generation, offset)) = offsets.get(&object_number) {
+                    written_xref.insert(
+                        ObjectRef::new(object_number, 0),
+                        XrefEntry::Uncompressed {
+                            offset: u64::try_from(offset).map_err(|_| {
+                                crate::Error::Unsupported(
+                                    "xref offset does not fit u64".to_string(),
+                                )
+                            })?,
+                        },
+                    );
                 }
             }
 
