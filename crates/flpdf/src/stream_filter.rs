@@ -2287,6 +2287,22 @@ pub(crate) mod tests {
         .expect("test JPEG must encode")
     }
 
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    fn test_late_truncated_jpeg() -> Vec<u8> {
+        let pixels: Vec<u8> = (0..(16 * 16 * 3))
+            .map(|value| (value % 256) as u8)
+            .collect();
+        libjpeg_turbo_rs::compress(
+            &pixels,
+            16,
+            16,
+            libjpeg_turbo_rs::PixelFormat::Rgb,
+            75,
+            libjpeg_turbo_rs::Subsampling::S444,
+        )
+        .expect("late-truncation test JPEG must encode")
+    }
+
     fn test_grayscale_jpeg() -> Vec<u8> {
         libjpeg_turbo_rs::compress(
             &[64u8, 192],
@@ -4712,7 +4728,13 @@ pub(crate) mod tests {
             };
 
             assert!(matches!(error, PipelineError::Runtime(_)));
+            #[cfg(not(feature = "qpdf-libjpeg-compat"))]
             assert_eq!(error.to_string(), "DCT decode: unexpected marker: 0xFF6F");
+            #[cfg(feature = "qpdf-libjpeg-compat")]
+            assert_eq!(
+                error.to_string(),
+                "DCT decode: Not a JPEG file: starts with 0x6e 6f"
+            );
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
@@ -4739,12 +4761,45 @@ pub(crate) mod tests {
             };
 
             assert!(matches!(error, PipelineError::Runtime(_)));
+            #[cfg(not(feature = "qpdf-libjpeg-compat"))]
             assert_eq!(error.to_string(), "DCT decode: unexpected end of data");
+            #[cfg(feature = "qpdf-libjpeg-compat")]
+            assert_eq!(error.to_string(), "DCT decode: Premature end of input file");
             assert!(sink.writes.is_empty());
             assert_eq!(sink.write_attempts, 0);
             assert_eq!(sink.finishes, 0);
             assert_eq!(sink.finish_attempts, 0);
         }
+    }
+
+    #[cfg(feature = "qpdf-libjpeg-compat")]
+    #[test]
+    fn dct_compat_rejects_late_truncation_after_scanline_output() {
+        let jpeg = test_late_truncated_jpeg();
+        assert_eq!(&jpeg[jpeg.len() - 2..], [0xff, 0xd9]);
+
+        let mut filter = stream_filter_for(b"DCTDecode").expect("registered DCT filter");
+        assert!(filter.set_decode_params(&DecodeParams::Absent));
+        let mut sink = DctSink::default();
+        let error = {
+            let mut stage = filter
+                .decode_pipeline(&mut sink)
+                .expect("DCT stage construction must succeed")
+                .expect("DCT filter must contribute a decode stage");
+            stage
+                .write(&jpeg[..jpeg.len() - 2])
+                .expect("late-truncated JPEG must buffer");
+            stage
+                .finish()
+                .expect_err("missing EOI must be a codec error")
+        };
+
+        // The C source must report EOF only after libjpeg has emitted its
+        // already-decoded scanlines.
+        assert!(!sink.writes.is_empty());
+        assert!(matches!(error, PipelineError::Runtime(_)));
+        assert_eq!(error.to_string(), "DCT decode: Premature end of input file");
+        assert_eq!(sink.finishes, 0);
     }
 
     #[test]
@@ -4838,9 +4893,15 @@ pub(crate) mod tests {
             stage.finish().expect_err("12-bit JPEG must be rejected")
         };
         assert!(matches!(error, PipelineError::Runtime(_)));
+        #[cfg(not(feature = "qpdf-libjpeg-compat"))]
         assert_eq!(
             error.to_string(),
             "DCT decode: sample precision 12 (only 8-bit supported)"
+        );
+        #[cfg(feature = "qpdf-libjpeg-compat")]
+        assert_eq!(
+            error.to_string(),
+            "DCT decode: Unsupported JPEG data precision 12"
         );
         assert!(sink.writes.is_empty());
         assert_eq!(sink.finish_attempts, 0);

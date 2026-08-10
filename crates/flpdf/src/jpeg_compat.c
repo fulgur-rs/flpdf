@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <jpeglib.h>
+#include <jerror.h>
 
 #include <limits.h>
 #include <setjmp.h>
@@ -10,6 +11,10 @@
 
 #if BITS_IN_JSAMPLE != 8
 #error "flpdf requires an 8-bit system libjpeg build"
+#endif
+
+#if !defined(JPEG_LIB_VERSION) || (JPEG_LIB_VERSION < 80)
+#error "flpdf requires libjpeg API version 80 or newer"
 #endif
 
 enum {
@@ -24,6 +29,68 @@ struct flpdf_jpeg_error_manager {
     char *error_message;
     size_t error_message_len;
 };
+
+struct flpdf_jpeg_source {
+    struct jpeg_source_mgr public;
+};
+
+static void
+flpdf_jpeg_init_source(j_decompress_ptr cinfo)
+{
+    (void)cinfo;
+}
+
+static boolean
+flpdf_jpeg_fill_input_buffer(j_decompress_ptr cinfo)
+{
+    ERREXIT(cinfo, JERR_INPUT_EOF);
+    return FALSE;
+}
+
+static void
+flpdf_jpeg_skip_input_data(j_decompress_ptr cinfo, long num_bytes)
+{
+    if (num_bytes < 0) {
+        ERREXIT(cinfo, JERR_INPUT_EOF);
+        return;
+    }
+
+    size_t skip = (size_t)num_bytes;
+    if (skip > cinfo->src->bytes_in_buffer) {
+        ERREXIT(cinfo, JERR_INPUT_EOF);
+        return;
+    }
+    cinfo->src->next_input_byte += skip;
+    cinfo->src->bytes_in_buffer -= skip;
+}
+
+static void
+flpdf_jpeg_term_source(j_decompress_ptr cinfo)
+{
+    (void)cinfo;
+}
+
+static void
+flpdf_jpeg_buffer_src(
+    j_decompress_ptr cinfo,
+    const unsigned char *data,
+    size_t data_len)
+{
+    struct flpdf_jpeg_source *source =
+        (struct flpdf_jpeg_source *)(*cinfo->mem->alloc_small)(
+            (j_common_ptr)cinfo,
+            JPOOL_PERMANENT,
+            sizeof(struct flpdf_jpeg_source));
+
+    source->public.init_source = flpdf_jpeg_init_source;
+    source->public.fill_input_buffer = flpdf_jpeg_fill_input_buffer;
+    source->public.skip_input_data = flpdf_jpeg_skip_input_data;
+    source->public.resync_to_restart = jpeg_resync_to_restart;
+    source->public.term_source = flpdf_jpeg_term_source;
+    source->public.next_input_byte = data;
+    source->public.bytes_in_buffer = data_len;
+    cinfo->src = &source->public;
+}
 
 static void
 flpdf_copy_error_message(char *destination, size_t destination_len, const char *message)
@@ -45,19 +112,83 @@ flpdf_copy_error_message(char *destination, size_t destination_len, const char *
 }
 
 static void
+flpdf_jpeg_format_error(
+    j_common_ptr common,
+    char *destination,
+    size_t destination_len)
+{
+    char diagnostic[JMSG_LENGTH_MAX];
+
+    switch (common->err->msg_code) {
+    case JERR_INPUT_EOF:
+        flpdf_copy_error_message(
+            destination,
+            destination_len,
+            "Premature end of input file");
+        return;
+    case JERR_NO_IMAGE:
+        flpdf_copy_error_message(
+            destination,
+            destination_len,
+            "JPEG datastream contains no image");
+        return;
+    case JERR_BAD_PRECISION:
+        (void)snprintf(
+            diagnostic,
+            sizeof(diagnostic),
+            "Unsupported JPEG data precision %d",
+            common->err->msg_parm.i[0]);
+        flpdf_copy_error_message(destination, destination_len, diagnostic);
+        return;
+    case JERR_NO_SOI:
+        (void)snprintf(
+            diagnostic,
+            sizeof(diagnostic),
+            "Not a JPEG file: starts with 0x%02x %02x",
+            (unsigned int)(common->err->msg_parm.i[0] & 0xff),
+            (unsigned int)(common->err->msg_parm.i[1] & 0xff));
+        flpdf_copy_error_message(destination, destination_len, diagnostic);
+        return;
+    case JERR_SOF_NO_SOS:
+        flpdf_copy_error_message(
+            destination,
+            destination_len,
+            "Invalid JPEG file structure: missing SOS marker");
+        return;
+    case JERR_SOF_UNSUPPORTED:
+        (void)snprintf(
+            diagnostic,
+            sizeof(diagnostic),
+            "Unsupported JPEG process: SOF type 0x%02x",
+            (unsigned int)(common->err->msg_parm.i[0] & 0xff));
+        flpdf_copy_error_message(destination, destination_len, diagnostic);
+        return;
+    case JERR_UNKNOWN_MARKER:
+        (void)snprintf(
+            diagnostic,
+            sizeof(diagnostic),
+            "Unsupported marker type 0x%02x",
+            (unsigned int)(common->err->msg_parm.i[0] & 0xff));
+        flpdf_copy_error_message(destination, destination_len, diagnostic);
+        return;
+    default:
+        (*common->err->format_message)(common, diagnostic);
+        flpdf_copy_error_message(destination, destination_len, diagnostic);
+        return;
+    }
+}
+
+static void
 flpdf_jpeg_error_exit(j_common_ptr common)
 {
     struct flpdf_jpeg_error_manager *error_manager =
         (struct flpdf_jpeg_error_manager *)common->err;
 
     if ((error_manager->error_message != NULL) && (error_manager->error_message_len > 0)) {
-        char diagnostic[JMSG_LENGTH_MAX];
-
-        (*common->err->format_message)(common, diagnostic);
-        flpdf_copy_error_message(
+        flpdf_jpeg_format_error(
+            common,
             error_manager->error_message,
-            error_manager->error_message_len,
-            diagnostic);
+            error_manager->error_message_len);
     }
     longjmp(error_manager->jump_buffer, 1);
 }
@@ -104,7 +235,7 @@ flpdf_jpeg_decode_scanlines(
 
     decompress_cleanup_needed = 1;
     jpeg_create_decompress(&cinfo);
-    jpeg_mem_src(&cinfo, data, (unsigned long)data_len);
+    flpdf_jpeg_buffer_src(&cinfo, data, data_len);
     (void)jpeg_read_header(&cinfo, TRUE);
     (void)jpeg_calc_output_dimensions(&cinfo);
 
@@ -147,7 +278,14 @@ flpdf_jpeg_decode_scanlines(
         JPOOL_IMAGE,
         (JDIMENSION)row_len,
         1);
-    (void)jpeg_start_decompress(&cinfo);
+    if (jpeg_start_decompress(&cinfo) == FALSE) {
+        flpdf_copy_error_message(
+            error_message,
+            error_message_len,
+            "jpeg_start_decompress returned false");
+        jpeg_destroy_decompress(&cinfo);
+        return FLPDF_JPEG_CODEC_ERROR;
+    }
 
     while (cinfo.output_scanline < cinfo.output_height) {
         JDIMENSION rows_read = jpeg_read_scanlines(&cinfo, row, 1);
@@ -165,7 +303,14 @@ flpdf_jpeg_decode_scanlines(
         }
     }
 
-    (void)jpeg_finish_decompress(&cinfo);
+    if (jpeg_finish_decompress(&cinfo) == FALSE) {
+        flpdf_copy_error_message(
+            error_message,
+            error_message_len,
+            "jpeg_finish_decompress returned false");
+        jpeg_destroy_decompress(&cinfo);
+        return FLPDF_JPEG_CODEC_ERROR;
+    }
     jpeg_destroy_decompress(&cinfo);
     return FLPDF_JPEG_SUCCESS;
 }

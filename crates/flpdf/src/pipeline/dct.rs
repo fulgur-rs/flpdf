@@ -5,16 +5,22 @@ use super::buffer::Buffer;
 use super::{Pipeline, PipelineError, PipelineResult};
 
 #[cfg(feature = "qpdf-libjpeg-compat")]
+#[allow(unsafe_code)]
 mod jpeg_compat {
+    use std::ffi::CStr;
     use std::os::raw::{c_char, c_int, c_uchar, c_void};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::slice;
 
-    pub(super) const SUCCESS: c_int = 0;
-    pub(super) const CODEC_ERROR: c_int = 1;
-    pub(super) const CALLBACK_ERROR: c_int = 2;
-    pub(super) const CALLBACK_FAILURE: c_int = 1;
+    use super::{Pipeline, PipelineError, PipelineResult};
+
+    const SUCCESS: c_int = 0;
+    const CODEC_ERROR: c_int = 1;
+    const CALLBACK_ERROR: c_int = 2;
+    const CALLBACK_FAILURE: c_int = 1;
 
     extern "C" {
-        pub(super) fn flpdf_jpeg_decode_scanlines(
+        fn flpdf_jpeg_decode_scanlines(
             data: *const c_uchar,
             data_len: usize,
             callback: unsafe extern "C" fn(*mut c_void, *const c_uchar, usize) -> c_int,
@@ -23,62 +29,104 @@ mod jpeg_compat {
             error_message_len: usize,
         ) -> c_int;
     }
-}
 
-#[cfg(feature = "qpdf-libjpeg-compat")]
-struct CallbackState<'a> {
-    next: &'a mut dyn Pipeline,
-    error: Option<PipelineError>,
-}
-
-#[cfg(feature = "qpdf-libjpeg-compat")]
-unsafe extern "C" fn jpeg_scanline_callback(
-    user: *mut std::os::raw::c_void,
-    row: *const std::os::raw::c_uchar,
-    row_len: usize,
-) -> std::os::raw::c_int {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::slice;
-
-    if user.is_null() {
-        return jpeg_compat::CALLBACK_FAILURE;
+    struct CallbackState<'a> {
+        next: &'a mut dyn Pipeline,
+        error: Option<PipelineError>,
     }
 
-    let state = unsafe { &mut *(user.cast::<CallbackState<'_>>()) };
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        if state.error.is_some() {
-            return jpeg_compat::CALLBACK_FAILURE;
-        }
-        if row.is_null() && row_len != 0 {
-            state.error = Some(PipelineError::runtime(
-                "DCT decode: compatibility backend returned a null scanline",
-            ));
-            return jpeg_compat::CALLBACK_FAILURE;
+    unsafe extern "C" fn jpeg_scanline_callback(
+        user: *mut c_void,
+        row: *const c_uchar,
+        row_len: usize,
+    ) -> c_int {
+        if user.is_null() {
+            return CALLBACK_FAILURE;
         }
 
-        let row = if row_len == 0 {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(row, row_len) }
-        };
-        match state.next.write(row) {
-            Ok(()) => jpeg_compat::SUCCESS,
-            Err(error) => {
-                state.error = Some(error);
-                jpeg_compat::CALLBACK_FAILURE
+        let state = unsafe { &mut *(user.cast::<CallbackState<'_>>()) };
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if state.error.is_some() {
+                return CALLBACK_FAILURE;
             }
-        }
-    }));
-
-    match result {
-        Ok(result) => result,
-        Err(_) => {
-            if state.error.is_none() {
+            if row.is_null() && row_len != 0 {
                 state.error = Some(PipelineError::runtime(
-                    "DCT decode: downstream pipeline panicked",
+                    "DCT decode: compatibility backend returned a null scanline",
                 ));
+                return CALLBACK_FAILURE;
             }
-            jpeg_compat::CALLBACK_FAILURE
+
+            let row = if row_len == 0 {
+                &[]
+            } else {
+                unsafe { slice::from_raw_parts(row, row_len) }
+            };
+            match state.next.write(row) {
+                Ok(()) => SUCCESS,
+                Err(error) => {
+                    state.error = Some(error);
+                    CALLBACK_FAILURE
+                }
+            }
+        }));
+
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                if state.error.is_none() {
+                    state.error = Some(PipelineError::runtime(
+                        "DCT decode: downstream pipeline panicked",
+                    ));
+                }
+                CALLBACK_FAILURE
+            }
+        }
+    }
+
+    pub(super) fn decode_scanlines(
+        identifier: &str,
+        data: &[u8],
+        next: &mut dyn Pipeline,
+    ) -> PipelineResult<()> {
+        let mut state = CallbackState { next, error: None };
+        let mut error_message = [0 as c_char; 256];
+        let result = unsafe {
+            flpdf_jpeg_decode_scanlines(
+                data.as_ptr(),
+                data.len(),
+                jpeg_scanline_callback,
+                (&mut state as *mut CallbackState<'_>).cast::<c_void>(),
+                error_message.as_mut_ptr(),
+                error_message.len(),
+            )
+        };
+        let downstream_error = state.error.take();
+        drop(state);
+
+        if let Some(error) = downstream_error {
+            return Err(error);
+        }
+        match result {
+            SUCCESS => next.finish(),
+            CODEC_ERROR => {
+                let diagnostic = unsafe { CStr::from_ptr(error_message.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned();
+                let diagnostic = if diagnostic.is_empty() {
+                    "libjpeg decode failed".to_owned()
+                } else {
+                    diagnostic
+                };
+                Err(PipelineError::runtime(format!(
+                    "{identifier}: {diagnostic}"
+                )))
+            }
+            CALLBACK_ERROR => Err(PipelineError::runtime(format!(
+                "{identifier}: compatibility backend callback failed without a downstream error"
+            ))),
+            status => Err(PipelineError::runtime(format!(
+                "{identifier}: compatibility backend returned unknown status {status}"
+            ))),
         }
     }
 }
@@ -103,79 +151,9 @@ impl<'a> PlDct<'a> {
         PipelineError::runtime(format!("{}: {error}", self.identifier))
     }
 
+    #[cfg(not(feature = "qpdf-libjpeg-compat"))]
     fn runtime_error(&self, message: impl AsRef<str>) -> PipelineError {
         PipelineError::runtime(format!("{}: {}", self.identifier, message.as_ref()))
-    }
-
-    #[cfg(feature = "qpdf-libjpeg-compat")]
-    fn decode_with_libjpeg(&mut self, data: &[u8]) -> PipelineResult<()> {
-        use std::ffi::CStr;
-        use std::os::raw::{c_char, c_void};
-
-        let mut state = CallbackState {
-            next: self.next,
-            error: None,
-        };
-        let mut error_message = [0 as c_char; 256];
-        let result = unsafe {
-            jpeg_compat::flpdf_jpeg_decode_scanlines(
-                data.as_ptr(),
-                data.len(),
-                jpeg_scanline_callback,
-                (&mut state as *mut CallbackState<'_>).cast::<c_void>(),
-                error_message.as_mut_ptr(),
-                error_message.len(),
-            )
-        };
-        let downstream_error = state.error.take();
-        drop(state);
-
-        if let Some(error) = downstream_error {
-            return Err(error);
-        }
-        match result {
-            jpeg_compat::SUCCESS => self.next.finish(),
-            jpeg_compat::CODEC_ERROR => {
-                let diagnostic =
-                    unsafe { CStr::from_ptr(error_message.as_ptr()) }.to_string_lossy();
-                let diagnostic = if diagnostic.is_empty() {
-                    "libjpeg decode failed"
-                } else {
-                    diagnostic.as_ref()
-                };
-                Err(self.compatibility_codec_error(diagnostic))
-            }
-            jpeg_compat::CALLBACK_ERROR => Err(self
-                .runtime_error("compatibility backend callback failed without a downstream error")),
-            status => Err(self.runtime_error(format!(
-                "compatibility backend returned unknown status {status}"
-            ))),
-        }
-    }
-
-    #[cfg(feature = "qpdf-libjpeg-compat")]
-    fn compatibility_codec_error(&self, diagnostic: &str) -> PipelineError {
-        if let Some(precision) = diagnostic.strip_prefix("Unsupported JPEG data precision ") {
-            return self.runtime_error(format!(
-                "sample precision {precision} (only 8-bit supported)"
-            ));
-        }
-
-        if diagnostic == "Invalid JPEG file structure: missing SOS marker" {
-            return self.runtime_error("unexpected end of data");
-        }
-
-        if let Some(bytes) = diagnostic.strip_prefix("Not a JPEG file: starts with 0x") {
-            let mut values = bytes.split_whitespace();
-            let _first = values.next();
-            if let Some(second) = values.next() {
-                let second = second.strip_prefix("0x").unwrap_or(second);
-                if let Ok(marker) = u8::from_str_radix(second, 16) {
-                    return self.runtime_error(format!("unexpected marker: 0xFF{marker:02X}"));
-                }
-            }
-        }
-        self.runtime_error(diagnostic)
     }
 }
 
@@ -196,7 +174,7 @@ impl Pipeline for PlDct<'_> {
         }
 
         #[cfg(feature = "qpdf-libjpeg-compat")]
-        return self.decode_with_libjpeg(&data);
+        return jpeg_compat::decode_scanlines(&self.identifier, &data, self.next);
 
         #[cfg(not(feature = "qpdf-libjpeg-compat"))]
         {
