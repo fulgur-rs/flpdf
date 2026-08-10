@@ -1,4 +1,4 @@
-//! qpdf 11.9.0 parity tests for the V=5 reader/writer password boundary.
+//! qpdf parity tests for the V=5 reader/writer password boundary.
 
 use flpdf::{write_pdf_with_options, EncryptParams, Pdf, PdfOpenOptions, WriteOptions};
 use std::fs;
@@ -6,16 +6,43 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The qpdf release whose behavior these parity assertions cover.
+/// Update this single value when the oracle release moves.
+const EXPECTED_QPDF_VERSION: &str = "11.9.0";
+
 fn minimal_fixture() -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/minimal.pdf");
     fs::read(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
+
+#[test]
+fn qpdf_version_gate_matches_the_requested_version() {
+    assert!(qpdf_version_matches(b"qpdf version 11.9.0\n", "11.9.0"));
+    assert!(qpdf_version_matches(
+        b"qpdf version 12.0.0\nextra details\n",
+        "12.0.0"
+    ));
+    assert!(!qpdf_version_matches(b"qpdf version 12.0.0\n", "11.9.0"));
+    assert!(!qpdf_version_matches(
+        b"qpdf version 11.9.0-dev\n",
+        "11.9.0"
+    ));
+    assert!(!qpdf_version_matches(b"", "11.9.0"));
+}
+
+fn qpdf_version_matches(stdout: &[u8], expected_version: &str) -> bool {
+    let expected_line = format!("qpdf version {expected_version}");
+    let output = String::from_utf8_lossy(stdout);
+    output.lines().next().map(str::trim) == Some(expected_line.as_str())
 }
 
 fn qpdf_available() -> bool {
     Command::new("qpdf")
         .arg("--version")
         .output()
-        .map(|output| output.status.success())
+        .map(|output| {
+            output.status.success() && qpdf_version_matches(&output.stdout, EXPECTED_QPDF_VERSION)
+        })
         .unwrap_or(false)
 }
 
@@ -118,7 +145,7 @@ fn write_bytes(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
 #[test]
 fn v5_password_truncation_matches_qpdf_reader_writer_split() {
     if !qpdf_available() {
-        eprintln!("qpdf 11.9.0 not available; skipping V=5 password parity test");
+        eprintln!("qpdf {EXPECTED_QPDF_VERSION} not available; skipping V=5 password parity test");
         return;
     }
 
