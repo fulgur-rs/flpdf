@@ -4332,8 +4332,13 @@ fn run_page_extraction(
     let mut options = options;
     // Page-op flags reject explicit encryption/copy-encryption options above;
     // source-encryption preservation follows the primary-input rule captured
-    // above.
-    options.preserve_encryption = primary_encrypted;
+    // above for a single output. qpdf's QPDFJob::doSplitPages creates a fresh
+    // empty QPDF for each chunk (QPDFJob.cc:2979-2988), so the split output is
+    // cleartext unless explicit encryption options were supplied. The bytes
+    // handed to split_pages are also its per-chunk re-open source; preserving
+    // the primary /Encrypt there would make that internal re-open authenticate
+    // without the input password.
+    options.preserve_encryption = primary_encrypted && page_ops.split_pages.is_none();
     if !overlay_specs.is_empty() {
         let mut built = build_overlay_specs(overlay_specs, repair)?;
 
@@ -4488,8 +4493,12 @@ fn run_rewrite_with_page_ops(
 
     // Page operations emit a fresh document and preserve encryption only when
     // the primary input itself was encrypted, matching qpdf's page copier.
+    // `--split-pages` is the exception: qpdf's doSplitPages path makes a fresh
+    // empty output document per chunk, so its intermediate and final chunks
+    // are cleartext unless explicit encryption options are configured. Keep
+    // the memory intermediate decryptable before split_pages re-opens it.
     let mut options = options;
-    options.preserve_encryption = pdf.is_encrypted();
+    options.preserve_encryption = page_ops.split_pages.is_none() && pdf.is_encrypted();
     let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
