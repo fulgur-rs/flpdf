@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const BUF_SIZE: usize = 16;
 
 /// qpdf `Pl_AES_PDF::use_static_iv` (`libqpdf/Pl_AES_PDF.cc:11`), a *static*
-/// member rather than a per-instance flag: `QPDFWriter` turns it on
+/// member rather than a per-instance flag: the PDF writer turns it on
 /// (`libqpdf/QPDFWriter.cc:296`) with no handle on the individual stages
 /// created inside `QPDF_encryption`, so the switch has to be reachable
 /// without one. Documented "for testing only" in qpdf's own header
@@ -511,7 +511,7 @@ mod tests {
     }
 
     // `useStaticIV` is a *process-global* switch in qpdf
-    // (`libqpdf/Pl_AES_PDF.cc:11`, `:66-70`), because `QPDFWriter` sets it
+    // (`libqpdf/Pl_AES_PDF.cc:11`, `:66-70`), because the PDF writer sets it
     // (`libqpdf/QPDFWriter.cc:296`) without a handle on the individual stages
     // created deep inside `QPDF_encryption`. `initializeVector` then fills the
     // block with `14 * (1 + i)` (`:133-137`), and CBC writes it ahead of the

@@ -172,7 +172,7 @@ fn rewrite_pdf(pdf_path: &str, extra_args: &[&str]) -> (tempfile::TempDir, std::
     let tmp = tempdir().unwrap();
     let out_path = tmp.path().join("out.pdf");
 
-    let mut args = vec!["rewrite", "--full-rewrite", pdf_path];
+    let mut args = vec!["rewrite", pdf_path];
     args.extend_from_slice(extra_args);
     args.push(out_path.to_str().unwrap());
 

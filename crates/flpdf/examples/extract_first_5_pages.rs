@@ -6,10 +6,10 @@
 mod common;
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 
 use flpdf::{
-    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, PagePlan, Pdf, WriteOptions,
+    pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, PagePlan, Pdf, PdfWriter,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,14 +25,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     rebuild_page_tree(&mut pdf, &selected)?;
 
-    #[allow(clippy::field_reassign_with_default)]
-    let opts = {
-        let mut opts = WriteOptions::default();
-        opts.full_rewrite = true;
-        opts
-    };
-    let out = BufWriter::new(File::create(&out_path)?);
-    flpdf::write_pdf_with_options(&mut pdf, out, &opts)?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(&out_path)?;
+    writer.write()?;
 
     // Re-open and verify these are the *first* five pages by their distinct
     // MediaBox widths (the fixture assigns width = 100 + 1-based page index, so

@@ -7,10 +7,11 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 
 use flpdf::{
-    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef, Pdf,
+    copy_objects, page_closure::page_object_closure, pages::page_refs, splice_pages, ObjectRef,
+    Pdf, PdfWriter,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,10 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = 1usize;
     splice_pages(&mut b, n..n, &copied)?;
 
-    // A plain write keeps existing objects; we only append pages, so the
-    // unreferenced-object pruning of `full_rewrite` (see extract_pages) is unnecessary.
-    let out = BufWriter::new(File::create(&out_path)?);
-    flpdf::write_pdf(&mut b, out)?;
+    // The canonical writer emits one fresh qpdf-style document.
+    let mut writer = PdfWriter::new(&mut b);
+    writer.set_output_file(&out_path)?;
+    writer.write()?;
 
     // Verify: B grew from 2 to 5 pages (2 original + 3 inserted).
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;

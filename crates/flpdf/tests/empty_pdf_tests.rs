@@ -5,17 +5,16 @@
 //! mutation, page-document-helper, and writer APIs as any other opened
 //! document.
 
-use flpdf::{
-    write_pdf_with_options, ObjectHandle, PageDocumentHelper, PageInput, Pdf, WriteOptions,
-};
+use flpdf::{ObjectHandle, PageDocumentHelper, PageInput, Pdf};
 use std::process::Command;
 
 fn write_static_id(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> Vec<u8> {
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut out = Vec::new();
-    write_pdf_with_options(pdf, &mut out, &options).expect("write empty document");
+    write_with_settings(pdf, &mut out, &options).expect("write empty document");
     out
 }
 
@@ -105,11 +104,12 @@ fn empty_document_accepts_added_page_via_page_document_helper_and_passes_qpdf_ch
     }
     let dir = tempfile::tempdir().unwrap();
     let input_path = dir.path().join("empty-plus-page.pdf");
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.static_id = true;
+    let options = WriterTestSettings {
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut bytes = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut bytes, &options).unwrap();
+    write_with_settings(&mut pdf, &mut bytes, &options).unwrap();
     std::fs::write(&input_path, &bytes).unwrap();
 
     let output = Command::new("qpdf")
@@ -123,3 +123,7 @@ fn empty_document_accepts_added_page_via_page_document_helper_and_passes_qpdf_ch
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

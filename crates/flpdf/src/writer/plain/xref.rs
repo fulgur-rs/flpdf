@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 
 use crate::writer::{serialize::xref_stream, write_deterministic_id_inline};
-use crate::{Dictionary, Object, ObjectRef, XrefForm};
+use crate::{Dictionary, Object, ObjectRef, XrefEntry, XrefForm};
 
 /// Location of an object encoded inside an object-stream container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +65,7 @@ pub(crate) fn append_xref_and_trailer(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
-) -> crate::Result<()> {
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     layout.validate()?;
 
     match trailer.form {
@@ -83,7 +83,7 @@ fn append_xref_stream_and_trailer(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
-) -> crate::Result<()> {
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let xref_offset = bytes.len();
     let max_number = layout.max_number();
     let xref_number = max_number.checked_add(1).ok_or_else(|| {
@@ -162,6 +162,7 @@ fn append_xref_stream_and_trailer(
         prev: None,
         trailer: Some(&dictionary),
         id: None,
+        encrypt: None,
     };
     let xref_ref = ObjectRef::new(xref_number, 0);
     match &trailer.id {
@@ -190,7 +191,7 @@ fn append_xref_stream_and_trailer(
         }
     }
     bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-    Ok(())
+    written_xref_stream(layout, xref_ref, xref_offset)
 }
 
 fn materialized_id(dictionary: &Dictionary) -> crate::Result<Option<(Vec<u8>, Vec<u8>)>> {
@@ -214,7 +215,7 @@ fn append_classic_xref_and_trailer(
     bytes: &mut Vec<u8>,
     layout: &BodyLayout,
     trailer: &TrailerPlan,
-) -> crate::Result<()> {
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
     let xref_offset = bytes.len();
     let size = layout
         .max_number()
@@ -262,7 +263,78 @@ fn append_classic_xref_and_trailer(
         }
     }
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
-    Ok(())
+    written_xref_table(layout, size)
+}
+
+fn written_xref_table(
+    layout: &BodyLayout,
+    size: u32,
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+    let mut result = BTreeMap::new();
+    for number in 1..size {
+        if let Some(&(_generation, offset)) = layout.uncompressed.get(&number) {
+            result.insert(
+                ObjectRef::new(number, 0),
+                XrefEntry::Uncompressed {
+                    // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                    // on every supported target.
+                    offset: u64::try_from(offset).map_err(|_| {
+                        crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                    })?,
+                    // cov:ignore-end
+                },
+            );
+        }
+    }
+    Ok(result)
+}
+
+fn written_xref_stream(
+    layout: &BodyLayout,
+    xref_ref: ObjectRef,
+    xref_offset: usize,
+) -> crate::Result<BTreeMap<ObjectRef, XrefEntry>> {
+    let size = xref_ref
+        .number
+        .checked_add(1)
+        .ok_or_else(|| crate::Error::Unsupported("plain writer /Size overflows u32".into()))?;
+    let mut result = BTreeMap::new();
+    for number in 1..size {
+        if number == xref_ref.number {
+            result.insert(
+                ObjectRef::new(xref_ref.number, 0),
+                XrefEntry::Uncompressed {
+                    // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                    // on every supported target.
+                    offset: u64::try_from(xref_offset).map_err(|_| {
+                        crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                    })?,
+                    // cov:ignore-end
+                },
+            );
+        } else if let Some(&(_generation, offset)) = layout.uncompressed.get(&number) {
+            result.insert(
+                ObjectRef::new(number, 0),
+                XrefEntry::Uncompressed {
+                    // cov:ignore-start: offsets originate in Vec::len and usize fits u64
+                    // on every supported target.
+                    offset: u64::try_from(offset).map_err(|_| {
+                        crate::Error::Unsupported("xref offset does not fit u64".to_string())
+                    })?,
+                    // cov:ignore-end
+                },
+            );
+        } else if let Some(location) = layout.compressed.get(&number) {
+            result.insert(
+                ObjectRef::new(number, 0),
+                XrefEntry::Compressed {
+                    stream: location.container,
+                    index: location.index,
+                },
+            );
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -293,6 +365,29 @@ mod tests {
               trailer << /Root 1 0 R /Size 2 >>\n\
               startxref\n4\n%%EOF\n"
         );
+    }
+
+    #[test]
+    fn classic_xref_free_gap_uses_generation_zero_in_bytes_and_result() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        layout.uncompressed.insert(3, (0, 2));
+
+        let result = append_xref_and_trailer(&mut bytes, &layout, &trailer(XrefForm::Table))
+            .expect("classic xref emission succeeds");
+
+        assert_eq!(
+            bytes
+                .windows(b"0000000000 65535 f \n".len())
+                .filter(|window| *window == b"0000000000 65535 f \n")
+                .count(),
+            1,
+            "only the object-0 row carries generation 65535"
+        );
+        assert!(!result.contains_key(&ObjectRef::new(2, 0)));
+        assert!(!result.contains_key(&ObjectRef::new(2, 65535)));
+        assert!(result.keys().all(|object_ref| object_ref.generation == 0));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! (flpdf-9hc.5.8.2 — thread the ObjStm batch plan into Part3/Part4 emission).
 //!
 //! Scope of 5.8.2 (per the epic data flow): the linearized writer consumes
-//! `WriteOptions.object_streams`, emits ObjStm containers in their assigned
+//! `WriterOptions.object_streams`, emits ObjStm containers in their assigned
 //! Annex F part (Part 3 = shared/catalog, before `/E`; Part 5 = rest), keeps
 //! renumber/offset consistency, and the result **round-trips via `Pdf::open`**
 //! with all members (incl. compressed ones) resolvable.

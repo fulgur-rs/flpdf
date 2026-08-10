@@ -403,17 +403,18 @@ fn direct_length_with_length1_left_verbatim() {
 /// matrix is flpdf-9hc.6.9.
 #[test]
 fn writer_qdf_then_edit_then_fix_qdf_closed_loop() {
-    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+    use flpdf::Pdf;
     use std::io::Cursor;
 
     let source = read("../compat/three-page.pdf");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.qdf = true;
-    opts.static_id = true;
+    let opts = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut qdf = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut qdf, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut qdf, &opts).unwrap();
 
     // Sanity: writer produced an indirect-length stream + holder.
     let lp = find(&qdf, b"/Length ").expect("indirect /Length entry");
@@ -933,18 +934,19 @@ fn two_object_qdf_with_second_number(second: u32) -> Vec<u8> {
 /// regress to a hard error if the writer ever re-emitted holders out of order).
 #[test]
 fn writer_indirect_length_qdf_round_trips() {
-    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+    use flpdf::Pdf;
     use std::io::Cursor;
 
     // Streams are clean Flate so `qpdf --check` stays warning-free.
     let source = read("../compat/objstm-lin-od-indirect-length-flate.pdf");
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.qdf = true;
-    opts.static_id = true;
+    let opts = WriterTestSettings {
+        qdf: true,
+        static_id: true,
+        ..WriterTestSettings::default()
+    };
     let mut qdf = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut qdf, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut qdf, &opts).unwrap();
 
     // fix_qdf accepts only ascending 1..N file order, so a successful repair
     // proves the writer emitted this indirect-length source qpdf-canonically;
@@ -981,3 +983,7 @@ fn writer_indirect_length_qdf_round_trips() {
         "fix_qdf must be idempotent on repaired indirect-length QDF"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

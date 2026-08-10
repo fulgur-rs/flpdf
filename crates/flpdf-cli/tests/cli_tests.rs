@@ -118,7 +118,7 @@ fn check_repair_encrypted_fixture_rejects_wrong_password_actionably() {
 }
 
 #[test]
-fn rewrite_encrypted_fixture_writes_plaintext_output() {
+fn rewrite_encrypted_fixture_preserves_encryption_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -135,7 +135,7 @@ fn rewrite_encrypted_fixture_writes_plaintext_output() {
         .args(["--check", output.to_str().unwrap()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("File is not encrypted\n"));
+        .stdout(predicate::str::contains("File is encrypted\n"));
 }
 
 #[test]
@@ -439,8 +439,8 @@ fn rewrite_default_is_qpdf_equivalent_full_rewrite() {
     // flpdf-9hc.12.7 acceptance: a plain `flpdf rewrite IN OUT` (no flags)
     // must match qpdf's documented defaults — qpdf full-rewrites and applies
     // --compress-streams=y by default. This asserts that the deliberate
-    // default behavior (full rewrite + FlateDecode compression) holds, so a
-    // regression to a verbatim/incremental no-op default would be caught.
+    // default behavior (fresh rewrite + FlateDecode compression) holds, so a
+    // regression to a verbatim no-op default would be caught.
     let temp = tempfile::tempdir().unwrap();
     let default_out = temp.path().join("default.pdf");
     let nocomp_out = temp.path().join("nocomp.pdf");
@@ -554,7 +554,7 @@ fn dump_object_subcommand_accepts_ref() {
 fn qdf_subcommand_rewrites_output() {
     // The `qdf` subcommand is now an alias of `rewrite --qdf` (epic
     // flpdf-9hc.6 architecture decision): it must emit canonical QDF, not the
-    // old standalone `write_qdf` raw dump.
+    // legacy raw-dump route.
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -1116,12 +1116,11 @@ fn rewrite_min_version_raises_header_on_low_source() {
 }
 
 #[test]
-fn rewrite_force_version_honored_on_incremental_path() {
+fn rewrite_force_version_honored_without_mutation() {
     // Regression for flpdf-9hc.13.1: `--remove-unreferenced-resources=no`
-    // with no other mutation flag would otherwise take the incremental-update
-    // write path, which copies the source header verbatim and silently drops
-    // --force-version. The CLI must promote to full_rewrite so the version
-    // setter is honored (qpdf always full-rewrites and always honors it).
+    // must not change the canonical writer route or silently drop
+    // --force-version. qpdf always emits a fresh rewrite and honors the
+    // version setter.
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
 
@@ -1139,7 +1138,7 @@ fn rewrite_force_version_honored_on_incremental_path() {
     let bytes = std::fs::read(&output).unwrap();
     assert!(
         bytes.starts_with(b"%PDF-1.4\n"),
-        "force-version must be honored even on the would-be incremental path; \
+        "force-version must be honored on the canonical rewrite path; \
          got {:?}",
         std::str::from_utf8(&bytes[..bytes.len().min(9)]).unwrap_or("<bad>")
     );
@@ -4112,7 +4111,7 @@ fn rewrite_compress_streams_y_accepted_and_produces_valid_output() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--compress-streams=y", "--full-rewrite"])
+        .args(["rewrite", "--compress-streams=y"])
         .arg(&input)
         .arg(&output)
         .assert()
@@ -4135,7 +4134,7 @@ fn rewrite_compress_streams_n_accepted_and_produces_valid_output() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--compress-streams=n", "--full-rewrite"])
+        .args(["rewrite", "--compress-streams=n"])
         .arg(&input)
         .arg(&output)
         .assert()
@@ -4846,7 +4845,7 @@ fn rewrite_newline_before_endstream_y_accepted_and_produces_valid_output() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--newline-before-endstream=y", "--full-rewrite"])
+        .args(["rewrite", "--newline-before-endstream=y"])
         .arg(&input)
         .arg(&output)
         .assert()
@@ -4869,7 +4868,7 @@ fn rewrite_newline_before_endstream_n_accepted_and_produces_valid_output() {
 
     Command::cargo_bin("flpdf")
         .unwrap()
-        .args(["rewrite", "--newline-before-endstream=n", "--full-rewrite"])
+        .args(["rewrite", "--newline-before-endstream=n"])
         .arg(&input)
         .arg(&output)
         .assert()
@@ -4942,7 +4941,6 @@ fn rewrite_full_rewrite_with_compress_n_and_newline_n() {
         .unwrap()
         .args([
             "rewrite",
-            "--full-rewrite",
             "--compress-streams=n",
             "--newline-before-endstream=n",
         ])

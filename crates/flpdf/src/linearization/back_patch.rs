@@ -330,7 +330,7 @@ mod tests {
     use crate::linearization::plan::{LinearizationPlan, PageHintEntry};
     use crate::linearization::renumber::RenumberMap;
     use crate::linearization::writer::{write_linearized, LinearizedDocument, LinearizedOffsets};
-    use crate::writer::WriteOptions;
+    use crate::writer::WriterOptions;
     use crate::{ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -379,7 +379,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = open_tiny_pdf();
-        write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+        write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
             .expect("write_linearized")
     }
 

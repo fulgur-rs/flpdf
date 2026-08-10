@@ -6,11 +6,10 @@
 mod common;
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek};
+use std::io::{BufReader, Read, Seek};
 
 use flpdf::{
-    extract_attachment, insert_embedded_file, list_attachment_info, FileSpecBuilder, Pdf,
-    WriteOptions,
+    extract_attachment, insert_embedded_file, list_attachment_info, FileSpecBuilder, Pdf, PdfWriter,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,17 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         attach(&mut pdf, "notes.txt", b"hello from flpdf")?;
         attach(&mut pdf, "data.csv", b"a,b,c\n1,2,3\n")?;
 
-        // `WriteOptions` is `#[non_exhaustive]`, so it must be built from its
-        // `Default` and then mutated rather than via a struct literal. A full
-        // (non-incremental) rewrite materializes the new name-tree objects.
-        #[allow(clippy::field_reassign_with_default)]
-        let opts = {
-            let mut opts = WriteOptions::default();
-            opts.full_rewrite = true;
-            opts
-        };
-        let out = BufWriter::new(File::create(&with_files)?);
-        flpdf::write_pdf_with_options(&mut pdf, out, &opts)?;
+        // The canonical writer materializes the new name-tree objects.
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_file(&with_files)?;
+        writer.write()?;
     }
 
     // Expected payloads keyed by display name, used to verify the round-trip.

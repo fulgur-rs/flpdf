@@ -20,17 +20,16 @@ use flpdf::{
     flatten_rotation_on_pages, fonts,
     json_inspect::{DecodeLevel, JsonKey, JsonObjectSelector},
     linearization::{
-        check_linearization_path, show_linearization_path, write_linearized,
-        write_linearized_with_pass1_file, LinearizationCheckError, LinearizationPlan, RenumberMap,
+        check_linearization_path, show_linearization_path, LinearizationCheckError,
         ShowLinearizationError,
     },
     normalize_content_stream, pages,
     pages::coalesce_page_contents,
-    parse_pdf_version, write_pdf_with_options, AnnotationObjectHelper, CompressStreams,
-    CopyEncryptionSource, Dictionary, EncryptMethod, EncryptParams, FormFieldObjectHelper,
-    NewlineBeforeEndstream, Object, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper,
-    PasswordMode, Pdf, PdfOpenOptions, PdfVersion, PermissionsConfig, PrintPermission, QPDFLogger,
-    RemoveUnreferencedResources, Severity, Stream, StreamDataMode, WriteOptions,
+    parse_pdf_version, AnnotationObjectHelper, CompressStreams, CopyEncryptionSource, Dictionary,
+    EncryptMethod, EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object,
+    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
+    PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
+    RemoveUnreferencedResources, Severity, Stream, StreamDataMode,
 };
 use flpdf::{
     copy_attachments_from, extract_attachment, fix_qdf, format_attachment_list,
@@ -57,6 +56,131 @@ impl Write for PipelineWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// CLI-owned writer configuration. The library's lower-level option bridge is
+/// intentionally private; all CLI output is configured through PdfWriter.
+#[derive(Debug, Clone)]
+struct WriterOptions {
+    object_streams: ObjectStreamMode,
+    compress_streams: CompressStreams,
+    content_normalization: bool,
+    content_normalization_set: bool,
+    qdf: bool,
+    preserve_unreferenced_objects: bool,
+    newline_before_endstream: NewlineBeforeEndstream,
+    stream_data: Option<StreamDataMode>,
+    recompress_flate: bool,
+    static_id: bool,
+    deterministic_id: bool,
+    static_aes_iv: bool,
+    no_original_object_ids: bool,
+    min_version: Option<String>,
+    min_extension_level: Option<i64>,
+    force_version: Option<String>,
+    force_extension_level: Option<i64>,
+    encrypt: Option<EncryptParams>,
+    copy_encryption: Option<CopyEncryptionSource>,
+    preserve_encryption: bool,
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            object_streams: ObjectStreamMode::Preserve,
+            compress_streams: CompressStreams::Yes,
+            content_normalization: false,
+            content_normalization_set: false,
+            qdf: false,
+            preserve_unreferenced_objects: false,
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            stream_data: None,
+            recompress_flate: false,
+            static_id: false,
+            deterministic_id: false,
+            static_aes_iv: false,
+            no_original_object_ids: false,
+            min_version: None,
+            min_extension_level: None,
+            force_version: None,
+            force_extension_level: None,
+            encrypt: None,
+            copy_encryption: None,
+            preserve_encryption: true,
+        }
+    }
+}
+
+fn configure_pdf_writer<R: Read + Seek + 'static>(
+    writer: &mut PdfWriter<'_, R>,
+    options: &WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+) -> CliResult<()> {
+    writer.set_object_stream_mode(options.object_streams);
+    writer.set_compress_streams(matches!(options.compress_streams, CompressStreams::Yes));
+    if let Some(mode) = options.stream_data {
+        writer.set_stream_data_mode(mode);
+    }
+    writer.set_recompress_flate(options.recompress_flate);
+    writer.set_qdf_mode(options.qdf && !linearize);
+    if options.content_normalization_set {
+        writer.set_content_normalization(options.content_normalization);
+    }
+    writer.set_preserve_unreferenced_objects(options.preserve_unreferenced_objects);
+    writer.set_newline_before_endstream_mode(options.newline_before_endstream);
+    writer.set_static_id(options.static_id);
+    writer.set_deterministic_id(options.deterministic_id);
+    writer.set_static_aes_iv(options.static_aes_iv);
+    writer.set_suppress_original_object_ids(options.no_original_object_ids);
+    writer.set_preserve_encryption(options.preserve_encryption);
+    if let Some(version) = options.min_version.as_deref() {
+        writer.set_minimum_pdf_version(version, options.min_extension_level.unwrap_or(0));
+    }
+    if let Some(version) = options.force_version.as_deref() {
+        writer.force_pdf_version(version, options.force_extension_level.unwrap_or(0));
+    }
+    if let Some(params) = options.encrypt.clone() {
+        writer.set_encryption_parameters(params);
+    }
+    if let Some(source) = options.copy_encryption.clone() {
+        writer.copy_encryption_parameters(source);
+    }
+    writer.set_linearization(linearize);
+    if let Some(path) = linearize_pass1 {
+        writer.set_linearization_pass1_filename(path.to_path_buf());
+    }
+    Ok(())
+}
+
+fn write_with_pdf_writer<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    output: &Path,
+    standard_output: &mut Option<PipelineWriter>,
+    options: &WriterOptions,
+    linearize: bool,
+    linearize_pass1: Option<&Path>,
+) -> CliResult<()> {
+    let mut writer = PdfWriter::new(pdf);
+    configure_pdf_writer(&mut writer, options, linearize, linearize_pass1)?;
+    if let Some(sink) = standard_output.take() {
+        writer.set_output_writer(sink)?;
+    } else {
+        writer.set_output_file(output)?;
+    }
+    writer.write()?;
+    Ok(())
+}
+
+fn write_qpdf_to_memory<R: Read + Seek + 'static>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+) -> CliResult<Vec<u8>> {
+    let mut writer = PdfWriter::new(pdf);
+    configure_pdf_writer(&mut writer, options, false, None)?;
+    writer.set_output_memory()?;
+    writer.write()?;
+    Ok(writer.get_buffer()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +462,9 @@ struct Cli {
     /// qpdf), unlike `--remove-restrictions` which prints a one-line
     /// diagnostic when an encrypted input was de-restricted.
     ///
-    /// Relationship with `--remove-restrictions`: on the current rewrite
-    /// path the two flags produce IDENTICAL output bytes because flpdf
-    /// always strips `/Encrypt` (and `/P` only exists inside `/Encrypt`).
-    /// The flags differ only in intent and diagnostic. They become
-    /// distinguishable once `--encrypt` lands and the
-    /// rewrite gains the ability to preserve or produce encryption.
+    /// Relationship with `--remove-restrictions`: both select the same
+    /// unencrypted output bytes; this flag is silent while
+    /// `--remove-restrictions` prints its diagnostic.
     // Same conflict semantics as --remove-restrictions: this is a
     // rewrite-path modifier and must be rejected against the inspection
     // subcommands so `flpdf --check --decrypt in out` is a usage error
@@ -546,15 +667,10 @@ struct Cli {
     ///
     /// Syntax: `--encrypt USER-PW OWNER-PW KEY-LEN [sub-flags] --`
     ///
-    /// USER-PW / OWNER-PW are the two password strings; KEY-LEN selects
-    /// the algorithm (`40` → V=1, `128` → V=2 or V=4, `256` → V=5 R=6).
-    /// The writer currently only supports
-    /// `KEY-LEN=128` together with `--use-aes=y` (= V=4 AES-128); the
-    /// other algorithms have their dict builders shipped but no writer
-    /// dispatch yet and are rejected with a clear "not yet supported"
-    /// diagnostic. Permission sub-flags (`--print`, `--modify`, etc.) are
-    /// likewise rejected for now; the default "all permissions granted"
-    /// is used implicitly.
+    /// USER-PW / OWNER-PW are the two password strings; KEY-LEN selects the
+    /// qpdf Standard security handler family (`40`, `128`, or `256`). The
+    /// AES, R=5, weak-crypto, and permission sub-flags follow qpdf's
+    /// compatibility rules and are validated before writing.
     ///
     /// The `--` terminator ends the sub-flag segment. The tokens after
     /// `--` are the INPUT / OUTPUT positionals.
@@ -581,8 +697,7 @@ struct Cli {
             "copy_encryption_from",
         ],
         help = "Encrypt output (qpdf --encrypt compatible): \
-                USER-PW OWNER-PW KEY-LEN [sub-flags] -- ; \
-                walking skeleton supports 128 with --use-aes=y only"
+                USER-PW OWNER-PW KEY-LEN [sub-flags] --"
     )]
     encrypt: Vec<String>,
 
@@ -594,11 +709,8 @@ struct Cli {
     /// supported; other schemes are rejected
     /// with a "not yet supported" diagnostic.
     ///
-    /// Mutually exclusive with `--encrypt`. `--linearize` is accepted at the
-    /// clap layer (qpdf itself supports the combination), but the linearized
-    /// writer currently returns a clean `Unsupported` error for this specific
-    /// pairing (reconciling the donor's `/ID[0]` with the linearized writer's
-    /// early `/ID`-computation requirement is a separate implementation gap).
+    /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
+    /// this option; qpdf supports copying encryption into a linearized output.
     #[arg(
         long = "copy-encryption-from",
         value_name = "FILE",
@@ -928,7 +1040,7 @@ struct RewriteCommand {
     ///
     /// The changing identifier /ID[1] is an MD5 over the rewritten output body;
     /// the permanent identifier /ID[0] is preserved from the input (matching
-    /// `--static-id` and ISO 32000-1 §14.4). Implies `--full-rewrite`. Mutually
+    /// `--static-id` and ISO 32000-1 §14.4). Uses the canonical writer. Mutually
     /// exclusive with `--static-id`, and incompatible with encrypted output (the
     /// /ID feeds the encryption key). Unlike `--static-id` it is a production-safe
     /// flag and emits no testing-only warning.
@@ -942,14 +1054,10 @@ struct RewriteCommand {
     /// Strip encryption and advisory permission restrictions from the output
     /// (qpdf `--remove-restrictions` equivalent).
     ///
-    /// A plaintext `rewrite` already drops the /Encrypt dictionary, and the
-    /// advisory permission bits live only inside /Encrypt /P, so the rewritten
-    /// output is inherently unrestricted. This flag adds no new decryption
-    /// behaviour beyond what plaintext rewrite already does: it makes the
-    /// intent explicit and prints a one-line diagnostic when an encrypted
-    /// (restricted) input was de-restricted. It does NOT bypass authentication
-    /// — an auth-requiring input without a working --password is rejected
-    /// exactly as a plain `rewrite` would reject it.
+    /// A normal rewrite preserves authenticated source encryption. This flag
+    /// explicitly disables that preservation, removes `/Encrypt` (and its
+    /// advisory `/P` permissions), and prints a one-line diagnostic when an
+    /// encrypted input was de-restricted. It does NOT bypass authentication.
     ///
     /// See `--decrypt` for the silent qpdf-compatible variant; on the current
     /// rewrite path the two flags produce identical output bytes.
@@ -960,16 +1068,13 @@ struct RewriteCommand {
     /// authenticate; on plaintext input it is a no-op pass-through. Silent
     /// in both cases, matching qpdf `--decrypt`.
     ///
-    /// Relationship with `--remove-restrictions`: on the current rewrite
-    /// path the two flags produce identical output bytes because flpdf
-    /// always drops `/Encrypt` and `/P` only lives inside `/Encrypt`. The
-    /// flags differ only in intent and diagnostic (this one is silent).
-    /// They become distinguishable once `--encrypt` lands.
+    /// Relationship with `--remove-restrictions`: both select the same
+    /// unencrypted output bytes; this flag is silent while
+    /// `--remove-restrictions` prints its diagnostic.
     #[arg(long = "decrypt")]
     decrypt: bool,
     /// Encrypt the output (qpdf `--encrypt` compatible). See the top-level
-    /// `--encrypt` documentation for the full syntax and the current
-    /// restrictions (KEY-LEN=128 + --use-aes=y only, default permissions).
+    /// `--encrypt` documentation for the full syntax and supported modes.
     /// `--linearize` is not rejected: qpdf itself supports
     /// `--linearize --encrypt ...`, and `write_linearized` threads
     /// `options.encrypt` through correctly.
@@ -993,11 +1098,8 @@ struct RewriteCommand {
     /// supported; other schemes are rejected
     /// with a "not yet supported" diagnostic.
     ///
-    /// Mutually exclusive with `--encrypt`. `--linearize` is accepted at the
-    /// clap layer (qpdf itself supports the combination), but the linearized
-    /// writer currently returns a clean `Unsupported` error for this specific
-    /// pairing (reconciling the donor's `/ID[0]` with the linearized writer's
-    /// early `/ID`-computation requirement is a separate implementation gap).
+    /// Mutually exclusive with `--encrypt`. `--linearize` may be combined with
+    /// this option; qpdf supports copying encryption into a linearized output.
     #[arg(
         long = "copy-encryption-from",
         value_name = "FILE",
@@ -1042,17 +1144,11 @@ struct RewriteCommand {
     /// byte-level no-op.
     #[arg(long = "no-original-object-ids")]
     no_original_object_ids: bool,
-    /// Decode every stream through its filter chain and re-emit the document
-    /// end-to-end with a single /FlateDecode filter per stream.  The output
-    /// contains no /Prev chain.  Cannot be combined with --linearize.
-    #[arg(long = "full-rewrite")]
-    full_rewrite: bool,
     /// Create a PDF in QDF form: uncompressed, normalized,
     /// human-readable/editable; pair with the qdf-fix subcommand after manual
     /// edits (qpdf --qdf equivalent).
     ///
-    /// Implies --full-rewrite (the QDF code path lives in the full-rewrite
-    /// writer) and forces object streams off. Cannot be combined with
+    /// Uses the canonical writer and forces object streams off. Cannot be combined with
     /// --linearize (QDF is inherently non-linearized).
     #[arg(long = "qdf")]
     qdf: bool,
@@ -1065,8 +1161,7 @@ struct RewriteCommand {
     /// - `generate`: pack eligible objects into freshly generated ObjStm
     ///   containers.
     ///
-    /// Only applies to the full-rewrite path; the incremental write path
-    /// ignores this flag.
+    /// Applies to the canonical qpdf writer output.
     #[arg(long = "object-streams", value_enum, default_value_t = CliObjectStreamMode::Preserve)]
     object_streams: CliObjectStreamMode,
 
@@ -1089,9 +1184,12 @@ struct RewriteCommand {
     ///
     /// When enabled, each page's content stream is updated in-place before writing,
     /// which requires a full rewrite of the document.
-    #[arg(long = "normalize-content", value_enum, default_value_t = CliYesNo::No,
-          help = "Normalize page content streams (qpdf default: n)")]
-    normalize_content: CliYesNo,
+    #[arg(
+        long = "normalize-content",
+        value_enum,
+        help = "Normalize page content streams (qpdf default: n)"
+    )]
+    normalize_content: Option<CliYesNo>,
 
     /// Coalesce multiple /Contents streams into a single stream per page
     /// (qpdf --coalesce-contents).
@@ -1341,7 +1439,7 @@ enum CliYesNo {
 
 /// Resolve qpdf's two-bit content-normalization state.
 ///
-/// qpdf's `QPDFJob` only calls `QPDFWriter::setContentNormalization` for an
+/// qpdf's `QPDFJob` only calls its content-normalization setter for an
 /// explicit `--normalize-content` option. The writer then enables normalization
 /// for QDF only when no explicit value was set, so `--qdf
 /// --normalize-content=n` must remain distinguishable from an absent option.
@@ -1526,8 +1624,8 @@ fn main() {
     // chain. The `else if args.linearize` branch (below) wins over the
     // default rewrite branch, so deferring this check into the rewrite branch
     // would let the linearize path run while silently dropping --qdf. QDF is
-    // inherently non-linearized; mirror the `rewrite --full-rewrite
-    // --linearize` rejection. (The `Commands::Rewrite` arm performs the
+    // inherently non-linearized; mirror the rewrite/--linearize rejection.
+    // (The `Commands::Rewrite` arm performs the
     // equivalent check for the subcommand form.)
     if args.qdf && args.linearize {
         eprintln!("flpdf: --qdf and --linearize cannot be used together");
@@ -1537,7 +1635,7 @@ fn main() {
     // Top-level `--qdf` combined with a page operation is rejected here, before
     // the dispatch chain, for the same reason: the `else if
     // page_ops_active(...)` branch (below) wins over the default rewrite
-    // branch and does not thread `--qdf` into its `WriteOptions`, so the
+    // branch and does not thread `--qdf` into its `WriterOptions`, so the
     // combination would silently emit a non-QDF document. The page-extraction
     // pipeline produces a normalized (non-QDF) doc by design; reject the
     // combination explicitly rather than ignoring the flag.
@@ -1708,12 +1806,16 @@ fn main() {
             eprintln!("flpdf: --linearize cannot be combined with --pages/--rotate/--split-pages");
             std::process::exit(1);
         }
-        let mut options = WriteOptions::default();
-        options.static_id = args.static_id;
-        options.deterministic_id = args.deterministic_id;
-        options.static_aes_iv = args.static_aes_iv;
-        options.no_original_object_ids = args.no_original_object_ids;
-        // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
+        let mut options = WriterOptions {
+            static_id: args.static_id,
+            deterministic_id: args.deterministic_id,
+            static_aes_iv: args.static_aes_iv,
+            no_original_object_ids: args.no_original_object_ids,
+            content_normalization: normalize_content,
+            content_normalization_set: args.normalize_content.is_some(),
+            ..WriterOptions::default()
+        };
+        // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
@@ -1726,10 +1828,10 @@ fn main() {
             }
         }
         // Top-level --encrypt / --copy-encryption-from on the --linearize
-        // alias: wire encryption onto WriteOptions (shared with the
+        // alias: wire encryption onto WriterOptions (shared with the
         // non-linearize branch below and the `rewrite` subcommand via
         // apply_encryption_options). Without this call the linearize branch
-        // would silently drop --encrypt/--copy-encryption-from (WriteOptions
+        // would silently drop --encrypt/--copy-encryption-from (WriterOptions
         // built here is separate from the non-linearize branch's), emitting
         // plaintext output even though the user asked for encryption.
         apply_encryption_options(
@@ -1764,7 +1866,7 @@ fn main() {
         // `flpdf in.pdf --pages . 1-3 -- out.pdf`). Mirrors the `rewrite`
         // subcommand's page-op dispatch below.
         //
-        // The page-op pipeline does not thread `WriteOptions.encrypt`
+        // The page-op pipeline does not thread `WriterOptions.encrypt`
         // through to the page-extraction / page-rewrite paths, so
         // silently honoring `--encrypt` here would emit plaintext output
         // even though the user asked for encryption. Reject upfront with
@@ -1788,11 +1890,15 @@ fn main() {
             );
             std::process::exit(1);
         }
-        let mut options = WriteOptions::default();
-        options.static_id = args.static_id;
-        options.deterministic_id = args.deterministic_id;
-        options.static_aes_iv = args.static_aes_iv;
-        options.no_original_object_ids = args.no_original_object_ids;
+        let mut options = WriterOptions {
+            static_id: args.static_id,
+            deterministic_id: args.deterministic_id,
+            static_aes_iv: args.static_aes_iv,
+            no_original_object_ids: args.no_original_object_ids,
+            content_normalization: normalize_content,
+            content_normalization_set: args.normalize_content.is_some(),
+            ..WriterOptions::default()
+        };
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
                 "y" => options.compress_streams = CompressStreams::Yes,
@@ -1841,27 +1947,19 @@ fn main() {
             _ => Err("page operations require both an input and an output file".into()),
         }
     } else {
-        let mut options = WriteOptions::default();
-        options.static_id = args.static_id;
-        options.deterministic_id = args.deterministic_id;
-        options.static_aes_iv = args.static_aes_iv;
-        options.no_original_object_ids = args.no_original_object_ids;
-        // Top-level `--qdf` is an alias of `rewrite --qdf`. The QDF code path
-        // lives in the full-rewrite writer, so --qdf must imply
-        // full_rewrite=true regardless of any --full-rewrite flag (the
-        // top-level surface has none). The library forces ObjStm off under
-        // qdf; --object-streams is not accepted on the top-level surface, so
-        // no conflict diagnostic is needed here.
-        options.qdf = args.qdf;
-        if args.qdf {
-            options.full_rewrite = true;
-        }
-        if args.deterministic_id {
-            // The deterministic /ID is an MD5 over the rewritten body, which
-            // only the full-rewrite writer produces; imply it like --qdf does.
-            options.full_rewrite = true;
-        }
-        // Top-level --compress-streams=y|n: parse and wire to WriteOptions.
+        let mut options = WriterOptions {
+            static_id: args.static_id,
+            deterministic_id: args.deterministic_id,
+            static_aes_iv: args.static_aes_iv,
+            no_original_object_ids: args.no_original_object_ids,
+            content_normalization: normalize_content,
+            content_normalization_set: args.normalize_content.is_some(),
+            qdf: args.qdf,
+            ..WriterOptions::default()
+        };
+        // Top-level `--qdf` is an alias of `rewrite --qdf`; both configure the
+        // same canonical qpdf writer. The library forces ObjStm off under qdf.
+        // Top-level --compress-streams=y|n: parse and wire to WriterOptions.
         // Accepted values are "y" and "n" (qpdf-compatible); other values exit 2.
         if let Some(ref cs) = args.compress_streams {
             match cs.as_str() {
@@ -1874,10 +1972,9 @@ fn main() {
             }
         }
         // Top-level --encrypt / --copy-encryption-from: wire encryption onto
-        // WriteOptions (shared with the `rewrite` surface via
-        // apply_encryption_options). Both force full_rewrite because the
-        // incremental writer cannot run an encryption pass; parse / donor-open
-        // errors exit 2. The page-op pipeline does not thread either option, so
+        // WriterOptions (shared with the `rewrite` surface via
+        // apply_encryption_options). Parse / donor-open errors exit 2. The
+        // page-op pipeline does not thread either option, so
         // the `else if page_ops_active` arm above already rejects them; this is
         // the non-page-op branch, so no further page-op guard is needed here.
         apply_encryption_options(
@@ -2160,13 +2257,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     std::process::exit(1);
                 }
             }
-            if cmd.full_rewrite && cmd.linearize {
-                eprintln!("flpdf: --full-rewrite and --linearize cannot be used together");
-                std::process::exit(1);
-            }
             // QDF is inherently non-linearized; reject the combination with a
-            // fatal diagnostic, mirroring the --full-rewrite/--linearize
-            // rejection above. (The top-level `--qdf --linearize` form is
+            // fatal diagnostic, mirroring the rewrite/--linearize rejection
+            // above. (The top-level `--qdf --linearize` form is
             // rejected earlier in main(), before the linearize branch wins
             // the dispatch chain.)
             if cmd.qdf && cmd.linearize {
@@ -2197,54 +2290,36 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                     CliObjectStreamMode::Preserve => {}
                 }
             }
-            let mut options = WriteOptions::default();
-            options.static_id = cmd.static_id;
-            options.deterministic_id = cmd.deterministic_id;
-            options.static_aes_iv = cmd.static_aes_iv;
-            options.min_version = cmd.min_version;
-            options.force_version = cmd.force_version;
-            options.no_original_object_ids = cmd.no_original_object_ids;
-            // `--qdf` enables QDF and, because the QDF code path lives in the
-            // full-rewrite writer, forces full_rewrite=true regardless of
-            // whether --full-rewrite was passed. `--deterministic-id` likewise
-            // needs the full-rewrite body to hash, so it implies full_rewrite.
-            options.qdf = cmd.qdf;
-            options.full_rewrite = cmd.full_rewrite || cmd.qdf || cmd.deterministic_id;
-            options.object_streams = cmd.object_streams.into();
-            options.compress_streams = match cmd.compress_streams {
-                CliYesNo::Yes => CompressStreams::Yes,
-                CliYesNo::No => CompressStreams::No,
+            let mut options = WriterOptions {
+                static_id: cmd.static_id,
+                deterministic_id: cmd.deterministic_id,
+                static_aes_iv: cmd.static_aes_iv,
+                min_version: cmd.min_version,
+                force_version: cmd.force_version,
+                no_original_object_ids: cmd.no_original_object_ids,
+                // `--qdf` and `--deterministic-id` configure the canonical writer's
+                // output preparation directly.
+                qdf: cmd.qdf,
+                object_streams: cmd.object_streams.into(),
+                compress_streams: match cmd.compress_streams {
+                    CliYesNo::Yes => CompressStreams::Yes,
+                    CliYesNo::No => CompressStreams::No,
+                },
+                newline_before_endstream: match cmd.newline_before_endstream {
+                    CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
+                    CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::No,
+                    CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
+                },
+                // --stream-data overrides --compress-streams when set.
+                stream_data: cmd.stream_data.map(Into::into),
+                // Recompressing an existing lone /FlateDecode stream is a writer
+                // setting and is applied by the same canonical route.
+                recompress_flate: cmd.recompress_flate,
+                ..WriterOptions::default()
             };
-            options.newline_before_endstream = match cmd.newline_before_endstream {
-                CliNewlineBeforeEndstream::Yes => NewlineBeforeEndstream::Yes,
-                CliNewlineBeforeEndstream::No => NewlineBeforeEndstream::No,
-                CliNewlineBeforeEndstream::Never => NewlineBeforeEndstream::Never,
-            };
-            // --stream-data overrides --compress-streams when set. The
-            // policy is only applied by the full-rewrite path; without this
-            // promotion the flag would be silently dropped on invocations
-            // that would otherwise take the incremental path (e.g. with
-            // --remove-unreferenced-resources=no on unencrypted input).
-            // Mirrors the same auto-promotion done for --qdf, --min-version,
-            // --force-version, and the content-mutation flags below.
-            options.stream_data = cmd.stream_data.map(Into::into);
-            if options.stream_data.is_some() {
-                options.full_rewrite = true;
-            }
-            // --recompress-flate only has an effect in the full-rewrite writer
-            // (it re-encodes lone /FlateDecode streams there). Promote to a full
-            // rewrite so the flag is not silently dropped on invocations that
-            // would otherwise take the incremental path (e.g. with
-            // --remove-unreferenced-resources=no on unencrypted input), matching
-            // the --stream-data promotion above.
-            options.recompress_flate = cmd.recompress_flate;
-            if cmd.recompress_flate {
-                options.full_rewrite = true;
-            }
             // `rewrite --encrypt` / `--copy-encryption-from`: wire encryption
-            // onto WriteOptions (shared with the top-level surface via
-            // apply_encryption_options). Both force full_rewrite — the
-            // incremental write path cannot run an encryption pass.
+            // onto WriterOptions (shared with the top-level surface via
+            // apply_encryption_options).
             apply_encryption_options(
                 &mut options,
                 &cmd.encrypt,
@@ -2252,7 +2327,9 @@ fn run_command(command: Commands, overlay_specs: &[OverlaySpec]) -> CliResult<()
                 cmd.encryption_file_password.as_deref(),
                 cmd.password.allow_weak_crypto,
             );
-            let normalize_content = cmd.normalize_content == CliYesNo::Yes;
+            let normalize_content = matches!(cmd.normalize_content, Some(CliYesNo::Yes));
+            options.content_normalization = normalize_content;
+            options.content_normalization_set = cmd.normalize_content.is_some();
             let coalesce_contents = cmd.coalesce_contents;
             let remove_unref = cmd.remove_unreferenced_resources;
 
@@ -2534,15 +2611,14 @@ fn print_check_block(input: &Path, summary: &flpdf::CheckSummary) -> CliResult<(
 }
 
 /// Wire `--encrypt` / `--copy-encryption-from` onto `options`, shared by the
-/// top-level and `rewrite` surfaces so the two stay in lock-step. Both options
-/// force `full_rewrite` because the incremental write path cannot run an
-/// encryption pass. A `--encrypt` parse error or a `--copy-encryption-from`
+/// top-level and `rewrite` surfaces so the two stay in lock-step. A `--encrypt`
+/// parse error or a `--copy-encryption-from`
 /// donor-open/validation error prints a `flpdf:`-prefixed diagnostic and exits
 /// 2, matching the surrounding option parsers. The two options are mutually
 /// exclusive at the CLI layer (clap `conflicts_with`), so at most one branch
 /// fires.
 fn apply_encryption_options(
-    options: &mut WriteOptions,
+    options: &mut WriterOptions,
     encrypt: &[String],
     copy_encryption_from: Option<&std::path::Path>,
     encryption_file_password: Option<&str>,
@@ -2552,7 +2628,6 @@ fn apply_encryption_options(
         match parse_encrypt_segment(encrypt, allow_weak_crypto) {
             Ok(params) => {
                 options.encrypt = Some(params);
-                options.full_rewrite = true;
             }
             Err(e) => {
                 eprintln!("flpdf: {e}");
@@ -2564,7 +2639,6 @@ fn apply_encryption_options(
         match build_copy_encryption_source(donor_path, encryption_file_password) {
             Ok(src) => {
                 options.copy_encryption = Some(src);
-                options.full_rewrite = true;
             }
             Err(e) => {
                 eprintln!("flpdf: {e}");
@@ -2579,7 +2653,7 @@ fn apply_encryption_options(
 /// (`--copy-encryption-from`).
 ///
 /// Returns a [`CopyEncryptionSource`] ready to be stored in
-/// [`WriteOptions::copy_encryption`] or an error string suitable for printing
+/// [`WriterOptions::copy_encryption`] or an error string suitable for printing
 /// to stderr before `exit(2)`.
 ///
 /// Only V=4 AES-128 donors are accepted.  Other encryption schemes are
@@ -3049,122 +3123,64 @@ fn run_rewrite(
     decrypt: bool,
     normalize_content: bool,
     coalesce_contents: bool,
-    remove_unref: CliRemoveUnreferencedResources,
+    _remove_unref: CliRemoveUnreferencedResources,
     generate_appearances: bool,
     flatten_annotations_mode: Option<CliFlattenMode>,
     flatten_rotation: bool,
     overlay_specs: &[OverlaySpec],
     verbose: bool,
-    options: WriteOptions,
+    options: WriterOptions,
 ) -> CliResult<()> {
     let input = input.ok_or("missing input file")?;
     let output = output.ok_or("missing output file")?;
     let mut standard_output = prepare_pdf_standard_output(&output)?;
 
-    // Overlay/underlay stacking mutates page dictionaries and adds objects that
-    // only surface on the full-rewrite path; the linearize path computes its
-    // object plan up front (before any such mutation), so the combination is
-    // rejected upfront. All overlay goldens use the plain full-rewrite path.
+    // Overlay/underlay stacking mutates page dictionaries and adds objects
+    // before the canonical writer plans the output. The linearized path has a
+    // separate qpdf ordering contract, so the combination is rejected upfront.
     if linearize && !overlay_specs.is_empty() {
         return Err("--overlay/--underlay cannot be combined with --linearize".into());
     }
 
-    // SCOPE BOUNDARY (flpdf-9hc.3.18 vs flpdf-9hc.4.10):
-    // `--remove-restrictions` and `--decrypt` both add NO new decryption
-    // logic. A plaintext `rewrite` of an authenticated encrypted input
-    // already drops the /Encrypt dictionary (crates/flpdf/src/writer.rs
-    // trailer.remove / xref_dict.remove "Encrypt"), and the advisory
-    // permission bits live only inside /Encrypt /P, so the rewritten
-    // output is inherently unrestricted (Pdf::permissions() on it is
-    // None). On the current rewrite path the two flags therefore produce
-    // identical output bytes; they differ only in intent and diagnostic:
-    //
-    // - `--remove-restrictions` prints a one-line diagnostic when an
-    //   encrypted input was de-restricted (flpdf-9hc.3.18).
-    // - `--decrypt` is silent in both cases, matching qpdf `--decrypt`
-    //   (flpdf-9hc.4.10).
-    //
-    // Neither flag bypasses authentication: `open_pdf` below performs the
-    // same auth as a plain `rewrite`, so a wrong/missing password is
-    // rejected identically and any diagnostic (printed only after a
-    // successful write) is never reached. `decrypt` is currently a flag-
-    // only parameter; it becomes behaviorally meaningful once `--encrypt`
-    // (flpdf-9hc.4.9) lands and the rewrite gains the ability to preserve
-    // or produce encryption — at that point `--decrypt` will override
-    // `--encrypt` back to plaintext.
-    let _ = decrypt;
     if linearize {
         let mut pdf = open_pdf(&input, repair, password)?;
-        reject_encrypted_write(&pdf)?;
         let diagnostics_start = pdf.repair_diagnostics().entries().len();
-        // --remove-restrictions must strip signatures BEFORE the linearization
-        // plan is computed: disable_digital_signatures deletes signature dicts and
-        // erases /Sig fields from /Fields, changing the reachable/first-page object
-        // set. The plan (and its per-page hint tables) is built from `pdf`, so it
-        // must see the post-strip graph; the independent write copy (pdf2) is
-        // stripped identically below. Both opens are stripped deterministically, so
-        // the plan and the written objects agree (a plan built pre-strip would
-        // count objects the write no longer emits — a hint-table mismatch). qpdf
-        // runs disableDigitalSignatures unconditionally under
-        // --remove-restrictions; the returned `had_signatures` reports whether
-        // anything changed, driving the full-rewrite promotion and the warning.
+        // --remove-restrictions must strip signatures before the linearization
+        // plan is computed: removing signature objects changes the reachable
+        // first-page graph. qpdf applies this transformation before planning.
         let had_signatures = if remove_restrictions {
             disable_digital_signatures(&mut pdf)?
         } else {
             false
         };
-        // Linearization plans object membership and sizes from this graph.
-        // Apply content normalization before planning, then repeat it on the
-        // independently opened write graph below so plan and emitted objects
-        // describe the same transformed document.
+        let mut options = options;
+        if decrypt || remove_restrictions {
+            options.preserve_encryption = false;
+        }
+        // Apply content normalization before the writer plans and emits the
+        // linearized document.
         let normalization_last_bad = if normalize_content {
             normalize_page_contents(&mut pdf)?
         } else {
             Vec::new()
         };
-        let plan =
-            LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, options.object_streams)?;
-        let renumber = RenumberMap::from_plan(&plan);
-
-        // Re-open the PDF so `write_linearized` can seek/read objects independently.
-        let mut pdf2 = open_pdf(&input, repair, password)?;
-        reject_encrypted_write(&pdf2)?;
-        let mut options = options;
-        // Strip the write copy identically whenever restrictions are removed, so
-        // pdf2 matches pdf's post-strip graph regardless of whether it changed.
-        if remove_restrictions {
-            disable_digital_signatures(&mut pdf2)?;
-        }
-        if normalize_content {
-            normalize_page_contents(&mut pdf2)?;
-        }
-        if had_signatures {
-            options.full_rewrite = true;
-        }
-        let mut doc = match linearize_pass1 {
-            Some(path) => {
-                write_linearized_with_pass1_file(&plan, &renumber, &mut pdf2, &options, path)?
-            }
-            None => write_linearized(&plan, &renumber, &mut pdf2, &options)?,
-        };
-        doc.back_patch()?;
-
-        if let Some(writer) = standard_output.as_mut() {
-            writer.write_all(&doc.bytes)?; // cov:ignore: exercised by binary_linearized_pdf_dash subprocess integration test
-        } else {
-            std::fs::write(&output, &doc.bytes)?;
-        }
-        if verbose && standard_output.is_none() {
+        let announce_file = standard_output.is_none();
+        write_with_pdf_writer(
+            &mut pdf,
+            &output,
+            &mut standard_output,
+            &options,
+            true,
+            linearize_pass1,
+        )?;
+        if verbose && announce_file {
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
         if had_signatures {
             logger_warn("flpdf: warning: removed signatures; signatures are now invalidated\n")?;
         }
-        // The linearize branch rejects encrypted input outright via
-        // reject_encrypted_write above, so an encrypted (restricted) input
-        // never reaches here; on unsigned unencrypted input there is nothing
-        // to de-restrict. Per qpdf-lenient behaviour that diagnostic is
-        // omitted.
+        // On an encrypted input, `--decrypt`/`--remove-restrictions` has
+        // already disabled source-encryption preservation above.
         // Preserve the pre-existing no-normalization linearize behavior:
         // warning finalization is part of this content-mutation consumer,
         // rather than a broad change to all repaired linearized rewrites.
@@ -3174,37 +3190,29 @@ fn run_rewrite(
     } else {
         let mut pdf = open_pdf(&input, repair, password)?;
         let diagnostics_start = pdf.repair_diagnostics().entries().len();
-        // Capture encryption state BEFORE the write: the plaintext path
-        // below drops /Encrypt, so this must be sampled while the in-memory
-        // model still reflects the input.
+        // Capture encryption state before the write for the qpdf-compatible
+        // restriction diagnostic.
         let was_encrypted = pdf.is_encrypted();
         // qpdf runs disableDigitalSignatures unconditionally under
         // --remove-restrictions: remove catalog /Perms, zero /AcroForm
         // /SigFlags, strip /FT /V /SV /Lock from /Sig form fields, and erase them
         // from the top-level /Fields array (a field still reachable from a page
         // /Annots survives as a plain annotation; orphaned signature dicts are
-        // dropped by the full-rewrite GC). The returned flag reports whether
-        // anything changed, driving the full-rewrite promotion and the warning.
+        // dropped by the canonical rewrite GC). The returned flag reports
+        // whether anything changed, driving the warning.
         let had_signatures = if remove_restrictions {
             disable_digital_signatures(&mut pdf)?
         } else {
             false
         };
         let mut options = options;
-        if was_encrypted {
-            options.full_rewrite = true;
+        if decrypt || remove_restrictions {
+            options.preserve_encryption = false;
         }
-        if had_signatures {
-            options.full_rewrite = true;
-        }
-
         // ── Content mutation pass ─────────────────────────────────────────────
         //
         // The mutations below operate on the in-memory Pdf model (via set_object).
-        // They are only visible in the output when the full-rewrite path is used
-        // (the incremental-update path copies source bytes verbatim and silently
-        // ignores in-memory mutations). Therefore we force full_rewrite = true
-        // whenever any content-mutating flag is active.
+        // They are all visible in the canonical writer output.
         //
         // Application order (semantically motivated):
         //   1. coalesce_page_contents  — merge /Contents arrays so subsequent
@@ -3223,43 +3231,13 @@ fn run_rewrite(
         // Pruning on a plain rewrite was a divergence that dropped an
         // unreferenced image XObject (flpdf-79ef); it is the resource-entry half
         // of flpdf-9hc.12.4/12.7, which conflated unreferenced-OBJECT GC (the
-        // renumber drops unreachable objects on every full rewrite — kept) with
+        // renumber drops unreachable objects on every canonical rewrite — kept) with
         // /Resources-ENTRY pruning (page-op-only — removed here).
         //
-        // INTENTIONAL DEFAULT: qpdf always performs a full rewrite and defaults
-        // to `--compress-streams=y`. flpdf mirrors this — because `remove_unref`
-        // defaults to `auto` (≠ `no`), a plain `flpdf rewrite IN OUT` forces the
-        // full-rewrite path (FlateDecode compression applied), matching plain
-        // `qpdf IN OUT`. The `remove_unref != No` term below is retained for that
-        // full-rewrite-default trigger AND the documented signed-PDF opt-out:
-        // `--remove-unreferenced-resources=no` drops to the incremental path,
-        // which preserves signed byte ranges (see docs/signed-pdf.md). The
-        // full-rewrite default is asserted by the
-        // `rewrite_default_is_qpdf_equivalent_full_rewrite` CLI test.
-        let needs_mutation = coalesce_contents
-            || normalize_content
-            || remove_unref != CliRemoveUnreferencedResources::No
-            || generate_appearances
-            || flatten_annotations_mode.is_some()
-            || flatten_rotation
-            || !overlay_specs.is_empty();
-        if needs_mutation {
-            options.full_rewrite = true;
-        }
-
-        // --min-version / --force-version rewrite the `%PDF-x.y` header line,
-        // which only the new-generation write paths emit. The incremental-update
-        // path (`write_pdf`) copies the source header verbatim and would
-        // silently drop the requested version. qpdf always full-rewrites, so
-        // every `qpdf --force-version`/`--min-version` invocation honors the
-        // flag; mirror that by promoting to full_rewrite whenever a version
-        // setter is active and we would otherwise take the incremental path
-        // (e.g. `rewrite --remove-unreferenced-resources=no --force-version=1.4`
-        // on unencrypted input). flpdf-9hc.13.1.
-        if options.min_version.is_some() || options.force_version.is_some() {
-            options.full_rewrite = true;
-        }
-
+        // qpdf always creates a fresh document and defaults to
+        // `--compress-streams=y`; the canonical writer applies those defaults
+        // for every rewrite. Version setters therefore always affect the
+        // emitted header, including with `--remove-unreferenced-resources=no`.
         // Step 1: coalesce per-page /Contents arrays into a single stream.
         if coalesce_contents {
             let page_refs = pages::page_refs(&mut pdf)?;
@@ -3311,8 +3289,7 @@ fn run_rewrite(
         // the other content transforms and before writing; mirror that ordering
         // so the output graph (and thus the bytes) matches qpdf. Each source is
         // opened (with its --password) and imported into the in-memory document
-        // here; the new objects only surface because full_rewrite was forced on
-        // above.
+        // here; the new objects are part of the canonical writer graph.
         if !overlay_specs.is_empty() {
             let mut built = build_overlay_specs(overlay_specs, repair)?;
 
@@ -3380,14 +3357,17 @@ fn run_rewrite(
             flpdf::apply_overlay_specs(&mut pdf, &mut built)?;
         }
 
-        if let Some(writer) = standard_output.as_mut() {
-            write_pdf_with_options(&mut pdf, writer, &options)?;
-        } else {
-            let mut out = File::create(&output)?;
-            write_pdf_with_options(&mut pdf, &mut out, &options)?;
-        }
+        let announce_file = standard_output.is_none();
+        write_with_pdf_writer(
+            &mut pdf,
+            &output,
+            &mut standard_output,
+            &options,
+            false,
+            None,
+        )?;
 
-        if verbose && standard_output.is_none() {
+        if verbose && announce_file {
             logger_info(format!("flpdf: wrote file {}\n", output.display()))?;
         }
         if remove_restrictions && was_encrypted {
@@ -4150,7 +4130,7 @@ fn run_page_extraction(
     page_ops: &PageOpArgs,
     overlay_specs: &[OverlaySpec],
     remove_unref: CliRemoveUnreferencedResources,
-    options: WriteOptions,
+    options: WriterOptions,
     verbose: bool,
 ) -> CliResult<()> {
     let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
@@ -4213,6 +4193,14 @@ fn run_page_extraction(
         .into());
     }
 
+    // qpdf's page-operation output inherits encryption from the command's
+    // primary input. A plaintext primary importing pages from an encrypted
+    // secondary produces plaintext; an encrypted primary remains encrypted.
+    // Probe the primary separately because the selected page source may be a
+    // different input in qpdf's `--pages` command.
+    let primary_encrypted =
+        open_pdf(&primary_input.to_path_buf(), repair, password)?.is_encrypted();
+
     // --verbose: emit qpdf-parity `--pages` progress. Order matches
     // libqpdf/QPDFJob.cc: process_all() emits the shared-resource scan
     // per input file (L2250/L2312), then the top-level pipeline emits
@@ -4271,7 +4259,6 @@ fn run_page_extraction(
         src_pw.password_file = None;
     }
     let mut pdf = open_pdf(&source_path.to_path_buf(), repair, &src_pw)?;
-    reject_encrypted_write(&pdf)?;
 
     let selected: Vec<ObjectRef> = combined_pages.iter().map(|cp| cp.page.page_ref).collect();
     if selected.is_empty() {
@@ -4343,7 +4330,10 @@ fn run_page_extraction(
     // count. Mirror that ordering by applying overlays here, after the
     // page tree has been rebuilt and pruned.
     let mut options = options;
-    options.full_rewrite = true;
+    // Page-op flags reject explicit encryption/copy-encryption options above;
+    // source-encryption preservation follows the primary-input rule captured
+    // above.
+    options.preserve_encryption = primary_encrypted;
     if !overlay_specs.is_empty() {
         let mut built = build_overlay_specs(overlay_specs, repair)?;
 
@@ -4398,8 +4388,7 @@ fn run_page_extraction(
     }
 
     // Step 9: serialize. Extraction always implies a full document rewrite.
-    let mut bytes: Vec<u8> = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut bytes, &options)?;
+    let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
@@ -4479,7 +4468,7 @@ fn run_rewrite_with_page_ops(
     repair: bool,
     password: &PasswordArgs,
     page_ops: &PageOpArgs,
-    options: WriteOptions,
+    options: WriterOptions,
     verbose: bool,
 ) -> CliResult<()> {
     let mut standard_output = prepare_page_operation_standard_output(output, page_ops)?;
@@ -4491,19 +4480,17 @@ fn run_rewrite_with_page_ops(
         );
     }
     let mut pdf = open_pdf(&input.to_path_buf(), repair, password)?;
-    reject_encrypted_write(&pdf)?;
 
     if !page_ops.rotate.is_empty() {
         let page_refs = pages::page_refs(&mut pdf)?;
         apply_rotate_specs(&mut pdf, &page_ops.rotate, &page_refs)?;
     }
 
-    // Force a full rewrite so the in-memory /Rotate mutations are emitted
-    // (the incremental write path copies source bytes verbatim).
+    // Page operations emit a fresh document and preserve encryption only when
+    // the primary input itself was encrypted, matching qpdf's page copier.
     let mut options = options;
-    options.full_rewrite = true;
-    let mut bytes: Vec<u8> = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut bytes, &options)?;
+    options.preserve_encryption = pdf.is_encrypted();
+    let bytes = write_qpdf_to_memory(&mut pdf, &options)?;
 
     if let Some(raw) = page_ops.split_pages.as_deref() {
         let n = parse_split_n(raw)?;
@@ -4624,22 +4611,21 @@ fn run_qdf(
     let output = output.ok_or("missing output file")?;
     let mut standard_output = prepare_pdf_standard_output(&output)?;
     let mut pdf = open_pdf(&input, repair, password)?;
-    reject_encrypted_write(&pdf)?;
     let diagnostics_start = pdf.repair_diagnostics().entries().len();
 
-    // The `qdf` subcommand is an alias of `rewrite --qdf` (epic flpdf-9hc.6
-    // architecture decision): produce canonical QDF via the full-rewrite
-    // path rather than the old standalone `write_qdf` raw dump. The QDF code
-    // path lives in write_pdf_full_rewrite, so full_rewrite must be true.
-    let mut options = WriteOptions::default();
-    options.qdf = true;
-    options.full_rewrite = true;
-    if let Some(writer) = standard_output.as_mut() {
-        write_pdf_with_options(&mut pdf, writer, &options)?; // cov:ignore: exercised by binary_qdf_dash subprocess integration test
-    } else {
-        let mut out = File::create(output)?;
-        write_pdf_with_options(&mut pdf, &mut out, &options)?;
-    }
+    // The `qdf` subcommand is the canonical PdfWriter QDF mode.
+    let options = WriterOptions {
+        qdf: true,
+        ..WriterOptions::default()
+    };
+    write_with_pdf_writer(
+        &mut pdf,
+        &output,
+        &mut standard_output,
+        &options,
+        false,
+        None,
+    )?;
     finish_lazy_warnings(&input, &pdf, diagnostics_start)
 }
 
@@ -4654,13 +4640,6 @@ fn run_qdf_fix(input: &std::path::Path, output: &std::path::Path) -> CliResult<(
     let bytes = std::fs::read(input)?;
     let fixed = fix_qdf(&bytes)?;
     std::fs::write(output, fixed)?;
-    Ok(())
-}
-
-fn reject_encrypted_write<R: std::io::Read + std::io::Seek>(pdf: &Pdf<R>) -> CliResult<()> {
-    if pdf.is_encrypted() {
-        return Err("encrypted PDF output is not supported for this mode; use plain rewrite to produce decrypted plaintext".into());
-    }
     Ok(())
 }
 
@@ -5820,7 +5799,6 @@ fn run_add_attachment(
     })?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
-    reject_encrypted_write(&pdf)?;
 
     // Duplicate-key handling.
     if !args.replace {
@@ -5857,11 +5835,19 @@ fn run_add_attachment(
     let filespec_ref = builder.build(&mut pdf)?;
     insert_embedded_file(&mut pdf, &key, filespec_ref)?;
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.deterministic_id = deterministic_id;
-    let mut out = File::create(&output)?;
-    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    let options = WriterOptions {
+        deterministic_id,
+        ..WriterOptions::default()
+    };
+    let mut standard_output = None;
+    write_with_pdf_writer(
+        &mut pdf,
+        &output,
+        &mut standard_output,
+        &options,
+        false,
+        None,
+    )?;
     Ok(())
 }
 
@@ -5878,18 +5864,25 @@ fn run_remove_attachment(
     let output = output.ok_or("--remove-attachment: missing output PDF")?;
 
     let mut pdf = open_pdf(&input, repair, password)?;
-    reject_encrypted_write(&pdf)?;
 
     let found = remove_attachment(&mut pdf, key.as_bytes())?;
     if !found {
         return Err(format!("--remove-attachment: key {:?} not found in document", key).into());
     }
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.deterministic_id = deterministic_id;
-    let mut out = File::create(&output)?;
-    write_pdf_with_options(&mut pdf, &mut out, &options)?;
+    let options = WriterOptions {
+        deterministic_id,
+        ..WriterOptions::default()
+    };
+    let mut standard_output = None;
+    write_with_pdf_writer(
+        &mut pdf,
+        &output,
+        &mut standard_output,
+        &options,
+        false,
+        None,
+    )?;
     Ok(())
 }
 
@@ -5971,17 +5964,24 @@ fn run_copy_attachments_from(
         .map_err(|e| format!("--copy-attachments-from: failed to open source PDF: {e}"))?;
 
     let mut target = open_pdf(&input, repair, password)?;
-    reject_encrypted_write(&target)?;
 
     let prefix = args.prefix.as_deref();
     let count = copy_attachments_from(&mut target, &mut src, prefix)?;
     eprintln!("copied {count} attachment(s)");
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.deterministic_id = deterministic_id;
-    let mut out = File::create(&output)?;
-    write_pdf_with_options(&mut target, &mut out, &options)?;
+    let options = WriterOptions {
+        deterministic_id,
+        ..WriterOptions::default()
+    };
+    let mut standard_output = None;
+    write_with_pdf_writer(
+        &mut target,
+        &output,
+        &mut standard_output,
+        &options,
+        false,
+        None,
+    )?;
     Ok(())
 }
 

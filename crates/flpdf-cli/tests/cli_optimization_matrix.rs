@@ -261,11 +261,7 @@ fn normalize_content_y_produces_canonical_form() {
     let output = tmp.path().join("normalized.pdf");
 
     // Run with full-rewrite (required by normalize-content) + normalize-content=y
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--normalize-content=y"],
-    );
+    run_rewrite(&input, &output, &["--normalize-content=y"]);
 
     // Open input and output with flpdf::Pdf
     let input_bytes = std::fs::read(&input).unwrap();
@@ -351,11 +347,7 @@ fn normalize_content_y_matches_qpdf_11_9_decoded_bytes() {
     run_rewrite(
         &input,
         &flpdf_output,
-        &[
-            "--full-rewrite",
-            "--normalize-content=y",
-            "--compress-streams=n",
-        ],
+        &["--normalize-content=y", "--compress-streams=n"],
     );
 
     assert_eq!(
@@ -390,12 +382,7 @@ fn normalize_content_bad_tokens_match_qpdf_bytes_and_warning_exit() {
 
     let mut flpdf = CargoCommand::cargo_bin("flpdf").unwrap();
     let flpdf = flpdf
-        .args([
-            "rewrite",
-            "--full-rewrite",
-            "--normalize-content=y",
-            "--compress-streams=n",
-        ])
+        .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
         .arg(&input)
         .arg(&flpdf_output)
         .output()
@@ -453,12 +440,7 @@ fn normalize_content_indirect_forms_match_qpdf_11_9() {
 
         let flpdf = CargoCommand::cargo_bin("flpdf")
             .unwrap()
-            .args([
-                "rewrite",
-                "--full-rewrite",
-                "--normalize-content=y",
-                "--compress-streams=n",
-            ])
+            .args(["rewrite", "--normalize-content=y", "--compress-streams=n"])
             .arg(&input)
             .arg(&flpdf_output)
             .output()
@@ -511,11 +493,7 @@ fn normalize_content_n_leaves_content_unchanged() {
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("norm-n.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--normalize-content=n"],
-    );
+    run_rewrite(&input, &output, &["--normalize-content=n"]);
 
     let input_bytes = std::fs::read(&input).unwrap();
     let output_bytes = std::fs::read(&output).unwrap();
@@ -556,7 +534,7 @@ fn coalesce_contents_merges_array_to_single_stream() {
     let input = fixture_path("multi-contents-one-page.pdf");
     let output = tmp.path().join("coalesced.pdf");
 
-    run_rewrite(&input, &output, &["--full-rewrite", "--coalesce-contents"]);
+    run_rewrite(&input, &output, &["--coalesce-contents"]);
 
     let input_bytes = std::fs::read(&input).unwrap();
     let output_bytes = std::fs::read(&output).unwrap();
@@ -649,11 +627,7 @@ fn remove_unref_resources_auto_keeps_unused_font_like_qpdf() {
     let input = fixture_path("unref-resources-one-page.pdf");
     let output = tmp.path().join("unref-auto.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--remove-unreferenced-resources=auto"],
-    );
+    run_rewrite(&input, &output, &["--remove-unreferenced-resources=auto"]);
 
     let font_keys = extract_page_resource_keys(&output, "Font");
     assert!(
@@ -680,11 +654,7 @@ fn remove_unref_resources_yes_keeps_unused_font_like_qpdf() {
     let input = fixture_path("unref-resources-one-page.pdf");
     let output = tmp.path().join("unref-yes.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--remove-unreferenced-resources=yes"],
-    );
+    run_rewrite(&input, &output, &["--remove-unreferenced-resources=yes"]);
 
     let font_keys = extract_page_resource_keys(&output, "Font");
     assert!(
@@ -737,13 +707,13 @@ fn kept_indirect_length_plain_rewrite_keeps_image_xobject() {
     // the fixture, not a defect in flpdf's rewrite. The /Im0 + /DCTDecode presence
     // checks above are the meaningful assertions for flpdf-79ef.
 
-    // The issue also cited `--full-rewrite --static-id` as a repro; it hits the same
+    // The issue also cited the canonical rewrite with `--static-id` as a repro; it hits the same
     // run_rewrite path, so pin it explicitly too.
     let output_fr = tmp.path().join("kept-indirect-length-fr.pdf");
-    run_rewrite(&input, &output_fr, &["--full-rewrite", "--static-id"]);
+    run_rewrite(&input, &output_fr, &["--static-id"]);
     assert!(
         extract_page_resource_keys(&output_fr, "XObject").contains(&b"Im0".to_vec()),
-        "--full-rewrite --static-id must also keep the image XObject /Im0",
+        "canonical rewrite with --static-id must also keep the image XObject /Im0",
     );
 }
 
@@ -753,11 +723,7 @@ fn remove_unref_resources_no_retains_all_fonts() {
     let input = fixture_path("unref-resources-one-page.pdf");
     let output = tmp.path().join("unref-no.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--remove-unreferenced-resources=no"],
-    );
+    run_rewrite(&input, &output, &["--remove-unreferenced-resources=no"]);
 
     let font_keys = extract_page_resource_keys(&output, "Font");
     assert!(
@@ -834,7 +800,7 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("compress-y.pdf");
 
-    run_rewrite(&input, &output, &["--full-rewrite", "--compress-streams=y"]);
+    run_rewrite(&input, &output, &["--compress-streams=y"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
     let mut out_pdf = Pdf::open(Cursor::new(output_bytes.clone())).unwrap();
@@ -906,17 +872,19 @@ fn compress_streams_y_applies_flatedecode_and_roundtrips() {
 // ---------------------------------------------------------------------------
 // Cell 4b: compress-streams=n
 //
-// Asserts: the output page's stream dict has NO /Filter key, and decoded
-// bytes match the input.
+// qpdf's `--compress-streams=n` only disables newly generated compression; it
+// does not raise the decode level. Existing filter chains therefore remain
+// intact. Use `--stream-data=uncompress` when all decodable filters must be
+// removed. This cell asserts qpdf's actual `--compress-streams=n` behaviour.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn compress_streams_n_omits_filter_and_roundtrips() {
+fn compress_streams_n_preserves_existing_filters_and_roundtrips() {
     let tmp = tempdir().unwrap();
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("compress-n.pdf");
 
-    run_rewrite(&input, &output, &["--full-rewrite", "--compress-streams=n"]);
+    run_rewrite(&input, &output, &["--compress-streams=n"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
     let mut out_pdf = Pdf::open(Cursor::new(output_bytes.clone())).unwrap();
@@ -944,8 +912,11 @@ fn compress_streams_n_omits_filter_and_roundtrips() {
 
         let filter = content_stream.dict.get("Filter");
         assert!(
-            filter.is_none(),
-            "compress-streams=n: /Contents stream must have no /Filter key; got {filter:?}"
+            matches!(filter, Some(Object::Array(filters)) if filters.as_slice() == [
+                Object::Name(b"ASCII85Decode".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]),
+            "compress-streams=n: qpdf preserves the existing filter chain; got {filter:?}"
         );
     }
 
@@ -980,11 +951,7 @@ fn newline_before_endstream_y_always_inserts_newline() {
     let input = fixture_path("one-page.pdf");
     let output = tmp.path().join("newline-y.pdf");
 
-    run_rewrite(
-        &input,
-        &output,
-        &["--full-rewrite", "--newline-before-endstream=y"],
-    );
+    run_rewrite(&input, &output, &["--newline-before-endstream=y"]);
 
     let output_bytes = std::fs::read(&output).unwrap();
     // Use the structural helper to find only genuine endstream keyword positions,
@@ -1059,11 +1026,7 @@ fn newline_before_endstream_n_omits_extra_newline_for_eol_terminated_payload() {
     run_rewrite(
         &input,
         &output,
-        &[
-            "--full-rewrite",
-            "--newline-before-endstream=n",
-            "--compress-streams=n",
-        ],
+        &["--newline-before-endstream=n", "--compress-streams=n"],
     );
 
     let output_bytes = std::fs::read(&output).unwrap();
@@ -1132,7 +1095,6 @@ fn combination_normalize_coalesce_compress_succeeds() {
         &input,
         &output,
         &[
-            "--full-rewrite",
             "--normalize-content=y",
             "--coalesce-contents",
             "--compress-streams=y",

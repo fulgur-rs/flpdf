@@ -6,10 +6,13 @@
 //! inheritance resolution and per-page mutation round-trips.
 
 use flpdf::{
-    apply_rotate_to_pages, pages, write_pdf, Error, Object, ObjectRef, PageBox, PageObjectHelper,
-    Pdf, RotateMode, RotateOp,
+    apply_rotate_to_pages, pages, Error, Object, ObjectRef, PageBox, PageObjectHelper, Pdf,
+    RotateMode, RotateOp,
 };
 use std::io::Cursor;
+
+mod common;
+use common::write_default;
 
 // ---------------------------------------------------------------------------
 // Minimal PDF builder helpers
@@ -299,7 +302,7 @@ fn rotate_round_trip_after_mutation() {
 
     // Serialize and re-open.
     let mut serialized: Vec<u8> = Vec::new();
-    write_pdf(&mut pdf, &mut serialized).unwrap();
+    write_default(&mut pdf, &mut serialized).unwrap();
     let mut pdf2 = open(serialized);
 
     let page_refs = pages::page_refs(&mut pdf2).unwrap();
@@ -624,7 +627,7 @@ fn media_box_round_trip_after_mutation() {
 
     // Serialize and re-open.
     let mut serialized: Vec<u8> = Vec::new();
-    write_pdf(&mut pdf, &mut serialized).unwrap();
+    write_default(&mut pdf, &mut serialized).unwrap();
     let mut pdf2 = open(serialized);
 
     let page_refs = pages::page_refs(&mut pdf2).unwrap();

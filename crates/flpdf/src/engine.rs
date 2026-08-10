@@ -151,7 +151,6 @@ impl<R: Read + Seek> Pdf<R> {
             resolver,
             version: loaded.version,
             trailer: loaded.trailer,
-            startxref: loaded.startxref,
             last_xref_form: loaded.last_xref_form,
             cache,
             foreign_object_maps: BTreeMap::new(),

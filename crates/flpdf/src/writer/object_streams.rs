@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::object::{Dictionary, Object, ObjectRef};
+use crate::writer::WriterOptions;
 use crate::XrefEntry;
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -168,8 +169,8 @@ pub(crate) struct ObjectStreamPlan {
     pub(crate) removed_refs: BTreeSet<ObjectRef>,
 }
 
-/// Convert public [`WriteOptions`](crate::WriteOptions) into an internal
-/// [`PlannerConfig`].  The conversion is direct: `WriteOptions.object_streams`
+/// Convert public [`WriterOptions`](crate::writer::WriterOptions) into an internal
+/// [`PlannerConfig`].  The conversion is direct: `WriterOptions.object_streams`
 /// names the policy, and the planner's batch cap defaults to qpdf's value of
 /// 100.  Future writer-side knobs (e.g. an explicit cap override) would be
 /// threaded through this conversion.
@@ -179,7 +180,7 @@ pub(crate) struct ObjectStreamPlan {
 /// output must not contain any ObjStm containers.  `options.object_streams` is
 /// intentionally left unmodified so that conflicts between
 /// `--qdf` and an explicit `--object-streams=generate` flag can be detected.
-pub(crate) fn planner_config_from_options(options: &crate::WriteOptions) -> PlannerConfig {
+pub(crate) fn planner_config_from_options(options: &WriterOptions) -> PlannerConfig {
     let mode = if options.qdf {
         ObjectStreamMode::Disable
     } else {
@@ -264,10 +265,28 @@ pub(crate) fn filter_objstm_batches_for_output<R: std::io::Read + std::io::Seek>
 pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek>(
     pdf: &mut crate::Pdf<R>,
 ) -> crate::Result<ObjectStreamPlan> {
+    plan_qpdf_preserve_object_streams_with_unreferenced(pdf, false)
+}
+
+/// Reconstruct source ObjStm grouping with qpdf's
+/// `preserveUnreferencedObjects` policy. qpdf keeps every source ObjStm
+/// member in the source container map in this mode; reachability filtering is
+/// applied only when the setting is disabled.
+pub(crate) fn plan_qpdf_preserve_object_streams_with_unreferenced<
+    R: std::io::Read + std::io::Seek,
+>(
+    pdf: &mut crate::Pdf<R>,
+    preserve_unreferenced: bool,
+) -> crate::Result<ObjectStreamPlan> {
     let ctx = eligibility_context(pdf)?;
     let length_exclusions = collect_indirect_objstm_length_refs(pdf)?;
-    let compressible = compressible_objgens_qpdf_plan(pdf)?;
-    let eligible: BTreeSet<ObjectRef> = compressible.eligible.iter().copied().collect();
+    let compressible = (!preserve_unreferenced)
+        .then(|| compressible_objgens_qpdf_plan(pdf))
+        .transpose()?;
+    let eligible: BTreeSet<ObjectRef> = compressible
+        .as_ref()
+        .map(|plan| plan.eligible.iter().copied().collect())
+        .unwrap_or_default();
     let mut by_container: BTreeMap<ObjectRef, Vec<ObjectRef>> = BTreeMap::new();
 
     for (member, entry) in pdf.source_xref_entries() {
@@ -283,7 +302,9 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
     for (source, members) in by_container {
         let mut retained = Vec::new();
         for member in members {
-            if length_exclusions.contains(&member) || !eligible.contains(&member) {
+            if length_exclusions.contains(&member)
+                || (!preserve_unreferenced && !eligible.contains(&member))
+            {
                 continue;
             }
             let eligible_for_objstm = {
@@ -305,7 +326,9 @@ pub(crate) fn plan_qpdf_preserve_object_streams<R: std::io::Read + std::io::Seek
 
     Ok(ObjectStreamPlan {
         groups,
-        removed_refs: compressible.removed_refs,
+        removed_refs: compressible
+            .map(|plan| plan.removed_refs)
+            .unwrap_or_default(),
     })
 }
 
@@ -1041,15 +1064,14 @@ mod tests {
             2,
         );
         let mut pdf = crate::Pdf::open(std::io::Cursor::new(bytes)).unwrap();
-        let options = crate::WriteOptions {
-            full_rewrite: true,
+        let options = crate::writer::WriterOptions {
             object_streams: ObjectStreamMode::Generate,
             static_id: true,
-            ..crate::WriteOptions::default()
+            ..crate::writer::WriterOptions::default()
         };
         let mut output = Vec::new();
 
-        crate::write_pdf_with_options(&mut pdf, &mut output, &options)
+        crate::writer::emit_canonical_pdf(&mut pdf, &mut output, &options)
             .expect("unreachable malformed object must not block qpdf-style rewrite");
 
         assert!(
@@ -2242,7 +2264,7 @@ mod tests {
 
     #[test]
     fn write_options_default_is_preserve_mode() {
-        let options = crate::WriteOptions::default();
+        let options = crate::writer::WriterOptions::default();
         assert_eq!(options.object_streams, ObjectStreamMode::Preserve);
     }
 
@@ -2253,7 +2275,7 @@ mod tests {
 
     #[test]
     fn planner_config_from_options_maps_preserve() {
-        let options = crate::WriteOptions {
+        let options = crate::writer::WriterOptions {
             object_streams: ObjectStreamMode::Preserve,
             ..Default::default()
         };
@@ -2264,7 +2286,7 @@ mod tests {
 
     #[test]
     fn planner_config_from_options_maps_disable() {
-        let options = crate::WriteOptions {
+        let options = crate::writer::WriterOptions {
             object_streams: ObjectStreamMode::Disable,
             ..Default::default()
         };
@@ -2274,7 +2296,7 @@ mod tests {
 
     #[test]
     fn planner_config_from_options_maps_generate() {
-        let options = crate::WriteOptions {
+        let options = crate::writer::WriterOptions {
             object_streams: ObjectStreamMode::Generate,
             ..Default::default()
         };
@@ -2286,7 +2308,7 @@ mod tests {
 
     #[test]
     fn qdf_flag_forces_disable_mode_over_preserve() {
-        let options = crate::WriteOptions {
+        let options = crate::writer::WriterOptions {
             qdf: true,
             object_streams: ObjectStreamMode::Preserve,
             ..Default::default()
@@ -2303,7 +2325,7 @@ mod tests {
 
     #[test]
     fn qdf_flag_forces_disable_mode_over_generate() {
-        let options = crate::WriteOptions {
+        let options = crate::writer::WriterOptions {
             qdf: true,
             object_streams: ObjectStreamMode::Generate,
             ..Default::default()
@@ -2320,7 +2342,7 @@ mod tests {
 
     #[test]
     fn qdf_false_does_not_override_generate() {
-        let options = crate::WriteOptions {
+        let options = crate::writer::WriterOptions {
             qdf: false,
             object_streams: ObjectStreamMode::Generate,
             ..Default::default()

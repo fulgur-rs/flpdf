@@ -4,7 +4,7 @@
 //! which call `write_linearized` directly), these run the actual `flpdf` binary
 //! through `rewrite --linearize [...]` and diff the full output bytes against the
 //! committed qpdf goldens. This exercises the whole CLI path — argument parsing,
-//! `WriteOptions` assembly, the write pipeline, and final framing — so a
+//! `WriterOptions` assembly, the write pipeline, and final framing — so a
 //! divergence introduced by the CLI layer (not just the library) is caught.
 //!
 //! Gated on `qpdf-zlib-compat`: byte identity requires flpdf's DEFLATE to match
@@ -55,10 +55,10 @@ fn run_cli(stem: &str, extra: &[&str]) -> Vec<u8> {
     std::fs::read(&out).unwrap_or_else(|e| panic!("read flpdf output for {stem}: {e}"))
 }
 
-/// Run `flpdf rewrite --full-rewrite --static-id <fixture> <out>` through the
+/// Run `flpdf rewrite --static-id <fixture> <out>` through the
 /// actual binary and return the written bytes. Mirrors the library-level
 /// `cmp_diff_zero_tests` but goes through the CLI so a divergence in argv
-/// parsing, `WriteOptions` assembly, or defaults (e.g. `--newline-before-endstream`)
+/// parsing, `WriterOptions` assembly, or defaults (e.g. `--newline-before-endstream`)
 /// is caught end-to-end.
 fn run_cli_full_rewrite_static_id(stem: &str) -> Vec<u8> {
     let outdir = tempfile::tempdir().unwrap();
@@ -68,7 +68,6 @@ fn run_cli_full_rewrite_static_id(stem: &str) -> Vec<u8> {
     Command::cargo_bin("flpdf")
         .unwrap()
         .arg("rewrite")
-        .arg("--full-rewrite")
         .arg("--static-id")
         .arg(&input)
         .arg(&out)

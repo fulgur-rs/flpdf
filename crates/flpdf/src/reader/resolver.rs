@@ -130,8 +130,8 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     ///
     /// It is *not* equivalent, and the difference is what
     /// [`Self::rewind_underlying_source`] exists for: wrapping makes the shift
-    /// unskippable, so qpdf reaches the bytes before it through the wrapper's
-    /// `proxied` member rather than through `m->file`.
+    /// unskippable, so raw-input snapshots reach the bytes before it through
+    /// the wrapper's `proxied` member rather than through `m->file`.
     header_offset: usize,
     /// qpdf `m->xref_table` (`QPDF.hh:1465`).
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
@@ -436,8 +436,8 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// same member; `header_offset` is what stands in for the wrapper, so the
     /// member has to become a method.
     ///
-    /// qpdf never reads `proxied` directly. flpdf must, for
-    /// `ResolverHandle::read_physical_input` — see there.
+    /// qpdf never reads `proxied` directly. flpdf needs the equivalent source
+    /// boundary for raw-input snapshots used by JSON inspection and repair.
     fn rewind_underlying_source(&mut self) -> Result<()> {
         self.reader.seek(SeekFrom::Start(0))?;
         Ok(())
@@ -1200,20 +1200,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
     pub(crate) fn read_window(&self, offset: u64, next: Option<u64>) -> Result<Vec<u8>> {
         self.seek(offset)?;
         self.read_to_owned(next.map(|next| next.saturating_sub(offset)))
-    }
-
-    /// Read the entire input from the *unwrapped* source's offset zero, header
-    /// shift included. Callers that want qpdf-logical coordinates use
-    /// [`Self::read_window`].
-    ///
-    /// `qpdf-legacy-tenant(flpdf-25kg.3.5)`: same status and same reason for
-    /// living here as [`Self::read_window`]. Its one caller is
-    /// `Pdf::source_bytes`, which the writer uses to copy the original file
-    /// verbatim — which is why the bytes before the header shift have to be
-    /// included, and why [`ResolverCore::rewind_underlying_source`] exists.
-    pub(crate) fn read_physical_input(&self) -> Result<Vec<u8>> {
-        self.core.borrow_mut().rewind_underlying_source()?;
-        self.read_to_owned(None)
     }
 
     /// Collect `limit` bytes — or everything left when `limit` is `None` —
@@ -4882,7 +4868,7 @@ mod tests {
     #[test]
     fn canonical_resolver_decrypts_strings_at_parse_time() {
         use crate::encrypt_setup::EncryptParams;
-        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+        use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
 
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let mut entries: Vec<(u16, usize)> = Vec::new();
@@ -4910,17 +4896,16 @@ mod tests {
 
         let mut plaintext = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
         let mut encrypted = Vec::new();
-        write_pdf_with_options(
+        emit_canonical_pdf(
             &mut plaintext,
             &mut encrypted,
-            &WriteOptions {
-                full_rewrite: true,
+            &WriterOptions {
                 compress_streams: CompressStreams::No,
                 encrypt: Some(EncryptParams::v4_aes128(
                     b"user-pw".to_vec(),
                     b"owner-pw".to_vec(),
                 )),
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             },
         )
         .expect("V=4 AES128 encrypted write");
@@ -4968,7 +4953,7 @@ mod tests {
         info_body: &[u8],
         encrypt: crate::encrypt_setup::EncryptParams,
     ) -> Vec<u8> {
-        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+        use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
 
         let mut bytes = b"%PDF-1.7\n".to_vec();
         let mut entries: Vec<(u16, usize)> = Vec::new();
@@ -4996,14 +4981,13 @@ mod tests {
 
         let mut plaintext = Pdf::open(Cursor::new(bytes)).expect("open plaintext fixture");
         let mut encrypted = Vec::new();
-        write_pdf_with_options(
+        emit_canonical_pdf(
             &mut plaintext,
             &mut encrypted,
-            &WriteOptions {
-                full_rewrite: true,
+            &WriterOptions {
                 compress_streams: CompressStreams::No,
                 encrypt: Some(encrypt),
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             },
         )
         .expect("encrypted write");
@@ -5013,7 +4997,7 @@ mod tests {
     fn encrypted_stream_fixture(
         encrypt: crate::encrypt_setup::EncryptParams,
     ) -> (Vec<u8>, &'static [u8]) {
-        use crate::writer::{write_pdf_with_options, CompressStreams, WriteOptions};
+        use crate::writer::{emit_canonical_pdf, CompressStreams, WriterOptions};
 
         const PAYLOAD: &[u8] = b"qpdf 11.9.0 decryptStream differential payload";
         let mut stream = format!("3 0 obj\n<< /Length {} >>\nstream\n", PAYLOAD.len()).into_bytes();
@@ -5027,14 +5011,13 @@ mod tests {
 
         let mut plaintext = Pdf::open(Cursor::new(bytes)).expect("open plaintext stream fixture");
         let mut encrypted = Vec::new();
-        write_pdf_with_options(
+        emit_canonical_pdf(
             &mut plaintext,
             &mut encrypted,
-            &WriteOptions {
-                full_rewrite: true,
+            &WriterOptions {
                 compress_streams: CompressStreams::No,
                 encrypt: Some(encrypt),
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             },
         )
         .expect("encrypted stream write");
@@ -8760,16 +8743,22 @@ mod tests {
     }
 
     #[test]
-    fn incremental_write_synchronizes_recovered_compressed_parent_provenance() {
+    fn full_rewrite_synchronizes_recovered_compressed_parent_provenance() {
         let object_ref = ObjectRef::new(7, 0);
         let stream_ref = ObjectRef::new(5, 0);
         let mut pdf = Pdf::open_mem_owned(recovered_objstm_member_pdf()).expect("open fixture");
-        let stream_offset = pdf
-            .source_xref_offsets()
-            .into_iter()
-            .find(|(object_ref, _)| *object_ref == stream_ref)
-            .map(|(_, offset)| offset)
-            .expect("object stream must have a type-1 xref entry");
+        let stream_offset = match pdf.resolver.xref_entry(stream_ref) {
+            Some(XrefEntry::Uncompressed { offset }) => offset,
+            other => panic!("object stream must have a type-1 xref entry, got {other:?}"), // cov:ignore: fixture invariant is asserted by this test
+        };
+        let root_ref = pdf.root_ref().expect("catalog ref");
+        let mut root = pdf
+            .resolve(root_ref)
+            .expect("catalog")
+            .into_dict()
+            .expect("catalog dictionary");
+        root.insert("Recovered", crate::Object::Reference(object_ref));
+        pdf.set_object(root_ref, crate::Object::Dictionary(root));
 
         // This is the state immediately after editing a member that was
         // originally in an object stream: `set_object` records the dirty
@@ -8800,13 +8789,19 @@ mod tests {
         );
         pdf.resolver.core.borrow_mut().reconstructed_xref = true;
 
-        let mut output = Vec::new();
-        crate::write_pdf(&mut pdf, &mut output).expect("incremental write");
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let emitted_ref = writer
+            .get_renumbered_obj_gen(object_ref)
+            .expect("query recovered object mapping")
+            .expect("reachable recovered object must be emitted");
+        let output = writer.get_buffer().expect("take full-rewrite output");
 
-        let mut reopened = Pdf::open_mem_owned(output).expect("reopen incremental output");
+        let mut reopened = Pdf::open_mem_owned(output).expect("reopen full-rewrite output");
         assert_eq!(
             reopened
-                .resolve(object_ref)
+                .resolve(emitted_ref)
                 .expect("resolve rewritten object"),
             crate::Object::Integer(42),
             "a recovered standalone object must be emitted outside the obsolete ObjStm"

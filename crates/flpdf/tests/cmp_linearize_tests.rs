@@ -20,8 +20,7 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions};
+use flpdf::{NewlineBeforeEndstream, Pdf};
 use std::path::Path;
 
 /// Linearize `fixture` via the public API (mirroring the CLI `--linearize`
@@ -31,30 +30,18 @@ fn flpdf_linearized(fixture: &str) -> Vec<u8> {
         .join("../../tests/fixtures/compat")
         .join(fixture);
 
-    // Build the plan + renumber map from one handle.
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        // qpdf's default output writes no newline before endstream; the linearized
+        // body content streams honour this option (see the plain-path sibling in
+        // `cmp_diff_zero_tests`).
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
-    // Re-open so `write_linearized` can seek/read objects independently.
-    let file2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(file2)).unwrap();
-
-    let mut opts = WriteOptions::default();
-    // Linearization is implied by calling `write_linearized`; this only opts in
-    // to the qpdf-matching deterministic trailer `/ID`.
-    opts.deterministic_id = true;
-    // qpdf's default output writes no newline before endstream; the linearized
-    // body content streams honour this option (see the plain-path sibling in
-    // `cmp_diff_zero_tests`).
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    // Back-patches the param-dict placeholders (/L, /H, /O, /E, /T, /N), /Prev,
-    // and /ID with their final values.
-    doc.back_patch().unwrap();
-    doc.bytes
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
 /// As [`flpdf_linearized`], but opens the fixture with `open_with_repair` so an
@@ -67,19 +54,12 @@ fn flpdf_linearized_repair(fixture: &str) -> Vec<u8> {
 
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open_with_repair(std::io::BufReader::new(file)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let file2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open_with_repair(std::io::BufReader::new(file2)).unwrap();
-
-    let mut opts = WriteOptions::default();
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
 fn golden(fixture_stem: &str) -> Vec<u8> {
@@ -686,16 +666,21 @@ fn plain_rewrite_one_page() -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.deterministic_id = true;
-    // Same framing the linearized path uses, so the content-stream bytes line up.
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        // Same framing the linearized path uses, so the content-stream bytes line up.
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_linearized_with_settings, write_with_settings, WriterTestSettings};
 
 /// Extract the page content-stream object body — the single-`/FlateDecode`
 /// stream whose dict has neither `/Type` (excludes xref/ObjStm/metadata) nor

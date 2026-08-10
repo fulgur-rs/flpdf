@@ -2,7 +2,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
     load_xref_and_trailer, load_xref_and_trailer_best_effort, load_xref_and_trailer_with_repair,
-    write_pdf, Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions,
+    Diagnostics, Dictionary, Error, LoadedXref, Object, ObjectRef, Pdf, PdfOpenOptions, PdfWriter,
     XrefEntry, XrefForm,
 };
 use std::collections::BTreeMap;
@@ -1935,11 +1935,17 @@ fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
     assert!(pdf.resolve(root).expect("resolve root").as_dict().is_some());
 
     pdf.set_object(root, Object::Boolean(false));
-    let mut rewritten = Vec::new();
-    write_pdf(&mut pdf, &mut rewritten).expect("incremental write");
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_memory().expect("memory output");
+    writer.write().expect("qpdf full rewrite");
+    let output_root = writer
+        .get_renumbered_obj_gen(root)
+        .expect("root mapping")
+        .expect("root is emitted");
+    let rewritten = writer.get_buffer().expect("writer buffer");
     assert!(
-        rewritten.starts_with(&bytes),
-        "incremental output preserves the physical source prefix"
+        !rewritten.starts_with(&bytes),
+        "qpdf full rewrite must emit a fresh document rather than copy the repaired prefix"
     );
     let mut reopened = Pdf::open_mem_owned_with_options(
         rewritten,
@@ -1955,7 +1961,7 @@ fn repair_finds_a_valid_header_in_the_first_1024_bytes_and_uses_it_as_origin() {
     );
     assert_eq!(
         reopened
-            .resolve(root)
+            .resolve(output_root)
             .expect("resolve rewritten root")
             .as_bool(),
         Some(false)
@@ -3871,15 +3877,11 @@ fn repair_forwards_size_resolution_diagnostics_after_header_reconstruction() {
 }
 
 #[test]
-fn incremental_write_after_candidate_recovery_uses_the_recovered_offset() {
-    // flpdf-specific correctness gate: qpdf's own `QPDFWriter` has no
-    // incremental-update mode at all, so there is no oracle behavior to
-    // match here -- this instead protects flpdf's own incremental writer's
-    // structural contract. After a corrupt-`startxref` document recovers via
-    // the xref-stream-candidate fallback, a subsequent incremental write's
-    // `/Prev` must point at the recovered, verified offset, not the original
-    // corrupt `startxref` value that a strict reopen of the written output
-    // could never follow.
+fn candidate_recovery_can_be_full_rewritten_without_prev() {
+    // qpdf's writer always emits a fresh document. After a corrupt `startxref`
+    // is recovered via the xref-stream-candidate fallback, the canonical
+    // writer must therefore produce a valid output without carrying the
+    // repaired source's incremental history into the new trailer.
     let (mut bytes, xref_stream_offset) = xref_stream_document(false);
     let original_suffix = format!("startxref\n{xref_stream_offset}\n%%EOF\n");
     assert!(bytes.ends_with(original_suffix.as_bytes()));
@@ -3889,20 +3891,18 @@ fn incremental_write_after_candidate_recovery_uses_the_recovered_offset() {
     let mut pdf =
         Pdf::open_with_repair(Cursor::new(bytes)).expect("candidate recovery recovers the trailer");
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).expect("incremental write succeeds");
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_memory().expect("memory output");
+    writer.write().expect("qpdf full rewrite succeeds");
+    let out = writer.get_buffer().expect("writer buffer");
     let out_str = String::from_utf8_lossy(&out);
 
     assert!(
-        out_str.contains(&format!("/Prev {xref_stream_offset}")),
-        "incremental /Prev must point at the recovered offset, got:\n{out_str}"
-    );
-    assert!(
-        !out_str.contains("/Prev 999999"),
-        "incremental /Prev must not carry over the original corrupt startxref, got:\n{out_str}"
+        !out_str.contains("/Prev"),
+        "qpdf full rewrite must not carry incremental history, got:\n{out_str}"
     );
 
-    Pdf::open_mem_owned(out).expect("the incrementally-written output must be strictly reopenable");
+    Pdf::open_mem_owned(out).expect("the full-rewrite output must be strictly reopenable");
 }
 
 #[test]

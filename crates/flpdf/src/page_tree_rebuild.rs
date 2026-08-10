@@ -198,7 +198,7 @@ fn leaf_has_own(dict: &crate::Dictionary, key: &str) -> bool {
 /// value lists exactly the selected pages, each with inheritable attributes
 /// materialized and `/Parent` repointed at that root. An indirect root keeps
 /// its object reference; a direct catalog root remains direct. Serialize the
-/// result with [`crate::write_pdf`].
+/// result with [`crate::PdfWriter`].
 ///
 /// The `selected` refs it consumes are produced by
 /// [`PagePlan`](crate::page_plan::PagePlan) (single document) or a single-input
@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::check::check_reader;
     use crate::pages::page_refs;
-    use crate::writer::write_pdf;
+    use crate::writer::write_qpdf_to_memory;
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -597,8 +597,7 @@ mod tests {
             assert_eq!(page.get("Parent"), Some(&Object::Dictionary(root.clone())));
         }
 
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut reopened = Pdf::open(Cursor::new(out)).expect("direct-root output must parse");
         assert_eq!(
             crate::PageDocumentHelper::new(&mut reopened)
@@ -700,18 +699,18 @@ mod tests {
         let mut pdf = open(build_nested_pdf());
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(4, 0), ObjectRef::new(6, 0)]).unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         let mut pdf2 = Pdf::open(Cursor::new(out.clone())).expect("rebuilt PDF should parse");
         let refs = page_refs(&mut pdf2).expect("page tree should walk");
         assert_eq!(refs.len(), 2, "/Pages should enumerate exactly 2 leaves");
-        assert_eq!(refs, vec![ObjectRef::new(4, 0), ObjectRef::new(6, 0)]);
 
         // Each leaf must carry the materialized inherited attrs after reopen.
-        let leaf = dict_of(&mut pdf2, ObjectRef::new(6, 0));
-        assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
-        assert!(leaf.get("MediaBox").is_some());
+        for page_ref in refs {
+            let leaf = dict_of(&mut pdf2, page_ref);
+            assert_eq!(leaf.get("Rotate"), Some(&Object::Integer(90)));
+            assert!(leaf.get("MediaBox").is_some());
+        }
 
         // Belt-and-suspenders: the crate's own validity check is clean.
         let report = check_reader(Cursor::new(out)).expect("check should run");
@@ -735,8 +734,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("should parse");
         let refs = page_refs(&mut pdf2).expect("walk");

@@ -1937,12 +1937,9 @@ impl ObjectHandle {
     /// through them first.
     ///
     /// This also has no path to inform the owning [`crate::Pdf`] that
-    /// `self`'s ref changed. A default (incremental) call to
-    /// [`crate::write_pdf`] emits only refs marked dirty by
-    /// [`crate::Pdf::set_object`]/[`crate::Pdf::delete_object`] — after
-    /// mutating an already-registered indirect handle through this method,
-    /// call [`crate::Pdf::mark_object_dirty`] with the same ref or the
-    /// change is silently dropped from the written output.
+    /// `self`'s ref changed. After mutating an already-registered indirect
+    /// handle through this method, call [`crate::Pdf::mark_object_dirty`] with
+    /// the same ref so the canonical writer observes the change.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
         if value.is_direct() && value.is_null() {
             self.remove_key(key);
@@ -3853,9 +3850,8 @@ impl ObjectHandle {
     /// own `writeStringQDF` calls (`:1169,1175,1190,1195,1233`) are
     /// QDF-only formatting this primitive does not replicate, matching
     /// [`crate::object::Dictionary::write_pdf_trailer`]'s identical
-    /// compact-only scope; the QDF classic trailer is a separate,
-    /// pre-existing, hand-rolled writer (`write_qdf_trailer`, `writer.rs`)
-    /// this issue does not touch.
+    /// compact-only scope; the QDF classic trailer is emitted separately by
+    /// the canonical writer (`write_qdf_trailer`, `writer.rs`).
     ///
     /// **Narrower than the full C++ function -- read before reusing for a
     /// new caller.** Real `writeTrailer` first calls `getTrimmedTrailer()`
@@ -3871,7 +3867,7 @@ impl ObjectHandle {
     /// Trimming, the `/Size` value substitution, and the `t_lin_first`
     /// inline `/Prev` are the caller's responsibility -- matching this
     /// crate's own already-established split, where
-    /// `strip_incremental_trailer_keys`/`strip_xref_stream_trailer_keys`
+    /// `strip_writer_trailer_history_keys`/`strip_xref_stream_trailer_keys`
     /// (`writer.rs`) do the trimming and `writer.rs:4012`'s
     /// `trailer.insert("Size", ...)` supplies the correct value before
     /// either the legacy `Dictionary::write_pdf_trailer` or this

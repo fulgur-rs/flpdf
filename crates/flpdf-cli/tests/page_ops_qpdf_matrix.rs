@@ -106,6 +106,21 @@ fn npages_of(path: &Path) -> usize {
         .expect("npages integer")
 }
 
+fn npages_of_with_password(path: &Path, password: &str) -> usize {
+    let out = flpdf_ok(&[
+        &format!("--password={password}"),
+        "--show-npages",
+        path.to_str().unwrap(),
+    ]);
+    out.trim()
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("npages integer")
+}
+
 /// Per-page `/Rotate` values read from `path` via flpdf's `--show-pages`
 /// (`  rotate: <n>` lines), in page order. Common reader for both tools'
 /// outputs.
@@ -957,15 +972,10 @@ fn make_encrypted_three_page(dir: &Path, pw: &str) -> Option<PathBuf> {
 }
 
 #[test]
-fn pages_secondary_encrypted_input_is_expected_scope_error() {
-    // EXPECTED divergence (documented scope boundary, analogous to #4):
+fn pages_secondary_encrypted_input_matches_qpdf() {
     // qpdf pulls pages from an encrypted secondary (given its password) and
-    // writes a DECRYPTED output. flpdf intentionally refuses to emit
-    // decrypted output in page-ops mode (reject_encrypted_write in
-    // crates/flpdf-cli/src/main.rs ~line 1882): "encrypted PDF output is not
-    // supported for this mode; use plain rewrite to produce decrypted
-    // plaintext". Assert flpdf's actionable refusal; qpdf-divergent by
-    // design.
+    // writes a decrypted output. The canonical flpdf writer follows the same
+    // page-operation route and must accept the authenticated secondary.
     let tmp = tempfile::tempdir().unwrap();
     let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
         return;
@@ -984,46 +994,44 @@ fn pages_secondary_encrypted_input_is_expected_scope_error() {
         "--",
         q.to_str().unwrap(),
     ]);
-    // qpdf produces a decrypted 2-page output (its documented behavior). We
-    // only require that qpdf accepts it; the divergence is flpdf's refusal.
+    // qpdf produces a decrypted 2-page output.
     assert!(ok || q.exists(), "qpdf is expected to accept the merge");
 
-    // flpdf: refuses with the documented actionable error.
-    Command::cargo_bin("flpdf")
-        .unwrap()
-        .args([
-            three.to_str().unwrap(),
-            "--pages",
-            enc.to_str().unwrap(),
-            "--password=secretpw",
-            "1-2",
-            "--",
-            f.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "encrypted PDF output is not supported for this mode",
-        ));
+    // flpdf: the authenticated secondary follows the same fresh-output route.
+    flpdf_ok(&[
+        three.to_str().unwrap(),
+        "--pages",
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "1-2",
+        "--",
+        f.to_str().unwrap(),
+    ]);
+    assert_eq!(npages_of(&q), npages_of(&f));
 }
 
 #[test]
-#[ignore = "flpdf-1uh: with an encrypted PRIMARY input + top-level --password, `--pages . RANGE --` fails with 'incorrect password' because the top-level password is not forwarded to CombinedPlan::from_specs's planning open (only to the later rebuild open). Layer flpdf-9hc.8.12 (run_page_extraction in crates/flpdf-cli/src/main.rs). Proven not an auth/AES-256 gap: plain `rewrite enc3.pdf --password=secretpw out.pdf` succeeds. Tracked as bug flpdf-1uh (P2, child of epic flpdf-9hc.8); un-ignore once fixed in the 8.12 layer."]
-fn pages_primary_encrypted_toplevel_password_threads_through() {
-    // Repro: encrypted primary, top-level --password=secretpw, --pages . 2-3.
-    // Expected (matching qpdf's auth model): the planning stage should open
-    // the primary with the supplied password. flpdf currently does NOT thread
-    // the top-level password into CombinedPlan::from_specs, so it reports
-    // "encrypted PDF: incorrect password" even though the password is correct.
-    // (After 8.12 threads the password, the EXPECTED end-state is the same
-    // documented scope refusal as the secondary-input case — i.e. flpdf would
-    // then reject with "encrypted PDF output is not supported for this mode".
-    // This test is ignored until 8.12 forwards the password; do NOT fix here.)
+fn pages_primary_encrypted_toplevel_password_matches_qpdf() {
+    // qpdf authenticates the primary with the top-level password before
+    // planning the selected pages. The same password must reach both the
+    // planning and rebuild opens in flpdf.
     let tmp = tempfile::tempdir().unwrap();
     let Some(enc) = make_encrypted_three_page(tmp.path(), "secretpw") else {
         return;
     };
+    let q = tmp.path().join("q.pdf");
     let f = tmp.path().join("f.pdf");
+
+    let (ok, _) = run_qpdf(&[
+        enc.to_str().unwrap(),
+        "--password=secretpw",
+        "--pages",
+        ".",
+        "2-3",
+        "--",
+        q.to_str().unwrap(),
+    ]);
+    assert!(ok || q.exists(), "qpdf is expected to accept the merge");
 
     Command::cargo_bin("flpdf")
         .unwrap()
@@ -1037,10 +1045,9 @@ fn pages_primary_encrypted_toplevel_password_threads_through() {
             f.to_str().unwrap(),
         ])
         .assert()
-        // Once 8.12 threads the top-level password, planning auth succeeds and
-        // flpdf reaches the documented encrypted-output scope refusal.
-        .failure()
-        .stderr(predicates::str::contains(
-            "encrypted PDF output is not supported for this mode",
-        ));
+        .success();
+    assert_eq!(
+        npages_of_with_password(&q, "secretpw"),
+        npages_of_with_password(&f, "secretpw")
+    );
 }

@@ -214,7 +214,7 @@ Entry points through which untrusted bytes reach flpdf:
 | Stream decoding | filter pipeline in `filters.rs`: Flate, LZW, ASCII85, ASCIIHex, RunLength (+ pass-through DCT/JBIG2/JPX/CCITT) |
 | Decryption | standard security handler (`security/`): RC4-40/128, AES-128 (V4/R4), AES-256 (V5/R5 deprecated, V5/R6); password normalization incl. SASLprep |
 | Validation | `check_reader`, `check_reader_strict`, `check_reader_with_options`, `check_reader_with_options_and_limits` |
-| Writing (reads everything it writes) | `write_pdf`, `write_qdf`, linearization |
+| Writing (reads everything it writes) | `PdfWriter`, QDF repair, linearization |
 | Signature inspection | `signatures.rs` (`/ByteRange`, signature dictionaries, certificates) |
 | CLI (drives all of the above on argv-named files) | `flpdf-cli`: `check`, `rewrite`, `qdf`, `qdf-fix`, `linearize`, `dump-object`, `show-stream`, `pages`/`--pages`, `--split-pages`, attachment options, encryption options, JSON output |
 | Cross-document operations (two untrusted documents interacting) | `--pages` merging, `--copy-attachments-from`, `--copy-encryption-from` |

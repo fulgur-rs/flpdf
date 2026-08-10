@@ -2658,7 +2658,7 @@ fn emit_section(
 /// escaped. The former `json::JsonValue`, `json::write`,
 /// `build_qpdf_json_v2*`, `filter_json_keys`, `filter_json_objects`, and
 /// materialized `build_qpdf_key*` APIs could not preserve both contracts.
-/// Call this incremental writer instead; select sections with `keys`, select
+/// Call this streaming JSON writer instead; select sections with `keys`, select
 /// raw objects with `objects`, and inspect or transform the accepted bytes at
 /// the supplied [`Pipeline`] sink.
 pub fn write_qpdf_json_v2_selected_objects_with_options<R: Read + Seek>(

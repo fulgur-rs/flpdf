@@ -6,7 +6,7 @@
 //! qpdf's `have_extensions_adbe = keys.count("/ADBE") > 0` (L1387) on inputs
 //! whose source /ADBE dict lacks a valid `/ExtensionLevel`.
 //!
-//! INJECTION (`inject_adbe_extension` fired by `WriteOptions::min_extension_level`,
+//! INJECTION (`inject_adbe_extension` fired by `WriterTestSettings::min_extension_level`,
 //! qpdf `--min-version=<v>.<ext>`) covers three shapes: (1) fresh /Extensions
 //! creation when the source Catalog has none, (2) direct /Extensions with a
 //! non-ADBE developer prefix (/XYZW) preserved, (3) indirect /Extensions
@@ -16,25 +16,24 @@
 //! Fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
 
-use flpdf::{write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions};
+use flpdf::{NewlineBeforeEndstream, Pdf};
 use std::path::Path;
 
-/// STRIP-side WriteOptions (plain full rewrite, qpdf-matching newline/id).
+/// STRIP-side WriterTestSettings (plain full rewrite, qpdf-matching newline/id).
 ///
-/// Field-mutation form (not struct-literal) because `WriteOptions` is
-/// `#[non_exhaustive]` and E0639 blocks struct-literal construction from
-/// outside the crate even with functional update.
-fn strip_options() -> WriteOptions {
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    opts
+/// Keep the non-default fields explicit so this parity helper documents the
+/// exact writer settings used by the probe.
+fn strip_options() -> WriterTestSettings {
+    WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    }
 }
 
-/// INJECT-side WriteOptions: strip_options() + min-version 1.7 with extension
+/// INJECT-side WriterTestSettings: strip_options() + min-version 1.7 with extension
 /// level 8 (mirrors `qpdf --min-version=1.7.8`).
-fn inject_options() -> WriteOptions {
+fn inject_options() -> WriterTestSettings {
     let mut opts = strip_options();
     opts.min_version = Some("1.7".into());
     opts.min_extension_level = Some(8);
@@ -42,7 +41,7 @@ fn inject_options() -> WriteOptions {
 }
 
 /// Plain full-rewrite of `fixture` with the given options; return bytes.
-fn write_qpdf_equivalent(fixture: &str, options: &WriteOptions) -> Vec<u8> {
+fn write_qpdf_equivalent(fixture: &str, options: &WriterTestSettings) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/compat")
         .join(fixture);
@@ -50,7 +49,7 @@ fn write_qpdf_equivalent(fixture: &str, options: &WriteOptions) -> Vec<u8> {
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, options).unwrap();
+    write_with_settings(&mut pdf, &mut out, options).unwrap();
     out
 }
 
@@ -76,7 +75,7 @@ fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     Some(common)
 }
 
-fn assert_parity(fixture: &str, golden_name: &str, options: &WriteOptions) {
+fn assert_parity(fixture: &str, golden_name: &str, options: &WriterTestSettings) {
     let stem = fixture
         .strip_suffix(".pdf")
         .expect("fixture must end in .pdf");
@@ -152,3 +151,7 @@ fn indirect_extensions_inlined_and_adbe_overwritten_preserving_non_adbe_prefix_b
         &inject_options(),
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

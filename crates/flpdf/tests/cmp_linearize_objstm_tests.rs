@@ -16,8 +16,8 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{NewlineBeforeEndstream, ObjectRef, ObjectStreamMode, Pdf, WriteOptions};
+use flpdf::linearization::LinearizationPlan;
+use flpdf::{ObjectRef, ObjectStreamMode, Pdf};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -30,20 +30,12 @@ fn flpdf_linearized_objstm(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, true).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-
-    let mut opts = WriteOptions::default();
-    opts.object_streams = ObjectStreamMode::Generate;
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
 fn golden(stem: &str) -> Vec<u8> {
@@ -63,19 +55,12 @@ fn flpdf_linearized_objstm_preserve(fixture: &str) -> Vec<u8> {
         .join(fixture);
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan =
-        LinearizationPlan::from_pdf_with_object_stream_mode(&mut pdf, ObjectStreamMode::Preserve)
-            .unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-    let mut opts = WriteOptions::default();
-    opts.object_streams = ObjectStreamMode::Preserve;
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    let opts = WriterTestSettings {
+        object_streams: ObjectStreamMode::Preserve,
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
 
 fn golden_preserve(stem: &str) -> Vec<u8> {
@@ -1711,19 +1696,18 @@ fn flpdf_linearized_objstm_mode_force(
         .join(fixture);
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, mode == ObjectStreamMode::Generate).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-    let mut opts = WriteOptions::default();
-    opts.object_streams = mode;
-    opts.deterministic_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
-    opts.force_version = Some(force.to_string());
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        deterministic_id: true,
+        force_version: Some(force.to_string()),
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_linearized_with_settings, WriterTestSettings};
 
 /// Linearize `fixture` with generate + a forced version (qpdf-matching options).
 fn flpdf_linearized_objstm_force(fixture: &str, force: &str) -> Vec<u8> {

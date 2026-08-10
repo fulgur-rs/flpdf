@@ -31,7 +31,7 @@ pub(crate) struct CompressedMemberProvenance {
 /// `Pdf` is the core type of the crate. Opening a document only reads the cross-reference
 /// table and the trailer; individual objects are parsed on first access via
 /// [`Pdf::resolve`]. The same handle is what every higher-level helper
-/// ([`crate::pages`], [`crate::outline`], [`crate::fonts`], [`crate::write_pdf`])
+/// ([`crate::pages`], [`crate::outline`], [`crate::fonts`], [`crate::PdfWriter`])
 /// consumes.
 ///
 /// # Examples
@@ -78,7 +78,6 @@ pub struct Pdf<R: Read + Seek + 'static> {
     pub(crate) resolver: Rc<ResolverHandle<R>>,
     pub(crate) version: String,
     pub(crate) trailer: Dictionary,
-    pub(crate) startxref: u64,
     pub(crate) last_xref_form: XrefForm,
     pub(crate) cache: ObjectCache,
     // The canonical indirect-object handle registry that used to live here is

@@ -2904,7 +2904,7 @@ fn corrupt_page_content_single_page_default_mode_does_not_abort() {
     let pdf_bytes = build_pdf(&["/Contents 4 0 R /Resources 5 0 R"], &extra);
 
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).expect("open");
-    // Default mode == Auto, exactly the `rewrite --full-rewrite` default path.
+    // Default mode == Auto, exactly the canonical rewrite default path.
     remove_unreferenced_resources(&mut pdf, RemoveUnreferencedResources::default())
         .expect("default-mode prune must degrade gracefully, not abort");
 

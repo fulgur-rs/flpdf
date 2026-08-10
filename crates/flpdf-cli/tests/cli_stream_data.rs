@@ -285,7 +285,6 @@ fn cli_stream_data_dct_preserve() {
         &src,
         &[
             "--stream-data=preserve",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -313,7 +312,6 @@ fn cli_stream_data_dct_uncompress() {
         &src,
         &[
             "--stream-data=uncompress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -341,7 +339,6 @@ fn cli_stream_data_dct_compress() {
         &src,
         &[
             "--stream-data=compress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -376,7 +373,6 @@ fn cli_stream_data_ccitt_preserve() {
         &src,
         &[
             "--stream-data=preserve",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -407,7 +403,6 @@ fn cli_stream_data_ccitt_uncompress() {
         &src,
         &[
             "--stream-data=uncompress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -438,7 +433,6 @@ fn cli_stream_data_ccitt_compress() {
         &src,
         &[
             "--stream-data=compress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -469,7 +463,6 @@ fn cli_stream_data_jbig2_preserve() {
         &src,
         &[
             "--stream-data=preserve",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -496,7 +489,6 @@ fn cli_stream_data_jbig2_uncompress() {
         &src,
         &[
             "--stream-data=uncompress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -523,7 +515,6 @@ fn cli_stream_data_jbig2_compress() {
         &src,
         &[
             "--stream-data=compress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -554,7 +545,6 @@ fn cli_stream_data_jpx_preserve() {
         &src,
         &[
             "--stream-data=preserve",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -581,7 +571,6 @@ fn cli_stream_data_jpx_uncompress() {
         &src,
         &[
             "--stream-data=uncompress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );
@@ -608,7 +597,6 @@ fn cli_stream_data_jpx_compress() {
         &src,
         &[
             "--stream-data=compress",
-            "--full-rewrite",
             "--remove-unreferenced-resources=no", // flpdf-s9s
         ],
     );

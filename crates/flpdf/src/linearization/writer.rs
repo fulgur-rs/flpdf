@@ -76,9 +76,9 @@ use crate::writer::object_streams::{
 };
 use crate::writer::{
     effective_pdf_version_and_ext, effective_stream_policy, inject_adbe_extension, is_lone_flate,
-    reencode_stream_for_compress, serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order,
-    serialize::xref_stream, strip_adbe_extension, CompressStreams, NewlineBeforeEndstream,
-    WriteOptions,
+    reencode_stream_for_compress, report_progress_event,
+    serialize::write_qpdf_stream as write_stream_to_buf_qpdf_order, serialize::xref_stream,
+    strip_adbe_extension, CompressStreams, NewlineBeforeEndstream, WriterOptions, WriterResult,
 };
 use crate::{Dictionary, Object, ObjectRef, Pdf, Result, Stream};
 
@@ -143,7 +143,7 @@ impl ObjStmLayout {
     fn resolve_batches<R: Read + Seek>(
         plan: &LinearizationPlan,
         pdf: &mut Pdf<R>,
-        options: &WriteOptions,
+        options: &WriterOptions,
     ) -> Result<crate::linearization::plan::ObjStmBatchPlan> {
         let config = planner_config_from_options(options);
         let batch_plan = plan.objstm_batches(pdf, &config)?;
@@ -305,6 +305,7 @@ fn append_objstm_container_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     removed_refs: &BTreeSet<ObjectRef>,
     filtered: bool,
+    encrypt_ctx: Option<&crate::writer::EncryptionContext>,
 ) -> Result<usize> {
     let mut resolved: Vec<(ObjectRef, Object)> = Vec::with_capacity(container.members.len());
     for &(orig, new_ref) in &container.members {
@@ -318,7 +319,21 @@ fn append_objstm_container_object<R: Read + Seek>(
     } else {
         CompressStreams::No
     };
-    let stream = wrap_objstm_body(&body, compress)?;
+    let mut stream = wrap_objstm_body(&body, compress)?;
+    // PDF encryption applies to the ObjStm container stream as one stream
+    // object. The member objects remain plaintext inside that encrypted
+    // payload; encrypting them individually would not match qpdf or the PDF
+    // object-stream encryption rules.
+    // cov:ignore-start: the linearization encryption context is validated before
+    // emission; its in-memory AES/ObjStm payload cannot produce a distinct error edge.
+    if let Some(ctx) = encrypt_ctx {
+        crate::writer::encrypt_stream_payload_for_writer(
+            ObjectRef::new(container.container_new_num, 0),
+            &mut stream,
+            ctx,
+        )?;
+    }
+    // cov:ignore-end
 
     // Emit the container dict in qpdf 11.9.0's fixed key order
     // (`/Type /ObjStm /Length /Filter /N /First`); the generic `BTreeMap`-backed
@@ -354,7 +369,8 @@ fn append_objstm_container_object<R: Read + Seek>(
 // Public result types
 // ---------------------------------------------------------------------------
 
-/// Byte offsets and derived values returned by [`write_linearized`].
+/// Byte offsets and derived values returned by the internal `write_linearized`
+/// implementation.
 ///
 /// All values are absolute byte positions within `LinearizedDocument::bytes`
 /// unless stated otherwise.  The back-patcher uses these to
@@ -576,7 +592,7 @@ fn append_object(
 /// (see [`crate::writer::apply_stream_compress_policy`]).
 ///
 /// The flat writer (`crate::writer`, the `Object::Stream` branch of
-/// `write_pdf_full_rewrite`) decodes each declared filter chain and, under
+/// `emit_canonical_pdf`) decodes each declared filter chain and, under
 /// [`CompressStreams::Yes`] (the default), re-encodes to a single
 /// `/FlateDecode`. The plain [`append_object`] path instead clones the source
 /// stream's dict + raw data verbatim — preserving e.g. an
@@ -614,7 +630,7 @@ fn append_body_object(
     new_ref: ObjectRef,
     original_ref: ObjectRef,
     object: Object,
-    options: &WriteOptions,
+    options: &WriterOptions,
     recovered_stream_eol: Option<&[u8]>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
@@ -625,7 +641,7 @@ fn append_body_object(
 
     let policy = effective_stream_policy(options);
     let (reencoded, source_filter_is_lone_flate) =
-        reencode_stream_for_compress(stream, options, true, recovered_stream_eol);
+        reencode_stream_for_compress(stream, options, true, recovered_stream_eol, false, false);
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.
@@ -641,7 +657,7 @@ fn append_body_object(
     // adds a 16-byte IV prefix plus PKCS#7 padding).
     //
     // `--cleartext-metadata` exemption (mirrors crate::writer's
-    // write_pdf_full_rewrite loop, writer.rs's Object::Stream branch): when
+    // emit_canonical_pdf loop, writer.rs's Object::Stream branch): when
     // `ctx.metadata_ref` is this object's original ref, leave the payload in
     // the clear and prepend /Crypt /Identity so a reader knows not to decrypt
     // it, instead of running it through the cipher. /Length stays the
@@ -1040,6 +1056,9 @@ struct FirstPageXrefPatch {
     /// Trailer `/ID` placeholder bytes `(id0, id1)`, written into the rebuilt
     /// dict so the deterministic-`/ID` back-patch finds them afterwards.
     id: Option<(Vec<u8>, Vec<u8>)>,
+    /// Trailer `/Encrypt` reference on the first-page xref stream. The main
+    /// linearization xref stream intentionally omits this (`t_lin_second`).
+    encrypt: Option<ObjectRef>,
     /// Highest object number (sizes field 2 alongside the max offset).
     max_id: u32,
     /// Largest object-stream member index (sizes field 3 of `/W`).
@@ -1076,9 +1095,10 @@ struct FirstPageXrefPatch {
 ///     preserved, otherwise the same fresh value is used for both elements
 ///     (ISO 32000-1 §14.4).
 fn finalize_linearized_id(
-    options: &WriteOptions,
+    options: &WriterOptions,
     source_trailer: &Dictionary,
     det_id_source_id0: Option<&[u8]>,
+    copy_encryption: Option<&crate::encrypt_setup::CopyEncryptionSource>,
 ) -> Object {
     if options.deterministic_id {
         // Size the all-zero permanent-identifier placeholder to the source
@@ -1094,6 +1114,19 @@ fn finalize_linearized_id(
         Object::Array(vec![
             Object::String(vec![0u8; len0]),
             Object::String(vec![0u8; 16]),
+        ])
+    } else if let Some(source) = copy_encryption {
+        let generated =
+            crate::writer::generate_id_array(source_trailer.get("ID"), options.static_id);
+        let id1 = generated
+            .as_array()
+            .and_then(|values| values.get(1))
+            .and_then(Object::as_string)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_else(|| source.id0.clone());
+        Object::Array(vec![
+            Object::String(source.id0.clone()),
+            Object::String(id1),
         ])
     } else {
         crate::writer::generate_id_array(source_trailer.get("ID"), options.static_id)
@@ -1135,7 +1168,7 @@ fn split_xref_common_id(source_trailer: &Dictionary) -> Option<Object> {
 /// A linearized file repeats `/ID` across the first-page xref-stream dict and
 /// the main xref-stream dict; a file identifier is file-scoped, so both must
 /// carry the *same* value. This function does **not** compute the identifier:
-/// `id0`/`id1` are precomputed by [`write_linearized`] from a digest over a
+/// `id0`/`id1` are precomputed by [`write_linearized_for_pdf_writer`] from a digest over a
 /// reconstruction of qpdf's first write pass (the `det_id` computation; the
 /// pass-1 buffer is built by [`build_pass1_part1`] with qpdf's `writePad`
 /// length-stabilisation). That reconstruction is what reproduces qpdf's
@@ -1228,32 +1261,10 @@ fn patch_linearized_deterministic_id(
 /// (Part-6) xref at EOF carries no `/Prev`, so the chain is acyclic. Its
 /// `/Index [second_half_count, first_half_count)` covers the FIRST-half objects.
 //
-// Scope note: this function has no `encrypt_ctx` parameter, unlike its
-// classic-path sibling `write_part1_xref_and_trailer`. `write_linearized`
-// rejects encryption combined with any ObjStm-emitting mode before
-// `relocation`/`objstm_layout` are built, so this xref-stream path (called
-// only when `!objstm_layout.is_empty()`) and `encrypt_ctx.is_some()` can
-// never coincide in the same call to `do_write_pass` — adding an /Encrypt
-// arm here would be dead code unreachable through the public API. qpdf's own
-// `writeTrailer` (QPDFWriter.cc:1160-1231) writes `/Encrypt` identically for
-// both the classic and xref-stream trailer forms (right after `/ID`, for
-// every `which != t_lin_second`), so if this scope limitation is ever
-// lifted, thread `encrypt_ctx` here the same way and emit `/Encrypt {N} {G}
-// R` right after the `/ID` array.
-//
-// CAUTION for that future change: `write_object`/`write_object_with_id_writer`
-// (crate::writer::serialize::xref_stream) are SHARED with the plain
-// (non-linearized) writer's own xref-stream path
-// (crates/flpdf/src/writer/plain/xref.rs), which already deliberately
-// strips "Encrypt" out of its passthrough trailer dict before calling into
-// them (writer/plain/xref.rs's key filter list) — i.e. today, neither
-// caller emits `/Encrypt` there. Do NOT add an unconditional `/Encrypt`
-// write inside those shared functions' bodies: every xref-stream object
-// written through the plain writer would then gain a spurious /Encrypt
-// reference (or, once the plain writer supports encrypt+xref-stream, a
-// doubled one via its trailer passthrough). Add a new opt-in field (e.g.
-// `Option<ObjectRef>` on `XrefStreamDict`) instead, left `None` at the
-// plain writer's call sites, so this stays per-caller.
+// qpdf's `writeTrailer` emits `/Encrypt` immediately after `/ID` for every
+// linearization trailer except `t_lin_second` (QPDFWriter.cc:1160-1231).
+// `XrefStreamDict::encrypt` is an opt-in field because the same serializer is
+// also used by the plain writer, whose xref-stream trailer has no such entry.
 #[allow(clippy::too_many_arguments)]
 fn write_first_page_xref_stream(
     bytes: &mut Vec<u8>,
@@ -1264,6 +1275,7 @@ fn write_first_page_xref_stream(
     source_trailer: &Dictionary,
     max_ostream_index: u64,
     filtered: bool,
+    encrypt: Option<ObjectRef>,
 ) -> Result<FirstPageXrefPatch> {
     let final_size = total_count;
     let first_xref_num = relocation.first_xref_slot;
@@ -1302,6 +1314,7 @@ fn write_first_page_xref_stream(
             prev: Some(0),
             trailer: None,
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
+            encrypt,
         };
         xref_stream::first_pass_region_len(obj_ref, &dict, index_count as usize)
     };
@@ -1328,6 +1341,7 @@ fn write_first_page_xref_stream(
         info_new_ref,
         size: final_size,
         id,
+        encrypt,
         max_id,
         max_ostream_index,
         filtered,
@@ -1425,6 +1439,7 @@ fn patch_first_page_xref(
         prev: Some(prev),
         trailer: None,
         id: patch.id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
+        encrypt: patch.encrypt,
     };
     // cov:ignore: the `?` below never fires — write_padded_region errors only if
     // the object exceeds its pass-1-sized region. Filtered final payloads fit
@@ -1526,6 +1541,7 @@ fn write_main_xref_stream_and_trailer(
         prev: None,
         trailer: None,
         id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
+        encrypt: None,
     };
 
     // Pad the object to its fixed pass-1 region (qpdf's writePad), then a newline
@@ -1545,6 +1561,7 @@ fn write_main_xref_stream_and_trailer(
             prev: None,
             trailer: None,
             id: id.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())),
+            encrypt: None,
         };
         xref_stream::first_pass_region_len(main_obj_ref, &p1_dict, main_count as usize)
     };
@@ -1876,6 +1893,7 @@ fn build_pass1_part1(part1: &Part1Bytes) -> Part1Bytes {
 struct LinearizedPassOutput {
     bytes: Vec<u8>,
     xref_offsets: BTreeMap<u32, usize>,
+    first_page_xref_offset: Option<usize>,
     hint_stream_offset: usize,
     hint_stream_obj_total_len: usize,
     end_of_first_page_offset: usize,
@@ -1927,11 +1945,13 @@ fn do_write_pass<R: Read + Seek>(
     source_trailer: &Dictionary,
     objstm_layout: &ObjStmLayout,
     relocation: &ObjStmRelocation,
-    options: &WriteOptions,
+    options: &WriterOptions,
     pass1_digest: bool,
     mut id_writer: Option<crate::object::ReborrowableIdWriter>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     mut encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    progress_events: &mut usize,
+    progress_expected: usize,
 ) -> Result<LinearizedPassOutput> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut xref_offsets: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1947,6 +1967,12 @@ fn do_write_pass<R: Read + Seek>(
     let param_dict_obj_number = renumber.param_dict_ref().number;
     let param_dict_absolute_offset = part1.obj1_offset;
     bytes.extend_from_slice(&part1.bytes);
+    // qpdf deliberately writes extra header text after the linearization
+    // parameter dictionary, rather than in `writeHeader`, so the dictionary
+    // remains within the first 1024 bytes (QPDFWriter.cc:2718-2720). The
+    // setting has already been normalized with a trailing newline by
+    // PdfWriter, matching qpdf's `setExtraHeaderText` contract.
+    bytes.extend_from_slice(options.extra_header_text.as_bytes());
     xref_offsets.insert(param_dict_obj_number, param_dict_absolute_offset);
 
     // member new-number → (container new-number, index) for the type-2 xref
@@ -2049,6 +2075,7 @@ fn do_write_pass<R: Read + Seek>(
             source_trailer,
             max_ostream_index,
             structural_streams_filtered,
+            encrypt_ctx.map(|ctx| ctx.encrypt_ref),
         )?;
         // First-page xref stream object carries one `/ID` (the main xref
         // stream below carries the second).  `patch_first_page_xref` later
@@ -2092,6 +2119,7 @@ fn do_write_pass<R: Read + Seek>(
         );
         let offset = appended?;
         xref_offsets.insert(catalog_new_ref.number, offset);
+        report_progress_event(options, progress_events, progress_expected);
         catalog_emitted_early = true;
     }
 
@@ -2130,6 +2158,7 @@ fn do_write_pass<R: Read + Seek>(
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
+        report_progress_event(options, progress_events, progress_expected);
     }
 
     // Open-document ObjStm containers (qpdf part4).  qpdf places the
@@ -2147,8 +2176,14 @@ fn do_write_pass<R: Read + Seek>(
             pdf,
             &plan.removed_refs,
             structural_streams_filtered,
+            encrypt_ctx,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
+        if !pass1_digest {
+            for _ in &container.members {
+                report_progress_event(options, progress_events, progress_expected);
+            }
+        }
     }
 
     // `/Encrypt` dictionary object (qpdf `writeEncryptionDictionary`, called
@@ -2231,6 +2266,7 @@ fn do_write_pass<R: Read + Seek>(
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
+        report_progress_event(options, progress_events, progress_expected);
     }
 
     // Part 3 (Annex F) continued: shared objects sit INSIDE the first-page
@@ -2272,6 +2308,7 @@ fn do_write_pass<R: Read + Seek>(
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
+        report_progress_event(options, progress_events, progress_expected);
     }
 
     // Part-3 ObjStm containers.  These hold shared/catalog members and MUST
@@ -2286,8 +2323,14 @@ fn do_write_pass<R: Read + Seek>(
             pdf,
             &plan.removed_refs,
             structural_streams_filtered,
+            encrypt_ctx,
         )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
         xref_offsets.insert(container.container_new_num, offset);
+        if !pass1_digest {
+            for _ in &container.members {
+                report_progress_event(options, progress_events, progress_expected);
+            }
+        }
     }
 
     // Part 6 outline objects (classic path, UseOutlines): first-page outlines
@@ -2399,6 +2442,7 @@ fn do_write_pass<R: Read + Seek>(
                 );
                 let offset = appended?;
                 xref_offsets.insert(new_ref.number, offset);
+                report_progress_event(options, progress_events, progress_expected);
             }
             Part4Emit::Container(container) => {
                 let offset = append_objstm_container_object(
@@ -2408,8 +2452,14 @@ fn do_write_pass<R: Read + Seek>(
                     pdf,
                     &plan.removed_refs,
                     structural_streams_filtered,
+                    encrypt_ctx,
                 )?; // cov:ignore: error requires an internal planner/renumber inconsistency.
                 xref_offsets.insert(container.container_new_num, offset);
+                if !pass1_digest {
+                    for _ in &container.members {
+                        report_progress_event(options, progress_events, progress_expected);
+                    }
+                }
             }
         }
     }
@@ -2540,6 +2590,9 @@ fn do_write_pass<R: Read + Seek>(
     Ok(LinearizedPassOutput {
         bytes,
         xref_offsets,
+        first_page_xref_offset: first_page_xref_patch
+            .as_ref()
+            .map(|patch| patch.region.start),
         hint_stream_offset,
         hint_stream_obj_total_len,
         end_of_first_page_offset,
@@ -2750,17 +2803,17 @@ struct CatalogAdbeStatus {
     /// anywhere in that subtree; no case-by-case shape enumeration is
     /// needed or attempted.
     ///
-    /// `crate::writer::write_pdf_full_rewrite_inner` can absorb any such
+    /// `crate::writer::emit_canonical_pdf_inner` can absorb any such
     /// case safely: it mutates the Catalog and THEN builds its
     /// `CatalogFirstRenumber` from the SAME (now-mutated) handle
     /// (`writer.rs:3154-3238`), so a dropped object simply never gets a
-    /// slot. [`write_linearized`] cannot: its `plan`/`renumber` are built
+    /// slot. [`write_linearized_for_pdf_writer`] cannot: its `plan`/`renumber` are built
     /// by the CALLER from a SEPARATE `Pdf` handle BEFORE this function ever
     /// runs (see the doc above the `Optimization::prepare_for_linearized_write`
     /// call below), so an object dropped this way is already counted in
     /// that frozen `plan` and would still be walked and emitted — with its
     /// STALE, now-orphaned, pre-mutation content — a genuine byte
-    /// divergence from qpdf, not a cosmetic one. [`write_linearized`]
+    /// divergence from qpdf, not a cosmetic one. [`write_linearized_for_pdf_writer`]
     /// checks this so any such case is rejected loudly (`Unsupported`)
     /// instead of silently producing wrong bytes.
     orphans_indirect_object: bool,
@@ -2812,8 +2865,9 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
         // Dictionary-shaped /Extensions, an unrelated developer-prefix key
         // next to /ADBE that would actually survive intact). Reusing the
         // same "reject the rare/unusual structure loudly" pattern applied
-        // elsewhere in this crate (e.g. the ObjStm+encrypt scope-out)
-        // rather than special-casing which reference positions are
+        // elsewhere in this crate (e.g. the conservative handling of
+        // unusual extension structures) rather than special-casing which
+        // reference positions are
         // provably safe.
         let mut refs = Vec::new();
         collect_direct_refs(raw_extensions, 0, &mut refs)?;
@@ -2886,15 +2940,15 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 /// Returns [`LinearizedDocument`] containing both the bytes and the
 /// [`LinearizedOffsets`] needed for back-patching.
 ///
-/// With [`WriteOptions::deterministic_id`] the `/ID` is derived from an MD5
+/// With [`WriterOptions::deterministic_id`] the `/ID` is derived from an MD5
 /// over the assembled layout (the same digest feeds every trailer / xref-stream
 /// dict), so the identifier is reproducible across runs for identical input.
 ///
 /// # Errors
 ///
-/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::deterministic_id`]
-/// is combined with encrypted output ([`WriteOptions::encrypt`] or
-/// [`WriteOptions::copy_encryption`]): a content-derived `/ID` cannot be
+/// Returns [`crate::Error::Unsupported`] when [`WriterOptions::deterministic_id`]
+/// is combined with encrypted output ([`WriterOptions::encrypt`] or
+/// [`WriterOptions::copy_encryption`]): a content-derived `/ID` cannot be
 /// produced once the bytes are encrypted, because the identifier would need to
 /// be known before the file encryption key that protects every string and
 /// stream can be derived (the key derives from `/ID[0]`, PDF 1.7 §7.6.3.3
@@ -2906,21 +2960,9 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 /// deterministic ID` internal error), so linearize+encrypt on its own is not
 /// rejected by this guard.
 ///
-/// Returns [`crate::Error::Unsupported`] when encryption is combined with
-/// object-stream emission (any [`crate::writer::ObjectStreamMode`] that
-/// actually emits ObjStm containers — `Generate`, or `Preserve` on a source
-/// that already carries object streams). This is a temporary flpdf scope
-/// limitation, not a qpdf restriction: qpdf itself supports
-/// linearize+encrypt+object-streams together.
-///
-/// Returns [`crate::Error::Unsupported`] when [`WriteOptions::copy_encryption`]
-/// is set. This is a temporary flpdf scope limitation, not a qpdf
-/// restriction: qpdf itself supports linearize+copy-encryption together.
-/// [`WriteOptions::encrypt`] is not affected by this restriction.
-///
 /// Returns [`crate::Error::Unsupported`] when the effective Adobe developer
 /// extension level (`/Extensions /ADBE /ExtensionLevel` — contributed by
-/// [`WriteOptions::encrypt`]'s method, [`WriteOptions::min_extension_level`],
+/// [`WriterOptions::encrypt`]'s method, [`WriterOptions::min_extension_level`],
 /// or the source document itself) would change AND applying that change
 /// would orphan an indirect object: an indirect reference is reachable
 /// anywhere within the source Catalog's `/Extensions` subtree — the
@@ -2941,13 +2983,14 @@ fn resolve_catalog_adbe_status<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Catal
 /// length that disagrees with `page_hints`, `/Size` overflows `u32`, a shared
 /// object lacks a pass-1 byte length, or a hint-table field cannot represent its
 /// pass-1 value.
-pub fn write_linearized<R: Read + Seek>(
+#[cfg(test)]
+pub(crate) fn write_linearized<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-    options: &WriteOptions,
+    options: &WriterOptions,
 ) -> Result<LinearizedDocument> {
-    write_linearized_impl(plan, renumber, pdf, options, None)
+    Ok(write_linearized_impl(plan, renumber, pdf, options, None)?.0)
 }
 
 /// Write a linearized PDF and qpdf's first-pass representation to `pass1_path`.
@@ -2955,14 +2998,44 @@ pub fn write_linearized<R: Read + Seek>(
 /// The pass-1 file is written after the final hint object has been generated.
 /// Its body is the same throwaway first pass used for deterministic ID
 /// computation, followed by qpdf's pass-1 offset comments.
-pub fn write_linearized_with_pass1_file<R: Read + Seek>(
+#[cfg(test)]
+pub(crate) fn write_linearized_with_pass1_file<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-    options: &WriteOptions,
+    options: &WriterOptions,
     pass1_path: &Path,
 ) -> Result<LinearizedDocument> {
-    write_linearized_impl(plan, renumber, pdf, options, Some(pass1_path))
+    Ok(write_linearized_impl(plan, renumber, pdf, options, Some(pass1_path))?.0)
+}
+
+/// Write linearized output through the canonical [`crate::PdfWriter`] route.
+///
+/// The public compatibility helpers above accept an already-built plan for
+/// the inspection/fixture APIs.  A real writer must plan and emit the same
+/// live `Pdf` after all writer settings and graph mutations have settled.  The
+/// returned mapping is taken from the final local renumber map, including any
+/// ObjStm relocation performed by the two-pass linearization emitter.
+pub(crate) fn write_linearized_for_pdf_writer<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    options: &WriterOptions,
+    pass1_path: Option<&Path>,
+) -> Result<(LinearizedDocument, WriterResult)> {
+    // The canonical PdfWriter route plans the same live Pdf that it emits.
+    // qpdf's optimization prefix can materialize indirect graph nodes (for
+    // example direct `/Outlines` or repaired page-tree state), so it must run
+    // before planning rather than on a separate planning snapshot. The
+    // implementation below retains the idempotent call for the legacy public
+    // helpers, but this entry point establishes the source-faithful order.
+    crate::optimization::Optimization::prepare_for_linearized_write(pdf)?;
+    let mode = if crate::writer::force_version_below_1_5(options) {
+        crate::writer::ObjectStreamMode::Disable
+    } else {
+        options.object_streams
+    };
+    let plan = LinearizationPlan::from_pdf_with_object_stream_mode(pdf, mode)?;
+    let renumber = RenumberMap::from_plan(&plan);
+    write_linearized_impl(&plan, &renumber, pdf, options, pass1_path)
 }
 
 /// Write the pass-1 body through qpdf's stdio-shaped buffering boundary.
@@ -3035,12 +3108,12 @@ fn write_linearized_impl<R: Read + Seek>(
     plan: &LinearizationPlan,
     renumber: &RenumberMap,
     pdf: &mut Pdf<R>,
-    options: &WriteOptions,
+    options: &WriterOptions,
     pass1_path: Option<&Path>,
-) -> Result<LinearizedDocument> {
+) -> Result<(LinearizedDocument, WriterResult)> {
     // `--deterministic-id` and `--static-id` are mutually exclusive: a
     // content-derived `/ID` and qpdf's fixed test constant cannot both be the
-    // identifier. The flat (`crate::writer::write_pdf_full_rewrite`) path
+    // identifier. The flat (`crate::writer::emit_canonical_pdf`) path
     // rejects the combination; mirror it here so the public linearization API
     // does not silently let the deterministic branch win over `static_id`.
     if options.deterministic_id && options.static_id {
@@ -3083,8 +3156,12 @@ fn write_linearized_impl<R: Read + Seek>(
             (None, Vec::new())
         };
     let pass1_id = linearization_pass1_id(&source_trailer);
-    let finalized_id =
-        finalize_linearized_id(options, &source_trailer, det_id_source_id0.as_deref());
+    let finalized_id = finalize_linearized_id(
+        options,
+        &source_trailer,
+        det_id_source_id0.as_deref(),
+        options.copy_encryption.as_ref(),
+    );
     // Extract `/ID[0]` now, before `finalized_id` moves into `source_trailer`,
     // for `build_encryption_context` below (PDF 1.7 §7.6.3.3 Algorithm 2 uses
     // `/ID[0]` as a salt, and the trailer's `/ID[0]` must carry the same bytes
@@ -3134,34 +3211,12 @@ fn write_linearized_impl<R: Read + Seek>(
     // `/ID` cannot be computed before the encrypted bytes exist, yet the file
     // encryption key that produces those bytes itself derives from `/ID[0]`
     // (PDF 1.7 §7.6.3.3 Algorithm 2). Mirror the flat
-    // (`crate::writer::write_pdf_full_rewrite`) guard so both write paths
+    // (`crate::writer::emit_canonical_pdf`) guard so both write paths
     // reject exactly the same combination.
     let encrypting = options.encrypt.is_some() || options.copy_encryption.is_some();
     if options.deterministic_id && encrypting {
         return Err(crate::Error::Unsupported(
             "the deterministic-id option is incompatible with encrypted output files".to_string(),
-        ));
-    }
-
-    // `--copy-encryption-from` is not yet supported for linearized output. The
-    // donor's `/ID[0]` must become the output `/ID[0]` (Algorithm 2 is pinned
-    // to it — see `CopyEncryptionSource::id0`'s doc), which is the OPPOSITE of
-    // the `--encrypt` case above: there, the id0 finalized just above already
-    // is the single source of truth and only needs to be threaded into the
-    // context builder. For a donor, `finalize_linearized_id` would need to
-    // learn the donor's id0 (and its exact byte width, which is unconstrained
-    // — see `CopyEncryptionSource::id0`) BEFORE computing `/ID`, so the width
-    // is settled before the two-pass probe loop below runs. That change
-    // belongs where `/ID` is finalized above, not here. This is a temporary
-    // flpdf implementation gap, not a qpdf restriction — qpdf's own
-    // QPDFWriter supports linearize + copy-encryption together. Reject the
-    // combination rather than build a context whose id0 provably cannot be
-    // reconciled with the already-finalized `/ID` above.
-    if options.copy_encryption.is_some() {
-        return Err(crate::Error::Unsupported(
-            "linearize+copy-encryption-from is not yet supported; use --encrypt \
-             directly, or file a follow-up if you need both"
-                .to_string(),
         ));
     }
 
@@ -3181,7 +3236,7 @@ fn write_linearized_impl<R: Read + Seek>(
 
     // Reconcile the caller-built plan/renumber pair with the writer's effective
     // object-stream mode. The historical `from_pdf(bool)` API maps `false` to
-    // Disable, while `WriteOptions::default()` is Preserve; source-ObjStm
+    // Disable, while `WriterOptions::default()` is Preserve; source-ObjStm
     // Preserve has different stale-generation and container-routing rules, so
     // reusing the Disable partitions can reject or mis-layout the file. Rebuild
     // both structures together whenever their recorded planning mode differs.
@@ -3209,7 +3264,7 @@ fn write_linearized_impl<R: Read + Seek>(
     };
     let must_normalize_options = options.object_streams != effective_object_stream_mode;
     let normalized_options = if must_normalize_options {
-        Some(WriteOptions {
+        Some(WriterOptions {
             object_streams: effective_object_stream_mode,
             ..options.clone()
         })
@@ -3327,38 +3382,11 @@ fn write_linearized_impl<R: Read + Seek>(
     // /Info there); Part-4 batches are interleaved among the second-half
     // objects at their part position.
     //
-    // Unlike the `deterministic_id && encrypting` guard above (which mirrors
-    // a restriction qpdf itself enforces — verified empirically, see
-    // flpdf-txag's design), this one does NOT mirror any qpdf restriction:
-    // qpdf's own QPDFWriter supports linearize+encrypt+ObjStm together. This
-    // is a temporary flpdf implementation gap, not a spec/qpdf constraint —
-    // do not "fix" it by trying to match a nonexistent qpdf behavior.
-    //
-    // linearize+encrypt does not yet implement the ObjStm relocation path:
-    // `RenumberMap::reserve_encrypt_dict_slot` (wired in by a later encrypting
-    // step) and `RenumberMap::place_objstm_members_per_half` are mutually
-    // exclusive — the latter's rebuild loop treats any renumber-map sentinel
-    // it does not recognize (including a reserved `/Encrypt` slot) as
-    // "unexpected" and silently drops it (see `reserve_encrypt_dict_slot`'s
-    // doc comment). Reject the combination and skip the call to
-    // `place_objstm_members_per_half` entirely — rather than merely ordering
-    // it relative to a future `reserve_encrypt_dict_slot` call — so the two
-    // can never coincide in the same execution, regardless of
-    // `ObjectStreamMode` (this also covers `Preserve` on an already-ObjStm
-    // source, not just `Generate`). When `emits_object_streams` is false the
-    // call would have taken `place_objstm_members_per_half`'s own fast path
-    // (leaving the map untouched and returning
-    // [`ObjStmRelocation::default`]), so using that default directly here is
-    // behaviorally identical for every non-rejected combination.
+    // qpdf supports linearize+encrypt+ObjStm. Placement must therefore happen
+    // before the `/Encrypt` slot is inserted; the slot reservation below then
+    // shifts the placed map and the derived ObjStm layout is built afterwards
+    // from the shifted map.
     let relocation = if emits_object_streams {
-        if encrypting {
-            return Err(crate::Error::Unsupported(
-                "linearize+encrypt does not yet support object streams; use \
-                 --object-streams=disable with --linearize --encrypt, or file a \
-                 follow-up if you need both"
-                    .to_string(),
-            ));
-        }
         local_renumber.place_objstm_members_per_half(
             &resolved_batch_plan.open_document_batches,
             &resolved_batch_plan.part3_batches,
@@ -3370,7 +3398,7 @@ fn write_linearized_impl<R: Read + Seek>(
     } else {
         ObjStmRelocation::default()
     };
-    let container_numbers = relocation.container_numbers.clone();
+    let mut container_numbers = relocation.container_numbers.clone();
 
     // Build the encryption context and reserve the `/Encrypt` dict's object
     // slot BEFORE anything below reads `param_dict_ref()`, `hint_stream_slot()`,
@@ -3383,11 +3411,9 @@ fn write_linearized_impl<R: Read + Seek>(
     // placing the reservation here (rather than scattered at each read site)
     // covers all of them at once.
     //
-    // `place_objstm_members_per_half` above is guaranteed NOT to have run
-    // when `encrypting` is true (the `emits_object_streams` guard above
-    // returns `Unsupported` first), so this reservation and that call can
-    // never both touch `local_renumber` — see `reserve_encrypt_dict_slot`'s
-    // doc for why the two are mutually exclusive.
+    // ObjStm placement runs before this reservation. Inserting the encryption
+    // sentinel at the hint slot then shifts only the first-half objects that
+    // follow it; the container numbers below are adjusted by the same amount.
     //
     // `existing_max` only feeds `build_encryption_context`'s internal
     // `existing_max + 1` slot guess. That guess is immediately discarded
@@ -3396,11 +3422,9 @@ fn write_linearized_impl<R: Read + Seek>(
     // `existing_max`'s exact value has no other effect on the returned
     // context — any non-overflowing count is safe here.
     //
-    // `copy_encryption` is rejected above, so `options.encrypt.is_some()` is
-    // the only way `encrypting` can be true — branch on `options.encrypt`
-    // directly (rather than re-testing `encrypting` and then unwrapping
-    // `options.encrypt` with a defensive error arm that could never
-    // actually trigger).
+    // Explicit encryption and copied source encryption share the same qpdf
+    // output slot and emission machinery. The copy branch supplies the
+    // authenticated donor key instead of deriving a new key from passwords.
     //
     // `encrypt_ctx` is threaded into every `do_write_pass` call below, which
     // emits `ctx.encrypt_dict` as a plaintext indirect object right after the
@@ -3449,6 +3473,45 @@ fn write_linearized_impl<R: Read + Seek>(
             );
             let mut ctx = ctx_result?;
             ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
+            for container_number in &mut container_numbers {
+                if *container_number >= ctx.encrypt_ref.number {
+                    *container_number += 1;
+                }
+            }
+            Some(ctx)
+        } else if let Some(source) = options.copy_encryption.as_ref() {
+            // cov:ignore-start: a supported in-memory PDF cannot contain 2^32 objects;
+            // the conversion failure is an internal capacity guard only.
+            let existing_max: u32 = local_renumber.len().try_into().map_err(|_| {
+                crate::Error::Unsupported(
+                    "linearization writer: object count overflows u32 for /Encrypt slot \
+                     reservation"
+                        .to_string(),
+                )
+            })?;
+            // cov:ignore-end
+            let encrypt_metadata = source
+                .encrypt_dict
+                .get("EncryptMetadata")
+                .and_then(Object::as_bool)
+                .unwrap_or(true);
+            let metadata_ref = if encrypt_metadata {
+                None
+            } else {
+                crate::writer::resolve_metadata_stream_ref(pdf)
+            };
+            let mut ctx = crate::writer::build_copy_encryption_context(
+                source,
+                options,
+                existing_max,
+                metadata_ref,
+            )?;
+            ctx.encrypt_ref = local_renumber.reserve_encrypt_dict_slot();
+            for container_number in &mut container_numbers {
+                if *container_number >= ctx.encrypt_ref.number {
+                    *container_number += 1;
+                }
+            }
             Some(ctx)
         } else {
             None
@@ -3494,7 +3557,7 @@ fn write_linearized_impl<R: Read + Seek>(
     // `addDeveloperExtension`, and the pairwise `setMinimumPDFVersion`
     // contributions at L806-815 that give V=5 R=6/R=5 `--encrypt` their
     // `/Extensions /ADBE /ExtensionLevel` 8/3 floor) — mirrors
-    // `crate::writer::write_pdf_full_rewrite_inner`'s handling
+    // `crate::writer::emit_canonical_pdf_inner`'s handling
     // (writer.rs:3154-3238), reusing the SAME pairwise-combine function so
     // the injected `/BaseVersion` always agrees with the header version
     // computed from the identical `(eff_version, eff_ext)` pair. `source_ver`
@@ -3707,6 +3770,13 @@ fn write_linearized_impl<R: Read + Seek>(
     // `id_writer = None`), exactly as qpdf's pass 1 does, so the digest depends
     // only on the input and is stable.
     let pass1_part1 = build_pass1_part1(&part1);
+    // qpdf's progress denominator is an approximation of source object count
+    // times the two linearization passes (`QPDFWriter::write`, around
+    // QPDFWriter.cc:2191). Keep one counter across both passes so progress
+    // reaches the same pre-sink 99% ceiling before `QPDFWriter::write` emits
+    // the terminal 100% event after the sink finishes.
+    let progress_expected = pdf.object_refs().len().saturating_mul(2).max(1);
+    let mut progress_events = 0_usize;
     let pass1_output = do_write_pass(
         plan,
         renumber,
@@ -3727,6 +3797,8 @@ fn write_linearized_impl<R: Read + Seek>(
         None,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
+        &mut progress_events,
+        progress_expected,
     )?; // cov:ignore: pass-1 mode uses the same write path as the successful final pass while omitting only the hint object.
 
     let classic_det_id: Option<(Vec<u8>, [u8; 16])> = if options.deterministic_id {
@@ -4127,10 +4199,13 @@ fn write_linearized_impl<R: Read + Seek>(
         id_writer,
         encrypt_ctx.as_ref(),
         encrypted_string_emitter.as_mut(),
+        &mut progress_events,
+        progress_expected,
     )?; // cov:ignore: pass 2 reuses the validated plan and fixed layout after pass 1 succeeds; this is only defensive error propagation.
     let LinearizedPassOutput {
         bytes: mut final_bytes,
         xref_offsets: final_xref_offsets,
+        first_page_xref_offset: final_first_page_xref_offset,
         hint_stream_offset: final_hint_stream_offset,
         hint_stream_obj_total_len: final_hint_stream_obj_total_len,
         end_of_first_page_offset: final_end_of_first_page_offset,
@@ -4214,15 +4289,73 @@ fn write_linearized_impl<R: Read + Seek>(
         last_xref_offset: final_last_xref_first_entry_offset.saturating_sub(1),
         page_count,
         part1_placeholders,
-        xref_offsets: final_xref_offsets,
+        xref_offsets: final_xref_offsets.clone(),
         first_trailer_prev_range: final_first_trailer_prev_range,
         dict_writable_region: part1_dict_region,
     };
 
-    Ok(LinearizedDocument {
-        bytes: final_bytes,
-        offsets,
-    })
+    let old_to_new = renumber
+        .iter_in_layout_order()
+        .map(|(new_ref, old_ref)| (old_ref, new_ref))
+        .collect();
+
+    let mut written_xref = final_xref_offsets
+        .iter()
+        .map(|(&number, &offset)| {
+            (
+                ObjectRef::new(number, 0),
+                crate::XrefEntry::Uncompressed {
+                    offset: offset as u64,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if !objstm_layout.is_empty() {
+        // cov:ignore-start: every non-empty ObjStm layout pass records its first-page xref offset;
+        // a missing value is an internal invariant failure, not a supported input shape.
+        let first_xref_offset = final_first_page_xref_offset.ok_or_else(|| {
+            crate::Error::Unsupported(
+                "linearization result: missing first-page xref offset".to_string(),
+            )
+        })?;
+        // cov:ignore-end
+        written_xref.insert(
+            ObjectRef::new(relocation.first_xref_slot, 0),
+            crate::XrefEntry::Uncompressed {
+                offset: first_xref_offset as u64,
+            },
+        );
+        written_xref.insert(
+            ObjectRef::new(relocation.main_xref_slot, 0),
+            crate::XrefEntry::Uncompressed {
+                offset: final_last_xref_keyword_offset as u64,
+            },
+        );
+        for container in objstm_layout
+            .open_document
+            .iter()
+            .chain(&objstm_layout.part3)
+            .chain(&objstm_layout.part4)
+        {
+            for (index, &(_original, new_ref)) in container.members.iter().enumerate() {
+                written_xref.insert(
+                    new_ref,
+                    crate::XrefEntry::Compressed {
+                        stream: container.container_new_num,
+                        index: index as u32,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok((
+        LinearizedDocument {
+            bytes: final_bytes,
+            offsets,
+        },
+        WriterResult::new(old_to_new, written_xref),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -4234,7 +4367,7 @@ mod tests {
     use super::*;
     use crate::linearization::plan::LinearizationPlan;
     use crate::object::MAX_INLINE_DEPTH;
-    use crate::writer::{WriteOptions, DETERMINISTIC_ID_ARRAY_LEN};
+    use crate::writer::{WriterOptions, DETERMINISTIC_ID_ARRAY_LEN};
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -4309,6 +4442,31 @@ mod tests {
         Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("tiny PDF should parse")
     }
 
+    fn open_encrypted_three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/compat/encrypted-r4-three-page.pdf");
+        let bytes = std::fs::read(&path).expect("encrypted three-page fixture must exist");
+        Pdf::open(Cursor::new(bytes)).expect("encrypted three-page PDF should parse")
+    }
+
+    fn open_cleartext_metadata_encrypted_three_page_pdf() -> Pdf<Cursor<Vec<u8>>> {
+        let mut input = Pdf::open(Cursor::new(
+            include_bytes!("../../../../tests/fixtures/compat/three-page.pdf").to_vec(),
+        ))
+        .expect("three-page fixture should parse");
+        let mut params =
+            crate::encrypt_setup::EncryptParams::v4_aes128(Vec::new(), b"owner".to_vec());
+        params.encrypt_metadata = false;
+        let options = WriterOptions {
+            encrypt: Some(params),
+            ..WriterOptions::default()
+        };
+        let mut encrypted = Vec::new();
+        crate::writer::emit_canonical_pdf(&mut input, &mut encrypted, &options)
+            .expect("cleartext-metadata encrypted donor should write");
+        Pdf::open(Cursor::new(encrypted)).expect("generated donor should parse")
+    }
+
     /// Minimal one-page PDF whose catalog contains a direct `/Outlines`
     /// dictionary. qpdf's optimization prefix makes it indirect before both
     /// planning and writing.
@@ -4360,7 +4518,7 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = open_tiny_pdf();
-        write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+        write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
             .expect("write_linearized")
     }
 
@@ -4370,6 +4528,90 @@ mod tests {
     #[test]
     fn write_linearized_succeeds() {
         let _doc = build_linearized();
+    }
+
+    #[test]
+    fn canonical_linearized_copy_encryption_covers_objstm() {
+        let mut pdf = open_encrypted_three_page_pdf();
+        let source = pdf
+            .writer_copy_encryption_source()
+            .expect("authenticated donor snapshot")
+            .expect("encrypted fixture must provide copy parameters");
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            copy_encryption: Some(source),
+            ..WriterOptions::default()
+        };
+
+        let (mut document, _) = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect("canonical linearized copy-encryption write");
+        document.back_patch().expect("back-patch final document");
+
+        assert!(
+            document
+                .bytes
+                .windows(b"/Type /ObjStm".len())
+                .any(|window| { window == b"/Type /ObjStm" }),
+            "generated copy-encrypted linearization must contain an object stream"
+        );
+        assert!(
+            document
+                .bytes
+                .windows(b"/Encrypt".len())
+                .any(|window| window == b"/Encrypt"),
+            "copy-encrypted linearization must carry the trailer encryption reference"
+        );
+    }
+
+    #[test]
+    fn canonical_linearized_copy_encryption_covers_cleartext_metadata_branch() {
+        let mut pdf = open_cleartext_metadata_encrypted_three_page_pdf();
+        let source = pdf
+            .writer_copy_encryption_source()
+            .expect("authenticated donor snapshot")
+            .expect("encrypted fixture must provide copy parameters");
+        let options = WriterOptions {
+            object_streams: crate::writer::ObjectStreamMode::Generate,
+            copy_encryption: Some(source),
+            ..WriterOptions::default()
+        };
+
+        let (mut document, _) = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect("canonical cleartext-metadata copy-encryption write");
+        document.back_patch().expect("back-patch final document");
+
+        assert!(
+            document
+                .bytes
+                .windows(b"/EncryptMetadata false".len())
+                .any(|window| window == b"/EncryptMetadata false"),
+            "copy-encrypted linearization must preserve /EncryptMetadata false"
+        );
+        assert!(
+            document
+                .bytes
+                .windows(b"/Type /ObjStm".len())
+                .any(|window| window == b"/Type /ObjStm"),
+            "cleartext-metadata copy-encrypted linearization must contain ObjStm"
+        );
+    }
+
+    #[test]
+    fn canonical_linearized_copy_encryption_propagates_shape_errors() {
+        let mut pdf = open_tiny_pdf();
+        let options = WriterOptions {
+            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
+                encrypt_dict: Dictionary::new(),
+                file_key: Vec::new(),
+                id0: Vec::new(),
+                object_key_alg: crate::ObjectKeyAlg::Aes,
+            }),
+            ..WriterOptions::default()
+        };
+
+        let error = write_linearized_for_pdf_writer(&mut pdf, &options, None)
+            .expect_err("invalid copy-encryption dictionary must fail");
+        assert!(matches!(error, crate::Error::Unsupported(_)));
     }
 
     fn write_linearized_with_pass1_file_mode(
@@ -4382,9 +4624,9 @@ mod tests {
         )
         .expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let temp = tempfile::tempdir().expect("temporary directory");
         let pass1_path = temp.path().join("pass1.pdf");
@@ -4464,7 +4706,7 @@ mod tests {
             &plan,
             &renumber,
             &mut writing_pdf,
-            &WriteOptions::default(),
+            &WriterOptions::default(),
             &pass1_path,
         )
         .expect_err("missing pass-1 parent must fail before returning final output");
@@ -4559,7 +4801,7 @@ mod tests {
             &plan,
             &renumber,
             &mut writing_pdf,
-            &WriteOptions::default(),
+            &WriterOptions::default(),
             pass1_path,
         )
         .expect("qpdf ignores non-EBADF failure while finishing a buffered small pass-1 body");
@@ -4582,7 +4824,7 @@ mod tests {
         let planning_file = std::fs::File::open(&input_path).expect("open large fixture for plan");
         let mut planning_pdf = Pdf::open(std::io::BufReader::new(planning_file))
             .expect("large fixture parses for plan");
-        let options = WriteOptions::default();
+        let options = WriterOptions::default();
         let plan = LinearizationPlan::from_pdf_with_object_stream_mode(
             &mut planning_pdf,
             options.object_streams,
@@ -4644,9 +4886,9 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
 
         let mut writing_pdf = Pdf::open(Cursor::new(bytes)).expect("write fixture parses");
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams: crate::writer::ObjectStreamMode::Disable,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut document = write_linearized(&plan, &renumber, &mut writing_pdf, &options)
             .expect("linearized write");
@@ -4665,10 +4907,10 @@ mod tests {
         let mut planning_pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut planning_pdf, true).expect("valid plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             force_version: Some("1.4".to_string()),
             object_streams: crate::writer::ObjectStreamMode::Generate,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut write_pdf = pdf_without_root();
 
@@ -4851,14 +5093,14 @@ mod tests {
         let plan = LinearizationPlan::from_pdf(&mut plan_pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
 
-        // Deep write-handle. WriteOptions::default() leaves deterministic_id /
+        // Deep write-handle. WriterOptions::default() leaves deterministic_id /
         // static_id false and encrypt / copy_encryption None, so the option
         // guards ahead of the push are no-ops and the push is the first fallible
         // step reached.
         let mut deep_pdf =
             Pdf::open(Cursor::new(deep_pages_pdf_bytes())).expect("deep fixture parses");
 
-        let result = write_linearized(&plan, &renumber, &mut deep_pdf, &WriteOptions::default());
+        let result = write_linearized(&plan, &renumber, &mut deep_pdf, &WriterOptions::default());
         // Match on the depth-overflow message too, not merely the Unsupported
         // variant, so an unrelated Unsupported can't satisfy the test. (The
         // message does not by itself localize the failure to one line — the same
@@ -4942,8 +5184,8 @@ mod tests {
         let part1_len = Part1Bytes::build(&plan, &renumber, "1.4").byte_length();
 
         let mut pdf2 = open_tiny_pdf();
-        let doc =
-            write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default()).expect("write");
+        let doc = write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
+            .expect("write");
 
         assert!(
             doc.offsets.hint_stream_offset >= part1_len,
@@ -5314,7 +5556,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 =
             Pdf::open(Cursor::new(catalog_backref_pdf_bytes())).expect("backref PDF must parse");
-        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
             .expect("write_linearized");
         doc.back_patch().expect("back_patch");
         // The catalog must be emitted exactly once (`/Type /Catalog` is unique
@@ -5545,7 +5787,7 @@ mod tests {
         let renumber = RenumberMap::from_plan(&plan);
         let mut pdf2 = Pdf::open(Cursor::new(catalog_backref_two_page_pdf_bytes()))
             .expect("two-page backref PDF must parse");
-        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+        let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
             .expect("write_linearized");
         doc.back_patch().expect("back_patch");
         let needle = b"/Type /Catalog";
@@ -5582,10 +5824,10 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, use_generate).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             deterministic_id: true,
             object_streams,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
         let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts)
@@ -5702,7 +5944,7 @@ mod tests {
     fn linearize_with_pass1(
         source_bytes: &[u8],
         object_streams: crate::writer::ObjectStreamMode,
-        options: WriteOptions,
+        options: WriterOptions,
     ) -> (Vec<u8>, Vec<u8>) {
         let use_generate = object_streams == crate::writer::ObjectStreamMode::Generate;
         let mut planning_pdf =
@@ -5717,7 +5959,7 @@ mod tests {
             &plan,
             &renumber,
             &mut writing_pdf,
-            &WriteOptions {
+            &WriterOptions {
                 object_streams,
                 ..options
             },
@@ -5749,19 +5991,19 @@ mod tests {
             crate::writer::ObjectStreamMode::Generate,
         ] {
             for (policy, options) in [
-                ("default", WriteOptions::default()),
+                ("default", WriterOptions::default()),
                 (
                     "static",
-                    WriteOptions {
+                    WriterOptions {
                         static_id: true,
-                        ..WriteOptions::default()
+                        ..WriterOptions::default()
                     },
                 ),
                 (
                     "deterministic",
-                    WriteOptions {
+                    WriterOptions {
                         deterministic_id: true,
-                        ..WriteOptions::default()
+                        ..WriterOptions::default()
                     },
                 ),
             ] {
@@ -5973,7 +6215,7 @@ mod tests {
             b"[<00000000000000000000000000000000><00000000000000000000000000000000>]";
         let src = tiny_pdf_with_placeholder_in_content();
 
-        // Default WriteOptions => compress_streams = Yes, stream_data = None.
+        // Default WriterOptions => compress_streams = Yes, stream_data = None.
         let out = linearize_with(&src, |o| o.deterministic_id = true);
 
         // Re-encoded: the raw literal no longer appears verbatim in the output.
@@ -6146,7 +6388,7 @@ mod tests {
         let payload: &[u8] = b"flpdf linearized external-file lone-flate exclusion payload";
         let src = tiny_pdf_with_external_file_lone_flate_stream(payload);
 
-        // Default WriteOptions => compress_streams = Yes, recompress_flate =
+        // Default WriterOptions => compress_streams = Yes, recompress_flate =
         // false: exactly the conditions under which a lone-/FlateDecode body
         // stream WITHOUT /F is preserved verbatim. The /F here must force the
         // re-encode (exclusion) branch instead.
@@ -6365,7 +6607,7 @@ mod tests {
             .number;
 
         let mut pdf2 = open_tiny_pdf();
-        let doc = write_linearized(&plan, &renumber, &mut pdf2, &WriteOptions::default())
+        let doc = write_linearized(&plan, &renumber, &mut pdf2, &WriterOptions::default())
             .expect("write_linearized");
 
         assert_eq!(
@@ -6507,14 +6749,14 @@ mod tests {
     }
 
     /// Linearize `source_bytes` in the given write mode with the supplied
-    /// `WriteOptions` mutator applied, returning the fully back-patched bytes.
+    /// `WriterOptions` mutator applied, returning the fully back-patched bytes.
     /// Mirrors [`linearize_deterministic_mode`] but lets a test pick a
     /// non-deterministic `/ID` policy (e.g. `--static-id`).
-    fn linearize_with(source_bytes: &[u8], configure: impl FnOnce(&mut WriteOptions)) -> Vec<u8> {
+    fn linearize_with(source_bytes: &[u8], configure: impl FnOnce(&mut WriterOptions)) -> Vec<u8> {
         let mut pdf = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let mut opts = WriteOptions::default();
+        let mut opts = WriterOptions::default();
         configure(&mut opts);
         let mut pdf2 = Pdf::open(Cursor::new(source_bytes.to_vec())).expect("source parses");
         let mut doc =
@@ -6527,7 +6769,7 @@ mod tests {
     /// boundary fixtures. `static_id` fixes the encryption key inputs while
     /// `static_aes_iv` fixes every AES IV; neither setting is used by the
     /// random-IV production-path regression below.
-    fn configure_deterministic_aes128(options: &mut WriteOptions) {
+    fn configure_deterministic_aes128(options: &mut WriterOptions) {
         options.static_id = true;
         options.static_aes_iv = true;
         options.encrypt = Some(crate::encrypt_setup::EncryptParams::v4_aes128(
@@ -6745,20 +6987,20 @@ mod tests {
     /// guard does not mean linearize+encrypt is unsupported in general —
     /// non-deterministic (default) and `--static-id` `/ID`s combine with
     /// encryption just fine; see [`write_linearized`]'s `# Errors` section.
-    /// Mirrors the flat (`write_pdf_full_rewrite`) guard, including its
+    /// Mirrors the flat (`emit_canonical_pdf`) guard, including its
     /// wording.
     #[test]
     fn deterministic_id_linearized_rejects_encrypt() {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             deterministic_id: true,
             encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -6770,17 +7012,17 @@ mod tests {
     }
 
     /// `--deterministic-id` and `--static-id` are mutually exclusive on the
-    /// linearized write path too, mirroring `write_pdf_full_rewrite`. Without
+    /// linearized write path too, mirroring `emit_canonical_pdf`. Without
     /// the guard the deterministic branch silently wins over `static_id`.
     #[test]
     fn deterministic_id_linearized_rejects_static_id() {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             deterministic_id: true,
             static_id: true,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -6798,7 +7040,7 @@ mod tests {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             deterministic_id: true,
             copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
                 encrypt_dict: Dictionary::new(),
@@ -6806,7 +7048,7 @@ mod tests {
                 id0: Vec::new(),
                 object_key_alg: crate::ObjectKeyAlg::Aes,
             }),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -6824,9 +7066,9 @@ mod tests {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             deterministic_id: true,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &opts)
@@ -6850,13 +7092,13 @@ mod tests {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             // `deterministic_id` left at its default `false`.
             encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
                 b"user".to_vec(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &opts)
@@ -6883,7 +7125,7 @@ mod tests {
         let mut pdf = open_tiny_pdf();
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             encrypt: Some(crate::encrypt_setup::EncryptParams {
                 encrypt_metadata: false,
                 ..crate::encrypt_setup::EncryptParams::v4_aes128(
@@ -6891,83 +7133,11 @@ mod tests {
                     b"owner".to_vec(),
                 )
             }),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = open_tiny_pdf();
         write_linearized(&plan, &renumber, &mut pdf2, &opts)
             .expect("cleartext-metadata must not change whether the write succeeds");
-    }
-
-    /// linearize+encrypt+ObjStm is out of scope for now: the ObjStm
-    /// relocation path (`RenumberMap::place_objstm_members_per_half`) and the
-    /// encrypt-dict slot reservation it will need
-    /// (`RenumberMap::reserve_encrypt_dict_slot`) are mutually exclusive, so
-    /// the combination must be rejected rather than silently mis-encrypted or
-    /// silently linearized without the requested object streams.
-    /// `ObjectStreamMode::Generate` always builds fresh containers regardless
-    /// of the source's own form, so `tiny_pdf_bytes()` (no source ObjStm)
-    /// still reliably produces a non-empty batch here — see
-    /// `deterministic_id_linearized_all_ids_match`, which pins the same
-    /// fixture+mode pair to the xref-stream output shape.
-    ///
-    /// Asserts the exact rejection message (not just the `Unsupported`
-    /// variant): `write_linearized` has several other `Unsupported` exits
-    /// upstream and downstream of this guard (missing `/Root`, xref/renumber
-    /// inconsistencies, …), so a loose variant-only match could pass for the
-    /// wrong reason if this fixture ever tripped one of those instead.
-    #[test]
-    fn objstm_encrypt_linearize_combination_is_unsupported() {
-        let mut pdf = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("source parses");
-        let plan = LinearizationPlan::from_pdf(&mut pdf, true).expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
-            object_streams: crate::writer::ObjectStreamMode::Generate,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                b"user".to_vec(),
-                b"owner".to_vec(),
-            )),
-            ..WriteOptions::default()
-        };
-        let mut pdf2 = Pdf::open(Cursor::new(tiny_pdf_bytes())).expect("source parses");
-        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m.contains("does not yet support object streams")),
-            "got {err:?}"
-        );
-    }
-
-    /// `--copy-encryption-from` combined with linearization is rejected: the
-    /// donor's `/ID[0]` must become the output's `/ID[0]` (Algorithm 2 is
-    /// pinned to it, see `CopyEncryptionSource::id0`'s doc), which conflicts
-    /// with `/ID` already being finalized at a fixed width before this guard
-    /// runs — required for the two-pass probe loop's offset stability. See
-    /// the guard's own comment (right after the `deterministic_id &&
-    /// encrypting` guard) for the full reasoning. Mirrors
-    /// `objstm_encrypt_linearize_combination_is_unsupported`'s style: assert
-    /// the exact message, since `write_linearized` has several other
-    /// `Unsupported` exits that a loose variant-only match could mask.
-    #[test]
-    fn copy_encryption_linearize_combination_is_unsupported() {
-        let mut pdf = open_tiny_pdf();
-        let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
-            copy_encryption: Some(crate::encrypt_setup::CopyEncryptionSource {
-                encrypt_dict: Dictionary::new(),
-                file_key: Vec::new(),
-                id0: Vec::new(),
-                object_key_alg: crate::ObjectKeyAlg::Aes,
-            }),
-            ..WriteOptions::default()
-        };
-        let mut pdf2 = open_tiny_pdf();
-        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m.contains("linearize+copy-encryption-from is not yet supported")),
-            "got {err:?}"
-        );
     }
 
     /// Building the `/Encrypt` object's `EncryptionContext`, reserving its
@@ -7548,7 +7718,7 @@ mod tests {
         // shape). This was flpdf-txag's Task 11 review-found gap:
         // `write_linearized` wired the header-version half
         // (`effective_pdf_version`) but never the Catalog-injection half
-        // that `crate::writer::write_pdf_full_rewrite_inner` already had
+        // that `crate::writer::emit_canonical_pdf_inner` already had
         // (writer.rs:3154-3238).
         let catalog_new_ref = renumber
             .new_for_original(plan.root_ref.expect("plan has root_ref"))
@@ -7769,7 +7939,7 @@ mod tests {
     /// see [`CatalogAdbeStatus::orphans_indirect_object`]'s doc for why
     /// (this function's `plan`/`renumber` are already frozen from a
     /// separate `Pdf` handle by the time this runs, unlike
-    /// `crate::writer::write_pdf_full_rewrite_inner`, which mutates the
+    /// `crate::writer::emit_canonical_pdf_inner`, which mutates the
     /// Catalog before its OWN renumbering). V=5 R=6 encryption's ext-8
     /// floor (`eff_ext > 0`) is what makes this fixture actually need to
     /// touch `/Extensions` at all — a non-encrypting linearize of the same
@@ -7781,12 +7951,12 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -7859,12 +8029,12 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -7936,12 +8106,12 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -8014,12 +8184,12 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -8088,12 +8258,12 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(src.clone())).expect("source parses");
         let plan = LinearizationPlan::from_pdf(&mut pdf, false).expect("plan");
         let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
+        let opts = WriterOptions {
             encrypt: Some(crate::encrypt_setup::EncryptParams::v5_r6(
                 Vec::new(),
                 b"owner".to_vec(),
             )),
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut pdf2 = Pdf::open(Cursor::new(src)).expect("source parses");
         let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
@@ -8231,7 +8401,7 @@ mod tests {
     /// Task 8 follow-up: `--cleartext-metadata` (`encrypt_metadata: false`)
     /// must exempt ONLY the `/Catalog /Metadata` XMP stream from encryption
     /// (leaving it in the clear with `/Crypt /Identity` prepended, mirroring
-    /// `crate::writer::write_pdf_full_rewrite`'s `Object::Stream` branch,
+    /// `crate::writer::emit_canonical_pdf`'s `Object::Stream` branch,
     /// `writer.rs` around line 3826) — every OTHER body string/stream must
     /// still be encrypted normally. A same-fixture A/B check: the metadata
     /// marker stays readable, the content-stream marker and the `/Info
@@ -8412,7 +8582,7 @@ mod tests {
         // Default compression policy (CompressStreams::Yes; StreamDataMode
         // set explicitly to Compress rather than left at the default None,
         // so the intent is self-evident here without relying on
-        // WriteOptions::default()'s fallback chain). The /Metadata stream's
+        // WriterOptions::default()'s fallback chain). The /Metadata stream's
         // source has no /Filter, so it gets decoded (a no-op) and
         // RE-ENCODED to a bare /Filter /FlateDecode inside
         // reencode_stream_for_compress, BEFORE the cleartext-metadata
@@ -9140,131 +9310,6 @@ mod tests {
         );
 
         assert_classic_xref_section_entries_are_ascii_plaintext(&encrypted);
-    }
-
-    /// Minimal PDF 1.5 cross-reference-*stream* fixture with a genuine
-    /// source-side ObjStm: object 4 (`/Info`) exists ONLY inside object 5's
-    /// ObjStm — there is no plain indirect object 4 in the file. Used to
-    /// exercise `ObjectStreamMode::Preserve` (the default), which reuses the
-    /// *source's* ObjStm membership rather than repacking, as opposed to
-    /// `Generate`, which always builds fresh containers regardless of source
-    /// form.
-    fn objstm_bearing_pdf_bytes() -> Vec<u8> {
-        fn append_u24_be(bytes: &mut Vec<u8>, value: u32) {
-            bytes.extend_from_slice(&value.to_be_bytes()[1..]);
-        }
-        fn append_xref_entry(entries: &mut Vec<u8>, entry_type: u8, field1: u32, field2: u8) {
-            entries.push(entry_type);
-            append_u24_be(entries, field1);
-            entries.push(field2);
-        }
-
-        let objstm_num: u32 = 5;
-        let xref_num: u32 = 6;
-        let total_size: u32 = xref_num + 1;
-
-        let mut bytes = b"%PDF-1.5\n".to_vec();
-
-        let catalog_offset = bytes.len();
-        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
-
-        let pages_offset = bytes.len();
-        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
-
-        let page_offset = bytes.len();
-        bytes.extend_from_slice(
-            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
-        );
-
-        // Object 4 (/Info) lives ONLY inside the ObjStm (object 5) — no plain
-        // indirect object 4 exists in the file.
-        let header: &[u8] = b"4 0 ";
-        let info_bytes: &[u8] = b"<< /Title (x) >>";
-        let first = header.len();
-        let mut stream_data = Vec::new();
-        stream_data.extend_from_slice(header);
-        stream_data.extend_from_slice(info_bytes);
-
-        let objstm_offset = bytes.len();
-        bytes.extend_from_slice(
-            format!(
-                "{objstm_num} 0 obj\n<< /Type /ObjStm /N 1 /First {first} /Length {} >>\nstream\n",
-                stream_data.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&stream_data);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-
-        let xref_offset = bytes.len();
-        let mut xref_entries: Vec<u8> = Vec::new();
-        append_xref_entry(&mut xref_entries, 0, 0, 0); // 0: free
-        append_xref_entry(&mut xref_entries, 1, catalog_offset as u32, 0); // 1: Catalog
-        append_xref_entry(&mut xref_entries, 1, pages_offset as u32, 0); // 2: Pages
-        append_xref_entry(&mut xref_entries, 1, page_offset as u32, 0); // 3: Page
-        append_xref_entry(&mut xref_entries, 2, objstm_num, 0); // 4: Info, compressed
-        append_xref_entry(&mut xref_entries, 1, objstm_offset as u32, 0); // 5: ObjStm
-        append_xref_entry(&mut xref_entries, 1, xref_offset as u32, 0); // 6: XRef
-
-        bytes.extend_from_slice(
-            format!(
-                "{xref_num} 0 obj\n<< /Type /XRef /Size {total_size} /Root 1 0 R /Info 4 0 R \
-                 /W [1 3 1] /Index [0 {total_size}] /Length {} >>\nstream\n",
-                xref_entries.len()
-            )
-            .as_bytes(),
-        );
-        bytes.extend_from_slice(&xref_entries);
-        bytes.extend_from_slice(b"\nendstream\nendobj\n");
-        bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        bytes
-    }
-
-    /// As [`objstm_encrypt_linearize_combination_is_unsupported`], but for
-    /// `ObjectStreamMode::Preserve` (the default) on a source that already
-    /// carries an ObjStm — the path Task 2's code review specifically flagged
-    /// as a way to reach a non-empty batch plan *without*
-    /// `ObjectStreamMode::Generate`. Confirms the guard is keyed on the
-    /// resolved batch plan (which reflects the source's real membership under
-    /// Preserve), not on the write-mode enum variant.
-    #[test]
-    fn preserve_objstm_encrypt_linearize_combination_is_unsupported() {
-        let mut pdf = Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
-        let plan = LinearizationPlan::from_pdf_with_object_stream_mode(
-            &mut pdf,
-            crate::writer::ObjectStreamMode::Preserve,
-        )
-        .expect("plan");
-        let renumber = RenumberMap::from_plan(&plan);
-        let opts = WriteOptions {
-            object_streams: crate::writer::ObjectStreamMode::Preserve,
-            encrypt: Some(crate::encrypt_setup::EncryptParams::v4_aes128(
-                b"user".to_vec(),
-                b"owner".to_vec(),
-            )),
-            ..WriteOptions::default()
-        };
-        // Precondition: the source's ObjStm membership actually survives
-        // planning under Preserve, so this test exercises the relocation
-        // path rather than being vacuously true on an empty batch plan.
-        let mut precheck_pdf =
-            Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
-        let resolved = ObjStmLayout::resolve_batches(&plan, &mut precheck_pdf, &opts)
-            .expect("resolve_batches");
-        assert!(
-            !resolved.open_document_batches.is_empty()
-                || !resolved.part3_batches.is_empty()
-                || !resolved.part4_batches.is_empty(),
-            "test precondition: Preserve on an ObjStm-bearing source must \
-             yield a non-empty batch plan"
-        );
-        let mut pdf2 = Pdf::open(Cursor::new(objstm_bearing_pdf_bytes())).expect("source parses");
-        let err = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap_err();
-        assert!(
-            matches!(err, crate::Error::Unsupported(ref m)
-                if m.contains("does not yet support object streams")),
-            "got {err:?}"
-        );
     }
 
     /// The primary hint-stream object must serialize its filtered dict in

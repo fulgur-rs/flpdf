@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use flpdf::{load_xref_and_trailer, write_pdf, Object, ObjectRef, Pdf, XrefForm};
+use flpdf::{load_xref_and_trailer, Object, ObjectRef, Pdf, PdfWriter, XrefForm};
 use predicates::prelude::*;
 use std::collections::BTreeMap;
 use std::fs;
@@ -179,7 +179,7 @@ fn qpdf_split_and_merge_matrix_roundtrip_still_parsable() {
 }
 
 #[test]
-fn qpdf_incremental_touched_only_emission_keeps_prefix_and_pages() {
+fn qpdf_full_rewrite_emits_touched_object_and_keeps_pages() {
     if !is_qpdf_available() {
         return;
     }
@@ -198,12 +198,12 @@ fn qpdf_incremental_touched_only_emission_keeps_prefix_and_pages() {
     pdf.set_object(root, Object::Dictionary(root_dict));
 
     let output = tmp.path().join("touched-out.pdf");
-    let mut out = File::create(&output).unwrap();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(&output).unwrap();
+    writer.write().unwrap();
 
     let rewritten = fs::read(&output).unwrap();
-    assert!(rewritten.len() > source_bytes.len());
-    assert_eq!(&rewritten[..source_bytes.len()], &source_bytes);
+    assert_ne!(rewritten, source_bytes);
 
     let expected_pages = qpdf_show_npages(&source);
     assert_eq!(expected_pages, qpdf_show_npages(&output));
@@ -213,7 +213,7 @@ fn qpdf_incremental_touched_only_emission_keeps_prefix_and_pages() {
 }
 
 #[test]
-fn qpdf_incremental_rewrite_of_xref_stream_input_preserves_structure() {
+fn qpdf_full_rewrite_of_xref_stream_input_preserves_structure() {
     if !is_qpdf_available() {
         return;
     }
@@ -235,7 +235,7 @@ fn qpdf_incremental_rewrite_of_xref_stream_input_preserves_structure() {
 }
 
 #[test]
-fn qpdf_incremental_xref_stream_form_round_trips() {
+fn qpdf_full_rewrite_xref_stream_form_round_trips() {
     if !is_qpdf_available() {
         return;
     }
@@ -263,7 +263,7 @@ fn qpdf_incremental_xref_stream_form_round_trips() {
 }
 
 #[test]
-fn qpdf_incremental_prev_chain_and_page_counts_are_stable() {
+fn qpdf_full_rewrite_drops_previous_chain_and_page_counts_are_stable() {
     if !is_qpdf_available() {
         return;
     }
@@ -292,23 +292,15 @@ fn qpdf_incremental_prev_chain_and_page_counts_are_stable() {
     }
 
     for pair in generations.windows(2) {
-        let previous = &pair[0];
         let current = &pair[1];
 
-        let previous_startxref = parse_startxref(&fs::read(previous).unwrap());
         let pdf = Pdf::open(BufReader::new(File::open(current).unwrap())).unwrap();
-        let prev = pdf
-            .trailer()
-            .get("Prev")
-            .and_then(as_integer)
-            .expect("expected /Prev in incremental generation");
-
-        assert_eq!(prev as u64, previous_startxref);
+        assert!(pdf.trailer().get("Prev").is_none());
     }
 }
 
 #[test]
-fn qpdf_incremental_object_stream_member_rewrite_stays_qpdf_compatible() {
+fn qpdf_full_rewrite_object_stream_member_rewrite_stays_qpdf_compatible() {
     if !is_qpdf_available() {
         return;
     }
@@ -337,8 +329,9 @@ fn qpdf_incremental_object_stream_member_rewrite_stays_qpdf_compatible() {
 
     let touched = touched.expect("unable to select a compressed object to touch");
     let output = tmp.path().join("objstm-output.pdf");
-    let mut out = File::create(&output).unwrap();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(&output).unwrap();
+    writer.write().unwrap();
 
     assert_eq!(qpdf_show_npages(&source), qpdf_show_npages(&output));
     qpdf_check(&output);
@@ -431,13 +424,6 @@ fn qpdf_check(path: &Path) {
     run_qpdf_with_args(&["--check", path.to_str().unwrap()]);
 }
 
-fn as_integer(object: &Object) -> Option<i64> {
-    match object {
-        Object::Integer(value) => Some(*value),
-        _ => None,
-    }
-}
-
 fn qpdf_show_npages(path: &Path) -> String {
     run_qpdf(&["--show-npages", path.to_str().unwrap()])
 }
@@ -521,39 +507,6 @@ fn bytes_use_xref_stream(bytes: &[u8]) -> bool {
         .windows(b"\nxref\n".len())
         .any(|window| window == b"\nxref\n");
     has_xref_keyword && !has_ascii_xref
-}
-
-fn parse_startxref(bytes: &[u8]) -> u64 {
-    let marker = b"startxref";
-    let eof = bytes
-        .windows(b"%%EOF".len())
-        .rposition(|window| window == b"%%EOF")
-        .unwrap_or(bytes.len());
-    let search = &bytes[..eof];
-
-    let Some(pos) = search
-        .windows(marker.len())
-        .rposition(|window| window == marker)
-    else {
-        panic!("missing startxref marker")
-    };
-
-    let mut cursor = pos + marker.len();
-    while cursor < search.len() && search[cursor].is_ascii_whitespace() {
-        cursor += 1;
-    }
-
-    let start = cursor;
-    while cursor < search.len() && search[cursor].is_ascii_digit() {
-        cursor += 1;
-    }
-
-    if start == cursor {
-        panic!("missing startxref offset")
-    }
-
-    let value = std::str::from_utf8(&search[start..cursor]).unwrap();
-    value.parse::<u64>().unwrap()
 }
 
 fn golden_path(file: &str) -> PathBuf {

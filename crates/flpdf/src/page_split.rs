@@ -45,11 +45,9 @@
 //! Since a full page-tree rebuild pass is not yet available,
 //! this module uses a minimal approach: for each chunk it reopens the source
 //! bytes, mutates the `/Pages` root to contain only the chunk's page refs
-//! (updating `/Count` and `/Kids`), then writes the modified PDF via
-//! [`write_pdf`] (incremental update). Orphan objects from the other pages
-//! remain in the file but are unreachable from the page tree — this is
-//! tolerated under the "minimal, qpdf-equivalent" requirement; all output files open
-//! correctly in PDF readers.
+//! (updating `/Count` and `/Kids`), then writes the modified PDF through
+//! [`PdfWriter`]. The writer's qpdf reachability pass
+//! drops objects that are no longer reachable from the chunk's roots.
 //!
 //! ## Known limitation: inheritable attributes
 //!
@@ -81,16 +79,14 @@
 //! use flpdf::{page_split::split_pages, Pdf};
 //!
 //! let src = std::fs::read("input.pdf").unwrap();
-//! // `false` = incremental chunks; pass `true` for deterministic-ID full-rewrite chunks.
+//! // `true` applies qpdf's deterministic-ID policy to every chunk.
 //! split_pages(src, 2, Path::new("output.pdf"), false).unwrap();
 //! // Produces: output-1-2.pdf, output-3-4.pdf, …
 //! ```
 
 use crate::pages::page_refs;
-use crate::writer::{write_pdf, write_pdf_with_options, WriteOptions};
-use crate::{Error, Object, ObjectRef, Pdf, Result};
-use std::fs::File;
-use std::io::{BufWriter, Cursor};
+use crate::{Error, Object, ObjectRef, Pdf, PdfWriter, Result};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -119,10 +115,9 @@ use std::sync::Arc;
 ///   → `output-1-2.pdf`), or `-{page}` for `chunk_size == 1` (e.g.
 ///   `output.pdf` → `output-1.pdf`), matching qpdf 11.9.0.
 ///
-/// When `deterministic_id` is set, each chunk is written as a full rewrite with
-/// a content-derived deterministic `/ID` (mirroring `qpdf --split-pages
-/// --deterministic-id`, which applies the deterministic-ID policy to every split
-/// output); otherwise each chunk is written as an incremental update.
+/// When `deterministic_id` is set, each chunk uses a content-derived
+/// deterministic `/ID` (mirroring `qpdf --split-pages --deterministic-id`,
+/// which applies the deterministic-ID policy to every split output).
 ///
 /// Returns the list of chunk output paths in write order. Callers that want to
 /// mirror qpdf's `--verbose --split-pages` `wrote file <chunk>` emission can
@@ -408,8 +403,8 @@ impl AsRef<[u8]> for SharedSource {
 /// Write a single chunk PDF to `out_path`.
 ///
 /// Re-opens `src_bytes` as a fresh `Pdf`, mutates the `/Pages` root so that
-/// only the `chunk_refs` pages remain, then appends an incremental update via
-/// [`write_pdf`]. `chunk_start` (inclusive) and `chunk_end` (exclusive) are
+/// only the `chunk_refs` pages remain, then emits a fresh PDF via
+/// [`PdfWriter`]. `chunk_start` (inclusive) and `chunk_end` (exclusive) are
 /// the chunk's 0-based half-open `[chunk_start, chunk_end)` span in the
 /// *source* document, used to reconstruct `/PageLabels` for the chunk
 /// (qpdf `--split-pages` parity).
@@ -483,21 +478,14 @@ fn write_chunk(
         }
     }
 
-    // Write the modified PDF. With --deterministic-id the chunk needs a
-    // content-derived /ID, which only the full-rewrite writer produces; without
-    // it, keep the cheaper incremental update.
-    let file = File::create(out_path).map_err(Error::Io)?;
-    let mut writer = BufWriter::new(file);
+    // Every split output is a fresh qpdf writer output. deterministic_id is a
+    // writer setting, not a route selector.
+    let mut writer = PdfWriter::new(&mut pdf);
     if deterministic_id {
-        let options = WriteOptions {
-            full_rewrite: true,
-            deterministic_id: true,
-            ..WriteOptions::default()
-        };
-        write_pdf_with_options(&mut pdf, &mut writer, &options)?;
-    } else {
-        write_pdf(&mut pdf, &mut writer)?;
+        writer.set_deterministic_id(true);
     }
+    writer.set_output_file(out_path)?;
+    writer.write()?;
 
     Ok(())
 }

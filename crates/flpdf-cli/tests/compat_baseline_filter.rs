@@ -1,9 +1,9 @@
-//! Filter-policy baseline test: verify that `flpdf rewrite --full-rewrite`
+//! Filter-policy baseline test: verify that the canonical `flpdf rewrite`
 //! produces streams with the same `/Filter` policy as `qpdf <in> <out>`.
 //!
 //! For each unencrypted, non-linearized fixture:
 //! 1. Run `qpdf <input> qpdf-out.pdf` (plain passthrough, no flags).
-//! 2. Run `flpdf rewrite --full-rewrite --static-id <input> flpdf-out.pdf`.
+//! 2. Run `flpdf rewrite --static-id <input> flpdf-out.pdf`.
 //! 3. Open each output with `flpdf::Pdf::open`, resolve all known object refs,
 //!    filter for `Object::Stream`, and extract the `/Filter` field from each.
 //! 4. Assert that every stream's `/Filter` resolves to exactly `[FlateDecode]`
@@ -144,11 +144,10 @@ fn stream_filter_policy_matches_qpdf() {
             String::from_utf8_lossy(&qpdf_status.stderr)
         );
 
-        // 2. Run flpdf rewrite --full-rewrite --static-id.
+        // 2. Run flpdf rewrite --static-id.
         let flpdf_status = CargoCommand::cargo_bin("flpdf")
             .expect("flpdf binary must exist")
             .arg("rewrite")
-            .arg("--full-rewrite")
             .arg("--static-id")
             .arg(fixture_path.to_str().unwrap())
             .arg(flpdf_out.to_str().unwrap())

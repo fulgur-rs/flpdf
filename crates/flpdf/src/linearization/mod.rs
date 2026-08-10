@@ -36,6 +36,4 @@ pub use part1::{Part1Bytes, Part1Placeholders, PLACEHOLDER_WIDTH};
 pub use plan::{LinearizationPlan, PageHintEntry, SharedObjectHintEntry};
 pub use renumber::{ObjStmRelocation, RenumberMap};
 pub use show::{show_linearization_bytes, show_linearization_path, ShowLinearizationError};
-pub use writer::{
-    write_linearized, write_linearized_with_pass1_file, LinearizedDocument, LinearizedOffsets,
-};
+pub use writer::{LinearizedDocument, LinearizedOffsets};

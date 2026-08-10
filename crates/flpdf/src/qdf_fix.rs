@@ -2,7 +2,7 @@
 //! `fix_qdf`: the flpdf equivalent of qpdf's `fix-qdf` tool.
 //!
 //! After a human edits a QDF-form PDF (the flat, normalized layout produced by
-//! [`crate::write_qdf`] / `qpdf --qdf`), the cross-reference offsets, stream
+//! [`crate::PdfWriter::set_qdf_mode`] / `qpdf --qdf`), the cross-reference offsets, stream
 //! `/Length` values, the trailer `/Size`, and `startxref` are all stale. This
 //! module recomputes exactly those four regions from the current bytes while
 //! preserving every other byte verbatim — object bodies, comments, formatting,

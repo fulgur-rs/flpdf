@@ -14,26 +14,20 @@ use std::sync::Arc;
 /// Same pipeline as the `roundtrip` fuzz target. A panic here fails the test;
 /// `Err` results are the expected outcome for malformed input and are ignored.
 fn roundtrip(data: &[u8]) {
-    // One owned buffer shared by all three opens, exactly as the fuzz target
+    // One owned buffer shared by both opens, exactly as the fuzz target
     // does it: `Pdf<R>` requires `R: 'static`, so the input cannot be borrowed.
     let shared: Arc<[u8]> = Arc::from(data);
 
     let _ = flpdf::check_reader(Cursor::new(Arc::clone(&shared)));
 
-    // Each writer gets a freshly parsed handle (writing mutates handle state, so
-    // a shared handle would feed the second writer a post-write document — a
-    // sequence no real consumer produces). Mirrors `fuzz/fuzz_targets/roundtrip.rs`.
+    // The writer gets a freshly parsed handle (writing mutates handle state, so
+    // a shared handle would feed it a post-write document — a sequence no real
+    // consumer produces). Mirrors `fuzz/fuzz_targets/roundtrip.rs`.
     if let Ok(mut pdf) = flpdf::Pdf::open_mem(Arc::clone(&shared)) {
-        let mut incremental = Vec::new();
-        let _ = flpdf::write_pdf(&mut pdf, &mut incremental);
-    }
-    if let Ok(mut pdf) = flpdf::Pdf::open_mem(Arc::clone(&shared)) {
-        let mut rewritten = Vec::new();
-        // `WriteOptions` is `#[non_exhaustive]`: build via `default()` then set
-        // fields (struct-literal syntax is rejected outside the defining crate).
-        let mut options = flpdf::WriteOptions::default();
-        options.full_rewrite = true;
-        let _ = flpdf::write_pdf_with_options(&mut pdf, &mut rewritten, &options);
+        let mut writer = flpdf::PdfWriter::new(&mut pdf);
+        if writer.set_output_memory().is_ok() && writer.write().is_ok() {
+            let _ = writer.get_buffer();
+        }
     }
 }
 

@@ -5,14 +5,16 @@ use cbc::Encryptor;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use flpdf::{
-    load_xref_and_trailer, parse_object, write_pdf_with_options, CompressStreams, EncryptMethod,
-    EncryptParams, EncryptedError, Error, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, Pdf, PdfOpenOptions, StreamDataMode, WriteOptions, XrefEntry,
+    load_xref_and_trailer, parse_object, EncryptMethod, EncryptParams, EncryptedError, Error,
+    Object, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
 };
 use md5::{Digest, Md5};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
+
+mod common;
+use common::{write_with_settings, WriterTestSettings};
 
 #[test]
 fn opens_pdf_without_resolving_all_objects() {
@@ -854,15 +856,16 @@ fn assert_encrypted_plaintext_stream_rewrite_restores_recovered_eol(
     expect_unfiltered: bool,
 ) {
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("encrypted source");
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Disable;
-    options.stream_data = Some(StreamDataMode::Preserve);
-    options.compress_streams = CompressStreams::No;
-    options.static_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let settings = WriterTestSettings {
+        object_streams: flpdf::ObjectStreamMode::Disable,
+        stream_data: Some(flpdf::StreamDataMode::Preserve),
+        compress_streams: flpdf::CompressStreams::No,
+        static_id: true,
+        preserve_encryption: false,
+        ..WriterTestSettings::default()
+    };
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).expect("plaintext rewrite");
+    write_with_settings(&mut pdf, &mut output, &settings).expect("plaintext rewrite");
 
     let mut rewritten = Pdf::open(std::io::Cursor::new(output)).expect("rewritten output");
     let root = rewritten.root_ref().expect("root");
@@ -921,15 +924,16 @@ fn assert_explicit_identity_filter_chain_does_not_append_decoded_eol(crypt_after
     let bytes =
         encrypted_v4_explicit_crypt_filter_fixture_with_length(true, crypt_after_flate, false);
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("encrypted source");
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Disable;
-    options.stream_data = Some(StreamDataMode::Preserve);
-    options.compress_streams = CompressStreams::No;
-    options.static_id = true;
-    options.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let settings = WriterTestSettings {
+        object_streams: flpdf::ObjectStreamMode::Disable,
+        stream_data: Some(flpdf::StreamDataMode::Preserve),
+        compress_streams: flpdf::CompressStreams::No,
+        static_id: true,
+        preserve_encryption: false,
+        ..WriterTestSettings::default()
+    };
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).expect("plaintext rewrite");
+    write_with_settings(&mut pdf, &mut output, &settings).expect("plaintext rewrite");
 
     // qpdf 11.9.0 removes only the explicit /Crypt slot. Even though /Length
     // was invalid and the source payload came from the endstream fallback, the
@@ -1244,10 +1248,11 @@ fn encrypted_v4_aes_known_password_fixture() -> Vec<u8> {
     let input = std::fs::read(minimal_fixture_path()).expect("read minimal fixture");
     let mut pdf = Pdf::open(std::io::Cursor::new(input)).expect("open minimal fixture");
     let mut output = Vec::new();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.encrypt = Some(EncryptParams::v4_aes128(Vec::new(), b"ownerpass".to_vec()));
-    write_pdf_with_options(&mut pdf, &mut output, &options).expect("write V=4 AES fixture");
+    let settings = WriterTestSettings {
+        encrypt: Some(EncryptParams::v4_aes128(Vec::new(), b"ownerpass".to_vec())),
+        ..WriterTestSettings::default()
+    };
+    write_with_settings(&mut pdf, &mut output, &settings).expect("write V=4 AES fixture");
     output
 }
 
@@ -1799,21 +1804,21 @@ fn writer_generated_rc4_reader_fixture(use_object_stream: bool) -> Vec<u8> {
     );
 
     let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("open plaintext RC4 fixture");
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = if use_object_stream {
-        ObjectStreamMode::Generate
-    } else {
-        ObjectStreamMode::Disable
+    let settings = WriterTestSettings {
+        object_streams: if use_object_stream {
+            flpdf::ObjectStreamMode::Generate
+        } else {
+            flpdf::ObjectStreamMode::Disable
+        },
+        encrypt: Some(EncryptParams::rc4(
+            EncryptMethod::V1Rc440,
+            b"user-pw".to_vec(),
+            b"owner-pw".to_vec(),
+        )),
+        ..WriterTestSettings::default()
     };
-    options.encrypt = Some(EncryptParams::rc4(
-        EncryptMethod::V1Rc440,
-        b"user-pw".to_vec(),
-        b"owner-pw".to_vec(),
-    ));
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options)
-        .expect("write RC4 object-stream fixture");
+    write_with_settings(&mut pdf, &mut output, &settings).expect("write RC4 object-stream fixture");
     output
 }
 

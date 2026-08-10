@@ -40,9 +40,7 @@
 //! These fixtures are content-stream-free, so byte-identity is independent of the
 //! deflate backend — this file is NOT gated on `qpdf-zlib-compat`.
 
-use flpdf::{
-    disable_digital_signatures, write_pdf_with_options, NewlineBeforeEndstream, Pdf, WriteOptions,
-};
+use flpdf::{disable_digital_signatures, NewlineBeforeEndstream, Pdf};
 use std::path::Path;
 
 /// Full-rewrite `fixture` after `disable_digital_signatures`, with the
@@ -56,13 +54,14 @@ fn remove_restrictions_qpdf_equivalent(fixture: &str) -> Vec<u8> {
 
     disable_digital_signatures(&mut pdf).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        static_id: true,
+        newline_before_endstream: NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
@@ -189,3 +188,7 @@ fn indirect_fields_array_preserved_byte_identical_to_qpdf() {
         "acroform-sig-indirect-fields",
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

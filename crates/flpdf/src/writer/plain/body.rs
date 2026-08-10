@@ -5,11 +5,12 @@ use crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed;
 use crate::writer::object_streams;
 use crate::writer::plain::plan::{PlainWritePlan, PlannedIndirectObject};
 use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
+use crate::writer::WriterOptions;
 use crate::writer::{
     reencode_stream_for_compress, serialize, write_reencoded_object, CompressStreams,
     QPDF_BINARY_MARKER,
 };
-use crate::{Object, Pdf, WriteOptions};
+use crate::{Object, Pdf};
 
 /// Emit every body placement already chosen by `plan`.
 ///
@@ -18,7 +19,7 @@ use crate::{Object, Pdf, WriteOptions};
 /// responsibility of the plan and xref stages.
 pub(crate) fn emit_bodies<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    options: &WriteOptions,
+    options: &WriterOptions,
     plan: &PlainWritePlan,
 ) -> crate::Result<(Vec<u8>, BodyLayout)> {
     validate_objstm_member_bodies(pdf, plan)?;
@@ -28,13 +29,12 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
     bytes.extend_from_slice(QPDF_BINARY_MARKER);
 
     let mut layout = BodyLayout::default();
+    let expected = plan.objects.len().max(1);
+    let mut events = 0_usize;
     for planned in &plan.objects {
         match planned {
             PlannedIndirectObject::Source { source, output } => {
                 let mut object = pdf.resolve(*source)?;
-                if crate::writer::is_source_structural_container(&object) {
-                    continue;
-                }
                 let offset = bytes.len();
                 bytes.extend_from_slice(
                     format!("{} {} obj\n", output.number, output.generation).as_bytes(),
@@ -52,6 +52,8 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                             options,
                             true,
                             pdf.recovered_stream_eol(*source),
+                            false,
+                            false,
                         );
                         write_reencoded_object(
                             &mut bytes,
@@ -70,7 +72,9 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                     .insert(output.number, (output.generation, offset));
             }
             PlannedIndirectObject::ObjectStream {
-                output, members, ..
+                origin,
+                output,
+                members,
             } => {
                 let mut resolved = Vec::with_capacity(members.len());
                 for member in members {
@@ -93,11 +97,36 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 } else {
                     CompressStreams::No
                 };
-                serialize::write_objstm_stream(
+                let extends = match origin {
+                    crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source) => {
+                        let object = pdf.resolve(*source)?;
+                        match object.as_stream() {
+                            Some(stream) => match stream.dict.get("Extends") {
+                                Some(Object::Reference(extends)) => Some(
+                                    plan.old_to_new.get(extends).copied().ok_or_else(|| {
+                                        crate::Error::Unsupported(format!(
+                                            "plain writer: source ObjStm /Extends {} {} R is absent from renumber map",
+                                            extends.number, extends.generation
+                                        ))
+                                    })?,
+                                ),
+                                _ => None,
+                            },
+                            // qpdf permits a null or otherwise non-stream source
+                            // identity here as a placeholder for a reconstructed
+                            // object stream. The rebuilt container still carries
+                            // the surviving members, but has no /Extends key.
+                            None => None,
+                        }
+                    }
+                    crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic => None,
+                };
+                serialize::write_objstm_stream_with_extends(
                     &mut bytes,
                     &body,
                     structural_compress,
                     options.newline_before_endstream,
+                    extends,
                 )?; // cov:ignore: error arm requires an in-memory zlib encoder failure
                 bytes.extend_from_slice(b"\nendobj\n");
                 layout
@@ -114,6 +143,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                 }
             }
         }
+        crate::writer::report_progress_event(options, &mut events, expected);
     }
 
     Ok((bytes, layout))
@@ -195,12 +225,11 @@ mod tests {
     fn disable_emission_records_every_planned_source_offset() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        let options = WriteOptions {
-            full_rewrite: true,
+        let options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,
             static_id: true,
             newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
         let (_, layout) = emit_bodies(&mut pdf, &options, &plan).unwrap();
@@ -219,13 +248,12 @@ mod tests {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         for compress_streams in [CompressStreams::Yes, CompressStreams::No] {
             let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-            let options = WriteOptions {
-                full_rewrite: true,
+            let options = WriterOptions {
                 object_streams: ObjectStreamMode::Generate,
                 compress_streams,
                 static_id: true,
                 newline_before_endstream: NewlineBeforeEndstream::Never,
-                ..WriteOptions::default()
+                ..WriterOptions::default()
             };
             let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
             let (bytes, layout) = emit_bodies(&mut pdf, &options, &plan).unwrap();
@@ -269,9 +297,9 @@ mod tests {
     fn source_emission_propagates_reference_rewrite_failure() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
         plan.old_to_new.remove(&crate::ObjectRef::new(2, 0));
@@ -283,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn disable_emission_does_not_serialize_reachable_source_objstm_container() {
+    fn disable_emission_serializes_reachable_source_objstm_container() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
         let root = pdf.root_ref().unwrap();
@@ -291,17 +319,17 @@ mod tests {
         let source_objstm = ObjectRef::new(1, 0);
         catalog.insert("ReachableStructural", Object::Reference(source_objstm));
         pdf.set_object(root, Object::Dictionary(catalog));
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams: ObjectStreamMode::Disable,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
         let output_objstm = plan.new_for_original(source_objstm).unwrap();
 
         let (bytes, layout) = emit_bodies(&mut pdf, &options, &plan).unwrap();
 
-        assert!(!layout.uncompressed.contains_key(&output_objstm.number));
-        assert!(!bytes
+        assert!(layout.uncompressed.contains_key(&output_objstm.number));
+        assert!(bytes
             .windows(b"/Type /ObjStm".len())
             .any(|window| window == b"/Type /ObjStm"));
     }
@@ -310,9 +338,9 @@ mod tests {
     fn object_stream_emission_propagates_reference_rewrite_failure() {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams: ObjectStreamMode::Generate,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let mut plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
         plan.old_to_new.remove(&crate::ObjectRef::new(2, 0));
@@ -323,12 +351,62 @@ mod tests {
             if message.contains("reference 2 0 R absent from renumber map")));
     }
 
+    #[test]
+    fn source_objstm_extends_must_be_present_in_the_renumber_map() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Preserve,
+            ..WriterOptions::default()
+        };
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let mut candidates = vec![PlannedIndirectObject::Source {
+            source: ObjectRef::new(0, 0),
+            output: ObjectRef::new(0, 0),
+        }];
+        candidates.extend(plan.objects.iter().cloned());
+        let container_source = candidates
+            .iter()
+            .find_map(|object| match object {
+                PlannedIndirectObject::ObjectStream {
+                    origin:
+                        crate::writer::plain::plan::PlannedObjectStreamOrigin::SourceBacked(source),
+                    ..
+                } => Some(*source),
+                PlannedIndirectObject::Source { .. }
+                | PlannedIndirectObject::ObjectStream {
+                    origin: crate::writer::plain::plan::PlannedObjectStreamOrigin::Synthetic,
+                    ..
+                } => None,
+            })
+            .expect("preserve plan must retain a source-backed ObjStm");
+
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        dict.insert("N", Object::Integer(0));
+        dict.insert("First", Object::Integer(0));
+        dict.insert("Length", Object::Integer(0));
+        dict.insert("Extends", Object::Reference(ObjectRef::new(99_999, 0)));
+        pdf.set_object(
+            container_source,
+            Object::Stream(Stream {
+                dict,
+                data: Vec::new(),
+            }),
+        );
+
+        let error = emit_bodies(&mut pdf, &options, &plan).unwrap_err();
+
+        assert!(matches!(error, crate::Error::Unsupported(ref message)
+            if message.contains("/Extends 99999 0 R is absent from renumber map")));
+    }
+
     fn assert_invalid_planned_member_is_rejected(invalid: Object, expected_kind: &str) {
         let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
         let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
-        let options = WriteOptions {
+        let options = WriterOptions {
             object_streams: ObjectStreamMode::Generate,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         };
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
         let members: Vec<_> = plan

@@ -2,7 +2,7 @@
 //! User-facing encryption parameters for the writer side.
 //!
 //! Callers populate [`EncryptParams`] from CLI flags (or library API
-//! arguments) and pass it through [`crate::WriteOptions::encrypt`]; the
+//! arguments) and pass it through [`crate::PdfWriter::set_encryption_parameters`]; the
 //! writer takes care of resolving `/ID[0]`, deriving the file encryption
 //! key, building the `/Encrypt` dictionary, emitting it as an indirect
 //! object, encrypting every string and stream payload at emission time,
@@ -60,7 +60,7 @@ pub enum EncryptMethod {
 
 /// User-facing encryption parameters for the writer.
 ///
-/// Set via [`crate::WriteOptions::encrypt`]. The CLI populates these from
+/// Set via [`crate::PdfWriter::set_encryption_parameters`]. The CLI populates these from
 /// `--encrypt user-pw owner-pw key-len -- [--print …] [--modify …] [...]`;
 /// library callers can construct one directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -186,13 +186,15 @@ impl EncryptParams {
 ///
 /// Built by the CLI layer from the donor PDF's on-disk state (opened with
 /// [`crate::Pdf::open_with_options`]) and stored in
-/// [`crate::WriteOptions::copy_encryption`].  The writer uses it to construct
+/// [`crate::PdfWriter::copy_encryption_parameters`]. The writer uses it to construct
 /// an `EncryptionContext` directly, bypassing the normal
 /// password-derivation path.
 ///
-/// **Scope:** Only V=4 AES-128 donors are supported in this release.
-/// Donors using other schemes (V=1/V=2/V=4 RC4/V=5 R=6) are rejected at the
-/// CLI layer with a clear "not yet supported" diagnostic.
+/// The writer accepts the Standard handler matrix qpdf's copy path accepts:
+/// V=1/V=2 RC4, V=4 (canonicalized to AESV2 even when the donor used RC4),
+/// and V=5 R=5/R=6 AESV3. The donor dictionary is an input snapshot; the
+/// writer rebuilds qpdf's canonical `/Encrypt` dictionary rather than copying
+/// arbitrary crypt-filter entries verbatim.
 #[derive(Debug, Clone)]
 pub struct CopyEncryptionSource {
     /// The donor's `/Encrypt` dictionary, copied verbatim.  The writer emits
@@ -203,14 +205,16 @@ pub struct CopyEncryptionSource {
     /// [`crate::Pdf::encryption_file_key`]).  The writer uses it directly
     /// instead of re-deriving a key from a password, so that encrypted strings
     /// and streams are consistent with the copied `/O` / `/U` / `/P` entries.
-    /// It must be exactly 16 bytes for the supported V=4 AES-128 source;
-    /// shorter or longer public inputs are rejected before output emission.
+    /// Its required length is validated against the donor's `/V`, `/R`, and
+    /// `/Length` before output emission (5/16 bytes for supported V<5
+    /// handlers, 32 bytes for V=5).
     pub file_key: Vec<u8>,
     /// The donor's `/ID[0]` bytes.  Copied into the output trailer's `/ID[0]`
     /// position; Algorithm 2 key derivation is pinned to this value.
     pub id0: Vec<u8>,
-    /// Per-object key derivation algorithm implied by the donor's crypt filter.
-    /// Always [`ObjectKeyAlg::Aes`] for the V=4 AES-128 scope.
+    /// Per-object key derivation algorithm supplied by an explicit donor
+    /// caller. qpdf's canonical copy rules override this for V>=4 (AESV2),
+    /// while V<4 uses RC4 regardless of this hint.
     pub object_key_alg: ObjectKeyAlg,
 }
 

@@ -8,7 +8,8 @@ use crate::pdf_version::{parse_pdf_version, PDF_1_5};
 use crate::rewrite_renumber::{CatalogFirstRenumber, NewNumberLookup, ObjectStreamRenumber};
 use crate::writer::object_streams::{self, ObjectStreamGroup, ObjectStreamMode};
 use crate::writer::plain::xref::{IdPlan, TrailerPlan};
-use crate::{CompressStreams, Object, ObjectRef, Pdf, WriteOptions, XrefEntry, XrefForm};
+use crate::writer::WriterOptions;
+use crate::{CompressStreams, Object, ObjectRef, Pdf, XrefEntry, XrefForm};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedMember {
@@ -48,7 +49,7 @@ pub(crate) struct PlainWritePlan {
 impl PlainWritePlan {
     pub(crate) fn build<R: Read + Seek>(
         pdf: &mut Pdf<R>,
-        options: &WriteOptions,
+        options: &WriterOptions,
     ) -> crate::Result<Self> {
         let source_root = pdf.root_ref().ok_or(crate::Error::Missing("/Root"))?;
         let source_had_compressed_objects = source_has_compressed_entries(pdf);
@@ -57,14 +58,29 @@ impl PlainWritePlan {
 
         let placement = match options.object_streams {
             ObjectStreamMode::Disable => {
-                let renumber =
-                    CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?;
+                // Task 3A intentionally changes only the plain Disable path.
+                // Preserve/Generate ObjStm membership for this setting remains
+                // a follow-up; do not imply that their packing semantics are
+                // solved by the source-object seed set below.
+                let renumber = if options.preserve_unreferenced_objects {
+                    CatalogFirstRenumber::build_qpdf_preserving_unreferenced_excluding(
+                        pdf,
+                        true,
+                        &explicitly_removed,
+                    )? // cov:ignore: malformed source graph is rejected by the catalog walk
+                } else {
+                    CatalogFirstRenumber::build_qpdf_excluding(pdf, true, &explicitly_removed)?
+                };
                 let mut placement = build_sources_from_catalog_first(renumber);
                 placement.removed_refs = explicitly_removed;
                 placement
             }
             ObjectStreamMode::Preserve => {
-                let mut packing = object_streams::plan_qpdf_preserve_object_streams(pdf)?;
+                let mut packing =
+                    object_streams::plan_qpdf_preserve_object_streams_with_unreferenced(
+                        pdf,
+                        options.preserve_unreferenced_objects,
+                    )?; // cov:ignore: malformed source graph is rejected by the preserve planner
                 packing
                     .removed_refs
                     .extend(explicitly_removed.iter().copied());
@@ -83,7 +99,12 @@ impl PlainWritePlan {
                 } else {
                     let groups = &packing.groups;
                     let removed = &packing.removed_refs;
-                    let renumber = renumber_plain(pdf, groups, removed)?;
+                    let renumber = renumber_plain(
+                        pdf,
+                        groups,
+                        removed,
+                        options.preserve_unreferenced_objects,
+                    )?; // cov:ignore: planner groups are produced by the same validated source walk
                     build_container_aware(renumber, packing.groups, packing.removed_refs)?
                 }
             }
@@ -102,7 +123,7 @@ impl PlainWritePlan {
                     .map(|members| ObjectStreamGroup::Synthetic { members })
                     .collect();
                 let removed = &compressible.removed_refs;
-                let renumber = renumber_plain(pdf, &renumber_groups, removed)?;
+                let renumber = renumber_plain(pdf, &renumber_groups, removed, false)?;
                 build_container_aware(renumber, renumber_groups, compressible.removed_refs)?
             }
         };
@@ -145,7 +166,7 @@ impl PlainWritePlan {
         }
 
         let mut dictionary = pdf.trailer().clone();
-        crate::writer::strip_incremental_trailer_keys(&mut dictionary);
+        crate::writer::strip_writer_trailer_history_keys(&mut dictionary);
         crate::writer::remap_qpdf_trailer_refs_with_removed(
             pdf,
             &mut dictionary,
@@ -349,8 +370,13 @@ fn renumber_plain<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     groups: &[ObjectStreamGroup],
     removed_refs: &BTreeSet<ObjectRef>,
+    preserve_unreferenced_objects: bool,
 ) -> crate::Result<ObjectStreamRenumber> {
-    ObjectStreamRenumber::build(pdf, groups, true, removed_refs)
+    if preserve_unreferenced_objects {
+        ObjectStreamRenumber::build_preserving_unreferenced(pdf, groups, true, removed_refs)
+    } else {
+        ObjectStreamRenumber::build(pdf, groups, true, removed_refs)
+    }
 }
 
 fn build_container_aware(
@@ -515,7 +541,8 @@ mod tests {
 
     use crate::writer::object_streams::ObjectStreamMode;
     use crate::writer::plain::xref::{IdPlan, TrailerPlan};
-    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, Pdf, WriteOptions, XrefForm};
+    use crate::writer::WriterOptions;
+    use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, Pdf, XrefForm};
 
     fn fixture_path(fixture: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -523,13 +550,12 @@ mod tests {
             .join(fixture)
     }
 
-    fn write_options(mode: ObjectStreamMode) -> WriteOptions {
-        WriteOptions {
-            full_rewrite: true,
+    fn write_options(mode: ObjectStreamMode) -> WriterOptions {
+        WriterOptions {
             object_streams: mode,
             static_id: true,
             newline_before_endstream: NewlineBeforeEndstream::Never,
-            ..WriteOptions::default()
+            ..WriterOptions::default()
         }
     }
 

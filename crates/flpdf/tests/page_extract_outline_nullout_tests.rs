@@ -8,8 +8,8 @@
 //! structural parity check, not a byte-compare against qpdf (qpdf renumbers).
 
 use flpdf::{
-    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, write_pdf,
-    write_pdf_with_options, Object, ObjectRef, Pdf, RemoveUnreferencedResources, WriteOptions,
+    prune_after_subset, rebuild_page_tree, remap_outline_and_dests, Object, ObjectRef, Pdf,
+    RemoveUnreferencedResources,
 };
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -245,7 +245,7 @@ fn full_rewrite_roundtrip_reopens_and_keeps_nav() {
 
     // Write (full rewrite renumbers + emits the referenced nulls) and reopen.
     let mut out: Vec<u8> = Vec::new();
-    write_pdf(&mut pdf, &mut out).expect("write");
+    write_default(&mut pdf, &mut out).expect("write");
     let mut re = Pdf::open(Cursor::new(out)).expect("reopen rewritten subset");
 
     // Catalog still carries the navigation structures after the round trip.
@@ -333,7 +333,7 @@ fn malformed_dest_to_non_page_object_is_never_nulled() {
     // This is object-model persistence only, NOT a signature-validity claim
     // (see SCOPE note above; the full pipeline invalidates the signature).
     let mut out: Vec<u8> = Vec::new();
-    write_pdf(&mut pdf, &mut out).expect("write");
+    write_default(&mut pdf, &mut out).expect("write");
     let mut re = Pdf::open(Cursor::new(out)).expect("reopen");
     let names_ref = re
         .resolve(re.root_ref().unwrap())
@@ -382,11 +382,10 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
     // regardless of how it is referenced; flpdf's page-driven null-out does too.
     // A destination-following null-out left the page live behind the indirection.
     //
-    // The page-op pipeline always full-rewrites (`flpdf --pages` forces
-    // `full_rewrite=true`), so the removed page is emitted as `N 0 obj null` and
+    // The page-op pipeline always uses the canonical writer (`flpdf --pages`),
+    // so the removed page is emitted as `N 0 obj null` and
     // its original `/Secret` bytes never reach the output.
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let opts = WriterTestSettings::default();
     for obj40 in ["4 0 R", "<< /X 4 0 R >>"] {
         let mut pdf = Pdf::open(Cursor::new(build_indirect_removed_dest_fixture(obj40)))
             .expect("open fixture");
@@ -402,7 +401,7 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
 
         // Full rewrite: the removed page's content must not appear in the bytes.
         let mut out: Vec<u8> = Vec::new();
-        write_pdf_with_options(&mut pdf, &mut out, &opts).expect("write");
+        write_with_settings(&mut pdf, &mut out, &opts).expect("write");
         assert!(
             !out.windows(b"SECRETPAGE4".len())
                 .any(|w| w == b"SECRETPAGE4"),
@@ -410,3 +409,7 @@ fn removed_page_behind_indirect_dest_does_not_leak() {
         );
     }
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

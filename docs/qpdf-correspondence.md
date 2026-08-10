@@ -150,7 +150,7 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
 
 qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的に扱う。flpdf は
 経路ごとに分岐しており **xref 出力が 3 箇所**に分かれる。byte-parity の修正が片方の
-経路にしか入らない構造的リスクがここに集中している。`write_pdf_full_rewrite_inner`
+経路にしか入らない構造的リスクがここに集中している。`emit_canonical_pdf_inner`
 は単独で約 1,250 行。
 
 **renumber は重複していない**: `rewrite_renumber.rs` は `linearization/plan.rs` からも

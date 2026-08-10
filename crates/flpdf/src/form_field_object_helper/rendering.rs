@@ -1710,7 +1710,7 @@ mod tests {
     use crate::content_stream::{
         parse_content_operations, parse_content_stream_data, ParseControl, ParserCallbacks,
     };
-    use crate::writer::write_pdf;
+    use crate::writer::PdfWriter;
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -2294,10 +2294,16 @@ mod tests {
         assert_eq!(rendered, b"Hello World", "Tj does not match field value");
 
         // Write out and re-parse to make sure the PDF structure is sound.
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).expect("write_pdf");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("qpdf writer");
+        let xobj_ref2 = writer
+            .get_renumbered_obj_gen(xobj_ref)
+            .expect("xobj mapping query")
+            .expect("written xobj mapping");
+        let out = writer.get_buffer().expect("writer buffer");
         let mut reparsed = Pdf::open(Cursor::new(out)).expect("re-parse written PDF");
-        let xobj2 = reparsed.resolve(xobj_ref).expect("re-resolve xobj");
+        let xobj2 = reparsed.resolve(xobj_ref2).expect("re-resolve xobj");
         assert!(
             matches!(xobj2, Object::Stream(_)),
             "re-parsed xobj is not a stream"
@@ -2410,7 +2416,7 @@ mod tests {
         pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
         let off3 = pdf.len() as u64;
         pdf.extend_from_slice(
-            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]>>\nendobj\n",
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [4 0 R]>>\nendobj\n",
         );
         let off4 = pdf.len() as u64;
         pdf.extend_from_slice(
@@ -4429,11 +4435,21 @@ mod tests {
             .expect("generate")
             .expect("must produce appearance");
 
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).expect("write_pdf");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("qpdf writer");
+        let widget_ref2 = writer
+            .get_renumbered_obj_gen(ObjectRef::new(4, 0))
+            .expect("widget mapping query")
+            .expect("written widget mapping");
+        let on_ref2 = writer
+            .get_renumbered_obj_gen(on_ref)
+            .expect("on-state mapping query")
+            .expect("written on-state mapping");
+        let out = writer.get_buffer().expect("writer buffer");
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("re-parse");
-        let widget_obj = pdf2.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let widget_obj = pdf2.resolve(widget_ref2).expect("resolve widget");
         let Object::Dictionary(wdict) = widget_obj else {
             panic!("not dict")
         };
@@ -4444,7 +4460,7 @@ mod tests {
         );
 
         // on-state XObject must be re-resolvable.
-        let xobj2 = pdf2.resolve(on_ref).expect("re-resolve on xobj");
+        let xobj2 = pdf2.resolve(on_ref2).expect("re-resolve on xobj");
         assert!(
             matches!(xobj2, Object::Stream(_)),
             "on xobj must be a stream after round-trip"
@@ -5084,17 +5100,27 @@ mod tests {
             .expect("generate")
             .expect("must produce appearance");
 
-        let mut out = Vec::new();
-        write_pdf(&mut pdf, &mut out).expect("write_pdf");
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("qpdf writer");
+        let widget_ref2 = writer
+            .get_renumbered_obj_gen(ObjectRef::new(4, 0))
+            .expect("widget mapping query")
+            .expect("written widget mapping");
+        let xobj_ref2 = writer
+            .get_renumbered_obj_gen(xobj_ref)
+            .expect("xobj mapping query")
+            .expect("written xobj mapping");
+        let out = writer.get_buffer().expect("writer buffer");
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).expect("re-parse");
-        let widget_obj = pdf2.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let widget_obj = pdf2.resolve(widget_ref2).expect("resolve widget");
         let Object::Dictionary(wdict) = widget_obj else {
             panic!("not dict")
         };
         assert!(wdict.get("AP").is_some(), "/AP missing after round-trip");
 
-        let xobj2 = pdf2.resolve(xobj_ref).expect("re-resolve xobj");
+        let xobj2 = pdf2.resolve(xobj_ref2).expect("re-resolve xobj");
         assert!(
             matches!(xobj2, Object::Stream(_)),
             "xobj must be stream after round-trip"

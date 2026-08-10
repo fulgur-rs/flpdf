@@ -7,7 +7,7 @@
 //! first). These tests pin the qpdf ordering for the full-rewrite classic-xref
 //! path. The deflate-dependent stream bytes and `/ID` value are out of scope.
 
-use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+use flpdf::Pdf;
 use std::fs::File;
 use std::io::BufReader;
 
@@ -15,10 +15,9 @@ fn full_rewrite_bytes(fixture: &str) -> Vec<u8> {
     let path = format!("../../tests/fixtures/compat/{fixture}");
     let file = File::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let mut pdf = Pdf::open(BufReader::new(file)).unwrap();
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
+    let opts = WriterTestSettings::default();
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
@@ -93,3 +92,7 @@ fn classic_trailer_keys_sorted_with_id_last() {
         );
     }
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_default, write_with_settings, WriterTestSettings};

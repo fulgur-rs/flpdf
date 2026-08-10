@@ -72,11 +72,24 @@ pub(crate) fn framing_adds_newline(data: &[u8], policy: NewlineBeforeEndstream) 
 }
 
 /// Serialize an object-stream container with qpdf's fixed dictionary key order.
+#[allow(dead_code)]
 pub(crate) fn write_objstm_stream(
     out: &mut Vec<u8>,
     body: &object_streams::ObjStmBody,
     compress: CompressStreams,
     policy: NewlineBeforeEndstream,
+) -> crate::Result<()> {
+    write_objstm_stream_with_extends(out, body, compress, policy, None)
+}
+
+/// Serialize an object-stream container, preserving qpdf's source `/Extends`
+/// edge when this is a source-backed Preserve group.
+pub(crate) fn write_objstm_stream_with_extends(
+    out: &mut Vec<u8>,
+    body: &object_streams::ObjStmBody,
+    compress: CompressStreams,
+    policy: NewlineBeforeEndstream,
+    extends: Option<crate::ObjectRef>,
 ) -> crate::Result<()> {
     let stream = object_streams::wrap_objstm_body(body, compress)?;
     out.extend_from_slice(b"<< /Type /ObjStm /Length ");
@@ -85,8 +98,14 @@ pub(crate) fn write_objstm_stream(
         out.extend_from_slice(b" /Filter /FlateDecode");
     }
     out.extend_from_slice(
-        format!(" /N {} /First {} >>", body.n_members, body.first_offset).as_bytes(),
+        format!(" /N {} /First {}", body.n_members, body.first_offset).as_bytes(),
     );
+    if let Some(extends) = extends {
+        out.extend_from_slice(
+            format!(" /Extends {} {} R", extends.number, extends.generation).as_bytes(),
+        );
+    }
+    out.extend_from_slice(b" >>");
     write_stream_payload(out, &stream.data, policy);
     Ok(())
 }
@@ -262,6 +281,10 @@ pub(crate) mod xref_stream {
         pub trailer: Option<&'a Dictionary>,
         /// Trailer `/ID` as two raw byte strings, serialized as `<hex><hex>`.
         pub id: Option<(&'a [u8], &'a [u8])>,
+        /// Trailer `/Encrypt` reference. qpdf emits this after `/ID` on the
+        /// first-page xref stream, but omits it from the main linearization
+        /// xref stream (`t_lin_second`).
+        pub encrypt: Option<ObjectRef>,
     }
 
     /// Append two lowercase hex digits per byte of `bytes` to `out`.
@@ -349,6 +372,11 @@ pub(crate) mod xref_stream {
             push_hex(out, id1);
             out.extend_from_slice(b">]");
         }
+        if let Some(encrypt) = dict.encrypt {
+            out.extend_from_slice(
+                format!(" /Encrypt {} {} R", encrypt.number, encrypt.generation).as_bytes(),
+            );
+        }
         write_object_framing(out, payload);
     }
 
@@ -369,6 +397,11 @@ pub(crate) mod xref_stream {
         write_object_dict_prefix(out, object, dict, payload.len());
         out.extend_from_slice(b" /ID ");
         id_writer(out);
+        if let Some(encrypt) = dict.encrypt {
+            out.extend_from_slice(
+                format!(" /Encrypt {} {} R", encrypt.number, encrypt.generation).as_bytes(),
+            );
+        }
         write_object_framing(out, payload);
     }
 
@@ -646,6 +679,7 @@ pub(crate) mod xref_stream {
                 prev: Some(2356),
                 trailer: None,
                 id: Some((&ID0, &ID1)),
+                encrypt: None,
             };
             assert_eq!(first_pass_region_len(ObjectRef::new(7, 0), &dict, 11), 391);
         }
@@ -747,6 +781,7 @@ pub(crate) mod xref_stream {
                 prev: None,
                 trailer: None,
                 id: Some((&ID0, &ID1)),
+                encrypt: None,
             };
             let region = write_padded_region(ObjectRef::new(5, 0), &dict, b"PAYLOAD", 400).unwrap();
             assert_eq!(region.len(), 400);
@@ -768,6 +803,7 @@ pub(crate) mod xref_stream {
                 prev: None,
                 trailer: None,
                 id: Some((&ID0, &ID1)),
+                encrypt: None,
             };
             // A 10-byte region cannot hold the object; the writer must error rather
             // than silently overflow the reserved region.
@@ -850,6 +886,7 @@ pub(crate) mod xref_stream {
                     prev: Some(2226),
                     trailer: None,
                     id: Some((&ID0, &ID1)),
+                    encrypt: None,
                 },
                 b"PAYLOAD",
             );
@@ -887,6 +924,7 @@ pub(crate) mod xref_stream {
                     prev: None,
                     trailer: Some(&trailer),
                     id: Some((&ID0, &ID1)),
+                    encrypt: None,
                 },
                 b"X",
             );
@@ -914,6 +952,7 @@ pub(crate) mod xref_stream {
                     prev: None,
                     trailer: None,
                     id: Some((&ID0, &ID1)),
+                    encrypt: None,
                 },
                 b"X",
             );
@@ -959,6 +998,7 @@ pub(crate) mod xref_stream {
                     prev: Some(2226),
                     trailer: None,
                     id: Some((&ID0, &ID1)),
+                    encrypt: None,
                 },
                 &payload,
             );
@@ -983,6 +1023,7 @@ pub(crate) mod xref_stream {
                     prev: None,
                     trailer: None,
                     id: Some((&ID0, &ID1)),
+                    encrypt: None,
                 },
                 &payload,
             );
@@ -1015,6 +1056,7 @@ pub(crate) mod xref_stream {
 mod tests {
     use super::*;
     use crate::writer::object_streams::ObjStmBody;
+    use crate::ObjectRef;
 
     #[test]
     fn raw_objstm_uses_qpdf_fixed_key_order() {
@@ -1053,5 +1095,34 @@ mod tests {
             b"payload",
             NewlineBeforeEndstream::Never
         ));
+    }
+
+    #[test]
+    fn xref_stream_id_writer_emits_encrypt_reference_after_id() {
+        let dict = xref_stream::XrefStreamDict {
+            filtered: false,
+            widths: [1, 1, 1],
+            index: None,
+            info: None,
+            root: Some(ObjectRef::new(1, 0)),
+            size: 2,
+            prev: None,
+            trailer: None,
+            id: None,
+            encrypt: Some(ObjectRef::new(7, 0)),
+        };
+        let mut output = Vec::new();
+        let mut id_writer = |out: &mut Vec<u8>| out.extend_from_slice(b"[<00><11>]");
+
+        xref_stream::write_object_with_id_writer(
+            &mut output,
+            ObjectRef::new(8, 0),
+            &dict,
+            &[0, 1],
+            &mut id_writer,
+        );
+
+        let output = String::from_utf8(output).expect("xref stream output is ASCII");
+        assert!(output.contains("/ID [<00><11>] /Encrypt 7 0 R"));
     }
 }

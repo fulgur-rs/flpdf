@@ -22,9 +22,11 @@
 
 #![cfg(feature = "qpdf-zlib-compat")]
 
+mod common;
+
+use common::{write_with_settings, WriterTestSettings};
 use flpdf::{
-    load_xref_and_trailer, write_pdf_with_options, NewlineBeforeEndstream, Object, ObjectRef,
-    ObjectStreamMode, Pdf, StreamDataMode, WriteOptions, XrefEntry,
+    load_xref_and_trailer, Object, ObjectRef, ObjectStreamMode, Pdf, StreamDataMode, XrefEntry,
 };
 use std::io::Cursor;
 use std::path::Path;
@@ -43,16 +45,17 @@ fn rewrite_qpdf_equivalent_mode(fixture: &str, mode: ObjectStreamMode) -> Vec<u8
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.object_streams = mode;
-    opts.static_id = true;
-    // qpdf's default output writes no newline before endstream.
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        static_id: true,
+        // qpdf's default output writes no newline before endstream.
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
     // compress_streams defaults to Yes (decode + re-encode to single FlateDecode).
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
@@ -117,15 +120,16 @@ fn rewrite_mode_force_qpdf_equivalent(
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.object_streams = mode;
-    opts.force_version = Some(force.to_string());
-    opts.static_id = true;
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        object_streams: mode,
+        force_version: Some(force.to_string()),
+        static_id: true,
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 
@@ -147,14 +151,15 @@ fn rewrite_preserve_qpdf_equivalent(fixture: &str) -> Vec<u8> {
     let file = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(file)).unwrap();
 
-    let mut opts = WriteOptions::default();
-    opts.full_rewrite = true;
-    opts.static_id = true;
-    opts.stream_data = Some(StreamDataMode::Preserve);
-    opts.newline_before_endstream = NewlineBeforeEndstream::Never;
+    let opts = WriterTestSettings {
+        static_id: true,
+        stream_data: Some(StreamDataMode::Preserve),
+        newline_before_endstream: flpdf::NewlineBeforeEndstream::Never,
+        ..WriterTestSettings::default()
+    };
 
     let mut out = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut out, &opts).unwrap();
+    write_with_settings(&mut pdf, &mut out, &opts).unwrap();
     out
 }
 

@@ -444,16 +444,11 @@ impl RenumberMap {
     /// push, regardless of whether the catalog / open-document-plain
     /// sections in between are empty), so it never shifts.
     ///
-    /// Mutually exclusive with
-    /// [`place_objstm_members_per_half`](Self::place_objstm_members_per_half):
-    /// encrypted ObjStm-relocated linearized output is out of scope, so a
-    /// caller must use at most one of the two. Calling this method first
-    /// would not be a safe substitute sequencing —
-    /// `place_objstm_members_per_half` treats any `by_new_number` slot that
-    /// is not `old_param_slot`/`old_hint_slot` and holds a sentinel
-    /// (`original.number == 0`) as an "unexpected sentinel" and silently
-    /// drops it, which would discard this reservation rather than preserve
-    /// it.
+    /// Call this after [`place_objstm_members_per_half`](Self::place_objstm_members_per_half)
+    /// when the output also contains relocated ObjStm members, then rebuild
+    /// any derived layout from this map. Calling it first is unsafe because
+    /// `place_objstm_members_per_half` rebuilds the slot table and would treat
+    /// the extra sentinel as an unexpected reservation.
     ///
     /// Returns the newly reserved [`ObjectRef`] (generation 0) for the writer
     /// to use as the `/Encrypt` object number.

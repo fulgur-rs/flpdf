@@ -594,7 +594,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::writer::write_pdf;
+    use crate::writer::write_qpdf_to_memory;
     use crate::{pages, Pdf};
     use std::io::Cursor;
 
@@ -1174,8 +1174,7 @@ mod tests {
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
         // Serialize.
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         // Re-open and verify.
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
@@ -1209,8 +1208,7 @@ mod tests {
         apply_rotate_to_pages(&mut pdf, &[page_ref], &op).unwrap();
 
         // Serialize and re-open.
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
         let page_refs2 = pages::page_refs(&mut pdf2).unwrap();
 
@@ -1412,8 +1410,7 @@ mod tests {
         assert!(s.contains("BT (x) Tj ET"), "{s:?}");
 
         // Round-trips through the writer + reparse without error.
-        let mut buf = Vec::new();
-        write_pdf(&mut pdf, &mut buf).unwrap();
+        let buf = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let mut pdf2 = Pdf::open(Cursor::new(buf)).unwrap();
         let p2 = pages::page_refs(&mut pdf2).unwrap()[0];
         let Object::Dictionary(d2) = pdf2.resolve(p2).unwrap() else {

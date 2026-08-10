@@ -257,7 +257,7 @@ mod tests {
     use crate::object::MAX_INLINE_DEPTH;
     use crate::page_tree_rebuild::rebuild_page_tree;
     use crate::pages::page_refs;
-    use crate::writer::write_pdf;
+    use crate::writer::write_qpdf_to_memory;
     use crate::{Object, ObjectRef, Pdf};
     use std::collections::BTreeMap;
     use std::io::Cursor;
@@ -524,8 +524,7 @@ mod tests {
         );
 
         // Output must still be valid.
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let report = check_reader(Cursor::new(out)).unwrap();
         assert!(
             report.valid,
@@ -606,8 +605,7 @@ mod tests {
         );
 
         // Output should be valid.
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let report = check_reader(Cursor::new(out)).unwrap();
         assert!(
             report.valid,
@@ -681,8 +679,7 @@ mod tests {
         );
 
         // Valid output.
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let report = check_reader(Cursor::new(out)).unwrap();
         assert!(
             report.valid,
@@ -757,8 +754,7 @@ mod tests {
         );
 
         // Output must still be valid.
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
         let report = check_reader(Cursor::new(out)).unwrap();
         assert!(
             report.valid,
@@ -776,8 +772,7 @@ mod tests {
         rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0)]).unwrap();
         prune_after_subset(&mut pdf, RemoveUnreferencedResources::Auto).unwrap();
 
-        let mut out: Vec<u8> = Vec::new();
-        write_pdf(&mut pdf, &mut out).unwrap();
+        let out = write_qpdf_to_memory(&mut pdf, |_| {}).unwrap();
 
         let mut pdf2 = Pdf::open(Cursor::new(out)).unwrap();
         let refs = page_refs(&mut pdf2).unwrap();

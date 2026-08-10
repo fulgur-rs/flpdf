@@ -25,21 +25,13 @@ fuzz_target!(|data: &[u8]| {
     // panicking, so it exercises the recovery branches the strict open skips.
     let _ = flpdf::check_reader(Cursor::new(Arc::clone(&shared)));
 
-    // Strict open + writer round-trip. The incremental-append writer and the
-    // full-rewrite writer each get a freshly parsed handle: writing mutates the
-    // handle's object/xref state, so a shared handle would feed the second
-    // writer a post-write document — a sequence no real consumer produces (each
-    // writes once per open).
+    // Strict open + qpdf-shaped writer round-trip. Writing mutates the handle's
+    // object/xref state, so it gets a freshly parsed handle rather than reusing
+    // the handle from the repair-enabled check path.
     if let Ok(mut pdf) = flpdf::Pdf::open_mem(Arc::clone(&shared)) {
-        let mut incremental = Vec::new();
-        let _ = flpdf::write_pdf(&mut pdf, &mut incremental);
-    }
-    if let Ok(mut pdf) = flpdf::Pdf::open_mem(Arc::clone(&shared)) {
-        let mut rewritten = Vec::new();
-        // `WriteOptions` is `#[non_exhaustive]`: build via `default()` then set
-        // fields (struct-literal syntax is rejected outside the defining crate).
-        let mut options = flpdf::WriteOptions::default();
-        options.full_rewrite = true;
-        let _ = flpdf::write_pdf_with_options(&mut pdf, &mut rewritten, &options);
+        let mut writer = flpdf::PdfWriter::new(&mut pdf);
+        if writer.set_output_memory().is_ok() && writer.write().is_ok() {
+            let _ = writer.get_buffer();
+        }
     }
 });

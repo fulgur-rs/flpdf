@@ -124,7 +124,7 @@ Expected result: all generator tests pass. Do not wire consumers or delete old r
 ### Task 4: Cut over full-rewrite and incremental callers
 
 **Files:**
-- Modify: `crates/flpdf/src/writer.rs` at `write_incremental_trailer`, `apply_encrypt_trailer_entries`, and `write_pdf_full_rewrite_inner`.
+- Modify: `crates/flpdf/src/writer.rs` at `write_incremental_trailer`, `apply_encrypt_trailer_entries`, and `emit_canonical_pdf_inner`.
 - Modify: `crates/flpdf/src/writer/plain/plan.rs` where the eligible full-rewrite plain pipeline builds its trailer dictionary.
 - Test: `crates/flpdf/src/writer.rs` existing writer tests plus the new empty-ID tests.
 
@@ -138,7 +138,7 @@ In `PlainWritePlan::build`, before calling `apply_encrypt_trailer_entries`, crea
 
 - [x] **Step 3: Compute the legacy full-rewrite ordinary/static array once**
 
-In `write_pdf_full_rewrite_inner`, before explicit encryption context construction, create an `Option<Object>` containing `generate_id_array(pdf.trailer().get("ID"), options.static_id)` when `deterministic_id` is false and `copy_encryption` is absent. Keep it `None` for deterministic-id and donor-copy routes.
+In `emit_canonical_pdf_inner`, before explicit encryption context construction, create an `Option<Object>` containing `generate_id_array(pdf.trailer().get("ID"), options.static_id)` when `deterministic_id` is false and `copy_encryption` is absent. Keep it `None` for deterministic-id and donor-copy routes.
 
 - [x] **Step 4: Feed the selected first element to explicit encryption**
 

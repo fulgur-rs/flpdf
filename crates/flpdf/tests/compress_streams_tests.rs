@@ -254,7 +254,7 @@ fn compress_yes_does_not_double_compress_flate_stream() {
 }
 
 // ---------------------------------------------------------------------------
-// Full-rewrite integration: write_pdf_with_options + CompressStreams::No
+// Canonical-writer integration: PdfWriter + CompressStreams::No
 // ---------------------------------------------------------------------------
 
 /// Build a minimal in-memory PDF whose stream uses FlateDecode.
@@ -378,16 +378,17 @@ fn assert_legacy_encoded_empty_payload(
 
 #[test]
 fn generate_route_matches_qpdf_empty_refilter() {
-    use flpdf::{write_pdf_with_options, ObjectStreamMode, Pdf, WriteOptions};
+    use flpdf::{ObjectStreamMode, Pdf};
     use std::io::Cursor;
 
     let mut pdf = Pdf::open(Cursor::new(build_minimal_pdf_with_empty_stream())).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.object_streams = ObjectStreamMode::Generate;
+    let options = WriterTestSettings {
+        object_streams: ObjectStreamMode::Generate,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
@@ -404,20 +405,18 @@ fn generate_route_matches_qpdf_empty_refilter() {
 
 #[test]
 fn linearized_route_matches_qpdf_empty_refilter() {
-    use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-    use flpdf::{Pdf, WriteOptions};
+    use flpdf::{Pdf, PdfWriter};
     use std::io::Cursor;
 
     let source = build_minimal_pdf_with_empty_stream();
-    let mut plan_pdf = Pdf::open(Cursor::new(source.clone())).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut plan_pdf, false).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
     let mut write_pdf = Pdf::open(Cursor::new(source)).unwrap();
-    let mut document =
-        write_linearized(&plan, &renumber, &mut write_pdf, &WriteOptions::default()).unwrap();
-    document.back_patch().unwrap();
+    let mut writer = PdfWriter::new(&mut write_pdf);
+    writer.set_linearization(true);
+    writer.set_output_memory().unwrap();
+    writer.write().unwrap();
+    let output = writer.get_buffer().unwrap();
 
-    let mut reopened = Pdf::open(Cursor::new(document.bytes)).unwrap();
+    let mut reopened = Pdf::open(Cursor::new(output)).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
     assert!(
         stream.data.is_empty(),
@@ -432,21 +431,22 @@ fn linearized_route_matches_qpdf_empty_refilter() {
 
 #[test]
 fn output_encryption_route_keeps_encoded_empty_payload() {
-    use flpdf::{write_pdf_with_options, EncryptParams, Pdf, PdfOpenOptions, WriteOptions};
+    use flpdf::{EncryptParams, Pdf, PdfOpenOptions};
     use std::io::Cursor;
 
     let mut pdf = Pdf::open(Cursor::new(build_minimal_pdf_with_empty_stream())).unwrap();
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.static_id = true;
-    options.static_aes_iv = true;
-    options.encrypt = Some(EncryptParams::v4_aes128(
-        b"user".to_vec(),
-        b"owner".to_vec(),
-    ));
+    let options = WriterTestSettings {
+        static_id: true,
+        static_aes_iv: true,
+        encrypt: Some(EncryptParams::v4_aes128(
+            b"user".to_vec(),
+            b"owner".to_vec(),
+        )),
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open_with_options(
         Cursor::new(output),
@@ -465,18 +465,19 @@ fn output_encryption_route_keeps_encoded_empty_payload() {
 
 #[test]
 fn full_rewrite_compress_no_strips_filter_from_all_streams() {
-    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+    use flpdf::Pdf;
     use std::io::Cursor;
 
     let (source, original_raw) = build_minimal_pdf_with_flate_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.compress_streams = CompressStreams::No;
+    let options = WriterTestSettings {
+        compress_streams: CompressStreams::No,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     // Re-open the output and inspect the stream. Output object numbers are
     // renumbered Catalog-first, so navigate via the Catalog's /Metadata ref
@@ -502,18 +503,19 @@ fn full_rewrite_compress_no_strips_filter_from_all_streams() {
 
 #[test]
 fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
-    use flpdf::{write_pdf_with_options, Pdf, WriteOptions};
+    use flpdf::Pdf;
     use std::io::Cursor;
 
     let (source, original_raw) = build_minimal_pdf_with_flate_stream();
     let mut pdf = Pdf::open(Cursor::new(source)).unwrap();
 
-    let mut options = WriteOptions::default();
-    options.full_rewrite = true;
-    options.compress_streams = CompressStreams::Yes;
+    let options = WriterTestSettings {
+        compress_streams: CompressStreams::Yes,
+        ..WriterTestSettings::default()
+    };
 
     let mut output = Vec::new();
-    write_pdf_with_options(&mut pdf, &mut output, &options).unwrap();
+    write_with_settings(&mut pdf, &mut output, &options).unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(output.clone())).unwrap();
     let stream = resolve_metadata_stream(&mut reopened);
@@ -533,3 +535,7 @@ fn full_rewrite_compress_yes_applies_flate_to_all_streams() {
         "compress_streams=Yes: decoded output must equal original payload"
     );
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_with_settings, WriterTestSettings};

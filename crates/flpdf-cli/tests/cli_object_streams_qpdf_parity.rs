@@ -200,13 +200,12 @@ fn membership_map(records: &[XrefRecord]) -> BTreeMap<u32, BTreeSet<u32>> {
 // flpdf helpers
 // ---------------------------------------------------------------------------
 
-/// Run `flpdf rewrite --full-rewrite --object-streams=<mode> <input> <output>`.
+/// Run `flpdf rewrite --object-streams=<mode> <input> <output>`.
 fn rewrite_with_mode(mode: &str, input: &Path, output: &Path) {
     CargoCommand::cargo_bin("flpdf")
         .unwrap()
         .args([
             "rewrite",
-            "--full-rewrite",
             &format!("--object-streams={mode}"),
             input.to_str().unwrap(),
             output.to_str().unwrap(),

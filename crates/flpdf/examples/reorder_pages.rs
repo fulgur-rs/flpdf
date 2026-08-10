@@ -6,9 +6,9 @@
 mod common;
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::BufReader;
 
-use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, Pdf, WriteOptions};
+use flpdf::{pages::page_refs, rebuild_page_tree, ObjectRef, PageObjectHelper, Pdf, PdfWriter};
 
 /// Read each page's MediaBox width (`urx - llx`, rounded to `i64`) in document
 /// order. The shared-font fixture assigns distinct widths so order is observable.
@@ -41,14 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     reversed.reverse();
     rebuild_page_tree(&mut pdf, &reversed)?;
 
-    #[allow(clippy::field_reassign_with_default)]
-    let opts = {
-        let mut opts = WriteOptions::default();
-        opts.full_rewrite = true;
-        opts
-    };
-    let out = BufWriter::new(File::create(&out_path)?);
-    flpdf::write_pdf_with_options(&mut pdf, out, &opts)?;
+    let mut writer = PdfWriter::new(&mut pdf);
+    writer.set_output_file(&out_path)?;
+    writer.write()?;
 
     // Re-open and prove the reversal happened by reading the page widths again.
     let mut out_pdf = Pdf::open(BufReader::new(File::open(&out_path)?))?;

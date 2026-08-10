@@ -2,17 +2,17 @@
 //! `qpdf-zlib-compat`, covering the outline section-routing fix (flpdf-vvjr.2).
 //!
 //! These tests drive the public `write_linearized` API with default
-//! `WriteOptions` (classic xref-table path, no ObjStm containers) and assert
+//! `WriterOptions` (classic xref-table path, no ObjStm containers) and assert
 //! structural properties of the back-patched bytes directly, so they run on
 //! every build. Byte-identity against qpdf goldens is gated on `qpdf-zlib-compat`
 //! in `cmp_linearize_tests.rs`.
 
-use flpdf::linearization::{write_linearized, LinearizationPlan, RenumberMap};
-use flpdf::{Pdf, WriteOptions};
+use flpdf::linearization::LinearizationPlan;
+use flpdf::Pdf;
 use std::io::Cursor;
 use std::path::Path;
 
-/// Linearize `fixture` with default `WriteOptions` (classic xref-table, no ObjStm)
+/// Linearize `fixture` with default `WriterOptions` (classic xref-table, no ObjStm)
 /// via the public API and return the complete back-patched bytes.
 fn linearize_classic(fixture: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -21,19 +21,16 @@ fn linearize_classic(fixture: &str) -> Vec<u8> {
 
     let f1 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
     let mut pdf = Pdf::open(std::io::BufReader::new(f1)).unwrap();
-    let plan = LinearizationPlan::from_pdf(&mut pdf, false).unwrap();
-    let renumber = RenumberMap::from_plan(&plan);
-
-    let f2 = std::fs::File::open(&path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let mut pdf2 = Pdf::open(std::io::BufReader::new(f2)).unwrap();
-
-    let mut opts = WriteOptions::default();
-    opts.deterministic_id = true;
-
-    let mut doc = write_linearized(&plan, &renumber, &mut pdf2, &opts).unwrap();
-    doc.back_patch().unwrap();
-    doc.bytes
+    let opts = WriterTestSettings {
+        deterministic_id: true,
+        ..WriterTestSettings::default()
+    };
+    write_linearized_with_settings(&mut pdf, &opts).unwrap()
 }
+
+mod common;
+#[allow(unused_imports)]
+use common::{write_linearized_with_settings, WriterTestSettings};
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)

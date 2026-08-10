@@ -16,7 +16,6 @@ fn rewrite_with_object_streams(value: &str) -> assert_cmd::assert::Assert {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         &format!("--object-streams={}", value),
         FIXTURE,
         output.to_str().unwrap(),
@@ -31,7 +30,6 @@ fn object_streams_preserve_is_accepted() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "--object-streams=preserve",
         FIXTURE,
         output.to_str().unwrap(),
@@ -48,7 +46,6 @@ fn object_streams_disable_is_accepted() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "--object-streams=disable",
         FIXTURE,
         output.to_str().unwrap(),
@@ -68,7 +65,6 @@ fn object_streams_generate_is_accepted_and_emits_objstm() {
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
     cmd.args([
         "rewrite",
-        "--full-rewrite",
         "--object-streams=generate",
         FIXTURE,
         output.to_str().unwrap(),
@@ -104,14 +100,9 @@ fn object_streams_default_is_preserve() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("out.pdf");
     let mut cmd = Command::cargo_bin("flpdf").unwrap();
-    cmd.args([
-        "rewrite",
-        "--full-rewrite",
-        FIXTURE,
-        output.to_str().unwrap(),
-    ])
-    .assert()
-    .success();
+    cmd.args(["rewrite", FIXTURE, output.to_str().unwrap()])
+        .assert()
+        .success();
     assert!(output.exists());
 }
 

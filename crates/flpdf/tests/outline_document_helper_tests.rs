@@ -1,8 +1,11 @@
 //! Integration tests for [`flpdf::OutlineDocumentHelper`].
 
-use flpdf::{write_pdf, Dictionary, Error, Object, ObjectRef, OutlineItem, Pdf};
+use flpdf::{Dictionary, Error, Object, ObjectRef, OutlineItem, Pdf};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
+
+mod common;
+use common::{remap_object_refs, write_with_settings_and_mapping, WriterTestSettings};
 
 /// Build a minimal cross-reffed PDF from `(objnum, body)` pairs.
 fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
@@ -1946,22 +1949,31 @@ fn name_tree_begin_lower_bound_converts_the_direct_first_path_before_skipping_se
         ]))
     );
 
-    let mut serialized = Vec::new();
-    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let (serialized, mapping) = write_with_settings_and_mapping(
+        &mut pdf,
+        &WriterTestSettings::default(),
+        &[
+            ObjectRef::new(8, 0),
+            ObjectRef::new(9, 0),
+            ObjectRef::new(10, 0),
+            ObjectRef::new(11, 0),
+        ],
+    )
+    .unwrap();
+    let mapped_first_parent = mapping[&ObjectRef::new(10, 0)];
+    let mapped_first_leaf = mapping[&ObjectRef::new(11, 0)];
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
     let dests = direct_dests_root(&mut reopened);
     assert!(matches!(
         dests.get("Kids"),
-        Some(Object::Array(kids)) if kids.first() == Some(&Object::Reference(ObjectRef::new(10, 0)))
+        Some(Object::Array(kids)) if kids.first() == Some(&Object::Reference(mapped_first_parent))
     ));
-    let Object::Dictionary(first_parent) = reopened.resolve(ObjectRef::new(10, 0)).unwrap() else {
+    let Object::Dictionary(first_parent) = reopened.resolve(mapped_first_parent).unwrap() else {
         panic!("reopened first parent must be a dictionary");
     };
     assert_eq!(
         first_parent.get("Kids"),
-        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
-            11, 0,
-        ))]))
+        Some(&Object::Array(vec![Object::Reference(mapped_first_leaf)]))
     );
 }
 
@@ -1996,17 +2008,21 @@ fn name_tree_begin_converts_a_direct_first_kid_under_an_indirect_root() {
         Object::Dictionary(_)
     ));
 
-    let mut serialized = Vec::new();
-    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let (serialized, mapping) = write_with_settings_and_mapping(
+        &mut pdf,
+        &WriterTestSettings::default(),
+        &[ObjectRef::new(8, 0), ObjectRef::new(9, 0)],
+    )
+    .unwrap();
+    let mapped_root = mapping[&ObjectRef::new(8, 0)];
+    let mapped_leaf = mapping[&ObjectRef::new(9, 0)];
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
-    let Object::Dictionary(root) = reopened.resolve(ObjectRef::new(8, 0)).unwrap() else {
+    let Object::Dictionary(root) = reopened.resolve(mapped_root).unwrap() else {
         panic!("reopened indirect destination root must remain a dictionary");
     };
     assert_eq!(
         root.get("Kids"),
-        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
-            9, 0,
-        ))]))
+        Some(&Object::Array(vec![Object::Reference(mapped_leaf)]))
     );
 }
 
@@ -2040,10 +2056,16 @@ fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
         ))]))
     );
 
-    let mut serialized = Vec::new();
-    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let (serialized, mapping) = write_with_settings_and_mapping(
+        &mut pdf,
+        &WriterTestSettings::default(),
+        &[ObjectRef::new(8, 0), ObjectRef::new(9, 0)],
+    )
+    .unwrap();
+    let mapped_names = mapping[&ObjectRef::new(8, 0)];
+    let mapped_leaf = mapping[&ObjectRef::new(9, 0)];
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
-    let Object::Dictionary(names) = reopened.resolve(ObjectRef::new(8, 0)).unwrap() else {
+    let Object::Dictionary(names) = reopened.resolve(mapped_names).unwrap() else {
         panic!("reopened indirect /Names holder must remain a dictionary");
     };
     let Some(Object::Dictionary(root)) = names.get("Dests") else {
@@ -2051,9 +2073,7 @@ fn name_tree_begin_updates_a_direct_root_inside_an_indirect_names_holder() {
     };
     assert_eq!(
         root.get("Kids"),
-        Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
-            9, 0,
-        ))]))
+        Some(&Object::Array(vec![Object::Reference(mapped_leaf)]))
     );
 }
 
@@ -2813,8 +2833,11 @@ fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
         Object::Dictionary(_)
     ));
 
-    let mut serialized = Vec::new();
-    write_pdf(&mut pdf, &mut serialized).unwrap();
+    let serialized = {
+        let mut out = Vec::new();
+        common::write_default(&mut pdf, &mut out).unwrap();
+        out
+    };
     let mut reopened = Pdf::open(Cursor::new(serialized)).unwrap();
     let catalog_ref = reopened.root_ref().unwrap();
     let Object::Dictionary(catalog) = reopened.resolve(catalog_ref).unwrap() else {
@@ -2828,10 +2851,6 @@ fn missing_name_tree_limits_repairs_and_mutates_the_existing_direct_root() {
     };
     assert_eq!(dests.get("Kids"), None);
     assert!(matches!(dests.get("Names"), Some(Object::Array(_))));
-    assert!(matches!(
-        reopened.resolve(ObjectRef::new(8, 0)).unwrap(),
-        Object::Dictionary(_)
-    ));
 }
 
 #[test]
@@ -3627,13 +3646,24 @@ fn action_round_trip_through_write_pdf_unmodified() {
     let before: Vec<Object> = refs.iter().map(|&r| raw_action(&mut pdf, r)).collect();
     assert_eq!(refs.len(), 5, "sanity: fixture has 5 outline items");
 
-    let mut out = Vec::new();
-    write_pdf(&mut pdf, &mut out).unwrap();
+    let mut source_refs = vec![ObjectRef::new(3, 0)];
+    source_refs.extend(refs.iter().copied());
+
+    let (out, mapping) =
+        write_with_settings_and_mapping(&mut pdf, &WriterTestSettings::default(), &source_refs)
+            .unwrap();
 
     let mut reopened = Pdf::open(Cursor::new(out)).unwrap();
-    let after: Vec<Object> = refs.iter().map(|&r| raw_action(&mut reopened, r)).collect();
+    let after: Vec<Object> = refs
+        .iter()
+        .map(|r| raw_action(&mut reopened, mapping[r]))
+        .collect();
+    let mut expected = before.clone();
+    for value in &mut expected {
+        remap_object_refs(value, &mapping);
+    }
     assert_eq!(
-        before, after,
+        expected, after,
         "every raw /A object must round-trip unmodified through write_pdf"
     );
 }
