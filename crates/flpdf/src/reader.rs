@@ -2111,7 +2111,7 @@ impl<R: Read + Seek> Pdf<R> {
         dict.iter()
             .map(|(k, v)| {
                 Ok((
-                    k.to_vec(),
+                    crate::object_handle::canonical_dictionary_key_from_legacy(k),
                     self.lift_to_handle_bounded(v, depth + 1, max_depth)?,
                 ))
             })
@@ -8763,6 +8763,33 @@ mod tests {
             "last write wins for a duplicate key"
         );
         assert_eq!(dict.get("B"), Some(&Object::Integer(3)));
+    }
+
+    #[test]
+    fn legacy_lift_preserves_a_decoded_leading_slash_in_dictionary_key() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let mut dictionary = Dictionary::new();
+        // The legacy dictionary stores the decoded name body. For the PDF
+        // name /#2Ffoo, that body begins with `/`, so it must not be mistaken
+        // for an already-canonical ObjectHandle key.
+        dictionary.insert(b"/foo", Object::Integer(1));
+
+        let handle = pdf
+            .lift_object_to_handle(&Object::Dictionary(dictionary))
+            .expect("lift legacy dictionary");
+        let entries = handle.as_dictionary().expect("dictionary handle");
+        assert_eq!(
+            entries
+                .get(b"//foo".as_slice())
+                .and_then(ObjectHandle::as_integer),
+            Some(1)
+        );
+        assert!(!entries.contains_key(b"/foo".as_slice()));
+
+        let Object::Dictionary(materialized) = handle.materialize().expect("materialize") else {
+            panic!("lifted value remains a dictionary");
+        };
+        assert_eq!(materialized.get(b"/foo"), Some(&Object::Integer(1)));
     }
 
     #[test]

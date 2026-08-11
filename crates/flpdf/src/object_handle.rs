@@ -595,6 +595,16 @@ pub(crate) fn canonical_dictionary_key(key: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Convert a legacy `Dictionary` key body to qpdf's canonical dictionary key.
+/// Legacy keys omit the PDF name delimiter, but their decoded body may itself
+/// begin with `/` (for example, the body of `/#2Ffoo`).
+pub(crate) fn canonical_dictionary_key_from_legacy(key: &[u8]) -> Vec<u8> {
+    let mut canonical = Vec::with_capacity(key.len() + 1);
+    canonical.push(b'/');
+    canonical.extend_from_slice(key);
+    canonical
+}
+
 /// Convert a canonical ObjectHandle dictionary key back to the legacy
 /// `Dictionary` representation, whose writer adds the leading slash itself.
 pub(crate) fn legacy_dictionary_key(key: &[u8]) -> &[u8] {

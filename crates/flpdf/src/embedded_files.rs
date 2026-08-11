@@ -254,7 +254,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         else {
             return Ok(updated);
         };
-        let merged = if key == b"Names"
+        let merged = if key == b"/Names"
             && current_items.len() % 2 == 0
             && updated_items.len() % 2 == 0
         {
@@ -1421,6 +1421,26 @@ mod tests {
             .update_direct_embedded_files_root(&target, owner_ref, Object::Dictionary(updated))
             .expect("add root entry");
         assert!(target.has_key(b"/Names"));
+    }
+
+    #[test]
+    fn canonical_names_root_merge_preserves_shifted_name_pair_handles() {
+        type Helper<'a> = EmbeddedFileDocumentHelper<'a, std::io::Cursor<Vec<u8>>>;
+
+        let retained_key = ObjectHandle::string(b"a".to_vec());
+        let current = ObjectHandle::array(vec![retained_key.clone(), ObjectHandle::integer(5)]);
+        let updated = ObjectHandle::array(vec![
+            ObjectHandle::string(b"b".to_vec()),
+            ObjectHandle::integer(7),
+            ObjectHandle::string(b"a".to_vec()),
+            ObjectHandle::integer(6),
+        ]);
+
+        let merged = Helper::merge_updated_root_entry(b"/Names", &current, updated)
+            .expect("root entry merges");
+        let items = merged.as_array().expect("merged names array");
+        assert!(items[2].is_same_object_as(&retained_key));
+        assert_eq!(items[3].as_integer(), Some(6));
     }
 
     #[test]
