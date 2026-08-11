@@ -2566,9 +2566,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(&error, object_offset)?;
+                self.warn_stream_failure(&error, object_offset, object_ref)?;
                 recovered = true;
-                self.recover_stream_length(stream_offset)?
+                self.recover_stream_length(stream_offset, object_ref)?
             }
             Err(error) => return Err(error),
         };
@@ -2591,8 +2591,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(&error, object_offset)?;
-                length = self.recover_stream_length(stream_offset)?;
+                self.warn_stream_failure(&error, object_offset, object_ref)?;
+                length = self.recover_stream_length(stream_offset, object_ref)?;
             }
         }
 
@@ -2641,7 +2641,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `recoverStreamLength`. Length failures are attributed to the indirect
     /// object's header; `expected endstream` is attributed to the attempted
     /// framing read at the stream data position.
-    fn warn_stream_failure(&self, error: &Error, object_offset: u64) -> Result<()> {
+    fn warn_stream_failure(
+        &self,
+        error: &Error,
+        object_offset: u64,
+        object_ref: ObjectRef,
+    ) -> Result<()> {
         let Error::Parse { offset, message } = error else {
             return Ok(());
         };
@@ -2650,7 +2655,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } else {
             object_offset
         };
-        self.push_warning_at(warning_offset, message.clone())
+        self.push_stream_warning(object_ref, warning_offset, message)
     }
 
     /// Port qpdf's `recoverStreamLength` (`libqpdf/QPDF.cc:1482-1524`).
@@ -2664,8 +2669,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// longer word remains discoverable. For `endobj`, qpdf rewinds to the
     /// token start so the outer `readObject` consumes it; for `endstream`, it
     /// leaves the input after the token.
-    fn recover_stream_length(&self, stream_offset: u64) -> Result<usize> {
-        self.push_warning_at(stream_offset, "attempting to recover stream length")?;
+    fn recover_stream_length(&self, stream_offset: u64, object_ref: ObjectRef) -> Result<usize> {
+        let warning = self.push_stream_warning(
+            object_ref,
+            stream_offset,
+            "attempting to recover stream length",
+        );
+        warning?;
 
         let terminator = self.find_stream_recovery_terminator(stream_offset)?;
         let (length, next_position) = match terminator {
@@ -2683,14 +2693,36 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         if length == 0 {
-            self.push_warning_at(
+            self.push_stream_warning(
+                object_ref,
                 stream_offset,
                 "unable to recover stream data; treating stream as empty",
             )?;
         } else {
-            self.push_warning_at(stream_offset, format!("recovered stream length: {length}"))?;
+            let message = format!("recovered stream length: {length}");
+            self.push_stream_warning(object_ref, stream_offset, message)?;
         }
         Ok(length)
+    }
+
+    /// qpdf's `damagedPDF(input, offset, message)` warning carries the
+    /// resolved object's `QPDFObjGen` in the rendered message while leaving
+    /// the logger's input-source prefix separate (`QPDF.cc:1482-1529`). Keep
+    /// that same shape instead of passing the offset as a bare diagnostic,
+    /// which would lose the object identity at the canonical ObjectHandle
+    /// boundary.
+    fn push_stream_warning(
+        &self,
+        object_ref: ObjectRef,
+        offset: u64,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        self.push_warning(format!(
+            "(object {} {}, offset {offset}): {}",
+            object_ref.number,
+            object_ref.generation,
+            message.into()
+        ))
     }
 
     /// The `PatternFinder`/`findEndstream` pair used by qpdf's
@@ -7338,7 +7370,7 @@ mod tests {
             let resolver = resolver_over(payload.to_vec());
             assert_eq!(
                 resolver
-                    .recover_stream_length(0)
+                    .recover_stream_length(0, ObjectRef::new(1, 0))
                     .expect("recovery without a terminator"),
                 0,
                 "payload {payload:?} must not produce a terminator"
@@ -7348,7 +7380,7 @@ mod tests {
                 .entries()
                 .iter()
                 .any(|entry| entry.message
-                    == "unable to recover stream data; treating stream as empty"));
+                    == "(object 1 0, offset 0): unable to recover stream data; treating stream as empty"));
         }
     }
 
@@ -7358,7 +7390,7 @@ mod tests {
             resolver_over_with_failing_warning(b"payload without a framing token".to_vec(), 2);
         assert!(matches!(
             resolver
-                .recover_stream_length(0)
+                .recover_stream_length(0, ObjectRef::new(1, 0))
                 .expect_err("the empty-recovery warning must reach the sink"),
             Error::System(message) if message == "sink write failure 2"
         ));
@@ -7368,7 +7400,11 @@ mod tests {
     fn stream_failure_warning_ignores_non_parse_errors() {
         let resolver = resolver_over(Vec::new());
         resolver
-            .warn_stream_failure(&Error::Unsupported("not a parse failure".to_owned()), 7)
+            .warn_stream_failure(
+                &Error::Unsupported("not a parse failure".to_owned()),
+                7,
+                ObjectRef::new(1, 0),
+            )
             .expect("non-parse failures do not emit stream-recovery warnings");
         assert!(resolver.repair_diagnostics().entries().is_empty());
     }
@@ -9037,10 +9073,18 @@ mod tests {
 
     #[test]
     fn canonical_stream_reuses_the_length_recovered_from_bad_framing() {
+        let body = b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n".to_vec();
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+            body.clone(),
         ]);
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset
+            + body
+                .windows(b"stream\n".len())
+                .position(|window| window == b"stream\n")
+                .expect("stream keyword")
+            + b"stream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -9061,11 +9105,10 @@ mod tests {
                 .as_slice(),
             b"abc\n"
         );
-        assert!(pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|entry| entry.message == "recovered stream length: 4"));
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            entry.message
+                == format!("(object 2 0, offset {stream_offset}): recovered stream length: 4")
+        }));
     }
 
     #[test]
@@ -9103,21 +9146,29 @@ mod tests {
             .collect();
         assert!(messages
             .iter()
-            .any(|message| message == "expected endstream"));
+            .any(|message| message == "(object 2 0, offset 76): expected endstream"));
+        assert!(messages.iter().any(|message| {
+            message == "(object 2 0, offset 76): attempting to recover stream length"
+        }));
         assert!(messages
             .iter()
-            .any(|message| message == "attempting to recover stream length"));
-        assert!(messages
-            .iter()
-            .any(|message| message == "recovered stream length: 2"));
+            .any(|message| { message == "(object 2 0, offset 76): recovered stream length: 2" }));
     }
 
     #[test]
     fn canonical_stream_recovery_repositions_before_endobj() {
+        let body = b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendobj\n".to_vec();
         let bytes = pdf_with_bodies(&[
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
-            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendobj\n".to_vec(),
+            body.clone(),
         ]);
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset
+            + body
+                .windows(b"stream\n".len())
+                .position(|window| window == b"stream\n")
+                .expect("stream keyword")
+            + b"stream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -9138,11 +9189,10 @@ mod tests {
                 .as_slice(),
             b"abc\n"
         );
-        assert!(pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|entry| entry.message == "recovered stream length: 4"));
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            entry.message
+                == format!("(object 2 0, offset {stream_offset}): recovered stream length: 4")
+        }));
     }
 
     #[test]
@@ -9153,6 +9203,8 @@ mod tests {
         body.extend_from_slice(&payload);
         body.extend_from_slice(b"endstream\nendobj\n");
         let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset + b"2 0 obj\n<< /Length 0 >>\nstream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -9173,11 +9225,10 @@ mod tests {
                 .as_slice(),
             payload.as_slice()
         );
-        assert!(pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|entry| entry.message == "recovered stream length: 20"));
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            entry.message
+                == format!("(object 2 0, offset {stream_offset}): recovered stream length: 20")
+        }));
     }
 
     #[test]
@@ -9219,6 +9270,8 @@ mod tests {
             b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
             b"2 0 obj\n<< /Length 0 >>\nstream\n(\nendstream\nendobj\n".to_vec(),
         ]);
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset + b"2 0 obj\n<< /Length 0 >>\nstream\n".len();
         let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
         let path = directory.path().join("malformed-stream-framing.pdf");
         fs::write(&path, &bytes).expect("write qpdf fixture");
@@ -9266,9 +9319,11 @@ mod tests {
         assert_eq!(
             flpdf_diagnostics,
             vec![
-                "expected endstream".to_owned(),
-                "attempting to recover stream length".to_owned(),
-                "recovered stream length: 2".to_owned(),
+                format!("(object 2 0, offset {stream_offset}): expected endstream"),
+                format!(
+                    "(object 2 0, offset {stream_offset}): attempting to recover stream length"
+                ),
+                format!("(object 2 0, offset {stream_offset}): recovered stream length: 2"),
             ]
         );
     }
@@ -9308,7 +9363,10 @@ mod tests {
             .collect();
         assert_eq!(
             diagnostics.first(),
-            Some(&("expected endstream".to_owned(), Some(attempted_offset)))
+            Some(&(
+                format!("(object 2 0, offset {attempted_offset}): expected endstream"),
+                None
+            ))
         );
     }
 
@@ -9351,7 +9409,10 @@ mod tests {
             .collect();
         assert_eq!(
             diagnostics.first(),
-            Some(&("expected endstream".to_owned(), Some(attempted_offset)))
+            Some(&(
+                format!("(object 2 0, offset {attempted_offset}): expected endstream"),
+                None
+            ))
         );
     }
 
@@ -10289,8 +10350,14 @@ mod tests {
 
     #[test]
     fn public_resolve_recovers_a_malformed_stream_after_xref_reconstruction() {
+        let bytes = synthetic_malformed_recovery_mismatch_pdf();
+        let stream_offset = bytes
+            .windows(b"stream\n".len())
+            .position(|window| window == b"stream\n")
+            .expect("stream keyword")
+            + b"stream\n".len();
         let mut pdf = Pdf::open_mem_owned_with_options(
-            synthetic_malformed_recovery_mismatch_pdf(),
+            bytes,
             crate::PdfOpenOptions {
                 repair: true,
                 ..Default::default()
@@ -10302,11 +10369,10 @@ mod tests {
             .resolve(ObjectRef::new(1, 0))
             .expect("qpdf stream recovery must run after xref reconstruction");
         assert_eq!(stream.as_stream().expect("recovered stream").data, b"abc\n");
-        assert!(pdf
-            .repair_diagnostics()
-            .entries()
-            .iter()
-            .any(|entry| entry.message == "recovered stream length: 4"));
+        assert!(pdf.repair_diagnostics().entries().iter().any(|entry| {
+            entry.message
+                == format!("(object 1 0, offset {stream_offset}): recovered stream length: 4")
+        }));
     }
 
     #[test]
