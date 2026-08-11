@@ -1323,11 +1323,26 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .contains(&object_ref)
     }
 
-    /// A snapshot of the whole effective cross-reference table. Free entries
-    /// are not present in the reader table; explicit cache deletion is a
-    /// separate mutable-document concern.
-    pub(crate) fn xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
+    /// A snapshot of the source cross-reference entries, excluding the
+    /// resolver-created default free rows. Resolution decisions use this view
+    /// because those rows are lookup side effects rather than source objects.
+    pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
         self.core.borrow().source_xref_entries.clone()
+    }
+
+    /// A snapshot of the whole effective cross-reference table. qpdf inserts
+    /// a default type-0 row into `m->xref_table` when an object-stream header
+    /// names an absent member (`libqpdf/QPDF.cc:1823`); expose that row in the
+    /// public snapshot while preserving any source row for the same identity.
+    pub(crate) fn xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
+        let core = self.core.borrow();
+        let mut entries = core.source_xref_entries.clone();
+        for object_ref in &core.default_xref_entries {
+            entries
+                .entry(*object_ref)
+                .or_insert(XrefEntry::Free { next: 0 });
+        }
+        entries
     }
 
     fn object_stream_description_template(
@@ -7437,6 +7452,12 @@ mod tests {
             .get_object_handle(present_ref)
             .try_dereference()
             .expect("the present member triggers ObjStm header inspection");
+
+        assert_eq!(
+            resolver.xref_entries().get(&absent_ref),
+            Some(&XrefEntry::Free { next: 0 })
+        );
+        assert!(!resolver.source_xref_entries().contains_key(&absent_ref));
 
         let absent = resolver.get_object_handle(absent_ref);
         absent

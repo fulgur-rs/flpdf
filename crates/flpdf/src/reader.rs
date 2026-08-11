@@ -995,7 +995,7 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        self.resolver.xref_entries()
+        self.resolver.source_xref_entries()
     }
 
     /// Return qpdf's effective source cross-reference table.
@@ -1384,7 +1384,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn object_refs(&self) -> Vec<ObjectRef> {
         let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
             self.cache
-                .refs_after_xref_recovery(&self.resolver.xref_entries(), false)
+                .refs_after_xref_recovery(&self.resolver.source_xref_entries(), false)
                 .into_iter()
                 .collect()
         } else {
@@ -1416,7 +1416,7 @@ impl<R: Read + Seek> Pdf<R> {
     pub fn live_object_refs(&self) -> Vec<ObjectRef> {
         let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
             self.cache
-                .refs_after_xref_recovery(&self.resolver.xref_entries(), true)
+                .refs_after_xref_recovery(&self.resolver.source_xref_entries(), true)
                 .into_iter()
                 .collect()
         } else {
@@ -1452,6 +1452,9 @@ impl<R: Read + Seek> Pdf<R> {
                         Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
                     ) || (cache_entry.is_none() && !handle.is_resolved()))
                 {
+                    return None;
+                }
+                if live_only && self.cache.entry(object_ref).is_none() && !handle.is_resolved() {
                     return None;
                 }
                 Some(object_ref)
@@ -1844,11 +1847,42 @@ impl<R: Read + Seek> Pdf<R> {
             // while a value that already parsed successfully can be valid up
             // to MAX_PARSE_DEPTH. Rebuild the canonical value at that looser
             // bound so enumeration cannot return the stale source handle.
-            let value = self.lift_bounded(&replacement, 0, crate::parser::MAX_PARSE_DEPTH)?;
+            // Content-stream tokens are valid `ObjectValue` leaves even
+            // though the generic legacy lift rejects them outside a content
+            // stream; preserve them rather than making enumeration fail.
+            let value = match &replacement {
+                Object::Operator(bytes) => ObjectValue::Operator(bytes.clone()),
+                Object::InlineImage(bytes) => ObjectValue::InlineImage(bytes.clone()),
+                _ => self.lift_bounded(&replacement, 0, crate::parser::MAX_PARSE_DEPTH)?,
+            };
             handle.set_resolved(value);
             handle.clear_description();
             handle.reset_parsed_offset();
             self.legacy_materialized_memo.remove(&object_ref);
+        }
+        Ok(())
+    }
+
+    fn register_parsed_xref_stream_handles(&mut self) -> Result<()> {
+        let pending: Vec<(ObjectRef, Object)> = self
+            .qpdf_parsed_xref_streams
+            .iter()
+            .map(|(object_ref, object)| (*object_ref, object.clone()))
+            .collect();
+        for (object_ref, object) in pending {
+            if object_ref.number == 0
+                || object_ref.generation == u16::MAX
+                || self.qpdf_removed_refs.contains(&object_ref)
+                || self.resolver.xref_entry(object_ref).is_some()
+            {
+                continue;
+            }
+            let handle = self.get_object_handle(object_ref);
+            if handle.is_resolved() || handle.is_missing() {
+                continue;
+            }
+            let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
+            handle.set_resolved(value);
         }
         Ok(())
     }
@@ -1885,6 +1919,11 @@ impl<R: Read + Seek> Pdf<R> {
     /// effective source table, matching qpdf's `insertFreeXrefEntry` split
     /// between `xref_table` and `deleted_objects`.
     pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
+        // Reconcile caller-supplied replacements before qpdf-style dangling
+        // reference preparation. Otherwise resolving the superseded source
+        // value can register references that the replacement no longer owns.
+        self.reconcile_legacy_materialized_memos()?;
+        self.register_parsed_xref_stream_handles()?;
         self.resolver.fix_dangling_references()?;
 
         // A trailer reference can be valid even when it has no body/xref row.
@@ -1913,9 +1952,9 @@ impl<R: Read + Seek> Pdf<R> {
             .all_object_handles()
             .into_iter()
             .filter(|handle| {
-                handle
-                    .object_ref()
-                    .is_none_or(|object_ref| !removed.contains(&object_ref))
+                handle.object_ref().is_none_or(|object_ref| {
+                    object_ref.number != 0 && !removed.contains(&object_ref)
+                })
             })
             .collect())
     }
@@ -2599,7 +2638,7 @@ impl<R: Read + Seek> Pdf<R> {
             return;
         }
 
-        let entries = self.resolver.xref_entries();
+        let entries = self.resolver.source_xref_entries();
         self.cache.synchronize_with_xref(&entries);
         // Keep the actual `/Extends`-resolved parent for a still-identical
         // compressed xref entry, but never let a mapping survive a rebuilt
@@ -7673,6 +7712,98 @@ mod tests {
     }
 
     #[test]
+    fn get_all_objects_reconciles_memos_before_resolving_the_replaced_source() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                b"3 0 obj\n<< /Old 9 0 R >>\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        let mut replacement = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement);
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("enumerate the replacement without resolving the old source");
+        assert!(!objects
+            .iter()
+            .any(|handle| handle.object_ref() == Some(ObjectRef::new(9, 0))));
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_content_stream_token_memos() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let replacements = [
+            (ObjectRef::new(3, 0), Object::Operator(b"Do".to_vec())),
+            (
+                ObjectRef::new(99, 0),
+                Object::InlineImage(b"BI /W 1 ID x EI".to_vec()),
+            ),
+        ];
+        for (object_ref, object) in &replacements {
+            pdf.set_object(*object_ref, object.clone());
+        }
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("content-stream-only replacements remain enumerable");
+        for (object_ref, expected) in replacements {
+            let found = objects
+                .iter()
+                .find(|handle| handle.object_ref() == Some(object_ref))
+                .expect("replacement handle is enumerated");
+            assert_eq!(found.materialize().expect("materialize token"), expected);
+        }
+    }
+
+    #[test]
+    fn get_all_objects_excludes_the_object_zero_free_list_head() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                b"3 0 obj\n<< /Free 0 65535 R >>\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+
+        let objects = pdf.get_all_objects().expect("enumerate source objects");
+        assert!(objects.iter().all(|handle| handle
+            .object_ref()
+            .is_none_or(|object_ref| object_ref.number != 0)));
+    }
+
+    #[test]
+    fn get_all_objects_registers_parsed_xref_stream_handles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let historical_ref = ObjectRef::new(99, 0);
+        let mut historical_dict = Dictionary::new();
+        historical_dict.insert("Value", Object::Integer(7));
+        let historical = Object::Dictionary(historical_dict);
+        pdf.qpdf_parsed_xref_streams
+            .insert(historical_ref, historical.clone());
+
+        let found = pdf
+            .get_all_objects()
+            .expect("enumerate retained xref-stream cache entries")
+            .into_iter()
+            .find(|handle| handle.object_ref() == Some(historical_ref))
+            .expect("historical xref-stream handle is enumerated");
+        assert_eq!(
+            found.materialize().expect("materialize historical entry"),
+            historical
+        );
+    }
+
+    #[test]
     fn get_all_objects_registers_trailer_only_dangling_references() {
         let mut pdf = Pdf::open_mem_owned(trailer_only_dangling_info_pdf()).expect("open");
         assert!(pdf
@@ -7730,6 +7861,12 @@ mod tests {
 
         assert!(pdf.object_refs().contains(&deleted_ref));
         assert!(!pdf.live_object_refs().contains(&deleted_ref));
+
+        let placeholder_ref = ObjectRef::new(5, 1);
+        let placeholder = pdf.get_object_handle(placeholder_ref);
+        assert!(!placeholder.is_resolved());
+        assert!(pdf.object_refs().contains(&placeholder_ref));
+        assert!(!pdf.live_object_refs().contains(&placeholder_ref));
     }
 
     #[test]
