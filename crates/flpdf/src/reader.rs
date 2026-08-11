@@ -1556,6 +1556,43 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.make_indirect_from_object_handle(handle)
     }
 
+    /// Replace a canonical object value while retaining the target
+    /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
+    /// raw [`Object`] materialization and writer traversal remain outside this
+    /// layer.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn replace_object_handle(
+        &mut self,
+        object_ref: ObjectRef,
+        replacement: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        let target = self.resolver.replace_object(object_ref, replacement)?;
+        self.qpdf_removed_refs.remove(&object_ref);
+        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_dangling_refs.remove(&object_ref);
+        self.recovered_stream_eols.remove(&object_ref);
+        self.transformed_stream_refs.remove(&object_ref);
+        self.mark_object_handle_mutated(object_ref);
+        Ok(target)
+    }
+
+    /// Remove a canonical object from the resolver's xref/cache view and
+    /// leave outstanding handles as floating null values. The legacy cache is
+    /// deliberately not rewritten here; its writer-facing cutover belongs to
+    /// `flpdf-25kg.3.6.3`.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
+        self.resolver.remove_object(object_ref)?;
+        self.qpdf_removed_refs.insert(object_ref);
+        self.qpdf_parsed_xref_streams.remove(&object_ref);
+        self.qpdf_dangling_refs.remove(&object_ref);
+        self.recovered_stream_eols.remove(&object_ref);
+        self.transformed_stream_refs.remove(&object_ref);
+        self.legacy_materialized_memo.remove(&object_ref);
+        self.mark_object_handle_mutated(object_ref);
+        Ok(())
+    }
+
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.object_ref().is_some_and(|object_ref| {
             self.resolver
@@ -7054,6 +7091,139 @@ mod tests {
         assert!(alias.is_direct());
         assert_eq!(alias.object_ref(), None);
         assert_eq!(alias.as_integer(), Some(42));
+    }
+
+    #[test]
+    fn replace_object_handle_preserves_target_identity_and_shares_payload() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let target = pdf.get_object_handle(object_ref);
+        target.try_dereference().expect("resolve target");
+        assert!(target.get_parsed_offset() >= 0);
+
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        let replacement_alias = replacement.clone();
+
+        let returned = pdf
+            .replace_object_handle(object_ref, replacement)
+            .expect("replace canonical object");
+
+        assert!(returned.is_same_object_as(&target));
+        assert_eq!(target.object_ref(), Some(object_ref));
+        assert_eq!(target.get_key(b"Value").as_integer(), Some(7));
+        assert_eq!(target.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert_eq!(target.description(), "object 1 0");
+        assert!(pdf.is_dirty(object_ref));
+
+        // The replacement handle remains a distinct direct identity, but
+        // qpdf's QPDFObject::assign makes its value payload shared with the
+        // canonical target. Mutating either side must therefore be visible
+        // through the other side.
+        assert!(replacement_alias.is_direct());
+        replacement_alias.replace_direct_value(ObjectValue::Integer(9));
+        assert_eq!(target.as_integer(), Some(9));
+    }
+
+    #[test]
+    fn replace_object_handle_clears_source_derived_side_tables() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        pdf.recovered_stream_eols
+            .insert(object_ref, crate::parser::RecoveredStreamEol::Lf);
+        pdf.transformed_stream_refs.insert(object_ref);
+        pdf.qpdf_parsed_xref_streams
+            .insert(object_ref, Object::Null);
+        pdf.qpdf_dangling_refs.insert(object_ref);
+
+        pdf.replace_object_handle(object_ref, ObjectHandle::integer(7))
+            .expect("replace canonical object");
+
+        assert!(!pdf.recovered_stream_eols.contains_key(&object_ref));
+        assert!(!pdf.transformed_stream_refs.contains(&object_ref));
+        assert!(!pdf.qpdf_parsed_xref_streams.contains_key(&object_ref));
+        assert!(!pdf.qpdf_dangling_refs.contains(&object_ref));
+    }
+
+    #[test]
+    fn replace_object_handle_rejects_indirect_replacement_without_mutation() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let target = pdf.get_object_handle(object_ref);
+        target.try_dereference().expect("resolve target");
+        let before = target.get_key(b"Type").as_name().expect("catalog type");
+
+        let indirect_replacement = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let error = pdf
+            .replace_object_handle(object_ref, indirect_replacement)
+            .expect_err("qpdf rejects an indirect replacement handle");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: QPDF::replaceObject called with indirect object handle"
+        );
+        assert_eq!(target.object_ref(), Some(object_ref));
+        assert_eq!(target.get_key(b"Type").as_name(), Some(before));
+        assert!(!pdf.is_dirty(object_ref));
+    }
+
+    #[test]
+    fn replace_object_handle_rejects_a_foreign_direct_value_without_mutation() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open target");
+        let mut foreign_pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open foreign");
+        let target_ref = ObjectRef::new(1, 0);
+        let target = pdf.get_object_handle(target_ref);
+        let foreign_root = foreign_pdf.get_object_handle(ObjectRef::new(1, 0));
+        foreign_root
+            .try_dereference()
+            .expect("resolve foreign root");
+        let foreign_direct = foreign_root.get_key(b"Type");
+        assert!(foreign_direct.is_direct());
+
+        let error = pdf
+            .replace_object_handle(target_ref, foreign_direct)
+            .expect_err("qpdf rejects a value owned by another document");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file."
+        );
+        assert!(target.is_same_object_as(&pdf.get_object_handle(target_ref)));
+        assert!(!target.is_resolved());
+        assert!(!pdf.is_dirty(target_ref));
+    }
+
+    #[test]
+    fn remove_object_handle_nullifies_outstanding_handles_before_cache_removal() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        let alias = handle.clone();
+        handle.try_dereference().expect("resolve target");
+        assert!(handle.get_parsed_offset() >= 0);
+        assert!(pdf.resolver.xref_entry(object_ref).is_some());
+
+        pdf.remove_object_handle(object_ref)
+            .expect("remove canonical object");
+
+        assert!(alias.is_same_object_as(&handle));
+        assert!(handle.is_direct());
+        assert!(handle.is_null());
+        assert_eq!(handle.object_ref(), None);
+        assert_eq!(handle.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert_eq!(handle.description(), "");
+        assert!(pdf.resolver.registered_handle(object_ref).is_none());
+        assert!(pdf.resolver.xref_entry(object_ref).is_none());
+        assert!(pdf.qpdf_removed_refs.contains(&object_ref));
+        assert!(pdf.is_dirty(object_ref));
+
+        let fresh = pdf.get_object_handle(object_ref);
+        assert!(!fresh.is_same_object_as(&handle));
+        fresh
+            .try_dereference()
+            .expect("removed ref resolves as missing");
+        assert!(fresh.is_indirect());
+        assert!(fresh.is_null());
     }
 
     #[test]

@@ -332,7 +332,8 @@ pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 impl std::fmt::Debug for ObjectHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let slot = self.0.borrow();
-        let state: &str = match &slot.state {
+        let state = slot.state.borrow();
+        let state: &str = match &*state {
             ObjectState::NotYetResolved => "NotYetResolved",
             ObjectState::Resolved(_) => "Resolved(..)",
             ObjectState::Missing => "Missing",
@@ -417,7 +418,21 @@ fn expand_description_template(
 // it keeps the current payload and all indirect metadata together rather
 // than placing direct and indirect forms in separate backing storage.
 struct ObjectSlot {
-    state: ObjectState,
+    /// The payload state is separately reference-counted so qpdf's
+    /// `QPDFObject::assign` boundary can make two distinct handles observe
+    /// one replacement value while retaining their own handle identities.
+    state: Rc<RefCell<ObjectState>>,
+    /// Every slot whose payload is the [`Self::state`] allocation. Normally
+    /// this contains only the slot itself; qpdf's `QPDFObject::assign` can
+    /// temporarily make a direct replacement handle and an indirect target
+    /// share one payload while retaining distinct handle identities.
+    ///
+    /// The weak back-links let a later mutation through either alias update
+    /// containment edges for every owner of the shared payload. Without this
+    /// list, mutating the direct replacement after `replaceObject` would
+    /// update only its own parent edges while the canonical target retained
+    /// stale ownership metadata.
+    state_owners: Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
     object_ref: Option<ObjectRef>,
     active_pdf_unique_id: Option<u64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
@@ -431,14 +446,12 @@ struct ObjectSlot {
 
 impl ObjectSlot {
     fn get_description(&self) -> String {
+        let state = self.state.borrow();
         if let Some(desc) = &self.description {
             match desc {
-                ObjectDescription::Template(tmpl) => expand_description_template(
-                    tmpl,
-                    self.object_ref,
-                    &self.state,
-                    self.parsed_offset,
-                ),
+                ObjectDescription::Template(tmpl) => {
+                    expand_description_template(tmpl, self.object_ref, &state, self.parsed_offset)
+                }
                 ObjectDescription::Json(j) => {
                     let obj_part = if j.object.is_empty() {
                         String::new()
@@ -739,8 +752,9 @@ impl ObjectHandle {
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
         let _ = offset;
-        Self(Rc::new(RefCell::new(ObjectSlot {
-            state: ObjectState::NotYetResolved,
+        let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            state: Rc::new(RefCell::new(ObjectState::NotYetResolved)),
+            state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
             active_pdf_unique_id: pdf_unique_id,
             resolver,
@@ -750,7 +764,9 @@ impl ObjectHandle {
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
-        })))
+        })));
+        handle.register_state_owner();
+        handle
     }
 
     fn new_direct(value: ObjectValue, parsed_offset: i64) -> Self {
@@ -763,7 +779,8 @@ impl ObjectHandle {
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: ObjectState::Resolved(value),
+            state: Rc::new(RefCell::new(ObjectState::Resolved(value))),
+            state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
             active_pdf_unique_id: None,
             resolver,
@@ -774,12 +791,203 @@ impl ObjectHandle {
             containment_parents: Vec::new(),
             description: None,
         })));
+        handle.register_state_owner();
         handle.with_value(|value| {
             if let Some(value) = value {
                 handle.attach_value_children(value);
             }
         });
         handle
+    }
+
+    fn register_state_owner(&self) {
+        let owners = self.0.borrow().state_owners.clone();
+        let self_slot = self.0.clone();
+        let mut owners = owners.borrow_mut();
+        owners.retain(|owner| owner.strong_count() != 0);
+        if !owners.iter().any(|owner| {
+            owner
+                .upgrade()
+                .is_some_and(|slot| Rc::ptr_eq(&slot, &self_slot))
+        }) {
+            owners.push(Rc::downgrade(&self_slot));
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the staged mutation boundary below
+    fn remove_state_owner(
+        owners: &Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
+        slot_to_remove: &Rc<RefCell<ObjectSlot>>,
+    ) {
+        let mut owners = owners.borrow_mut();
+        owners.retain(|owner| {
+            owner
+                .upgrade()
+                .is_some_and(|slot| !Rc::ptr_eq(&slot, slot_to_remove))
+        });
+    }
+
+    fn state_owner_handles(&self) -> Vec<Self> {
+        let owners = self.0.borrow().state_owners.clone();
+        let mut owners = owners.borrow_mut();
+        let mut handles = Vec::new();
+        owners.retain(|owner| {
+            let Some(slot) = owner.upgrade() else {
+                return false;
+            };
+            handles.push(Self(slot));
+            true
+        });
+        handles
+    }
+
+    fn detach_child_from_state_owners(&self, child: &ObjectHandle) {
+        for owner in self.state_owner_handles() {
+            let parent = owner.containment_parent();
+            Self::detach_child_from_parent(child, &parent);
+        }
+    }
+
+    fn attach_child_to_state_owners(&self, child: &ObjectHandle) {
+        for owner in self.state_owner_handles() {
+            let parent = owner.containment_parent();
+            Self::attach_child_to_parent(child, &parent);
+        }
+    }
+
+    fn state_children(state: &ObjectState) -> Vec<ObjectHandle> {
+        match state {
+            ObjectState::Resolved(value) => Self::direct_children(value),
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Replace the shared payload and keep every slot that owns it in sync
+    /// with the payload's direct-child containment edges.
+    fn replace_shared_state(&self, new_state: ObjectState) -> ObjectState {
+        let state = self.0.borrow().state.clone();
+        let old_state = {
+            let mut state = state.borrow_mut();
+            std::mem::replace(&mut *state, new_state)
+        };
+        let old_children = Self::state_children(&old_state);
+        let new_children = {
+            let state = state.borrow();
+            Self::state_children(&state)
+        };
+        for owner in self.state_owner_handles() {
+            let parent = owner.containment_parent();
+            for child in &old_children {
+                Self::detach_child_from_parent(child, &parent);
+            }
+            for child in &new_children {
+                Self::attach_child_to_parent(child, &parent);
+            }
+        }
+        old_state
+    }
+
+    /// Replace only this slot's whole-object state, leaving other slots that
+    /// currently share its payload untouched. qpdf's remove/disconnect
+    /// transitions rebind the departing `QPDFObject`; they do not mutate the
+    /// `QPDFValue` allocation that a replacement alias still observes.
+    fn replace_detached_state(&self, new_state: ObjectState) {
+        let old_state = self.0.borrow().state.clone();
+        let old_owners = self.0.borrow().state_owners.clone();
+        let old_children = {
+            let state = old_state.borrow();
+            Self::state_children(&state)
+        };
+        let new_state = Rc::new(RefCell::new(new_state));
+
+        Self::remove_state_owner(&old_owners, &self.0);
+        {
+            let mut slot = self.0.borrow_mut();
+            slot.state = new_state;
+            slot.state_owners = Rc::new(RefCell::new(Vec::new()));
+        }
+        self.register_state_owner();
+
+        let parent = self.containment_parent();
+        for child in &old_children {
+            Self::detach_child_from_parent(child, &parent);
+        }
+    }
+
+    /// Make `self` and a distinct direct replacement handle observe one
+    /// shared payload, preserving the canonical target slot's identity.
+    ///
+    /// qpdf's `QPDFObject::assign` shares the `QPDFValue` allocation rather
+    /// than copying it (`QPDFObject_private.hh:117-120`). The two Rust
+    /// [`ObjectHandle`] slots therefore retain separate object metadata while
+    /// sharing the payload and its mutation visibility.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn share_value_state_with(&self, source: &Self) -> Result<()> {
+        if self.is_same_object_as(source) {
+            return Ok(());
+        }
+        if !source.is_direct() {
+            return Err(crate::Error::Unsupported(
+                "replacement ObjectHandle must be direct".to_string(),
+            ));
+        }
+        let source_state = source.0.borrow().state.clone();
+        if !matches!(&*source_state.borrow(), ObjectState::Resolved(_)) {
+            return Err(crate::Error::Unsupported(
+                "replacement ObjectHandle is not initialized".to_string(),
+            ));
+        }
+        let source_owners = source.0.borrow().state_owners.clone();
+        let old_state = {
+            let mut target = self.0.borrow_mut();
+            let old_state = target.state.clone();
+            let old_owners = target.state_owners.clone();
+            Self::remove_state_owner(&old_owners, &self.0);
+            target.state = source_state.clone();
+            target.state_owners = source_owners.clone();
+            old_state
+        };
+        Self::register_state_owner(self);
+
+        let old_children = {
+            let state = old_state.borrow();
+            Self::state_children(&state)
+        };
+        let new_children = {
+            let state = source_state.borrow();
+            Self::state_children(&state)
+        };
+        let parent = self.containment_parent();
+        for child in &old_children {
+            Self::detach_child_from_parent(child, &parent);
+        }
+        for child in &new_children {
+            Self::attach_child_to_parent(child, &parent);
+        }
+        if let Some(pdf_unique_id) = self.0.borrow().active_pdf_unique_id {
+            source.associate_pdf_identity(pdf_unique_id, &mut BTreeSet::new());
+        }
+        Ok(())
+    }
+
+    /// Turn an indirect canonical slot into the floating null object qpdf
+    /// leaves behind after `removeObject`.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn remove_from_document(&self) {
+        if !self.is_indirect() {
+            return;
+        }
+        self.replace_detached_state(ObjectState::Resolved(ObjectValue::Null));
+        let mut slot = self.0.borrow_mut();
+        slot.object_ref = None;
+        slot.active_pdf_unique_id = None;
+        slot.resolver = None;
+        slot.description = None;
+        slot.parsed_offset = NO_PARSED_OFFSET;
+        slot.end_before_space = NO_PARSED_OFFSET;
+        slot.end_after_space = NO_PARSED_OFFSET;
     }
 
     /// Promote this existing uniform slot to an indirect object in place.
@@ -803,7 +1011,8 @@ impl ObjectHandle {
             slot.active_pdf_unique_id = Some(pdf_unique_id);
             slot.resolver = Some(resolver);
             slot.pdf_unique_ids.insert(pdf_unique_id);
-            match &slot.state {
+            let state = slot.state.borrow();
+            match &*state {
                 ObjectState::Resolved(value) => Self::direct_children(value),
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
                     Vec::new()
@@ -861,7 +1070,8 @@ impl ObjectHandle {
         let parent = Rc::downgrade(&self.0);
         let children = {
             let slot = self.0.borrow();
-            match &slot.state {
+            let state = slot.state.borrow();
+            match &*state {
                 ObjectState::Resolved(value) => Self::direct_children(value),
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
                     return None
@@ -872,7 +1082,8 @@ impl ObjectHandle {
             Self::detach_child_from_parent(&child, &parent);
         }
         let slot = Rc::try_unwrap(self.0).ok()?.into_inner();
-        match slot.state {
+        let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
+        match state {
             ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
             ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
         }
@@ -912,7 +1123,8 @@ impl ObjectHandle {
         if slot.object_ref.is_some() {
             return Ok(None);
         }
-        match &slot.state {
+        let state = slot.state.borrow();
+        match &*state {
             ObjectState::Resolved(value) => Ok(Some(match value {
                 ObjectValue::Stream {
                     stream_dict,
@@ -957,23 +1169,7 @@ impl ObjectHandle {
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if self.is_indirect() {
-            let new_children = Self::direct_children(&value);
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    _ => None,
-                }
-            };
-            let parent = self.containment_parent();
-            if let Some(old_value) = old_value {
-                for child in Self::direct_children(&old_value) {
-                    Self::detach_child_from_parent(&child, &parent);
-                }
-            }
-            for child in new_children {
-                Self::attach_child_to_parent(&child, &parent);
-            }
+            self.replace_shared_state(ObjectState::Resolved(value));
         }
     }
 
@@ -1005,6 +1201,46 @@ impl ObjectHandle {
         }
     }
 
+    /// qpdf's `checkOwnership` rejects a value that is already attached to a
+    /// different document, including an indirect child nested below an
+    /// otherwise direct replacement value. A direct value with no recorded
+    /// document identity is unowned and can be inserted into one document.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
+        let mut pending = vec![self.clone()];
+        let mut visited = BTreeSet::new();
+        while let Some(handle) = pending.pop() {
+            let identity = Rc::as_ptr(&handle.0) as usize;
+            if !visited.insert(identity) {
+                continue;
+            }
+            let (object_ref, active_pdf_unique_id, pdf_unique_ids, children) = {
+                let slot = handle.0.borrow();
+                let state = slot.state.borrow();
+                (
+                    slot.object_ref,
+                    slot.active_pdf_unique_id,
+                    slot.pdf_unique_ids.clone(),
+                    Self::state_children(&state),
+                )
+            };
+            if object_ref.is_some() {
+                if active_pdf_unique_id != Some(pdf_unique_id) {
+                    return false;
+                }
+                continue;
+            }
+            if pdf_unique_ids
+                .iter()
+                .any(|known_pdf_unique_id| *known_pdf_unique_id != pdf_unique_id)
+            {
+                return false;
+            }
+            pending.extend(children);
+        }
+        true
+    }
+
     /// Mark this indirect handle as resolved-to-null because its reference is
     /// absent from — or broken in — the source cross-reference table (see
     /// [`ObjectState`]). A no-op for a direct handle, which has no
@@ -1023,24 +1259,12 @@ impl ObjectHandle {
     /// value's source location.
     pub(crate) fn set_missing(&self) {
         if self.is_indirect() {
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                let old_value = match std::mem::replace(&mut slot.state, ObjectState::Missing) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    _ => None,
-                };
-                slot.parsed_offset = NO_PARSED_OFFSET;
-                slot.end_before_space = NO_PARSED_OFFSET;
-                slot.end_after_space = NO_PARSED_OFFSET;
-                slot.description = None;
-                old_value
-            };
-            if let Some(old_value) = old_value {
-                let parent = self.containment_parent();
-                for child in Self::direct_children(&old_value) {
-                    Self::detach_child_from_parent(&child, &parent);
-                }
-            }
+            self.replace_detached_state(ObjectState::Missing);
+            let mut slot = self.0.borrow_mut();
+            slot.parsed_offset = NO_PARSED_OFFSET;
+            slot.end_before_space = NO_PARSED_OFFSET;
+            slot.end_after_space = NO_PARSED_OFFSET;
+            slot.description = None;
         }
     }
 
@@ -1070,49 +1294,29 @@ impl ObjectHandle {
     /// is destroyed. Surviving null and missing values retain their existing
     /// parsed-offset provenance.
     pub(crate) fn disconnect(&self) {
-        let old_value = {
-            let mut slot = self.0.borrow_mut();
+        let should_destroy = {
+            let slot = self.0.borrow();
             if slot.object_ref.is_none() {
                 return;
             }
-            slot.object_ref = None;
-            slot.active_pdf_unique_id = None;
-            slot.resolver = None;
-            let old_state = std::mem::replace(&mut slot.state, ObjectState::Destroyed);
-            match old_state {
-                ObjectState::Resolved(ObjectValue::Null) => {
-                    slot.state = ObjectState::Resolved(ObjectValue::Null);
-                    None
-                }
-                ObjectState::Missing => {
-                    slot.state = ObjectState::Missing;
-                    None
-                }
-                ObjectState::Resolved(value) => {
-                    slot.description = None;
-                    slot.parsed_offset = NO_PARSED_OFFSET;
-                    slot.end_before_space = NO_PARSED_OFFSET;
-                    slot.end_after_space = NO_PARSED_OFFSET;
-                    Some(value)
-                }
-                ObjectState::NotYetResolved => {
-                    slot.description = None;
-                    slot.parsed_offset = NO_PARSED_OFFSET;
-                    slot.end_before_space = NO_PARSED_OFFSET;
-                    slot.end_after_space = NO_PARSED_OFFSET;
-                    None
-                }
-                ObjectState::Destroyed => {
-                    slot.description = None;
-                    slot.parsed_offset = NO_PARSED_OFFSET;
-                    slot.end_before_space = NO_PARSED_OFFSET;
-                    slot.end_after_space = NO_PARSED_OFFSET;
-                    None
-                }
-            }
+            let state = slot.state.borrow();
+            !matches!(
+                &*state,
+                ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
+            )
         };
-        if let Some(old_value) = old_value {
-            self.detach_value_children(&old_value);
+        if should_destroy {
+            self.replace_detached_state(ObjectState::Destroyed);
+        }
+        let mut slot = self.0.borrow_mut();
+        slot.object_ref = None;
+        slot.active_pdf_unique_id = None;
+        slot.resolver = None;
+        if should_destroy {
+            slot.description = None;
+            slot.parsed_offset = NO_PARSED_OFFSET;
+            slot.end_before_space = NO_PARSED_OFFSET;
+            slot.end_after_space = NO_PARSED_OFFSET;
         }
     }
 
@@ -1130,7 +1334,9 @@ impl ObjectHandle {
     /// that turned out to be missing from the source, or on a value severed
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
-        !matches!(self.0.borrow().state, ObjectState::NotYetResolved)
+        let state = self.0.borrow().state.clone();
+        let resolved = !matches!(*state.borrow(), ObjectState::NotYetResolved);
+        resolved
     }
 
     /// Resolve this handle's own canonical slot in place, mirroring
@@ -1144,7 +1350,8 @@ impl ObjectHandle {
             let Some(object_ref) = slot.object_ref else {
                 return Ok(());
             };
-            if !matches!(slot.state, ObjectState::NotYetResolved) {
+            let state = slot.state.borrow();
+            if !matches!(&*state, ObjectState::NotYetResolved) {
                 return Ok(());
             }
             (object_ref, slot.resolver.clone())
@@ -1892,10 +2099,12 @@ impl ObjectHandle {
     /// that turned out to be missing from the source. A handle disconnected
     /// when its owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
-        matches!(
-            &self.0.borrow().state,
+        let state = self.0.borrow().state.clone();
+        let is_null = matches!(
+            &*state.borrow(),
             ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
-        )
+        );
+        is_null
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -1977,12 +2186,12 @@ impl ObjectHandle {
     /// retained as the dictionary value. A no-op on a
     /// non-dictionary handle or an unresolved/missing/destroyed indirect
     /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
-    /// than panicking. Also a no-op if `value` is the same direct handle as
-    /// `self` — inserting a dictionary into itself would otherwise create a
-    /// direct cycle that none of this crate's recursive walkers
-    /// (`shallow_copy`, `materialize`, `Debug`) guard against, since they
-    /// only stop recursion at an indirect-handle boundary. This does not
-    /// detect a multi-hop reciprocal cycle built from two or more
+    /// than panicking. Also a no-op if `value` is a direct handle sharing
+    /// `self`'s value state — inserting it into the dictionary would
+    /// otherwise create a direct cycle that none of this crate's recursive
+    /// walkers (`shallow_copy`, `materialize`, `Debug`) guard against, since
+    /// they only stop recursion at an indirect-handle boundary. This does
+    /// not detect a multi-hop reciprocal cycle built from two or more
     /// `replace_key` calls across distinct direct dictionaries. Unlike
     /// qpdf's `replaceKey`, this does not check that `value` belongs to the
     /// same document (`checkOwnership`) — no caller in this crate crosses
@@ -2008,7 +2217,7 @@ impl ObjectHandle {
             self.remove_key(key);
             return;
         }
-        if self.is_same_direct_handle(&value) {
+        if self.is_direct_value_alias(&value) {
             return;
         }
         let replaced = self.with_value_mut(|v| {
@@ -2018,11 +2227,10 @@ impl ObjectHandle {
             None
         });
         if let Some(old_value) = replaced {
-            let parent = self.containment_parent();
             if let Some(old_value) = old_value {
-                Self::detach_child_from_parent(&old_value, &parent);
+                self.detach_child_from_state_owners(&old_value);
             }
-            Self::attach_child_to_parent(&value, &parent);
+            self.attach_child_to_state_owners(&value);
         }
     }
 
@@ -2030,7 +2238,7 @@ impl ObjectHandle {
     /// shared handle identity. Returns `false` when this handle is not an
     /// array or `index` is out of bounds.
     pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
-        if self.is_same_direct_handle(&value) {
+        if self.is_direct_value_alias(&value) {
             return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
         }
         let old_value = self.with_value_mut(|current| {
@@ -2043,9 +2251,8 @@ impl ObjectHandle {
             Some(std::mem::replace(item, value.clone()))
         });
         if let Some(old_value) = old_value {
-            let parent = self.containment_parent();
-            Self::detach_child_from_parent(&old_value, &parent);
-            Self::attach_child_to_parent(&value, &parent);
+            self.detach_child_from_state_owners(&old_value);
+            self.attach_child_to_state_owners(&value);
             true
         } else {
             false
@@ -2054,9 +2261,9 @@ impl ObjectHandle {
 
     /// Replace every item in this live array while preserving the array
     /// handle itself. Returns `false` for a non-array handle or when the
-    /// replacement would create a direct self-cycle.
+    /// replacement would create a direct value-alias cycle.
     pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
-        if items.iter().any(|item| self.is_same_direct_handle(item)) {
+        if items.iter().any(|item| self.is_direct_value_alias(item)) {
             return false; // cov:ignore: internal callers only replay materialized child arrays
         }
         let old_items = self.with_value_mut(|current| {
@@ -2068,25 +2275,26 @@ impl ObjectHandle {
         let Some(old_items) = old_items else {
             return false; // cov:ignore: internal callers confirm the array type first
         };
-        let parent = self.containment_parent();
         for item in old_items {
-            Self::detach_child_from_parent(&item, &parent);
+            self.detach_child_from_state_owners(&item);
         }
         for item in &items {
-            Self::attach_child_to_parent(item, &parent);
+            self.attach_child_to_state_owners(item);
         }
         true
     }
 
-    /// True if `self` and `other` are both direct handles sharing the same
-    /// underlying storage — i.e. `other` is `self` itself (or a clone of
-    /// it), not merely a distinct direct handle with an equal value. Unlike
-    /// [`Self::is_same_object_as`], an indirect/indirect match returns `false` here:
-    /// an indirect handle referencing itself is not a direct cycle and is
-    /// already handled correctly by every recursive walker's
-    /// indirect-boundary stop.
-    fn is_same_direct_handle(&self, other: &Self) -> bool {
-        self.is_direct() && other.is_direct() && self.is_same_object_as(other)
+    /// True if `other` is a direct handle sharing this handle's value state.
+    /// A direct alias of an indirect container is still a direct cycle when
+    /// inserted into that container, while an indirect child remains a legal
+    /// PDF reference boundary for recursive walks.
+    fn is_direct_value_alias(&self, other: &Self) -> bool {
+        if !other.is_direct() {
+            return false;
+        }
+        let self_state = self.0.borrow().state.clone();
+        let other_state = other.0.borrow().state.clone();
+        Rc::ptr_eq(&self_state, &other_state)
     }
 
     fn direct_children(value: &ObjectValue) -> Vec<ObjectHandle> {
@@ -2158,13 +2366,6 @@ impl ObjectHandle {
         }
     }
 
-    fn detach_value_children(&self, value: &ObjectValue) {
-        let parent = self.containment_parent();
-        for child in Self::direct_children(value) {
-            Self::detach_child_from_parent(&child, &parent);
-        }
-    }
-
     fn associate_pdf_identity(&self, pdf_unique_id: u64, visited: &mut BTreeSet<usize>) {
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
@@ -2178,12 +2379,15 @@ impl ObjectHandle {
             let children = {
                 let mut slot = handle.0.borrow_mut();
                 slot.pdf_unique_ids.insert(pdf_unique_id);
-                match &slot.state {
+                let state = slot.state.clone();
+                drop(slot);
+                let children = match &*state.borrow() {
                     ObjectState::Resolved(value) => Self::direct_children(value),
                     ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
                         Vec::new()
                     }
-                }
+                };
+                children
             };
             pending.extend(children);
         }
@@ -2246,7 +2450,7 @@ impl ObjectHandle {
             None
         });
         if let Some(removed) = removed {
-            Self::detach_child_from_parent(&removed, &self.containment_parent());
+            self.detach_child_from_state_owners(&removed);
         }
     }
 
@@ -2970,7 +3174,8 @@ impl ObjectHandle {
             // metadata that disconnect clears. Bind the borrow to a local
             // and release it before `with_value` below takes its own borrow.
             let slot_ref = self.0.borrow();
-            match &slot_ref.state {
+            let state = slot_ref.state.borrow();
+            match &*state {
                 ObjectState::Destroyed => return 14,
                 ObjectState::NotYetResolved if slot_ref.object_ref.is_some() => return 13,
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
@@ -3035,7 +3240,9 @@ impl ObjectHandle {
     // use this helper; state-aware accessors such as `is_null` inspect their
     // slot directly instead.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
-        match &self.0.borrow().state {
+        let state = self.0.borrow().state.clone();
+        let state = state.borrow();
+        match &*state {
             ObjectState::NotYetResolved => f(None),
             ObjectState::Resolved(value) => f(Some(value)),
             ObjectState::Missing | ObjectState::Destroyed => f(Some(&ObjectValue::Null)),
@@ -3049,7 +3256,9 @@ impl ObjectHandle {
     // hand out a `&mut` into — those states only *present* as null, they do
     // not store one).
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
-        match &mut self.0.borrow_mut().state {
+        let state = self.0.borrow().state.clone();
+        let mut state = state.borrow_mut();
+        match &mut *state {
             ObjectState::Resolved(value) => f(Some(value)),
             ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => f(None),
         }
@@ -3188,23 +3397,7 @@ impl ObjectHandle {
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
-            let new_children = Self::direct_children(&value);
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
-                        None
-                    }
-                }
-            };
-            if let Some(old_value) = old_value {
-                self.detach_value_children(&old_value);
-            }
-            let parent = self.containment_parent();
-            for child in new_children {
-                Self::attach_child_to_parent(&child, &parent);
-            }
+            self.replace_shared_state(ObjectState::Resolved(value));
         }
     }
 
@@ -5019,6 +5212,149 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn canonical_payload_sharing_rejects_invalid_sources_without_mutating() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), -1);
+        let direct = ObjectHandle::integer(1);
+        direct
+            .share_value_state_with(&direct)
+            .expect("sharing a handle with itself is already a no-op");
+
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(31, 0), -1);
+        let error = target
+            .share_value_state_with(&indirect)
+            .expect_err("an indirect replacement is not a payload source");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: replacement ObjectHandle must be direct"
+        );
+
+        let destroyed = ObjectHandle::integer(2);
+        let destroyed_resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        destroyed.promote_to_indirect(
+            ObjectRef::new(32, 0),
+            4242,
+            Rc::downgrade(&destroyed_resolver),
+        );
+        destroyed.disconnect();
+        let error = target
+            .share_value_state_with(&destroyed)
+            .expect_err("a destroyed direct payload is not initialized");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: replacement ObjectHandle is not initialized"
+        );
+        assert!(!target.is_resolved());
+    }
+
+    #[test]
+    fn removing_a_direct_handle_is_a_no_op() {
+        let direct = ObjectHandle::integer(1);
+        direct.remove_from_document();
+        assert_eq!(direct.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn exclusive_pdf_ownership_walk_handles_cycles_and_indirect_mismatch() {
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        first.replace_key(b"Second", second.clone());
+        second.replace_key(b"First", first.clone());
+        assert!(first.belongs_exclusively_to_pdf(4242));
+
+        let foreign_resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let foreign_indirect = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(33, 0),
+            NO_PARSED_OFFSET,
+            4243,
+            Rc::downgrade(&foreign_resolver),
+        );
+        assert!(!foreign_indirect.belongs_exclusively_to_pdf(4242));
+
+        let promoted_foreign = ObjectHandle::integer(3);
+        promoted_foreign.promote_to_indirect(
+            ObjectRef::new(34, 0),
+            4243,
+            Rc::downgrade(&foreign_resolver),
+        );
+        assert_eq!(promoted_foreign.object_ref(), Some(ObjectRef::new(34, 0)));
+        assert_eq!(promoted_foreign.0.borrow().active_pdf_unique_id, Some(4243));
+        assert!(!promoted_foreign.belongs_exclusively_to_pdf(4242));
+    }
+
+    #[test]
+    fn exclusive_pdf_ownership_walk_checks_all_indirect_children() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let same_document = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(35, 0),
+            NO_PARSED_OFFSET,
+            4242,
+            Rc::downgrade(&resolver),
+        );
+        let foreign_document = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(36, 0),
+            NO_PARSED_OFFSET,
+            4243,
+            Rc::downgrade(&resolver),
+        );
+
+        // The LIFO walk visits the same-document child first in this order;
+        // it must still inspect the foreign sibling before accepting the
+        // container.
+        let same_first = ObjectHandle::array(vec![foreign_document.clone(), same_document.clone()]);
+        assert!(!same_first.belongs_exclusively_to_pdf(4242));
+
+        let foreign_first = ObjectHandle::array(vec![same_document, foreign_document]);
+        assert!(!foreign_first.belongs_exclusively_to_pdf(4242));
+    }
+
+    #[test]
+    fn removing_shared_canonical_state_rebinds_only_the_canonical_slot() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(37, 0), -1);
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        target.remove_from_document();
+
+        assert!(target.is_direct());
+        assert!(target.is_null());
+        assert_eq!(replacement.get_key(b"Value").as_integer(), Some(7));
+        replacement.replace_key(b"Value", ObjectHandle::integer(9));
+        assert_eq!(replacement.get_key(b"Value").as_integer(), Some(9));
+    }
+
+    #[test]
+    fn disconnecting_shared_canonical_state_rebinds_only_the_canonical_slot() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(38, 0), -1);
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        target.disconnect();
+
+        assert_eq!(target.type_code(), 14);
+        assert_eq!(replacement.get_key(b"Value").as_integer(), Some(7));
+    }
+
+    #[test]
+    fn shared_state_prunes_dropped_owners() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(39, 0), -1);
+        let source = ObjectHandle::integer(7);
+        target
+            .share_value_state_with(&source)
+            .expect("share replacement payload");
+
+        drop(target);
+        source.replace_direct_value(ObjectValue::Integer(8));
+
+        assert_eq!(source.as_integer(), Some(8));
+    }
+
+    #[test]
     fn detached_child_preserves_pdf_identity_without_a_live_root() {
         let owner_ref = ObjectRef::new(7, 0);
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
@@ -6664,12 +7000,12 @@ mod resolution_state_tests {
         // a mapping needs arms for the two variants neither handle can be in,
         // and an arm nothing reaches is an uncovered line.
         assert!(
-            matches!(&missing.0.borrow().state, ObjectState::Missing),
+            matches!(&*missing.0.borrow().state.borrow(), ObjectState::Missing),
             "`set_missing` must leave the slot in the `Missing` variant"
         );
-        let state = &null.0.borrow().state;
+        let state = null.0.borrow().state.clone();
         assert!(
-            matches!(state, ObjectState::Resolved(ObjectValue::Null)),
+            matches!(&*state.borrow(), ObjectState::Resolved(ObjectValue::Null)),
             "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
         );
     }
@@ -7012,7 +7348,10 @@ mod materialize_tests {
 
         assert!(handle.is_direct());
         let slot = handle.0.borrow();
-        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
+        let state = slot.state.clone();
+        drop(slot);
+        let state = state.borrow();
+        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &*state else {
             panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
         };
         let replaced_key_allocation = entries
@@ -10064,6 +10403,43 @@ mod mutation_tests {
     }
 
     #[test]
+    fn replace_key_rejects_a_direct_alias_of_a_shared_payload() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(39, 0), -1);
+        let replacement = ObjectHandle::dictionary(vec![]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        target.replace_key(b"Self", replacement.clone());
+
+        assert!(!target.has_key(b"Self"));
+    }
+
+    #[test]
+    fn replace_array_item_rejects_a_direct_alias_of_a_shared_payload() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(40, 0), -1);
+        let replacement = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        assert!(!target.replace_array_item(0, replacement.clone()));
+        assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replace_array_items_rejects_a_direct_alias_of_a_shared_payload() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(41, 0), -1);
+        let replacement = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        assert!(!target.replace_array_items(vec![replacement.clone()]));
+        assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(3));
+    }
+
+    #[test]
     fn replace_key_allows_an_indirect_handle_to_reference_itself() {
         // Unlike a direct self-insertion, an indirect handle referencing
         // itself is not a direct cycle -- every recursive walker already
@@ -10128,7 +10504,10 @@ mod mutation_tests {
 
         assert!(owner.is_indirect());
         let slot = owner.0.borrow();
-        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
+        let state = slot.state.clone();
+        drop(slot);
+        let state = state.borrow();
+        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &*state else {
             panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries

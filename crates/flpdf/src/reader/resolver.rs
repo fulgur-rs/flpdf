@@ -888,6 +888,62 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(promoted)
     }
 
+    /// Replace the canonical value for `object_ref` without replacing the
+    /// canonical handle itself.
+    ///
+    /// qpdf's `QPDF::replaceObject` rejects an indirect replacement, checks
+    /// ownership before mutating the cache, and then calls `updateCache`.
+    /// `QPDFObject::assign` inside that update shares the replacement's
+    /// `QPDFValue` (`QPDF.cc:1986-1993,1835-1857`;
+    /// `QPDFObject_private.hh:117-120`), which is represented by
+    /// [`ObjectHandle::share_value_state_with`].
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn replace_object(
+        &self,
+        object_ref: ObjectRef,
+        replacement: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        if !replacement.is_direct() {
+            return Err(Error::Unsupported(
+                "QPDF::replaceObject called with indirect object handle".to_string(),
+            ));
+        }
+        if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id) {
+            return Err(Error::Unsupported(
+                "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
+            ));
+        }
+
+        let target = self.get_object_handle(object_ref);
+        target.share_value_state_with(&replacement)?;
+        target.clear_description();
+        target.reset_parsed_offset();
+        target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
+        Ok(target)
+    }
+
+    /// Remove an object from the canonical xref/cache view and leave any
+    /// outstanding handle as a floating null value.
+    ///
+    /// qpdf erases the xref/cache entry after assigning a null value to the
+    /// cached object (`QPDF.cc:1996-2005`). The handle is nullified first so
+    /// aliases held by callers observe the transition even after the cache
+    /// entry is gone.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
+        let cached = {
+            let mut core = self.core.borrow_mut();
+            core.source_xref_entries.remove(&object_ref);
+            core.default_xref_entries.remove(&object_ref);
+            core.fixed_dangling_refs = false;
+            core.object_cache.remove(&object_ref)
+        };
+        if let Some(handle) = cached {
+            handle.remove_from_document();
+        }
+        Ok(())
+    }
+
     /// Whether a canonical handle occupies `number` at any generation.
     pub(crate) fn holds_object_number(&self, number: u32) -> bool {
         self.core
