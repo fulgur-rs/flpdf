@@ -958,6 +958,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(())
     }
 
+    /// Remove an object's source-xref row while retaining an outstanding
+    /// canonical handle's indirect identity for the legacy `delete_object`
+    /// contract. The qpdf-facing object snapshot filters the retained missing
+    /// slot through `qpdf_removed_refs`; `remove_object` above remains the
+    /// strict cache-erasing transition used by canonical replacement APIs.
+    pub(crate) fn remove_object_preserving_handle(&self, object_ref: ObjectRef) -> Result<()> {
+        let cached = {
+            let mut core = self.core.borrow_mut();
+            core.source_xref_entries.remove(&object_ref);
+            core.default_xref_entries.remove(&object_ref);
+            core.fixed_dangling_refs = false;
+            core.object_cache.get(&object_ref).cloned()
+        };
+        if let Some(handle) = cached {
+            handle.set_missing();
+        }
+        Ok(())
+    }
+
     /// Whether a canonical handle occupies `number` at any generation.
     #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
     pub(crate) fn holds_object_number(&self, number: u32) -> bool {

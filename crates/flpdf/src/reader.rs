@@ -1313,6 +1313,15 @@ impl<R: Read + Seek> Pdf<R> {
             return;
         }
 
+        // qpdf erases the source xref row and canonical object-cache entry
+        // while nullifying every outstanding handle (`QPDF.cc:1996-2004`).
+        // Keep the indirect identity for this legacy public API, but remove
+        // the source row and mark the retained handle missing. The qpdf-facing
+        // object snapshot filters this compatibility slot below.
+        self.resolver
+            .remove_object_preserving_handle(object_ref)
+            .expect("canonical resolver object removal is infallible");
+
         // Invalidate the handle-graph bridge state unconditionally, before
         // the cache-state early return below: `Pdf::prepare_qpdf_json_objects`
         // can mark a ref's cache entry `Missing` (discovered as a dangling
@@ -1320,9 +1329,7 @@ impl<R: Read + Seek> Pdf<R> {
         // it has ever been created via `Pdf::get_object_handle`. If the two
         // lines below ran only past the early return, that combination
         // (cache already `Missing`, handle still `NotYetResolved`) would
-        // skip them entirely, leaving a stale-but-unresolved handle whose
-        // correctness would then depend on `Pdf::resolve_object_handle`'s
-        // fallback arm staying a wildcard forever.
+        // leave stale compatibility data behind.
         self.legacy_materialized_memo.remove(&object_ref);
         self.handle_mutated_object_refs.remove(&object_ref);
         self.get_object_handle(object_ref).set_missing();
@@ -1818,6 +1825,34 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
+    fn reconcile_legacy_materialized_memos(&mut self) -> Result<()> {
+        let pending: Vec<(ObjectRef, Object)> = self
+            .legacy_materialized_memo
+            .iter()
+            .map(|(object_ref, object)| (*object_ref, object.clone()))
+            .collect();
+
+        for (object_ref, replacement) in pending {
+            let Some(handle) = self.resolver.registered_handle(object_ref) else {
+                continue;
+            };
+            if handle.materialize()? == replacement {
+                continue;
+            }
+
+            // `set_object`'s ordinary lift is bounded by MAX_INLINE_DEPTH,
+            // while a value that already parsed successfully can be valid up
+            // to MAX_PARSE_DEPTH. Rebuild the canonical value at that looser
+            // bound so enumeration cannot return the stale source handle.
+            let value = self.lift_bounded(&replacement, 0, crate::parser::MAX_PARSE_DEPTH)?;
+            handle.set_resolved(value);
+            handle.clear_description();
+            handle.reset_parsed_offset();
+            self.legacy_materialized_memo.remove(&object_ref);
+        }
+        Ok(())
+    }
+
     /// Return qpdf's complete canonical object cache in `ObjectRef` order.
     ///
     /// `QPDF::getAllObjects` first calls `fixDanglingReferences` and then
@@ -1829,7 +1864,37 @@ impl<R: Read + Seek> Pdf<R> {
     /// between `xref_table` and `deleted_objects`.
     pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
         self.resolver.fix_dangling_references()?;
-        Ok(self.resolver.all_object_handles())
+
+        // A trailer reference can be valid even when it has no body/xref row.
+        // qpdf's trailer parse has already observed these references; register
+        // them before taking the object-cache snapshot so `/Info 99 0 R` is not
+        // lost merely because no body object was resolved.
+        let trailer_refs: Vec<_> = self
+            .qpdf_trailer_references
+            .iter()
+            .copied()
+            .filter(|object_ref| {
+                object_ref.number != 0
+                    && object_ref.generation != u16::MAX
+                    && !self.qpdf_removed_refs.contains(object_ref)
+            })
+            .collect();
+        for object_ref in trailer_refs {
+            self.get_object_handle(object_ref);
+        }
+
+        self.reconcile_legacy_materialized_memos()?;
+        let removed = self.qpdf_removed_refs.clone();
+        Ok(self
+            .resolver
+            .all_object_handles()
+            .into_iter()
+            .filter(|handle| {
+                handle
+                    .object_ref()
+                    .is_none_or(|object_ref| !removed.contains(&object_ref))
+            })
+            .collect())
     }
 
     /// Compatibility name for the canonical qpdf object enumeration.
@@ -7503,6 +7568,95 @@ mod tests {
         assert!(handles
             .iter()
             .any(|handle| handle.object_ref() == Some(dangling_ref)));
+    }
+
+    fn trailer_only_dangling_info_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (object_ref, body) in [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".as_slice(),
+            ),
+        ] {
+            offsets.insert(object_ref, bytes.len() as u64);
+            bytes.extend_from_slice(format!("{object_ref} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for object_ref in 1..=3 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&object_ref]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 4 /Root 1 0 R /Info 99 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn get_all_objects_excludes_deleted_objects_from_xref_and_canonical_snapshots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle
+            .try_dereference()
+            .expect("resolve object before deletion");
+        assert!(pdf.get_xref_table().contains_key(&object_ref));
+
+        pdf.delete_object(object_ref);
+
+        assert!(!pdf.get_xref_table().contains_key(&object_ref));
+        assert!(handle.is_null());
+        assert!(!pdf
+            .get_all_objects()
+            .expect("enumerate after deletion")
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(object_ref)));
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_a_deep_memo_backed_replacement() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        let mut replacement = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement.clone());
+        assert_eq!(
+            pdf.resolve(object_ref).expect("resolve replacement"),
+            replacement
+        );
+
+        let found = pdf
+            .get_all_objects()
+            .expect("enumerate memo-backed replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement object remains enumerated");
+        assert_eq!(
+            found
+                .materialize()
+                .expect("materialize canonical replacement"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn get_all_objects_registers_trailer_only_dangling_references() {
+        let mut pdf = Pdf::open_mem_owned(trailer_only_dangling_info_pdf()).expect("open");
+        assert!(pdf
+            .get_all_objects()
+            .expect("enumerate trailer-only reference")
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(ObjectRef::new(99, 0))));
     }
 
     #[test]
