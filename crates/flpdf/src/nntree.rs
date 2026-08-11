@@ -1730,6 +1730,12 @@ impl<K: TreeKey> NNTree<K> {
             return Ok(());
         }
 
+        // qpdf's split allocation calls nextObjGen(), which first prepares the
+        // canonical cache through fixDanglingReferences. Do that before the
+        // caller mutates the live items array so parser-discovered dangling
+        // references participate in the same signed object-number preflight.
+        pdf.next_obj_gen()?;
+
         let mut allocations = 0usize;
         let mut parent_index = cursor.path.len().checked_sub(1);
         loop {
@@ -3827,6 +3833,51 @@ mod tests {
                 .ensure_available(&pdf_with_missing_max, 1)
                 .is_err(),
             "preflight must count a missing canonical handle at qpdf's signed limit"
+        );
+    }
+
+    #[test]
+    fn split_preflight_prepares_parser_discovered_dangling_refs_before_mutation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"%PDF-1.4\n");
+        let object_offset = bytes.len() as u64;
+        bytes
+            .extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Dangling 2147483647 0 R >>\nendobj\n");
+        let xref_offset = bytes.len() as u64;
+        bytes.extend_from_slice(
+            format!("xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n").as_bytes(),
+        );
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open dangling-reference PDF");
+
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"a".to_vec()), Object::Integer(1)]),
+        );
+        let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
+        tree.set_split_threshold(1);
+
+        let error = match tree.insert(&mut pdf, b"b".to_vec(), Object::Integer(2)) {
+            Err(error) => error,
+            Ok(_) => panic!("parser-discovered INT_MAX ref must fail before insertion"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: max object id is too high to create new objects"
+        );
+        let Object::Dictionary(root) = tree.root() else {
+            panic!("root must remain a dictionary"); // cov:ignore: test-shape guard
+        };
+        assert_eq!(
+            root.get("Names"),
+            Some(&Object::Array(vec![
+                Object::String(b"a".to_vec()),
+                Object::Integer(1),
+            ]))
         );
     }
 
