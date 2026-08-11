@@ -587,9 +587,9 @@ pub struct NumberTree {
 /// surface. Page-label lookup needs qpdf's value identity instead: a `/Nums`
 /// value must remain the same indirect handle when the helper copies `/S` and
 /// `/P` into its reconstructed dictionary. This view owns the root handle and
-/// walks `/Kids`/`/Nums` without crossing the legacy resolver boundary. Direct
-/// `/Kids` auto-repair remains on the legacy mutation surface until the
-/// canonical make-indirect and writer write-back boundary is complete.
+/// walks `/Kids`/`/Nums` without crossing the legacy resolver boundary. Like
+/// qpdf's default `auto_repair` mode, it indirectizes direct `/Kids` entries
+/// in place and records the repair warning.
 pub(crate) struct HandleNumberTree {
     root: ObjectHandle,
     max_depth: usize,
@@ -654,7 +654,7 @@ impl HandleNumberTree {
         {
             pdf.push_warning(structural_message(
                 node.object_ref(),
-                "loop detected while traversing name/number tree".to_string(),
+                "loop detected while traversing name/number tree",
             ))?;
             return Ok(());
         }
@@ -682,7 +682,7 @@ impl HandleNumberTree {
                                 // continues traversal.
                                 pdf.push_warning(structural_message(
                                     node.object_ref(),
-                                    "items array doesn't have enough elements".to_string(),
+                                    "items array doesn't have enough elements",
                                 ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
                                 break;
                             }
@@ -706,7 +706,32 @@ impl HandleNumberTree {
 
             if let Some(kids) = dictionary.get(b"Kids".as_slice()) {
                 if let Some(kid_handles) = kids.try_as_array()? {
-                    for kid in kid_handles {
+                    for (kid_number, kid) in kid_handles.into_iter().enumerate() {
+                        let kid = if kid.is_direct() {
+                            // qpdf 11.9.0 NNTreeIterator::deepen calls
+                            // makeIndirectObject for a direct kid, stores the
+                            // returned handle back into /Kids, and warns on
+                            // the containing node (NNTree.cc:623-638).
+                            pdf.push_warning(structural_message(
+                                node.object_ref(),
+                                format!("converting kid number {kid_number} to an indirect object"),
+                            ))?;
+                            let indirect = pdf.make_indirect_from_object_handle(kid)?;
+                            let replaced = kids.replace_array_item(kid_number, indirect.clone());
+                            debug_assert!(
+                                replaced,
+                                "the /Kids snapshot came from the same live array"
+                            );
+                            // The canonical allocation primitive intentionally
+                            // does not schedule writer output. The mutation is
+                            // on the live /Kids array, so mark its containing
+                            // indirect object dirty for the current writer
+                            // bridge (`ObjectHandle::replace_array_item`).
+                            pdf.mark_object_handle_dirty(kids)?;
+                            indirect
+                        } else {
+                            kid
+                        };
                         Self::collect(pdf, kid, depth + 1, max_depth, path, entries)?;
                     }
                 }
@@ -3025,6 +3050,53 @@ mod tests {
             .any(|warning| warning
                 .message
                 .contains("items array doesn't have enough elements")));
+    }
+
+    #[test]
+    fn handle_number_tree_auto_repairs_direct_kids_and_warns() {
+        let mut pdf = empty_pdf();
+        let root = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                b"Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(4),
+                    ObjectHandle::string(b"four".to_vec()),
+                ]),
+            )])]),
+        )]);
+        let catalog_ref = ObjectRef::new(1, 0);
+        let catalog = pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference().expect("catalog");
+        catalog.replace_key(b"PageLabels", root.clone());
+        pdf.clear_dirty(catalog_ref);
+
+        let entries = HandleNumberTree::new(root.clone(), 1)
+            .entries(&mut pdf)
+            .expect("direct kids must remain traversable after repair");
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+        assert!(pdf.is_dirty(catalog_ref));
+
+        let kids = root
+            .try_get_key(b"Kids")
+            .expect("root /Kids")
+            .try_as_array()
+            .expect("root /Kids array")
+            .expect("root /Kids must be an array");
+        assert!(kids[0].is_indirect(), "direct kid must be indirectized");
+        assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(2, 0)));
+        assert!(pdf
+            .get_all_object_handles()
+            .expect("enumerate repaired objects")
+            .iter()
+            .any(|handle| handle.is_same_object_as(&kids[0])));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| warning
+                .message
+                .contains("converting kid number 0 to an indirect object")));
     }
 
     #[test]
