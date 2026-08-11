@@ -3861,10 +3861,12 @@ mod tests {
         let mut tree = NNTree::<NameKey>::new(Object::Dictionary(root), false);
         tree.set_split_threshold(1);
 
-        let error = match tree.insert(&mut pdf, b"b".to_vec(), Object::Integer(2)) {
-            Err(error) => error,
-            Ok(_) => panic!("parser-discovered INT_MAX ref must fail before insertion"),
-        };
+        let result = tree.insert(&mut pdf, b"b".to_vec(), Object::Integer(2));
+        assert!(
+            result.is_err(),
+            "parser-discovered INT_MAX ref must fail before insertion"
+        );
+        let error = result.err().unwrap();
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: max object id is too high to create new objects"
