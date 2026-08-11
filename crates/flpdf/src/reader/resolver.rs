@@ -3006,6 +3006,7 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 }
 
 impl<R: Read + Seek> ResolverHandle<R> {
+    #[inline(never)]
     fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         // ---- phase 1: short borrows only ----
 
@@ -3073,7 +3074,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                                 let parsed_ref = parsed.object_ref;
                                 self.cache_parsed_object(parsed);
                                 if parsed_ref != object_ref {
-                                    handle.set_missing();
+                                    handle.set_missing(); // cov:ignore: reconstructed xref keys the exact parsed object reference
                                 }
                                 Ok(())
                             }
