@@ -398,11 +398,11 @@ pub(crate) fn template_from_survey(
 ///   field-tree walk needs, because that walk immediately follows the
 ///   merge that populated the map).
 ///
-/// - `by_source_ref`: (category, source `ObjectRef`) -> current dest name.
-///   Rebuilt from the destination category for each
-///   [`merge_resources_shallow`] call, then extended with inserts from that
-///   call. This mirrors qpdf's local `og_to_name` map and prevents a name
-///   overwritten by a later source from becoming a stale alias.
+/// - `by_source_ref`: (category, source `ObjectRef`) -> destination name from
+///   qpdf's collision-time `og_to_name` snapshot. Rebuilt lazily from the
+///   current destination category at the first occupied source key of each
+///   [`merge_resources_shallow`] call, then frozen for that category. Later
+///   verbatim inserts and fresh aliases do not extend it.
 ///
 /// Mirrors qpdf's per-call `dr_map`, populated by
 /// `QPDFObjectHandle::mergeResources`'s `conflicts` out-parameter and driven
@@ -418,9 +418,10 @@ pub(crate) struct DrMap {
     /// consumers must use it before the next merge is called on the same
     /// destination.
     by_name: ResourceRenames,
-    /// (category, source `ObjectRef`) -> current dest name. Rebuilt for each
-    /// resource merge from the current destination dictionary, then extended
-    /// for inserts in that merge.
+    /// (category, source `ObjectRef`) -> destination name from the
+    /// collision-time qpdf identity snapshot. Rebuilt lazily for each
+    /// resource merge and frozen after the first occupied source key in each
+    /// category.
     by_source_ref: BTreeMap<(Vec<u8>, ObjectRef), Vec<u8>>,
 }
 
@@ -1428,9 +1429,9 @@ fn ensure_dest_acroform_dr<R: Read + Seek>(
 /// `QPDFObjGen -> name` map from the current destination category when the
 /// first collision is encountered. A recurring source object therefore reuses
 /// its still-live destination name, while an alias overwritten by another
-/// source is not reused. `by_source_ref` models that map and is rebuilt at the
-/// start of each merge; the destination `/DR` itself remains shared across
-/// placements.
+/// source is not reused. `by_source_ref` models that map and is rebuilt lazily
+/// at the first collision of each merge category; the destination `/DR` itself
+/// remains shared across placements.
 fn merge_resources_shallow<R: Read + Seek>(
     dest: &mut Pdf<R>,
     dest_dr: ObjectRef,
@@ -1501,47 +1502,23 @@ fn merge_resources_shallow<R: Read + Seek>(
             _ => (crate::Dictionary::new(), None),
         };
 
-        // Seed `by_source_ref` from dest's PRE-EXISTING category entries so
-        // a source ref that turns out to already sit under some dest name
-        // (from a prior life of the dest `/DR`, not a prior merge) can be
-        // reused instead of duplicated. Same idea as recording verbatim
-        // inserts below: without this, source `/F2 <ref>` colliding with
-        // dest's `/F2 <other-ref>` would mint `/F2_1` even when the source
-        // ref already sits in dest under `/F1`.
-        for (existing_name, existing_val) in new_type_dict.iter() {
-            if let Object::Reference(existing_ref) = existing_val {
-                dr_map
-                    .by_source_ref
-                    .insert((type_key.to_vec(), *existing_ref), existing_name.to_vec());
-            } // cov:ignore: closing brace of the `if let Object::Reference` — llvm-cov instrumentation artifact; the body is exercised by `merge_resources_shallow_reuses_preexisting_dest_ref_at_different_name`.
-        }
-
         // qpdf initializes this pool lazily on the first occupied source key
         // and keeps it stable for the rest of this resource category
         // (`QPDFObjectHandle.cc:1108-1127`). It contains keys from the
         // dictionaries stored under the category's values, not the category's
         // own direct keys (`getResourceNames`, `:1155-1172`).
         let mut resource_names: Option<BTreeSet<Vec<u8>>> = None;
+        let mut source_ref_snapshot: Option<BTreeMap<ObjectRef, Vec<u8>>> = None;
         let mut min_suffix: u32 = 1;
 
         for (name, val) in src_type_dict.iter() {
             match new_type_dict.get(name) {
                 None => {
                     new_type_dict.insert(name, val.clone());
-                    // Record the freshly-installed name against its source
-                    // ref so a LATER entry in this same merge that collides
-                    // under a DIFFERENT name but points at the SAME source
-                    // object can reuse this one instead of minting a
-                    // duplicate. Example: source `/DR/Font { /F1 X /F2 X }`
-                    // into dest with only `/F2 Y` — qpdf inserts `/F1 X`
-                    // verbatim, then on `/F2 X` sees `X` is already in dest
-                    // under `/F1` and rewrites the `/DA` `/F2` operand to
-                    // `/F1` rather than adding a `/F2_1` alias.
-                    if let Some(source_ref) = val.as_ref_id() {
-                        dr_map
-                            .by_source_ref
-                            .insert((type_key.to_vec(), source_ref), name.to_vec());
-                    } // cov:ignore: closing brace of the `if let Some(source_ref)` — llvm-cov instrumentation artifact; the body is exercised by `merge_resources_shallow_reuses_verbatim_insert_from_same_source_ref`.
+                    // Do not update qpdf's identity snapshot here. If this
+                    // is before the first occupied source key, the insertion
+                    // will be included when the snapshot is built below; if
+                    // it is after that key, qpdf deliberately ignores it.
                 }
                 Some(existing_val) => {
                     // qpdf snapshots both `og_to_name` and `rnames` before
@@ -1550,6 +1527,24 @@ fn merge_resources_shallow<R: Read + Seek>(
                     // In particular, a same-object collision must still
                     // freeze the pool before later verbatim inserts can add
                     // second-level names.
+                    if source_ref_snapshot.is_none() {
+                        let mut snapshot = BTreeMap::new();
+                        for (existing_name, existing_val) in new_type_dict.iter() {
+                            if let Object::Reference(existing_ref) = existing_val {
+                                // `new_type_dict` is ordered by name, just as
+                                // qpdf's std::map-backed dictionary is. A
+                                // repeated object therefore keeps the last
+                                // name visited, matching make_og_to_name.
+                                snapshot.insert(*existing_ref, existing_name.to_vec());
+                            }
+                        }
+                        for (source_ref, dest_name) in &snapshot {
+                            dr_map
+                                .by_source_ref
+                                .insert((type_key.to_vec(), *source_ref), dest_name.clone());
+                        }
+                        source_ref_snapshot = Some(snapshot);
+                    }
                     if resource_names.is_none() {
                         resource_names = Some(get_resource_names(dest, &new_type_dict)?);
                     }
@@ -1566,9 +1561,9 @@ fn merge_resources_shallow<R: Read + Seek>(
                     }
                     // qpdf builds a local `QPDFObjGen -> name` map from the
                     // current destination category at the first collision.
-                    // `by_source_ref` was seeded from that current category
-                    // above and extended only by this merge, so a direct
-                    // alias overwritten by another source cannot be reused.
+                    // `source_ref_snapshot` was built from that category at
+                    // the first collision and is frozen for the rest of the
+                    // category, so later aliases cannot change qpdf's winner.
                     //
                     // Reuse is keyed by SOURCE `ObjectRef`, not by source
                     // NAME — two different source objects that both collide
@@ -1578,7 +1573,11 @@ fn merge_resources_shallow<R: Read + Seek>(
                     let reuse_key = val.as_ref_id().map(|r| (type_key.to_vec(), r));
                     let reuse = reuse_key
                         .as_ref()
-                        .and_then(|k| dr_map.by_source_ref.get(k))
+                        .and_then(|(_, source_ref)| {
+                            source_ref_snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.get(source_ref))
+                        })
                         .cloned();
                     if let Some(existing_new_name) = reuse {
                         // Refresh `by_name` for this call's placement so
@@ -1603,9 +1602,6 @@ fn merge_resources_shallow<R: Read + Seek>(
                         .entry(type_key.to_vec())
                         .or_default()
                         .insert(name.to_vec(), new_name.clone());
-                    if let Some(key) = reuse_key {
-                        dr_map.by_source_ref.insert(key, new_name);
-                    }
                 }
             }
         }
@@ -2656,8 +2652,8 @@ mod tests {
     /// lacks `/F1` but has `/F2 Y`: qpdf inserts `/F1 X` verbatim, then
     /// on the `/F2` collision sees that `X` is already sitting at `/F1`
     /// and rewrites the `/F2` operand to `/F1` rather than duplicating
-    /// `X` under `/F2_1`. Requires the verbatim-insert path to record
-    /// `by_source_ref` so the collision branch can reuse it.
+    /// `X` under `/F2_1`. The collision-time identity snapshot must include
+    /// the earlier verbatim `/F1` insertion.
     #[test]
     fn merge_resources_shallow_reuses_verbatim_insert_from_same_source_ref() {
         let mut pdf = open_minimal();
@@ -2698,10 +2694,100 @@ mod tests {
         );
     }
 
+    /// qpdf freezes its source-object map at the first occupied source key.
+    /// A later verbatim insertion with the same source ref must not make a
+    /// subsequent collision reuse that newly inserted name.
+    #[test]
+    fn merge_resources_shallow_freezes_source_ref_map_after_first_collision() {
+        let mut pdf = open_minimal();
+        let dest_a_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let dest_c_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Symbol".to_vec()))],
+        );
+        let source_a_ref = set_dict(
+            &mut pdf,
+            12,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let source_x_ref = set_dict(
+            &mut pdf,
+            13,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("A", dest_a_ref), ("C", dest_c_ref)]);
+        let source_dr = set_font_dr(
+            &mut pdf,
+            3,
+            &[
+                ("A", source_a_ref),
+                ("B", source_x_ref),
+                ("C", source_x_ref),
+            ],
+        );
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"C".as_slice())),
+            Some(&b"C_1".to_vec()),
+            "a verbatim /B insert after the first collision must not enter qpdf's frozen identity map",
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("B"), Some(source_x_ref));
+        assert_eq!(font.get_ref("C_1"), Some(source_x_ref));
+        assert!(font.get("C_2").is_none());
+    }
+
+    /// qpdf builds the identity map from the current destination dictionary
+    /// when the first collision occurs. If the same indirect object is
+    /// already present under two names, the dictionary's key order determines
+    /// the winner; an earlier verbatim source insert must not replace it.
+    #[test]
+    fn merge_resources_shallow_builds_source_ref_map_from_collision_dictionary() {
+        let mut pdf = open_minimal();
+        let shared_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let other_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("C", other_ref), ("Z", shared_ref)]);
+        let source_dr = set_font_dr(&mut pdf, 3, &[("A", shared_ref), ("C", shared_ref)]);
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"C".as_slice())),
+            Some(&b"Z".to_vec()),
+            "the collision-time destination dictionary must win over the earlier verbatim /A insert",
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("A"), Some(shared_ref));
+        assert_eq!(font.get_ref("C"), Some(other_ref));
+        assert_eq!(font.get_ref("Z"), Some(shared_ref));
+        assert!(font.get("C_1").is_none());
+    }
+
     /// Same reuse behavior applies when the source ref is already at a
     /// dest name from a PRIOR life of the dest `/DR` (not from an earlier
-    /// verbatim insert in the same merge). Pre-populating `by_source_ref`
-    /// from `new_type_dict` at the start of each category enables this.
+    /// verbatim insert in the same merge). Building the collision-time
+    /// snapshot from `new_type_dict` enables this.
     #[test]
     fn merge_resources_shallow_reuses_preexisting_dest_ref_at_different_name() {
         let mut pdf = open_minimal();
