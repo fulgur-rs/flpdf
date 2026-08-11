@@ -1282,6 +1282,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.core.borrow().header_offset
     }
 
+    #[cfg(test)]
+    pub(crate) fn mark_reconstructed_xref_for_test(&self) {
+        self.core.borrow_mut().reconstructed_xref = true;
+    }
+
     /// This document's encryption parameters, in their shared, mutable-in-
     /// place form — the pipe-side door onto [`ResolverCore::encryption_parameters`].
     ///
