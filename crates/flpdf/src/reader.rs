@@ -7683,6 +7683,22 @@ mod tests {
     }
 
     #[test]
+    fn get_all_objects_ignores_a_stale_memo_without_a_registered_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let stale_ref = ObjectRef::new(999, 0);
+        pdf.legacy_materialized_memo
+            .insert(stale_ref, Object::Integer(7));
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("a stale memo must not block canonical enumeration");
+        assert!(!objects
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(stale_ref)));
+        assert!(pdf.legacy_materialized_memo.contains_key(&stale_ref));
+    }
+
+    #[test]
     fn get_all_objects_registers_a_top_level_replacement_target() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let redirect_ref = ObjectRef::new(100, 0);
