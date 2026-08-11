@@ -2416,8 +2416,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let malformed = !parsed.diagnostics.is_empty();
         for warning in parsed.diagnostics {
-            self.push_warning_at(warning.relative_offset as u64, warning.message)
-                .map_err(ReadObjectAtOffsetError::Body)?;
+            let warning_offset = warning.relative_offset as u64;
+            self.push_warning_at(
+                warning_offset,
+                format!(
+                    "(object {} {}, offset {warning_offset}): {}",
+                    found.number, found.generation, warning.message
+                ),
+            )
+            .map_err(ReadObjectAtOffsetError::Body)?;
         }
 
         if let Some(empty_offset) = parsed.empty {
@@ -8817,8 +8824,12 @@ mod tests {
         let warning = diagnostics
             .entries()
             .iter()
-            .find(|entry| entry.message == "unexpected )")
+            .find(|entry| entry.message.contains("unexpected )"))
             .expect("qpdf tokenizer warning");
+        assert_eq!(
+            warning.message,
+            format!("(object 2 0, offset {malformed_at}): unexpected )")
+        );
         assert_eq!(warning.offset, Some(malformed_at as u64));
     }
 
