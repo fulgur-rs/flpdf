@@ -1853,6 +1853,28 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
+    fn register_top_level_replacement_targets(&mut self) {
+        // A bare `Object::Reference` supplied to `set_object` is represented
+        // as an `ObjectValue::Reference` on the holder itself. Unlike an
+        // indirect child, that lift does not mint the target handle. Register
+        // the target before taking the cache snapshot so a dangling target is
+        // visible exactly like a reference discovered inside a parsed value.
+        let targets: BTreeSet<_> = self
+            .resolver
+            .all_object_handles()
+            .into_iter()
+            .filter_map(|handle| handle.as_reference())
+            .filter(|object_ref| {
+                object_ref.number != 0
+                    && object_ref.generation != u16::MAX
+                    && !self.qpdf_removed_refs.contains(object_ref)
+            })
+            .collect();
+        for object_ref in targets {
+            self.get_object_handle(object_ref);
+        }
+    }
+
     /// Return qpdf's complete canonical object cache in `ObjectRef` order.
     ///
     /// `QPDF::getAllObjects` first calls `fixDanglingReferences` and then
@@ -1884,6 +1906,7 @@ impl<R: Read + Seek> Pdf<R> {
         }
 
         self.reconcile_legacy_materialized_memos()?;
+        self.register_top_level_replacement_targets();
         let removed = self.qpdf_removed_refs.clone();
         Ok(self
             .resolver
@@ -7657,6 +7680,24 @@ mod tests {
             .expect("enumerate trailer-only reference")
             .iter()
             .any(|candidate| candidate.object_ref() == Some(ObjectRef::new(99, 0))));
+    }
+
+    #[test]
+    fn get_all_objects_registers_a_top_level_replacement_target() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let redirect_ref = ObjectRef::new(100, 0);
+        let target_ref = ObjectRef::new(999, 0);
+        pdf.set_object(redirect_ref, Object::Reference(target_ref));
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("enumerate top-level replacement target");
+        assert!(objects
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(redirect_ref)));
+        assert!(objects
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(target_ref)));
     }
 
     #[test]
