@@ -672,7 +672,7 @@ impl HandleNumberTree {
 
             // qpdf 11.9.0 NNTreeIterator::deepen selects a non-empty /Nums
             // array before looking at /Kids, even when both keys are present.
-            if let Some(nums) = dictionary.get(b"Nums".as_slice()) {
+            if let Some(nums) = dictionary.get(b"/Nums".as_slice()) {
                 if let Some(items) = nums.try_as_array()? {
                     if !items.is_empty() {
                         for (pair_index, pair) in items.chunks(2).enumerate() {
@@ -704,7 +704,7 @@ impl HandleNumberTree {
                 }
             }
 
-            if let Some(kids) = dictionary.get(b"Kids".as_slice()) {
+            if let Some(kids) = dictionary.get(b"/Kids".as_slice()) {
                 if let Some(kid_handles) = kids.try_as_array()? {
                     for (kid_number, kid) in kid_handles.into_iter().enumerate() {
                         let kid = if kid.is_direct() {
@@ -3068,7 +3068,7 @@ mod tests {
         let catalog_ref = ObjectRef::new(1, 0);
         let catalog = pdf.get_object_handle(catalog_ref);
         catalog.try_dereference().expect("catalog");
-        catalog.replace_key(b"PageLabels", root.clone());
+        catalog.replace_key(b"/PageLabels", root.clone());
         pdf.clear_dirty(catalog_ref);
 
         let entries = HandleNumberTree::new(root.clone(), 1)
@@ -3078,7 +3078,7 @@ mod tests {
         assert!(pdf.is_dirty(catalog_ref));
 
         let kids = root
-            .try_get_key(b"Kids")
+            .try_get_key(b"/Kids")
             .expect("root /Kids")
             .try_as_array()
             .expect("root /Kids array")

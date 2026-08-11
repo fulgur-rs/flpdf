@@ -5624,9 +5624,9 @@ pub(crate) mod identity_tests {
 
         assert!(target.is_direct());
         assert!(target.is_null());
-        assert_eq!(replacement.get_key(b"Value").as_integer(), Some(7));
-        replacement.replace_key(b"Value", ObjectHandle::integer(9));
-        assert_eq!(replacement.get_key(b"Value").as_integer(), Some(9));
+        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
+        replacement.replace_key(b"/Value", ObjectHandle::integer(9));
+        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(9));
     }
 
     #[test]
@@ -5641,7 +5641,7 @@ pub(crate) mod identity_tests {
         target.disconnect();
 
         assert_eq!(target.type_code(), 14);
-        assert_eq!(replacement.get_key(b"Value").as_integer(), Some(7));
+        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
     }
 
     #[test]
@@ -10832,7 +10832,7 @@ mod mutation_tests {
             .share_value_state_with(&replacement)
             .expect("share replacement payload");
 
-        target.replace_key(b"Self", replacement.clone());
+        target.replace_key(b"/Self", replacement.clone());
 
         assert!(!target.has_key(b"Self"));
     }

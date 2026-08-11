@@ -109,19 +109,19 @@ impl LabelRange {
             return Ok(None);
         }
         let style = pdf
-            .resolve_object_handle_to_terminal(&handle.try_get_key(b"S")?)?
+            .resolve_object_handle_to_terminal(&handle.try_get_key(b"/S")?)?
             .try_as_name()?
             .map(|name| LabelStyle::from_name(&name))
             .unwrap_or(LabelStyle::None);
         let prefix = pdf
-            .resolve_object_handle_to_terminal(&handle.try_get_key(b"P")?)?
+            .resolve_object_handle_to_terminal(&handle.try_get_key(b"/P")?)?
             .as_string()
             .map(|bytes| {
                 crate::json_inspect::decode_pdf_text_string(&bytes)
                     .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned())
             })
             .unwrap_or_default();
-        let start = handle.try_get_key(b"St")?.try_as_integer()?.unwrap_or(1);
+        let start = handle.try_get_key(b"/St")?.try_as_integer()?.unwrap_or(1);
         Ok(Some(Self {
             style,
             prefix,
@@ -316,7 +316,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         let Some(dictionary) = catalog.try_as_dictionary()? else {
             return Ok(None);
         };
-        Ok(dictionary.get(b"PageLabels".as_slice()).cloned())
+        Ok(dictionary.get(b"/PageLabels".as_slice()).cloned())
     }
 
     fn pagelabels_tree(&mut self) -> Result<Option<crate::nntree::HandleNumberTree>> {
@@ -339,14 +339,14 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     pub fn page_label_dict(style: LabelStyle, start_num: i64, prefix: &str) -> ObjectHandle {
         let result = ObjectHandle::dictionary(Vec::new());
         if let Some(name) = style.to_name() {
-            result.replace_key(b"S", ObjectHandle::name(name.as_bytes().to_vec()));
+            result.replace_key(b"/S", ObjectHandle::name(name.as_bytes().to_vec()));
         }
         if !prefix.is_empty() {
             let bytes = crate::pdf_string::new_unicode_string(prefix.as_bytes());
-            result.replace_key(b"P", ObjectHandle::string(bytes));
+            result.replace_key(b"/P", ObjectHandle::string(bytes));
         }
         if start_num != 1 {
-            result.replace_key(b"St", ObjectHandle::integer(start_num));
+            result.replace_key(b"/St", ObjectHandle::integer(start_num));
         }
         result
     }
@@ -440,23 +440,23 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 .unwrap_or_else(|| ObjectHandle::dictionary(Vec::new())),
             None => ObjectHandle::dictionary(Vec::new()),
         };
-        if !first_label.try_has_key(b"St")? {
+        if !first_label.try_has_key(b"/St")? {
             let default_start = new_start_idx.checked_add(1).ok_or_else(|| {
                 Error::Unsupported("page label fabricated start overflow".to_string())
             })?;
-            first_label.replace_key(b"St", ObjectHandle::integer(default_start));
+            first_label.replace_key(b"/St", ObjectHandle::integer(default_start));
         }
 
         let skip_first = if let Some((last_index, last_label)) = labels.last() {
             if last_label.try_as_dictionary()?.is_some()
                 && first_label.try_as_dictionary()?.is_some()
             {
-                let last_s = last_label.try_get_key(b"S")?;
-                let first_s = first_label.try_get_key(b"S")?;
-                let last_p = last_label.try_get_key(b"P")?;
-                let first_p = first_label.try_get_key(b"P")?;
-                let last_st = last_label.try_get_key(b"St")?.try_as_integer()?;
-                let first_st = first_label.try_get_key(b"St")?.try_as_integer()?;
+                let last_s = last_label.try_get_key(b"/S")?;
+                let first_s = first_label.try_get_key(b"/S")?;
+                let last_p = last_label.try_get_key(b"/P")?;
+                let first_p = first_label.try_get_key(b"/P")?;
+                let last_st = last_label.try_get_key(b"/St")?.try_as_integer()?;
+                let first_st = first_label.try_get_key(b"/St")?.try_as_integer()?;
                 let idx_delta = new_start_idx.checked_sub(*last_index);
                 let st_delta = first_st
                     .and_then(|first_st| last_st.and_then(|last_st| first_st.checked_sub(last_st)));
@@ -511,15 +511,15 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         }
 
         let start = label
-            .try_get_key(b"St")?
+            .try_get_key(b"/St")?
             .try_as_integer()?
             .unwrap_or(1)
             .checked_add(offset)
             .ok_or_else(|| Error::Unsupported("page label /St offset overflow".to_string()))?;
         let result = ObjectHandle::dictionary(Vec::new());
-        result.replace_key(b"S", label.try_get_key(b"S")?);
-        result.replace_key(b"P", label.try_get_key(b"P")?);
-        result.replace_key(b"St", ObjectHandle::integer(start));
+        result.replace_key(b"/S", label.try_get_key(b"/S")?);
+        result.replace_key(b"/P", label.try_get_key(b"/P")?);
+        result.replace_key(b"/St", ObjectHandle::integer(start));
         Ok(Some(result))
     }
 
@@ -1161,26 +1161,29 @@ mod tests {
             .unwrap()
             .expect("unknown style range applies");
         assert_eq!(
-            unknown.try_get_key(b"S").unwrap().try_as_name().unwrap(),
+            unknown.try_get_key(b"/S").unwrap().try_as_name().unwrap(),
             Some(b"Z".to_vec())
         );
-        assert!(unknown.try_has_key(b"P").unwrap(), "empty /P is present");
-        assert_eq!(unknown.try_get_key(b"P").unwrap().as_string(), Some(vec![]));
-        assert_eq!(unknown.try_get_key(b"St").unwrap().as_integer(), Some(4));
+        assert!(unknown.try_has_key(b"/P").unwrap(), "empty /P is present");
+        assert_eq!(
+            unknown.try_get_key(b"/P").unwrap().as_string(),
+            Some(vec![])
+        );
+        assert_eq!(unknown.try_get_key(b"/St").unwrap().as_integer(), Some(4));
 
         let decimal = h
             .get_label_for_page(2)
             .unwrap()
             .expect("decimal range applies");
         assert_eq!(
-            decimal.try_get_key(b"S").unwrap().try_as_name().unwrap(),
+            decimal.try_get_key(b"/S").unwrap().try_as_name().unwrap(),
             Some(b"D".to_vec())
         );
         assert!(
-            !decimal.try_has_key(b"P").unwrap(),
+            !decimal.try_has_key(b"/P").unwrap(),
             "absent /P stays absent"
         );
-        assert_eq!(decimal.try_get_key(b"St").unwrap().as_integer(), Some(1));
+        assert_eq!(decimal.try_get_key(b"/St").unwrap().as_integer(), Some(1));
     }
 
     #[test]
@@ -1196,8 +1199,8 @@ mod tests {
 
         let source = pdf.get_object_handle(ObjectRef::new(11, 0));
         pdf.resolve_object_handle(&source).unwrap();
-        let source_style = source.try_get_key(b"S").unwrap();
-        let source_prefix = source.try_get_key(b"P").unwrap();
+        let source_style = source.try_get_key(b"/S").unwrap();
+        let source_prefix = source.try_get_key(b"/P").unwrap();
 
         let mut helper = pdf.page_labels();
         let result = helper
@@ -1206,11 +1209,11 @@ mod tests {
             .expect("label dictionary");
 
         assert!(result
-            .try_get_key(b"S")
+            .try_get_key(b"/S")
             .unwrap()
             .is_same_object_as(&source_style));
         assert!(result
-            .try_get_key(b"P")
+            .try_get_key(b"/P")
             .unwrap()
             .is_same_object_as(&source_prefix));
     }
@@ -1223,14 +1226,14 @@ mod tests {
             "§",
         );
         assert_eq!(
-            label.try_get_key(b"S").unwrap().try_as_name().unwrap(),
+            label.try_get_key(b"/S").unwrap().try_as_name().unwrap(),
             Some(b"A".to_vec())
         );
         assert_eq!(
-            label.try_get_key(b"P").unwrap().as_string(),
+            label.try_get_key(b"/P").unwrap().as_string(),
             Some(vec![0xa7])
         );
-        assert_eq!(label.try_get_key(b"St").unwrap().as_integer(), Some(3));
+        assert_eq!(label.try_get_key(b"/St").unwrap().as_integer(), Some(3));
 
         let ascii_prefix = PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(
             LabelStyle::Decimal,
@@ -1238,15 +1241,15 @@ mod tests {
             "A-",
         );
         assert_eq!(
-            ascii_prefix.try_get_key(b"P").unwrap().as_string(),
+            ascii_prefix.try_get_key(b"/P").unwrap().as_string(),
             Some(b"A-".to_vec())
         );
 
         let default =
             PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(LabelStyle::None, 1, "");
-        assert!(!default.try_has_key(b"S").unwrap());
-        assert!(!default.try_has_key(b"P").unwrap());
-        assert!(!default.try_has_key(b"St").unwrap());
+        assert!(!default.try_has_key(b"/S").unwrap());
+        assert!(!default.try_has_key(b"/P").unwrap());
+        assert!(!default.try_has_key(b"/St").unwrap());
     }
 
     #[test]
@@ -1276,25 +1279,25 @@ mod tests {
         assert_eq!(
             labels[0]
                 .1
-                .try_get_key(b"S")
+                .try_get_key(b"/S")
                 .unwrap()
                 .try_as_name()
                 .unwrap(),
             Some(b"r".to_vec())
         );
         assert_eq!(
-            labels[0].1.try_get_key(b"St").unwrap().as_integer(),
+            labels[0].1.try_get_key(b"/St").unwrap().as_integer(),
             Some(2)
         );
         assert_eq!(labels[1].0, 1);
-        assert!(labels[1].1.try_has_key(b"P").unwrap());
+        assert!(labels[1].1.try_has_key(b"/P").unwrap());
         assert_eq!(
-            labels[1].1.try_get_key(b"St").unwrap().as_integer(),
+            labels[1].1.try_get_key(b"/St").unwrap().as_integer(),
             Some(1)
         );
         assert_eq!(labels[2].0, 3);
         assert_eq!(
-            labels[2].1.try_get_key(b"St").unwrap().as_integer(),
+            labels[2].1.try_get_key(b"/St").unwrap().as_integer(),
             Some(10)
         );
     }
@@ -1305,7 +1308,7 @@ mod tests {
         let mut h = pdf.page_labels();
         let prior =
             PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(LabelStyle::Decimal, 1, "");
-        prior.replace_key(b"St", ObjectHandle::integer(1));
+        prior.replace_key(b"/St", ObjectHandle::integer(1));
         let mut labels = vec![(0, prior)];
 
         h.get_labels_for_page_range(1, 1, 1, &mut labels).unwrap();
@@ -1324,7 +1327,7 @@ mod tests {
         assert_eq!(labels.len(), 2);
         assert_eq!(labels[1].0, 0);
         assert_eq!(
-            labels[1].1.try_get_key(b"St").unwrap().as_integer(),
+            labels[1].1.try_get_key(b"/St").unwrap().as_integer(),
             Some(1)
         );
     }
