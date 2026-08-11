@@ -1175,6 +1175,34 @@ mod byte_gate {
         }
     }
 
+    /// Return one object body from a QDF output. The hidden-collision gate
+    /// deliberately inspects dictionaries rather than searching the whole
+    /// file, since the same resource operand appears in both copied `/DA`
+    /// strings and appearance-stream content.
+    fn qdf_object(output: &[u8], object_number: u32) -> &[u8] {
+        let marker = format!("{object_number} 0 obj\n");
+        let start = output
+            .windows(marker.len())
+            .position(|window| window == marker.as_bytes())
+            .expect("QDF object marker must exist");
+        let body = &output[start + marker.len()..];
+        let end_marker = b"\nendobj";
+        let end = body
+            .windows(end_marker.len())
+            .position(|window| window == end_marker)
+            .expect("QDF object terminator must exist");
+        &body[..end]
+    }
+
+    fn qdf_object_contains(object: &[u8], needle: &[u8], context: &str) {
+        let needle_text = String::from_utf8_lossy(needle);
+        assert!(
+            object.windows(needle.len()).any(|window| window == needle),
+            "{context}: QDF object is missing {:?}",
+            needle_text
+        );
+    }
+
     #[test]
     fn three_page_overlay_one_page_is_byte_identical() {
         // dest = three-page.pdf, source = one-page.pdf.
@@ -1682,6 +1710,124 @@ mod byte_gate {
         assert_byte_identical(&actual, "overlay-onto-existing-acroform-dr.pdf");
     }
     // cov:ignore-end
+
+    /// Record the qpdf divergence for a destination `/DR/Font` whose direct
+    /// category dictionary contains an indirect nested dictionary and an
+    /// existing `/F1_1` key. qpdf's `getResourceNames` sees only keys inside
+    /// the nested dictionary (`QPDFObjectHandle.cc:1155-1172`), so its
+    /// `mergeResources` collision path chooses `/F1_1` and overwrites the
+    /// existing direct key. flpdf's `unique_dr_name` scans the direct
+    /// category keys and chooses `/F1_2` instead. This is evidence for the
+    /// follow-up parity fix; it is intentionally not a byte-identity gate.
+    #[test]
+    fn overlay_copy_annotations_indirect_font_hidden_collision_records_qpdf_divergence() {
+        let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        let expected = golden("overlay-dr-merge-hidden-collision.pdf");
+
+        assert_ne!(
+            actual, expected,
+            "the hidden collision must remain a recorded qpdf/flpdf divergence"
+        );
+        // Inspect the copied field dictionaries themselves. A whole-file
+        // marker search is insufficient because the same operand also occurs
+        // in copied AP stream content and could mask a broken `/DA` rewrite.
+        for field_ref in [5, 6] {
+            let qpdf_field = qdf_object(&expected, field_ref);
+            let flpdf_field = qdf_object(&actual, field_ref);
+            qdf_object_contains(
+                qpdf_field,
+                b"/DA (0 0.4 0 rg /F1_1 18 Tf)",
+                "qpdf copied field /DA",
+            );
+            assert!(
+                !qpdf_field
+                    .windows(b"/F1_2 18 Tf".len())
+                    .any(|window| window == b"/F1_2 18 Tf"),
+                "qpdf copied field must not use /F1_2 in /DA"
+            );
+            qdf_object_contains(
+                flpdf_field,
+                b"/DA (0 0.4 0 rg /F1_2 18 Tf)",
+                "flpdf copied field /DA",
+            );
+            assert!(
+                !flpdf_field
+                    .windows(b"/F1_1 18 Tf".len())
+                    .any(|window| window == b"/F1_1 18 Tf"),
+                "flpdf copied field must expose its direct-key scan as /F1_2"
+            );
+        }
+
+        // Inspect the resource dictionaries behind those operands. Object 4
+        // is the copied field's `/DR`; object 31 is the `/Resources` of its
+        // `/AP/N` stream (object 12). Operand-only assertions would not catch
+        // either dictionary mapping being wrong while the bytes still contain
+        // the expected marker.
+        let qpdf_dr = qdf_object(&expected, 4);
+        qdf_object_contains(qpdf_dr, b"/F1 10 0 R", "qpdf /DR Helvetica mapping");
+        qdf_object_contains(qpdf_dr, b"/F1_1 11 0 R", "qpdf /DR Courier mapping");
+        assert!(
+            !qpdf_dr
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "qpdf /DR must not map Courier through /F1_2"
+        );
+
+        let flpdf_dr = qdf_object(&actual, 4);
+        qdf_object_contains(
+            flpdf_dr,
+            b"/F1 10 0 R",
+            "flpdf /DR original Helvetica mapping",
+        );
+        qdf_object_contains(
+            flpdf_dr,
+            b"/F1_1 10 0 R",
+            "flpdf /DR hidden direct-key mapping",
+        );
+        qdf_object_contains(flpdf_dr, b"/F1_2 11 0 R", "flpdf /DR Courier mapping");
+
+        let qpdf_ap_resources = qdf_object(&expected, 31);
+        qdf_object_contains(
+            qpdf_ap_resources,
+            b"/F1_1 11 0 R",
+            "qpdf AP `/Resources` Courier mapping",
+        );
+        assert!(
+            !qpdf_ap_resources
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "qpdf AP `/Resources` must not use /F1_2"
+        );
+
+        let flpdf_ap_resources = qdf_object(&actual, 31);
+        qdf_object_contains(
+            flpdf_ap_resources,
+            b"/F1_2 11 0 R",
+            "flpdf AP `/Resources` Courier mapping",
+        );
+        assert!(
+            !flpdf_ap_resources
+                .windows(b"/F1_1 11 0 R".len())
+                .any(|window| window == b"/F1_1 11 0 R"),
+            "flpdf AP `/Resources` must expose /F1_2"
+        );
+    }
 
     /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
     /// onto a dest with no `/AcroForm`. Exercises qpdf's
