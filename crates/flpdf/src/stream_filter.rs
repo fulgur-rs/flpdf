@@ -2897,6 +2897,7 @@ pub(crate) mod tests {
         finish_attempts: usize,
         fail_write: bool,
         fail_finish: bool,
+        #[cfg(feature = "qpdf-libjpeg-compat")]
         panic_write: bool,
     }
 
@@ -2907,6 +2908,7 @@ pub(crate) mod tests {
 
         fn write(&mut self, data: &[u8]) -> PipelineResult<()> {
             self.write_attempts += 1;
+            #[cfg(feature = "qpdf-libjpeg-compat")]
             if self.panic_write {
                 panic!("dct test downstream panic");
             }
