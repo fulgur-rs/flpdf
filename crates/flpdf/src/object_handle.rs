@@ -12557,7 +12557,7 @@ pub(crate) mod warning_emission_tests {
         (handle, recorder)
     }
 
-    fn warnings(recorder: &Rc<WarningRecorder>) -> Vec<String> {
+    pub(crate) fn warnings(recorder: &Rc<WarningRecorder>) -> Vec<String> {
         recorder.warnings.borrow().clone()
     }
 

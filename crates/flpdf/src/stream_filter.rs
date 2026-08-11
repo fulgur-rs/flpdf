@@ -781,12 +781,12 @@ fn decode_params_from_entries(
     let crypt_stage = is_crypt_filter(filter_name);
     let retained = entries
         .iter()
-        .filter_map(|(key, value)| {
+        .filter(|(key, _)| retains_decode_param_key(legacy_dictionary_key(key), crypt_stage))
+        .map(|(key, value)| {
             let logical_key = legacy_dictionary_key(key);
-            retains_decode_param_key(logical_key, crypt_stage)
-                .then(|| (logical_key.to_vec(), param_value_without_resolving(value)))
+            Ok((logical_key.to_vec(), param_value_without_resolving(value)?))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(DecodeParams::Present(retained))
 }
 
@@ -802,7 +802,7 @@ fn decode_params_from_entries(
 /// is unchanged; only the payload is dropped.
 fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<ParamValue> {
     if let Some(int) = value.try_as_integer()? {
-        return Ok(ParamValue::Int(clamp_to_i32(int)));
+        return Ok(ParamValue::Int(clamp_handle_value_to_i32(int, value)?));
     }
     Ok(match value.try_as_name()? {
         Some(name) if keeps_name => ParamValue::Name(name),
@@ -842,10 +842,10 @@ fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<Par
 /// single [`ParamValue`]. What must not vary is `Absent` vs `Present`, and
 /// that is decided upstream by the two unconditional calls on the parameter
 /// handle itself.
-fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
+fn param_value_without_resolving(value: &ObjectHandle) -> Result<ParamValue> {
     match value.as_integer() {
-        Some(int) => ParamValue::Int(clamp_to_i32(int)),
-        None => ParamValue::Other,
+        Some(int) => Ok(ParamValue::Int(clamp_handle_value_to_i32(int, value)?)),
+        None => Ok(ParamValue::Other),
     }
 }
 
@@ -1480,20 +1480,29 @@ fn keeps_crypt_name_payload(key: &[u8], crypt_stage: bool) -> bool {
     crypt_stage && CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS.contains(&key)
 }
 
-/// Apply `getIntValueAsInt`'s saturation (`QPDFObjectHandle.cc:531-538`), which
-/// pins a value below `INT_MIN` to `INT_MIN` and one above `INT_MAX` to
-/// `INT_MAX` rather than failing — so a `/Columns` far beyond `INT_MAX` behaves
-/// as `INT_MAX` does.
-///
-/// qpdf also emits `warnIfPossible("requested value of integer is too small;
-/// returning INT_MIN")` (and the `INT_MAX` counterpart) on those two branches;
-/// flpdf does not reproduce those diagnostics, only the value.
+/// Apply `getIntValueAsInt`'s value saturation
+/// (`QPDFObjectHandle.cc:525-543`), which pins a value below `INT_MIN` to
+/// `INT_MIN` and one above `INT_MAX` to `INT_MAX` rather than failing.
 ///
 /// This is the shape-independent half of the parity, kept separate from
 /// `clamped_int_param` so a second `/DecodeParms` shape reader clamps through
 /// this one copy instead of restating the bounds.
 fn clamp_to_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Apply qpdf's saturation and its `warnIfPossible` diagnostics to a live
+/// handle. `QPDFObjectHandle::getIntValueAsInt` calls `warnIfPossible` only
+/// after the caller has established that the value is an integer
+/// (`SF_FlateLzwDecode.cc:34-57`), so this helper deliberately does not emit a
+/// type warning for names or other non-integer values.
+fn clamp_handle_value_to_i32(value: i64, handle: &ObjectHandle) -> Result<i32> {
+    if value < i64::from(i32::MIN) {
+        handle.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
+    } else if value > i64::from(i32::MAX) {
+        handle.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
+    }
+    Ok(clamp_to_i32(value))
 }
 
 /// Read an `Object` the way qpdf reads a `/DecodeParms` value: `None` for every
@@ -2355,17 +2364,17 @@ pub(crate) mod tests {
     use super::{
         decode_filter_specs_from_handle, decode_filter_specs_from_object,
         decode_filter_specs_from_object_with_resolver, decode_flate, decode_flate_chunks,
-        decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
-        ignore_warning, keeps_crypt_name_payload, normalize_filter_name, stream_filter_for,
-        Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter, DecodeParams, FilterSpec,
-        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline, PipelineError,
-        PipelineResult, RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
-        RETAINED_DECODE_PARAM_KEYS,
+        decode_params_from_handle, decode_params_from_object, encode_flate, encode_run_length,
+        ignore_codec_warning, ignore_warning, keeps_crypt_name_payload, normalize_filter_name,
+        param_value_from_handle, stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter,
+        CryptStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle,
+        OutputBuffer, ParamValue, Pipeline, PipelineError, PipelineResult, RunLengthStreamFilter,
+        StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
     };
-    use crate::object_handle::warning_emission_tests::handle_resolving;
+    use crate::object_handle::warning_emission_tests::{handle_resolving, warnings};
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
@@ -6114,6 +6123,57 @@ pub(crate) mod tests {
             ]))))
         );
         assert_eq!((filter.columns, filter.colors), (i32::MAX, i32::MIN));
+    }
+
+    #[test]
+    fn handle_decode_params_warn_when_integer_values_are_saturated() {
+        let cases = [
+            (
+                i64::from(i32::MIN) - 1,
+                ParamValue::Int(i32::MIN),
+                "object 3 0: requested value of integer is too small; returning INT_MIN",
+            ),
+            (
+                i64::from(i32::MAX) + 1,
+                ParamValue::Int(i32::MAX),
+                "object 3 0: requested value of integer is too big; returning INT_MAX",
+            ),
+        ];
+
+        for (value, expected, warning) in cases {
+            let (handle, recorder) = handle_resolving(ObjectValue::Integer(value));
+
+            assert_eq!(param_value_from_handle(&handle, false).unwrap(), expected);
+            assert_eq!(warnings(&recorder), [warning]);
+        }
+    }
+
+    #[test]
+    fn snapshot_decode_params_warn_after_an_integer_was_already_resolved() {
+        let value = i64::from(i32::MAX) + 1;
+        let (child, recorder) = handle_resolving(ObjectValue::Integer(value));
+        assert_eq!(child.try_as_integer().unwrap(), Some(value));
+
+        let params = ObjectHandle::dictionary(vec![(b"/Columns".to_vec(), child)]);
+        assert_eq!(
+            decode_params_from_handle(&params, b"ASCIIHexDecode").unwrap(),
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(i32::MAX)),])
+        );
+        assert_eq!(
+            warnings(&recorder),
+            ["object 3 0: requested value of integer is too big; returning INT_MAX"]
+        );
+    }
+
+    #[test]
+    fn handle_decode_param_names_do_not_emit_integer_warnings() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Name(b"Identity".to_vec()));
+
+        assert_eq!(
+            param_value_from_handle(&handle, true).unwrap(),
+            ParamValue::Name(b"Identity".to_vec())
+        );
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]
