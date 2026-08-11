@@ -1303,6 +1303,61 @@ mod tests {
         assert!(font.get("C_2").is_none());
     }
 
+    #[test]
+    fn adjust_appearance_stream_propagates_resource_name_resolution_error() {
+        // Keep object 8 lazy and malformed: unknown references resolve to
+        // qpdf-shaped null, so the error path needs a real parser error from
+        // an indexed object rather than a dangling object number.
+        let bodies: &[&[u8]] = &[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            b"2 0 obj\nnull\nendobj\n",
+            b"3 0 obj\nnull\nendobj\n",
+            b"4 0 obj\nnull\nendobj\n",
+            b"5 0 obj\nnull\nendobj\n",
+            b"6 0 obj\nnull\nendobj\n",
+            b"7 0 obj\nnull\nendobj\n",
+            b"8 0 obj\n<<",
+        ];
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let mut offsets = Vec::new();
+        for body in bodies {
+            offsets.push(bytes.len() as u64);
+            bytes.extend_from_slice(body);
+        }
+        let xref_start = bytes.len();
+        bytes.extend_from_slice(b"xref\n0 9\n0000000000 65535 f \n");
+        for offset in offsets {
+            bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!("trailer\n<< /Size 9 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("malformed object must stay lazy");
+        let broken_resource_ref = set_dict(
+            &mut pdf,
+            5,
+            &[("Broken", Object::Reference(ObjectRef::new(8, 0)))],
+        );
+        let f1_ref = set_dict(&mut pdf, 6, &[]);
+        let f1_1_ref = set_dict(&mut pdf, 7, &[]);
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F0", Object::Reference(broken_resource_ref));
+        font_dict.insert("F1", Object::Reference(f1_ref));
+        font_dict.insert("F1_1", Object::Reference(f1_1_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 18 Tf",
+        );
+        let dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+
+        assert!(adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).is_err());
+    }
+
     /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its
     /// own literal code (codes 0-255 are always literal single-byte table
     /// entries per PDF §7.4.4), followed by EOD (257). Every code stays 9
