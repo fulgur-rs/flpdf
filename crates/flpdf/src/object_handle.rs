@@ -66,14 +66,11 @@ use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
 
 /// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
-#[allow(dead_code)]
 pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
 
 /// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
-#[allow(dead_code)]
 pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
-#[allow(dead_code)]
 struct StreamFilterPlan {
     filters: Vec<Box<dyn StreamFilter>>,
     specialized_compression: bool,
@@ -350,6 +347,8 @@ impl std::fmt::Debug for ObjectHandle {
             .field("object_ref", &slot.object_ref)
             .field("state", &state)
             .field("parsed_offset", &slot.parsed_offset)
+            .field("end_before_space", &slot.end_before_space)
+            .field("end_after_space", &slot.end_after_space)
             .finish()
     }
 }
@@ -423,6 +422,8 @@ struct ObjectSlot {
     active_pdf_unique_id: Option<u64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
     parsed_offset: i64,
+    end_before_space: i64,
+    end_after_space: i64,
     pdf_unique_ids: BTreeSet<u64>,
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
     description: Option<ObjectDescription>,
@@ -744,6 +745,8 @@ impl ObjectHandle {
             active_pdf_unique_id: pdf_unique_id,
             resolver,
             parsed_offset: NO_PARSED_OFFSET,
+            end_before_space: NO_PARSED_OFFSET,
+            end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
@@ -765,6 +768,8 @@ impl ObjectHandle {
             active_pdf_unique_id: None,
             resolver,
             parsed_offset,
+            end_before_space: NO_PARSED_OFFSET,
+            end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
@@ -930,15 +935,22 @@ impl ObjectHandle {
     /// fields remain attached to the promoted value
     /// (`libqpdf/QPDF.cc:1882-1898`).
     pub(crate) fn copy_description_and_parsed_offset_to(&self, target: &Self) {
-        let (description, parsed_offset) = {
+        let (description, parsed_offset, end_before_space, end_after_space) = {
             let slot = self.0.borrow();
-            (slot.description.clone(), slot.parsed_offset)
+            (
+                slot.description.clone(),
+                slot.parsed_offset,
+                slot.end_before_space,
+                slot.end_after_space,
+            )
         };
         let mut target_slot = target.0.borrow_mut();
         target_slot.description = description;
         if target_slot.parsed_offset < 0 {
             target_slot.parsed_offset = parsed_offset;
         }
+        target_slot.end_before_space = end_before_space;
+        target_slot.end_after_space = end_after_space;
     }
 
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
@@ -1018,6 +1030,8 @@ impl ObjectHandle {
                     _ => None,
                 };
                 slot.parsed_offset = NO_PARSED_OFFSET;
+                slot.end_before_space = NO_PARSED_OFFSET;
+                slot.end_after_space = NO_PARSED_OFFSET;
                 slot.description = None;
                 old_value
             };
@@ -1077,16 +1091,22 @@ impl ObjectHandle {
                 ObjectState::Resolved(value) => {
                     slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
                     Some(value)
                 }
                 ObjectState::NotYetResolved => {
                     slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
                     None
                 }
                 ObjectState::Destroyed => {
                     slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
                     None
                 }
             }
@@ -1685,6 +1705,22 @@ impl ObjectHandle {
         if slot.parsed_offset < 0 {
             slot.parsed_offset = offset;
         }
+    }
+
+    /// Record qpdf's source extent metadata updated alongside a cache value by
+    /// `QPDF::updateCache` (`libqpdf/QPDF.cc:1843-1858`). These offsets are
+    /// distinct from the value's parsed/token offset: they bracket the
+    /// indirect object's `endobj` token and the whitespace following it.
+    pub(crate) fn set_end_offsets(&self, end_before_space: i64, end_after_space: i64) {
+        let mut slot = self.0.borrow_mut();
+        slot.end_before_space = end_before_space;
+        slot.end_after_space = end_after_space;
+    }
+
+    /// Return qpdf's cached source extent metadata for this value.
+    pub(crate) fn end_offsets(&self) -> (i64, i64) {
+        let slot = self.0.borrow();
+        (slot.end_before_space, slot.end_after_space)
     }
 
     /// Construct a direct null value.
@@ -2469,7 +2505,8 @@ impl ObjectHandle {
     /// the stream filters are added in reverse `/Filter` order. The source
     /// is finally dispatched through the completed chain without a legacy
     /// `Object` materialization.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(dead_code)] // writer/inspection consumers are not on the canonical resolver route yet.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pipe_stream_data(
         &self,
         pipeline: &mut dyn Pipeline,
@@ -2478,6 +2515,53 @@ impl ObjectHandle {
         decode_level: DecodeLevel,
         suppress_warnings: bool,
         will_retry: bool,
+    ) -> Result<bool> {
+        self.pipe_stream_data_inner(
+            pipeline,
+            filtering_attempted,
+            encode_flags,
+            decode_level,
+            suppress_warnings,
+            will_retry,
+            false,
+        )
+    }
+
+    /// The object-stream resolver uses qpdf's resolve-time catch boundary for
+    /// codec failures raised while decoding replaced stream data. Ordinary
+    /// callers keep the original pipeline error so writer and inspection
+    /// paths do not silently turn their own sink failures into recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pipe_stream_data_for_object_stream(
+        &self,
+        pipeline: &mut dyn Pipeline,
+        filtering_attempted: &mut bool,
+        encode_flags: u32,
+        decode_level: DecodeLevel,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        self.pipe_stream_data_inner(
+            pipeline,
+            filtering_attempted,
+            encode_flags,
+            decode_level,
+            suppress_warnings,
+            will_retry,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_stream_data_inner(
+        &self,
+        pipeline: &mut dyn Pipeline,
+        filtering_attempted: &mut bool,
+        encode_flags: u32,
+        decode_level: DecodeLevel,
+        suppress_warnings: bool,
+        will_retry: bool,
+        recover_codec_errors: bool,
     ) -> Result<bool> {
         self.try_dereference()?;
         let Some((stream_dict, stream_data, stream_length)) =
@@ -2505,6 +2589,7 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
+                false,
             );
         }
 
@@ -2516,6 +2601,7 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
+                false,
             );
         };
         if (plan.lossy_compression && decode_level < DecodeLevel::All)
@@ -2528,11 +2614,13 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
+                false,
             );
         }
 
         *filtering_attempted = true;
         let mut head = PipelineRef::Borrowed(pipeline);
+        let warning_delivery_error: Rc<RefCell<Option<Error>>> = Rc::new(RefCell::new(None));
         let normalization_warnings =
             if encode_flags & STREAM_ENCODE_NORMALIZE != 0 && !suppress_warnings {
                 Some(Rc::new(RefCell::new(Vec::new())))
@@ -2562,10 +2650,16 @@ impl ObjectHandle {
 
         for filter in plan.filters.iter_mut().rev() {
             let warning_handle = self.clone();
+            let warning_delivery_error = Rc::clone(&warning_delivery_error);
             filter.set_warning_callback(Box::new(move |message, _code| {
-                warning_handle
-                    .object_warning(message)
-                    .map_err(|error| PipelineError::runtime(error.to_string()))
+                match warning_handle.object_warning(message) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        *warning_delivery_error.borrow_mut() = Some(error);
+                        Err(PipelineError::runtime(error_message))
+                    }
+                }
             }));
             head = match filter.decode_pipeline_owned(head)? {
                 OwnedDecodePipeline::Stage(stage) => PipelineRef::Owned(stage),
@@ -2573,14 +2667,24 @@ impl ObjectHandle {
             };
         }
 
-        let success = self.pipe_stream_source(
-            &stream_dict,
-            stream_data,
-            stream_length,
-            &mut head,
-            suppress_warnings,
-            will_retry,
-        )?;
+        let success = self
+            .pipe_stream_source(
+                &stream_dict,
+                stream_data,
+                stream_length,
+                &mut head,
+                suppress_warnings,
+                will_retry,
+                recover_codec_errors,
+            )
+            .map_err(|error| warning_delivery_error.borrow_mut().take().unwrap_or(error))?;
+        if let Some(error) = warning_delivery_error.borrow_mut().take() {
+            // A source-backed decoder can recover its codec failure and
+            // return `false` after the warning callback itself failed. Keep
+            // that callback error visible to the resolver instead of
+            // converting the member to qpdf's ordinary null fallback.
+            return Err(error);
+        }
         if !success {
             *filtering_attempted = false;
         }
@@ -2594,7 +2698,6 @@ impl ObjectHandle {
         Ok(success)
     }
 
-    #[allow(dead_code)]
     fn prepare_stream_filter_plan(
         &self,
         stream_dict: &ObjectHandle,
@@ -2740,9 +2843,11 @@ impl ObjectHandle {
             pipeline,
             false,
             false,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pipe_stream_source(
         &self,
         stream_dict: &ObjectHandle,
@@ -2751,10 +2856,15 @@ impl ObjectHandle {
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
+        recover_codec_errors: bool,
     ) -> Result<bool> {
         if let Some(stream_data) = stream_data {
-            pipeline.write(&stream_data)?;
-            pipeline.finish()?;
+            pipeline
+                .write(&stream_data)
+                .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
+            pipeline
+                .finish()
+                .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
             return Ok(true);
         }
 
@@ -2789,6 +2899,18 @@ impl ObjectHandle {
             suppress_warnings,
             will_retry,
         )
+    }
+
+    fn map_stream_pipeline_error(error: PipelineError, recover_codec_errors: bool) -> Error {
+        if recover_codec_errors {
+            if let PipelineError::Runtime(message) = error {
+                return Error::Unsupported(format!(
+                    "error decoding stream data: {}",
+                    message.into_string_lossy()
+                ));
+            }
+        }
+        error.into()
     }
 
     /// The value as raw operator bytes if this handle's value — its own if
@@ -8972,6 +9094,18 @@ mod mutation_tests {
         assert!(success);
         assert!(filtering_attempted);
         assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn stream_pipeline_error_mapping_keeps_non_codec_errors_fatal() {
+        assert!(matches!(
+            ObjectHandle::map_stream_pipeline_error(PipelineError::logic("sink failed"), true),
+            Error::Internal(message) if message == "sink failed"
+        ));
+        assert!(matches!(
+            ObjectHandle::map_stream_pipeline_error(PipelineError::runtime("sink failed"), false),
+            Error::System(message) if message == "sink failed"
+        ));
     }
 
     #[test]

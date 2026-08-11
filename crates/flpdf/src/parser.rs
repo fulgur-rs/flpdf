@@ -1505,7 +1505,13 @@ mod live_input_tests {
             .expect("empty handle object");
         assert!(matches!(value, ObjectValue::Null));
         assert_eq!(parsed_offset, super::NO_PARSED_OFFSET);
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            diagnostics,
+            vec![super::ParserDiagnostic {
+                relative_offset: 2,
+                message: "empty object treated as null".to_string(),
+            }]
+        );
 
         let mut rebasing = super::OffsetHandleResolver {
             resolver: &mut resolver,
@@ -1658,8 +1664,15 @@ pub(crate) fn parse_qpdf_direct_object_handle_with_diagnostics(
         top_level_offset,
     };
     let parsed = parse_live_file_object(&mut input_source, &mut rebasing_resolver)?;
-    if parsed.empty.is_some() {
-        return Ok((ObjectValue::Null, NO_PARSED_OFFSET, Vec::new()));
+    if let Some(empty_offset) = parsed.empty {
+        return Ok((
+            ObjectValue::Null,
+            NO_PARSED_OFFSET,
+            vec![ParserDiagnostic {
+                relative_offset: usize::try_from(empty_offset).unwrap_or(usize::MAX),
+                message: "empty object treated as null".to_string(),
+            }],
+        ));
     }
 
     let handle = parsed.value;
