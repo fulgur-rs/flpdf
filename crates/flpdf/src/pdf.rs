@@ -116,7 +116,7 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// [`Pdf::delete_object`] so the next resolve re-derives from the
     /// updated handle.
     pub(crate) legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
-    /// Entries in [`legacy_materialized_memo`] that are authoritative
+    /// Entries in [`Self::legacy_materialized_memo`] that are authoritative
     /// caller-supplied replacements which still need to be lifted into the
     /// canonical handle graph. Compatibility snapshots populated by
     /// [`Pdf::resolve_borrowed`] are deliberately not included: reconciling
