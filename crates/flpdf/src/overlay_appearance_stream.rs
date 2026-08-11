@@ -218,24 +218,24 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
         // names the SAME object elsewhere in `subdict` (an `ObjectRef`
         // identity scan, qpdf's `og_to_name`), else mint a fresh name.
         //
-        // `og_to_name`'s lazy-init-then-FROZEN lifecycle (qpdf
+        // `og_to_name` and `rnames`' lazy-init-then-FROZEN lifecycle (qpdf
         // `libqpdf/QPDFObjectHandle.cc`, `mergeResources`, the
         // `initialized_maps` guard around `make_og_to_name`, verified
         // against the live source — line numbers below are from qpdf
         // `main` as fetched, not the finding's cited
         // `QPDFAcroFormDocumentHelper.cc:791-816`, which was for a
         // different, older qpdf revision):
-        //   - `og_to_name` is built EXACTLY ONCE, lazily, the first time a
+        //   - Both maps are built EXACTLY ONCE, lazily, the first time a
         //     staged key collides with an occupied `subdict` slot (a
-        //     genuine conflict, not a phase-1-vacated slot) — so it DOES
+        //     genuine conflict, not a phase-1-vacated slot) — so they DO
         //     see any vacated-slot reinstates that happened EARLIER in
         //     THIS SAME staged loop (they already mutated `subdict`/
         //     `this_val` by then).
-        //   - Once built, it is NEVER updated again for the rest of this
+        //   - Once built, neither map is EVER updated again for the rest of
         //     resource-type's staged loop — neither by a LATER vacated-slot
         //     reinstate, nor by a freshly-minted alias from a LATER genuine
         //     conflict (`this_val.replaceKey(new_key, rval)` in qpdf's
-        //     `else` branch does not touch `og_to_name`).
+        //     `else` branch does not touch either map).
         // Concretely: two genuine conflicts on the SAME object each mint
         // their OWN fresh alias (no reuse between them) — reuse only
         // happens when one of the two colliding values was already visible
@@ -259,20 +259,26 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
                     subdict.insert(key, rval);
                     continue;
                 }
-                // Genuine conflict — snapshot `subdict` into `ref_to_key`
-                // lazily, on the FIRST such conflict only (`og_to_name`'s
-                // `initialized_maps` guard). This snapshot legitimately
-                // includes any vacated-slot reinstates already applied
-                // above in this same loop.
-                let snapshot = ref_to_key.get_or_insert_with(|| {
+                // Genuine conflict — snapshot both qpdf maps lazily, on the
+                // FIRST such conflict only (`og_to_name`'s
+                // `initialized_maps` guard). These snapshots legitimately
+                // include any vacated-slot reinstates already applied above
+                // in this same loop, and neither map changes afterward.
+                if ref_to_key.is_none() {
                     let mut m = std::collections::HashMap::new();
                     for (k, v) in subdict.iter() {
                         if let Some(r) = v.as_ref_id() {
                             m.insert(r, k.to_vec());
                         }
                     }
-                    m
-                });
+                    ref_to_key = Some(m);
+                    resource_names = Some(crate::overlay_annotations::get_resource_names(
+                        dest, &subdict,
+                    )?);
+                }
+                let snapshot = ref_to_key
+                    .as_ref()
+                    .expect("identity map initialized on first AP conflict");
                 let reused = rval.as_ref_id().and_then(|r| snapshot.get(&r).cloned());
                 if let Some(existing_key) = reused {
                     // `existing_key == key` (no rename needed — the
@@ -283,18 +289,11 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
                         local_dr_map.insert_rename(category, key, existing_key);
                     }
                 } else {
-                    let fresh_name = if let Some(names) = resource_names.as_ref() {
-                        crate::overlay_annotations::unique_dr_name(&key, names, &mut min_suffix)?
-                    } else {
-                        let names = crate::overlay_annotations::get_resource_names(dest, &subdict)?;
-                        let fresh_name = crate::overlay_annotations::unique_dr_name(
-                            &key,
-                            &names,
-                            &mut min_suffix,
-                        )?; // cov:ignore: trailing `)?;` on a multi-line call — llvm-cov attributes it to the unreachable suffix-exhaustion Err path
-                        resource_names = Some(names);
-                        fresh_name
-                    };
+                    let names = resource_names
+                        .as_ref()
+                        .expect("resource-name pool initialized on first AP conflict");
+                    let fresh_name =
+                        crate::overlay_annotations::unique_dr_name(&key, names, &mut min_suffix)?;
                     subdict.insert(fresh_name.clone(), rval);
                     local_dr_map.insert_rename(category, key, fresh_name);
                 }
@@ -1242,6 +1241,66 @@ mod tests {
             "no fresh alias minted for F4 — it reuses F1_1 by ObjectRef \
              identity instead"
         );
+    }
+
+    #[test]
+    fn adjust_appearance_stream_freezes_name_pool_with_identity_snapshot() {
+        let mut pdf = open_minimal();
+        let shared_ref = ObjectRef::new(5, 0);
+        let temp_a_ref = ObjectRef::new(6, 0);
+        let temp_b_ref = ObjectRef::new(7, 0);
+        let temp_c_ref = ObjectRef::new(8, 0);
+        let b_original_ref = ObjectRef::new(9, 0);
+        let c_original_ref = ObjectRef::new(10, 0);
+        for object_ref in [
+            shared_ref,
+            temp_a_ref,
+            temp_b_ref,
+            temp_c_ref,
+            c_original_ref,
+        ] {
+            pdf.set_object(object_ref, Object::Dictionary(Dictionary::new()));
+        }
+        let mut b_original = Dictionary::new();
+        b_original.insert("C_1", Object::Name(b"Inserted".to_vec()));
+        pdf.set_object(b_original_ref, Object::Dictionary(b_original));
+
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F0", Object::Reference(shared_ref));
+        font_dict.insert("A", Object::Reference(shared_ref));
+        font_dict.insert("A0", Object::Reference(temp_a_ref));
+        font_dict.insert("A1", Object::Reference(temp_b_ref));
+        font_dict.insert("A2", Object::Reference(temp_c_ref));
+        font_dict.insert("B", Object::Reference(b_original_ref));
+        font_dict.insert("C", Object::Reference(c_original_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/C 12 Tf",
+        );
+        let mut dr_map = dr_map_with(b"Font", b"A0", b"A");
+        dr_map.insert_rename(b"Font", b"A1".to_vec(), b"B".to_vec());
+        dr_map.insert_rename(b"Font", b"A2".to_vec(), b"C".to_vec());
+        dr_map.insert_rename(b"Font", b"B".to_vec(), b"D".to_vec());
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data, b"/C_1 12 Tf",
+            "the later fresh conflict must use the pool captured by the first conflict"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .expect("Resources should stay a direct (embedded) dictionary");
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(font.get_ref("C_1"), Some(c_original_ref));
+        assert!(font.get("C_2").is_none());
     }
 
     /// Pack literal bytes as a minimal `/LZWDecode` stream: each byte is its

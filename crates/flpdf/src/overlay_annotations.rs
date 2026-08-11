@@ -1516,7 +1516,7 @@ fn merge_resources_shallow<R: Read + Seek>(
             } // cov:ignore: closing brace of the `if let Object::Reference` — llvm-cov instrumentation artifact; the body is exercised by `merge_resources_shallow_reuses_preexisting_dest_ref_at_different_name`.
         }
 
-        // qpdf initializes this pool lazily on the first genuine collision
+        // qpdf initializes this pool lazily on the first occupied source key
         // and keeps it stable for the rest of this resource category
         // (`QPDFObjectHandle.cc:1108-1127`). It contains keys from the
         // dictionaries stored under the category's values, not the category's
@@ -1544,6 +1544,15 @@ fn merge_resources_shallow<R: Read + Seek>(
                     } // cov:ignore: closing brace of the `if let Some(source_ref)` — llvm-cov instrumentation artifact; the body is exercised by `merge_resources_shallow_reuses_verbatim_insert_from_same_source_ref`.
                 }
                 Some(existing_val) => {
+                    // qpdf snapshots both `og_to_name` and `rnames` before
+                    // deciding whether this occupied key is a same-object
+                    // no-op, an identity reuse, or a fresh-name collision.
+                    // In particular, a same-object collision must still
+                    // freeze the pool before later verbatim inserts can add
+                    // second-level names.
+                    if resource_names.is_none() {
+                        resource_names = Some(get_resource_names(dest, &new_type_dict)?);
+                    }
                     // Same-name collision. qpdf's short-circuit is object
                     // identity (QPDFObjGen), not deep equality — a direct
                     // (non-reference) value can never match here even if
@@ -1584,14 +1593,10 @@ fn merge_resources_shallow<R: Read + Seek>(
                             .insert(name.to_vec(), existing_new_name);
                         continue;
                     }
-                    let new_name = if let Some(names) = resource_names.as_ref() {
-                        unique_dr_name(name, names, &mut min_suffix)?
-                    } else {
-                        let names = get_resource_names(dest, &new_type_dict)?;
-                        let new_name = unique_dr_name(name, &names, &mut min_suffix)?;
-                        resource_names = Some(names);
-                        new_name
-                    };
+                    let names = resource_names
+                        .as_ref()
+                        .expect("resource-name pool initialized on occupied source key");
+                    let new_name = unique_dr_name(name, names, &mut min_suffix)?;
                     new_type_dict.insert(&new_name, val.clone());
                     dr_map
                         .by_name
@@ -1652,8 +1657,10 @@ pub(crate) fn unique_dr_name(
 
 /// qpdf's `QPDFObjectHandle::getResourceNames` (`QPDFObjectHandle.cc:1155-1172`):
 /// collect keys from the dictionaries stored under a resource category's
-/// values, resolving indirect values first. The category's own direct keys
-/// are intentionally not included.
+/// values, resolving indirect values first. Null-valued nested keys (including
+/// indirect references that resolve to null) are omitted by qpdf's
+/// `getKeys()` contract. The category's own direct keys are intentionally not
+/// included.
 pub(crate) fn get_resource_names<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     dict: &crate::Dictionary,
@@ -1665,7 +1672,16 @@ pub(crate) fn get_resource_names<R: Read + Seek>(
             _ => value.as_dict().cloned(),
         };
         if let Some(value_dict) = value_dict {
-            names.extend(value_dict.iter().map(|(key, _)| key.to_vec()));
+            for (key, nested_value) in value_dict.iter() {
+                let is_null = match nested_value {
+                    Object::Null => true,
+                    Object::Reference(reference) => pdf.resolve(*reference)?.is_null(),
+                    _ => false,
+                };
+                if !is_null {
+                    names.insert(key.to_vec());
+                }
+            }
         }
     }
     Ok(names)
@@ -2075,11 +2091,30 @@ mod tests {
     }
 
     #[test]
-    fn get_resource_names_collects_second_level_keys_from_direct_and_indirect_values() {
+    fn get_resource_names_excludes_null_valued_second_level_keys() {
         let mut pdf = open_minimal();
-        let indirect_ref = set_dict(&mut pdf, 10, &[("IndirectName", Object::Null)]);
+        let indirect_null_ref = ObjectRef::new(11, 0);
+        pdf.set_object(indirect_null_ref, Object::Null);
+        let indirect_visible_ref = ObjectRef::new(12, 0);
+        pdf.set_object(
+            indirect_visible_ref,
+            Object::Name(b"IndirectVisible".to_vec()),
+        );
+        let indirect_ref = set_dict(
+            &mut pdf,
+            10,
+            &[
+                ("IndirectName", Object::Null),
+                ("IndirectNullRef", Object::Reference(indirect_null_ref)),
+                (
+                    "IndirectVisibleRef",
+                    Object::Reference(indirect_visible_ref),
+                ),
+            ],
+        );
         let mut direct_value = crate::Dictionary::new();
         direct_value.insert("DirectName", Object::Null);
+        direct_value.insert("DirectVisible", Object::Name(b"DirectVisible".to_vec()));
         let mut category = crate::Dictionary::new();
         category.insert("F0", Object::Dictionary(direct_value));
         category.insert("F1", Object::Reference(indirect_ref));
@@ -2087,8 +2122,11 @@ mod tests {
 
         let names = get_resource_names(&mut pdf, &category).unwrap();
 
-        assert!(names.contains(b"DirectName".as_slice()));
-        assert!(names.contains(b"IndirectName".as_slice()));
+        assert!(!names.contains(b"DirectName".as_slice()));
+        assert!(!names.contains(b"IndirectName".as_slice()));
+        assert!(!names.contains(b"IndirectNullRef".as_slice()));
+        assert!(names.contains(b"DirectVisible".as_slice()));
+        assert!(names.contains(b"IndirectVisibleRef".as_slice()));
         assert!(!names.contains(b"F0".as_slice()));
         assert!(!names.contains(b"F1".as_slice()));
     }
@@ -2165,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_resources_shallow_scans_past_taken_suffix_to_next_n() {
+    fn merge_resources_shallow_ignores_null_nested_key_when_minting_suffix() {
         let mut pdf = open_minimal();
         let helv_ref = set_dict(
             &mut pdf,
@@ -2177,8 +2215,8 @@ mod tests {
             11,
             &[
                 ("BaseFont", Object::Name(b"TimesRoman".to_vec())),
-                // qpdf's getResourceNames sees this second-level key even
-                // though it is not a direct `/Font` entry.
+                // qpdf's getResourceNames omits this null-valued second-level
+                // key even though it is present in the raw dictionary.
                 ("F1_1", Object::Null),
             ],
         );
@@ -2188,9 +2226,9 @@ mod tests {
             &[("BaseFont", Object::Name(b"Courier".to_vec()))],
         );
         // Pre-seed dest with BOTH F1 (which will collide with source) and
-        // F1_1 (an unrelated pre-existing entry). Its value exposes F1_1 in
-        // qpdf's second-level name pool, forcing the suffix scan to skip to
-        // F1_2 without relying on the category's direct key set.
+        // F1_1 (an unrelated pre-existing entry). Its null-valued nested key
+        // must not enter qpdf's second-level name pool, so the collision is
+        // allowed to overwrite the direct F1_1 key.
         let dest_dr = set_font_dr(&mut pdf, 2, &[("F1", helv_ref), ("F1_1", other_ref)]);
         let source_dr = set_font_dr(&mut pdf, 3, &[("F1", courier_ref)]);
 
@@ -2201,12 +2239,12 @@ mod tests {
             dr_map
                 .category(b"Font")
                 .and_then(|m| m.get(b"F1".as_slice())),
-            Some(&b"F1_2".to_vec())
+            Some(&b"F1_1".to_vec())
         );
         let font = font_dict(&mut pdf, dest_dr);
         assert_eq!(font.get_ref("F1"), Some(helv_ref));
-        assert_eq!(font.get_ref("F1_1"), Some(other_ref));
-        assert_eq!(font.get_ref("F1_2"), Some(courier_ref));
+        assert_eq!(font.get_ref("F1_1"), Some(courier_ref));
+        assert!(font.get("F1_2").is_none());
     }
 
     #[test]
@@ -2255,6 +2293,52 @@ mod tests {
         assert_eq!(font.get_ref("F1_1"), Some(source_f1));
         assert_eq!(font.get_ref("F2"), Some(dest_f2));
         assert_eq!(font.get_ref("F2_1"), Some(source_f2));
+    }
+
+    #[test]
+    fn merge_resources_shallow_freezes_name_pool_on_same_object_collision() {
+        let mut pdf = open_minimal();
+        let shared_ref = set_dict(
+            &mut pdf,
+            10,
+            &[("BaseFont", Object::Name(b"Helvetica".to_vec()))],
+        );
+        let dest_c_ref = set_dict(
+            &mut pdf,
+            11,
+            &[("BaseFont", Object::Name(b"Times-Roman".to_vec()))],
+        );
+        let inserted_b_ref = set_dict(&mut pdf, 12, &[("C_1", Object::Name(b"Inserted".to_vec()))]);
+        let source_c_ref = set_dict(
+            &mut pdf,
+            13,
+            &[("BaseFont", Object::Name(b"Courier".to_vec()))],
+        );
+        let dest_dr = set_font_dr(&mut pdf, 2, &[("A", shared_ref), ("C", dest_c_ref)]);
+        let source_dr = set_font_dr(
+            &mut pdf,
+            3,
+            &[
+                ("A", shared_ref),
+                ("B", inserted_b_ref),
+                ("C", source_c_ref),
+            ],
+        );
+
+        let mut dr_map = DrMap::new();
+        merge_resources_shallow(&mut pdf, dest_dr, source_dr, &mut dr_map).unwrap();
+
+        assert_eq!(
+            dr_map
+                .category(b"Font")
+                .and_then(|m| m.get(b"C".as_slice())),
+            Some(&b"C_1".to_vec()),
+            "the name pool must be frozen at the first occupied source key"
+        );
+        let font = font_dict(&mut pdf, dest_dr);
+        assert_eq!(font.get_ref("B"), Some(inserted_b_ref));
+        assert_eq!(font.get_ref("C_1"), Some(source_c_ref));
+        assert!(font.get("C_2").is_none());
     }
 
     /// Source `/DR/Font` is stored as an indirect reference (not a direct
@@ -2424,9 +2508,9 @@ mod tests {
             11,
             &[
                 ("BaseFont", Object::Name(b"Helvetica".to_vec())),
-                // After source A is installed, this second-level key keeps
-                // qpdf's next merge from reusing A's direct alias for B.
-                ("F1_1", Object::Null),
+                // After source A is installed, this non-null second-level key
+                // keeps qpdf's next merge from reusing A's direct alias for B.
+                ("F1_1", Object::Name(b"Reserved".to_vec())),
             ],
         );
         let courier_ref = set_dict(
