@@ -145,6 +145,47 @@ fn test_parsedoffset_rejects_an_enumerated_object_missing_from_xref() {
 }
 
 #[test]
+fn test_parsedoffset_preserves_repair_warnings_before_post_enumeration_failure() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let mut input_bytes = fs::read(fixture_path("test_driver/repairable_input.pdf"))
+        .expect("read repairable input");
+    let marker = b"/QTest true >>";
+    let marker_start = input_bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("repairable trailer marker");
+    let insert_at = marker_start + b"/QTest true".len();
+    input_bytes.splice(insert_at..insert_at, b" /Info 99 0 R".iter().copied());
+
+    let input = directory.path().join("repairable-with-dangling-info.pdf");
+    fs::write(&input, input_bytes).expect("write repaired-input variant");
+    let path = input.display();
+
+    let output = Command::cargo_bin("test_parsedoffset")
+        .expect("test_parsedoffset binary")
+        .arg(&input)
+        .output()
+        .expect("run test_parsedoffset");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_start = format!(
+        "WARNING: {path}: file is damaged\n\
+         WARNING: {path}: can't find startxref\n\
+         WARNING: {path}: Attempting to reconstruct cross-reference table\n"
+    );
+    assert!(
+        stderr.starts_with(&warning_start),
+        "repair warnings must precede the terminal error: {stderr}"
+    );
+    assert!(
+        stderr.ends_with(&format!("{path}: 99/0 is not found in xref table\n")),
+        "the post-enumeration error must remain visible: {stderr}"
+    );
+}
+
+#[test]
 fn test_xref_matches_qpdf_recovered_xref_and_warning_order() {
     let path = fixture_path("test_driver/repairable_input.pdf");
     Command::cargo_bin("test_xref")

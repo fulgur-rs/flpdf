@@ -247,20 +247,43 @@ fn render_parsed_groups(groups: &mut BTreeMap<u32, Vec<ParsedObject>>) -> String
 /// Format qpdf's `test_parsedoffset` output and return recovery warnings separately.
 pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Vec<u8>)> {
     let mut pdf = open(path)?;
-    let objects = pdf.get_all_objects()?;
-    let xref = pdf.get_xref_table();
-    let mut groups: BTreeMap<u32, Vec<ParsedObject>> = BTreeMap::new();
+    let result = (|| {
+        let objects = pdf.get_all_objects()?;
+        let xref = pdf.get_xref_table();
+        let mut groups: BTreeMap<u32, Vec<ParsedObject>> = BTreeMap::new();
 
-    for object in objects {
-        let object_ref = metadata_object_ref(&object)?;
-        let group = stream_group(object_ref, xref.get(&object_ref).copied())?;
-        walk(&object, group, &mut groups);
+        for object in objects {
+            let object_ref = metadata_object_ref(&object)?;
+            let group = stream_group(object_ref, xref.get(&object_ref).copied())?;
+            walk(&object, group, &mut groups);
+        }
+
+        let mut output = render_parsed_groups(&mut groups);
+        output.push_str("succeeded\n");
+        Ok(output)
+    })();
+
+    match result {
+        Ok(output) => {
+            let warnings = repair_diagnostics(path, &pdf);
+            Ok((output, warnings))
+        }
+        Err(error) => {
+            // qpdf keeps repair warnings on the live document until the
+            // helper formats the terminal failure. Do the same here: a
+            // post-enumeration error must not drop warnings collected while
+            // reconstructing the effective xref table.
+            let diagnostics = pdf.repair_diagnostics();
+            if diagnostics.entries().is_empty() {
+                Err(error)
+            } else {
+                Err(Error::OpenFailure {
+                    source: Box::new(error),
+                    diagnostics,
+                })
+            }
+        }
     }
-
-    let mut output = render_parsed_groups(&mut groups);
-    output.push_str("succeeded\n");
-    let warnings = repair_diagnostics(path, &pdf);
-    Ok((output, warnings))
 }
 
 #[cfg(test)]
