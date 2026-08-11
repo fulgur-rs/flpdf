@@ -3453,6 +3453,18 @@ impl ObjectHandle {
     pub(crate) fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
     }
+
+    /// Writer-emission counterpart that rewrites indirect child references
+    /// through the caller's output-number map without materializing an
+    /// [`Object`]. The handle graph remains the source of truth; the callback
+    /// only changes the reference token written at each child position.
+    pub(crate) fn unparse_object_with_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    ) -> Result<()> {
+        unparse_object_walk_with_ref_map(self, out, map)
+    }
 }
 
 // The sole recursion hub for `ObjectHandle::materialize` — every nested
@@ -3790,6 +3802,93 @@ fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
             out.extend_from_slice(object_ref.to_string().as_bytes());
         }
     }
+    Ok(())
+}
+
+type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
+
+fn write_child_with_ref_map(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+) -> Result<()> {
+    if let Some(object_ref) = handle.object_ref() {
+        let mapped = map(object_ref)?;
+        out.extend_from_slice(mapped.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_with_ref_map(handle, out, map)
+}
+
+fn unparse_object_walk_with_ref_map(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+) -> Result<()> {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.try_dereference()?;
+        handle.with_value(|value| match value {
+            Some(value) => unparse_object_value_with_ref_map(value, out, map),
+            None => {
+                // cov:ignore-start: successful dereference exposes Null for missing states or errors while unresolved
+                out.extend_from_slice(b"null");
+                Ok(())
+            } // cov:ignore-end
+        })
+    })
+}
+
+fn unparse_object_value_with_ref_map(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+) -> Result<()> {
+    match value {
+        ObjectValue::Array(children) => {
+            out.push(b'[');
+            for child in children {
+                out.push(b' ');
+                write_child_with_ref_map(child, out, map)?;
+            }
+            out.extend_from_slice(b" ]");
+        }
+        ObjectValue::Dictionary(entries) => {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            unparse_dict_entries_with_ref_map(&entries, out, map)?;
+        }
+        ObjectValue::Stream { stream_dict, .. } => {
+            unparse_object_walk_with_ref_map(stream_dict, out, map)?;
+        }
+        ObjectValue::Reference(object_ref) => {
+            let mapped = map(*object_ref)?;
+            out.extend_from_slice(mapped.to_string().as_bytes());
+        }
+        _ => unparse_object_value(value, out)?,
+    }
+    Ok(())
+}
+
+fn unparse_dict_entries_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        out.push(b' ');
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_ref_map(value, out, map)?;
+        }
+    }
+    out.extend_from_slice(b" >>");
     Ok(())
 }
 
@@ -4274,6 +4373,39 @@ impl ObjectHandle {
             unparse_stream_dict_entries_qdf(&entries, indent, out)
         })
     }
+
+    /// Stream-dictionary writer emission with output reference remapping.
+    /// This is the canonical writer boundary: dictionary children are read
+    /// from the live handle graph and only the serialized reference tokens are
+    /// translated for the new file.
+    pub(crate) fn unparse_stream_body_with_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    ) -> Result<()> {
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_with_ref_map(&entries, refiltered, out, map)
+        })
+    }
 }
 
 // Writes a stream dictionary's own body -- `unparse_stream_body`'s sole
@@ -4403,6 +4535,51 @@ fn unparse_stream_dict_entries_qdf(
     }
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    refiltered: bool,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+) -> Result<()> {
+    let excluded_entries;
+    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
+        excluded_entries = entries
+            .iter()
+            .filter(|entry| entry.0.as_slice() != b"Filter" && entry.0.as_slice() != b"DecodeParms")
+            .cloned()
+            .collect::<Vec<_>>();
+        &excluded_entries
+    } else {
+        entries
+    };
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if key.as_slice() == b"Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        out.push(b'/');
+        crate::object::write_name_escaped(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_ref_map(value, out, map)?;
+        }
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_ref_map(length, out, map)?;
+    }
+    if refiltered {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
     Ok(())
 }
 
@@ -8565,6 +8742,61 @@ mod unparse_object_tests {
         ]);
         let mut out = Vec::new();
         assert!(dict.unparse_stream_body(&mut out, false).is_err());
+    }
+
+    #[test]
+    fn mapped_unparse_writes_stream_children_and_non_dictionary_shapes() {
+        let (child, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Child".to_vec(), child),
+            (b"Length".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let stream = ObjectHandle::stream(dict, Rc::new(b"ab".to_vec()));
+        let map = |object_ref| {
+            assert_eq!(object_ref, ObjectRef::new(20, 0));
+            Ok(ObjectRef::new(8, 0))
+        };
+
+        let mut object = Vec::new();
+        stream
+            .unparse_object_with_ref_map(&mut object, &map)
+            .unwrap();
+        assert_eq!(object, b"<< /Child 8 0 R /Length 2 >>");
+
+        let mut body = Vec::new();
+        stream
+            .unparse_stream_body_with_ref_map(&mut body, false, &map)
+            .unwrap();
+        assert_eq!(body, b"<< /Child 8 0 R /Length 2 >>");
+
+        let signature = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+                (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+                (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+            ]),
+            Rc::new(b"ab".to_vec()),
+        );
+        let mut signature_body = Vec::new();
+        signature
+            .unparse_stream_body_with_ref_map(&mut signature_body, false, &map)
+            .unwrap();
+        assert_eq!(
+            signature_body,
+            b"<< /ByteRange [ ] /Contents <6869> /Type /Sig >>"
+        );
+
+        let mut nested_non_dictionary = Vec::new();
+        ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()))
+            .unparse_stream_body_with_ref_map(&mut nested_non_dictionary, false, &map)
+            .unwrap();
+        assert_eq!(nested_non_dictionary, b"<< >>");
+
+        let mut non_dictionary = Vec::new();
+        ObjectHandle::integer(5)
+            .unparse_stream_body_with_ref_map(&mut non_dictionary, false, &map)
+            .unwrap();
+        assert_eq!(non_dictionary, b"<< >>");
     }
 
     #[test]

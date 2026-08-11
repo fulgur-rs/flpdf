@@ -2854,11 +2854,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         return write_pclm(pdf, out, options);
     }
 
-    if plain::eligible(
-        pdf.encryption_ref().is_some(),
-        options,
-        requested_object_streams,
-    ) {
+    if plain::eligible(pdf.is_encrypted(), options, requested_object_streams) {
         return plain::write_plain(pdf, out, options);
     }
 

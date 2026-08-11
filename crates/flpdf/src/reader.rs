@@ -1828,6 +1828,18 @@ impl<R: Read + Seek> Pdf<R> {
         handle.try_dereference()
     }
 
+    /// Run the plain canonical writer with qpdf's default stream-framing
+    /// recovery enabled. This preserves the writer's historical behavior for
+    /// a document opened in flpdf's strict xref mode without changing the
+    /// strict semantics of ordinary `ObjectHandle` resolution.
+    pub(crate) fn with_plain_writer_stream_recovery<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let resolver = Rc::clone(&self.resolver);
+        resolver.with_writer_stream_recovery(|| operation(self))
+    }
+
     /// Resolve `handle` (via [`Pdf::resolve_object_handle`]), then chase
     /// through a [`Pdf::set_object`]-driven bare-reference redirect (if any)
     /// to its terminal (non-reference) value. Every accessor (`type_code`,
@@ -5323,6 +5335,162 @@ mod tests {
     }
 
     #[test]
+    fn canonical_stream_allocation_and_mutation_survive_without_legacy_materialization() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let stream = pdf
+            .make_indirect_object_handle(ObjectHandle::stream(
+                ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(18))]),
+                Rc::new(b"canonical stream data".to_vec()),
+            ))
+            .expect("make stream indirect");
+        let stream_ref = stream.object_ref().expect("stream ref");
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve_object_handle(&root).expect("resolve root");
+        root.replace_key(b"Extra", stream.clone());
+        pdf.mark_object_dirty(ObjectRef::new(1, 0));
+
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_compress_streams(false);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let emitted_ref = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("query stream mapping")
+            .expect("allocated stream must be emitted");
+        let out = writer.get_buffer().expect("take full-rewrite output");
+
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical stream output must not materialize a legacy object"
+        );
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        let extra_ref = reopened
+            .resolve(ObjectRef::new(1, 0))
+            .expect("resolve rewritten root")
+            .into_dict()
+            .and_then(|dict| dict.get("Extra").cloned())
+            .and_then(|object| object.as_ref_id())
+            .expect("rewritten root has stream reference");
+        assert_eq!(extra_ref, emitted_ref);
+        assert_eq!(
+            reopened
+                .resolve(emitted_ref)
+                .expect("resolve rewritten stream")
+                .as_stream()
+                .expect("stream remains a stream")
+                .data,
+            b"canonical stream data"
+        );
+    }
+
+    #[test]
+    fn canonical_replacement_survives_without_legacy_materialization() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Marker".to_vec(), ObjectHandle::integer(779))]);
+        let page_ref = ObjectRef::new(3, 0);
+        pdf.replace_object_handle(page_ref, replacement)
+            .expect("replace page object canonically");
+
+        let (emitted_ref, out) = {
+            let mut writer = crate::PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+            writer.set_output_memory().expect("configure memory output");
+            writer.write().expect("full rewrite");
+            let emitted_ref = writer
+                .get_renumbered_obj_gen(page_ref)
+                .expect("query replacement mapping")
+                .expect("replacement must be emitted");
+            (emitted_ref, writer.get_buffer().expect("take output"))
+        };
+
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical replacement must not populate the legacy materialization bridge"
+        );
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        assert_eq!(
+            reopened
+                .resolve(emitted_ref)
+                .expect("resolve replacement")
+                .into_dict()
+                .and_then(|dict| dict.get("Marker").cloned())
+                .and_then(|object| object.as_integer()),
+            Some(779)
+        );
+    }
+
+    #[test]
+    fn canonical_removal_emits_a_null_child_without_legacy_materialization() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        pdf.resolve_object_handle(&pages).expect("resolve pages");
+        let kids = pages.get_key(b"Kids");
+        assert_eq!(kids.try_array_len().expect("read page kids"), Some(1));
+
+        pdf.remove_object_handle(ObjectRef::new(3, 0))
+            .expect("remove page canonically");
+
+        let out = {
+            let mut writer = crate::PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+            writer.set_output_memory().expect("configure memory output");
+            writer.write().expect("full rewrite");
+            writer.get_buffer().expect("take output")
+        };
+
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical removal must not populate the legacy materialization bridge"
+        );
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        let rewritten_pages = reopened
+            .resolve(ObjectRef::new(2, 0))
+            .expect("resolve rewritten pages")
+            .into_dict()
+            .expect("pages is a dictionary");
+        let kids = rewritten_pages
+            .get("Kids")
+            .and_then(Object::as_array)
+            .expect("rewritten pages has kids");
+        assert_eq!(kids, &[Object::Null]);
+        assert_eq!(
+            reopened
+                .resolve(ObjectRef::new(3, 0))
+                .expect("removed page resolves as qpdf null"),
+            Object::Null,
+            "removed page must not be emitted as an indirect body"
+        );
+    }
+
+    #[test]
+    fn canonical_writer_rejects_a_foreign_indirect_child() {
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open target");
+        let mut foreign_pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open foreign");
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve_object_handle(&root)
+            .expect("resolve target root");
+        let foreign = foreign_pdf.get_object_handle(ObjectRef::new(3, 0));
+        root.replace_key(b"Foreign", foreign);
+        pdf.mark_object_dirty(ObjectRef::new(1, 0));
+
+        let error = {
+            let mut writer = crate::PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+            writer.set_output_memory().expect("configure memory output");
+            writer.write().expect_err("foreign child must be rejected")
+        };
+
+        assert!(error
+            .to_string()
+            .contains("QPDFObjectHandle from different QPDF found while writing"));
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "foreign-owner rejection must happen before legacy materialization"
+        );
+    }
+
+    #[test]
     fn make_indirect_object_handle_is_visible_to_qpdf_json_without_materializing_cache() {
         // qpdf's QPDF::makeIndirectFromQPDFObject stores the same shared
         // QPDFObject in obj_cache. The handle registry is Rust's equivalent
@@ -5390,11 +5558,21 @@ mod tests {
         pdf.resolve_object_handle(&page).expect("resolve page");
         page.replace_key(b"Rotate", ObjectHandle::integer(90));
         pdf.mark_object_dirty(page_ref);
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical mutation setup must not materialize a legacy snapshot"
+        );
 
         let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
         writer.set_output_memory().expect("configure memory output");
         writer.write().expect("full rewrite");
         let out = writer.get_buffer().expect("take full-rewrite output");
+
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical writer traversal must not populate the legacy materialization bridge"
+        );
 
         let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
         let resolved_page = reopened
@@ -6267,7 +6445,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_direct_child_neither_dirties_nor_emits_its_former_owner() {
+    fn detached_direct_child_does_not_dirty_owner_but_live_removal_is_written() {
         let owner_ref = ObjectRef::new(1, 0);
         let bytes = classic_pdf_with_bodies(
             &[b"1 0 obj\n<< /Type /Catalog /Child << /Value 1 >> >>\nendobj\n"],
@@ -6299,13 +6477,9 @@ mod tests {
         let mut reopened = Pdf::open_mem_owned(out).expect("reopen full-rewrite output");
         let reopened_owner = reopened.get_object_handle(owner_ref);
         reopened.resolve_object_handle(&reopened_owner).unwrap();
-        assert_eq!(
-            reopened_owner
-                .get_key(b"Child")
-                .get_key(b"Value")
-                .as_integer(),
-            Some(1),
-            "a detached child mutation must not change the former owner on disk"
+        assert!(
+            reopened_owner.get_key(b"Child").is_null(),
+            "canonical writer must emit the live owner's remove_key mutation"
         );
     }
 

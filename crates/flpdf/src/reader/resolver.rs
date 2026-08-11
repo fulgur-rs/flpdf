@@ -185,6 +185,15 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// reconstruct that happened in a separate member
     /// (`m->reconstructed_xref`, `QPDF.hh:1480`).
     attempt_recovery: bool,
+    /// Writer-local equivalent of qpdf's default recovery permission.
+    ///
+    /// flpdf keeps `PdfOpenOptions::repair = false` as the strict xref/header
+    /// mode, while the qpdf writer still recovers malformed stream framing
+    /// when it reads source objects. The legacy writer already did this via
+    /// its bounded file-object parser; the canonical writer toggles this
+    /// field for the duration of its plain-write walk so the cutover retains
+    /// that observable behavior without weakening direct handle resolution.
+    writer_stream_recovery: bool,
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
     ///
     /// Set to `true` when live resolution triggers cross-reference table
@@ -665,6 +674,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
                 attempt_recovery,
+                writer_stream_recovery: false,
                 // qpdf `m->reconstructed_xref` (`QPDF.cc:524`): set by
                 // `reconstruct_xref` which runs both at open time (`:464`) and
                 // during resolution (`:1617`). Carry open-time recovery state
@@ -968,6 +978,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// whether a failed object read may trigger `reconstruct_xref`.
     pub(crate) fn attempt_recovery(&self) -> bool {
         self.core.borrow().attempt_recovery
+    }
+
+    /// Run a writer operation with qpdf's default stream-framing recovery
+    /// enabled, restoring the previous setting before returning.
+    pub(crate) fn with_writer_stream_recovery<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let previous = {
+            let mut core = self.core.borrow_mut();
+            let previous = core.writer_stream_recovery;
+            core.writer_stream_recovery = true;
+            previous
+        };
+        let result = operation();
+        self.core.borrow_mut().writer_stream_recovery = previous;
+        result
+    }
+
+    fn stream_recovery_enabled(&self) -> bool {
+        let core = self.core.borrow();
+        core.attempt_recovery || core.writer_stream_recovery
     }
 
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`
@@ -2466,7 +2495,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let mut length = match Self::stream_length(&dict) {
             Ok(length) => length,
             Err(error) if self.is_recoverable_stream_error(&error) => {
-                if !self.attempt_recovery() {
+                if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
                 self.warn_stream_failure(&error, object_offset)?;
@@ -2491,7 +2520,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let (framing_token, framing_offset) = self.read_token_from_input()?;
             if !framing_token.is_word_value(b"endstream") {
                 let error = Error::parse(framing_offset as usize, "expected endstream");
-                if !self.attempt_recovery() {
+                if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
                 self.warn_stream_failure(&error, object_offset)?;
