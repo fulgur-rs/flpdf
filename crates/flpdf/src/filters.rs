@@ -10,8 +10,9 @@ use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs_from_handle, decode_filter_specs_from_object,
     decode_filter_specs_from_object_with_resolver, encode_flate, encode_run_length,
-    stream_filter_for, validate_filter_chain_count, DecodeParams, FilterDecodePhase, FilterSpec,
-    CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
+    passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
+    undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
+    FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -76,13 +77,7 @@ pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
 /// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
 /// Returns `None` for any other filter name.
 pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
-    match filter_name {
-        b"DCTDecode" => Some("DCTDecode"),
-        b"JBIG2Decode" => Some("JBIG2Decode"),
-        b"JPXDecode" => Some("JPXDecode"),
-        b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
-        _ => None,
-    }
+    stream_passthrough_codec_label(filter_name)
 }
 
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
@@ -923,19 +918,6 @@ fn decode_codec_prefix(
         .expect("preflighted codec prefix pipeline is infallible")
 }
 
-/// Report why a filter name has no decode route.
-fn undecodable_filter_error(filter_name: &[u8]) -> Error {
-    if let Some(label) = passthrough_codec_label(filter_name) {
-        return Error::Unsupported(format!(
-            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        ));
-    }
-    Error::Unsupported(format!(
-        "unsupported stream filter: {}",
-        std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    ))
-}
-
 fn encode_stream_data_with_filters(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -1136,6 +1118,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+    }
+
+    #[test]
+    fn unknown_filter_precedes_misaligned_decode_parms_on_all_decode_entry_points() {
+        let filter = Object::Array(vec![
+            Object::Name(b"BogusDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let params = Object::Array(vec![Object::Null]);
+        let expected = "unsupported PDF feature: unsupported stream filter: BogusDecode";
+
+        let mut legacy = Dictionary::new();
+        legacy.insert("Filter", filter.clone());
+        legacy.insert("DecodeParms", params.clone());
+        assert_eq!(
+            decode_stream_data(&legacy, b"payload")
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+
+        let mut resolve = |value: &Object| value.clone();
+        assert_eq!(
+            decode_stream_data_from_xref_context(&legacy, b"payload", &mut resolve)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+
+        let native = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), handle_from_object(Some(&filter))),
+            (b"DecodeParms".to_vec(), handle_from_object(Some(&params))),
+        ]);
+        assert_eq!(
+            decode_stream_data_from_handle(&native, b"payload", DecodeLimits::default())
+                .unwrap_err()
+                .to_string(),
+            expected
         );
     }
 

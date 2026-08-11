@@ -236,6 +236,15 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 バイト範囲をダイジェストできる。`--deterministic-id` の byte-parity は
 `deterministic_id_qpdf_parity_tests` で既にゲート済み。
 
+`QPDF_Stream::filterable` の filter factory lookup（`QPDF_Stream.cc:419-435`）は
+`/DecodeParms` の読み取り（`:439-459`）より先に完了する。未知フィルタと長さ不整合を
+組み合わせた場合も、`decode_filter_specs_from_object`、resolver 付き Object reader、
+`decode_filter_specs_from_handle` の3経路がこの順序で同じ `unsupported stream filter`
+エラーを返す。qpdf 11.9.0 の既存 fixture
+`tests/fixtures/test_driver/stream_unsupported_filter_skips_decode_parms.pdf` と
+`.out` を oracle/golden とし、`scripts/qpdf-test-driver-diff.sh --check` で51 fixture・
+11 CLI probe の一致を確認する（`flpdf-vatj`）。
+
 ## 7. ドキュメント / オブジェクトヘルパー
 
 | qpdf | 行 | flpdf | 状態 |

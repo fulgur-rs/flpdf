@@ -197,6 +197,51 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
+/// Return a human-readable codec label if `filter_name` is an image/binary
+/// passthrough codec that flpdf does not decode.
+///
+/// The four codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
+/// are always emitted verbatim by the writer.  Keeping this classification
+/// beside the filter registry lets the qpdf-shaped factory check use the same
+/// diagnostic that the later decode stage would have produced.
+pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
+    match filter_name {
+        b"DCTDecode" => Some("DCTDecode"),
+        b"JBIG2Decode" => Some("JBIG2Decode"),
+        b"JPXDecode" => Some("JPXDecode"),
+        b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
+        _ => None,
+    }
+}
+
+/// Report why a filter name has no decode factory.
+pub(crate) fn undecodable_filter_error(filter_name: &[u8]) -> Error {
+    if let Some(label) = passthrough_codec_label(filter_name) {
+        return Error::Unsupported(format!(
+            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
+        ));
+    }
+    Error::Unsupported(format!(
+        "unsupported stream filter: {}",
+        std::str::from_utf8(filter_name).unwrap_or("<binary>")
+    ))
+}
+
+/// Validate `/Filter` names at the same stage as qpdf's `filter_factories`
+/// lookup (`QPDF_Stream.cc:419-435`), before `/DecodeParms` is inspected.
+pub(crate) fn validate_filter_factories<'a, I>(names: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    for name in names {
+        let normalized = normalize_filter_name(name);
+        if stream_filter_for(normalized).is_none() {
+            return Err(undecodable_filter_error(normalized));
+        }
+    }
+    Ok(())
+}
+
 /// `QPDF_Stream::filterable`'s `warn("stream filter type is not name or
 /// array")` (`libqpdf/QPDF_Stream.cc:413`). flpdf raises the same text as an
 /// error instead of a warning; see plan decision D3 of `flpdf-25kg.3.4`.
@@ -206,17 +251,11 @@ pub(crate) const FILTER_TYPE_ERROR: &str = "stream filter type is not name or ar
 /// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised as an
 /// error rather than a warning just as [`FILTER_TYPE_ERROR`] is.
 ///
-/// **flpdf reaches this check on inputs qpdf does not.** qpdf validates every
-/// filter name against `filter_factories` first and returns on an unknown one
-/// (`QPDF_Stream.cc:433-435`), so `:459`'s condition is never evaluated for a
-/// stream whose `/Filter` names an unimplemented codec. Neither flpdf shape
-/// reader consults filter-name validity at all — that is
-/// `filters::prepare_decode_filters`' job, downstream of [`FilterSpec`] — so
-/// an unknown filter combined with a misaligned `/DecodeParms` reports the
-/// length error here where qpdf would report the unknown filter. Tracked as
-/// beads `flpdf-vatj` (P2); not fixed here, because Task 5's contract is that
-/// the two readers keep the same branch order. Both readers diverge from qpdf
-/// *identically*, so the legacy-vs-native equivalence gate stays valid.
+/// qpdf validates every filter name against `filter_factories` first and
+/// returns on an unknown one (`QPDF_Stream.cc:433-435`), so `:459`'s condition
+/// is never evaluated for a stream whose `/Filter` names an unimplemented
+/// codec. Both flpdf shape readers make the same factory decision before
+/// reading `/DecodeParms`, through [`validate_filter_factories`].
 pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
     "stream /DecodeParms length is inconsistent with filters";
 
@@ -270,6 +309,8 @@ pub(crate) fn decode_filter_specs_from_object(
     if names.is_empty() {
         return Ok(Vec::new());
     }
+
+    validate_filter_factories(names.iter().copied())?;
 
     let params: Vec<Option<&Object>> = match decode_params {
         None | Some(Object::Null) => vec![None; names.len()],
@@ -354,6 +395,8 @@ pub(crate) fn decode_filter_specs_from_object_with_resolver(
     if names.is_empty() {
         return Ok(Vec::new());
     }
+
+    validate_filter_factories(names.iter().map(Vec::as_slice))?;
 
     let params: Vec<Option<Object>> = match decode_params {
         None | Some(Object::Null) => vec![None; names.len()],
@@ -471,6 +514,8 @@ pub(crate) fn decode_filter_specs_from_handle(
     if names.is_empty() {
         return Ok(Vec::new());
     }
+
+    validate_filter_factories(names.iter().map(Vec::as_slice))?;
 
     let params: Vec<DecodeParams> = if decode_params.try_is_null()? {
         absent_params(names.len())
@@ -613,11 +658,10 @@ fn replicated_decode_params(params: &ObjectHandle, names: &[Vec<u8>]) -> Result<
 /// `QPDF_Stream.cc:419-423`, ahead of the `filter_factories` lookup at `:425`,
 /// so `/Fl` reaches `SF_FlateLzwDecode` and consumes.
 ///
-/// An unknown name has no registered filter, so it lands on `false`. That is
-/// *closer* to qpdf, which fails the factory lookup and returns at
-/// `QPDF_Stream.cc:433-435` without ever reading `/DecodeParms` at `:441` —
-/// but not identical, because flpdf still resolves the `/DecodeParms` handle
-/// itself. That residue is beads `flpdf-vatj`, not this function's business.
+/// An unknown name has no registered filter, so it lands on `false`. The shape
+/// readers perform that factory lookup before `/DecodeParms` is read, matching
+/// qpdf's early return at `QPDF_Stream.cc:433-435` and leaving the later
+/// parameter-reduction code concerned only with registered filters.
 fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
     // No caller's answer depends on this arm today, and no assertion can
     // witness it: `CryptStreamFilter` is registered and its
@@ -3093,6 +3137,47 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unknown_filter_is_rejected_before_decode_parms_mismatch_by_each_shape_reader() {
+        let filter = Object::Array(vec![
+            Object::Name(b"BogusDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let params = Object::Array(vec![Object::Null]);
+        let expected = "unsupported PDF feature: unsupported stream filter: BogusDecode";
+
+        assert_eq!(
+            decode_filter_specs_from_object(Some(&filter), Some(&params), None)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+
+        let mut resolve = |value: &Object| value.clone();
+        assert_eq!(
+            decode_filter_specs_from_object_with_resolver(
+                Some(&filter),
+                Some(&params),
+                None,
+                &mut resolve,
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+
+        assert_eq!(
+            decode_filter_specs_from_handle(
+                &handle_from_object(Some(&filter)),
+                &handle_from_object(Some(&params)),
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+    }
+
+    #[test]
     fn empty_decode_parms_array_is_null_and_filter_abbreviation_expands() {
         let filter = Object::Name(b"Fl".to_vec());
         let params = Object::Array(Vec::new());
@@ -4994,9 +5079,12 @@ pub(crate) mod tests {
         ];
 
         for &(abbreviation, expected) in cases {
-            let filter = Object::Name(abbreviation.to_vec());
-            let specs = decode_filter_specs_from_object(Some(&filter), None, None).unwrap();
-            assert_eq!(specs[0].normalized_name(), expected);
+            assert_eq!(normalize_filter_name(abbreviation), expected);
+            if stream_filter_for(expected).is_some() {
+                let filter = Object::Name(abbreviation.to_vec());
+                let specs = decode_filter_specs_from_object(Some(&filter), None, None).unwrap();
+                assert_eq!(specs[0].normalized_name(), expected);
+            }
         }
     }
 
