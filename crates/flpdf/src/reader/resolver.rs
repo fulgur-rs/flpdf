@@ -1369,8 +1369,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         let decoded_stream_data = decoded_stream.take_buffer()?;
 
-        let object_count = Self::object_stream_integer(&stream_dict, b"N", "/N")?;
-        let first = Self::object_stream_integer(&stream_dict, b"First", "/First")?;
+        let object_count = Self::object_stream_integer(&stream_dict, b"/N", "/N")?;
+        let first = Self::object_stream_integer(&stream_dict, b"/First", "/First")?;
         let mut tokenizer = Tokenizer::new(&decoded_stream_data);
         let mut members = BTreeMap::new();
         for _ in 0..object_count {
@@ -2743,7 +2743,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "stream keyword follows an object that is not a dictionary",
             ));
         };
-        let length = entries.get(b"Length".as_slice());
+        let length = entries.get(b"/Length".as_slice());
         if let Some(length) = length {
             length.try_dereference()?;
         }
@@ -2803,7 +2803,7 @@ fn inspect_stream_encryption(
     encryption: &EncryptionState,
     stream_dict: &ObjectHandle,
 ) -> Result<StreamEncryptionInspection> {
-    let stream_type = stream_dict.try_get_key(b"Type")?.try_as_name()?;
+    let stream_type = stream_dict.try_get_key(b"/Type")?.try_as_name()?;
     let is_xref = stream_type.as_deref() == Some(b"XRef");
     let is_metadata = stream_type.as_deref() == Some(b"Metadata");
     let default_source = "/StmF from /Encrypt dictionary";
@@ -2818,17 +2818,17 @@ fn inspect_stream_encryption(
         });
     }
 
-    let filter = stream_dict.try_get_key(b"Filter")?;
+    let filter = stream_dict.try_get_key(b"/Filter")?;
     let mut method = None;
     let mut method_source = default_source;
     if filter.try_is_or_has_name(b"Crypt")? {
-        let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+        let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
         // qpdf's `if (isDictionary()) { if (isDictionaryOfType()) ... }
         // else if (isArray() && filter.isArray()) ...` shape matters: a
         // dictionary of the wrong type never falls through to array pairing.
         if decode_params.try_is_dictionary_of_type(b"", b"")? {
             if decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")? {
-                let name = decode_params.try_get_key(b"Name")?;
+                let name = decode_params.try_get_key(b"/Name")?;
                 method = Some(interpret_cf_from_handle(encryption, &name)?);
                 method_source = "stream's Crypt decode parameters";
             } // cov:ignore: llvm maps the covered typed-dictionary branch to its closing brace
@@ -2848,7 +2848,7 @@ fn inspect_stream_encryption(
                     if !is_crypt || !has_dictionary_params {
                         continue;
                     }
-                    let name = crypt_params.try_get_key(b"Name")?;
+                    let name = crypt_params.try_get_key(b"/Name")?;
                     if name.try_as_name()?.is_some() {
                         method = Some(interpret_cf_from_handle(encryption, &name)?);
                         method_source = "stream's Crypt decode parameters (array)";
@@ -3721,13 +3721,13 @@ mod tests {
             .as_dictionary()
             .expect("expected a dictionary object");
         let level_one = values
-            .get(b"L1".as_slice())
+            .get(b"/L1".as_slice())
             .and_then(ObjectHandle::as_dictionary)
-            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L2".as_slice()).cloned())
             .expect("level two dictionary");
         let value = level_one
             .as_dictionary()
-            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("deep scalar");
 
         assert_eq!(level_one.get_parsed_offset(), 22);
@@ -3768,7 +3768,7 @@ mod tests {
         assert_eq!(root.description(), "input.pdf, object 1 0 at offset 11");
         let level_one = root
             .as_dictionary()
-            .and_then(|values| values.get(b"L1".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L1".as_slice()).cloned())
             .expect("level one dictionary");
         assert_eq!(
             level_one.description(),
@@ -3777,7 +3777,7 @@ mod tests {
 
         let level_two = level_one
             .as_dictionary()
-            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L2".as_slice()).cloned())
             .expect("level two dictionary");
         assert_eq!(
             level_two.description(),
@@ -3786,13 +3786,13 @@ mod tests {
 
         let value = level_two
             .as_dictionary()
-            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("deep scalar");
         assert_eq!(value.description(), "input.pdf, object 1 0 at offset 33");
 
         let items = root
             .as_dictionary()
-            .and_then(|values| values.get(b"Items".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Items".as_slice()).cloned())
             .expect("array value");
         assert_eq!(items.description(), "input.pdf, object 1 0 at offset 49");
         let array_scalar = items
@@ -3840,7 +3840,7 @@ mod tests {
                 .as_dictionary()
                 .expect("expected a dictionary object");
             values
-                .get(b"Value".as_slice())
+                .get(b"/Value".as_slice())
                 .cloned()
                 .expect("direct value")
         };
@@ -5616,15 +5616,15 @@ mod tests {
         let values = info.as_dictionary().expect("/Info must be a dictionary");
         assert_eq!(
             values
-                .get(b"Title".as_slice())
+                .get(b"/Title".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"TopSecretTitle".to_vec())
         );
         assert_eq!(
             values
-                .get(b"Metadata".as_slice())
+                .get(b"/Metadata".as_slice())
                 .and_then(crate::ObjectHandle::as_dictionary)
-                .and_then(|metadata| metadata.get(b"Label".as_slice()).cloned())
+                .and_then(|metadata| metadata.get(b"/Label".as_slice()).cloned())
                 .and_then(|label| label.as_string()),
             Some(b"NestedSecret".to_vec())
         );
@@ -5795,7 +5795,7 @@ mod tests {
             let offset = stream.get_parsed_offset();
             let dict = stream.as_stream_dict().expect("stream dictionary");
             let length = usize::try_from(
-                dict.try_get_key(b"Length")
+                dict.try_get_key(b"/Length")
                     .expect("resolve /Length")
                     .try_as_integer()
                     .expect("inspect /Length")
@@ -5961,7 +5961,7 @@ mod tests {
             .expect("canonical resolver must decrypt with qpdf's AES fallback");
         assert_eq!(
             info.as_dictionary()
-                .and_then(|values| values.get(b"Title".as_slice()).cloned())
+                .and_then(|values| values.get(b"/Title".as_slice()).cloned())
                 .and_then(|title| title.as_string()),
             Some(b"TopSecretTitle".to_vec()) // cov:ignore: llvm maps the assertion's mismatch-only diagnostic region to this expected value
         );
@@ -6053,16 +6053,16 @@ mod tests {
                 canonical_info_dictionary(encrypted.clone(), allow_weak_crypto);
             assert_eq!(
                 values
-                    .get(b"Title".as_slice())
+                    .get(b"/Title".as_slice())
                     .and_then(crate::ObjectHandle::as_string),
                 Some(b"TopSecretTitle".to_vec()),
                 "{name}: canonical resolver title"
             );
             assert_eq!(
                 values
-                    .get(b"Metadata".as_slice())
+                    .get(b"/Metadata".as_slice())
                     .and_then(crate::ObjectHandle::as_dictionary)
-                    .and_then(|metadata| metadata.get(b"Label".as_slice()).cloned())
+                    .and_then(|metadata| metadata.get(b"/Label".as_slice()).cloned())
                     .and_then(|label| label.as_string()),
                 Some(b"NestedSecret".to_vec()),
                 "{name}: canonical resolver nested label"
@@ -6103,12 +6103,12 @@ mod tests {
         let (info_ref, values) = canonical_info_dictionary(encrypted.clone(), false);
         assert_eq!(
             values
-                .get(b"Reason".as_slice())
+                .get(b"/Reason".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"ReasonPlain".to_vec())
         );
         let contents = values
-            .get(b"Contents".as_slice())
+            .get(b"/Contents".as_slice())
             .and_then(crate::ObjectHandle::as_string)
             .expect("signature /Contents is a string");
         assert_ne!(contents, b"SignatureCipher");
@@ -6127,7 +6127,7 @@ mod tests {
         let (_, values) = canonical_info_dictionary(no_byte_range, false);
         assert_eq!(
             values
-                .get(b"Contents".as_slice())
+                .get(b"/Contents".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"SignatureCipher".to_vec())
         );
@@ -6159,7 +6159,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("the catalog is a dictionary")
-                .get(b"Type".as_slice())
+                .get(b"/Type".as_slice())
                 .and_then(crate::ObjectHandle::as_name),
             Some(b"Catalog".to_vec())
         );
@@ -6423,7 +6423,7 @@ mod tests {
         assert_eq!(
             member
                 .as_dictionary()
-                .and_then(|dict| dict.get(b"Value".as_slice()).cloned())
+                .and_then(|dict| dict.get(b"/Value".as_slice()).cloned())
                 .and_then(|value| value.as_integer()),
             Some(1)
         );
@@ -6510,7 +6510,7 @@ mod tests {
         member
             .try_dereference()
             .expect("the duplicate's final header entry is the one qpdf parses");
-        assert_eq!(member.try_get_key(b"Value").unwrap().as_integer(), Some(2));
+        assert_eq!(member.try_get_key(b"/Value").unwrap().as_integer(), Some(2));
         assert!(!resolver
             .repair_diagnostics()
             .entries()
@@ -6842,7 +6842,7 @@ mod tests {
         assert_eq!(
             resolver
                 .get_object_handle(member_ref)
-                .try_get_key(b"Value")
+                .try_get_key(b"/Value")
                 .expect("resolved member dictionary")
                 .as_integer(),
             Some(1)
@@ -7125,7 +7125,7 @@ mod tests {
             .expect("qpdf warns about a later member and keeps the earlier cache entry");
         assert_eq!(
             requested
-                .try_get_key(b"Value")
+                .try_get_key(b"/Value")
                 .expect("the earlier member remains a dictionary")
                 .as_integer(),
             Some(1)
@@ -7256,7 +7256,7 @@ mod tests {
             ObjectHandle::name(b"not-an-integer".to_vec()),
         )]);
         let error =
-            ResolverHandle::<Cursor<Vec<u8>>>::object_stream_integer(&dictionary, b"N", "/N")
+            ResolverHandle::<Cursor<Vec<u8>>>::object_stream_integer(&dictionary, b"/N", "/N")
                 .expect_err("object-stream metadata must be integer");
         assert!(matches!(
             error,
@@ -7563,7 +7563,7 @@ mod tests {
         assert_eq!(
             member
                 .as_dictionary()
-                .and_then(|dict| dict.get(b"Value".as_slice()).cloned())
+                .and_then(|dict| dict.get(b"/Value".as_slice()).cloned())
                 .and_then(|value| value.as_integer()),
             Some(1)
         );
@@ -7822,7 +7822,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("the catalog is a dictionary")
-                .get(b"Type".as_slice())
+                .get(b"/Type".as_slice())
                 .and_then(crate::ObjectHandle::as_name),
             Some(b"Catalog".to_vec())
         );
@@ -7859,7 +7859,7 @@ mod tests {
         let minted_child = catalog
             .as_dictionary()
             .expect("the catalog is a dictionary")
-            .get(b"Pages".as_slice())
+            .get(b"/Pages".as_slice())
             .expect("the catalog has /Pages")
             .clone();
         assert!(
@@ -7873,7 +7873,7 @@ mod tests {
         let kid = pages
             .as_dictionary()
             .expect("the page tree is a dictionary")
-            .get(b"Kids".as_slice())
+            .get(b"/Kids".as_slice())
             .and_then(crate::ObjectHandle::as_array)
             .expect("/Kids is an array")
             .first()
@@ -7943,7 +7943,7 @@ mod tests {
         stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .replace_key(b"Length", ObjectHandle::integer(0));
+            .replace_key(b"/Length", ObjectHandle::integer(0));
         assert_eq!(
             stream
                 .get_raw_stream_data()
@@ -8142,7 +8142,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("dictionary")
-                .get(b"Filler".as_slice())
+                .get(b"/Filler".as_slice())
                 .and_then(crate::ObjectHandle::as_string)
                 .map(|value| value.len()),
             Some(filler.len()),
@@ -8192,7 +8192,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("dictionary")
-                .get(b"Filler".as_slice())
+                .get(b"/Filler".as_slice())
                 .and_then(crate::ObjectHandle::as_string)
                 .map(|value| value.len()),
             Some(filler.len()),
@@ -8244,7 +8244,7 @@ mod tests {
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert_eq!(
             dictionary
-                .get(b"QPDFFake1".as_slice())
+                .get(b"/QPDFFake1".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"orphan".to_vec())
         );
@@ -8622,7 +8622,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("the value is a dictionary")
-                .get(b"F".as_slice())
+                .get(b"/F".as_slice())
                 .and_then(crate::ObjectHandle::as_string)
                 .map(|value| value.len()),
             Some(filler.len()),
@@ -8696,7 +8696,7 @@ mod tests {
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert!(
             dictionary
-                .get(b"QPDFFake1".as_slice())
+                .get(b"/QPDFFake1".as_slice())
                 .is_some_and(|value| value.as_string().as_deref() == Some(b"x".as_slice())),
             "qpdf retains the orphan word under /QPDFFake1"
         );
@@ -9782,7 +9782,7 @@ mod tests {
         let ap = annotation
             .as_dictionary()
             .expect("the annotation is a dictionary")
-            .get(b"AP".as_slice())
+            .get(b"/AP".as_slice())
             .expect("the annotation has /AP")
             .clone();
         // Pins the fixture's own shape, not resolver behavior: confirms /AP
@@ -9797,7 +9797,7 @@ mod tests {
         let n = ap
             .as_dictionary()
             .expect("/AP is a dictionary")
-            .get(b"N".as_slice())
+            .get(b"/N".as_slice())
             .expect("/AP has /N")
             .clone();
         assert!(

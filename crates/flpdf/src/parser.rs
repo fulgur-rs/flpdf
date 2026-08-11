@@ -183,7 +183,10 @@ fn materialize_live_handle(handle: &ObjectHandle) -> Result<Object> {
     if let Some(values) = handle.as_dictionary() {
         let mut dictionary = Dictionary::new();
         for (key, value) in values {
-            dictionary.insert(key, materialize_live_handle(&value)?);
+            dictionary.insert(
+                crate::object_handle::legacy_dictionary_key(&key),
+                materialize_live_handle(&value)?,
+            );
         }
         return Ok(Object::Dictionary(dictionary));
     } // cov:ignore: LLVM attributes the exercised dictionary return to its closing delimiter.
@@ -459,7 +462,10 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                 TokenType::Name => {
                     if let Some(LiveFrame::Dictionary { pending_key, .. }) = frames.last_mut() {
                         if pending_key.is_none() {
-                            *pending_key = Some(token.value[1..].to_vec());
+                            // qpdf keeps dictionary keys as canonical name
+                            // strings, including `/` and tokenizer-decoded
+                            // `#xx` bytes (`QPDFTokenizer.cc:317-320,430-445`).
+                            *pending_key = Some(token.value.clone());
                             continue;
                         }
                     }
@@ -527,7 +533,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         else {
             return;
         };
-        if pending_key.as_deref() == Some(b"Contents") {
+        if pending_key.as_deref() == Some(b"/Contents") {
             *contents = Some((token.value.clone(), token.start as i64));
         }
     }
@@ -585,11 +591,17 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
         let orphan_names: std::collections::BTreeSet<Vec<u8>> = orphan_values
             .iter()
             .filter_map(ObjectHandle::as_name)
+            .map(|name| {
+                let mut key = Vec::with_capacity(name.len() + 1);
+                key.push(b'/');
+                key.extend(name);
+                key
+            })
             .collect();
         let mut fake = 1;
         for value in orphan_values {
             let key = loop {
-                let candidate = format!("QPDFFake{fake}").into_bytes();
+                let candidate = format!("/QPDFFake{fake}").into_bytes();
                 fake += 1;
                 if !values.contains_key(&candidate) && !orphan_names.contains(&candidate) {
                     break candidate;
@@ -599,26 +611,26 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                 frame_offset,
                 format!(
                     "expected dictionary key but found non-name object; inserting key /{}",
-                    String::from_utf8_lossy(&key)
+                    String::from_utf8_lossy(crate::object_handle::legacy_dictionary_key(&key))
                 ),
             )?;
             values.insert(key, value);
         }
 
         let is_signature = values
-            .get(b"Type".as_slice())
+            .get(b"/Type".as_slice())
             .and_then(ObjectHandle::as_name)
             .as_deref()
             == Some(b"Sig".as_slice());
-        let has_byte_range = values.contains_key(b"ByteRange".as_slice());
+        let has_byte_range = values.contains_key(b"/ByteRange".as_slice());
         let has_string_contents = values
-            .get(b"Contents".as_slice())
+            .get(b"/Contents".as_slice())
             .and_then(ObjectHandle::as_string)
             .is_some();
         if is_signature && has_byte_range && has_string_contents {
             if let Some((raw_contents, offset)) = contents {
                 let contents = self.direct_at(ObjectValue::String(raw_contents), offset);
-                values.insert(b"Contents".to_vec(), contents);
+                values.insert(b"/Contents".to_vec(), contents);
             }
         }
 
@@ -706,7 +718,7 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
                 offset,
                 format!(
                     "dictionary has duplicated key /{}; last occurrence overrides earlier ones",
-                    String::from_utf8_lossy(&key)
+                    String::from_utf8_lossy(crate::object_handle::legacy_dictionary_key(&key))
                 ),
             )?;
         }
@@ -827,13 +839,14 @@ impl<I: LiveInput> LiveFileParser<'_, '_, '_, I> {
 mod live_input_tests {
     use super::{
         parse_live_file_object, parse_live_file_object_with_decrypter, parse_qpdf_file_object,
-        HandleResolver, LiveInput, LiveParsedObject, LiveTokenSource, SliceLiveInput,
-        StringDecrypter, MAX_PARSE_DEPTH,
+        HandleResolver, LiveFileParser, LiveFrame, LiveInput, LiveParsedObject, LiveTokenSource,
+        SliceLiveInput, StringDecrypter, MAX_PARSE_DEPTH,
     };
     use crate::object_handle::{DocumentResolver, ObjectHandle, ObjectValue};
     use crate::tokenizer::TokenType;
     use crate::{Error, ObjectRef, Result};
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::rc::{Rc, Weak};
 
     struct CountingInput {
@@ -973,13 +986,13 @@ mod live_input_tests {
         let values = parsed.value.as_dictionary().expect("dictionary");
         assert_eq!(
             values
-                .get(b"Top".as_slice())
+                .get(b"/Top".as_slice())
                 .and_then(ObjectHandle::as_string),
             Some(b"top-plain".to_vec())
         );
         assert_eq!(
             values
-                .get(b"Items".as_slice())
+                .get(b"/Items".as_slice())
                 .and_then(ObjectHandle::as_array)
                 .and_then(|items| items.first().cloned())
                 .and_then(|item| item.as_string()),
@@ -987,9 +1000,9 @@ mod live_input_tests {
         );
         assert_eq!(
             values
-                .get(b"Nested".as_slice())
+                .get(b"/Nested".as_slice())
                 .and_then(ObjectHandle::as_dictionary)
-                .and_then(|nested| nested.get(b"Value".as_slice()).cloned())
+                .and_then(|nested| nested.get(b"/Value".as_slice()).cloned())
                 .and_then(|value| value.as_string()),
             Some(b"dict-plain".to_vec())
         );
@@ -1060,7 +1073,7 @@ mod live_input_tests {
         .expect("signature dictionary");
         let signature_values = signature.value.as_dictionary().expect("dictionary");
         let contents = signature_values
-            .get(b"Contents".as_slice())
+            .get(b"/Contents".as_slice())
             .expect("signature contents");
         assert_eq!(contents.as_string(), Some(b"cipher".to_vec()));
         assert_eq!(contents.get_parsed_offset(), 48);
@@ -1073,7 +1086,7 @@ mod live_input_tests {
         );
         assert_eq!(
             signature_values
-                .get(b"Reason".as_slice())
+                .get(b"/Reason".as_slice())
                 .and_then(ObjectHandle::as_string),
             Some(b"reason-plain".to_vec())
         );
@@ -1093,7 +1106,7 @@ mod live_input_tests {
             non_signature
                 .value
                 .as_dictionary()
-                .and_then(|values| values.get(b"Contents".as_slice()).cloned())
+                .and_then(|values| values.get(b"/Contents".as_slice()).cloned())
                 .and_then(|contents| contents.as_string()),
             Some(b"cipher-plain".to_vec())
         );
@@ -1352,7 +1365,7 @@ mod live_input_tests {
         let missing_value = parse_with_null_resolver(b"<< /Last >>");
         let missing_value_entries = missing_value.value.as_dictionary().expect("dictionary");
         assert!(missing_value_entries
-            .get(b"Last".as_slice())
+            .get(b"/Last".as_slice())
             .is_some_and(ObjectHandle::is_null));
         assert_eq!(
             missing_value.diagnostics[0].message,
@@ -1363,7 +1376,7 @@ mod live_input_tests {
         let duplicate_entries = duplicate.value.as_dictionary().expect("dictionary");
         assert_eq!(
             duplicate_entries
-                .get(b"K".as_slice())
+                .get(b"/K".as_slice())
                 .and_then(ObjectHandle::as_integer),
             Some(2)
         );
@@ -1376,7 +1389,7 @@ mod live_input_tests {
         let collision_entries = collision.value.as_dictionary().expect("dictionary");
         assert_eq!(
             collision_entries
-                .get(b"QPDFFake2".as_slice())
+                .get(b"/QPDFFake2".as_slice())
                 .and_then(ObjectHandle::as_integer),
             Some(2)
         );
@@ -1409,6 +1422,56 @@ mod live_input_tests {
                 .and_then(ObjectHandle::object_ref),
             Some(ObjectRef::new(1, 0))
         );
+    }
+
+    #[test]
+    fn live_dictionary_recovery_reserves_orphan_name_fake_keys() {
+        let mut input = CountingInput::new(b"");
+        let mut resolver = NullResolver;
+        let mut tokens = LiveTokenSource::new(&mut input);
+        let mut parser = LiveFileParser {
+            tokens: &mut tokens,
+            resolver: &mut resolver,
+            buffered: VecDeque::new(),
+            diagnostics: Vec::new(),
+            good_count: 0,
+            bad_count: 0,
+            give_up: false,
+            has_context: true,
+            decrypter: None,
+        };
+        let frame = LiveFrame::Dictionary {
+            values: std::collections::BTreeMap::from([(
+                b"/QPDFFake1".to_vec(),
+                ObjectHandle::integer(1),
+            )]),
+            orphan_values: vec![
+                ObjectHandle::name(b"QPDFFake1".to_vec()),
+                ObjectHandle::integer(2),
+            ],
+            pending_key: None,
+            contents: None,
+            start: 0,
+            frame_offset: 2,
+        };
+
+        let parsed = parser
+            .finish_dictionary(frame)
+            .expect("dictionary recovery");
+        let values = parsed.as_dictionary().expect("dictionary");
+        assert_eq!(
+            values
+                .get(b"/QPDFFake2".as_slice())
+                .and_then(ObjectHandle::as_name),
+            Some(b"QPDFFake1".to_vec())
+        );
+        assert_eq!(
+            values
+                .get(b"/QPDFFake3".as_slice())
+                .and_then(ObjectHandle::as_integer),
+            Some(2)
+        );
+        assert_eq!(parser.diagnostics.len(), 2);
     }
 
     #[test]

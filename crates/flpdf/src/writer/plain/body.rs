@@ -1,5 +1,6 @@
 //! qpdf correspondence: QPDFWriter.cc plain object-body emission split from planning and xref output.
 use std::io::{Read, Seek};
+#[cfg(test)]
 use std::rc::Rc;
 
 use crate::rewrite_renumber::renumber_qpdf_refs_in_place_with_removed;
@@ -175,37 +176,49 @@ fn emit_canonical_source<R: Read + Seek>(
     };
 
     if handle.as_stream_dict().is_some() {
-        let (dict, data, refiltered) = canonical_stream_output(pdf, &handle, options, source)?;
-        dict.unparse_stream_body_with_ref_map(bytes, refiltered, &map)?;
+        let (dict, data, refiltered) = canonical_stream_output(&handle, options)?;
+        dict.unparse_stream_body_with_ref_map_and_removed(
+            bytes,
+            refiltered,
+            &map,
+            &plan.removed_refs,
+        )?; // cov:ignore: LLVM attributes the validated success continuation to the call lines above
         serialize::write_stream_payload(bytes, &data, options.newline_before_endstream);
     } else {
-        handle.unparse_object_with_ref_map(bytes, &map)?;
+        handle.unparse_object_with_ref_map_and_removed(bytes, &map, &plan.removed_refs)?;
     }
     Ok(())
 }
 
-fn canonical_stream_output<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+fn canonical_stream_output(
     handle: &ObjectHandle,
     options: &WriterOptions,
-    source: crate::ObjectRef,
 ) -> crate::Result<(ObjectHandle, Vec<u8>, bool)> {
     let stream_dict = handle
         .as_stream_dict()
         .ok_or_else(|| crate::Error::Internal("canonical stream dictionary is missing".into()))?;
     let source_has_lone_flate = canonical_is_lone_flate(&stream_dict)?;
-    let policy = crate::writer::effective_stream_policy(options);
+    // QPDFWriter.cc:1251-1278 gives cleartext /Type /Metadata streams their
+    // own policy: decode fully and emit without a filter, even when the global
+    // writer policy would preserve or compress a lone-Flate source. The plain
+    // route is unencrypted, so this exception always applies here.
+    let is_metadata_stream = stream_dict.try_is_dictionary_of_type(b"Metadata", b"")?;
+    let policy = if is_metadata_stream {
+        Some(CompressStreams::No)
+    } else {
+        crate::writer::effective_stream_policy(options)
+    };
+    let decode_level = if is_metadata_stream {
+        crate::writer::DecodeLevel::All
+    } else {
+        options.decode_level
+    };
     let preserve_lone_flate = matches!(policy, Some(CompressStreams::Yes))
         && source_has_lone_flate
         && !options.recompress_flate
         && !options.content_normalization
-        && !stream_dict.try_has_key(b"F")?;
-    let mut source_for_pipe = handle.clone();
-    if let Some(eol) = pdf.recovered_stream_eol(source) {
-        let mut raw = handle.get_raw_stream_data()?.as_ref().clone();
-        raw.extend_from_slice(eol);
-        source_for_pipe = ObjectHandle::stream(stream_dict.clone(), Rc::new(raw));
-    }
+        && !stream_dict.try_has_key(b"/F")?;
+    let source_for_pipe = handle.clone();
 
     let (data, filtering_attempted) = if policy.is_none() || preserve_lone_flate {
         (
@@ -224,7 +237,7 @@ fn canonical_stream_output<R: Read + Seek>(
             &mut buffer,
             &mut filtering_attempted,
             encode_flags,
-            options.decode_level,
+            decode_level,
             true,
             false,
         )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
@@ -242,23 +255,23 @@ fn canonical_stream_output<R: Read + Seek>(
     };
 
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
-    entries.remove(b"Length".as_slice());
+    entries.remove(b"/Length".as_slice());
     if filtering_attempted {
         entries.retain(|key, _| {
             !matches!(
                 key.as_slice(),
-                b"Filter" | b"DecodeParms" | b"F" | b"FFilter" | b"FDecodeParms"
+                b"/Filter" | b"/DecodeParms" | b"/F" | b"/FFilter" | b"/FDecodeParms"
             )
         });
         if matches!(policy, Some(CompressStreams::Yes)) {
             entries.insert(
-                b"Filter".to_vec(),
+                b"/Filter".to_vec(),
                 ObjectHandle::name(b"FlateDecode".to_vec()),
             );
         }
     }
     entries.insert(
-        b"Length".to_vec(),
+        b"/Length".to_vec(),
         ObjectHandle::integer(i64::try_from(data.len()).unwrap_or(i64::MAX)),
     );
     let dict = ObjectHandle::dictionary(entries.into_iter().collect());
@@ -267,7 +280,7 @@ fn canonical_stream_output<R: Read + Seek>(
 }
 
 fn canonical_is_lone_flate(dict: &ObjectHandle) -> crate::Result<bool> {
-    let filter = dict.try_get_key(b"Filter")?;
+    let filter = dict.try_get_key(b"/Filter")?;
     if filter.try_is_null()? {
         return Ok(false);
     }
@@ -468,6 +481,107 @@ mod tests {
     }
 
     #[test]
+    fn canonical_stream_output_does_not_duplicate_a_recovered_stream_eol() {
+        let fixture =
+            include_bytes!("../../../../../tests/fixtures/compat/null-length-framing-matrix.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        pdf.resolve(ObjectRef::new(5, 0))
+            .expect("legacy resolution records the recovered framing EOL");
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            stream_data: Some(crate::StreamDataMode::Preserve),
+            newline_before_endstream: NewlineBeforeEndstream::Never,
+            ..WriterOptions::default()
+        };
+
+        let (_, data) = pdf
+            .with_plain_writer_stream_recovery(|pdf| {
+                let handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+                pdf.resolve_object_handle(&handle)?;
+                let (_, data, _) = canonical_stream_output(&handle, &options)?;
+                Ok((Vec::<u8>::new(), data))
+            })
+            .unwrap();
+
+        assert_eq!(data, b"missing-lf\n");
+    }
+
+    #[test]
+    fn canonical_stream_output_decodes_metadata_even_under_compress_policy() {
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = crate::filters::encode_stream_data(&filter_dict, b"metadata")
+            .expect("metadata payload must encode");
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Metadata".to_vec())),
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (
+                    b"Length".to_vec(),
+                    ObjectHandle::integer(encoded.len() as i64),
+                ),
+            ]),
+            Rc::new(encoded),
+        );
+
+        let options = WriterOptions::default();
+        let (dict, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
+
+        assert_eq!(data, b"metadata");
+        assert!(!refiltered);
+        assert!(!dict.try_has_key(b"Filter").unwrap());
+    }
+
+    #[test]
+    fn canonical_emission_turns_a_reference_to_a_removed_object_into_null() {
+        let fixture = include_bytes!("../../../../../tests/fixtures/compat/three-page.pdf");
+        let mut pdf = Pdf::open(Cursor::new(&fixture[..])).unwrap();
+        let root = pdf.root_ref().unwrap();
+        let removed = ObjectRef::new(100, 0);
+        let stream_ref = ObjectRef::new(101, 0);
+        pdf.set_object(removed, Object::Integer(7));
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Length", Object::Integer(3));
+        stream_dict.insert("StreamRemovedDirect", Object::Reference(removed));
+        pdf.set_object(
+            stream_ref,
+            Object::Stream(Stream {
+                dict: stream_dict,
+                data: b"abc".to_vec(),
+            }),
+        );
+        let mut catalog = pdf.resolve(root).unwrap().into_dict().unwrap();
+        catalog.insert("RemovedDirect", Object::Reference(removed));
+        catalog.insert(
+            "RemovedArray",
+            Object::Array(vec![Object::Reference(removed)]),
+        );
+        catalog.insert("RemovedStream", Object::Reference(stream_ref));
+        pdf.set_object(root, Object::Dictionary(catalog));
+        pdf.delete_object(removed);
+
+        let options = WriterOptions {
+            object_streams: ObjectStreamMode::Disable,
+            ..WriterOptions::default()
+        };
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+        let (bytes, _) = emit_bodies(&mut pdf, &options, &plan).unwrap();
+
+        assert!(bytes
+            .windows(b"/RemovedArray [ null ]".len())
+            .any(|window| window == b"/RemovedArray [ null ]"));
+        assert!(!bytes
+            .windows(b"/RemovedDirect".len())
+            .any(|window| window == b"/RemovedDirect"));
+        assert!(!bytes
+            .windows(b"/StreamRemovedDirect".len())
+            .any(|window| window == b"/StreamRemovedDirect"));
+    }
+
+    #[test]
     fn canonical_stream_output_retries_with_the_raw_payload_after_a_source_decode_failure() {
         let mut bytes = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let bodies: [(u32, &[u8]); 4] = [
@@ -506,13 +620,12 @@ mod tests {
             ..WriterOptions::default()
         };
 
-        let (dict, data, refiltered) =
-            canonical_stream_output(&mut pdf, &stream, &options, ObjectRef::new(4, 0)).unwrap();
+        let (dict, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
 
         assert_eq!(data, b"abc");
         assert!(!refiltered);
         assert!(dict
-            .get_key(b"Filter")
+            .get_key(b"/Filter")
             .try_is_name_and_equals(b"FlateDecode")
             .unwrap());
     }
@@ -526,15 +639,13 @@ mod tests {
 
         assert!(canonical_is_lone_flate(&dict).unwrap());
 
-        let mut pdf = Pdf::empty().unwrap();
         let stream = ObjectHandle::stream(dict, Rc::new(b"abc".to_vec()));
         let options = WriterOptions {
             compress_streams: CompressStreams::Yes,
             ..WriterOptions::default()
         };
 
-        let (_, data, refiltered) =
-            canonical_stream_output(&mut pdf, &stream, &options, ObjectRef::new(1, 0)).unwrap();
+        let (_, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
 
         assert_eq!(data, b"abc");
         assert!(!refiltered);

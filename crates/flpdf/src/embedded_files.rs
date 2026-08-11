@@ -186,11 +186,11 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         self.pdf.resolve_object_handle(&catalog)?;
         let (names, terminal_ref) = self
             .pdf
-            .resolve_object_handle_to_terminal_ref(&catalog.get_key(b"Names"))?;
+            .resolve_object_handle_to_terminal_ref(&catalog.get_key(b"/Names"))?;
         let names = terminal_ref
             .map(|object_ref| self.pdf.get_object_handle(object_ref))
             .unwrap_or(names);
-        let root = names.get_key(b"EmbeddedFiles");
+        let root = names.get_key(b"/EmbeddedFiles");
         Ok(
             (root.object_ref().is_none() && root.as_dictionary().is_some())
                 .then_some((root, terminal_ref.unwrap_or(catalog_ref))),
@@ -323,16 +323,16 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         self.pdf.resolve_object_handle(&catalog)?;
-        let names = catalog.get_key(b"Names");
+        let names = catalog.get_key(b"/Names");
         if names.is_indirect() {
             self.pdf.resolve_object_handle(&names)?;
         }
-        let mut node = names.get_key(b"EmbeddedFiles");
+        let mut node = names.get_key(b"/EmbeddedFiles");
         if node.is_indirect() {
             self.pdf.resolve_object_handle(&node)?;
         }
         for &kid_number in path {
-            let kids = node.get_key(b"Kids");
+            let kids = node.get_key(b"/Kids");
             if kids.is_indirect() {
                 self.pdf.resolve_object_handle(&kids)?; // cov:ignore: resolving a node lifts its /Kids child handle
             }
@@ -349,7 +349,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             // cov:ignore-end
             node = kid;
         }
-        let pairs = node.get_key(b"Names"); // cov:ignore: LLVM attributes the covered direct-leaf path to the preceding loop exit
+        let pairs = node.get_key(b"/Names"); // cov:ignore: LLVM attributes the covered direct-leaf path to the preceding loop exit
         if pairs.is_indirect() {
             self.pdf.resolve_object_handle(&pairs)?; // cov:ignore: resolving a leaf lifts its /Names child handle
         }
@@ -1299,8 +1299,8 @@ mod tests {
         let catalog_handle = pdf.get_object_handle(catalog_ref);
         pdf.resolve_object_handle(&catalog_handle)
             .expect("resolve catalog");
-        let retained_root = catalog_handle.get_key(b"Names").get_key(b"EmbeddedFiles");
-        let retained_pairs = retained_root.get_key(b"Names");
+        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
+        let retained_pairs = retained_root.get_key(b"/Names");
 
         let filespec_ref = ObjectRef::new(90, 0);
         pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
@@ -1311,7 +1311,7 @@ mod tests {
 
         assert!(
             retained_root
-                .get_key(b"Names")
+                .get_key(b"/Names")
                 .as_array()
                 .is_some_and(|pairs| pairs.len() == 2),
             "a retained direct root must observe helper replacement"
@@ -1331,7 +1331,7 @@ mod tests {
             .expect("remove"));
         assert_eq!(
             retained_root
-                .get_key(b"Names")
+                .get_key(b"/Names")
                 .as_array()
                 .expect("names array")
                 .len(),
@@ -1420,7 +1420,7 @@ mod tests {
         Helper::new(&mut pdf)
             .update_direct_embedded_files_root(&target, owner_ref, Object::Dictionary(updated))
             .expect("add root entry");
-        assert!(target.has_key(b"Names"));
+        assert!(target.has_key(b"/Names"));
     }
 
     #[test]
@@ -1451,7 +1451,7 @@ mod tests {
         let terminal_handle = pdf.get_object_handle(terminal_ref);
         pdf.resolve_object_handle(&terminal_handle)
             .expect("resolve terminal names dictionary");
-        let retained_root = terminal_handle.get_key(b"EmbeddedFiles");
+        let retained_root = terminal_handle.get_key(b"/EmbeddedFiles");
 
         let filespec = pdf.get_object_handle(filespec_ref);
         pdf.embedded_files()
@@ -1460,7 +1460,7 @@ mod tests {
 
         assert_eq!(
             retained_root
-                .get_key(b"Names")
+                .get_key(b"/Names")
                 .as_array()
                 .expect("updated names array")
                 .len(),
@@ -1501,7 +1501,7 @@ mod tests {
         let catalog_handle = pdf.get_object_handle(catalog_ref);
         pdf.resolve_object_handle(&catalog_handle)
             .expect("resolve catalog");
-        let retained_root = catalog_handle.get_key(b"Names").get_key(b"EmbeddedFiles");
+        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
 
         let filespec_ref = ObjectRef::new(90, 0);
         pdf.set_object(filespec_ref, Object::Dictionary(Dictionary::new()));
@@ -1512,7 +1512,7 @@ mod tests {
 
         assert!(
             retained_root
-                .get_key(b"Kids")
+                .get_key(b"/Kids")
                 .as_array()
                 .and_then(|kids| kids.first().cloned())
                 .is_some_and(|kid| kid.is_indirect()),
@@ -1549,9 +1549,9 @@ mod tests {
         let catalog_handle = pdf.get_object_handle(catalog_ref);
         pdf.resolve_object_handle(&catalog_handle)
             .expect("resolve catalog");
-        let retained_root = catalog_handle.get_key(b"Names").get_key(b"EmbeddedFiles");
+        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
         let retained_filespec = retained_root
-            .get_key(b"Names")
+            .get_key(b"/Names")
             .as_array()
             .expect("names array")[1]
             .clone();
@@ -1563,14 +1563,14 @@ mod tests {
             .replace_embedded_file(b"b", added)
             .expect("replace");
 
-        retained_filespec.replace_key(b"F", ObjectHandle::string(b"new.txt".to_vec()));
+        retained_filespec.replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()));
         let current_filespec = retained_root
-            .get_key(b"Names")
+            .get_key(b"/Names")
             .as_array()
             .expect("updated names array")[1]
             .clone();
         assert_eq!(
-            current_filespec.get_key(b"F").as_string(),
+            current_filespec.get_key(b"/F").as_string(),
             Some(b"new.txt".to_vec())
         );
     }

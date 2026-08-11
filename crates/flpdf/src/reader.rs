@@ -3947,7 +3947,7 @@ mod tests {
         let dict = info_handle
             .as_dictionary()
             .expect("/Info must be a dictionary");
-        let title_handle = dict.get(b"Title".as_slice()).expect("/Title entry");
+        let title_handle = dict.get(b"/Title".as_slice()).expect("/Title entry");
         let title = title_handle.as_string().expect("/Title must be a string");
 
         assert_eq!(
@@ -4543,7 +4543,7 @@ mod tests {
         let ciphertext = rc4_ciphertext(object_ref, b"TopSecretTitle", &encryption);
         let inner =
             ObjectHandle::dictionary(vec![(b"Title".to_vec(), ObjectHandle::string(ciphertext))]);
-        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"Nested".to_vec(), inner)]));
+        let mut value = ObjectValue::Dictionary(BTreeMap::from([(b"/Nested".to_vec(), inner)]));
 
         decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
             .expect("nested-dictionary string decryption");
@@ -4551,9 +4551,9 @@ mod tests {
         let ObjectValue::Dictionary(entries) = &value else {
             panic!("value must still be a dictionary"); // cov:ignore: unreachable given this test's own construction of value
         };
-        let nested = entries.get(b"Nested".as_slice()).expect("Nested entry");
+        let nested = entries.get(b"/Nested".as_slice()).expect("Nested entry");
         let nested_dict = nested.as_dictionary().expect("Nested must be a dictionary");
-        let title = nested_dict.get(b"Title".as_slice()).expect("Title entry");
+        let title = nested_dict.get(b"/Title".as_slice()).expect("Title entry");
         assert_eq!(
             title.as_string().as_deref(),
             Some(b"TopSecretTitle".as_slice())
@@ -4587,7 +4587,7 @@ mod tests {
             panic!("value must still be a stream"); // cov:ignore: unreachable given this test's own construction of value
         };
         let stream_dict = stream_dict.as_dictionary().expect("stream dict");
-        let title = stream_dict.get(b"Title".as_slice()).expect("Title entry");
+        let title = stream_dict.get(b"/Title".as_slice()).expect("Title entry");
         assert_eq!(
             title.as_string().as_deref(),
             Some(b"TopSecretTitle".as_slice())
@@ -4637,7 +4637,7 @@ mod tests {
             .expect("array item must still be a stream")
             .as_dictionary()
             .expect("stream dict");
-        let title = nested_dict.get(b"Title".as_slice()).expect("Title entry");
+        let title = nested_dict.get(b"/Title".as_slice()).expect("Title entry");
         assert_eq!(
             title.as_string().as_deref(),
             Some(b"TopSecretTitle".as_slice())
@@ -5207,14 +5207,14 @@ mod tests {
         let indirect = pdf
             .make_indirect_object_handle(direct)
             .expect("make indirect even though a clone is still outstanding");
-        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+        assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
         // The new indirect handle is its own object; mutating the original
         // direct clone the caller kept does not affect it (Rust's Direct
         // and Indirect slots are distinct storage, unlike qpdf's uniform
         // shared_ptr<QPDFObject> -- see make_indirect_object_handle's own
         // doc comment).
-        clone_kept_by_caller.replace_key(b"A", ObjectHandle::integer(99));
-        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
+        clone_kept_by_caller.replace_key(b"/A", ObjectHandle::integer(99));
+        assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
     }
 
     #[test]
@@ -5246,7 +5246,7 @@ mod tests {
         let promoted_length = promoted
             .as_stream_dict()
             .expect("promoted stream dict")
-            .get_key(b"Length")
+            .get_key(b"/Length")
             .as_integer();
         assert_eq!(
             promoted_length,
@@ -5263,7 +5263,7 @@ mod tests {
             direct_stream
                 .as_stream_dict()
                 .expect("source stream dict")
-                .get_key(b"Length")
+                .get_key(b"/Length")
                 .as_integer(),
             Some(15),
             "while the source records its own replacement"
@@ -5350,7 +5350,7 @@ mod tests {
         let stream_ref = stream.object_ref().expect("stream ref");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve_object_handle(&root).expect("resolve root");
-        root.replace_key(b"Extra", stream.clone());
+        root.replace_key(b"/Extra", stream.clone());
         pdf.mark_object_dirty(ObjectRef::new(1, 0));
 
         let mut writer = crate::PdfWriter::new(&mut pdf);
@@ -5429,7 +5429,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
         pdf.resolve_object_handle(&pages).expect("resolve pages");
-        let kids = pages.get_key(b"Kids");
+        let kids = pages.get_key(b"/Kids");
         assert_eq!(kids.try_array_len().expect("read page kids"), Some(1));
 
         pdf.remove_object_handle(ObjectRef::new(3, 0))
@@ -5475,7 +5475,7 @@ mod tests {
         pdf.resolve_object_handle(&root)
             .expect("resolve target root");
         let foreign = foreign_pdf.get_object_handle(ObjectRef::new(3, 0));
-        root.replace_key(b"Foreign", foreign);
+        root.replace_key(b"/Foreign", foreign);
         pdf.mark_object_dirty(ObjectRef::new(1, 0));
 
         let error = {
@@ -5560,7 +5560,7 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let page = pdf.get_object_handle(page_ref);
         pdf.resolve_object_handle(&page).expect("resolve page");
-        page.replace_key(b"Rotate", ObjectHandle::integer(90));
+        page.replace_key(b"/Rotate", ObjectHandle::integer(90));
         pdf.mark_object_dirty(page_ref);
         assert!(
             pdf.legacy_materialized_memo.is_empty(),
@@ -6337,7 +6337,7 @@ mod tests {
         );
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle).unwrap();
-        handle.replace_key(b"Value", ObjectHandle::integer(2));
+        handle.replace_key(b"/Value", ObjectHandle::integer(2));
         pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
@@ -6378,7 +6378,7 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle)
             .expect("resolve the canonical handle before mutating it");
-        handle.replace_key(b"Value", ObjectHandle::integer(2));
+        handle.replace_key(b"/Value", ObjectHandle::integer(2));
         pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
@@ -6418,7 +6418,7 @@ mod tests {
         let mut source = Pdf::open_mem_owned(bytes.clone()).expect("open source");
         let source_owner = source.get_object_handle(object_ref);
         source.resolve_object_handle(&source_owner).unwrap();
-        let foreign = source_owner.get_key(b"Child");
+        let foreign = source_owner.get_key(b"/Child");
         assert!(foreign.is_direct());
         let mut destination = Pdf::open_mem_owned(bytes).expect("open destination");
 
@@ -6441,7 +6441,7 @@ mod tests {
         pdf.resolve_object_handle(&owner).unwrap();
         let inner = ObjectHandle::integer(42);
         let container = ObjectHandle::dictionary(vec![(b"Inner".to_vec(), inner.clone())]);
-        owner.replace_key(b"Container", container);
+        owner.replace_key(b"/Container", container);
         pdf.clear_dirty(object_ref);
 
         pdf.mark_object_handle_dirty(&inner).unwrap();
@@ -6458,11 +6458,11 @@ mod tests {
         let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open fixture");
         let owner = pdf.get_object_handle(owner_ref);
         pdf.resolve_object_handle(&owner).unwrap();
-        let child = owner.get_key(b"Child");
+        let child = owner.get_key(b"/Child");
 
-        owner.remove_key(b"Child");
+        owner.remove_key(b"/Child");
         pdf.clear_dirty(owner_ref);
-        child.replace_key(b"Value", ObjectHandle::integer(2));
+        child.replace_key(b"/Value", ObjectHandle::integer(2));
         pdf.mark_object_handle_dirty(&child).unwrap();
 
         assert!(!pdf.is_dirty(owner_ref));
@@ -6482,7 +6482,7 @@ mod tests {
         let reopened_owner = reopened.get_object_handle(owner_ref);
         reopened.resolve_object_handle(&reopened_owner).unwrap();
         assert!(
-            reopened_owner.get_key(b"Child").is_null(),
+            reopened_owner.get_key(b"/Child").is_null(),
             "canonical writer must emit the live owner's remove_key mutation"
         );
     }
@@ -7193,8 +7193,8 @@ mod tests {
         assert!(indirect.is_same_object_as(&alias));
         assert!(alias.is_indirect());
         assert_eq!(alias.object_ref(), Some(object_ref));
-        alias.replace_key(b"Value", ObjectHandle::integer(11));
-        assert_eq!(indirect.get_key(b"Value").as_integer(), Some(11));
+        alias.replace_key(b"/Value", ObjectHandle::integer(11));
+        assert_eq!(indirect.get_key(b"/Value").as_integer(), Some(11));
         assert!(!pdf.is_dirty(object_ref));
 
         let all = pdf
@@ -7285,7 +7285,7 @@ mod tests {
 
         assert!(returned.is_same_object_as(&target));
         assert_eq!(target.object_ref(), Some(object_ref));
-        assert_eq!(target.get_key(b"Value").as_integer(), Some(7));
+        assert_eq!(target.get_key(b"/Value").as_integer(), Some(7));
         assert_eq!(target.get_parsed_offset(), NO_PARSED_OFFSET);
         assert_eq!(target.description(), "object 1 0");
         assert!(pdf.is_dirty(object_ref));
@@ -7325,7 +7325,7 @@ mod tests {
         let object_ref = ObjectRef::new(1, 0);
         let target = pdf.get_object_handle(object_ref);
         target.try_dereference().expect("resolve target");
-        let before = target.get_key(b"Type").as_name().expect("catalog type");
+        let before = target.get_key(b"/Type").as_name().expect("catalog type");
 
         let indirect_replacement = pdf.get_object_handle(ObjectRef::new(2, 0));
         let error = pdf
@@ -7337,7 +7337,7 @@ mod tests {
             "unsupported PDF feature: QPDF::replaceObject called with indirect object handle"
         );
         assert_eq!(target.object_ref(), Some(object_ref));
-        assert_eq!(target.get_key(b"Type").as_name(), Some(before));
+        assert_eq!(target.get_key(b"/Type").as_name(), Some(before));
         assert!(!pdf.is_dirty(object_ref));
     }
 
@@ -7351,7 +7351,7 @@ mod tests {
         foreign_root
             .try_dereference()
             .expect("resolve foreign root");
-        let foreign_direct = foreign_root.get_key(b"Type");
+        let foreign_direct = foreign_root.get_key(b"/Type");
         assert!(foreign_direct.is_direct());
 
         let error = pdf
@@ -7472,9 +7472,9 @@ mod tests {
         let dict = handle
             .as_dictionary()
             .expect("trailer is a dictionary handle");
-        assert!(dict.contains_key(b"Root".as_slice()) || dict.contains_key(b"Size".as_slice()));
+        assert!(dict.contains_key(b"/Root".as_slice()) || dict.contains_key(b"/Size".as_slice()));
 
-        let root_handle = dict.get(b"Root".as_slice()).expect("trailer has /Root");
+        let root_handle = dict.get(b"/Root".as_slice()).expect("trailer has /Root");
         assert!(root_handle.is_indirect());
         assert_eq!(root_handle.object_ref(), pdf.root_ref());
     }
@@ -7686,7 +7686,7 @@ mod tests {
             .expect("handle resolves to a dictionary");
         assert_eq!(dict.len(), legacy_dict.iter().count());
         assert_eq!(
-            dict.get(b"Pages".as_slice())
+            dict.get(b"/Pages".as_slice())
                 .and_then(ObjectHandle::object_ref),
             legacy_dict.get_ref("Pages")
         );
@@ -7855,10 +7855,10 @@ mod tests {
         let nested_handle = result
             .as_dictionary()
             .expect("terminal is a dictionary")
-            .get(b"Nested".as_slice())
+            .get(b"/Nested".as_slice())
             .expect("Nested present")
             .clone();
-        nested_handle.replace_key(b"Inner", ObjectHandle::integer(999));
+        nested_handle.replace_key(b"/Inner", ObjectHandle::integer(999));
 
         let canonical_target = pdf.get_object_handle(target_ref);
         pdf.resolve_object_handle(&canonical_target)
@@ -7876,11 +7876,11 @@ mod tests {
         let canonical_inner = canonical_target
             .as_dictionary()
             .expect("canonical target is a dictionary")
-            .get(b"Nested".as_slice())
+            .get(b"/Nested".as_slice())
             .and_then(ObjectHandle::as_dictionary)
             .and_then(|nested| {
                 nested
-                    .get(b"Inner".as_slice())
+                    .get(b"/Inner".as_slice())
                     .and_then(ObjectHandle::as_integer)
             });
         assert_eq!(
@@ -8303,28 +8303,28 @@ mod tests {
             .expect("resolve compressed scalar/dictionary/reference dict");
 
         let dict = handle.as_dictionary().expect("dictionary");
-        assert!(dict.contains_key(b"B".as_slice()));
-        assert!(dict.contains_key(b"R".as_slice()));
+        assert!(dict.contains_key(b"/B".as_slice()));
+        assert!(dict.contains_key(b"/R".as_slice()));
         assert_eq!(
-            dict.get(b"RL".as_slice())
+            dict.get(b"/RL".as_slice())
                 .and_then(ObjectHandle::as_real_literal),
             Some((0.5, b".5".to_vec()))
         );
-        assert!(dict.contains_key(b"N".as_slice()));
-        assert!(dict.contains_key(b"S".as_slice()));
-        assert!(dict.get(b"Nul".as_slice()).expect("Nul entry").is_null());
+        assert!(dict.contains_key(b"/N".as_slice()));
+        assert!(dict.contains_key(b"/S".as_slice()));
+        assert!(dict.get(b"/Nul".as_slice()).expect("Nul entry").is_null());
 
-        let kid = dict.get(b"Kid".as_slice()).expect("Kid entry");
+        let kid = dict.get(b"/Kid".as_slice()).expect("Kid entry");
         assert!(kid.is_indirect());
         assert_eq!(kid.object_ref(), Some(ObjectRef::new(5, 0)));
 
         let sub = dict
-            .get(b"Sub".as_slice())
+            .get(b"/Sub".as_slice())
             .expect("Sub entry")
             .as_dictionary()
             .expect("nested dictionary");
         assert_eq!(
-            sub.get(b"X".as_slice()).and_then(ObjectHandle::as_integer),
+            sub.get(b"/X".as_slice()).and_then(ObjectHandle::as_integer),
             Some(1)
         );
     }
@@ -8356,7 +8356,7 @@ mod tests {
         let dict = handle.as_stream_dict().expect("stream dictionary");
         let entries = dict.as_dictionary().expect("dictionary entries");
         let filters = entries
-            .get(b"Filter".as_slice())
+            .get(b"/Filter".as_slice())
             .and_then(ObjectHandle::as_array)
             .expect("source filter array");
         assert_eq!(
@@ -8372,14 +8372,14 @@ mod tests {
         );
 
         let decode_parms = entries
-            .get(b"DecodeParms".as_slice())
+            .get(b"/DecodeParms".as_slice())
             .and_then(ObjectHandle::as_array)
             .expect("source decode-params array");
         assert_eq!(decode_parms.len(), filters.len());
         assert_eq!(
             decode_parms[1]
                 .as_dictionary()
-                .and_then(|params| params.get(b"Name".as_slice()).cloned())
+                .and_then(|params| params.get(b"/Name".as_slice()).cloned())
                 .and_then(|name| name.as_name()),
             Some(b"Identity".to_vec())
         );
@@ -8587,7 +8587,7 @@ mod tests {
         );
         let nested = handle
             .as_dictionary()
-            .and_then(|entries| entries.get(b"Nested".as_slice()).cloned())
+            .and_then(|entries| entries.get(b"/Nested".as_slice()).cloned())
             .expect("nested dictionary");
         assert!(
             nested.description().contains("object 1 0 at offset"),
@@ -8637,9 +8637,9 @@ mod tests {
 
         let inner = handle
             .as_dictionary()
-            .and_then(|entries| entries.get(b"Outer".as_slice()).cloned())
+            .and_then(|entries| entries.get(b"/Outer".as_slice()).cloned())
             .and_then(|outer| outer.as_dictionary())
-            .and_then(|entries| entries.get(b"Inner".as_slice()).cloned())
+            .and_then(|entries| entries.get(b"/Inner".as_slice()).cloned())
             .expect("nested dictionary");
         inner
             .object_warning("nested warning")

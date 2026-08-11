@@ -251,7 +251,7 @@ impl CanonicalCatalogFirstRenumber {
             pdf.get_all_object_handles()?
                 .into_iter()
                 .filter_map(|handle| handle.object_ref())
-                .filter(|object_ref| !removed_refs.contains(object_ref))
+                .filter(|object_ref| object_ref.number != 0 && !removed_refs.contains(object_ref))
                 .collect()
         } else {
             Vec::new()
@@ -263,7 +263,7 @@ impl CanonicalCatalogFirstRenumber {
         for (key, value) in trailer_entries {
             if matches!(
                 key.as_slice(),
-                b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size"
+                b"/ID" | b"/Encrypt" | b"/Prev" | b"/Root" | b"/Size"
             ) {
                 continue;
             }
@@ -352,7 +352,7 @@ fn collect_canonical_children<R: Read + Seek>(
         pdf.resolve_object_handle(&stream_dict)?;
         if let Some(entries) = stream_dict.try_as_dictionary()? {
             for (key, value) in entries {
-                if skip_length && key.as_slice() == b"Length" {
+                if skip_length && key.as_slice() == b"/Length" {
                     continue;
                 }
                 if !value.try_is_null()? {
@@ -1374,6 +1374,19 @@ mod tests {
             .expect("object zero is a direct null in the canonical writer");
 
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn preserving_unreferenced_objects_does_not_seed_object_zero() {
+        let mut pdf = Pdf::open_mem_owned(build_raw_pdf(&[(1, b"<< /Type /Catalog >>")]))
+            .expect("minimal PDF must open");
+        let _zero = pdf.get_object_handle(ObjectRef::new(0, 0));
+
+        let map = CanonicalCatalogFirstRenumber::build_qpdf(&mut pdf, true, true, &BTreeSet::new())
+            .expect("preserve-unreferenced renumbering must succeed");
+
+        assert_eq!(map.new_for_original(ObjectRef::new(0, 0)), None);
+        assert!(map.pairs().all(|(_output, source)| source.number != 0));
     }
 
     #[test]

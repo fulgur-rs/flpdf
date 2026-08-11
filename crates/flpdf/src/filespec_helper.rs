@@ -82,6 +82,7 @@
 
 use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
+use crate::object_handle::canonical_dictionary_key;
 use crate::pdf_string::{new_unicode_string, utf8_value};
 use crate::pipeline::md5::PlMd5;
 use crate::pipeline::{Discard, Pipeline};
@@ -207,7 +208,8 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     }
 
     fn resolved_key(&self, dictionary: &ObjectHandle, key: &[u8]) -> Result<ObjectHandle> {
-        let value = dictionary.get_key(key);
+        let key = canonical_dictionary_key(key);
+        let value = dictionary.get_key(&key);
         self.pdf
             .borrow_mut()
             .resolve_object_handle_to_terminal(&value)
@@ -367,7 +369,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let Some((_, stream_dict, stream_ref)) = self.resolved_stream()? else {
             return Ok(());
         };
-        let params = stream_dict.get_key(b"Params");
+        let params = stream_dict.get_key(b"/Params");
         let (resolved, terminal_ref) = self
             .pdf
             .borrow_mut()
@@ -390,7 +392,8 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                     pdf.mark_object_handle_dirty(&target)?;
                 }
             }
-            target.replace_key(key.as_bytes(), ObjectHandle::string(value));
+            let key = canonical_dictionary_key(key.as_bytes());
+            target.replace_key(&key, ObjectHandle::string(value));
             return Ok(());
         }
 
@@ -403,8 +406,11 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             }
         }
         stream_dict.replace_key(
-            b"Params",
-            ObjectHandle::dictionary(vec![(key.as_bytes().to_vec(), ObjectHandle::string(value))]),
+            b"/Params",
+            ObjectHandle::dictionary(vec![(
+                canonical_dictionary_key(key.as_bytes()),
+                ObjectHandle::string(value),
+            )]),
         );
         Ok(())
     }
@@ -434,7 +440,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 pdf.mark_object_handle_dirty(&stream_dict)?;
             }
         }
-        stream_dict.replace_key(b"Subtype", ObjectHandle::name(value.as_ref().to_vec()));
+        stream_dict.replace_key(b"/Subtype", ObjectHandle::name(value.as_ref().to_vec()));
         Ok(self)
     }
 }
@@ -569,7 +575,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         };
         self.pdf.mark_object_handle_dirty(&dict)?;
         dict.replace_key(
-            b"Desc",
+            b"/Desc",
             ObjectHandle::string(new_unicode_string(description.as_ref())),
         );
         Ok(self)
@@ -590,12 +596,12 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         };
         self.pdf.mark_object_handle_dirty(&dict)?;
         let unicode_name = new_unicode_string(unicode_name.as_ref());
-        dict.replace_key(b"UF", ObjectHandle::string(unicode_name.clone()));
+        dict.replace_key(b"/UF", ObjectHandle::string(unicode_name.clone()));
         let compatibility_name = compatibility_name
             .map(ToOwned::to_owned)
             .filter(|name| !name.is_empty());
         dict.replace_key(
-            b"F",
+            b"/F",
             ObjectHandle::string(compatibility_name.unwrap_or(unicode_name)),
         );
         Ok(self)
@@ -718,12 +724,13 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         };
 
         if !key.is_empty() {
-            let key = key.strip_prefix('/').unwrap_or(key);
-            return Ok(ef.get_key(key.as_bytes()));
+            let key = canonical_dictionary_key(key.as_bytes());
+            return Ok(ef.get_key(&key));
         }
 
         for key in NAME_KEYS {
-            let Some(candidate) = entries.get(key.as_bytes()).cloned() else {
+            let key = canonical_dictionary_key(key.as_bytes());
+            let Some(candidate) = entries.get(&key).cloned() else {
                 continue;
             };
             let terminal = self.pdf.resolve_object_handle_to_terminal(&candidate)?;
@@ -740,7 +747,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         let Some(filespec) = self.filespec_dict()? else {
             return Ok(ObjectHandle::null());
         };
-        Ok(filespec.get_key(b"EF"))
+        Ok(filespec.get_key(b"/EF"))
     }
 
     /// Resolve and return the embedded file stream.
@@ -1723,7 +1730,7 @@ mod tests {
         pdf.set_object(owner_ref, Object::Dictionary(owner));
         let owner = pdf.get_object_handle(owner_ref);
         pdf.resolve_object_handle(&owner).unwrap();
-        let direct_filespec = owner.get_key(b"FS");
+        let direct_filespec = owner.get_key(b"/FS");
         pdf.clear_dirty(owner_ref);
 
         let mut helper = FileSpec::new(direct_filespec, &mut pdf).unwrap();
@@ -1755,7 +1762,7 @@ mod tests {
         source.set_object(owner_ref, Object::Dictionary(owner_dict));
         let owner = source.get_object_handle(owner_ref);
         source.resolve_object_handle(&owner).unwrap();
-        let foreign_direct_filespec = owner.get_key(b"FS");
+        let foreign_direct_filespec = owner.get_key(b"/FS");
         assert!(foreign_direct_filespec.is_direct());
 
         let mut destination = open_minimal();

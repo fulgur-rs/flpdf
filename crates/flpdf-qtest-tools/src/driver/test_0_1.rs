@@ -227,7 +227,7 @@ fn write_object_details<R: Read + Seek>(
             emit_new_diagnostics(pdf, diagnostics_written, filename, stdout, stderr)?;
             for (key, is_indirect) in items {
                 write!(stdout, "  /")?;
-                write_bytes(stdout, &key)?;
+                write_bytes(stdout, key.strip_prefix(b"/").unwrap_or(&key))?;
                 let direct_prefix = if is_indirect { "in" } else { "" };
                 writeln!(stdout, " is {direct_prefix}direct")?;
             }
@@ -1090,7 +1090,7 @@ mod tests {
             )
             .len();
             let mut pdf = Pdf::open_mem_owned(bytes).expect("open DecodeParms warning fixture");
-            let original = pdf.trailer_handle().get_key(b"QTest");
+            let original = pdf.trailer_key_handle(b"QTest");
             let (qtest, terminal_ref) = pdf
                 .resolve_object_handle_to_terminal_ref(&original)
                 .expect("resolve qtest");
@@ -1140,7 +1140,7 @@ mod tests {
             )],
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open warning fixture");
-        let original = pdf.trailer_handle().get_key(b"QTest");
+        let original = pdf.trailer_key_handle(b"QTest");
         let (qtest, terminal_ref) = pdf
             .resolve_object_handle_to_terminal_ref(&original)
             .expect("resolve qtest");
@@ -1175,7 +1175,7 @@ mod tests {
             )],
         );
         let mut pdf = Pdf::open_mem_owned(bytes).expect("open codec-error fixture");
-        let original = pdf.trailer_handle().get_key(b"QTest");
+        let original = pdf.trailer_key_handle(b"QTest");
         let (qtest, terminal_ref) = pdf
             .resolve_object_handle_to_terminal_ref(&original)
             .expect("resolve qtest");

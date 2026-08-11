@@ -286,7 +286,7 @@ pub fn format_attachment_list<R: Read + Seek>(
             if pdf.resolve_object_handle_to_terminal(&stream)?.is_null() {
                 continue;
             }
-            out.extend_from_slice(b"    /");
+            out.extend_from_slice(b"    ");
             out.extend_from_slice(&stream_key);
             out.extend_from_slice(b" -> ");
             out.extend_from_slice(object_generation(&stream).as_bytes());
