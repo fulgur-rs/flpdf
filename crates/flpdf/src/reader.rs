@@ -1358,22 +1358,28 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.remove(&object_ref);
     }
 
-    /// Every object reference known from the cross-reference table, including objects
-    /// that have not yet been parsed.
+    /// Every object reference known from the cross-reference table or the
+    /// canonical handle registry, including objects that have not yet been
+    /// parsed. The registry half is needed for qpdf-shaped allocations made
+    /// from an existing [`ObjectHandle`].
     pub fn object_refs(&self) -> Vec<ObjectRef> {
-        if self.resolver.reconstructed_xref() {
-            return self
-                .cache
-                .refs_after_xref_recovery(&self.resolver.xref_entries(), false);
-        }
+        let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
+            self.cache
+                .refs_after_xref_recovery(&self.resolver.xref_entries(), false)
+                .into_iter()
+                .collect()
+        } else {
+            self.cache
+                .entries()
+                .iter()
+                .filter_map(|(object_ref, entry)| {
+                    (!matches!(entry, CacheEntry::Missing)).then_some(*object_ref)
+                })
+                .collect()
+        };
 
-        self.cache
-            .entries()
-            .iter()
-            .filter_map(|(object_ref, entry)| {
-                (!matches!(entry, CacheEntry::Missing)).then_some(*object_ref)
-            })
-            .collect()
+        refs.extend(self.canonical_object_refs(false));
+        refs.into_iter().collect()
     }
 
     /// Object refs that the cross-reference table marks as live.
@@ -1389,20 +1395,48 @@ impl<R: Read + Seek> Pdf<R> {
     /// is a real null indirect object (e.g. `1 0 obj null endobj`), not an
     /// absent one.
     pub fn live_object_refs(&self) -> Vec<ObjectRef> {
-        if self.resolver.reconstructed_xref() {
-            return self
-                .cache
-                .refs_after_xref_recovery(&self.resolver.xref_entries(), true);
-        }
+        let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
+            self.cache
+                .refs_after_xref_recovery(&self.resolver.xref_entries(), true)
+                .into_iter()
+                .collect()
+        } else {
+            self.cache
+                .entries()
+                .iter()
+                .filter_map(|(object_ref, entry)| match entry {
+                    crate::cache::CacheEntry::Deleted
+                    | crate::cache::CacheEntry::Missing
+                    | crate::cache::CacheEntry::Reserved => None,
+                    _ => Some(*object_ref),
+                })
+                .collect()
+        };
 
-        self.cache
-            .entries()
-            .iter()
-            .filter_map(|(object_ref, entry)| match entry {
-                crate::cache::CacheEntry::Deleted
-                | crate::cache::CacheEntry::Missing
-                | crate::cache::CacheEntry::Reserved => None,
-                _ => Some(*object_ref),
+        refs.extend(self.canonical_object_refs(true));
+        refs.into_iter().collect()
+    }
+
+    fn canonical_object_refs(&self, live_only: bool) -> BTreeSet<ObjectRef> {
+        self.resolver
+            .all_object_handles()
+            .into_iter()
+            .filter_map(|handle| {
+                let object_ref = handle.object_ref()?;
+                if handle.is_missing()
+                    || matches!(self.cache.entry(object_ref), Some(CacheEntry::Missing))
+                {
+                    return None;
+                }
+                if live_only
+                    && matches!(
+                        self.cache.entry(object_ref),
+                        Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
+                    )
+                {
+                    return None;
+                }
+                Some(object_ref)
             })
             .collect()
     }
@@ -1673,18 +1707,23 @@ impl<R: Read + Seek> Pdf<R> {
     /// Return an unused generation-zero object reference.
     ///
     /// Both the legacy object cache and the canonical handle registry own
-    /// object numbers. A number absent from `object_refs()` may therefore
-    /// still belong to an unmaterialized [`ObjectHandle`].
+    /// object numbers. The enumeration includes both sources, and the
+    /// resolver maximum is retained here so an unmaterialized handle cannot
+    /// be skipped between the scan and allocation.
     pub(crate) fn next_available_object_ref(&self) -> Result<ObjectRef> {
-        let next_number = self
+        let max_number = self
             .object_refs()
             .iter()
             .map(|r| r.number)
             .chain(self.resolver.max_object_number())
             .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            .unwrap_or(0);
+        if max_number >= i32::MAX as u32 {
+            return Err(Error::Unsupported(
+                "max object id is too high to create new objects".to_string(),
+            ));
+        }
+        let next_number = max_number + 1;
         Ok(ObjectRef::new(next_number, 0))
     }
 
