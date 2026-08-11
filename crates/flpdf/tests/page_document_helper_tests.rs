@@ -1497,10 +1497,12 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
         PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap(),
         vec![
             ObjectRef::new(13, 0),
-            ObjectRef::new(3, 0),
             ObjectRef::new(14, 0),
+            ObjectRef::new(3, 0),
+            ObjectRef::new(12, 0),
+            ObjectRef::new(15, 0),
         ],
-        "qpdf traverses direct nodes in place, mints direct leaves, and clones duplicate leaves"
+        "qpdf traverses direct nodes in place, promotes direct leaves, retains indirect scalar leaves, and clones duplicate leaves"
     );
 
     let Object::Dictionary(minted_leaf) = pdf.resolve(ObjectRef::new(13, 0)).unwrap() else {
@@ -1519,6 +1521,25 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     assert_eq!(
         minted_leaf.get("Type"),
         Some(&Object::Name(b"Page".to_vec()))
+    );
+
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(14, 0)).unwrap(),
+        Object::Integer(42),
+        "qpdf promotes a direct scalar kid without changing its value"
+    );
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(12, 0)).unwrap(),
+        Object::Integer(12),
+        "qpdf includes an indirect scalar kid in the flattened page order"
+    );
+    let Object::Dictionary(cloned_leaf) = pdf.resolve(ObjectRef::new(15, 0)).unwrap() else {
+        panic!("duplicate page must be copied as a dictionary");
+    };
+    assert_eq!(
+        cloned_leaf.get("Type"),
+        Some(&Object::Name(b"Page".to_vec())),
+        "qpdf repairs the duplicate copy as a page"
     );
 
     let Object::Dictionary(root) = pdf.resolve(ObjectRef::new(2, 0)).unwrap() else {

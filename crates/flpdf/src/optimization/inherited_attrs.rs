@@ -321,15 +321,11 @@ fn push_internal<R: Read + Seek>(
 }
 
 fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
-    let number = pdf
-        .object_refs()
-        .into_iter()
-        .map(|object_ref| object_ref.number)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_owned()))?;
-    Ok(ObjectRef::new(number, 0))
+    // qpdf's page optimization allocates through the same object cache that
+    // `getAllPagesInternal` uses for direct-leaf promotion and duplicate-page
+    // cloning. Looking only at the legacy raw cache can reuse a freshly minted
+    // canonical page object number (`QPDF.cc:1271-1283,1872-1888`).
+    pdf.next_obj_gen()
 }
 
 #[cfg(test)]
