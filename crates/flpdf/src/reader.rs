@@ -1696,6 +1696,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `nextObjGen()` allocates above the maximum object number, so a
     /// generation-one occupant reserves the number just as generation zero
     /// does.
+    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
     pub(crate) fn object_number_is_available(&self, number: u32) -> bool {
         !self.cache.contains_object_number(number) && !self.resolver.holds_object_number(number)
     }

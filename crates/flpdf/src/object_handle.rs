@@ -2180,6 +2180,16 @@ impl ObjectHandle {
         is_null
     }
 
+    /// True if this indirect handle resolved as a missing or malformed source
+    /// object rather than as a parsed literal null. The distinction is kept
+    /// private to the canonical reader/consumer boundary because both states
+    /// intentionally present as null through the public qpdf-compatible view.
+    pub(crate) fn is_missing(&self) -> bool {
+        let state = self.0.borrow().state.clone();
+        let is_missing = matches!(&*state.borrow(), ObjectState::Missing);
+        is_missing
+    }
+
     /// The value as `i64` if this handle's value — its own if direct, or its
     /// already-resolved value if indirect — is an integer, or `None`
     /// otherwise. This never performs resolution itself: an indirect handle

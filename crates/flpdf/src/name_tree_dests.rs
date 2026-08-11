@@ -111,17 +111,7 @@ pub fn insert_name_tree_dest<R: Read + Seek>(
             catalog.insert("Names", Object::Reference(names_ref));
         }
         NamesLocation::Direct | NamesLocation::Missing => {
-            let number = pdf
-                .object_refs()
-                .into_iter()
-                .map(|object_ref| object_ref.number)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or_else(|| {
-                    crate::Error::Unsupported("object-number space exhausted".to_string())
-                })?;
-            let names_ref = crate::ObjectRef::new(number, 0);
+            let names_ref = pdf.next_available_object_ref()?;
             pdf.set_object(names_ref, Object::Dictionary(names));
             catalog.insert("Names", Object::Reference(names_ref));
         }

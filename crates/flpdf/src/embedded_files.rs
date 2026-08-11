@@ -1179,6 +1179,14 @@ mod tests {
         Pdf::open(std::io::Cursor::new(minimal_pdf_bytes())).expect("open minimal PDF")
     }
 
+    fn next_object_number(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>) -> u32 {
+        pdf.next_available_object_ref()
+            .expect("object-number space must have room in the test fixture")
+            .number
+            .checked_sub(1)
+            .expect("minimal test fixture has object 1 as its first object")
+    }
+
     fn indirect_names_pdf_bytes() -> Vec<u8> {
         let mut pdf = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
@@ -1607,12 +1615,7 @@ mod tests {
         let mut pdf = open_minimal();
 
         // A side-car stream that will be reachable ONLY via the filespec dict.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let sidecar_ref = ObjectRef::new(next + 1, 0);
         pdf.set_object(
             sidecar_ref,
@@ -1722,12 +1725,7 @@ mod tests {
 
         // Allocate a standalone array object [fs_ref] and point catalog /AF at
         // it *indirectly* (the only reference to this array object).
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let af_array_ref = ObjectRef::new(next + 1, 0);
         pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
 
@@ -1792,12 +1790,7 @@ mod tests {
 
         // One indirect /AF array object [fs_ref], referenced by BOTH the
         // catalog and the page.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let af_array_ref = ObjectRef::new(next + 1, 0);
         pdf.set_object(af_array_ref, Object::Array(vec![Object::Reference(fs_ref)]));
 
@@ -1891,12 +1884,7 @@ mod tests {
 
         // A separate, type-less name-tree leaf (models a /Dests name tree) that
         // legitimately references the SAME filespec.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let dests_leaf_ref = ObjectRef::new(next + 1, 0);
         let mut dests_leaf = Dictionary::new();
         dests_leaf.insert(
@@ -2030,12 +2018,7 @@ mod tests {
             .expect("stream a exists");
 
         // Build a second filespec whose /EF points at the SAME stream object.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let fs_b = ObjectRef::new(next + 1, 0);
         let mut ef = Dictionary::new();
         ef.insert("F", Object::Reference(shared_stream));
@@ -2095,12 +2078,7 @@ mod tests {
         };
 
         // Add a *distinct* second stream object under /EF /UF.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let stream_uf = ObjectRef::new(next + 1, 0);
         let mut s2 = Dictionary::new();
         s2.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
@@ -2146,12 +2124,7 @@ mod tests {
     fn remove_attachment_leaves_empty_indirect_af_array_intact() {
         let mut pdf = open_minimal();
 
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
 
         // An empty indirect /AF array object, shared by the catalog *and* a
         // second dictionary so wrongly deleting it would dangle a live ref.
@@ -2301,12 +2274,7 @@ mod tests {
         let mut pdf = open_minimal();
 
         // Allocate the shared EmbeddedFile stream object.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let stream_ref = ObjectRef::new(next + 1, 0);
         let fs_ref1 = ObjectRef::new(next + 2, 0);
         let fs_ref2 = ObjectRef::new(next + 3, 0);
@@ -2431,12 +2399,7 @@ mod tests {
 
         // Insert a bare-reference carrier in front of the names dict so the
         // catalog reaches /Names through two hops: catalog → carrier → names.
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let names_ref = ObjectRef::new(next + 1, 0);
         let carrier_ref = ObjectRef::new(next + 2, 0);
         pdf.set_object(names_ref, Object::Dictionary(names));
@@ -2492,12 +2455,7 @@ mod tests {
         let mut dests = Dictionary::new();
         dests.insert("X", Object::Reference(fs_ref));
         terminal.insert("Dests", Object::Dictionary(dests));
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
+        let next = next_object_number(&mut pdf);
         let terminal_ref = ObjectRef::new(next + 1, 0);
         pdf.set_object(terminal_ref, Object::Dictionary(terminal));
 

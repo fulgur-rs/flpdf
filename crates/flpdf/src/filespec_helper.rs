@@ -1450,10 +1450,10 @@ fn sanitize_imported_object<R: Read + Seek>(
 /// # Object numbering
 ///
 /// Two new object numbers are allocated per copied attachment (one for the
-/// `/EmbeddedFile` stream, one for the `/Filespec` dictionary).  The numbers
-/// are derived from `max(target.object_refs().number) + 1`, snapshotted once
-/// before the loop and incremented locally to avoid collisions across
-/// attachments within the same call.
+/// `/EmbeddedFile` stream, one for the `/Filespec` dictionary).  Allocation
+/// considers the target's canonical handle registry as well as its legacy
+/// object cache, so name-tree roots created by an earlier iteration cannot be
+/// reused by a later attachment.
 ///
 /// # Password-protected sources
 ///
@@ -1562,18 +1562,11 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
             }
         }
 
-        // Allocate two fresh object numbers in target for this attachment.
-        // Re-snapshot the max after every `insert_embedded_file` call so that
-        // object numbers allocated by the name-tree rebuild inside that call are
-        // accounted for and do not collide with our next pair.
-        let base: u32 = target
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
-        let new_stream_ref = ObjectRef::new(base + 1, 0);
-        let new_fs_ref = ObjectRef::new(base + 2, 0);
+        // Allocate the stream first and publish it before allocating the
+        // Filespec. `next_object_ref` walks the canonical handle registry, so
+        // both this stream and any root created by a prior tree mutation are
+        // reserved when the next identity is selected.
+        let new_stream_ref = next_object_ref(target)?;
 
         // Write the copied stream into target (bytes + dict, verbatim).
         target.set_object(new_stream_ref, Object::Stream(ef_stream));
@@ -1624,6 +1617,8 @@ pub fn copy_attachments_from<R1: Read + Seek, R2: Read + Seek>(
         new_ef_sub.insert("F", Object::Reference(new_stream_ref));
         new_ef_sub.insert("UF", Object::Reference(new_stream_ref));
         new_fs.insert("EF", Object::Dictionary(new_ef_sub));
+
+        let new_fs_ref = next_object_ref(target)?;
 
         target.set_object(new_fs_ref, Object::Dictionary(new_fs));
 

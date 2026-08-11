@@ -409,13 +409,8 @@ mod tests {
     use crate::ObjectRef;
 
     fn next_ref(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectRef {
-        let next = pdf
-            .object_refs()
-            .iter()
-            .map(|r| r.number)
-            .max()
-            .unwrap_or(0);
-        ObjectRef::new(next + 1, 0)
+        pdf.next_available_object_ref()
+            .expect("object-number space must have room in the test fixture")
     }
 
     /// Store an `/EmbeddedFile` stream and return its reference.

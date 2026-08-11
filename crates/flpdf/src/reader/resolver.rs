@@ -618,6 +618,10 @@ impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R
 struct ParsedObjectAtOffset {
     object_ref: ObjectRef,
     value: ObjectValue,
+    /// Parser diagnostics observed while recovering this object's body. A
+    /// recovered null is kept distinct from a literal null at the canonical
+    /// cache boundary so legacy tree consumers can preserve their error path.
+    malformed: bool,
     parsed_offset: i64,
     description: String,
     end_before_space: i64,
@@ -955,6 +959,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     /// Whether a canonical handle occupies `number` at any generation.
+    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
     pub(crate) fn holds_object_number(&self, number: u32) -> bool {
         self.core
             .borrow()
@@ -1426,6 +1431,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     Some(member_start),
                     &mut handles,
                 )?;
+            let malformed = !diagnostics.is_empty() && matches!(&value, ObjectValue::Null);
             for diagnostic in diagnostics {
                 let offset =
                     (member_start as u64).saturating_add(diagnostic.relative_offset as u64);
@@ -1440,14 +1446,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
 
             let member_handle = self.get_object_handle(object_ref);
-            member_handle.set_resolved(value);
-            member_handle.set_parsed_offset_if_unset(parsed_offset);
-            member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
-            if parsed_offset >= 0 && !member_handle.is_null() {
-                member_handle.set_description(
-                    self.object_stream_description_template(stream_number, object_ref),
-                    parsed_offset,
-                );
+            if malformed {
+                member_handle.set_missing();
+            } else {
+                member_handle.set_resolved(value);
+                member_handle.set_parsed_offset_if_unset(parsed_offset);
+                member_handle.set_end_offsets(stream_end_before_space, stream_end_after_space);
+                if parsed_offset >= 0 && !member_handle.is_null() {
+                    member_handle.set_description(
+                        self.object_stream_description_template(stream_number, object_ref),
+                        parsed_offset,
+                    );
+                }
             }
         }
         Ok(())
@@ -1518,13 +1528,28 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// object under the generation it actually read, and lets the originally
     /// requested slot fall through to the common null fallback.
     fn cache_parsed_object(&self, parsed: ParsedObjectAtOffset) {
-        let object_ref = parsed.object_ref;
+        let ParsedObjectAtOffset {
+            object_ref,
+            value,
+            malformed,
+            parsed_offset,
+            description,
+            end_before_space,
+            end_after_space,
+        } = parsed;
         let handle = self.get_object_handle(object_ref);
-        handle.set_resolved(parsed.value);
-        handle.set_parsed_offset_if_unset(parsed.parsed_offset);
-        handle.set_end_offsets(parsed.end_before_space, parsed.end_after_space);
-        if !parsed.description.is_empty() {
-            handle.set_description(parsed.description, parsed.parsed_offset);
+        if malformed && matches!(&value, ObjectValue::Null) {
+            // The qpdf parser recovers a damaged scalar/container close as a
+            // visible null, but the tree consumer still needs to distinguish
+            // that source damage from a literal null object.
+            handle.set_missing();
+            return;
+        }
+        handle.set_resolved(value);
+        handle.set_parsed_offset_if_unset(parsed_offset);
+        handle.set_end_offsets(end_before_space, end_after_space);
+        if !description.is_empty() {
+            handle.set_description(description, parsed_offset);
         }
     }
 
@@ -2350,6 +2375,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .map_err(ReadObjectAtOffsetError::Body)?;
         }
 
+        let malformed = !parsed.diagnostics.is_empty();
         for warning in parsed.diagnostics {
             self.push_warning_at(warning.relative_offset as u64, warning.message)
                 .map_err(ReadObjectAtOffsetError::Body)?;
@@ -2372,6 +2398,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Ok(ParsedObjectAtOffset {
                 object_ref: found,
                 value,
+                malformed: false,
                 parsed_offset,
                 description: String::new(),
                 end_before_space,
@@ -2407,6 +2434,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Ok(ParsedObjectAtOffset {
                 object_ref: found,
                 value,
+                malformed,
                 parsed_offset,
                 description: stream_description,
                 end_before_space,
@@ -2429,6 +2457,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             Ok(ParsedObjectAtOffset {
                 object_ref: found,
                 value,
+                malformed,
                 parsed_offset,
                 description,
                 end_before_space,
