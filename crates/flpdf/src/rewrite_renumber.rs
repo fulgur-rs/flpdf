@@ -131,22 +131,6 @@ impl CatalogFirstRenumber {
         Self::build_with_visibility(pdf, skip_length, true, false, removed_refs)
     }
 
-    /// Compute qpdf-visible Catalog-first numbering while preserving every
-    /// live source object before the normal trailer seeds.
-    ///
-    /// This mirrors `QPDFWriter::enqueueObjectsStandard`: qpdf first enqueues
-    /// `getAllObjects()` in source/object-reference order, then enqueues
-    /// `/Root` and the trimmed trailer values. `live_object_refs()` supplies
-    /// the corresponding source order while excluding free, missing, deleted,
-    /// and reserved entries; `removed_refs` keeps explicit deletions excluded.
-    pub(crate) fn build_qpdf_preserving_unreferenced_excluding<R: Read + Seek>(
-        pdf: &mut Pdf<R>,
-        skip_length: bool,
-        removed_refs: &BTreeSet<ObjectRef>,
-    ) -> crate::Result<Self> {
-        Self::build_with_visibility(pdf, skip_length, true, true, removed_refs)
-    }
-
     fn build_with_visibility<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         skip_length: bool,
@@ -225,6 +209,171 @@ impl CatalogFirstRenumber {
 
         Ok(Self { old_to_new, order })
     }
+}
+
+/// Catalog-first numbering over the live [`crate::ObjectHandle`] graph.
+///
+/// This is the writer's canonical traversal boundary: unlike
+/// [`CatalogFirstRenumber`], it never calls `Pdf::resolve` or
+/// `resolve_borrowed`, so an in-place handle mutation is observed directly and
+/// no legacy `Object` snapshot is created. The enqueue order and null-visible
+/// edge rules mirror `QPDFWriter::enqueueObject` and
+/// `enqueueObjectsStandard` (`QPDFWriter.cc:1072-1141,2916-2924`).
+pub(crate) struct CanonicalCatalogFirstRenumber {
+    old_to_new: HashMap<ObjectRef, ObjectRef>,
+    order: Vec<ObjectRef>,
+}
+
+impl NewNumberLookup for CanonicalCatalogFirstRenumber {
+    fn new_for_original(&self, original: ObjectRef) -> Option<ObjectRef> {
+        self.old_to_new.get(&original).copied()
+    }
+}
+
+impl CanonicalCatalogFirstRenumber {
+    pub(crate) fn pairs(&self) -> impl Iterator<Item = (ObjectRef, ObjectRef)> + '_ {
+        self.order
+            .iter()
+            .enumerate()
+            .map(|(index, &source)| (ObjectRef::new(index as u32 + 1, 0), source))
+    }
+
+    pub(crate) fn build_qpdf<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        skip_length: bool,
+        preserve_unreferenced_objects: bool,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> crate::Result<Self> {
+        let root = pdf
+            .root_ref()
+            .ok_or_else(|| Error::Unsupported("plain rewrite: trailer has no /Root".to_string()))?;
+        let mut seeds = if preserve_unreferenced_objects {
+            pdf.get_all_object_handles()?
+                .into_iter()
+                .filter_map(|handle| handle.object_ref())
+                .filter(|object_ref| !removed_refs.contains(object_ref))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        seeds.push(root);
+
+        let trailer = pdf.trailer_handle();
+        let trailer_entries = trailer.try_as_dictionary()?.unwrap_or_default();
+        for (key, value) in trailer_entries {
+            if matches!(
+                key.as_slice(),
+                b"ID" | b"Encrypt" | b"Prev" | b"Root" | b"Size"
+            ) {
+                continue;
+            }
+            collect_canonical_enqueue_refs(pdf, &value, 0, skip_length, &mut seeds)?;
+        }
+
+        let mut old_to_new = HashMap::new();
+        let mut order = Vec::new();
+        let mut queue = VecDeque::new();
+        for seed in seeds {
+            if !removed_refs.contains(&seed) {
+                enqueue(seed, &mut old_to_new, &mut order, &mut queue);
+            }
+        }
+
+        while let Some(source) = queue.pop_front() {
+            let handle = pdf.get_object_handle(source);
+            pdf.resolve_object_handle(&handle)?;
+            let mut found = Vec::new();
+            collect_canonical_children(pdf, &handle, 0, skip_length, &mut found)?;
+            for reference in found {
+                if !removed_refs.contains(&reference) {
+                    enqueue(reference, &mut old_to_new, &mut order, &mut queue);
+                }
+            }
+        }
+
+        Ok(Self { old_to_new, order })
+    }
+}
+
+fn collect_canonical_enqueue_refs<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &crate::ObjectHandle,
+    depth: usize,
+    skip_length: bool,
+    found: &mut Vec<ObjectRef>,
+) -> crate::Result<()> {
+    if let Some(object_ref) = handle.object_ref() {
+        ensure_canonical_owner(pdf, handle)?;
+        // qpdf treats `0 0 R` as a direct null at every child position
+        // (QPDFObjectHandle.cc:344-350); it is not an object to enqueue.
+        if object_ref.number != 0 {
+            found.push(object_ref);
+        }
+        return Ok(());
+    }
+    collect_canonical_children(pdf, handle, depth, skip_length, found)
+}
+
+fn collect_canonical_children<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &crate::ObjectHandle,
+    depth: usize,
+    skip_length: bool,
+    found: &mut Vec<ObjectRef>,
+) -> crate::Result<()> {
+    if depth > MAX_INLINE_DEPTH {
+        return Err(Error::Unsupported(
+            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during canonical enqueue collection"
+                .to_string(),
+        ));
+    }
+    pdf.resolve_object_handle(handle)?;
+    if let Some(reference) = handle.as_reference() {
+        if reference.number != 0 {
+            found.push(reference);
+        }
+        return Ok(());
+    }
+    if let Some(items) = handle.try_as_array()? {
+        for item in items {
+            collect_canonical_enqueue_refs(pdf, &item, depth + 1, skip_length, found)?;
+        }
+        return Ok(());
+    }
+    if let Some(entries) = handle.try_as_dictionary()? {
+        for (_, value) in entries {
+            if !value.try_is_null()? {
+                collect_canonical_enqueue_refs(pdf, &value, depth + 1, skip_length, found)?;
+            }
+        }
+        return Ok(());
+    }
+    if let Some(stream_dict) = handle.as_stream_dict() {
+        pdf.resolve_object_handle(&stream_dict)?;
+        if let Some(entries) = stream_dict.try_as_dictionary()? {
+            for (key, value) in entries {
+                if skip_length && key.as_slice() == b"Length" {
+                    continue;
+                }
+                if !value.try_is_null()? {
+                    collect_canonical_enqueue_refs(pdf, &value, depth + 1, skip_length, found)?;
+                }
+            }
+        } // cov:ignore: llvm-cov maps this if-let exit to an unhit synthetic branch; its body is covered
+    }
+    Ok(())
+}
+
+fn ensure_canonical_owner<R: Read + Seek>(
+    pdf: &Pdf<R>,
+    handle: &crate::ObjectHandle,
+) -> crate::Result<()> {
+    if !pdf.is_canonical_object_handle(handle) {
+        return Err(Error::Unsupported(
+            "QPDFObjectHandle from different QPDF found while writing".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn collect_qpdf_enqueue_refs<R: Read + Seek>(
@@ -1175,6 +1324,56 @@ mod tests {
 
         assert!(matches!(error, Error::Unsupported(message)
             if message == "object-stream renumber: trailer has no /Root"));
+    }
+
+    #[test]
+    fn canonical_lookup_and_collection_cover_direct_stream_and_depth_guard() {
+        let map = CanonicalCatalogFirstRenumber {
+            old_to_new: HashMap::from([(ObjectRef::new(9, 0), ObjectRef::new(1, 0))]),
+            order: vec![ObjectRef::new(9, 0)],
+        };
+        assert_eq!(
+            map.new_for_original(ObjectRef::new(9, 0)),
+            Some(ObjectRef::new(1, 0))
+        );
+        assert_eq!(map.new_for_original(ObjectRef::new(10, 0)), None);
+
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let stream = crate::ObjectHandle::stream(
+            crate::ObjectHandle::dictionary(vec![
+                (b"Length".to_vec(), crate::ObjectHandle::integer(2)),
+                (b"Type".to_vec(), crate::ObjectHandle::name(b"X".to_vec())),
+            ]),
+            std::rc::Rc::new(b"ab".to_vec()),
+        );
+        let mut found = Vec::new();
+        collect_canonical_children(&mut pdf, &stream, 0, true, &mut found)
+            .expect("direct stream dictionary is traversable");
+        assert!(found.is_empty());
+
+        let mut found = Vec::new();
+        let error = collect_canonical_children(
+            &mut pdf,
+            &crate::ObjectHandle::integer(1),
+            MAX_INLINE_DEPTH + 1,
+            true,
+            &mut found,
+        )
+        .expect_err("over-deep canonical inline values must be rejected");
+        assert!(matches!(error, Error::Unsupported(message)
+            if message.contains("canonical enqueue collection")));
+    }
+
+    #[test]
+    fn canonical_enqueue_collection_ignores_object_zero() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let zero = pdf.get_object_handle(ObjectRef::new(0, 0));
+        let mut found = Vec::new();
+
+        collect_canonical_enqueue_refs(&mut pdf, &zero, 0, true, &mut found)
+            .expect("object zero is a direct null in the canonical writer");
+
+        assert!(found.is_empty());
     }
 
     #[test]

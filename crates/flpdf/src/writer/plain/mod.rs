@@ -23,11 +23,13 @@ pub(crate) fn write_plain<R: Read + Seek, W: Write>(
     out: W,
     options: &WriterOptions,
 ) -> crate::Result<WriterResult> {
-    #[cfg(test)]
-    PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    pdf.with_plain_writer_stream_recovery(|pdf| {
+        #[cfg(test)]
+        PLAIN_PIPELINE_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-    let plan = plan::PlainWritePlan::build(pdf, options)?;
-    write_planned(pdf, out, options, &plan)
+        let plan = plan::PlainWritePlan::build(pdf, options)?;
+        write_planned(pdf, out, options, &plan)
+    })
 }
 
 fn write_planned<R: Read + Seek, W: Write>(
