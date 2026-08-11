@@ -2717,12 +2717,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
         offset: u64,
         message: impl Into<String>,
     ) -> Result<()> {
-        self.push_warning(format!(
-            "(object {} {}, offset {offset}): {}",
-            object_ref.number,
-            object_ref.generation,
-            message.into()
-        ))
+        self.push_warning_at(
+            offset,
+            format!(
+                "(object {} {}, offset {offset}): {}",
+                object_ref.number,
+                object_ref.generation,
+                message.into()
+            ),
+        )
     }
 
     /// The `PatternFinder`/`findEndstream` pair used by qpdf's
@@ -9365,7 +9368,7 @@ mod tests {
             diagnostics.first(),
             Some(&(
                 format!("(object 2 0, offset {attempted_offset}): expected endstream"),
-                None
+                Some(attempted_offset)
             ))
         );
     }
@@ -9411,7 +9414,7 @@ mod tests {
             diagnostics.first(),
             Some(&(
                 format!("(object 2 0, offset {attempted_offset}): expected endstream"),
-                None
+                Some(attempted_offset)
             ))
         );
     }
