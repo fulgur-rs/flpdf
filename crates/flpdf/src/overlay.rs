@@ -1710,16 +1710,13 @@ mod byte_gate {
     }
     // cov:ignore-end
 
-    /// Record the qpdf divergence for a destination `/DR/Font` whose direct
-    /// category dictionary contains an indirect nested dictionary and an
-    /// existing `/F1_1` key. qpdf's `getResourceNames` sees only keys inside
-    /// the nested dictionary (`QPDFObjectHandle.cc:1155-1172`), so its
-    /// `mergeResources` collision path chooses `/F1_1` and overwrites the
-    /// existing direct key. flpdf's `unique_dr_name` scans the direct
-    /// category keys and chooses `/F1_2` instead. This is evidence for the
-    /// follow-up parity fix; it is intentionally not a byte-identity gate.
+    /// Overlay a destination `/DR/Font` whose direct category dictionary
+    /// contains an indirect nested dictionary and an existing `/F1_1` key.
+    /// qpdf's `getResourceNames` sees only keys inside the nested dictionary
+    /// (`QPDFObjectHandle.cc:1155-1172`), so its `mergeResources` collision
+    /// path chooses `/F1_1` and overwrites the existing direct key.
     #[test]
-    fn overlay_copy_annotations_indirect_font_hidden_collision_records_qpdf_divergence() {
+    fn overlay_copy_annotations_indirect_font_hidden_collision_is_byte_identical_qdf() {
         let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");
         let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
@@ -1739,10 +1736,7 @@ mod byte_gate {
         });
         let expected = golden("overlay-dr-merge-hidden-collision.pdf");
 
-        assert_ne!(
-            actual, expected,
-            "the hidden collision must remain a recorded qpdf/flpdf divergence"
-        );
+        assert_byte_identical(&actual, "overlay-dr-merge-hidden-collision.pdf");
         // Inspect the copied field dictionaries themselves. A whole-file
         // marker search is insufficient because the same operand also occurs
         // in copied AP stream content and could mask a broken `/DA` rewrite.
@@ -1762,14 +1756,14 @@ mod byte_gate {
             );
             qdf_object_contains(
                 flpdf_field,
-                b"/DA (0 0.4 0 rg /F1_2 18 Tf)",
+                b"/DA (0 0.4 0 rg /F1_1 18 Tf)",
                 "flpdf copied field /DA",
             );
             assert!(
                 !flpdf_field
-                    .windows(b"/F1_1 18 Tf".len())
-                    .any(|window| window == b"/F1_1 18 Tf"),
-                "flpdf copied field must expose its direct-key scan as /F1_2"
+                    .windows(b"/F1_2 18 Tf".len())
+                    .any(|window| window == b"/F1_2 18 Tf"),
+                "flpdf copied field must not use /F1_2 in /DA"
             );
         }
 
@@ -1789,17 +1783,14 @@ mod byte_gate {
         );
 
         let flpdf_dr = qdf_object(&actual, 4);
-        qdf_object_contains(
-            flpdf_dr,
-            b"/F1 10 0 R",
-            "flpdf /DR original Helvetica mapping",
+        qdf_object_contains(flpdf_dr, b"/F1 10 0 R", "flpdf /DR Helvetica mapping");
+        qdf_object_contains(flpdf_dr, b"/F1_1 11 0 R", "flpdf /DR Courier mapping");
+        assert!(
+            !flpdf_dr
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "flpdf /DR must not map Courier through /F1_2"
         );
-        qdf_object_contains(
-            flpdf_dr,
-            b"/F1_1 10 0 R",
-            "flpdf /DR hidden direct-key mapping",
-        );
-        qdf_object_contains(flpdf_dr, b"/F1_2 11 0 R", "flpdf /DR Courier mapping");
 
         let qpdf_ap_resources = qdf_object(&expected, 31);
         qdf_object_contains(
@@ -1817,14 +1808,14 @@ mod byte_gate {
         let flpdf_ap_resources = qdf_object(&actual, 31);
         qdf_object_contains(
             flpdf_ap_resources,
-            b"/F1_2 11 0 R",
+            b"/F1_1 11 0 R",
             "flpdf AP `/Resources` Courier mapping",
         );
         assert!(
             !flpdf_ap_resources
-                .windows(b"/F1_1 11 0 R".len())
-                .any(|window| window == b"/F1_1 11 0 R"),
-            "flpdf AP `/Resources` must expose /F1_2"
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "flpdf AP `/Resources` must not use /F1_2"
         );
     }
 

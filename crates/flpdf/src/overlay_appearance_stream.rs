@@ -247,6 +247,8 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
                 .map(|(k, v)| (k.to_vec(), v.clone()))
                 .collect();
             let mut ref_to_key: Option<std::collections::HashMap<ObjectRef, Vec<u8>>> = None;
+            let mut resource_names: Option<std::collections::BTreeSet<Vec<u8>>> = None;
+            let mut min_suffix: u32 = 1;
             for (key, rval) in staged {
                 if subdict.get(key.as_slice()).is_none() {
                     // The slot this value was staged under is free again
@@ -281,7 +283,18 @@ pub(crate) fn adjust_appearance_stream<R: Read + Seek>(
                         local_dr_map.insert_rename(category, key, existing_key);
                     }
                 } else {
-                    let fresh_name = crate::overlay_annotations::unique_dr_name(&key, &subdict)?;
+                    let fresh_name = if let Some(names) = resource_names.as_ref() {
+                        crate::overlay_annotations::unique_dr_name(&key, names, &mut min_suffix)?
+                    } else {
+                        let names = crate::overlay_annotations::get_resource_names(dest, &subdict)?;
+                        let fresh_name = crate::overlay_annotations::unique_dr_name(
+                            &key,
+                            &names,
+                            &mut min_suffix,
+                        )?; // cov:ignore: trailing `)?;` on a multi-line call — llvm-cov attributes it to the unreachable suffix-exhaustion Err path
+                        resource_names = Some(names);
+                        fresh_name
+                    };
                     subdict.insert(fresh_name.clone(), rval);
                     local_dr_map.insert_rename(category, key, fresh_name);
                 }
@@ -791,6 +804,51 @@ mod tests {
             Some(f1_1_font_ref),
             "the displaced original F1_1 value moved to the freshly minted name"
         );
+    }
+
+    #[test]
+    fn adjust_appearance_stream_reuses_one_name_pool_for_multiple_conflicts() {
+        let mut pdf = open_minimal();
+        let f1_ref = ObjectRef::new(5, 0);
+        let f1_1_ref = ObjectRef::new(6, 0);
+        let f2_ref = ObjectRef::new(7, 0);
+        let f2_1_ref = ObjectRef::new(8, 0);
+        for object_ref in [f1_ref, f1_1_ref, f2_ref, f2_1_ref] {
+            pdf.set_object(object_ref, Object::Dictionary(Dictionary::new()));
+        }
+        let mut font_dict = Dictionary::new();
+        font_dict.insert("F1", Object::Reference(f1_ref));
+        font_dict.insert("F1_1", Object::Reference(f1_1_ref));
+        font_dict.insert("F2", Object::Reference(f2_ref));
+        font_dict.insert("F2_1", Object::Reference(f2_1_ref));
+        let mut resources = Dictionary::new();
+        resources.insert("Font", Object::Dictionary(font_dict));
+        let ap_ref = set_stream(
+            &mut pdf,
+            4,
+            &[("Resources", Object::Dictionary(resources))],
+            b"/F1 18 Tf /F1_1 18 Tf /F2 18 Tf /F2_1 18 Tf",
+        );
+        let mut dr_map = dr_map_with(b"Font", b"F1", b"F1_1");
+        dr_map.insert_rename(b"Font", b"F2".to_vec(), b"F2_1".to_vec());
+
+        adjust_appearance_stream(&mut pdf, ap_ref, &dr_map).unwrap();
+
+        let stream = pdf.resolve(ap_ref).unwrap().into_stream().unwrap();
+        assert_eq!(
+            stream.data,
+            b"/F1_1 18 Tf /F1_1_1 18 Tf /F2_1 18 Tf /F2_1_1 18 Tf"
+        );
+        let resources = stream
+            .dict
+            .get("Resources")
+            .and_then(Object::as_dict)
+            .unwrap();
+        let font = resources.get("Font").and_then(Object::as_dict).unwrap();
+        assert_eq!(font.get_ref("F1_1"), Some(f1_ref));
+        assert_eq!(font.get_ref("F1_1_1"), Some(f1_1_ref));
+        assert_eq!(font.get_ref("F2_1"), Some(f2_ref));
+        assert_eq!(font.get_ref("F2_1_1"), Some(f2_1_ref));
     }
 
     #[test]
