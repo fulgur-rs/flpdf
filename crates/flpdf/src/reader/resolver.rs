@@ -9745,7 +9745,7 @@ mod tests {
         let err = Error::parse(10, "expected 2 0 obj");
         let result = pdf
             .resolver
-            .reconstruct_xref_and_retry(err, ObjectRef::new(2, 0));
+            .reconstruct_xref_and_retry(err, ObjectRef::new(2, 0)); // cov:ignore: executed reconstruction retry continuation has no LLVM counter.
 
         assert!(
             matches!(&result, Err(Error::Parse { message, .. }) if message == "expected 2 0 obj"),
