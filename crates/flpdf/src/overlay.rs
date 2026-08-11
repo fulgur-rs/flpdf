@@ -1195,10 +1195,11 @@ mod byte_gate {
     }
 
     fn qdf_object_contains(object: &[u8], needle: &[u8], context: &str) {
+        let needle_text = String::from_utf8_lossy(needle);
         assert!(
             object.windows(needle.len()).any(|window| window == needle),
             "{context}: QDF object is missing {:?}",
-            String::from_utf8_lossy(needle)
+            needle_text
         );
     }
 
