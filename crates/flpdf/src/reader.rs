@@ -1525,6 +1525,15 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.reconstructed_xref()
     }
 
+    /// Prepare the canonical object cache and return qpdf's greatest object
+    /// number (`QPDF::getObjectCount`, `libqpdf/QPDF.cc:1271-1283`). This is
+    /// intentionally separate from fresh-object allocation, which belongs to
+    /// `flpdf-25kg.3.24`.
+    #[allow(dead_code)]
+    pub(crate) fn get_object_count(&self) -> Result<u32> {
+        self.resolver.get_object_count()
+    }
+
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.object_ref().is_some_and(|object_ref| {
             self.resolver
