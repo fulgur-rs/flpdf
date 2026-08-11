@@ -27,10 +27,11 @@
 //! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
 //! state-sensitive value.
 //!
-//! `QPDFObjectHandle.cc:456-466,759-785,1027-1039` supplies the
-//! name/dictionary/array inspection mirrored by `try_is_name_and_equals`,
-//! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
-//! `try_is_or_has_name`.
+//! `QPDFObjectHandle.cc:456-466,759-785,869-955,1027-1039` supplies the
+//! name/dictionary/array inspection and live array mutation mirrored by
+//! `try_is_name_and_equals`, `try_is_dictionary_of_type`, `try_array_len`,
+//! `try_array_item`, `set_array_item`, `set_array_items`,
+//! `insert_array_item`, `append_array_item`, and `erase_array_item`.
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
@@ -2310,6 +2311,260 @@ impl ObjectHandle {
             }
             self.attach_child_to_state_owners(&value);
         }
+    }
+
+    /// Set one item in the live array, porting qpdf's `setArrayItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:871-883`). The receiver is dereferenced
+    /// before its array type is inspected, so an unresolved indirect holder
+    /// is mutated through the same canonical slot that every alias observes.
+    ///
+    /// qpdf checks the index before `QPDF_Array::checkOwnership`, warns and
+    /// leaves the array unchanged for an invalid index, and otherwise throws
+    /// a logic error for a foreign or destroyed item. `Error::Internal` is the
+    /// crate's logic-error boundary. A contextless qpdf warning is likewise
+    /// returned as the existing `type_warning`/`object_warning` error.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to set item")? {
+            return Ok(());
+        }
+
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
+        );
+        if !in_bounds {
+            return self.object_warning("ignoring attempt to set out of bounds array item");
+        }
+
+        self.check_array_item_ownership(&value)?;
+        let old_value = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return None; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            Some(std::mem::replace(&mut items[index], value.clone()))
+        });
+        if let Some(old_value) = old_value {
+            self.detach_child_from_state_owners(&old_value);
+            self.attach_child_to_state_owners(&value);
+        }
+        Ok(())
+    }
+
+    /// Replace the live array contents in qpdf's `setFromVector` order
+    /// (`libqpdf/QPDFObjectHandle.cc:884-893`, `libqpdf/QPDF_Array.cc:220-243`).
+    /// The old contents are detached before the first ownership check. Items
+    /// are then checked and attached one at a time, so an ownership error at
+    /// item `n` intentionally leaves the accepted prefix in place, matching
+    /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to replace items")? {
+            return Ok(());
+        }
+
+        let expected_len = items.len();
+        let old_items = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(current_items)) = current else {
+                return None; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            let old_items = std::mem::take(current_items);
+            current_items.reserve(expected_len);
+            Some(old_items)
+        });
+        let Some(old_items) = old_items else {
+            return Ok(()); // cov:ignore: prepare_array_mutation fixed the type
+        };
+        for old_item in old_items {
+            self.detach_child_from_state_owners(&old_item);
+        }
+
+        for item in items {
+            self.check_array_item_ownership(&item)?;
+            let child = item.clone();
+            let inserted = self.with_value_mut(|current| {
+                let Some(ObjectValue::Array(current_items)) = current else {
+                    return false; // cov:ignore: only this method can change the state
+                };
+                current_items.push(item);
+                true
+            });
+            if inserted {
+                self.attach_child_to_state_owners(&child);
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert one item at an inclusive array position, porting qpdf's
+    /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
+    /// is the append position; larger positions warn without checking item
+    /// ownership or changing the array.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to insert item")? {
+            return Ok(());
+        }
+
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index <= items.len()),
+        );
+        if !in_bounds {
+            return self.object_warning("ignoring attempt to insert out of bounds array item");
+        }
+
+        self.check_array_item_ownership(&value)?;
+        let child = value.clone();
+        let inserted = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return false; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            if index == items.len() {
+                items.push(value);
+            } else {
+                items.insert(index, value);
+            }
+            true
+        });
+        if inserted {
+            self.attach_child_to_state_owners(&child);
+        }
+        Ok(())
+    }
+
+    /// qpdf's `insertItemAndGetNew`: return the supplied handle after the
+    /// same insertion/warning/ownership path as [`Self::insert_array_item`].
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn insert_array_item_and_get_new(
+        &self,
+        index: usize,
+        value: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        self.insert_array_item(index, value.clone())?;
+        Ok(value)
+    }
+
+    /// Append one item to the live array, porting qpdf's `appendItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to append item")? {
+            return Ok(());
+        }
+
+        self.check_array_item_ownership(&value)?;
+        let child = value.clone();
+        let appended = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return false; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            items.push(value);
+            true
+        });
+        if appended {
+            self.attach_child_to_state_owners(&child);
+        }
+        Ok(())
+    }
+
+    /// qpdf's `appendItemAndGetNew`: return the supplied handle after the
+    /// same append/warning/ownership path as [`Self::append_array_item`].
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn append_array_item_and_get_new(
+        &self,
+        value: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        self.append_array_item(value.clone())?;
+        Ok(value)
+    }
+
+    /// Erase one live array item, porting qpdf's `eraseItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn erase_array_item(&self, index: usize) -> Result<()> {
+        self.erase_array_item_and_get_old(index).map(|_| ())
+    }
+
+    /// Erase one live array item and return its original handle, porting
+    /// qpdf's `eraseItemAndGetOld` (`libqpdf/QPDFObjectHandle.cc:948-955`).
+    /// Invalid positions and non-array receivers return a fresh null after
+    /// emitting the corresponding qpdf warning.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
+        if !self.prepare_array_mutation("ignoring attempt to erase item")? {
+            return Ok(ObjectHandle::null());
+        }
+
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
+        );
+        if !in_bounds {
+            self.object_warning("ignoring attempt to erase out of bounds array item")?;
+            return Ok(ObjectHandle::null());
+        }
+
+        let old_value = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return None; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            Some(items.remove(index))
+        });
+        let Some(old_value) = old_value else {
+            return Ok(ObjectHandle::null()); // cov:ignore: prepare_array_mutation fixed the type
+        };
+        self.detach_child_from_state_owners(&old_value);
+        Ok(old_value)
+    }
+
+    /// Resolve the receiver and emit qpdf's type warning when it is not an
+    /// array. This is deliberately separate from `with_value_mut`: the
+    /// latter remains a no-hidden-I/O helper for legacy mutation paths, while
+    /// qpdf's public array mutators call `asArray()` and therefore resolve
+    /// their holder first.
+    #[allow(dead_code)] // consumed by the array mutator family above
+    fn prepare_array_mutation(&self, warning: &str) -> Result<bool> {
+        self.try_dereference()?;
+        if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+            return Ok(true);
+        }
+        self.type_warning("array", warning)?;
+        Ok(false)
+    }
+
+    /// Port `QPDF_Array::checkOwnership` (`libqpdf/QPDF_Array.cc:10-26`) at
+    /// the Rust error boundary. An indirect slot's active PDF is authoritative;
+    /// a direct value can retain one or more propagated owner ids through live
+    /// containment. A direct value with no owner id is qpdf's unowned array
+    /// case and is accepted by the upstream check.
+    #[allow(dead_code)] // consumed by the array mutator family above
+    fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
+        let item_is_destroyed = {
+            let slot = item.0.borrow();
+            let state = slot.state.borrow();
+            let destroyed = matches!(&*state, ObjectState::Destroyed);
+            destroyed
+        };
+        if item_is_destroyed {
+            return Err(Error::Internal(
+                "Attempting to add an uninitialized object to a QPDF_Array.".to_owned(),
+            ));
+        }
+
+        let owner_pdf_ids = {
+            let slot = self.0.borrow();
+            match slot.active_pdf_unique_id {
+                Some(pdf_unique_id) => vec![pdf_unique_id],
+                None => slot.pdf_unique_ids.iter().copied().collect::<Vec<_>>(),
+            }
+        };
+        if owner_pdf_ids
+            .iter()
+            .any(|pdf_unique_id| !item.belongs_exclusively_to_pdf(*pdf_unique_id))
+        {
+            return Err(Error::Internal(
+                "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Replace an existing array item with `value`, preserving `value`'s
@@ -10836,6 +11091,220 @@ mod mutation_tests {
     }
 
     #[test]
+    fn canonical_array_mutators_preserve_live_aliases_and_qpdf_return_handles() {
+        let first = ObjectHandle::integer(1);
+        let second = ObjectHandle::integer(2);
+        let array = ObjectHandle::array(vec![first.clone(), second.clone()]);
+        let replacement = ObjectHandle::dictionary(vec![]);
+
+        array
+            .set_array_item(1, replacement.clone())
+            .expect("setArrayItem accepts an in-bounds item");
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&replacement));
+
+        let inserted_at_front = ObjectHandle::name(b"front".to_vec());
+        array
+            .insert_array_item(0, inserted_at_front.clone())
+            .expect("insertItem accepts zero");
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&inserted_at_front));
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&first));
+
+        let inserted_middle = ObjectHandle::name(b"middle".to_vec());
+        let returned = array
+            .insert_array_item_and_get_new(2, inserted_middle.clone())
+            .expect("insertItemAndGetNew accepts an in-range position");
+        assert!(returned.is_same_object_as(&inserted_middle));
+        assert!(array
+            .try_array_item(2)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&inserted_middle));
+
+        let appended = ObjectHandle::name(b"append".to_vec());
+        array
+            .append_array_item(appended.clone())
+            .expect("appendItem accepts an item");
+        assert!(array
+            .try_array_item(4)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended));
+
+        let appended_and_returned = ObjectHandle::name(b"append-and-get".to_vec());
+        let returned = array
+            .append_array_item_and_get_new(appended_and_returned.clone())
+            .expect("appendItemAndGetNew accepts an item");
+        assert!(returned.is_same_object_as(&appended_and_returned));
+        assert!(array
+            .try_array_item(5)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended_and_returned));
+
+        let erased = array
+            .erase_array_item_and_get_old(1)
+            .expect("eraseItemAndGetOld returns the live old handle");
+        assert!(erased.is_same_object_as(&first));
+        assert_eq!(array.try_array_len().unwrap(), Some(5));
+
+        array
+            .erase_array_item(2)
+            .expect("eraseItem accepts an in-bounds position");
+        assert!(array
+            .try_array_item(2)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended));
+    }
+
+    #[test]
+    fn insert_array_item_at_size_uses_qpdfs_append_position() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let appended_at_size = ObjectHandle::integer(2);
+
+        array
+            .insert_array_item(1, appended_at_size.clone())
+            .expect("insertItem permits the inclusive end position");
+
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended_at_size));
+    }
+
+    #[test]
+    fn set_array_items_replaces_in_qpdf_order_and_preserves_child_identity() {
+        let old = ObjectHandle::integer(1);
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        let array = ObjectHandle::array(vec![old.clone()]);
+
+        array
+            .set_array_items(vec![first.clone(), second.clone()])
+            .expect("setArrayFromVector accepts unowned items");
+
+        assert!(old.containing_object_refs().is_empty());
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&first));
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&second));
+        assert_eq!(array.try_array_len().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn array_mutators_reject_foreign_ownership_and_keep_qpdf_partial_replacement_order() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let old = ObjectHandle::integer(1);
+        let array = ObjectHandle::array(vec![old.clone()]);
+        array.promote_to_indirect(ObjectRef::new(40, 0), 41, Rc::downgrade(&resolver));
+
+        let foreign = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(41, 0),
+            NO_PARSED_OFFSET,
+            42,
+            Rc::downgrade(&resolver),
+        );
+        let error = array
+            .append_array_item(foreign.clone())
+            .expect_err("appendItem rejects an object owned by another PDF");
+        assert!(matches!(error, Error::Internal(_)));
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&old));
+
+        let accepted = ObjectHandle::dictionary(vec![]);
+        let error = array
+            .set_array_items(vec![accepted.clone(), foreign])
+            .expect_err("setFromVector checks ownership in insertion order");
+        assert!(matches!(error, Error::Internal(_)));
+        assert!(old.containing_object_refs().is_empty());
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&accepted));
+
+        let same_pdf = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(42, 0),
+            NO_PARSED_OFFSET,
+            41,
+            Rc::downgrade(&resolver),
+        );
+        array
+            .append_array_item(same_pdf.clone())
+            .expect("same-document indirect items remain attachable");
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&same_pdf));
+    }
+
+    #[test]
+    fn canonical_array_mutators_resolve_a_lazy_holder_and_update_every_alias() {
+        let child = ObjectHandle::integer(1);
+        let (array, _resolver) =
+            super::identity_tests::resolver_bearing_handle(ObjectValue::Array(vec![child.clone()]));
+        let alias = array.clone();
+        let replacement = ObjectHandle::integer(2);
+
+        array
+            .set_array_item(0, replacement.clone())
+            .expect("qpdf array mutators dereference their holder");
+
+        assert!(array.is_resolved());
+        assert!(alias
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&replacement));
+        assert!(child.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn array_mutators_reject_destroyed_items_as_uninitialized() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let array = ObjectHandle::array(vec![]);
+        array.promote_to_indirect(ObjectRef::new(50, 0), 51, Rc::downgrade(&resolver));
+        let destroyed = ObjectHandle::integer(1);
+        destroyed.promote_to_indirect(ObjectRef::new(52, 0), 51, Rc::downgrade(&resolver));
+        destroyed.disconnect();
+
+        let error = array
+            .append_array_item(destroyed)
+            .expect_err("QPDF_Destroyed is not an initialized array item");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "Attempting to add an uninitialized object to a QPDF_Array."
+        ));
+        assert_eq!(array.try_array_len().unwrap(), Some(0));
+    }
+
+    #[test]
     fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let self_clone = dict.clone();
@@ -11957,6 +12426,52 @@ mod warning_emission_tests {
                     == "operation for dictionary attempted on object of type integer: \
                         treating as empty"
         ));
+    }
+
+    #[test]
+    fn array_mutators_emit_qpdf_warning_text_for_invalid_domains() {
+        let (array, recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::integer(1)]));
+
+        array.set_array_item(1, ObjectHandle::integer(2)).unwrap();
+        array
+            .insert_array_item(2, ObjectHandle::integer(3))
+            .unwrap();
+        let erased = array.erase_array_item_and_get_old(1).unwrap();
+
+        assert!(erased.is_null());
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "object 3 0: ignoring attempt to set out of bounds array item",
+                "object 3 0: ignoring attempt to insert out of bounds array item",
+                "object 3 0: ignoring attempt to erase out of bounds array item",
+            ]
+        );
+    }
+
+    #[test]
+    fn array_mutators_emit_type_warning_text_for_non_arrays() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle.set_array_item(0, ObjectHandle::integer(1)).unwrap();
+        handle
+            .set_array_items(vec![ObjectHandle::integer(2)])
+            .unwrap();
+        handle
+            .insert_array_item(0, ObjectHandle::integer(3))
+            .unwrap();
+        handle.append_array_item(ObjectHandle::integer(4)).unwrap();
+        let erased = handle.erase_array_item_and_get_old(0).unwrap();
+
+        assert!(erased.is_null());
+        assert_eq!(warnings(&recorder), [
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to set item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to replace items",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to insert item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to append item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to erase item",
+        ]);
     }
 
     /// A sink that appends every write to a shared buffer.
