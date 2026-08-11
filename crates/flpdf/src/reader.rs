@@ -8786,9 +8786,10 @@ mod tests {
         );
         assert!(!entries.contains_key(b"/foo".as_slice()));
 
-        let Object::Dictionary(materialized) = handle.materialize().expect("materialize") else {
-            panic!("lifted value remains a dictionary");
-        };
+        let materialized = handle.materialize().expect("materialize");
+        let materialized = materialized
+            .as_dict()
+            .expect("lifted value remains a dictionary");
         assert_eq!(materialized.get(b"/foo"), Some(&Object::Integer(1)));
     }
 
