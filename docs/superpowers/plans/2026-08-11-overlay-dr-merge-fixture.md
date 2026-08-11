@@ -4,7 +4,7 @@
 
 **Goal:** Add a qpdf 11.9.0 oracle fixture and gated diagnostic test that proves the hidden `/DR/Font` collision diverges from flpdf's current name scan.
 
-**Architecture:** Keep the existing `overlay::byte_gate` harness and writer recipe. Add one minimal destination PDF fixture and one qpdf QDF golden; the test will assert the known divergence and its `/F1_1` versus `/F1_2` markers. Do not alter `unique_dr_name` or the doc comments owned by `flpdf-l5in`.
+**Architecture:** Keep the existing `overlay::byte_gate` harness and writer recipe. Add one minimal destination PDF fixture and one qpdf QDF golden; the test will assert the known divergence plus the copied-field `/DA` and `/DR`/AP resource mappings in their QDF object dictionaries. Do not alter `unique_dr_name` or the doc comments owned by `flpdf-l5in`.
 
 **Tech Stack:** Rust unit tests in `crates/flpdf/src/overlay.rs`, qpdf 11.9.0, PDF/QDF fixtures under `tests/fixtures/compat` and `tests/golden/references/overlay`, feature `qpdf-zlib-compat`.
 
@@ -25,9 +25,10 @@ helpers. The test must perform the same overlay recipe as qpdf and assert:
 ```rust
 let expected = golden("overlay-dr-merge-hidden-collision.pdf");
 assert_ne!(actual, expected);
-assert!(expected.windows(b"/F1_1 18 Tf".len()).any(|w| w == b"/F1_1 18 Tf"));
-assert!(!expected.windows(b"/F1_2 18 Tf".len()).any(|w| w == b"/F1_2 18 Tf"));
-assert!(actual.windows(b"/F1_2 18 Tf".len()).any(|w| w == b"/F1_2 18 Tf"));
+// Parse the copied widget dictionaries and assert qpdf `/DA` uses `/F1_1`
+// while flpdf's recorded divergence uses `/F1_2`.
+// Parse the `/DR` and copied AP `/Resources` dictionaries and assert the
+// corresponding Helvetica/Courier object mappings in both outputs.
 ```
 
 Name it
@@ -102,10 +103,11 @@ qpdf --qdf --static-id --no-original-object-ids --min-version=1.6 \
   --repeat=1 -- tests/golden/references/overlay/overlay-dr-merge-hidden-collision.pdf
 ```
 
-- [ ] **Step 2: Inspect the oracle markers.**
+- [ ] **Step 2: Inspect the oracle dictionaries.**
 
 Verify that the destination DR contains the source font at `/F1_1`, copied
-field `/DA` strings use `/F1_1`, and no copied field `/DA` uses `/F1_2`.
+field `/DA` strings use `/F1_1`, no copied field `/DA` uses `/F1_2`, and the
+copied AP `/Resources` dictionary maps the renamed operand to the Courier font.
 
 - [ ] **Step 3: Run the diagnostic test and make it pass.**
 

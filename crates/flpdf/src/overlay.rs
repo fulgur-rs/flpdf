@@ -1175,6 +1175,33 @@ mod byte_gate {
         }
     }
 
+    /// Return one object body from a QDF output. The hidden-collision gate
+    /// deliberately inspects dictionaries rather than searching the whole
+    /// file, since the same resource operand appears in both copied `/DA`
+    /// strings and appearance-stream content.
+    fn qdf_object(output: &[u8], object_number: u32) -> &[u8] {
+        let marker = format!("{object_number} 0 obj\n");
+        let start = output
+            .windows(marker.len())
+            .position(|window| window == marker.as_bytes())
+            .expect("QDF object marker must exist");
+        let body = &output[start + marker.len()..];
+        let end_marker = b"\nendobj";
+        let end = body
+            .windows(end_marker.len())
+            .position(|window| window == end_marker)
+            .expect("QDF object terminator must exist");
+        &body[..end]
+    }
+
+    fn qdf_object_contains(object: &[u8], needle: &[u8], context: &str) {
+        assert!(
+            object.windows(needle.len()).any(|window| window == needle),
+            "{context}: QDF object is missing {:?}",
+            String::from_utf8_lossy(needle)
+        );
+    }
+
     #[test]
     fn three_page_overlay_one_page_is_byte_identical() {
         // dest = three-page.pdf, source = one-page.pdf.
@@ -1716,23 +1743,88 @@ mod byte_gate {
             actual, expected,
             "the hidden collision must remain a recorded qpdf/flpdf divergence"
         );
+        // Inspect the copied field dictionaries themselves. A whole-file
+        // marker search is insufficient because the same operand also occurs
+        // in copied AP stream content and could mask a broken `/DA` rewrite.
+        for field_ref in [5, 6] {
+            let qpdf_field = qdf_object(&expected, field_ref);
+            let flpdf_field = qdf_object(&actual, field_ref);
+            qdf_object_contains(
+                qpdf_field,
+                b"/DA (0 0.4 0 rg /F1_1 18 Tf)",
+                "qpdf copied field /DA",
+            );
+            assert!(
+                !qpdf_field
+                    .windows(b"/F1_2 18 Tf".len())
+                    .any(|window| window == b"/F1_2 18 Tf"),
+                "qpdf copied field must not use /F1_2 in /DA"
+            );
+            qdf_object_contains(
+                flpdf_field,
+                b"/DA (0 0.4 0 rg /F1_2 18 Tf)",
+                "flpdf copied field /DA",
+            );
+            assert!(
+                !flpdf_field
+                    .windows(b"/F1_1 18 Tf".len())
+                    .any(|window| window == b"/F1_1 18 Tf"),
+                "flpdf copied field must expose its direct-key scan as /F1_2"
+            );
+        }
+
+        // Inspect the resource dictionaries behind those operands. Object 4
+        // is the copied field's `/DR`; object 31 is the `/Resources` of its
+        // `/AP/N` stream (object 12). Operand-only assertions would not catch
+        // either dictionary mapping being wrong while the bytes still contain
+        // the expected marker.
+        let qpdf_dr = qdf_object(&expected, 4);
+        qdf_object_contains(qpdf_dr, b"/F1 10 0 R", "qpdf /DR Helvetica mapping");
+        qdf_object_contains(qpdf_dr, b"/F1_1 11 0 R", "qpdf /DR Courier mapping");
         assert!(
-            expected
-                .windows(b"/F1_1 18 Tf".len())
-                .any(|w| w == b"/F1_1 18 Tf"),
-            "qpdf must rewrite copied field /DA to /F1_1"
+            !qpdf_dr
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "qpdf /DR must not map Courier through /F1_2"
+        );
+
+        let flpdf_dr = qdf_object(&actual, 4);
+        qdf_object_contains(
+            flpdf_dr,
+            b"/F1 10 0 R",
+            "flpdf /DR original Helvetica mapping",
+        );
+        qdf_object_contains(
+            flpdf_dr,
+            b"/F1_1 10 0 R",
+            "flpdf /DR hidden direct-key mapping",
+        );
+        qdf_object_contains(flpdf_dr, b"/F1_2 11 0 R", "flpdf /DR Courier mapping");
+
+        let qpdf_ap_resources = qdf_object(&expected, 31);
+        qdf_object_contains(
+            qpdf_ap_resources,
+            b"/F1_1 11 0 R",
+            "qpdf AP `/Resources` Courier mapping",
         );
         assert!(
-            !expected
-                .windows(b"/F1_2 18 Tf".len())
-                .any(|w| w == b"/F1_2 18 Tf"),
-            "qpdf must not mint /F1_2 for the hidden collision"
+            !qpdf_ap_resources
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "qpdf AP `/Resources` must not use /F1_2"
+        );
+
+        let flpdf_ap_resources = qdf_object(&actual, 31);
+        qdf_object_contains(
+            flpdf_ap_resources,
+            b"/F1_2 11 0 R",
+            "flpdf AP `/Resources` Courier mapping",
         );
         assert!(
-            actual
-                .windows(b"/F1_2 18 Tf".len())
-                .any(|w| w == b"/F1_2 18 Tf"),
-            "flpdf must expose its direct-key scan as /F1_2"
+            !flpdf_ap_resources
+                .windows(b"/F1_1 11 0 R".len())
+                .any(|window| window == b"/F1_1 11 0 R"),
+            "flpdf AP `/Resources` must expose /F1_2"
         );
     }
 
