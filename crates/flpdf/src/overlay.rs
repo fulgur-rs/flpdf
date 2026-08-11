@@ -1683,6 +1683,59 @@ mod byte_gate {
     }
     // cov:ignore-end
 
+    /// Record the qpdf divergence for a destination `/DR/Font` whose direct
+    /// category dictionary contains an indirect nested dictionary and an
+    /// existing `/F1_1` key. qpdf's `getResourceNames` sees only keys inside
+    /// the nested dictionary (`QPDFObjectHandle.cc:1155-1172`), so its
+    /// `mergeResources` collision path chooses `/F1_1` and overwrites the
+    /// existing direct key. flpdf's `unique_dr_name` scans the direct
+    /// category keys and chooses `/F1_2` instead. This is evidence for the
+    /// follow-up parity fix; it is intentionally not a byte-identity gate.
+    #[test]
+    fn overlay_copy_annotations_indirect_font_hidden_collision_records_qpdf_divergence() {
+        let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
+        let mut src = fixture("form-fields-and-annotations.pdf");
+        let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
+        let mut specs = vec![OverlaySpec {
+            source: src,
+            kind: OverlayKind::Overlay,
+            from: pr(""),
+            to: pr(""),
+            repeat: Some(pr("1")),
+        }];
+        apply_overlay_specs(&mut dest, &mut specs).unwrap();
+        let actual = write_qpdf(&mut dest, |writer| {
+            writer.set_static_id(true);
+            writer.set_qdf_mode(true);
+            writer.set_suppress_original_object_ids(true);
+            writer.set_minimum_pdf_version(version, max_ext);
+        });
+        let expected = golden("overlay-dr-merge-hidden-collision.pdf");
+
+        assert_ne!(
+            actual, expected,
+            "the hidden collision must remain a recorded qpdf/flpdf divergence"
+        );
+        assert!(
+            expected
+                .windows(b"/F1_1 18 Tf".len())
+                .any(|w| w == b"/F1_1 18 Tf"),
+            "qpdf must rewrite copied field /DA to /F1_1"
+        );
+        assert!(
+            !expected
+                .windows(b"/F1_2 18 Tf".len())
+                .any(|w| w == b"/F1_2 18 Tf"),
+            "qpdf must not mint /F1_2 for the hidden collision"
+        );
+        assert!(
+            actual
+                .windows(b"/F1_2 18 Tf".len())
+                .any(|w| w == b"/F1_2 18 Tf"),
+            "flpdf must expose its direct-key scan as /F1_2"
+        );
+    }
+
     /// Overlay a source whose `/AcroForm` supplies `/DA` and `/Q` defaults
     /// onto a dest with no `/AcroForm`. Exercises qpdf's
     /// `adjustInheritedFields` (line 442-484, called from
