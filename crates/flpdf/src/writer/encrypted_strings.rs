@@ -500,23 +500,25 @@ mod tests {
         );
         dict.insert("Length", Object::Integer(5));
 
-        let mut emitter = EncryptedStringEmitter::from_context(&context);
-        let mut out = Vec::new();
-        emitter
-            .write_stream_dict(
-                &mut out,
-                emitted_ref,
-                None,
-                &dict,
-                StreamDictOptions::new(false, false, false),
-            )
-            .expect("cleartext stream dictionary emission");
+        for qdf in [false, true] {
+            let mut emitter = EncryptedStringEmitter::from_context(&context);
+            let mut out = Vec::new();
+            emitter
+                .write_stream_dict(
+                    &mut out,
+                    emitted_ref,
+                    None,
+                    &dict,
+                    StreamDictOptions::new(qdf, false, false),
+                )
+                .expect("cleartext stream dictionary emission");
 
-        assert!(
-            out.windows(b"metadata-dictionary-secret".len())
-                .any(|window| window == b"metadata-dictionary-secret"),
-            "cleartext metadata dictionary strings must bypass the object cipher"
-        );
+            assert!(
+                out.windows(b"metadata-dictionary-secret".len())
+                    .any(|window| window == b"metadata-dictionary-secret"),
+                "cleartext metadata dictionary strings must bypass the object cipher"
+            );
+        }
     }
 
     #[test]
