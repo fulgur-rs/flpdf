@@ -106,12 +106,13 @@ pub fn clean_trailer_handle<R: Read + Seek>(
         return Ok(());
     }
     let both_equal = items[0].unparse() == items[1].unparse();
-    let mut cleaned = items;
-    cleaned[1] = ObjectHandle::string(Vec::new());
+    id.set_array_item(1, ObjectHandle::string(Vec::new()))?;
     if both_equal {
-        cleaned[0] = ObjectHandle::string(Vec::new());
+        id.set_array_item(0, ObjectHandle::string(Vec::new()))?;
     }
-    trailer.replace_key(b"/ID", ObjectHandle::array(cleaned));
+    if let Some(object_ref) = id.object_ref() {
+        pdf.mark_object_dirty(object_ref);
+    }
     Ok(())
 }
 
@@ -140,7 +141,7 @@ pub fn clean_encryption_handle<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flpdf::PdfOpenOptions;
+    use flpdf::{ObjectRef, PdfOpenOptions};
     use std::io::Cursor;
 
     // ---------- clean_trailer ----------
@@ -438,6 +439,33 @@ mod tests {
             .expect("/ID remains an array");
         assert_eq!(items[0].as_string(), Some(Vec::new()));
         assert_eq!(items[1].as_string(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn clean_trailer_handle_mutates_an_indirect_id_array_in_place() {
+        let mut pdf = Pdf::empty().expect("create an empty PDF");
+        let id_ref = ObjectRef::new(9, 0);
+        pdf.set_object(
+            id_ref,
+            Object::Array(vec![
+                Object::String(b"first".to_vec()),
+                Object::String(b"second".to_vec()),
+            ]),
+        );
+        let id = pdf.get_object_handle(id_ref);
+        let trailer = ObjectHandle::dictionary(vec![(b"/ID".to_vec(), id.clone())]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
+
+        let cleaned_id = pdf
+            .resolve_object_handle_to_terminal(&trailer.get_key(b"/ID"))
+            .expect("resolve cleaned /ID");
+        assert_eq!(cleaned_id.object_ref(), Some(id_ref));
+        let items = cleaned_id.as_array().expect("/ID remains an array");
+        assert_eq!(items[0].as_string(), Some(b"first".to_vec()));
+        assert_eq!(items[1].as_string(), Some(Vec::new()));
+        let alias_items = id.as_array().expect("original alias remains live");
+        assert_eq!(alias_items[1].as_string(), Some(Vec::new()));
     }
 
     #[test]
