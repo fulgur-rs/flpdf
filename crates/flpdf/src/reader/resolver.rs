@@ -8374,7 +8374,9 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            vec!["expected dictionary key but found non-name object; inserting key /QPDFFake1"]
+            vec![
+                "(object 2 0, offset 55): expected dictionary key but found non-name object; inserting key /QPDFFake1"
+            ]
         );
     }
 
@@ -8527,7 +8529,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.message.as_str())
                 .collect::<Vec<_>>(),
-            vec![expected]
+            vec![format!("(object 2 0, offset 55): {expected}")]
         );
     }
 
@@ -8912,7 +8914,7 @@ mod tests {
                 );
                 assert_eq!(
                     warnings,
-                    ["name with stray # will not work with PDF >= 1.2"]
+                    ["(object 2 0, offset 56): name with stray # will not work with PDF >= 1.2"]
                 );
             },
         );
@@ -8924,7 +8926,7 @@ mod tests {
                 assert_eq!(
                     warnings,
                     [
-                        "name with stray # will not work with PDF >= 1.2",
+                        "(object 2 0, offset 56): name with stray # will not work with PDF >= 1.2",
                         "(object 2 0, offset 67): expected endobj",
                     ]
                 );
@@ -8959,7 +8961,7 @@ mod tests {
             assert!(handle.as_dictionary().is_some());
             assert_eq!(
                 warnings,
-                ["name with stray # will not work with PDF >= 1.2"],
+                ["(object 2 0, offset 56): name with stray # will not work with PDF >= 1.2"],
                 "one diagnostic per object, not one per scan_forward attempt"
             );
         });
