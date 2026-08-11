@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/flpdf",
+    "crates/flpdf-libjpeg-compat",
     "crates/flpdf-cli",
     "crates/flpdf-qtest-tools",
 ]

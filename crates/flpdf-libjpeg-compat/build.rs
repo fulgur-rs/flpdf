@@ -9,11 +9,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed={LIBJPEG_INCLUDE_DIR}");
     println!("cargo:rerun-if-env-changed={LIBJPEG_LIB_DIR}");
 
-    if env::var_os("CARGO_FEATURE_QPDF_LIBJPEG_COMPAT").is_none() {
+    if env::var_os("CARGO_FEATURE_SYSTEM_LIBJPEG").is_none() {
         return;
     }
 
-    println!("cargo:warning=flpdf qpdf-libjpeg-compat requires system libjpeg (jpeglib.h and -ljpeg); no vendored fallback is used");
+    println!("cargo:warning=flpdf-libjpeg-compat requires system libjpeg (jpeglib.h and -ljpeg); no vendored fallback is used");
 
     let include_dir = env::var_os(LIBJPEG_INCLUDE_DIR).map(PathBuf::from);
     if let Some(directory) = &include_dir {

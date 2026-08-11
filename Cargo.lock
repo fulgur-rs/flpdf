@@ -347,8 +347,8 @@ dependencies = [
  "aes",
  "ar_archive_writer",
  "cbc",
- "cc",
  "flate2",
+ "flpdf-libjpeg-compat",
  "getrandom",
  "hex",
  "libjpeg-turbo-rs",
@@ -374,6 +374,13 @@ dependencies = [
  "serde_json",
  "tempfile",
  "yaml-rust2",
+]
+
+[[package]]
+name = "flpdf-libjpeg-compat"
+version = "0.4.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
