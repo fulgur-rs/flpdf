@@ -619,8 +619,9 @@ impl HandleNumberTree {
             return Ok(None);
         };
         let offset = key.checked_sub(*actual_key).ok_or_else(|| {
+            // cov:ignore-start: BTreeMap::range(..=key) guarantees actual_key <= key, so this subtraction cannot overflow.
             Error::Unsupported("number-tree at-or-below offset overflow".to_string())
-        })?;
+        })?; // cov:ignore-end
         Ok(Some((value.clone(), offset)))
     }
 
@@ -2806,6 +2807,72 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!("K({children})")
+    }
+
+    #[test]
+    fn handle_number_tree_walks_and_validates_canonical_nodes() {
+        let mut pdf = empty_pdf();
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(4),
+                ObjectHandle::string(b"four".to_vec()),
+                ObjectHandle::integer(8),
+                ObjectHandle::string(b"eight".to_vec()),
+            ]),
+        )]);
+        let root = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![leaf.clone()]),
+        )]);
+
+        let tree = HandleNumberTree::new(root.clone(), 1);
+        let entries = tree.entries(&mut pdf).unwrap();
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4, 8]);
+        assert_eq!(
+            tree.find_object_at_or_below(&mut pdf, 7)
+                .unwrap()
+                .map(|(_, offset)| offset),
+            Some(3)
+        );
+
+        let depth_error = HandleNumberTree::new(root, 0)
+            .entries(&mut pdf)
+            .expect_err("nested canonical nodes must respect the depth limit");
+        assert!(depth_error.to_string().contains("maximum depth of 0"));
+
+        let non_dictionary = HandleNumberTree::new(ObjectHandle::integer(0), 0);
+        assert!(non_dictionary.entries(&mut pdf).unwrap().is_empty());
+
+        let kids_not_array = HandleNumberTree::new(
+            ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::integer(0))]),
+            0,
+        );
+        assert!(kids_not_array.entries(&mut pdf).unwrap().is_empty());
+
+        let missing_nums = HandleNumberTree::new(ObjectHandle::dictionary(Vec::new()), 0);
+        assert!(missing_nums.entries(&mut pdf).unwrap().is_empty());
+
+        let nums_not_array = HandleNumberTree::new(
+            ObjectHandle::dictionary(vec![(b"Nums".to_vec(), ObjectHandle::integer(0))]),
+            0,
+        );
+        assert!(nums_not_array.entries(&mut pdf).unwrap().is_empty());
+
+        let non_integer_key = HandleNumberTree::new(
+            ObjectHandle::dictionary(vec![(
+                b"Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"not-an-integer".to_vec()),
+                    ObjectHandle::integer(1),
+                ]),
+            )]),
+            0,
+        );
+        let key_error = non_integer_key
+            .entries(&mut pdf)
+            .expect_err("number-tree keys must be integers");
+        assert!(key_error.to_string().contains("key is not an integer"));
     }
 
     #[test]

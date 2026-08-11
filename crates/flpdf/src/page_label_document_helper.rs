@@ -488,8 +488,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             let mut source_idx = start_idx;
             while source_idx < end_idx {
                 source_idx = source_idx.checked_add(1).ok_or_else(|| {
+                    // cov:ignore-start: source_idx < end_idx and end_idx is an i64, so incrementing cannot overflow.
                     Error::Unsupported("page label source index overflow".to_string())
-                })?;
+                })?; // cov:ignore-end
                 if !tree.has_index(self.pdf, source_idx)? {
                     continue;
                 }
@@ -599,8 +600,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
                 LabelRange::from_handle(self.pdf, &label)?
                     .map(|label| (index, label))
                     .ok_or_else(|| {
+                        // cov:ignore-start: get_labels_for_page_range only stores direct dictionary handles in raw_labels.
                         Error::Unsupported("page label range is not a dictionary".to_string())
-                    })
+                    }) // cov:ignore-end
             })
             .collect()
     }
@@ -628,8 +630,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
         for (i, &src_idx) in src_indices.iter().enumerate() {
             let out_idx = out_start_idx
                 .checked_add(i64::try_from(i).map_err(|_| {
+                    // cov:ignore-start: supported 64-bit targets cannot allocate a slice with more than i64::MAX elements.
                     Error::Unsupported("page label selection index overflow".to_string())
-                })?)
+                })?) // cov:ignore-end
                 .ok_or_else(|| {
                     Error::Unsupported("page label output index overflow".to_string())
                 })?;
@@ -639,8 +642,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             };
             let label = match label {
                 Some(label) => LabelRange::from_handle(self.pdf, &label)?.ok_or_else(|| {
+                    // cov:ignore-start: get_label_for_page_from_tree returns Some only for a dictionary handle.
                     Error::Unsupported("page label range is not a dictionary".to_string())
-                })?,
+                })?, // cov:ignore-end
                 None => LabelRange {
                     style: LabelStyle::None,
                     prefix: String::new(),
@@ -1237,6 +1241,16 @@ mod tests {
         );
         assert_eq!(label.try_get_key(b"St").unwrap().as_integer(), Some(3));
 
+        let ascii_prefix = PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(
+            LabelStyle::Decimal,
+            1,
+            "A-",
+        );
+        assert_eq!(
+            ascii_prefix.try_get_key(b"P").unwrap().as_string(),
+            Some(b"A-".to_vec())
+        );
+
         let default =
             PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(LabelStyle::None, 1, "");
         assert!(!default.try_has_key(b"S").unwrap());
@@ -1306,6 +1320,130 @@ mod tests {
         h.get_labels_for_page_range(1, 1, 1, &mut labels).unwrap();
 
         assert_eq!(labels.len(), 1, "the leading continuation is redundant");
+    }
+
+    #[test]
+    fn get_labels_for_page_range_handles_missing_tree_and_non_dictionary_prior() {
+        let mut pdf = bare_one_page_pdf();
+        let mut h = pdf.page_labels();
+        let mut labels = vec![(0, ObjectHandle::integer(0))];
+
+        h.get_labels_for_page_range(0, 0, 0, &mut labels).unwrap();
+
+        assert_eq!(labels.len(), 2);
+        assert_eq!(labels[1].0, 0);
+        assert_eq!(
+            labels[1].1.try_get_key(b"St").unwrap().as_integer(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn get_labels_for_page_range_rejects_fabricated_start_overflow() {
+        let mut pdf = bare_one_page_pdf();
+        let error = pdf
+            .page_labels()
+            .get_labels_for_page_range(i64::MAX, i64::MAX, i64::MAX, &mut Vec::new())
+            .expect_err("fabricated /St must use checked arithmetic");
+        assert!(error.to_string().contains("fabricated start overflow"));
+    }
+
+    #[test]
+    fn get_labels_for_page_range_skips_non_dictionary_explicit_entries() {
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            label_dict("D", None, None),
+            Object::Integer(1),
+            Object::Integer(99),
+        ]);
+        let mut h = pdf.page_labels();
+        let mut labels = Vec::new();
+
+        h.get_labels_for_page_range(0, 2, 0, &mut labels).unwrap();
+
+        assert_eq!(
+            labels.len(),
+            1,
+            "a non-dictionary explicit value is skipped"
+        );
+        assert_eq!(labels[0].0, 0);
+    }
+
+    #[test]
+    fn get_labels_for_page_range_rejects_output_index_overflow() {
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(0),
+            label_dict("D", Some(1), None),
+            Object::Integer(1),
+            label_dict("R", Some(1), None),
+        ]);
+        let error = pdf
+            .page_labels()
+            .get_labels_for_page_range(0, 2, i64::MAX, &mut Vec::new())
+            .expect_err("reconstructed output index must use checked arithmetic");
+        assert!(error.to_string().contains("output index overflow"));
+    }
+
+    #[test]
+    fn labels_for_selection_reconstructs_effective_and_default_ranges() {
+        let mut pdf = pdf_with_pagelabels(vec![
+            Object::Integer(5),
+            label_dict("R", Some(2), Some("P-")),
+        ]);
+        let mut h = pdf.page_labels();
+
+        let labels = h.labels_for_selection(&[0, 5, 6], 10).unwrap();
+
+        assert_eq!(labels[0], (10, none_range(11)));
+        assert_eq!(
+            labels[1],
+            (
+                11,
+                LabelRange {
+                    style: LabelStyle::RomanUpper,
+                    prefix: "P-".into(),
+                    start: 2,
+                }
+            )
+        );
+        assert_eq!(
+            labels[2],
+            (
+                12,
+                LabelRange {
+                    style: LabelStyle::RomanUpper,
+                    prefix: "P-".into(),
+                    start: 3,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn labels_for_selection_handles_missing_tree() {
+        let mut pdf = bare_one_page_pdf();
+        let labels = pdf.page_labels().labels_for_selection(&[0], 0).unwrap();
+        assert_eq!(labels, vec![(0, none_range(1))]);
+    }
+
+    #[test]
+    fn labels_for_selection_rejects_output_index_overflow() {
+        let mut pdf = pdf_with_pagelabels(vec![Object::Integer(0), label_dict("D", None, None)]);
+        let error = pdf
+            .page_labels()
+            .labels_for_selection(&[0, 1], i64::MAX)
+            .expect_err("selection output index must use checked arithmetic");
+        assert!(error.to_string().contains("output index overflow"));
+    }
+
+    #[test]
+    fn labels_for_selection_rejects_fabricated_start_overflow() {
+        let mut pdf = bare_one_page_pdf();
+        let error = pdf
+            .page_labels()
+            .labels_for_selection(&[0], i64::MAX)
+            .expect_err("fabricated selection /St must use checked arithmetic");
+        assert!(error.to_string().contains("fabricated start overflow"));
     }
 
     #[test]
