@@ -7505,6 +7505,22 @@ mod tests {
     }
 
     #[test]
+    fn live_object_refs_excludes_deleted_canonical_registry_slots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let deleted_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(deleted_ref);
+        assert!(!handle.is_missing());
+
+        // Keep the canonical handle registered while presenting the legacy
+        // cache state that live enumeration must filter out. `delete_object`
+        // also marks the handle missing, which exercises a different guard.
+        pdf.cache.set_deleted(deleted_ref);
+
+        assert!(pdf.object_refs().contains(&deleted_ref));
+        assert!(!pdf.live_object_refs().contains(&deleted_ref));
+    }
+
+    #[test]
     fn trailer_handle_is_direct_with_a_canonical_indirect_root_child() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let handle = pdf.trailer_handle();
