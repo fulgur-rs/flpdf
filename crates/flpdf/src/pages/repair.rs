@@ -79,17 +79,25 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Track canonical
     // handle identity so the guard covers both indirect ObjGen slots and
     // direct dictionaries that share the same live allocation.
-    let mut seen_parent: Vec<ObjectHandle> = Vec::new();
+    let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut seen_parent_direct: Vec<ObjectHandle> = Vec::new();
     let mut changed_pages = false;
     let mut warned = false;
     loop {
-        if seen_parent
+        let repeated = if let Some(object_ref) = pages.object_ref() {
+            !seen_parent.insert(object_ref)
+        } else if seen_parent_direct
             .iter()
             .any(|seen| seen.is_same_object_as(&pages))
         {
+            true
+        } else {
+            seen_parent_direct.push(pages.clone());
+            false
+        };
+        if repeated {
             break;
         }
-        seen_parent.push(pages.clone());
         if !pages.try_has_key(b"/Parent")? {
             break;
         }
@@ -120,6 +128,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     let mut state = CanonicalRepairState {
         seen: BTreeSet::new(),
         visited: BTreeSet::new(),
+        visited_direct: Vec::new(),
         pages: Vec::new(),
     };
     if pages.try_has_key(b"/Kids")? {
@@ -139,6 +148,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
 struct CanonicalRepairState {
     seen: BTreeSet<ObjectRef>,
     visited: BTreeSet<ObjectRef>,
+    visited_direct: Vec<ObjectHandle>,
     pages: Vec<ObjectRef>,
 }
 
@@ -170,6 +180,16 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 "page tree cycle detected at {object_ref}"
             )));
         }
+    } else if state
+        .visited_direct
+        .iter()
+        .any(|seen| seen.is_same_object_as(&node))
+    {
+        return Err(Error::Unsupported(
+            "page tree cycle detected at direct /Pages node".to_owned(),
+        ));
+    } else {
+        state.visited_direct.push(node.clone());
     }
 
     node.try_dereference()?;
@@ -4000,6 +4020,46 @@ mod tests {
             }
         );
         assert_eq!(prepared.pages, vec![ObjectRef::new(4, 0)]);
+    }
+
+    #[test]
+    fn direct_kids_cycle_is_rejected_before_depth_overflow() {
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve catalog");
+        let leaf = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ]);
+        let first = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(vec![])),
+            (b"Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let second = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(vec![first.clone()])),
+            (b"Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        first.replace_key(b"/Kids", ObjectHandle::array(vec![second.clone(), leaf]));
+        catalog.replace_key(b"/Pages", first);
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark modified catalog");
+
+        let result = prepare_for_optimization_with_max_depth(&mut pdf, usize::MAX);
+        assert!(
+            matches!(result, Err(Error::Unsupported(ref message)) if message.contains("cycle")),
+            "direct /Kids cycle must be rejected before recursion can overflow: {result:?}"
+        );
     }
 
     /// The catalog's `/Pages` (obj 2, a valid `/Kids`-bearing root) carries a
