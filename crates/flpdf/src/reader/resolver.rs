@@ -2857,20 +2857,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the re-entry point, and a method with no access to [`ResolverCore`]
     /// cannot be holding a borrow of it when that happens.
     ///
-    /// **The `0` offsets below are placeholders, and the right value is
-    /// recorded rather than taken.** Nothing rebases these because the only caller,
-    /// [`Self::read_stream`], is not given the object's start. qpdf reports
-    /// them at `readObject`'s own `offset` — `m->file->tell()` taken at
-    /// `:1334`, immediately after the `obj` keyword and *before* any
-    /// whitespace is skipped — passed to `damagedPDF(offset, …)` at `:1376`
-    /// and `:1379`. Observed on qpdf 11.9.0 over a chained-`/Length` fixture:
-    /// `/Length key in stream dictionary is not an integer` at 233690 against
-    /// `attempting to recover stream length` at 233721, 31 bytes apart, which
-    /// is exactly `\n<< /Length 4002 0 R >>\nstream\n`. flpdf's nearest
-    /// quantity is the live parser's post-header position, which is taken
-    /// after the header delimiter. Closing the gap means carrying the object
-    /// header offset through `read_stream`, and is left to the slice that
-    /// ports `end_before_space`.
+    /// This helper only validates and dereferences `/Length`; it intentionally
+    /// has no input-position argument. [`Self::read_stream`] captures qpdf's
+    /// post-`obj` header position before calling this helper and passes it to
+    /// [`Self::warn_stream_failure`], which attributes recoverable `/Length`
+    /// failures to that position. A framing failure instead uses the attempted
+    /// `endstream` token's offset, while [`Self::recover_stream_length`] reports
+    /// its recovery warning at the stream-data offset.
     fn stream_length(dict: &ObjectValue) -> Result<usize> {
         let ObjectValue::Dictionary(entries) = dict else {
             return Err(Error::parse(
