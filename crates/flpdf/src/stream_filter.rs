@@ -45,7 +45,7 @@
 //! (`libqpdf/QPDF_Stream.cc:33-50`) has an `else` arm that refuses on any
 //! other key, which is why a `Crypt` stage keeps all of them.
 
-use crate::object_handle::ObjectHandle;
+use crate::object_handle::{legacy_dictionary_key, ObjectHandle};
 use crate::pipeline::ascii85::Ascii85Decoder;
 use crate::pipeline::ascii_hex::AsciiHexDecoder;
 use crate::pipeline::buffer::Buffer;
@@ -701,12 +701,16 @@ fn decode_params_from_consuming_handle(
     let crypt_stage = is_crypt_filter(filter_name);
     let mut retained = Vec::new();
     for key in params.try_get_keys()? {
-        if !retains_decode_param_key(&key, crypt_stage) {
+        let logical_key = legacy_dictionary_key(&key);
+        if !retains_decode_param_key(logical_key, crypt_stage) {
             continue;
         }
         let value = params.try_get_key(&key)?;
-        let keeps_name = keeps_crypt_name_payload(&key, crypt_stage);
-        retained.push((key, param_value_from_handle(&value, keeps_name)?));
+        let keeps_name = keeps_crypt_name_payload(logical_key, crypt_stage);
+        retained.push((
+            logical_key.to_vec(),
+            param_value_from_handle(&value, keeps_name)?,
+        ));
     }
     Ok(DecodeParams::Present(retained))
 }
@@ -731,8 +735,11 @@ fn decode_params_from_entries(
     let crypt_stage = is_crypt_filter(filter_name);
     let retained = entries
         .iter()
-        .filter(|(key, _)| retains_decode_param_key(key, crypt_stage))
-        .map(|(key, value)| (key.clone(), param_value_without_resolving(value)))
+        .filter_map(|(key, value)| {
+            let logical_key = legacy_dictionary_key(key);
+            retains_decode_param_key(logical_key, crypt_stage)
+                .then(|| (logical_key.to_vec(), param_value_without_resolving(value)))
+        })
         .collect();
     Ok(DecodeParams::Present(retained))
 }

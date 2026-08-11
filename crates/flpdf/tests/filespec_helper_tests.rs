@@ -354,7 +354,7 @@ fn filespec_direct_setter_persists_without_resolving_unrelated_object() {
     pdf.set_object(catalog_ref, Object::Dictionary(catalog));
     let owner = pdf.get_object_handle(owner_ref);
     pdf.resolve_object_handle(&owner).unwrap();
-    let direct_filespec = owner.get_key(b"Filespec");
+    let direct_filespec = owner.get_key(b"/Filespec");
 
     let mut filespec = FileSpec::new(direct_filespec.clone(), &mut pdf).unwrap();
     filespec.set_description("new description").unwrap();
@@ -511,13 +511,13 @@ fn get_embedded_file_stream_returns_requested_entry_and_ef_dictionary() {
         .expect("expected /EF dictionary");
     assert_eq!(
         entries
-            .get(b"F".as_slice())
+            .get(b"/F".as_slice())
             .and_then(ObjectHandle::object_ref),
         Some(ObjectRef::new(6, 0))
     );
     assert_eq!(
         entries
-            .get(b"UF".as_slice())
+            .get(b"/UF".as_slice())
             .and_then(ObjectHandle::object_ref),
         Some(ObjectRef::new(6, 0))
     );

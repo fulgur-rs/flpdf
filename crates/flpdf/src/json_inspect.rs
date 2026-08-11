@@ -255,6 +255,13 @@ fn qpdf_name_to_json_string(bytes: &[u8]) -> String {
     normalized
 }
 
+/// Convert a canonical ObjectHandle dictionary key to qpdf JSON v2's name
+/// representation. ObjectHandle keys include the PDF name delimiter; the
+/// decoded name value passed to [`qpdf_name_to_json_string`] does not.
+fn qpdf_dictionary_key_to_json_string(bytes: &[u8]) -> String {
+    qpdf_name_to_json_string(bytes.strip_prefix(b"/").unwrap_or(bytes))
+}
+
 /// Convert a PDF dictionary's entries to a JSON object, with keys sorted
 /// alphabetically (with the `/` prefix included in the sort key).
 fn dict_to_json(
@@ -266,7 +273,7 @@ fn dict_to_json(
     // `n:`-prefixed normalized form for non-UTF8 names.
     let mut pairs = Vec::new();
     for (raw_key, value) in entries {
-        let key_str = qpdf_name_to_json_string(raw_key);
+        let key_str = qpdf_dictionary_key_to_json_string(raw_key);
         let json_val = pdf_object_to_json_bounded(value, depth + 1)?;
         pairs.push((key_str, json_val));
     }
@@ -1099,7 +1106,7 @@ fn collect_image_refs<R: Read + Seek>(
         .unwrap_or_default();
 
     // Resolve the /XObject sub-dictionary (may itself be indirect).
-    let Some(xobject_handle) = resources_dict.get(b"XObject".as_slice()) else {
+    let Some(xobject_handle) = resources_dict.get(b"/XObject".as_slice()) else {
         return Ok(vec![]);
     };
     pdf.resolve_object_handle(xobject_handle)?;
@@ -1119,7 +1126,7 @@ fn collect_image_refs<R: Read + Seek>(
         let Some(stream_dict) = value.as_stream_dict().and_then(|d| d.as_dictionary()) else {
             continue;
         };
-        if let Some(subtype_handle) = stream_dict.get(b"Subtype".as_slice()) {
+        if let Some(subtype_handle) = stream_dict.get(b"/Subtype".as_slice()) {
             pdf.resolve_object_handle(subtype_handle)?;
             if let Some(subtype) = subtype_handle.as_name() {
                 if subtype.as_slice() == b"Image" {
@@ -1158,7 +1165,7 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
         let page_handle = pdf.get_object_handle(page_ref);
         pdf.resolve_object_handle(&page_handle)?;
         let page_dict = page_handle.as_dictionary().unwrap_or_default();
-        let contents_handle = page_dict.get(b"Contents".as_slice());
+        let contents_handle = page_dict.get(b"/Contents".as_slice());
         let contents: Vec<Json> = match contents_handle {
             Some(c) => collect_content_refs(pdf, c)?
                 .into_iter()
@@ -1202,7 +1209,7 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
 fn label_dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
     // Derive /S, /P, /St via the shared (non-resolving) LabelRange parser to keep
     // a single source of truth. `from_dict` is byte-for-byte equivalent to the
-    // prior inline extraction; use it (not `from_dict_resolved`) to preserve the
+    // prior inline extraction; use it (not the live ObjectHandle route) to preserve the
     // existing non-resolving JSON behavior.
     let range = crate::page_label_document_helper::LabelRange::from_dict(dict);
     let style = match range.style.to_name() {
@@ -1400,7 +1407,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Compute fullname: parent.T or just T at root.
-    let t_string = match field_dict.get(b"T".as_slice()) {
+    let t_string = match field_dict.get(b"/T".as_slice()) {
         Some(handle) => {
             let handle = pdf.resolve_object_handle_to_terminal(handle)?;
             handle
@@ -1458,7 +1465,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /TU — alternate name.
-    let alternatename = match field_dict.get(b"TU".as_slice()) {
+    let alternatename = match field_dict.get(b"/TU".as_slice()) {
         Some(handle) => {
             let handle = pdf.resolve_object_handle_to_terminal(handle)?;
             handle
@@ -1474,7 +1481,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // /TM — mapping name.
-    let mappingname = match field_dict.get(b"TM".as_slice()) {
+    let mappingname = match field_dict.get(b"/TM".as_slice()) {
         Some(handle) => {
             let handle = pdf.resolve_object_handle_to_terminal(handle)?;
             handle
@@ -1490,7 +1497,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     };
 
     // Determine if this field is itself a widget annotation.
-    let is_widget = match field_dict.get(b"Subtype".as_slice()) {
+    let is_widget = match field_dict.get(b"/Subtype".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle
@@ -1504,7 +1511,7 @@ fn walk_acroform_fields<R: Read + Seek>(
     // /Kids — may be a direct Array or an indirect Reference to an Array.
     // Resolve the indirect form so we don't silently drop the entire kid
     // chain when it lives in its own object.
-    let kids: Vec<ObjectHandle> = match field_dict.get(b"Kids".as_slice()) {
+    let kids: Vec<ObjectHandle> = match field_dict.get(b"/Kids".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle.as_array().unwrap_or_default()
@@ -1532,7 +1539,7 @@ fn walk_acroform_fields<R: Read + Seek>(
         let Some(d) = kid.as_dictionary() else {
             continue;
         };
-        let is_widget_subtype = match d.get(b"Subtype".as_slice()) {
+        let is_widget_subtype = match d.get(b"/Subtype".as_slice()) {
             Some(handle) => {
                 pdf.resolve_object_handle(handle)?;
                 handle
@@ -1548,14 +1555,14 @@ fn walk_acroform_fields<R: Read + Seek>(
         // alternate / mapping names, etc.) directly. /Parent is intentionally
         // NOT here: standalone widget annotations point back to their owning
         // field via /Parent, so its presence alone doesn't make a kid a field.
-        let has_field_entries = d.contains_key(b"T".as_slice())
-            || d.contains_key(b"FT".as_slice())
-            || d.contains_key(b"Kids".as_slice())
-            || d.contains_key(b"V".as_slice())
-            || d.contains_key(b"DV".as_slice())
-            || d.contains_key(b"Ff".as_slice())
-            || d.contains_key(b"TU".as_slice())
-            || d.contains_key(b"TM".as_slice());
+        let has_field_entries = d.contains_key(b"/T".as_slice())
+            || d.contains_key(b"/FT".as_slice())
+            || d.contains_key(b"/Kids".as_slice())
+            || d.contains_key(b"/V".as_slice())
+            || d.contains_key(b"/DV".as_slice())
+            || d.contains_key(b"/Ff".as_slice())
+            || d.contains_key(b"/TU".as_slice())
+            || d.contains_key(b"/TM".as_slice());
 
         if is_widget_subtype && !has_field_entries {
             // Pure widget annotation — collect ref string, do not recurse.
@@ -1641,7 +1648,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
         .ok_or_else(|| ConvertError::PdfError("catalog is not a dictionary".to_string()))?;
 
     // Check for /AcroForm.
-    let Some(acroform_handle) = catalog_dict.get(b"AcroForm".as_slice()) else {
+    let Some(acroform_handle) = catalog_dict.get(b"/AcroForm".as_slice()) else {
         return json_dictionary([
             ("fields".to_string(), Json::make_array()),
             ("hasacroform".to_string(), Json::make_bool(false)),
@@ -1660,7 +1667,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     };
 
     // /NeedAppearances (default false).
-    let need_appearances = match acroform_dict.get(b"NeedAppearances".as_slice()) {
+    let need_appearances = match acroform_dict.get(b"/NeedAppearances".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle.as_boolean().unwrap_or(false)
@@ -1672,7 +1679,7 @@ pub fn build_acroform_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     // accept both the direct Array form and an indirect Reference to an
     // Array, so AcroForm dictionaries that store /Fields as its own object
     // don't surface as an empty list.
-    let fields_array: Vec<ObjectHandle> = match acroform_dict.get(b"Fields".as_slice()) {
+    let fields_array: Vec<ObjectHandle> = match acroform_dict.get(b"/Fields".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle.as_array().unwrap_or_default()
@@ -1899,7 +1906,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
     };
 
     // description: /Desc decoded as PDF text string, bare (no u:/b: prefix)
-    let description = match filespec_dict.get(b"Desc".as_slice()) {
+    let description = match filespec_dict.get(b"/Desc".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle
@@ -1919,14 +1926,18 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let name_keys = ["DOS", "F", "Mac", "UF", "Unix"];
     let mut names_pairs: Vec<(String, Json)> = Vec::new();
     for key in &name_keys {
-        let Some(handle) = filespec_dict.get(key.as_bytes()) else {
+        let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
+        let Some(handle) = filespec_dict.get(&key) else {
             continue;
         };
         pdf.resolve_object_handle(handle)?;
         if let Some(bytes) = handle.as_string() {
             let s = decode_pdf_text_string(&bytes)
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-            names_pairs.push((format!("/{key}"), Json::make_string(s)));
+            names_pairs.push((
+                String::from_utf8_lossy(&key).into_owned(),
+                Json::make_string(s),
+            ));
         }
     }
 
@@ -1937,7 +1948,8 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let preferred_name_key_order = ["UF", "F", "Unix", "DOS", "Mac"];
     let mut preferredname = Json::make_null();
     for key in &preferred_name_key_order {
-        let Some(handle) = filespec_dict.get(key.as_bytes()) else {
+        let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
+        let Some(handle) = filespec_dict.get(&key) else {
             continue;
         };
         pdf.resolve_object_handle(handle)?;
@@ -1951,7 +1963,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
 
     // /EF dictionary: embedded file stream refs, keyed by /F /UF /DOS /Mac /Unix
     let ef_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
-        match filespec_dict.get(b"EF".as_slice()) {
+        match filespec_dict.get(b"/EF".as_slice()) {
             Some(handle) => {
                 pdf.resolve_object_handle(handle)?;
                 handle.as_dictionary()
@@ -1967,7 +1979,8 @@ fn filespec_dict_to_json<R: Read + Seek>(
     let mut preferredcontents = Json::make_null();
     if let Some(ref ef) = ef_dict {
         for key in &preferred_ef_key_order {
-            let Some(handle) = ef.get(key.as_bytes()) else {
+            let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
+            let Some(handle) = ef.get(&key) else {
                 continue;
             };
             let Some(r) = handle.object_ref() else {
@@ -1988,7 +2001,8 @@ fn filespec_dict_to_json<R: Read + Seek>(
 
     if let Some(ref ef) = ef_dict {
         for key in &ef_key_order {
-            let Some(stream_ref) = ef.get(key.as_bytes()).and_then(ObjectHandle::object_ref) else {
+            let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
+            let Some(stream_ref) = ef.get(&key).and_then(ObjectHandle::object_ref) else {
                 continue;
             };
 
@@ -2002,7 +2016,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             };
 
             // mimetype: /Subtype name → bare string (no "/" prefix), or null
-            let mimetype = match stream_dict.get(b"Subtype".as_slice()) {
+            let mimetype = match stream_dict.get(b"/Subtype".as_slice()) {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
                     handle
@@ -2017,7 +2031,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
 
             // /Params sub-dict
             let params_dict: Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> =
-                match stream_dict.get(b"Params".as_slice()) {
+                match stream_dict.get(b"/Params".as_slice()) {
                     Some(handle) => {
                         pdf.resolve_object_handle(handle)?;
                         handle.as_dictionary()
@@ -2028,7 +2042,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             // checksum: /Params /CheckSum bytes → lowercase hex, or null
             let checksum = match params_dict
                 .as_ref()
-                .and_then(|p| p.get(b"CheckSum".as_slice()))
+                .and_then(|p| p.get(b"/CheckSum".as_slice()))
             {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
@@ -2043,7 +2057,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
             // creationdate: /Params /CreationDate → ISO 8601, or null
             let creationdate = match params_dict
                 .as_ref()
-                .and_then(|p| p.get(b"CreationDate".as_slice()))
+                .and_then(|p| p.get(b"/CreationDate".as_slice()))
             {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
@@ -2071,7 +2085,7 @@ fn filespec_dict_to_json<R: Read + Seek>(
                 ("mimetype".to_string(), mimetype),
                 ("modificationdate".to_string(), modificationdate),
             ])?;
-            streams_pairs.push((format!("/{key}"), stream_entry));
+            streams_pairs.push((String::from_utf8_lossy(&key).into_owned(), stream_entry));
         }
     }
 
@@ -2218,7 +2232,7 @@ fn cf_method_string<R: Read + Seek>(
         pdf: &mut Pdf<R>,
         encrypt: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     ) -> Result<&'static str, ConvertError> {
-        let r = match encrypt.get(b"R".as_slice()) {
+        let r = match encrypt.get(b"/R".as_slice()) {
             Some(handle) => {
                 pdf.resolve_object_handle(handle)?;
                 handle.as_integer()
@@ -2239,7 +2253,7 @@ fn cf_method_string<R: Read + Seek>(
         return Ok("none");
     }
     // Look up the CFM entry inside /CF/<selector>
-    let cf = match encrypt.get(b"CF".as_slice()) {
+    let cf = match encrypt.get(b"/CF".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle.as_dictionary()
@@ -2249,7 +2263,8 @@ fn cf_method_string<R: Read + Seek>(
     let Some(cf) = cf else {
         return revision_default(pdf, encrypt);
     };
-    let filter = match cf.get(selector.as_bytes()) {
+    let selector = crate::object_handle::canonical_dictionary_key(selector.as_bytes());
+    let filter = match cf.get(&selector) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle.as_dictionary()
@@ -2259,7 +2274,7 @@ fn cf_method_string<R: Read + Seek>(
     let Some(filter) = filter else {
         return revision_default(pdf, encrypt);
     };
-    let cfm = match filter.get(b"CFM".as_slice()) {
+    let cfm = match filter.get(b"/CFM".as_slice()) {
         Some(handle) => {
             pdf.resolve_object_handle(handle)?;
             handle.as_name()
@@ -2288,7 +2303,8 @@ fn dict_name_str<R: Read + Seek>(
     dict: &std::collections::BTreeMap<Vec<u8>, ObjectHandle>,
     key: &str,
 ) -> Result<Option<String>, ConvertError> {
-    let Some(handle) = dict.get(key.as_bytes()) else {
+    let key = crate::object_handle::canonical_dictionary_key(key.as_bytes());
+    let Some(handle) = dict.get(&key) else {
         return Ok(None);
     };
     pdf.resolve_object_handle(handle)?;
@@ -2413,28 +2429,28 @@ pub fn build_encrypt_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, C
             // own encryption-parameter reads (`QPDFObjectHandle::isInteger`
             // et al.) transparently follow indirect references, so these
             // lookups resolve too rather than guarding against it.
-            let v = match enc.get(b"V".as_slice()) {
+            let v = match enc.get(b"/V".as_slice()) {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
                     handle.as_integer().unwrap_or(0)
                 }
                 None => 0,
             };
-            let r = match enc.get(b"R".as_slice()) {
+            let r = match enc.get(b"/R".as_slice()) {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
                     handle.as_integer().unwrap_or(0)
                 }
                 None => 0,
             };
-            let p_raw = match enc.get(b"P".as_slice()) {
+            let p_raw = match enc.get(b"/P".as_slice()) {
                 Some(handle) => {
                     pdf.resolve_object_handle(handle)?;
                     handle.as_integer().map(|n| n as i32).unwrap_or(0)
                 }
                 None => 0,
             };
-            let bits = match enc.get(b"Length".as_slice()) {
+            let bits = match enc.get(b"/Length".as_slice()) {
                 // Default key length when /Length is absent: 40 bits (V=1/2).
                 None => 40,
                 // Present: an integer value, or 0 for anything malformed.
@@ -5211,6 +5227,14 @@ mod tests {
     }
 
     #[test]
+    fn object_name_json_preserves_a_slash_in_the_decoded_name_body() {
+        assert_eq!(
+            pdf_object_to_json(&Object::Name(b"/leading".to_vec())).unwrap(),
+            serde_json::Value::String("//leading".to_string())
+        );
+    }
+
+    #[test]
     fn object_string_ascii_text_has_u_prefix() {
         let result = pdf_object_to_json(&Object::String(b"hello".to_vec())).unwrap();
         assert_eq!(result, serde_json::Value::String("u:hello".to_string()));
@@ -5418,8 +5442,8 @@ mod tests {
         // a depth bound this would recurse until the process aborts.
         let a = ObjectHandle::dictionary(vec![]);
         let b = ObjectHandle::dictionary(vec![]);
-        a.replace_key(b"Loop", b.clone());
-        b.replace_key(b"Loop", a.clone());
+        a.replace_key(b"/Loop", b.clone());
+        b.replace_key(b"/Loop", a.clone());
 
         let result = super::pdf_object_to_json(&a);
         assert!(
@@ -5767,6 +5791,22 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "n:/K#ffey");
         assert_eq!(pairs[0].1, number(7));
+    }
+
+    #[test]
+    fn object_handle_dictionary_json_emits_one_canonical_key_slash() {
+        let handle = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"Catalog".to_vec()),
+        )]);
+        let json = project(super::pdf_object_to_json(&handle).unwrap()).unwrap();
+        assert_eq!(
+            object_pairs(json),
+            vec![(
+                "/Type".to_string(),
+                serde_json::Value::String("/Catalog".to_string())
+            )]
+        );
     }
 
     #[test]

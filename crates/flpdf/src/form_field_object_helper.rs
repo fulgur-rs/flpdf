@@ -180,9 +180,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             let Some(dict) = node.as_dictionary() else {
                 break;
             };
-            let name = dict.get(b"T".as_slice()).cloned();
+            let name = dict.get(b"/T".as_slice()).cloned();
             let parent = dict
-                .get(b"Parent".as_slice())
+                .get(b"/Parent".as_slice())
                 .and_then(|parent| parent.object_ref().or_else(|| parent.as_reference()));
             if let Some(name) = self.resolve_string_handle(name)? {
                 parts.push(name);
@@ -539,7 +539,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 .and_then(|parent| parent.as_dictionary())
                 .map(|parent| {
                     parent
-                        .get(b"Parent".as_slice())
+                        .get(b"/Parent".as_slice())
                         .cloned()
                         .map(|parent| parent.materialize())
                         .transpose()
@@ -784,7 +784,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         };
         let value = self.pdf.lift_object_to_handle(&value)?;
         self.pdf.mark_object_handle_dirty(&dictionary)?;
-        dictionary.replace_key(key, value);
+        let key = crate::object_handle::canonical_dictionary_key(key);
+        dictionary.replace_key(&key, value);
         Ok(())
     }
 
@@ -896,7 +897,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
         let Some(parent) = node
             .as_dictionary()
-            .and_then(|dict| dict.get(b"Parent".as_slice()).cloned())
+            .and_then(|dict| dict.get(b"/Parent".as_slice()).cloned())
         else {
             return Ok(None);
         };
@@ -914,6 +915,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn resolve_inherited_handle(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+        let key = crate::object_handle::canonical_dictionary_key(key);
         let mut seen = BTreeSet::new();
         let mut current = self.field_ref;
         loop {
@@ -925,9 +927,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             let Some(dict) = node.as_dictionary() else {
                 return Ok(None);
             };
-            let found = dict.get(key).cloned();
+            let found = dict.get(&key).cloned();
             let parent_ref = dict
-                .get(b"Parent".as_slice())
+                .get(b"/Parent".as_slice())
                 .and_then(|parent| parent.object_ref().or_else(|| parent.as_reference()));
             if let Some(value) = found {
                 let terminal = self.pdf.resolve_object_handle_to_terminal(&value)?;
@@ -961,12 +963,13 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn string_key(&mut self, field_ref: ObjectRef, key: &[u8]) -> Result<Option<String>> {
+        let key = crate::object_handle::canonical_dictionary_key(key);
         let node = self.pdf.get_object_handle(field_ref);
         let node = self.pdf.resolve_object_handle_to_terminal(&node)?;
         let Some(dict) = node.as_dictionary() else {
             return Ok(None);
         };
-        let value = dict.get(key).cloned();
+        let value = dict.get(&key).cloned();
         self.resolve_string_handle(value)
     }
 

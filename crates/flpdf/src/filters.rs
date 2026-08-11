@@ -420,8 +420,8 @@ pub(crate) fn encode_stream_data_from_handle(
     stream_dict: &ObjectHandle,
     stream_data: &[u8],
 ) -> Result<Vec<u8>> {
-    let filter = stream_dict.try_get_key(b"Filter")?;
-    let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+    let filter = stream_dict.try_get_key(b"/Filter")?;
+    let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
     let specs = decode_filter_specs_from_handle(&filter, &decode_params, None)?;
     encode_stream_data_from_specs(specs, stream_data)
 }
@@ -552,8 +552,8 @@ fn decode_stream_data_from_handle_with_mode(
     limits: DecodeLimits,
     data_events: DataEventMode,
 ) -> Result<StreamDecodeOutcome> {
-    let filter = stream_dict.try_get_key(b"Filter")?;
-    let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+    let filter = stream_dict.try_get_key(b"/Filter")?;
+    let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
     let specs = decode_filter_specs_from_handle(&filter, &decode_params, limits.max_filter_chain)?;
     decode_prepared_specs(
         specs,

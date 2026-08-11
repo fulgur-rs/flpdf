@@ -106,12 +106,42 @@ fn resolve_object_handle_resolves_the_catalog_dictionary() {
     let dict = handle
         .as_dictionary()
         .expect("catalog resolves to a dictionary");
-    let pages_handle = dict.get(b"Pages".as_slice()).expect("Pages entry present");
+    let pages_handle = dict.get(b"/Pages".as_slice()).expect("Pages entry present");
     assert!(
         pages_handle.is_indirect(),
         "an indirect /Pages value must lift to an indirect handle, not an inlined copy"
     );
     assert_eq!(pages_handle.object_ref(), Some(ObjectRef::new(2, 0)));
+}
+
+#[test]
+fn dictionary_handles_use_qpdf_slash_prefixed_decoded_keys() {
+    let bytes = classic_pdf_with_bodies(
+        &[
+            b"1 0 obj\n<< /Type /Catalog /A#20B 2 0 R >>\nendobj\n",
+            b"2 0 obj\n42\nendobj\n",
+        ],
+        ObjectRef::new(1, 0),
+    );
+    let mut pdf = Pdf::open(std::io::Cursor::new(bytes)).expect("open key fixture");
+    let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+    pdf.resolve_object_handle(&catalog)
+        .expect("resolve catalog dictionary");
+
+    let decoded = catalog.get_key(b"/A B");
+    assert_eq!(decoded.object_ref(), Some(ObjectRef::new(2, 0)));
+    assert!(catalog.get_key(b"A B").is_null());
+}
+
+#[test]
+fn dictionary_handle_lookup_and_writer_use_one_canonical_slash() {
+    let dictionary = ObjectHandle::dictionary(vec![(b"A B".to_vec(), ObjectHandle::integer(7))]);
+
+    assert_eq!(dictionary.get_key(b"A B").as_integer(), None);
+    assert_eq!(dictionary.get_key(b"/A B").as_integer(), Some(7));
+    assert!(dictionary.has_key(b"/A B"));
+    assert!(!dictionary.has_key(b"A B"));
+    assert_eq!(dictionary.unparse_resolved(), b"<< /A#20B 7 >>");
 }
 
 /// A dangling indirect handle (a ref absent from the fixture's xref table)
@@ -183,7 +213,7 @@ fn resolve_object_handle_survives_a_cyclic_indirect_stream_length() {
         .expect("stream value carries its own dictionary handle")
         .as_dictionary()
         .expect("stream dictionary handle resolves to a dictionary");
-    let length_handle = dict.get(b"Length".as_slice()).expect("Length entry");
+    let length_handle = dict.get(b"/Length".as_slice()).expect("Length entry");
     assert!(length_handle.is_indirect());
     assert_eq!(length_handle.object_ref(), Some(ObjectRef::new(2, 0)));
 }
@@ -304,7 +334,7 @@ fn resolve_object_handle_lifts_array_elements_recursively() {
         .expect("resolve dict-with-array");
 
     let dict = handle.as_dictionary().expect("dictionary");
-    let kids_handle = dict.get(b"Kids".as_slice()).expect("Kids entry");
+    let kids_handle = dict.get(b"/Kids".as_slice()).expect("Kids entry");
     let kids = kids_handle.as_array().expect("Kids is an array");
     assert_eq!(kids.len(), 2);
     assert!(kids[0].is_indirect());
@@ -334,18 +364,19 @@ fn resolve_object_handle_lifts_every_scalar_object_value_variant() {
 
     let dict = handle.as_dictionary().expect("dictionary");
     assert_eq!(
-        dict.get(b"I".as_slice()).and_then(ObjectHandle::as_integer),
+        dict.get(b"/I".as_slice())
+            .and_then(ObjectHandle::as_integer),
         Some(7)
     );
     assert_eq!(
-        dict.get(b"RL".as_slice())
+        dict.get(b"/RL".as_slice())
             .and_then(ObjectHandle::as_real_literal),
         Some((0.5, b".5".to_vec()))
     );
-    assert!(dict.contains_key(b"B".as_slice()));
-    assert!(dict.contains_key(b"R".as_slice()));
-    assert!(dict.contains_key(b"N".as_slice()));
-    assert!(dict.contains_key(b"S".as_slice()));
+    assert!(dict.contains_key(b"/B".as_slice()));
+    assert!(dict.contains_key(b"/R".as_slice()));
+    assert!(dict.contains_key(b"/N".as_slice()));
+    assert!(dict.contains_key(b"/S".as_slice()));
 }
 
 // ---------------------------------------------------------------------
@@ -436,7 +467,8 @@ fn dictionary_parsed_offset_is_the_double_angle_bracket() {
     assert_eq!(handle.get_parsed_offset(), expected_dict_offset);
     let dict = handle.as_dictionary().expect("dictionary");
     assert_eq!(
-        dict.get(b"A".as_slice()).and_then(ObjectHandle::as_integer),
+        dict.get(b"/A".as_slice())
+            .and_then(ObjectHandle::as_integer),
         Some(1)
     );
 }
@@ -519,7 +551,7 @@ fn indirect_reference_child_is_the_canonical_handle_not_a_fresh_value() {
     pdf.resolve_object_handle(&handle).expect("resolve parent");
 
     let dict = handle.as_dictionary().expect("dictionary");
-    let kid_handle = dict.get(b"Kid".as_slice()).expect("Kid entry").clone();
+    let kid_handle = dict.get(b"/Kid".as_slice()).expect("Kid entry").clone();
     assert_eq!(kid_handle.object_ref(), Some(ObjectRef::new(5, 0)));
 
     pdf.resolve_object_handle(&kid_handle).expect("resolve kid");

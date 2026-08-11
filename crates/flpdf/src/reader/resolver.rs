@@ -185,6 +185,15 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// reconstruct that happened in a separate member
     /// (`m->reconstructed_xref`, `QPDF.hh:1480`).
     attempt_recovery: bool,
+    /// Writer-local equivalent of qpdf's default recovery permission.
+    ///
+    /// flpdf keeps `PdfOpenOptions::repair = false` as the strict xref/header
+    /// mode, while the qpdf writer still recovers malformed stream framing
+    /// when it reads source objects. The legacy writer already did this via
+    /// its bounded file-object parser; the canonical writer toggles this
+    /// field for the duration of its plain-write walk so the cutover retains
+    /// that observable behavior without weakening direct handle resolution.
+    writer_stream_recovery: bool,
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
     ///
     /// Set to `true` when live resolution triggers cross-reference table
@@ -665,6 +674,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
                 attempt_recovery,
+                writer_stream_recovery: false,
                 // qpdf `m->reconstructed_xref` (`QPDF.cc:524`): set by
                 // `reconstruct_xref` which runs both at open time (`:464`) and
                 // during resolution (`:1617`). Carry open-time recovery state
@@ -837,6 +847,113 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(self.max_object_number().unwrap_or(0))
     }
 
+    /// Return qpdf's next generation-zero object identity.
+    ///
+    /// `QPDF::nextObjGen` first prepares the effective object cache through
+    /// `getObjectCount`, then allocates one above its greatest object number
+    /// and rejects the signed `int` boundary
+    /// (`libqpdf/QPDF.cc:1271-1283,1872-1880`; `QPDFObjGen.hh:41-74`).
+    /// Free xref entries and legacy-only values are deliberately absent from
+    /// this cache and therefore cannot raise the allocation ceiling.
+    #[allow(dead_code)]
+    pub(crate) fn next_obj_gen(&self) -> Result<ObjectRef> {
+        let max_object_id = self.get_object_count()?;
+        if max_object_id >= i32::MAX as u32 {
+            return Err(Error::Unsupported(
+                "max object id is too high to create new objects".to_string(),
+            ));
+        }
+        Ok(ObjectRef::new(max_object_id + 1, 0))
+    }
+
+    /// Register the existing handle allocation under qpdf's fresh object
+    /// identity, preserving the handle's shared storage instead of cloning its
+    /// value. This is the Rust equivalent of
+    /// `QPDF::makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`): the
+    /// handle aliases held by the caller and the canonical cache see the same
+    /// object after promotion.
+    #[allow(dead_code)]
+    pub(crate) fn make_indirect_from_object_handle(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        if !handle.is_direct() {
+            return Err(Error::Unsupported(
+                "cannot make an already-indirect ObjectHandle indirect".to_string(),
+            ));
+        }
+
+        let object_ref = self.next_obj_gen()?;
+        let promoted =
+            handle.promote_to_indirect(object_ref, self.pdf_unique_id, self.self_weak.clone());
+        let previous = self
+            .core
+            .borrow_mut()
+            .object_cache
+            .insert(object_ref, promoted.clone());
+        debug_assert!(
+            previous.is_none(),
+            "next_obj_gen must return a fresh ObjGen"
+        );
+        Ok(promoted)
+    }
+
+    /// Replace the canonical value for `object_ref` without replacing the
+    /// canonical handle itself.
+    ///
+    /// qpdf's `QPDF::replaceObject` rejects an indirect replacement, checks
+    /// ownership before mutating the cache, and then calls `updateCache`.
+    /// `QPDFObject::assign` inside that update shares the replacement's
+    /// `QPDFValue` (`QPDF.cc:1986-1993,1835-1857`;
+    /// `QPDFObject_private.hh:117-120`), which is represented by
+    /// [`ObjectHandle::share_value_state_with`].
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn replace_object(
+        &self,
+        object_ref: ObjectRef,
+        replacement: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        if !replacement.is_direct() {
+            return Err(Error::Unsupported(
+                "QPDF::replaceObject called with indirect object handle".to_string(),
+            ));
+        }
+        if !replacement.belongs_exclusively_to_pdf(self.pdf_unique_id) {
+            return Err(Error::Unsupported(
+                "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_string(),
+            ));
+        }
+
+        let target = self.get_object_handle(object_ref);
+        target.share_value_state_with(&replacement)?;
+        target.clear_description();
+        target.reset_parsed_offset();
+        target.set_end_offsets(NO_PARSED_OFFSET, NO_PARSED_OFFSET);
+        Ok(target)
+    }
+
+    /// Remove an object from the canonical xref/cache view and leave any
+    /// outstanding handle as a floating null value.
+    ///
+    /// qpdf erases the xref/cache entry after assigning a null value to the
+    /// cached object (`QPDF.cc:1996-2005`). The handle is nullified first so
+    /// aliases held by callers observe the transition even after the cache
+    /// entry is gone.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn remove_object(&self, object_ref: ObjectRef) -> Result<()> {
+        let cached = {
+            let mut core = self.core.borrow_mut();
+            core.source_xref_entries.remove(&object_ref);
+            core.default_xref_entries.remove(&object_ref);
+            core.fixed_dangling_refs = false;
+            core.object_cache.remove(&object_ref)
+        };
+        if let Some(handle) = cached {
+            handle.remove_from_document();
+        }
+        Ok(())
+    }
+
     /// Whether a canonical handle occupies `number` at any generation.
     pub(crate) fn holds_object_number(&self, number: u32) -> bool {
         self.core
@@ -861,6 +978,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// whether a failed object read may trigger `reconstruct_xref`.
     pub(crate) fn attempt_recovery(&self) -> bool {
         self.core.borrow().attempt_recovery
+    }
+
+    /// Run a writer operation with qpdf's default stream-framing recovery
+    /// enabled, restoring the previous setting before returning.
+    pub(crate) fn with_writer_stream_recovery<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let previous = {
+            let mut core = self.core.borrow_mut();
+            let previous = core.writer_stream_recovery;
+            core.writer_stream_recovery = true;
+            previous
+        };
+        let result = operation();
+        self.core.borrow_mut().writer_stream_recovery = previous;
+        result
+    }
+
+    fn stream_recovery_enabled(&self) -> bool {
+        let core = self.core.borrow();
+        core.attempt_recovery || core.writer_stream_recovery
     }
 
     /// qpdf `QPDF::reconstruct_xref` (`libqpdf/QPDF.cc:516-530`) & `QPDF::readObjectAtOffset`
@@ -1233,8 +1369,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
         let decoded_stream_data = decoded_stream.take_buffer()?;
 
-        let object_count = Self::object_stream_integer(&stream_dict, b"N", "/N")?;
-        let first = Self::object_stream_integer(&stream_dict, b"First", "/First")?;
+        let object_count = Self::object_stream_integer(&stream_dict, b"/N", "/N")?;
+        let first = Self::object_stream_integer(&stream_dict, b"/First", "/First")?;
         let mut tokenizer = Tokenizer::new(&decoded_stream_data);
         let mut members = BTreeMap::new();
         for _ in 0..object_count {
@@ -2359,7 +2495,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let mut length = match Self::stream_length(&dict) {
             Ok(length) => length,
             Err(error) if self.is_recoverable_stream_error(&error) => {
-                if !self.attempt_recovery() {
+                if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
                 self.warn_stream_failure(&error, object_offset)?;
@@ -2384,7 +2520,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let (framing_token, framing_offset) = self.read_token_from_input()?;
             if !framing_token.is_word_value(b"endstream") {
                 let error = Error::parse(framing_offset as usize, "expected endstream");
-                if !self.attempt_recovery() {
+                if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
                 self.warn_stream_failure(&error, object_offset)?;
@@ -2607,7 +2743,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 "stream keyword follows an object that is not a dictionary",
             ));
         };
-        let length = entries.get(b"Length".as_slice());
+        let length = entries.get(b"/Length".as_slice());
         if let Some(length) = length {
             length.try_dereference()?;
         }
@@ -2667,7 +2803,7 @@ fn inspect_stream_encryption(
     encryption: &EncryptionState,
     stream_dict: &ObjectHandle,
 ) -> Result<StreamEncryptionInspection> {
-    let stream_type = stream_dict.try_get_key(b"Type")?.try_as_name()?;
+    let stream_type = stream_dict.try_get_key(b"/Type")?.try_as_name()?;
     let is_xref = stream_type.as_deref() == Some(b"XRef");
     let is_metadata = stream_type.as_deref() == Some(b"Metadata");
     let default_source = "/StmF from /Encrypt dictionary";
@@ -2682,17 +2818,17 @@ fn inspect_stream_encryption(
         });
     }
 
-    let filter = stream_dict.try_get_key(b"Filter")?;
+    let filter = stream_dict.try_get_key(b"/Filter")?;
     let mut method = None;
     let mut method_source = default_source;
     if filter.try_is_or_has_name(b"Crypt")? {
-        let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+        let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
         // qpdf's `if (isDictionary()) { if (isDictionaryOfType()) ... }
         // else if (isArray() && filter.isArray()) ...` shape matters: a
         // dictionary of the wrong type never falls through to array pairing.
         if decode_params.try_is_dictionary_of_type(b"", b"")? {
             if decode_params.try_is_dictionary_of_type(b"CryptFilterDecodeParms", b"")? {
-                let name = decode_params.try_get_key(b"Name")?;
+                let name = decode_params.try_get_key(b"/Name")?;
                 method = Some(interpret_cf_from_handle(encryption, &name)?);
                 method_source = "stream's Crypt decode parameters";
             } // cov:ignore: llvm maps the covered typed-dictionary branch to its closing brace
@@ -2712,7 +2848,7 @@ fn inspect_stream_encryption(
                     if !is_crypt || !has_dictionary_params {
                         continue;
                     }
-                    let name = crypt_params.try_get_key(b"Name")?;
+                    let name = crypt_params.try_get_key(b"/Name")?;
                     if name.try_as_name()?.is_some() {
                         method = Some(interpret_cf_from_handle(encryption, &name)?);
                         method_source = "stream's Crypt decode parameters (array)";
@@ -3326,6 +3462,34 @@ mod tests {
         pdf
     }
 
+    fn unreferenced_high_free_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let catalog = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 100\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{catalog:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{pages:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{page:010} 00000 n \n").as_bytes());
+        for _ in 4..100 {
+            pdf.extend_from_slice(b"0000000000 00000 f \n");
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 100 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     fn compressed_object_stream_fixture() -> (Vec<u8>, u64) {
         let member_data = b"<< /Value 1 >> [7 0 R]";
         let header = b"7 0 8 14 ";
@@ -3557,13 +3721,13 @@ mod tests {
             .as_dictionary()
             .expect("expected a dictionary object");
         let level_one = values
-            .get(b"L1".as_slice())
+            .get(b"/L1".as_slice())
             .and_then(ObjectHandle::as_dictionary)
-            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L2".as_slice()).cloned())
             .expect("level two dictionary");
         let value = level_one
             .as_dictionary()
-            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("deep scalar");
 
         assert_eq!(level_one.get_parsed_offset(), 22);
@@ -3604,7 +3768,7 @@ mod tests {
         assert_eq!(root.description(), "input.pdf, object 1 0 at offset 11");
         let level_one = root
             .as_dictionary()
-            .and_then(|values| values.get(b"L1".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L1".as_slice()).cloned())
             .expect("level one dictionary");
         assert_eq!(
             level_one.description(),
@@ -3613,7 +3777,7 @@ mod tests {
 
         let level_two = level_one
             .as_dictionary()
-            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L2".as_slice()).cloned())
             .expect("level two dictionary");
         assert_eq!(
             level_two.description(),
@@ -3622,13 +3786,13 @@ mod tests {
 
         let value = level_two
             .as_dictionary()
-            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("deep scalar");
         assert_eq!(value.description(), "input.pdf, object 1 0 at offset 33");
 
         let items = root
             .as_dictionary()
-            .and_then(|values| values.get(b"Items".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Items".as_slice()).cloned())
             .expect("array value");
         assert_eq!(items.description(), "input.pdf, object 1 0 at offset 49");
         let array_scalar = items
@@ -3676,7 +3840,7 @@ mod tests {
                 .as_dictionary()
                 .expect("expected a dictionary object");
             values
-                .get(b"Value".as_slice())
+                .get(b"/Value".as_slice())
                 .cloned()
                 .expect("direct value")
         };
@@ -5452,15 +5616,15 @@ mod tests {
         let values = info.as_dictionary().expect("/Info must be a dictionary");
         assert_eq!(
             values
-                .get(b"Title".as_slice())
+                .get(b"/Title".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"TopSecretTitle".to_vec())
         );
         assert_eq!(
             values
-                .get(b"Metadata".as_slice())
+                .get(b"/Metadata".as_slice())
                 .and_then(crate::ObjectHandle::as_dictionary)
-                .and_then(|metadata| metadata.get(b"Label".as_slice()).cloned())
+                .and_then(|metadata| metadata.get(b"/Label".as_slice()).cloned())
                 .and_then(|label| label.as_string()),
             Some(b"NestedSecret".to_vec())
         );
@@ -5631,7 +5795,7 @@ mod tests {
             let offset = stream.get_parsed_offset();
             let dict = stream.as_stream_dict().expect("stream dictionary");
             let length = usize::try_from(
-                dict.try_get_key(b"Length")
+                dict.try_get_key(b"/Length")
                     .expect("resolve /Length")
                     .try_as_integer()
                     .expect("inspect /Length")
@@ -5797,7 +5961,7 @@ mod tests {
             .expect("canonical resolver must decrypt with qpdf's AES fallback");
         assert_eq!(
             info.as_dictionary()
-                .and_then(|values| values.get(b"Title".as_slice()).cloned())
+                .and_then(|values| values.get(b"/Title".as_slice()).cloned())
                 .and_then(|title| title.as_string()),
             Some(b"TopSecretTitle".to_vec()) // cov:ignore: llvm maps the assertion's mismatch-only diagnostic region to this expected value
         );
@@ -5889,16 +6053,16 @@ mod tests {
                 canonical_info_dictionary(encrypted.clone(), allow_weak_crypto);
             assert_eq!(
                 values
-                    .get(b"Title".as_slice())
+                    .get(b"/Title".as_slice())
                     .and_then(crate::ObjectHandle::as_string),
                 Some(b"TopSecretTitle".to_vec()),
                 "{name}: canonical resolver title"
             );
             assert_eq!(
                 values
-                    .get(b"Metadata".as_slice())
+                    .get(b"/Metadata".as_slice())
                     .and_then(crate::ObjectHandle::as_dictionary)
-                    .and_then(|metadata| metadata.get(b"Label".as_slice()).cloned())
+                    .and_then(|metadata| metadata.get(b"/Label".as_slice()).cloned())
                     .and_then(|label| label.as_string()),
                 Some(b"NestedSecret".to_vec()),
                 "{name}: canonical resolver nested label"
@@ -5939,12 +6103,12 @@ mod tests {
         let (info_ref, values) = canonical_info_dictionary(encrypted.clone(), false);
         assert_eq!(
             values
-                .get(b"Reason".as_slice())
+                .get(b"/Reason".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"ReasonPlain".to_vec())
         );
         let contents = values
-            .get(b"Contents".as_slice())
+            .get(b"/Contents".as_slice())
             .and_then(crate::ObjectHandle::as_string)
             .expect("signature /Contents is a string");
         assert_ne!(contents, b"SignatureCipher");
@@ -5963,7 +6127,7 @@ mod tests {
         let (_, values) = canonical_info_dictionary(no_byte_range, false);
         assert_eq!(
             values
-                .get(b"Contents".as_slice())
+                .get(b"/Contents".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"SignatureCipher".to_vec())
         );
@@ -5995,7 +6159,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("the catalog is a dictionary")
-                .get(b"Type".as_slice())
+                .get(b"/Type".as_slice())
                 .and_then(crate::ObjectHandle::as_name),
             Some(b"Catalog".to_vec())
         );
@@ -6259,7 +6423,7 @@ mod tests {
         assert_eq!(
             member
                 .as_dictionary()
-                .and_then(|dict| dict.get(b"Value".as_slice()).cloned())
+                .and_then(|dict| dict.get(b"/Value".as_slice()).cloned())
                 .and_then(|value| value.as_integer()),
             Some(1)
         );
@@ -6346,7 +6510,7 @@ mod tests {
         member
             .try_dereference()
             .expect("the duplicate's final header entry is the one qpdf parses");
-        assert_eq!(member.try_get_key(b"Value").unwrap().as_integer(), Some(2));
+        assert_eq!(member.try_get_key(b"/Value").unwrap().as_integer(), Some(2));
         assert!(!resolver
             .repair_diagnostics()
             .entries()
@@ -6678,7 +6842,7 @@ mod tests {
         assert_eq!(
             resolver
                 .get_object_handle(member_ref)
-                .try_get_key(b"Value")
+                .try_get_key(b"/Value")
                 .expect("resolved member dictionary")
                 .as_integer(),
             Some(1)
@@ -6961,7 +7125,7 @@ mod tests {
             .expect("qpdf warns about a later member and keeps the earlier cache entry");
         assert_eq!(
             requested
-                .try_get_key(b"Value")
+                .try_get_key(b"/Value")
                 .expect("the earlier member remains a dictionary")
                 .as_integer(),
             Some(1)
@@ -7092,7 +7256,7 @@ mod tests {
             ObjectHandle::name(b"not-an-integer".to_vec()),
         )]);
         let error =
-            ResolverHandle::<Cursor<Vec<u8>>>::object_stream_integer(&dictionary, b"N", "/N")
+            ResolverHandle::<Cursor<Vec<u8>>>::object_stream_integer(&dictionary, b"/N", "/N")
                 .expect_err("object-stream metadata must be integer");
         assert!(matches!(
             error,
@@ -7399,7 +7563,7 @@ mod tests {
         assert_eq!(
             member
                 .as_dictionary()
-                .and_then(|dict| dict.get(b"Value".as_slice()).cloned())
+                .and_then(|dict| dict.get(b"/Value".as_slice()).cloned())
                 .and_then(|value| value.as_integer()),
             Some(1)
         );
@@ -7658,7 +7822,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("the catalog is a dictionary")
-                .get(b"Type".as_slice())
+                .get(b"/Type".as_slice())
                 .and_then(crate::ObjectHandle::as_name),
             Some(b"Catalog".to_vec())
         );
@@ -7695,7 +7859,7 @@ mod tests {
         let minted_child = catalog
             .as_dictionary()
             .expect("the catalog is a dictionary")
-            .get(b"Pages".as_slice())
+            .get(b"/Pages".as_slice())
             .expect("the catalog has /Pages")
             .clone();
         assert!(
@@ -7709,7 +7873,7 @@ mod tests {
         let kid = pages
             .as_dictionary()
             .expect("the page tree is a dictionary")
-            .get(b"Kids".as_slice())
+            .get(b"/Kids".as_slice())
             .and_then(crate::ObjectHandle::as_array)
             .expect("/Kids is an array")
             .first()
@@ -7779,7 +7943,7 @@ mod tests {
         stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .replace_key(b"Length", ObjectHandle::integer(0));
+            .replace_key(b"/Length", ObjectHandle::integer(0));
         assert_eq!(
             stream
                 .get_raw_stream_data()
@@ -7978,7 +8142,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("dictionary")
-                .get(b"Filler".as_slice())
+                .get(b"/Filler".as_slice())
                 .and_then(crate::ObjectHandle::as_string)
                 .map(|value| value.len()),
             Some(filler.len()),
@@ -8028,7 +8192,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("dictionary")
-                .get(b"Filler".as_slice())
+                .get(b"/Filler".as_slice())
                 .and_then(crate::ObjectHandle::as_string)
                 .map(|value| value.len()),
             Some(filler.len()),
@@ -8080,7 +8244,7 @@ mod tests {
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert_eq!(
             dictionary
-                .get(b"QPDFFake1".as_slice())
+                .get(b"/QPDFFake1".as_slice())
                 .and_then(crate::ObjectHandle::as_string),
             Some(b"orphan".to_vec())
         );
@@ -8458,7 +8622,7 @@ mod tests {
             handle
                 .as_dictionary()
                 .expect("the value is a dictionary")
-                .get(b"F".as_slice())
+                .get(b"/F".as_slice())
                 .and_then(crate::ObjectHandle::as_string)
                 .map(|value| value.len()),
             Some(filler.len()),
@@ -8532,7 +8696,7 @@ mod tests {
         let dictionary = handle.as_dictionary().expect("recovered dictionary");
         assert!(
             dictionary
-                .get(b"QPDFFake1".as_slice())
+                .get(b"/QPDFFake1".as_slice())
                 .is_some_and(|value| value.as_string().as_deref() == Some(b"x".as_slice())),
             "qpdf retains the orphan word under /QPDFFake1"
         );
@@ -9618,7 +9782,7 @@ mod tests {
         let ap = annotation
             .as_dictionary()
             .expect("the annotation is a dictionary")
-            .get(b"AP".as_slice())
+            .get(b"/AP".as_slice())
             .expect("the annotation has /AP")
             .clone();
         // Pins the fixture's own shape, not resolver behavior: confirms /AP
@@ -9633,7 +9797,7 @@ mod tests {
         let n = ap
             .as_dictionary()
             .expect("/AP is a dictionary")
-            .get(b"N".as_slice())
+            .get(b"/N".as_slice())
             .expect("/AP has /N")
             .clone();
         assert!(
@@ -10625,6 +10789,28 @@ mod tests {
                 .registered_handle(ObjectRef::new(0, u16::MAX))
                 .is_none(),
             "the xref free head must not become a canonical object"
+        );
+    }
+
+    #[test]
+    fn next_obj_gen_uses_a_parser_discovered_dangling_reference() {
+        let pdf = Pdf::open_mem_owned(dangling_reference_pdf_bytes()).expect("open");
+
+        assert_eq!(
+            pdf.resolver.next_obj_gen().expect("next dangling ObjGen"),
+            ObjectRef::new(100, 0)
+        );
+    }
+
+    #[test]
+    fn next_obj_gen_excludes_unreferenced_high_free_xref_entries() {
+        let pdf = Pdf::open_mem_owned(unreferenced_high_free_pdf_bytes()).expect("open");
+
+        assert_eq!(
+            pdf.resolver
+                .next_obj_gen()
+                .expect("next ObjGen after high free entry"),
+            ObjectRef::new(4, 0)
         );
     }
 

@@ -76,7 +76,7 @@
 | `crates/flpdf/src/page_document_helper.rs` | correspondence | QPDFPageDocumentHelper.cc responsibilities split with page extraction |
 | `crates/flpdf/src/page_extract.rs` | correspondence | QPDF::emptyPDF plus QPDFPageDocumentHelper.cc addPage, library level only |
 | `crates/flpdf/src/page_form_xobject.rs` | correspondence | QPDFPageObjectHelper.cc page-to-Form-XObject conversion split from the page helper |
-| `crates/flpdf/src/page_label_document_helper.rs` | correspondence | QPDFPageLabelDocumentHelper.cc behavior without a completed public API and single-implementation audit |
+| `crates/flpdf/src/page_label_document_helper.rs` | correspondence | \`QPDFPageLabelDocumentHelper.cc\` canonical page-label access and reconstruction |
 | `crates/flpdf/src/page_merge.rs` | correspondence | QPDFJob.cc page-selection merge pipeline split across page-operation modules |
 | `crates/flpdf/src/page_object_helper.rs` | correspondence | QPDFPageObjectHelper.cc responsibilities shared with page form, resource, flatten, and overlay modules |
 | `crates/flpdf/src/page_plan.rs` | correspondence | QPDFJob.cc handlePageSpecs single-document selection planning |

@@ -5,7 +5,7 @@
 
 use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
@@ -579,6 +579,170 @@ impl NameTreeCursor {
 pub struct NumberTree {
     inner: NNTree<NumberKey>,
     cursor_owner: Arc<()>,
+}
+
+/// qpdf-compatible number-tree view over the canonical [`ObjectHandle`] graph.
+///
+/// The existing [`NumberTree`] is the legacy materialized-`Object` mutation
+/// surface. Page-label lookup needs qpdf's value identity instead: a `/Nums`
+/// value must remain the same indirect handle when the helper copies `/S` and
+/// `/P` into its reconstructed dictionary. This view owns the root handle and
+/// walks `/Kids`/`/Nums` without crossing the legacy resolver boundary. Like
+/// qpdf's default `auto_repair` mode, it indirectizes direct `/Kids` entries
+/// in place and records the repair warning.
+pub(crate) struct HandleNumberTree {
+    root: ObjectHandle,
+    max_depth: usize,
+}
+
+impl HandleNumberTree {
+    pub(crate) fn new(root: ObjectHandle, max_depth: usize) -> Self {
+        Self { root, max_depth }
+    }
+
+    /// Return sorted explicit `/Nums` entries, preserving each value handle.
+    pub(crate) fn entries<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<BTreeMap<i64, ObjectHandle>> {
+        let mut entries = BTreeMap::new();
+        let mut path = Vec::new();
+        Self::collect(
+            pdf,
+            self.root.clone(),
+            0,
+            self.max_depth,
+            &mut path,
+            &mut entries,
+        )?;
+        Ok(entries)
+    }
+
+    /// Find the value at `key`, or the closest explicit key below it.
+    pub(crate) fn find_object_at_or_below<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+    ) -> Result<Option<(ObjectHandle, i64)>> {
+        let entries = self.entries(pdf)?;
+        let Some((actual_key, value)) = entries.range(..=key).next_back() else {
+            return Ok(None);
+        };
+        let offset = key.checked_sub(*actual_key).ok_or_else(|| {
+            // cov:ignore-start: BTreeMap::range(..=key) guarantees actual_key <= key, so this subtraction cannot overflow.
+            Error::Unsupported("number-tree at-or-below offset overflow".to_string())
+        })?; // cov:ignore-end
+        Ok(Some((value.clone(), offset)))
+    }
+
+    pub(crate) fn has_index<R: Read + Seek>(&self, pdf: &mut Pdf<R>, key: i64) -> Result<bool> {
+        Ok(self.entries(pdf)?.contains_key(&key))
+    }
+
+    fn collect<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        node: ObjectHandle,
+        depth: usize,
+        max_depth: usize,
+        path: &mut Vec<ObjectHandle>,
+        entries: &mut BTreeMap<i64, ObjectHandle>,
+    ) -> Result<()> {
+        let node = pdf.resolve_object_handle_to_terminal(&node)?;
+        if path
+            .iter()
+            .any(|ancestor| ancestor.is_same_object_as(&node))
+        {
+            pdf.push_warning(structural_message(
+                node.object_ref(),
+                "loop detected while traversing name/number tree",
+            ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
+            return Ok(());
+        }
+        if depth > max_depth {
+            return Err(Error::Unsupported(format!(
+                "number-tree exceeds maximum depth of {max_depth}"
+            )));
+        }
+        path.push(node.clone());
+
+        let result: Result<()> = (|| {
+            let Some(dictionary) = node.try_as_dictionary()? else {
+                return Ok(());
+            };
+
+            // qpdf 11.9.0 NNTreeIterator::deepen selects a non-empty /Nums
+            // array before looking at /Kids, even when both keys are present.
+            if let Some(nums) = dictionary.get(b"/Nums".as_slice()) {
+                if let Some(items) = nums.try_as_array()? {
+                    if !items.is_empty() {
+                        for (pair_index, pair) in items.chunks(2).enumerate() {
+                            if pair.len() < 2 {
+                                // qpdf 11.9.0 NNTreeIterator::increment warns
+                                // about a trailing item without a value and
+                                // continues traversal.
+                                pdf.push_warning(structural_message(
+                                    node.object_ref(),
+                                    "items array doesn't have enough elements",
+                                ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
+                                break;
+                            }
+                            let Some(key) = pair[0].try_as_integer()? else {
+                                let item_index = pair_index * 2;
+                                // qpdf 11.9.0 NNTreeIterator::increment warns
+                                // about a wrong-typed key and continues to the
+                                // next pair.
+                                pdf.push_warning(structural_message(
+                                    node.object_ref(),
+                                    format!("item {item_index} has the wrong type"),
+                                ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
+                                continue;
+                            };
+                            entries.insert(key, pair[1].clone());
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+
+            if let Some(kids) = dictionary.get(b"/Kids".as_slice()) {
+                if let Some(kid_handles) = kids.try_as_array()? {
+                    for (kid_number, kid) in kid_handles.into_iter().enumerate() {
+                        let kid = if kid.is_direct() {
+                            // qpdf 11.9.0 NNTreeIterator::deepen calls
+                            // makeIndirectObject for a direct kid, stores the
+                            // returned handle back into /Kids, and warns on
+                            // the containing node (NNTree.cc:623-638).
+                            pdf.push_warning(structural_message(
+                                node.object_ref(),
+                                format!("converting kid number {kid_number} to an indirect object"),
+                            ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
+                            let indirect = pdf.make_indirect_from_object_handle(kid)?;
+                            let replaced = kids.replace_array_item(kid_number, indirect.clone());
+                            debug_assert!(
+                                replaced,
+                                "the /Kids snapshot came from the same live array"
+                            );
+                            // The canonical allocation primitive intentionally
+                            // does not schedule writer output. The mutation is
+                            // on the live /Kids array, so mark its containing
+                            // indirect object dirty for the current writer
+                            // bridge (`ObjectHandle::replace_array_item`).
+                            pdf.mark_object_handle_dirty(kids)?;
+                            indirect
+                        } else {
+                            kid
+                        };
+                        Self::collect(pdf, kid, depth + 1, max_depth, path, entries)?;
+                    }
+                }
+                return Ok(());
+            }
+
+            Ok(())
+        })();
+        path.pop();
+        result
+    }
 }
 
 impl NumberTree {
@@ -2707,6 +2871,232 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!("K({children})")
+    }
+
+    #[test]
+    fn handle_number_tree_walks_and_validates_canonical_nodes() {
+        let mut pdf = empty_pdf();
+        let leaf = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(4),
+                ObjectHandle::string(b"four".to_vec()),
+                ObjectHandle::integer(8),
+                ObjectHandle::string(b"eight".to_vec()),
+            ]),
+        )]);
+        let root = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![leaf.clone()]),
+        )]);
+
+        let tree = HandleNumberTree::new(root.clone(), 1);
+        let entries = tree.entries(&mut pdf).unwrap();
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4, 8]);
+        assert_eq!(
+            tree.find_object_at_or_below(&mut pdf, 7)
+                .unwrap()
+                .map(|(_, offset)| offset),
+            Some(3)
+        );
+
+        let depth_error = HandleNumberTree::new(root, 0)
+            .entries(&mut pdf)
+            .expect_err("nested canonical nodes must respect the depth limit");
+        assert!(depth_error.to_string().contains("maximum depth of 0"));
+
+        let non_dictionary = HandleNumberTree::new(ObjectHandle::integer(0), 0);
+        assert!(non_dictionary.entries(&mut pdf).unwrap().is_empty());
+
+        let kids_not_array = HandleNumberTree::new(
+            ObjectHandle::dictionary(vec![(b"Kids".to_vec(), ObjectHandle::integer(0))]),
+            0,
+        );
+        assert!(kids_not_array.entries(&mut pdf).unwrap().is_empty());
+
+        let missing_nums = HandleNumberTree::new(ObjectHandle::dictionary(Vec::new()), 0);
+        assert!(missing_nums.entries(&mut pdf).unwrap().is_empty());
+
+        let nums_not_array = HandleNumberTree::new(
+            ObjectHandle::dictionary(vec![(b"Nums".to_vec(), ObjectHandle::integer(0))]),
+            0,
+        );
+        assert!(nums_not_array.entries(&mut pdf).unwrap().is_empty());
+
+        let non_integer_key = HandleNumberTree::new(
+            ObjectHandle::dictionary(vec![(
+                b"Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"not-an-integer".to_vec()),
+                    ObjectHandle::integer(1),
+                ]),
+            )]),
+            0,
+        );
+        assert!(non_integer_key.entries(&mut pdf).unwrap().is_empty());
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics.entries();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.message.contains("item 0 has the wrong type")));
+    }
+
+    #[test]
+    fn handle_number_tree_prefers_non_empty_nums_over_kids() {
+        let mut pdf = empty_pdf();
+        let child = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(8),
+                ObjectHandle::string(b"child".to_vec()),
+            ]),
+        )]);
+        let root = ObjectHandle::dictionary(vec![
+            (b"Kids".to_vec(), ObjectHandle::array(vec![child])),
+            (
+                b"Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(4),
+                    ObjectHandle::string(b"local".to_vec()),
+                ]),
+            ),
+        ]);
+
+        let entries = HandleNumberTree::new(root, 1)
+            .entries(&mut pdf)
+            .expect("non-empty local entries must be readable");
+
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn handle_number_tree_skips_wrong_number_keys_and_warns() {
+        let mut pdf = empty_pdf();
+        let root = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(4),
+                ObjectHandle::string(b"four".to_vec()),
+                ObjectHandle::string(b"not-an-integer".to_vec()),
+                ObjectHandle::integer(6),
+                ObjectHandle::integer(8),
+                ObjectHandle::string(b"eight".to_vec()),
+            ]),
+        )]);
+
+        let entries = HandleNumberTree::new(root, 0)
+            .entries(&mut pdf)
+            .expect("invalid keys must not discard valid pairs");
+
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4, 8]);
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics.entries();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("item 2 has the wrong type"));
+    }
+
+    #[test]
+    fn handle_number_tree_skips_cyclic_kids_and_continues_siblings() {
+        let mut pdf = empty_pdf();
+        let cyclic_ref = ObjectRef::new(10, 0);
+        let valid_ref = ObjectRef::new(11, 0);
+
+        let mut cyclic_node = Dictionary::new();
+        cyclic_node.insert("Kids", Object::Array(vec![Object::Reference(cyclic_ref)]));
+        pdf.set_object(cyclic_ref, Object::Dictionary(cyclic_node));
+        pdf.set_object(valid_ref, number_leaf(&[(4, b"four")], Some((4, 4))));
+
+        let root = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![
+                pdf.get_object_handle(cyclic_ref),
+                pdf.get_object_handle(valid_ref),
+            ]),
+        )]);
+
+        let entries = HandleNumberTree::new(root, 1)
+            .entries(&mut pdf)
+            .expect("a cyclic branch must not abort later siblings");
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| warning
+                .message
+                .contains("loop detected while traversing name/number tree")));
+    }
+
+    #[test]
+    fn handle_number_tree_keeps_complete_pairs_before_dangling_nums_item() {
+        let mut pdf = empty_pdf();
+        let root = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::string(b"zero".to_vec()),
+                ObjectHandle::integer(2),
+            ]),
+        )]);
+
+        let entries = HandleNumberTree::new(root, 0)
+            .entries(&mut pdf)
+            .expect("a dangling final item must not discard complete pairs");
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![0]);
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| warning
+                .message
+                .contains("items array doesn't have enough elements")));
+    }
+
+    #[test]
+    fn handle_number_tree_auto_repairs_direct_kids_and_warns() {
+        let mut pdf = empty_pdf();
+        let root = ObjectHandle::dictionary(vec![(
+            b"Kids".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                b"Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(4),
+                    ObjectHandle::string(b"four".to_vec()),
+                ]),
+            )])]),
+        )]);
+        let catalog_ref = ObjectRef::new(1, 0);
+        let catalog = pdf.get_object_handle(catalog_ref);
+        catalog.try_dereference().expect("catalog");
+        catalog.replace_key(b"/PageLabels", root.clone());
+        pdf.clear_dirty(catalog_ref);
+
+        let entries = HandleNumberTree::new(root.clone(), 1)
+            .entries(&mut pdf)
+            .expect("direct kids must remain traversable after repair");
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+        assert!(pdf.is_dirty(catalog_ref));
+
+        let kids = root
+            .try_get_key(b"/Kids")
+            .expect("root /Kids")
+            .try_as_array()
+            .expect("root /Kids array")
+            .expect("root /Kids must be an array");
+        assert!(kids[0].is_indirect(), "direct kid must be indirectized");
+        assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(2, 0)));
+        assert!(pdf
+            .get_all_object_handles()
+            .expect("enumerate repaired objects")
+            .iter()
+            .any(|handle| handle.is_same_object_as(&kids[0])));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|warning| warning
+                .message
+                .contains("converting kid number 0 to an indirect object")));
     }
 
     #[test]

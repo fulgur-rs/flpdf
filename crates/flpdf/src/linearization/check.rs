@@ -116,7 +116,7 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(false);
         };
 
-        let Some(linearized) = dictionary.get(&b"Linearized"[..]) else {
+        let Some(linearized) = dictionary.get(&b"/Linearized"[..]) else {
             return Ok(false);
         };
         if linearized.try_dereference().is_err() {
@@ -133,7 +133,7 @@ impl<R: Read + Seek> Pdf<R> {
             return Ok(false);
         }
 
-        if let Some(l_value) = dictionary.get(&b"L"[..]) {
+        if let Some(l_value) = dictionary.get(&b"/L"[..]) {
             if l_value.try_dereference().is_err() {
                 return Ok(false);
             }

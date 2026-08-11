@@ -27,10 +27,11 @@
 //! [`ObjectHandle::disconnect`] clears the same slot's indirect metadata and
 //! state-sensitive value.
 //!
-//! `QPDFObjectHandle.cc:456-466,759-785,1027-1039` supplies the
-//! name/dictionary/array inspection mirrored by `try_is_name_and_equals`,
-//! `try_is_dictionary_of_type`, `try_array_len`, `try_array_item`, and
-//! `try_is_or_has_name`.
+//! `QPDFObjectHandle.cc:456-466,759-785,869-955,1027-1039` supplies the
+//! name/dictionary/array inspection and live array mutation mirrored by
+//! `try_is_name_and_equals`, `try_is_dictionary_of_type`, `try_array_len`,
+//! `try_array_item`, `set_array_item`, `set_array_items`,
+//! `insert_array_item`, `append_array_item`, and `erase_array_item`.
 //!
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
@@ -43,10 +44,12 @@
 //
 // Deviation: qpdf's canonical name strings include a leading slash and its
 // array access borrows QPDF_Array, while ObjectValue stores decoded name bytes
-// without the slash and Vec<ObjectHandle>. Inspection compares the same decoded
-// bytes and clones only one Rc-backed child per valid array access. It emits no
-// bytes or diagnostics; invalid array access (where qpdf warns) is outside the
-// try_array_item contract. See docs/qpdf-correspondence.md.
+// without the slash and Vec<ObjectHandle>. Dictionary keys, however, retain
+// qpdf's canonical leading slash in the ObjectHandle graph. Inspection
+// compares the same decoded name bytes and clones only one Rc-backed child per
+// valid array access. It emits no bytes or diagnostics; invalid array access
+// (where qpdf warns) is outside the try_array_item contract. See
+// docs/qpdf-correspondence.md.
 
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
@@ -171,11 +174,11 @@ mod parse_tests {
             .expect("direct values do not need a parse context");
         let level_one = parsed
             .as_dictionary()
-            .and_then(|values| values.get(b"L1".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L1".as_slice()).cloned())
             .expect("level one dictionary");
         let level_two = level_one
             .as_dictionary()
-            .and_then(|values| values.get(b"L2".as_slice()).cloned())
+            .and_then(|values| values.get(b"/L2".as_slice()).cloned())
             .expect("level two scalar");
 
         let error = level_two
@@ -197,7 +200,7 @@ mod parse_tests {
         assert_eq!(parsed.description(), "parsed object,  at offset 2");
         let value = parsed
             .as_dictionary()
-            .and_then(|values| values.get(b"Value".as_slice()).cloned())
+            .and_then(|values| values.get(b"/Value".as_slice()).cloned())
             .expect("parsed scalar");
         assert_eq!(value.description(), "parsed object,  at offset 10");
 
@@ -332,7 +335,8 @@ pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 impl std::fmt::Debug for ObjectHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let slot = self.0.borrow();
-        let state: &str = match &slot.state {
+        let state = slot.state.borrow();
+        let state: &str = match &*state {
             ObjectState::NotYetResolved => "NotYetResolved",
             ObjectState::Resolved(_) => "Resolved(..)",
             ObjectState::Missing => "Missing",
@@ -417,7 +421,21 @@ fn expand_description_template(
 // it keeps the current payload and all indirect metadata together rather
 // than placing direct and indirect forms in separate backing storage.
 struct ObjectSlot {
-    state: ObjectState,
+    /// The payload state is separately reference-counted so qpdf's
+    /// `QPDFObject::assign` boundary can make two distinct handles observe
+    /// one replacement value while retaining their own handle identities.
+    state: Rc<RefCell<ObjectState>>,
+    /// Every slot whose payload is the [`Self::state`] allocation. Normally
+    /// this contains only the slot itself; qpdf's `QPDFObject::assign` can
+    /// temporarily make a direct replacement handle and an indirect target
+    /// share one payload while retaining distinct handle identities.
+    ///
+    /// The weak back-links let a later mutation through either alias update
+    /// containment edges for every owner of the shared payload. Without this
+    /// list, mutating the direct replacement after `replaceObject` would
+    /// update only its own parent edges while the canonical target retained
+    /// stale ownership metadata.
+    state_owners: Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
     object_ref: Option<ObjectRef>,
     active_pdf_unique_id: Option<u64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
@@ -431,14 +449,12 @@ struct ObjectSlot {
 
 impl ObjectSlot {
     fn get_description(&self) -> String {
+        let state = self.state.borrow();
         if let Some(desc) = &self.description {
             match desc {
-                ObjectDescription::Template(tmpl) => expand_description_template(
-                    tmpl,
-                    self.object_ref,
-                    &self.state,
-                    self.parsed_offset,
-                ),
+                ObjectDescription::Template(tmpl) => {
+                    expand_description_template(tmpl, self.object_ref, &state, self.parsed_offset)
+                }
                 ObjectDescription::Json(j) => {
                     let obj_part = if j.object.is_empty() {
                         String::new()
@@ -563,6 +579,63 @@ pub(crate) enum ObjectValue {
     // separate indirect `ObjectHandle`, never this variant -- see
     // `Pdf::lift_to_handle` and `materialize`'s own doc.
     Reference(ObjectRef),
+}
+
+/// qpdf stores dictionary names in their canonical name-string form, including
+/// the leading slash (`QPDFObjectHandle.hh:747-780`; `QPDF_Dictionary.cc:97-153`).
+/// The legacy `Object`/`Dictionary` bridge deliberately omits that slash, so
+/// conversion happens only at the boundary between the two representations.
+pub(crate) fn canonical_dictionary_key(key: &[u8]) -> Vec<u8> {
+    if key.first() == Some(&b'/') {
+        key.to_vec()
+    } else {
+        let mut canonical = Vec::with_capacity(key.len() + 1);
+        canonical.push(b'/');
+        canonical.extend_from_slice(key);
+        canonical
+    }
+}
+
+/// Convert a legacy `Dictionary` key body to qpdf's canonical dictionary key.
+/// Legacy keys omit the PDF name delimiter, but their decoded body may itself
+/// begin with `/` (for example, the body of `/#2Ffoo`).
+pub(crate) fn canonical_dictionary_key_from_legacy(key: &[u8]) -> Vec<u8> {
+    let mut canonical = Vec::with_capacity(key.len() + 1);
+    canonical.push(b'/');
+    canonical.extend_from_slice(key);
+    canonical
+}
+
+/// Convert a canonical ObjectHandle dictionary key back to the legacy
+/// `Dictionary` representation, whose writer adds the leading slash itself.
+pub(crate) fn legacy_dictionary_key(key: &[u8]) -> &[u8] {
+    key.strip_prefix(b"/").unwrap_or(key)
+}
+
+fn canonicalize_object_value(value: ObjectValue) -> ObjectValue {
+    match value {
+        ObjectValue::Dictionary(entries) => {
+            if entries.keys().all(|key| key.starts_with(b"/")) {
+                ObjectValue::Dictionary(entries)
+            } else {
+                ObjectValue::Dictionary(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (canonical_dictionary_key(&key), value))
+                        .collect(),
+                )
+            }
+        }
+        other => other,
+    }
+}
+
+/// Emit one canonical PDF name token from an ObjectHandle dictionary key.
+/// `write_name_escaped` writes only the name body, while the canonical key
+/// already contains `/`; stripping it first prevents `//Key` output.
+fn write_dictionary_key(out: &mut Vec<u8>, key: &[u8]) {
+    out.push(b'/');
+    crate::object::write_name_escaped(out, legacy_dictionary_key(key));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -739,8 +812,9 @@ impl ObjectHandle {
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
         let _ = offset;
-        Self(Rc::new(RefCell::new(ObjectSlot {
-            state: ObjectState::NotYetResolved,
+        let handle = Self(Rc::new(RefCell::new(ObjectSlot {
+            state: Rc::new(RefCell::new(ObjectState::NotYetResolved)),
+            state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: Some(object_ref),
             active_pdf_unique_id: pdf_unique_id,
             resolver,
@@ -750,7 +824,9 @@ impl ObjectHandle {
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
-        })))
+        })));
+        handle.register_state_owner();
+        handle
     }
 
     fn new_direct(value: ObjectValue, parsed_offset: i64) -> Self {
@@ -762,8 +838,10 @@ impl ObjectHandle {
         parsed_offset: i64,
         resolver: Option<Weak<dyn DocumentResolver>>,
     ) -> Self {
+        let value = canonicalize_object_value(value);
         let handle = Self(Rc::new(RefCell::new(ObjectSlot {
-            state: ObjectState::Resolved(value),
+            state: Rc::new(RefCell::new(ObjectState::Resolved(value))),
+            state_owners: Rc::new(RefCell::new(Vec::new())),
             object_ref: None,
             active_pdf_unique_id: None,
             resolver,
@@ -774,12 +852,203 @@ impl ObjectHandle {
             containment_parents: Vec::new(),
             description: None,
         })));
+        handle.register_state_owner();
         handle.with_value(|value| {
             if let Some(value) = value {
                 handle.attach_value_children(value);
             }
         });
         handle
+    }
+
+    fn register_state_owner(&self) {
+        let owners = self.0.borrow().state_owners.clone();
+        let self_slot = self.0.clone();
+        let mut owners = owners.borrow_mut();
+        owners.retain(|owner| owner.strong_count() != 0);
+        if !owners.iter().any(|owner| {
+            owner
+                .upgrade()
+                .is_some_and(|slot| Rc::ptr_eq(&slot, &self_slot))
+        }) {
+            owners.push(Rc::downgrade(&self_slot));
+        }
+    }
+
+    #[allow(dead_code)] // consumed by the staged mutation boundary below
+    fn remove_state_owner(
+        owners: &Rc<RefCell<Vec<Weak<RefCell<ObjectSlot>>>>>,
+        slot_to_remove: &Rc<RefCell<ObjectSlot>>,
+    ) {
+        let mut owners = owners.borrow_mut();
+        owners.retain(|owner| {
+            owner
+                .upgrade()
+                .is_some_and(|slot| !Rc::ptr_eq(&slot, slot_to_remove))
+        });
+    }
+
+    fn state_owner_handles(&self) -> Vec<Self> {
+        let owners = self.0.borrow().state_owners.clone();
+        let mut owners = owners.borrow_mut();
+        let mut handles = Vec::new();
+        owners.retain(|owner| {
+            let Some(slot) = owner.upgrade() else {
+                return false;
+            };
+            handles.push(Self(slot));
+            true
+        });
+        handles
+    }
+
+    fn detach_child_from_state_owners(&self, child: &ObjectHandle) {
+        for owner in self.state_owner_handles() {
+            let parent = owner.containment_parent();
+            Self::detach_child_from_parent(child, &parent);
+        }
+    }
+
+    fn attach_child_to_state_owners(&self, child: &ObjectHandle) {
+        for owner in self.state_owner_handles() {
+            let parent = owner.containment_parent();
+            Self::attach_child_to_parent(child, &parent);
+        }
+    }
+
+    fn state_children(state: &ObjectState) -> Vec<ObjectHandle> {
+        match state {
+            ObjectState::Resolved(value) => Self::direct_children(value),
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Replace the shared payload and keep every slot that owns it in sync
+    /// with the payload's direct-child containment edges.
+    fn replace_shared_state(&self, new_state: ObjectState) -> ObjectState {
+        let state = self.0.borrow().state.clone();
+        let old_state = {
+            let mut state = state.borrow_mut();
+            std::mem::replace(&mut *state, new_state)
+        };
+        let old_children = Self::state_children(&old_state);
+        let new_children = {
+            let state = state.borrow();
+            Self::state_children(&state)
+        };
+        for owner in self.state_owner_handles() {
+            let parent = owner.containment_parent();
+            for child in &old_children {
+                Self::detach_child_from_parent(child, &parent);
+            }
+            for child in &new_children {
+                Self::attach_child_to_parent(child, &parent);
+            }
+        }
+        old_state
+    }
+
+    /// Replace only this slot's whole-object state, leaving other slots that
+    /// currently share its payload untouched. qpdf's remove/disconnect
+    /// transitions rebind the departing `QPDFObject`; they do not mutate the
+    /// `QPDFValue` allocation that a replacement alias still observes.
+    fn replace_detached_state(&self, new_state: ObjectState) {
+        let old_state = self.0.borrow().state.clone();
+        let old_owners = self.0.borrow().state_owners.clone();
+        let old_children = {
+            let state = old_state.borrow();
+            Self::state_children(&state)
+        };
+        let new_state = Rc::new(RefCell::new(new_state));
+
+        Self::remove_state_owner(&old_owners, &self.0);
+        {
+            let mut slot = self.0.borrow_mut();
+            slot.state = new_state;
+            slot.state_owners = Rc::new(RefCell::new(Vec::new()));
+        }
+        self.register_state_owner();
+
+        let parent = self.containment_parent();
+        for child in &old_children {
+            Self::detach_child_from_parent(child, &parent);
+        }
+    }
+
+    /// Make `self` and a distinct direct replacement handle observe one
+    /// shared payload, preserving the canonical target slot's identity.
+    ///
+    /// qpdf's `QPDFObject::assign` shares the `QPDFValue` allocation rather
+    /// than copying it (`QPDFObject_private.hh:117-120`). The two Rust
+    /// [`ObjectHandle`] slots therefore retain separate object metadata while
+    /// sharing the payload and its mutation visibility.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn share_value_state_with(&self, source: &Self) -> Result<()> {
+        if self.is_same_object_as(source) {
+            return Ok(());
+        }
+        if !source.is_direct() {
+            return Err(crate::Error::Unsupported(
+                "replacement ObjectHandle must be direct".to_string(),
+            ));
+        }
+        let source_state = source.0.borrow().state.clone();
+        if !matches!(&*source_state.borrow(), ObjectState::Resolved(_)) {
+            return Err(crate::Error::Unsupported(
+                "replacement ObjectHandle is not initialized".to_string(),
+            ));
+        }
+        let source_owners = source.0.borrow().state_owners.clone();
+        let old_state = {
+            let mut target = self.0.borrow_mut();
+            let old_state = target.state.clone();
+            let old_owners = target.state_owners.clone();
+            Self::remove_state_owner(&old_owners, &self.0);
+            target.state = source_state.clone();
+            target.state_owners = source_owners.clone();
+            old_state
+        };
+        Self::register_state_owner(self);
+
+        let old_children = {
+            let state = old_state.borrow();
+            Self::state_children(&state)
+        };
+        let new_children = {
+            let state = source_state.borrow();
+            Self::state_children(&state)
+        };
+        let parent = self.containment_parent();
+        for child in &old_children {
+            Self::detach_child_from_parent(child, &parent);
+        }
+        for child in &new_children {
+            Self::attach_child_to_parent(child, &parent);
+        }
+        if let Some(pdf_unique_id) = self.0.borrow().active_pdf_unique_id {
+            source.associate_pdf_identity(pdf_unique_id, &mut BTreeSet::new());
+        }
+        Ok(())
+    }
+
+    /// Turn an indirect canonical slot into the floating null object qpdf
+    /// leaves behind after `removeObject`.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn remove_from_document(&self) {
+        if !self.is_indirect() {
+            return;
+        }
+        self.replace_detached_state(ObjectState::Resolved(ObjectValue::Null));
+        let mut slot = self.0.borrow_mut();
+        slot.object_ref = None;
+        slot.active_pdf_unique_id = None;
+        slot.resolver = None;
+        slot.description = None;
+        slot.parsed_offset = NO_PARSED_OFFSET;
+        slot.end_before_space = NO_PARSED_OFFSET;
+        slot.end_after_space = NO_PARSED_OFFSET;
     }
 
     /// Promote this existing uniform slot to an indirect object in place.
@@ -803,7 +1072,8 @@ impl ObjectHandle {
             slot.active_pdf_unique_id = Some(pdf_unique_id);
             slot.resolver = Some(resolver);
             slot.pdf_unique_ids.insert(pdf_unique_id);
-            match &slot.state {
+            let state = slot.state.borrow();
+            match &*state {
                 ObjectState::Resolved(value) => Self::direct_children(value),
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
                     Vec::new()
@@ -861,7 +1131,8 @@ impl ObjectHandle {
         let parent = Rc::downgrade(&self.0);
         let children = {
             let slot = self.0.borrow();
-            match &slot.state {
+            let state = slot.state.borrow();
+            match &*state {
                 ObjectState::Resolved(value) => Self::direct_children(value),
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
                     return None
@@ -872,7 +1143,8 @@ impl ObjectHandle {
             Self::detach_child_from_parent(&child, &parent);
         }
         let slot = Rc::try_unwrap(self.0).ok()?.into_inner();
-        match slot.state {
+        let state = Rc::try_unwrap(slot.state).ok()?.into_inner();
+        match state {
             ObjectState::Resolved(value) => Some((value, slot.parsed_offset)),
             ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => None, // cov:ignore: sole-owner branch just observed Resolved and no alias can mutate it
         }
@@ -912,7 +1184,8 @@ impl ObjectHandle {
         if slot.object_ref.is_some() {
             return Ok(None);
         }
-        match &slot.state {
+        let state = slot.state.borrow();
+        match &*state {
             ObjectState::Resolved(value) => Ok(Some(match value {
                 ObjectValue::Stream {
                     stream_dict,
@@ -957,23 +1230,7 @@ impl ObjectHandle {
     /// a direct handle, which has no resolution state to update.
     pub(crate) fn set_resolved(&self, value: ObjectValue) {
         if self.is_indirect() {
-            let new_children = Self::direct_children(&value);
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    _ => None,
-                }
-            };
-            let parent = self.containment_parent();
-            if let Some(old_value) = old_value {
-                for child in Self::direct_children(&old_value) {
-                    Self::detach_child_from_parent(&child, &parent);
-                }
-            }
-            for child in new_children {
-                Self::attach_child_to_parent(&child, &parent);
-            }
+            self.replace_shared_state(ObjectState::Resolved(canonicalize_object_value(value)));
         }
     }
 
@@ -1005,6 +1262,46 @@ impl ObjectHandle {
         }
     }
 
+    /// qpdf's `checkOwnership` rejects a value that is already attached to a
+    /// different document, including an indirect child nested below an
+    /// otherwise direct replacement value. A direct value with no recorded
+    /// document identity is unowned and can be inserted into one document.
+    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
+        let mut pending = vec![self.clone()];
+        let mut visited = BTreeSet::new();
+        while let Some(handle) = pending.pop() {
+            let identity = Rc::as_ptr(&handle.0) as usize;
+            if !visited.insert(identity) {
+                continue;
+            }
+            let (object_ref, active_pdf_unique_id, pdf_unique_ids, children) = {
+                let slot = handle.0.borrow();
+                let state = slot.state.borrow();
+                (
+                    slot.object_ref,
+                    slot.active_pdf_unique_id,
+                    slot.pdf_unique_ids.clone(),
+                    Self::state_children(&state),
+                )
+            };
+            if object_ref.is_some() {
+                if active_pdf_unique_id != Some(pdf_unique_id) {
+                    return false;
+                }
+                continue;
+            }
+            if pdf_unique_ids
+                .iter()
+                .any(|known_pdf_unique_id| *known_pdf_unique_id != pdf_unique_id)
+            {
+                return false;
+            }
+            pending.extend(children);
+        }
+        true
+    }
+
     /// Mark this indirect handle as resolved-to-null because its reference is
     /// absent from — or broken in — the source cross-reference table (see
     /// [`ObjectState`]). A no-op for a direct handle, which has no
@@ -1023,24 +1320,12 @@ impl ObjectHandle {
     /// value's source location.
     pub(crate) fn set_missing(&self) {
         if self.is_indirect() {
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                let old_value = match std::mem::replace(&mut slot.state, ObjectState::Missing) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    _ => None,
-                };
-                slot.parsed_offset = NO_PARSED_OFFSET;
-                slot.end_before_space = NO_PARSED_OFFSET;
-                slot.end_after_space = NO_PARSED_OFFSET;
-                slot.description = None;
-                old_value
-            };
-            if let Some(old_value) = old_value {
-                let parent = self.containment_parent();
-                for child in Self::direct_children(&old_value) {
-                    Self::detach_child_from_parent(&child, &parent);
-                }
-            }
+            self.replace_detached_state(ObjectState::Missing);
+            let mut slot = self.0.borrow_mut();
+            slot.parsed_offset = NO_PARSED_OFFSET;
+            slot.end_before_space = NO_PARSED_OFFSET;
+            slot.end_after_space = NO_PARSED_OFFSET;
+            slot.description = None;
         }
     }
 
@@ -1070,49 +1355,29 @@ impl ObjectHandle {
     /// is destroyed. Surviving null and missing values retain their existing
     /// parsed-offset provenance.
     pub(crate) fn disconnect(&self) {
-        let old_value = {
-            let mut slot = self.0.borrow_mut();
+        let should_destroy = {
+            let slot = self.0.borrow();
             if slot.object_ref.is_none() {
                 return;
             }
-            slot.object_ref = None;
-            slot.active_pdf_unique_id = None;
-            slot.resolver = None;
-            let old_state = std::mem::replace(&mut slot.state, ObjectState::Destroyed);
-            match old_state {
-                ObjectState::Resolved(ObjectValue::Null) => {
-                    slot.state = ObjectState::Resolved(ObjectValue::Null);
-                    None
-                }
-                ObjectState::Missing => {
-                    slot.state = ObjectState::Missing;
-                    None
-                }
-                ObjectState::Resolved(value) => {
-                    slot.description = None;
-                    slot.parsed_offset = NO_PARSED_OFFSET;
-                    slot.end_before_space = NO_PARSED_OFFSET;
-                    slot.end_after_space = NO_PARSED_OFFSET;
-                    Some(value)
-                }
-                ObjectState::NotYetResolved => {
-                    slot.description = None;
-                    slot.parsed_offset = NO_PARSED_OFFSET;
-                    slot.end_before_space = NO_PARSED_OFFSET;
-                    slot.end_after_space = NO_PARSED_OFFSET;
-                    None
-                }
-                ObjectState::Destroyed => {
-                    slot.description = None;
-                    slot.parsed_offset = NO_PARSED_OFFSET;
-                    slot.end_before_space = NO_PARSED_OFFSET;
-                    slot.end_after_space = NO_PARSED_OFFSET;
-                    None
-                }
-            }
+            let state = slot.state.borrow();
+            !matches!(
+                &*state,
+                ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
+            )
         };
-        if let Some(old_value) = old_value {
-            self.detach_value_children(&old_value);
+        if should_destroy {
+            self.replace_detached_state(ObjectState::Destroyed);
+        }
+        let mut slot = self.0.borrow_mut();
+        slot.object_ref = None;
+        slot.active_pdf_unique_id = None;
+        slot.resolver = None;
+        if should_destroy {
+            slot.description = None;
+            slot.parsed_offset = NO_PARSED_OFFSET;
+            slot.end_before_space = NO_PARSED_OFFSET;
+            slot.end_after_space = NO_PARSED_OFFSET;
         }
     }
 
@@ -1130,7 +1395,9 @@ impl ObjectHandle {
     /// that turned out to be missing from the source, or on a value severed
     /// because its owning document was dropped.
     pub fn is_resolved(&self) -> bool {
-        !matches!(self.0.borrow().state, ObjectState::NotYetResolved)
+        let state = self.0.borrow().state.clone();
+        let resolved = !matches!(*state.borrow(), ObjectState::NotYetResolved);
+        resolved
     }
 
     /// Resolve this handle's own canonical slot in place, mirroring
@@ -1144,7 +1411,8 @@ impl ObjectHandle {
             let Some(object_ref) = slot.object_ref else {
                 return Ok(());
             };
-            if !matches!(slot.state, ObjectState::NotYetResolved) {
+            let state = slot.state.borrow();
+            if !matches!(&*state, ObjectState::NotYetResolved) {
                 return Ok(());
             }
             (object_ref, slot.resolver.clone())
@@ -1390,7 +1658,9 @@ impl ObjectHandle {
         Ok(self.as_dictionary())
     }
 
-    /// Return the sorted keys whose values do not lazily resolve to null.
+    /// Return the sorted qpdf-canonical keys whose values do not lazily resolve
+    /// to null. Each returned key is a decoded PDF name string including its
+    /// leading `/`, such as `/Type`; the set is sorted lexicographically.
     ///
     /// Ports `QPDF_Dictionary::getKeys` and its `QPDFObjectHandle::getKeys`
     /// delegation (`libqpdf/QPDF_Dictionary.cc:117-127`;
@@ -1475,9 +1745,10 @@ impl ObjectHandle {
     /// `/Type` and `/Subtype` names equal the requested decoded bytes.
     ///
     /// Ports `QPDFObjectHandle::isDictionaryOfType` and its left-to-right
-    /// short-circuiting (`libqpdf/QPDFObjectHandle.cc:461-466`). flpdf keys and
-    /// names omit qpdf's canonical leading slash, so the lookups use `Type`
-    /// and `Subtype` and callers pass values such as `CryptFilterDecodeParms`.
+    /// short-circuiting (`libqpdf/QPDFObjectHandle.cc:461-466`). Dictionary
+    /// keys use qpdf's canonical leading slash; the requested type names
+    /// remain decoded name bytes without it, such as
+    /// `CryptFilterDecodeParms`.
     #[allow(dead_code)] // consumed by flpdf-25kg.3.12 after this prerequisite lands
     pub(crate) fn try_is_dictionary_of_type(
         &self,
@@ -1492,14 +1763,14 @@ impl ObjectHandle {
         }
         if !type_name.is_empty()
             && !self
-                .try_get_key(b"Type")?
+                .try_get_key(b"/Type")?
                 .try_is_name_and_equals(type_name)?
         {
             return Ok(false);
         }
         if !subtype_name.is_empty()
             && !self
-                .try_get_key(b"Subtype")?
+                .try_get_key(b"/Subtype")?
                 .try_is_name_and_equals(subtype_name)?
         {
             return Ok(false);
@@ -1642,6 +1913,10 @@ impl ObjectHandle {
     /// calls [`Self::type_warning`]. Live parser direct values now reach
     /// their owning document; explicit and programmatic direct values do not.
     ///
+    /// `key` must be qpdf's decoded, canonical dictionary key including its
+    /// leading `/` (for example, `/Type`). Lookup is exact; a slashless key is
+    /// not an alias and is treated as missing.
+    ///
     /// # Errors
     ///
     /// Propagates resolution failures.
@@ -1667,8 +1942,11 @@ impl ObjectHandle {
         }
     }
 
-    /// qpdf-compatible visible-key test. A present value that resolves to
-    /// null is treated as absent, matching `QPDF_Dictionary::hasKey`.
+    /// qpdf-compatible visible-key test. `key` must be qpdf's decoded,
+    /// canonical dictionary key including its leading `/` (for example,
+    /// `/Type`). Lookup is exact; a slashless key is not an alias. A present
+    /// value that resolves to null is treated as absent, matching
+    /// `QPDF_Dictionary::hasKey`.
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_has_key(&self, key: &[u8]) -> Result<bool> {
         self.try_dereference()?;
@@ -1768,12 +2046,14 @@ impl ObjectHandle {
     /// is the lexicographic order of the keys, not insertion order (matching
     /// [`crate::Dictionary`]); a repeated key keeps its last value. Values
     /// are handles, so cloning or re-reading this dictionary's entries never
-    /// deep-copies their subtrees.
+    /// deep-copies their subtrees. Each input key is normalized to qpdf's
+    /// decoded canonical name string, including the leading `/`.
     pub fn dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
-        Self::new_direct(
-            ObjectValue::Dictionary(entries.into_iter().collect()),
-            NO_PARSED_OFFSET,
-        )
+        let entries = entries
+            .into_iter()
+            .map(|(key, value)| (canonical_dictionary_key(&key), value))
+            .collect();
+        Self::new_direct(ObjectValue::Dictionary(entries), NO_PARSED_OFFSET)
     }
 
     /// Construct a direct stream value from `dict` (a dictionary handle —
@@ -1892,10 +2172,12 @@ impl ObjectHandle {
     /// that turned out to be missing from the source. A handle disconnected
     /// when its owning document is dropped is `Destroyed`, not null.
     pub fn is_null(&self) -> bool {
-        matches!(
-            &self.0.borrow().state,
+        let state = self.0.borrow().state.clone();
+        let is_null = matches!(
+            &*state.borrow(),
             ObjectState::Resolved(ObjectValue::Null) | ObjectState::Missing
-        )
+        );
+        is_null
     }
 
     /// The value as `i64` if this handle's value — its own if direct, or its
@@ -1928,7 +2210,8 @@ impl ObjectHandle {
     /// otherwise. This never performs resolution itself: an indirect handle
     /// that has not yet been resolved returns `None` too, the same as a
     /// resolved value of a different type. Cloning the returned map clones
-    /// only the child `Rc` handles, not their subtrees.
+    /// only the child `Rc` handles, not their subtrees. Dictionary keys use
+    /// qpdf's decoded canonical name strings, including the leading `/`.
     pub fn as_dictionary(&self) -> Option<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => Some(entries.clone()),
@@ -1944,8 +2227,10 @@ impl ObjectHandle {
     /// Unlike
     /// [`Self::as_dictionary`], this never snapshots the whole dictionary —
     /// it returns the one live child handle directly, so a caller that only
-    /// needs one key does not pay for every sibling. Never performs
-    /// resolution itself.
+    /// needs one key does not pay for every sibling. `key` must be qpdf's
+    /// decoded, canonical dictionary key including its leading `/` (for
+    /// example, `/Type`); lookup is exact and slashless keys are missing.
+    /// Never performs resolution itself.
     pub fn get_key(&self, key: &[u8]) -> ObjectHandle {
         self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
@@ -1958,8 +2243,10 @@ impl ObjectHandle {
     /// from [`Self::get_key`] returning a null handle for `key` (which
     /// cannot tell a missing key apart from one whose value is genuinely
     /// null) — mirrors `QPDFObjectHandle::hasKey`
-    /// (`libqpdf/QPDFObjectHandle.cc:966-976`). `false` for a non-dictionary
-    /// handle. Never performs resolution itself.
+    /// (`libqpdf/QPDFObjectHandle.cc:966-976`). `key` must be qpdf's decoded,
+    /// canonical dictionary key including its leading `/`; lookup is exact and
+    /// slashless keys are absent. `false` for a non-dictionary handle. Never
+    /// performs resolution itself.
     pub fn has_key(&self, key: &[u8]) -> bool {
         self.with_value(|value| match value {
             Some(ObjectValue::Dictionary(entries)) => entries.contains_key(key),
@@ -1977,17 +2264,18 @@ impl ObjectHandle {
     /// retained as the dictionary value. A no-op on a
     /// non-dictionary handle or an unresolved/missing/destroyed indirect
     /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
-    /// than panicking. Also a no-op if `value` is the same direct handle as
-    /// `self` — inserting a dictionary into itself would otherwise create a
-    /// direct cycle that none of this crate's recursive walkers
-    /// (`shallow_copy`, `materialize`, `Debug`) guard against, since they
-    /// only stop recursion at an indirect-handle boundary. This does not
-    /// detect a multi-hop reciprocal cycle built from two or more
+    /// than panicking. Also a no-op if `value` is a direct handle sharing
+    /// `self`'s value state — inserting it into the dictionary would
+    /// otherwise create a direct cycle that none of this crate's recursive
+    /// walkers (`shallow_copy`, `materialize`, `Debug`) guard against, since
+    /// they only stop recursion at an indirect-handle boundary. This does
+    /// not detect a multi-hop reciprocal cycle built from two or more
     /// `replace_key` calls across distinct direct dictionaries. Unlike
     /// qpdf's `replaceKey`, this does not check that `value` belongs to the
     /// same document (`checkOwnership`) — no caller in this crate crosses
     /// document boundaries this way today. Never performs resolution
-    /// itself.
+    /// itself. `key` must be qpdf's decoded, canonical dictionary key including
+    /// its leading `/`; this API does not normalize slashless input.
     ///
     /// This mutates the live handle graph directly. If `self`'s ref has
     /// already been read through [`crate::Pdf::resolve`] or
@@ -2008,7 +2296,7 @@ impl ObjectHandle {
             self.remove_key(key);
             return;
         }
-        if self.is_same_direct_handle(&value) {
+        if self.is_direct_value_alias(&value) {
             return;
         }
         let replaced = self.with_value_mut(|v| {
@@ -2018,19 +2306,272 @@ impl ObjectHandle {
             None
         });
         if let Some(old_value) = replaced {
-            let parent = self.containment_parent();
             if let Some(old_value) = old_value {
-                Self::detach_child_from_parent(&old_value, &parent);
+                self.detach_child_from_state_owners(&old_value);
             }
-            Self::attach_child_to_parent(&value, &parent);
+            self.attach_child_to_state_owners(&value);
         }
+    }
+
+    /// Set one item in the live array, porting qpdf's `setArrayItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:871-883`). The receiver is dereferenced
+    /// before its array type is inspected, so an unresolved indirect holder
+    /// is mutated through the same canonical slot that every alias observes.
+    ///
+    /// qpdf checks the index before `QPDF_Array::checkOwnership`, warns and
+    /// leaves the array unchanged for an invalid index, and otherwise throws
+    /// a logic error for a foreign or destroyed item. `Error::Internal` is the
+    /// crate's logic-error boundary. A contextless qpdf warning is likewise
+    /// returned as the existing `type_warning`/`object_warning` error.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to set item")? {
+            return Ok(());
+        }
+
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
+        );
+        if !in_bounds {
+            return self.object_warning("ignoring attempt to set out of bounds array item");
+        }
+
+        self.check_array_item_ownership(&value)?;
+        let old_value = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return None; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            Some(std::mem::replace(&mut items[index], value.clone()))
+        });
+        if let Some(old_value) = old_value {
+            self.detach_child_from_state_owners(&old_value);
+            self.attach_child_to_state_owners(&value);
+        }
+        Ok(())
+    }
+
+    /// Replace the live array contents in qpdf's `setFromVector` order
+    /// (`libqpdf/QPDFObjectHandle.cc:884-893`, `libqpdf/QPDF_Array.cc:220-243`).
+    /// The old contents are detached before the first ownership check. Items
+    /// are then checked and attached one at a time, so an ownership error at
+    /// item `n` intentionally leaves the accepted prefix in place, matching
+    /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to replace items")? {
+            return Ok(());
+        }
+
+        let expected_len = items.len();
+        let old_items = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(current_items)) = current else {
+                return None; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            let old_items = std::mem::take(current_items);
+            current_items.reserve(expected_len);
+            Some(old_items)
+        });
+        let Some(old_items) = old_items else {
+            return Ok(()); // cov:ignore: prepare_array_mutation fixed the type
+        };
+        for old_item in old_items {
+            self.detach_child_from_state_owners(&old_item);
+        }
+
+        for item in items {
+            self.check_array_item_ownership(&item)?;
+            let child = item.clone();
+            let inserted = self.with_value_mut(|current| {
+                let Some(ObjectValue::Array(current_items)) = current else {
+                    return false; // cov:ignore: only this method can change the state
+                };
+                current_items.push(item);
+                true
+            });
+            if inserted {
+                self.attach_child_to_state_owners(&child);
+            }
+        }
+        Ok(())
+    }
+
+    /// Insert one item at an inclusive array position, porting qpdf's
+    /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
+    /// is the append position; larger positions warn without checking item
+    /// ownership or changing the array.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to insert item")? {
+            return Ok(());
+        }
+
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index <= items.len()),
+        );
+        if !in_bounds {
+            return self.object_warning("ignoring attempt to insert out of bounds array item");
+        }
+
+        self.check_array_item_ownership(&value)?;
+        let child = value.clone();
+        let inserted = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return false; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            if index == items.len() {
+                items.push(value);
+            } else {
+                items.insert(index, value);
+            }
+            true
+        });
+        if inserted {
+            self.attach_child_to_state_owners(&child);
+        }
+        Ok(())
+    }
+
+    /// qpdf's `insertItemAndGetNew`: return the supplied handle after the
+    /// same insertion/warning/ownership path as [`Self::insert_array_item`].
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn insert_array_item_and_get_new(
+        &self,
+        index: usize,
+        value: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        self.insert_array_item(index, value.clone())?;
+        Ok(value)
+    }
+
+    /// Append one item to the live array, porting qpdf's `appendItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
+        if !self.prepare_array_mutation("ignoring attempt to append item")? {
+            return Ok(());
+        }
+
+        self.check_array_item_ownership(&value)?;
+        let child = value.clone();
+        let appended = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return false; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            items.push(value);
+            true
+        });
+        if appended {
+            self.attach_child_to_state_owners(&child);
+        }
+        Ok(())
+    }
+
+    /// qpdf's `appendItemAndGetNew`: return the supplied handle after the
+    /// same append/warning/ownership path as [`Self::append_array_item`].
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn append_array_item_and_get_new(
+        &self,
+        value: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        self.append_array_item(value.clone())?;
+        Ok(value)
+    }
+
+    /// Erase one live array item, porting qpdf's `eraseItem`
+    /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn erase_array_item(&self, index: usize) -> Result<()> {
+        self.erase_array_item_and_get_old(index).map(|_| ())
+    }
+
+    /// Erase one live array item and return its original handle, porting
+    /// qpdf's `eraseItemAndGetOld` (`libqpdf/QPDFObjectHandle.cc:948-955`).
+    /// Invalid positions and non-array receivers return a fresh null after
+    /// emitting the corresponding qpdf warning.
+    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
+    pub(crate) fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
+        if !self.prepare_array_mutation("ignoring attempt to erase item")? {
+            return Ok(ObjectHandle::null());
+        }
+
+        let in_bounds = self.with_value(
+            |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
+        );
+        if !in_bounds {
+            self.object_warning("ignoring attempt to erase out of bounds array item")?;
+            return Ok(ObjectHandle::null());
+        }
+
+        let old_value = self.with_value_mut(|current| {
+            let Some(ObjectValue::Array(items)) = current else {
+                return None; // cov:ignore: prepare_array_mutation fixed the type
+            };
+            Some(items.remove(index))
+        });
+        let Some(old_value) = old_value else {
+            return Ok(ObjectHandle::null()); // cov:ignore: prepare_array_mutation fixed the type
+        };
+        self.detach_child_from_state_owners(&old_value);
+        Ok(old_value)
+    }
+
+    /// Resolve the receiver and emit qpdf's type warning when it is not an
+    /// array. This is deliberately separate from `with_value_mut`: the
+    /// latter remains a no-hidden-I/O helper for legacy mutation paths, while
+    /// qpdf's public array mutators call `asArray()` and therefore resolve
+    /// their holder first.
+    #[allow(dead_code)] // consumed by the array mutator family above
+    fn prepare_array_mutation(&self, warning: &str) -> Result<bool> {
+        self.try_dereference()?;
+        if self.with_value(|current| matches!(current, Some(ObjectValue::Array(_)))) {
+            return Ok(true);
+        }
+        self.type_warning("array", warning)?;
+        Ok(false)
+    }
+
+    /// Port `QPDF_Array::checkOwnership` (`libqpdf/QPDF_Array.cc:10-26`) at
+    /// the Rust error boundary. An indirect slot's active PDF is authoritative;
+    /// a direct value can retain one or more propagated owner ids through live
+    /// containment. A direct value with no owner id is qpdf's unowned array
+    /// case and is accepted by the upstream check.
+    #[allow(dead_code)] // consumed by the array mutator family above
+    fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
+        let item_is_destroyed = {
+            let slot = item.0.borrow();
+            let state = slot.state.borrow();
+            let destroyed = matches!(&*state, ObjectState::Destroyed);
+            destroyed
+        };
+        if item_is_destroyed {
+            return Err(Error::Internal(
+                "Attempting to add an uninitialized object to a QPDF_Array.".to_owned(),
+            ));
+        }
+
+        let owner_pdf_ids = {
+            let slot = self.0.borrow();
+            match slot.active_pdf_unique_id {
+                Some(pdf_unique_id) => vec![pdf_unique_id],
+                None => slot.pdf_unique_ids.iter().copied().collect::<Vec<_>>(),
+            }
+        };
+        if owner_pdf_ids
+            .iter()
+            .any(|pdf_unique_id| !item.belongs_exclusively_to_pdf(*pdf_unique_id))
+        {
+            return Err(Error::Internal(
+                "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Replace an existing array item with `value`, preserving `value`'s
     /// shared handle identity. Returns `false` when this handle is not an
     /// array or `index` is out of bounds.
     pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
-        if self.is_same_direct_handle(&value) {
+        if self.is_direct_value_alias(&value) {
             return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
         }
         let old_value = self.with_value_mut(|current| {
@@ -2043,9 +2584,8 @@ impl ObjectHandle {
             Some(std::mem::replace(item, value.clone()))
         });
         if let Some(old_value) = old_value {
-            let parent = self.containment_parent();
-            Self::detach_child_from_parent(&old_value, &parent);
-            Self::attach_child_to_parent(&value, &parent);
+            self.detach_child_from_state_owners(&old_value);
+            self.attach_child_to_state_owners(&value);
             true
         } else {
             false
@@ -2054,9 +2594,9 @@ impl ObjectHandle {
 
     /// Replace every item in this live array while preserving the array
     /// handle itself. Returns `false` for a non-array handle or when the
-    /// replacement would create a direct self-cycle.
+    /// replacement would create a direct value-alias cycle.
     pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
-        if items.iter().any(|item| self.is_same_direct_handle(item)) {
+        if items.iter().any(|item| self.is_direct_value_alias(item)) {
             return false; // cov:ignore: internal callers only replay materialized child arrays
         }
         let old_items = self.with_value_mut(|current| {
@@ -2068,25 +2608,26 @@ impl ObjectHandle {
         let Some(old_items) = old_items else {
             return false; // cov:ignore: internal callers confirm the array type first
         };
-        let parent = self.containment_parent();
         for item in old_items {
-            Self::detach_child_from_parent(&item, &parent);
+            self.detach_child_from_state_owners(&item);
         }
         for item in &items {
-            Self::attach_child_to_parent(item, &parent);
+            self.attach_child_to_state_owners(item);
         }
         true
     }
 
-    /// True if `self` and `other` are both direct handles sharing the same
-    /// underlying storage — i.e. `other` is `self` itself (or a clone of
-    /// it), not merely a distinct direct handle with an equal value. Unlike
-    /// [`Self::is_same_object_as`], an indirect/indirect match returns `false` here:
-    /// an indirect handle referencing itself is not a direct cycle and is
-    /// already handled correctly by every recursive walker's
-    /// indirect-boundary stop.
-    fn is_same_direct_handle(&self, other: &Self) -> bool {
-        self.is_direct() && other.is_direct() && self.is_same_object_as(other)
+    /// True if `other` is a direct handle sharing this handle's value state.
+    /// A direct alias of an indirect container is still a direct cycle when
+    /// inserted into that container, while an indirect child remains a legal
+    /// PDF reference boundary for recursive walks.
+    fn is_direct_value_alias(&self, other: &Self) -> bool {
+        if !other.is_direct() {
+            return false;
+        }
+        let self_state = self.0.borrow().state.clone();
+        let other_state = other.0.borrow().state.clone();
+        Rc::ptr_eq(&self_state, &other_state)
     }
 
     fn direct_children(value: &ObjectValue) -> Vec<ObjectHandle> {
@@ -2158,13 +2699,6 @@ impl ObjectHandle {
         }
     }
 
-    fn detach_value_children(&self, value: &ObjectValue) {
-        let parent = self.containment_parent();
-        for child in Self::direct_children(value) {
-            Self::detach_child_from_parent(&child, &parent);
-        }
-    }
-
     fn associate_pdf_identity(&self, pdf_unique_id: u64, visited: &mut BTreeSet<usize>) {
         let mut pending = vec![self.clone()];
         while let Some(handle) = pending.pop() {
@@ -2178,12 +2712,15 @@ impl ObjectHandle {
             let children = {
                 let mut slot = handle.0.borrow_mut();
                 slot.pdf_unique_ids.insert(pdf_unique_id);
-                match &slot.state {
+                let state = slot.state.clone();
+                drop(slot);
+                let children = match &*state.borrow() {
                     ObjectState::Resolved(value) => Self::direct_children(value),
                     ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
                         Vec::new()
                     }
-                }
+                };
+                children
             };
             pending.extend(children);
         }
@@ -2232,8 +2769,9 @@ impl ObjectHandle {
     /// live value every other clone of this handle also observes — mirrors
     /// `QPDFObjectHandle::removeKey` (`libqpdf/QPDFObjectHandle.cc:1226-1234`).
     /// A no-op if `key` is absent, this handle is not a dictionary, or the
-    /// indirect handle is unresolved/missing/destroyed. Never performs
-    /// resolution itself.
+    /// indirect handle is unresolved/missing/destroyed. `key` must be qpdf's
+    /// decoded, canonical dictionary key including its leading `/`; this API
+    /// does not normalize slashless input. Never performs resolution itself.
     ///
     /// See [`Self::replace_key`]'s doc comment for the same
     /// `resolve`/`resolve_borrowed` staleness caveat and the
@@ -2246,7 +2784,7 @@ impl ObjectHandle {
             None
         });
         if let Some(removed) = removed {
-            Self::detach_child_from_parent(&removed, &self.containment_parent());
+            self.detach_child_from_state_owners(&removed);
         }
     }
 
@@ -2442,16 +2980,16 @@ impl ObjectHandle {
             return;
         };
         if let Some(filter) = filter {
-            dict.replace_key(b"Filter", filter);
+            dict.replace_key(b"/Filter", filter);
         }
         if let Some(decode_parms) = decode_parms {
-            dict.replace_key(b"DecodeParms", decode_parms);
+            dict.replace_key(b"/DecodeParms", decode_parms);
         }
         if length == 0 {
-            dict.remove_key(b"Length");
+            dict.remove_key(b"/Length");
         } else {
             dict.replace_key(
-                b"Length",
+                b"/Length",
                 ObjectHandle::integer(i64::try_from(length).unwrap_or(i64::MAX)),
             );
         }
@@ -2702,7 +3240,7 @@ impl ObjectHandle {
         &self,
         stream_dict: &ObjectHandle,
     ) -> Result<Option<StreamFilterPlan>> {
-        let filter = stream_dict.try_get_key(b"Filter")?;
+        let filter = stream_dict.try_get_key(b"/Filter")?;
         let filter_names = if filter.try_is_null()? {
             Vec::new()
         } else if let Some(name) = filter.try_as_name()? {
@@ -2755,7 +3293,7 @@ impl ObjectHandle {
             filters.push(filter);
         }
 
-        let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+        let decode_params = stream_dict.try_get_key(b"/DecodeParms")?;
         let decode_param_handles = if decode_params.try_is_null()? {
             vec![ObjectHandle::null(); filter_names.len()]
         } else if let Some(count) = decode_params.try_array_len()? {
@@ -2970,7 +3508,8 @@ impl ObjectHandle {
             // metadata that disconnect clears. Bind the borrow to a local
             // and release it before `with_value` below takes its own borrow.
             let slot_ref = self.0.borrow();
-            match &slot_ref.state {
+            let state = slot_ref.state.borrow();
+            match &*state {
                 ObjectState::Destroyed => return 14,
                 ObjectState::NotYetResolved if slot_ref.object_ref.is_some() => return 13,
                 ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Resolved(_) => {}
@@ -3035,7 +3574,9 @@ impl ObjectHandle {
     // use this helper; state-aware accessors such as `is_null` inspect their
     // slot directly instead.
     fn with_value<T>(&self, f: impl FnOnce(Option<&ObjectValue>) -> T) -> T {
-        match &self.0.borrow().state {
+        let state = self.0.borrow().state.clone();
+        let state = state.borrow();
+        match &*state {
             ObjectState::NotYetResolved => f(None),
             ObjectState::Resolved(value) => f(Some(value)),
             ObjectState::Missing | ObjectState::Destroyed => f(Some(&ObjectValue::Null)),
@@ -3049,7 +3590,9 @@ impl ObjectHandle {
     // hand out a `&mut` into — those states only *present* as null, they do
     // not store one).
     fn with_value_mut<T>(&self, f: impl FnOnce(Option<&mut ObjectValue>) -> T) -> T {
-        match &mut self.0.borrow_mut().state {
+        let state = self.0.borrow().state.clone();
+        let mut state = state.borrow_mut();
+        match &mut *state {
             ObjectState::Resolved(value) => f(Some(value)),
             ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => f(None),
         }
@@ -3188,23 +3731,7 @@ impl ObjectHandle {
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
-            let new_children = Self::direct_children(&value);
-            let old_value = {
-                let mut slot = self.0.borrow_mut();
-                match std::mem::replace(&mut slot.state, ObjectState::Resolved(value)) {
-                    ObjectState::Resolved(old_value) => Some(old_value),
-                    ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
-                        None
-                    }
-                }
-            };
-            if let Some(old_value) = old_value {
-                self.detach_value_children(&old_value);
-            }
-            let parent = self.containment_parent();
-            for child in new_children {
-                Self::attach_child_to_parent(&child, &parent);
-            }
+            self.replace_shared_state(ObjectState::Resolved(canonicalize_object_value(value)));
         }
     }
 
@@ -3292,6 +3819,33 @@ impl ObjectHandle {
     pub(crate) fn unparse_object_qdf(&self, out: &mut Vec<u8>, indent: usize) -> Result<()> {
         unparse_object_walk_qdf(self, indent, out)
     }
+
+    /// Writer-emission counterpart that rewrites indirect child references
+    /// through the caller's output-number map without materializing an
+    /// [`Object`]. The handle graph remains the source of truth; the callback
+    /// only changes the reference token written at each child position.
+    #[allow(dead_code)] // compatibility wrapper; canonical writers use the removed-aware sibling
+    pub(crate) fn unparse_object_with_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    ) -> Result<()> {
+        self.unparse_object_with_ref_map_and_removed(out, map, &BTreeSet::new())
+    }
+
+    /// Writer-emission counterpart that additionally treats references in
+    /// `removed_refs` as qpdf nulls. This is the canonical equivalent of
+    /// `renumber_qpdf_refs_in_place_with_removed` for live handle graphs: an
+    /// array keeps the position as `null`, while dictionary visibility drops
+    /// the null-valued key.
+    pub(crate) fn unparse_object_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        unparse_object_walk_with_ref_map(self, out, map, removed_refs)
+    }
 }
 
 // The sole recursion hub for `ObjectHandle::materialize` — every nested
@@ -3357,7 +3911,10 @@ fn materialize_value(value: &ObjectValue, depth: usize) -> Result<Object> {
         ObjectValue::Dictionary(entries) => {
             let mut dict = Dictionary::new();
             for (key, value) in entries {
-                dict.insert(key.as_slice(), materialize_child(value, depth + 1)?);
+                dict.insert(
+                    legacy_dictionary_key(key),
+                    materialize_child(value, depth + 1)?,
+                );
             }
             Object::Dictionary(dict)
         }
@@ -3401,7 +3958,7 @@ fn unparse_materialize_value(value: &ObjectValue) -> Object {
                 if unparse_is_known_null(value) {
                     continue;
                 }
-                dict.insert(key.as_slice(), unparse_materialize_child(value));
+                dict.insert(legacy_dictionary_key(key), unparse_materialize_child(value));
             }
             Object::Dictionary(dict)
         }
@@ -3507,6 +4064,15 @@ fn visible_dict_entries(
         }
     }
     Ok(visible)
+}
+
+fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef>) -> bool {
+    handle
+        .object_ref()
+        .is_some_and(|object_ref| removed_refs.contains(&object_ref))
+        || handle
+            .as_reference()
+            .is_some_and(|object_ref| removed_refs.contains(&object_ref))
 }
 
 // The sole recursion hub for the plain unparse family (`ObjectHandle::
@@ -3632,6 +4198,110 @@ fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
+
+fn write_child_with_ref_map(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+            // qpdf's direct-null identity is object number zero, not an
+            // output reference (QPDFObjectHandle.cc:344-350). A removed
+            // identity follows the same null path in the qpdf rewrite.
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        let mapped = map(object_ref)?;
+        out.extend_from_slice(mapped.to_string().as_bytes());
+        return Ok(());
+    }
+    unparse_object_walk_with_ref_map(handle, out, map, removed_refs)
+}
+
+fn unparse_object_walk_with_ref_map(
+    handle: &ObjectHandle,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
+        handle.try_dereference()?;
+        handle.with_value(|value| match value {
+            Some(value) => unparse_object_value_with_ref_map(value, out, map, removed_refs),
+            None => {
+                // cov:ignore-start: successful dereference exposes Null for missing states or errors while unresolved
+                out.extend_from_slice(b"null");
+                Ok(())
+            } // cov:ignore-end
+        })
+    })
+}
+
+fn unparse_object_value_with_ref_map(
+    value: &ObjectValue,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    match value {
+        ObjectValue::Array(children) => {
+            out.push(b'[');
+            for child in children {
+                out.push(b' ');
+                write_child_with_ref_map(child, out, map, removed_refs)?;
+            }
+            out.extend_from_slice(b" ]");
+        }
+        ObjectValue::Dictionary(entries) => {
+            let entries: Vec<(Vec<u8>, ObjectHandle)> = entries
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            unparse_dict_entries_with_ref_map(&entries, out, map, removed_refs)?;
+        }
+        ObjectValue::Stream { stream_dict, .. } => {
+            unparse_object_walk_with_ref_map(stream_dict, out, map, removed_refs)?;
+        }
+        ObjectValue::Reference(object_ref) => {
+            if object_ref.number == 0 || removed_refs.contains(object_ref) {
+                out.extend_from_slice(b"null");
+            } else {
+                let mapped = map(*object_ref)?;
+                out.extend_from_slice(mapped.to_string().as_bytes());
+            }
+        }
+        _ => unparse_object_value(value, out)?,
+    }
+    Ok(())
+}
+
+fn unparse_dict_entries_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    out.extend_from_slice(b"<<");
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_ref_map(value, out, map, removed_refs)?;
+        }
+    }
+    out.extend_from_slice(b" >>");
+    Ok(())
+}
+
 // Detects the sibling condition `QPDFWriter::unparseObject`'s dictionary
 // branch checks per key before special-casing `/Contents`
 // (`QPDFWriter.cc:1497-1498`: `object.isDictionaryOfType("/Sig") &&
@@ -3660,7 +4330,7 @@ fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
 // `/Type` is not `/Sig` never touches `/ByteRange`'s resolver at all.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -> Result<bool> {
-    let Some((_, type_value)) = entries.iter().find(|entry| entry.0.as_slice() == b"Type") else {
+    let Some((_, type_value)) = entries.iter().find(|entry| entry.0.as_slice() == b"/Type") else {
         return Ok(false);
     };
     type_value.try_dereference()?;
@@ -3672,7 +4342,7 @@ fn dict_is_sig_with_byte_range(entries: &[(Vec<u8>, ObjectHandle)]) -> Result<bo
     }
     let Some((_, byte_range_value)) = entries
         .iter()
-        .find(|entry| entry.0.as_slice() == b"ByteRange")
+        .find(|entry| entry.0.as_slice() == b"/ByteRange")
     else {
         return Ok(false);
     };
@@ -3783,11 +4453,10 @@ fn unparse_dict_entries(entries: &[(Vec<u8>, ObjectHandle)], out: &mut Vec<u8>) 
     out.extend_from_slice(b"<<");
     for (key, value) in visible_dict_entries(entries)? {
         out.push(b' ');
-        out.push(b'/');
-        crate::object::write_name_escaped(out, key);
+        write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child(value, out)?;
         }
@@ -3941,11 +4610,10 @@ fn unparse_dict_entries_qdf(
     out.extend_from_slice(b"<<\n");
     for (key, value) in visible_dict_entries(entries)? {
         push_spaces(out, indent + 2);
-        out.push(b'/');
-        crate::object::write_name_escaped(out, key);
+        write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
@@ -4113,6 +4781,52 @@ impl ObjectHandle {
             unparse_stream_dict_entries_qdf(&entries, indent, out)
         })
     }
+
+    /// Stream-dictionary writer emission with output reference remapping.
+    /// This is the canonical writer boundary: dictionary children are read
+    /// from the live handle graph and only the serialized reference tokens are
+    /// translated for the new file.
+    #[allow(dead_code)] // compatibility wrapper; canonical writers use the removed-aware sibling
+    pub(crate) fn unparse_stream_body_with_ref_map(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+    ) -> Result<()> {
+        self.unparse_stream_body_with_ref_map_and_removed(out, refiltered, map, &BTreeSet::new())
+    }
+
+    /// Stream-dictionary writer emission with output reference remapping and
+    /// qpdf null visibility for references removed during this write.
+    pub(crate) fn unparse_stream_body_with_ref_map_and_removed(
+        &self,
+        out: &mut Vec<u8>,
+        refiltered: bool,
+        map: &dyn Fn(ObjectRef) -> Result<ObjectRef>,
+        removed_refs: &BTreeSet<ObjectRef>,
+    ) -> Result<()> {
+        self.try_dereference()?;
+        self.with_value(|value| {
+            let entries = match value {
+                Some(ObjectValue::Dictionary(entries)) => entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                Some(ObjectValue::Stream { stream_dict, .. }) => {
+                    stream_dict.try_dereference()?;
+                    stream_dict.with_value(|dict_value| match dict_value {
+                        Some(ObjectValue::Dictionary(entries)) => entries
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                }
+                _ => Vec::new(),
+            };
+            unparse_stream_dict_entries_with_ref_map(&entries, refiltered, out, map, removed_refs)
+        })
+    }
 }
 
 // Writes a stream dictionary's own body -- `unparse_stream_body`'s sole
@@ -4157,7 +4871,9 @@ fn unparse_stream_dict_entries(
     let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
         excluded_entries = entries
             .iter()
-            .filter(|entry| entry.0.as_slice() != b"Filter" && entry.0.as_slice() != b"DecodeParms")
+            .filter(|entry| {
+                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
+            })
             .cloned()
             .collect::<Vec<_>>();
         &excluded_entries
@@ -4167,16 +4883,15 @@ fn unparse_stream_dict_entries(
     out.extend_from_slice(b"<<");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
-        if key.as_slice() == b"Length" {
+        if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
         }
         out.push(b' ');
-        out.push(b'/');
-        crate::object::write_name_escaped(out, key);
+        write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child(value, out)?;
         }
@@ -4219,16 +4934,15 @@ fn unparse_stream_dict_entries_qdf(
     out.extend_from_slice(b"<<\n");
     let mut length_value: Option<&ObjectHandle> = None;
     for (key, value) in visible_dict_entries(entries)? {
-        if key.as_slice() == b"Length" {
+        if key.as_slice() == b"/Length" {
             length_value = Some(value);
             continue;
         }
         push_spaces(out, indent + 2);
-        out.push(b'/');
-        crate::object::write_name_escaped(out, key);
+        write_dictionary_key(out, key);
         out.push(b' ');
         let force_hex_string =
-            key.as_slice() == b"Contents" && dict_is_sig_with_byte_range(entries)?;
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
         if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
             write_child_qdf(value, indent + 2, out)?;
         }
@@ -4242,6 +4956,56 @@ fn unparse_stream_dict_entries_qdf(
     }
     push_spaces(out, indent);
     out.extend_from_slice(b">>");
+    Ok(())
+}
+
+fn unparse_stream_dict_entries_with_ref_map(
+    entries: &[(Vec<u8>, ObjectHandle)],
+    refiltered: bool,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    let excluded_entries;
+    let entries: &[(Vec<u8>, ObjectHandle)] = if refiltered {
+        excluded_entries = entries
+            .iter()
+            .filter(|entry| {
+                entry.0.as_slice() != b"/Filter" && entry.0.as_slice() != b"/DecodeParms"
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        &excluded_entries
+    } else {
+        entries
+    };
+    out.extend_from_slice(b"<<");
+    let mut length_value: Option<&ObjectHandle> = None;
+    for (key, value) in visible_dict_entries(entries)? {
+        if is_removed_reference(value, removed_refs) {
+            continue;
+        }
+        if key.as_slice() == b"/Length" {
+            length_value = Some(value);
+            continue;
+        }
+        out.push(b' ');
+        write_dictionary_key(out, key);
+        out.push(b' ');
+        let force_hex_string =
+            key.as_slice() == b"/Contents" && dict_is_sig_with_byte_range(entries)?;
+        if !try_write_sig_contents_hex_string(value, force_hex_string, out)? {
+            write_child_with_ref_map(value, out, map, removed_refs)?;
+        }
+    }
+    if let Some(length) = length_value {
+        out.extend_from_slice(b" /Length ");
+        write_child_with_ref_map(length, out, map, removed_refs)?;
+    }
+    if refiltered {
+        out.extend_from_slice(b" /Filter /FlateDecode");
+    }
+    out.extend_from_slice(b" >>");
     Ok(())
 }
 
@@ -4369,19 +5133,18 @@ fn unparse_trailer_entries(
     let mut encrypt_value: Option<&ObjectHandle> = None;
     for (key, value) in entries {
         match key.as_slice() {
-            b"ID" => {
+            b"/ID" => {
                 id_value = Some(value);
                 continue;
             }
-            b"Encrypt" => {
+            b"/Encrypt" => {
                 encrypt_value = Some(value);
                 continue;
             }
             _ => {}
         }
         out.push(b' ');
-        out.push(b'/');
-        crate::object::write_name_escaped(out, key);
+        write_dictionary_key(out, key);
         out.push(b' ');
         write_child(value, out)?;
     }
@@ -4941,8 +5704,8 @@ pub(crate) mod identity_tests {
             ObjectHandle::new_indirect_with_resolver(ObjectRef::new(7, 0), Rc::downgrade(&erased));
         let clone = handle.clone();
 
-        assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
-        assert!(clone.try_has_key(b"A").unwrap());
+        assert_eq!(handle.try_get_key(b"/A").unwrap().as_integer(), Some(1));
+        assert!(clone.try_has_key(b"/A").unwrap());
         assert_eq!(*resolver.calls.borrow(), vec![ObjectRef::new(7, 0)]);
         assert!(handle.ptr_eq(&clone));
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(7, 0)));
@@ -5009,13 +5772,156 @@ pub(crate) mod identity_tests {
         // Both at once. The child's identity and live root edge are written
         // by `set_resolved`, so both can only be present if the document
         // identity survived *into* the resolution the resolver drove.
-        let child = handle.get_key(b"A");
+        let child = handle.get_key(b"/A");
         assert_eq!(child.as_integer(), Some(1));
         assert_eq!(
             child.containing_object_refs_for_pdf(PDF_ID),
             vec![object_ref]
         );
         assert!(child.containing_object_refs_for_pdf(PDF_ID + 1).is_empty());
+    }
+
+    #[test]
+    fn canonical_payload_sharing_rejects_invalid_sources_without_mutating() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(30, 0), -1);
+        let direct = ObjectHandle::integer(1);
+        direct
+            .share_value_state_with(&direct)
+            .expect("sharing a handle with itself is already a no-op");
+
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(31, 0), -1);
+        let error = target
+            .share_value_state_with(&indirect)
+            .expect_err("an indirect replacement is not a payload source");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: replacement ObjectHandle must be direct"
+        );
+
+        let destroyed = ObjectHandle::integer(2);
+        let destroyed_resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        destroyed.promote_to_indirect(
+            ObjectRef::new(32, 0),
+            4242,
+            Rc::downgrade(&destroyed_resolver),
+        );
+        destroyed.disconnect();
+        let error = target
+            .share_value_state_with(&destroyed)
+            .expect_err("a destroyed direct payload is not initialized");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: replacement ObjectHandle is not initialized"
+        );
+        assert!(!target.is_resolved());
+    }
+
+    #[test]
+    fn removing_a_direct_handle_is_a_no_op() {
+        let direct = ObjectHandle::integer(1);
+        direct.remove_from_document();
+        assert_eq!(direct.as_integer(), Some(1));
+    }
+
+    #[test]
+    fn exclusive_pdf_ownership_walk_handles_cycles_and_indirect_mismatch() {
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        first.replace_key(b"/Second", second.clone());
+        second.replace_key(b"/First", first.clone());
+        assert!(first.belongs_exclusively_to_pdf(4242));
+
+        let foreign_resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let foreign_indirect = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(33, 0),
+            NO_PARSED_OFFSET,
+            4243,
+            Rc::downgrade(&foreign_resolver),
+        );
+        assert!(!foreign_indirect.belongs_exclusively_to_pdf(4242));
+
+        let promoted_foreign = ObjectHandle::integer(3);
+        promoted_foreign.promote_to_indirect(
+            ObjectRef::new(34, 0),
+            4243,
+            Rc::downgrade(&foreign_resolver),
+        );
+        assert_eq!(promoted_foreign.object_ref(), Some(ObjectRef::new(34, 0)));
+        assert_eq!(promoted_foreign.0.borrow().active_pdf_unique_id, Some(4243));
+        assert!(!promoted_foreign.belongs_exclusively_to_pdf(4242));
+    }
+
+    #[test]
+    fn exclusive_pdf_ownership_walk_checks_all_indirect_children() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
+        let same_document = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(35, 0),
+            NO_PARSED_OFFSET,
+            4242,
+            Rc::downgrade(&resolver),
+        );
+        let foreign_document = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(36, 0),
+            NO_PARSED_OFFSET,
+            4243,
+            Rc::downgrade(&resolver),
+        );
+
+        // The LIFO walk visits the same-document child first in this order;
+        // it must still inspect the foreign sibling before accepting the
+        // container.
+        let same_first = ObjectHandle::array(vec![foreign_document.clone(), same_document.clone()]);
+        assert!(!same_first.belongs_exclusively_to_pdf(4242));
+
+        let foreign_first = ObjectHandle::array(vec![same_document, foreign_document]);
+        assert!(!foreign_first.belongs_exclusively_to_pdf(4242));
+    }
+
+    #[test]
+    fn removing_shared_canonical_state_rebinds_only_the_canonical_slot() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(37, 0), -1);
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        target.remove_from_document();
+
+        assert!(target.is_direct());
+        assert!(target.is_null());
+        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
+        replacement.replace_key(b"/Value", ObjectHandle::integer(9));
+        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(9));
+    }
+
+    #[test]
+    fn disconnecting_shared_canonical_state_rebinds_only_the_canonical_slot() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(38, 0), -1);
+        let replacement =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        target.disconnect();
+
+        assert_eq!(target.type_code(), 14);
+        assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
+    }
+
+    #[test]
+    fn shared_state_prunes_dropped_owners() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(39, 0), -1);
+        let source = ObjectHandle::integer(7);
+        target
+            .share_value_state_with(&source)
+            .expect("share replacement payload");
+
+        drop(target);
+        source.replace_direct_value(ObjectValue::Integer(8));
+
+        assert_eq!(source.as_integer(), Some(8));
     }
 
     #[test]
@@ -5033,9 +5939,9 @@ pub(crate) mod identity_tests {
             [(b"Parent".to_vec(), parent.clone())].into_iter().collect(),
         ));
         let child = ObjectHandle::dictionary(vec![]);
-        parent.replace_key(b"Child", child.clone());
+        parent.replace_key(b"/Child", child.clone());
 
-        parent.remove_key(b"Child");
+        parent.remove_key(b"/Child");
 
         assert!(child.belongs_to_pdf(41));
         assert!(!child.belongs_to_pdf(42));
@@ -5053,8 +5959,8 @@ pub(crate) mod identity_tests {
         );
         let first = ObjectHandle::dictionary(vec![]);
         let second = ObjectHandle::dictionary(vec![]);
-        first.replace_key(b"Second", second.clone());
-        second.replace_key(b"First", first.clone());
+        first.replace_key(b"/Second", second.clone());
+        second.replace_key(b"/First", first.clone());
 
         owner.set_resolved(ObjectValue::Dictionary(
             [(b"First".to_vec(), first.clone())].into_iter().collect(),
@@ -5109,11 +6015,11 @@ pub(crate) mod identity_tests {
             if message == "resolver failed")
         );
         assert_eq!(
-            handle.try_get_key(b"A").unwrap_err().to_string(),
+            handle.try_get_key(b"/A").unwrap_err().to_string(),
             "resolver failed"
         );
         assert_eq!(
-            handle.try_has_key(b"A").unwrap_err().to_string(),
+            handle.try_has_key(b"/A").unwrap_err().to_string(),
             "resolver failed"
         );
         assert_eq!(
@@ -5159,7 +6065,7 @@ pub(crate) mod identity_tests {
 
         assert_eq!(
             dict.try_get_keys().unwrap(),
-            BTreeSet::from([b"Alpha".to_vec(), b"Unknown".to_vec(), b"Zulu".to_vec(),])
+            BTreeSet::from([b"/Alpha".to_vec(), b"/Unknown".to_vec(), b"/Zulu".to_vec(),])
         );
         assert!(indirect_null.is_resolved());
         assert!(missing.is_resolved());
@@ -5177,7 +6083,7 @@ pub(crate) mod identity_tests {
         assert!(!dict.is_resolved());
         assert_eq!(
             dict.try_get_keys().unwrap(),
-            BTreeSet::from([b"Keep".to_vec()])
+            BTreeSet::from([b"/Keep".to_vec()])
         );
         assert!(dict.is_resolved());
         assert_eq!(*dict_calls.borrow(), vec![ObjectRef::new(20, 0)]);
@@ -5242,8 +6148,8 @@ pub(crate) mod identity_tests {
     fn try_has_key_treats_a_present_null_value_as_absent() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
 
-        assert!(!dict.try_has_key(b"A").unwrap());
-        assert!(!dict.try_has_key(b"Missing").unwrap());
+        assert!(!dict.try_has_key(b"/A").unwrap());
+        assert!(!dict.try_has_key(b"/Missing").unwrap());
     }
 
     #[test]
@@ -5257,10 +6163,10 @@ pub(crate) mod identity_tests {
             .try_as_dictionary()
             .unwrap()
             .expect("recording resolver installs a dictionary");
-        assert_eq!(entries.get(b"A".as_slice()).unwrap().as_integer(), Some(1));
+        assert_eq!(entries.get(b"/A".as_slice()).unwrap().as_integer(), Some(1));
 
         let scalar = ObjectHandle::integer(1);
-        assert!(!scalar.try_has_key(b"A").unwrap());
+        assert!(!scalar.try_has_key(b"/A").unwrap());
     }
 
     #[test]
@@ -5762,7 +6668,7 @@ mod uniform_identity_tests {
             self.calls.borrow_mut().push(object_ref);
             assert_eq!(handle.object_ref(), Some(object_ref));
             handle.set_resolved(ObjectValue::Dictionary(Default::default()));
-            handle.replace_key(b"Resolved", ObjectHandle::boolean(true));
+            handle.replace_key(b"/Resolved", ObjectHandle::boolean(true));
             Ok(())
         }
     }
@@ -5785,10 +6691,10 @@ mod uniform_identity_tests {
         assert_eq!(promoted.object_ref(), Some(ObjectRef::new(17, 2)));
         assert_eq!(outstanding_clone.get_parsed_offset(), 37);
 
-        original.replace_key(b"Value", ObjectHandle::integer(2));
-        assert_eq!(promoted.get_key(b"Value").as_integer(), Some(2));
-        promoted.replace_key(b"Value", ObjectHandle::integer(3));
-        assert_eq!(outstanding_clone.get_key(b"Value").as_integer(), Some(3));
+        original.replace_key(b"/Value", ObjectHandle::integer(2));
+        assert_eq!(promoted.get_key(b"/Value").as_integer(), Some(2));
+        promoted.replace_key(b"/Value", ObjectHandle::integer(3));
+        assert_eq!(outstanding_clone.get_key(b"/Value").as_integer(), Some(3));
     }
 
     #[test]
@@ -5882,7 +6788,7 @@ mod uniform_identity_tests {
 
         assert!(child.containing_object_refs_for_pdf(81).is_empty());
         let grandchild = ObjectHandle::integer(1);
-        child.replace_key(b"Grandchild", grandchild.clone());
+        child.replace_key(b"/Grandchild", grandchild.clone());
         assert_eq!(
             grandchild.containing_object_refs_for_pdf(81),
             vec![ObjectRef::new(43, 0)]
@@ -5905,7 +6811,7 @@ mod uniform_identity_tests {
         );
 
         child.promote_to_indirect(ObjectRef::new(83, 0), 112, Rc::downgrade(&resolver));
-        outer.remove_key(b"Child");
+        outer.remove_key(b"/Child");
         child.disconnect();
         assert!(child.containing_object_refs_for_pdf(111).is_empty());
     }
@@ -6087,7 +6993,7 @@ mod uniform_identity_tests {
         assert_eq!(*first_calls.borrow(), Vec::<ObjectRef>::new());
         assert_eq!(*latest_calls.borrow(), vec![ObjectRef::new(61, 7)]);
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(61, 7)));
-        assert_eq!(handle.get_key(b"Resolved").as_boolean(), Some(true));
+        assert_eq!(handle.get_key(b"/Resolved").as_boolean(), Some(true));
     }
 
     #[test]
@@ -6102,7 +7008,7 @@ mod uniform_identity_tests {
         handle.try_dereference().expect("reentrant resolver");
 
         assert_eq!(*calls.borrow(), vec![ObjectRef::new(67, 3)]);
-        assert_eq!(handle.get_key(b"Resolved").as_boolean(), Some(true));
+        assert_eq!(handle.get_key(b"/Resolved").as_boolean(), Some(true));
     }
 
     #[test]
@@ -6155,7 +7061,17 @@ mod object_value_tests {
         let value = ObjectHandle::name(b"Type".to_vec());
         let dict = ObjectHandle::dictionary(vec![(b"Key".to_vec(), value.clone())]);
         let entries = dict.as_dictionary().expect("dictionary");
-        assert!(entries.get(b"Key".as_slice()).unwrap().ptr_eq(&value));
+        assert!(entries.get(b"/Key".as_slice()).unwrap().ptr_eq(&value));
+    }
+
+    #[test]
+    fn dictionary_handle_normalizes_aliases_before_last_value_wins_collection() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"K".to_vec(), ObjectHandle::integer(1)),
+            (b"/K".to_vec(), ObjectHandle::integer(2)),
+        ]);
+
+        assert_eq!(dict.get_key(b"/K").as_integer(), Some(2));
     }
 
     #[test]
@@ -6354,7 +7270,7 @@ mod stream_payload_sharing_tests {
             destination
                 .as_stream_dict()
                 .expect("stream dict")
-                .get_key(b"Length")
+                .get_key(b"/Length")
                 .as_integer(),
             Some(4096),
         );
@@ -6383,9 +7299,9 @@ mod stream_payload_sharing_tests {
         assert!(Rc::ptr_eq(&payload_of(&copy), &shared));
         let copy_dict = copy.as_stream_dict().expect("copied stream dict");
         assert!(!copy_dict.is_same_object_as(&source_dict));
-        copy_dict.replace_key(b"Length", ObjectHandle::integer(7));
+        copy_dict.replace_key(b"/Length", ObjectHandle::integer(7));
         assert_eq!(
-            source_dict.get_key(b"Length").as_integer(),
+            source_dict.get_key(b"/Length").as_integer(),
             Some(4096),
             "each slot's dictionary describes only its own payload"
         );
@@ -6471,7 +7387,7 @@ mod stream_payload_sharing_tests {
             .shallow_copy()
             .expect("an indirect stream child is shared, never copied");
 
-        assert!(copy.get_key(b"Nested").is_same_object_as(&stream));
+        assert!(copy.get_key(b"/Nested").is_same_object_as(&stream));
     }
 
     // `QPDF_Stream::getStreamDataBuffer` (`libqpdf/qpdf/QPDF_Stream.hh:39`)
@@ -6502,7 +7418,7 @@ mod stream_payload_sharing_tests {
         assert!(!stream
             .as_stream_dict()
             .expect("stream dict")
-            .has_key(b"Length"));
+            .has_key(b"/Length"));
     }
 }
 
@@ -6664,12 +7580,12 @@ mod resolution_state_tests {
         // a mapping needs arms for the two variants neither handle can be in,
         // and an arm nothing reaches is an uncovered line.
         assert!(
-            matches!(&missing.0.borrow().state, ObjectState::Missing),
+            matches!(&*missing.0.borrow().state.borrow(), ObjectState::Missing),
             "`set_missing` must leave the slot in the `Missing` variant"
         );
-        let state = &null.0.borrow().state;
+        let state = null.0.borrow().state.clone();
         assert!(
-            matches!(state, ObjectState::Resolved(ObjectValue::Null)),
+            matches!(&*state.borrow(), ObjectState::Resolved(ObjectValue::Null)),
             "`set_resolved(Null)` must leave the slot in the `Resolved` variant"
         );
     }
@@ -7003,7 +7919,8 @@ mod materialize_tests {
     #[test]
     fn replace_direct_value_moves_dictionary_storage_without_cloning_it() {
         let handle = ObjectHandle::integer(1);
-        let key = vec![b'K'; 4_096];
+        let mut key = vec![b'K'; 4_096];
+        key[0] = b'/';
         let original_key_allocation = key.as_ptr();
         let value =
             ObjectValue::Dictionary([(key, ObjectHandle::integer(2))].into_iter().collect());
@@ -7012,7 +7929,10 @@ mod materialize_tests {
 
         assert!(handle.is_direct());
         let slot = handle.0.borrow();
-        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
+        let state = slot.state.clone();
+        drop(slot);
+        let state = state.borrow();
+        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &*state else {
             panic!("test handle must contain the supplied dictionary"); // cov:ignore: replacement fixes this value
         };
         let replaced_key_allocation = entries
@@ -7569,8 +8489,8 @@ mod unparse_object_tests {
     #[test]
     fn dict_is_sig_with_byte_range_true_when_both_present() {
         let entries = vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
-            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::array(vec![])),
         ];
         assert!(dict_is_sig_with_byte_range(&entries).unwrap());
     }
@@ -7582,8 +8502,8 @@ mod unparse_object_tests {
         // `/ByteRange` value counts as *absent*, the same way a null-valued
         // entry is excluded from `visible_dict_entries`'s own output.
         let entries = vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
-            (b"ByteRange".to_vec(), ObjectHandle::null()),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::null()),
         ];
         assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
     }
@@ -7595,8 +8515,8 @@ mod unparse_object_tests {
         // `hasKey` resolves an indirect `/ByteRange` to decide this too.
         let (indirect_null, _resolver) = resolver_bearing_handle(ObjectValue::Null);
         let entries = vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
-            (b"ByteRange".to_vec(), indirect_null),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), indirect_null),
         ];
         assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
     }
@@ -7610,29 +8530,29 @@ mod unparse_object_tests {
         let (indirect_byte_range, resolver) = error_resolving_handle(ObjectRef::new(32, 0));
         drop(resolver);
         let entries = vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
-            (b"ByteRange".to_vec(), indirect_byte_range),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+            (b"/ByteRange".to_vec(), indirect_byte_range),
         ];
         assert!(dict_is_sig_with_byte_range(&entries).is_err());
     }
 
     #[test]
     fn dict_is_sig_with_byte_range_false_without_byte_range_key() {
-        let entries = vec![(b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec()))];
+        let entries = vec![(b"/Type".to_vec(), ObjectHandle::name(b"Sig".to_vec()))];
         assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
     }
 
     #[test]
     fn dict_is_sig_with_byte_range_false_without_type_key() {
-        let entries = vec![(b"ByteRange".to_vec(), ObjectHandle::array(vec![]))];
+        let entries = vec![(b"/ByteRange".to_vec(), ObjectHandle::array(vec![]))];
         assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
     }
 
     #[test]
     fn dict_is_sig_with_byte_range_false_when_type_is_not_sig() {
         let entries = vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
-            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/ByteRange".to_vec(), ObjectHandle::array(vec![])),
         ];
         assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
     }
@@ -7646,8 +8566,8 @@ mod unparse_object_tests {
         let (indirect_type, _resolver) =
             resolver_bearing_handle(ObjectValue::Name(b"Sig".to_vec()));
         let entries = vec![
-            (b"Type".to_vec(), indirect_type),
-            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"/Type".to_vec(), indirect_type),
+            (b"/ByteRange".to_vec(), ObjectHandle::array(vec![])),
         ];
         assert!(dict_is_sig_with_byte_range(&entries).unwrap());
     }
@@ -7657,8 +8577,8 @@ mod unparse_object_tests {
         let (indirect_type, resolver) = error_resolving_handle(ObjectRef::new(30, 0));
         drop(resolver);
         let entries = vec![
-            (b"Type".to_vec(), indirect_type),
-            (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+            (b"/Type".to_vec(), indirect_type),
+            (b"/ByteRange".to_vec(), ObjectHandle::array(vec![])),
         ];
         assert!(dict_is_sig_with_byte_range(&entries).is_err());
     }
@@ -7673,8 +8593,8 @@ mod unparse_object_tests {
         // error here.
         let (indirect_byte_range, _resolver) = error_resolving_handle(ObjectRef::new(31, 0));
         let entries = vec![
-            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
-            (b"ByteRange".to_vec(), indirect_byte_range),
+            (b"/Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (b"/ByteRange".to_vec(), indirect_byte_range),
         ];
         assert!(!dict_is_sig_with_byte_range(&entries).unwrap());
     }
@@ -8331,6 +9251,123 @@ mod unparse_object_tests {
         ]);
         let mut out = Vec::new();
         assert!(dict.unparse_stream_body(&mut out, false).is_err());
+    }
+
+    #[test]
+    fn mapped_unparse_writes_stream_children_and_non_dictionary_shapes() {
+        let (child, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Child".to_vec(), child),
+            (b"Length".to_vec(), ObjectHandle::integer(2)),
+        ]);
+        let stream = ObjectHandle::stream(dict, Rc::new(b"ab".to_vec()));
+        let map = |object_ref| {
+            assert_eq!(object_ref, ObjectRef::new(20, 0));
+            Ok(ObjectRef::new(8, 0))
+        };
+
+        let mut object = Vec::new();
+        stream
+            .unparse_object_with_ref_map(&mut object, &map)
+            .unwrap();
+        assert_eq!(object, b"<< /Child 8 0 R /Length 2 >>");
+
+        let mut body = Vec::new();
+        stream
+            .unparse_stream_body_with_ref_map(&mut body, false, &map)
+            .unwrap();
+        assert_eq!(body, b"<< /Child 8 0 R /Length 2 >>");
+
+        let signature = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Sig".to_vec())),
+                (b"ByteRange".to_vec(), ObjectHandle::array(vec![])),
+                (b"Contents".to_vec(), ObjectHandle::string(b"hi".to_vec())),
+            ]),
+            Rc::new(b"ab".to_vec()),
+        );
+        let mut signature_body = Vec::new();
+        signature
+            .unparse_stream_body_with_ref_map(&mut signature_body, false, &map)
+            .unwrap();
+        assert_eq!(
+            signature_body,
+            b"<< /ByteRange [ ] /Contents <6869> /Type /Sig >>"
+        );
+
+        let mut nested_non_dictionary = Vec::new();
+        ObjectHandle::stream(ObjectHandle::integer(5), Rc::new(b"ab".to_vec()))
+            .unparse_stream_body_with_ref_map(&mut nested_non_dictionary, false, &map)
+            .unwrap();
+        assert_eq!(nested_non_dictionary, b"<< >>");
+
+        let mut non_dictionary = Vec::new();
+        ObjectHandle::integer(5)
+            .unparse_stream_body_with_ref_map(&mut non_dictionary, false, &map)
+            .unwrap();
+        assert_eq!(non_dictionary, b"<< >>");
+    }
+
+    #[test]
+    fn mapped_unparse_omits_removed_indirect_dictionary_entries() {
+        let removed_ref = ObjectRef::new(20, 0);
+        let (removed, _resolver) = resolver_bearing_handle(ObjectValue::Integer(7));
+        let kept = ObjectHandle::new_indirect_unresolved(ObjectRef::new(21, 0), 0);
+        kept.set_resolved(ObjectValue::Integer(8));
+        let mut removed_refs = BTreeSet::new();
+        removed_refs.insert(removed_ref);
+        let map = |object_ref| {
+            assert_ne!(object_ref, removed_ref);
+            Ok(ObjectRef::new(8, 0))
+        };
+
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Mapped".to_vec(), kept.clone()),
+            (b"Removed".to_vec(), removed.clone()),
+        ]);
+        let mut object = Vec::new();
+        dict.unparse_object_with_ref_map_and_removed(&mut object, &map, &removed_refs)
+            .unwrap();
+        assert_eq!(object, b"<< /Mapped 8 0 R >>");
+
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Mapped".to_vec(), kept),
+                (b"Length".to_vec(), ObjectHandle::integer(2)),
+                (b"Removed".to_vec(), removed),
+            ]),
+            Rc::new(b"ab".to_vec()),
+        );
+        let mut body = Vec::new();
+        stream
+            .unparse_stream_body_with_ref_map_and_removed(&mut body, false, &map, &removed_refs)
+            .unwrap();
+        assert_eq!(body, b"<< /Mapped 8 0 R /Length 2 >>");
+    }
+
+    #[test]
+    fn mapped_unparse_inlines_object_zero_as_null() {
+        let array = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
+            ObjectRef::new(0, 0),
+            0,
+        )]);
+        let map = |_object_ref| -> crate::Result<ObjectRef> {
+            panic!("object zero map call") // cov:ignore: intentional panic guard
+        };
+
+        let mut array_out = Vec::new();
+        array
+            .unparse_object_with_ref_map(&mut array_out, &map)
+            .unwrap();
+        assert_eq!(array_out, b"[ null ]");
+
+        let reference = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        reference.set_resolved(ObjectValue::Reference(ObjectRef::new(0, 0)));
+        let mut reference_out = Vec::new();
+        reference
+            .unparse_object_with_ref_map(&mut reference_out, &map)
+            .unwrap();
+        assert_eq!(reference_out, b"null");
     }
 
     #[test]
@@ -9909,47 +10946,47 @@ mod mutation_tests {
     #[test]
     fn object_value_clone_of_a_dictionary_shares_child_identity() {
         let child = ObjectHandle::integer(7);
-        let dict = ObjectValue::Dictionary([(b"K".to_vec(), child.clone())].into_iter().collect());
+        let dict = ObjectValue::Dictionary([(b"/K".to_vec(), child.clone())].into_iter().collect());
         let cloned = dict.clone();
         let ObjectValue::Dictionary(entries) = cloned else {
             panic!("expected dictionary"); // cov:ignore: unreachable in a passing run
         };
-        assert!(entries.get(b"K".as_slice()).unwrap().ptr_eq(&child));
+        assert!(entries.get(b"/K".as_slice()).unwrap().ptr_eq(&child));
     }
 
     #[test]
     fn get_key_returns_a_live_child_handle_without_snapshotting_the_dictionary() {
         let child = ObjectHandle::integer(1);
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
-        let fetched = dict.get_key(b"A");
+        let fetched = dict.get_key(b"/A");
         assert!(fetched.ptr_eq(&child));
     }
 
     #[test]
     fn get_key_on_a_missing_key_returns_a_direct_null_handle() {
         let dict = ObjectHandle::dictionary(vec![]);
-        assert!(dict.get_key(b"Missing").is_null());
+        assert!(dict.get_key(b"/Missing").is_null());
     }
 
     #[test]
     fn get_key_on_a_non_dictionary_handle_returns_a_direct_null_handle() {
         let scalar = ObjectHandle::integer(5);
-        assert!(scalar.get_key(b"A").is_null());
+        assert!(scalar.get_key(b"/A").is_null());
     }
 
     #[test]
     fn replace_key_mutates_the_live_dictionary_in_place() {
         let dict = ObjectHandle::dictionary(vec![]);
         let clone = dict.clone();
-        dict.replace_key(b"A", ObjectHandle::integer(9));
-        assert_eq!(clone.get_key(b"A").as_integer(), Some(9));
+        dict.replace_key(b"/A", ObjectHandle::integer(9));
+        assert_eq!(clone.get_key(b"/A").as_integer(), Some(9));
     }
 
     #[test]
     fn replace_key_overwrites_an_existing_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        dict.replace_key(b"A", ObjectHandle::integer(2));
-        assert_eq!(dict.get_key(b"A").as_integer(), Some(2));
+        dict.replace_key(b"/A", ObjectHandle::integer(2));
+        assert_eq!(dict.get_key(b"/A").as_integer(), Some(2));
     }
 
     #[test]
@@ -9962,9 +10999,9 @@ mod mutation_tests {
             [(b"Nested".to_vec(), dict.clone())].into_iter().collect(),
         ));
 
-        dict.replace_key(b"A", ObjectHandle::null());
+        dict.replace_key(b"/A", ObjectHandle::null());
 
-        assert!(!dict.has_key(b"A"));
+        assert!(!dict.has_key(b"/A"));
         assert!(child.containing_object_refs().is_empty());
     }
 
@@ -9972,9 +11009,9 @@ mod mutation_tests {
     fn replace_key_with_direct_null_keeps_a_missing_key_absent() {
         let dict = ObjectHandle::dictionary(vec![]);
 
-        dict.replace_key(b"Missing", ObjectHandle::null());
+        dict.replace_key(b"/Missing", ObjectHandle::null());
 
-        assert!(!dict.has_key(b"Missing"));
+        assert!(!dict.has_key(b"/Missing"));
     }
 
     #[test]
@@ -9986,16 +11023,16 @@ mod mutation_tests {
                 .collect(),
         ));
 
-        dict.replace_key(b"A", ObjectHandle::null());
+        dict.replace_key(b"/A", ObjectHandle::null());
 
-        assert!(!dict.has_key(b"A"));
+        assert!(!dict.has_key(b"/A"));
     }
 
     #[test]
     fn replace_key_with_direct_null_on_a_non_dictionary_is_a_no_op() {
         let scalar = ObjectHandle::integer(1);
 
-        scalar.replace_key(b"A", ObjectHandle::null());
+        scalar.replace_key(b"/A", ObjectHandle::null());
 
         assert_eq!(scalar.as_integer(), Some(1));
     }
@@ -10006,10 +11043,10 @@ mod mutation_tests {
         indirect_null.set_resolved(ObjectValue::Null);
         let dict = ObjectHandle::dictionary(vec![]);
 
-        dict.replace_key(b"Null", indirect_null.clone());
+        dict.replace_key(b"/Null", indirect_null.clone());
 
-        let retained = dict.get_key(b"Null");
-        assert!(dict.has_key(b"Null"));
+        let retained = dict.get_key(b"/Null");
+        assert!(dict.has_key(b"/Null"));
         assert!(retained.is_indirect());
         assert!(retained.is_null());
         assert!(retained.is_same_object_as(&indirect_null));
@@ -10021,10 +11058,10 @@ mod mutation_tests {
         dangling.set_missing();
         let dict = ObjectHandle::dictionary(vec![]);
 
-        dict.replace_key(b"Dangling", dangling.clone());
+        dict.replace_key(b"/Dangling", dangling.clone());
 
-        let retained = dict.get_key(b"Dangling");
-        assert!(dict.has_key(b"Dangling"));
+        let retained = dict.get_key(b"/Dangling");
+        assert!(dict.has_key(b"/Dangling"));
         assert!(retained.is_indirect());
         assert!(retained.is_null());
         assert!(retained.is_same_object_as(&dangling));
@@ -10033,7 +11070,7 @@ mod mutation_tests {
     #[test]
     fn replace_key_on_a_non_dictionary_handle_is_a_no_op() {
         let scalar = ObjectHandle::integer(1);
-        scalar.replace_key(b"A", ObjectHandle::integer(2));
+        scalar.replace_key(b"/A", ObjectHandle::integer(2));
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -10044,9 +11081,9 @@ mod mutation_tests {
         let retained = replacement.clone();
 
         assert!(array.replace_array_item(0, replacement));
-        retained.replace_key(b"K", ObjectHandle::integer(9));
+        retained.replace_key(b"/K", ObjectHandle::integer(9));
         let inserted = array.as_array().expect("array")[0].clone();
-        assert_eq!(inserted.get_key(b"K").as_integer(), Some(9));
+        assert_eq!(inserted.get_key(b"/K").as_integer(), Some(9));
 
         assert!(!array.replace_array_item(1, ObjectHandle::integer(2)));
         assert!(!ObjectHandle::integer(1).replace_array_item(0, ObjectHandle::integer(2)));
@@ -10054,13 +11091,264 @@ mod mutation_tests {
     }
 
     #[test]
+    fn canonical_array_mutators_preserve_live_aliases_and_qpdf_return_handles() {
+        let first = ObjectHandle::integer(1);
+        let second = ObjectHandle::integer(2);
+        let array = ObjectHandle::array(vec![first.clone(), second.clone()]);
+        let replacement = ObjectHandle::dictionary(vec![]);
+
+        array
+            .set_array_item(1, replacement.clone())
+            .expect("setArrayItem accepts an in-bounds item");
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&replacement));
+
+        let inserted_at_front = ObjectHandle::name(b"front".to_vec());
+        array
+            .insert_array_item(0, inserted_at_front.clone())
+            .expect("insertItem accepts zero");
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&inserted_at_front));
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&first));
+
+        let inserted_middle = ObjectHandle::name(b"middle".to_vec());
+        let returned = array
+            .insert_array_item_and_get_new(2, inserted_middle.clone())
+            .expect("insertItemAndGetNew accepts an in-range position");
+        assert!(returned.is_same_object_as(&inserted_middle));
+        assert!(array
+            .try_array_item(2)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&inserted_middle));
+
+        let appended = ObjectHandle::name(b"append".to_vec());
+        array
+            .append_array_item(appended.clone())
+            .expect("appendItem accepts an item");
+        assert!(array
+            .try_array_item(4)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended));
+
+        let appended_and_returned = ObjectHandle::name(b"append-and-get".to_vec());
+        let returned = array
+            .append_array_item_and_get_new(appended_and_returned.clone())
+            .expect("appendItemAndGetNew accepts an item");
+        assert!(returned.is_same_object_as(&appended_and_returned));
+        assert!(array
+            .try_array_item(5)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended_and_returned));
+
+        let erased = array
+            .erase_array_item_and_get_old(1)
+            .expect("eraseItemAndGetOld returns the live old handle");
+        assert!(erased.is_same_object_as(&first));
+        assert_eq!(array.try_array_len().unwrap(), Some(5));
+
+        array
+            .erase_array_item(2)
+            .expect("eraseItem accepts an in-bounds position");
+        assert!(array
+            .try_array_item(2)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended));
+    }
+
+    #[test]
+    fn insert_array_item_at_size_uses_qpdfs_append_position() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let appended_at_size = ObjectHandle::integer(2);
+
+        array
+            .insert_array_item(1, appended_at_size.clone())
+            .expect("insertItem permits the inclusive end position");
+
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&appended_at_size));
+    }
+
+    #[test]
+    fn set_array_items_replaces_in_qpdf_order_and_preserves_child_identity() {
+        let old = ObjectHandle::integer(1);
+        let first = ObjectHandle::dictionary(vec![]);
+        let second = ObjectHandle::dictionary(vec![]);
+        let array = ObjectHandle::array(vec![old.clone()]);
+
+        array
+            .set_array_items(vec![first.clone(), second.clone()])
+            .expect("setArrayFromVector accepts unowned items");
+
+        assert!(old.containing_object_refs().is_empty());
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&first));
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&second));
+        assert_eq!(array.try_array_len().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn array_mutators_reject_foreign_ownership_and_keep_qpdf_partial_replacement_order() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let old = ObjectHandle::integer(1);
+        let array = ObjectHandle::array(vec![old.clone()]);
+        array.promote_to_indirect(ObjectRef::new(40, 0), 41, Rc::downgrade(&resolver));
+
+        let foreign = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(41, 0),
+            NO_PARSED_OFFSET,
+            42,
+            Rc::downgrade(&resolver),
+        );
+        let error = array
+            .append_array_item(foreign.clone())
+            .expect_err("appendItem rejects an object owned by another PDF");
+        assert!(matches!(error, Error::Internal(_)));
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&old));
+
+        let accepted = ObjectHandle::dictionary(vec![]);
+        let error = array
+            .set_array_items(vec![accepted.clone(), foreign])
+            .expect_err("setFromVector checks ownership in insertion order");
+        assert!(matches!(error, Error::Internal(_)));
+        assert!(old.containing_object_refs().is_empty());
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert!(array
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&accepted));
+
+        let same_pdf = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(42, 0),
+            NO_PARSED_OFFSET,
+            41,
+            Rc::downgrade(&resolver),
+        );
+        array
+            .append_array_item(same_pdf.clone())
+            .expect("same-document indirect items remain attachable");
+        assert!(array
+            .try_array_item(1)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&same_pdf));
+    }
+
+    #[test]
+    fn canonical_array_mutators_resolve_a_lazy_holder_and_update_every_alias() {
+        let child = ObjectHandle::integer(1);
+        let (array, _resolver) =
+            super::identity_tests::resolver_bearing_handle(ObjectValue::Array(vec![child.clone()]));
+        let alias = array.clone();
+        let replacement = ObjectHandle::integer(2);
+
+        array
+            .set_array_item(0, replacement.clone())
+            .expect("qpdf array mutators dereference their holder");
+
+        assert!(array.is_resolved());
+        assert!(alias
+            .try_array_item(0)
+            .unwrap()
+            .unwrap()
+            .is_same_object_as(&replacement));
+        assert!(child.containing_object_refs().is_empty());
+    }
+
+    #[test]
+    fn array_mutators_reject_destroyed_items_as_uninitialized() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let array = ObjectHandle::array(vec![]);
+        array.promote_to_indirect(ObjectRef::new(50, 0), 51, Rc::downgrade(&resolver));
+        let destroyed = ObjectHandle::integer(1);
+        destroyed.promote_to_indirect(ObjectRef::new(52, 0), 51, Rc::downgrade(&resolver));
+        destroyed.disconnect();
+
+        let error = array
+            .append_array_item(destroyed)
+            .expect_err("QPDF_Destroyed is not an initialized array item");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "Attempting to add an uninitialized object to a QPDF_Array."
+        ));
+        assert_eq!(array.try_array_len().unwrap(), Some(0));
+    }
+
+    #[test]
     fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let self_clone = dict.clone();
-        dict.replace_key(b"Self", self_clone);
-        assert!(dict.get_key(b"Self").is_null());
+        dict.replace_key(b"/Self", self_clone);
+        assert!(dict.get_key(b"/Self").is_null());
         // The rest of the dictionary is untouched by the rejected insert.
-        assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
+        assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_rejects_a_direct_alias_of_a_shared_payload() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(39, 0), -1);
+        let replacement = ObjectHandle::dictionary(vec![]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        target.replace_key(b"/Self", replacement.clone());
+
+        assert!(!target.has_key(b"Self"));
+    }
+
+    #[test]
+    fn replace_array_item_rejects_a_direct_alias_of_a_shared_payload() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(40, 0), -1);
+        let replacement = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        assert!(!target.replace_array_item(0, replacement.clone()));
+        assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(2));
+    }
+
+    #[test]
+    fn replace_array_items_rejects_a_direct_alias_of_a_shared_payload() {
+        let target = ObjectHandle::new_indirect_unresolved(ObjectRef::new(41, 0), -1);
+        let replacement = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
+        target
+            .share_value_state_with(&replacement)
+            .expect("share replacement payload");
+
+        assert!(!target.replace_array_items(vec![replacement.clone()]));
+        assert_eq!(target.as_array().unwrap()[0].as_integer(), Some(3));
     }
 
     #[test]
@@ -10071,28 +11359,28 @@ mod mutation_tests {
         // insert rather than being rejected as a no-op.
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
-        indirect.replace_key(b"Self", indirect.clone());
-        assert!(indirect.get_key(b"Self").is_indirect());
+        indirect.replace_key(b"/Self", indirect.clone());
+        assert!(indirect.get_key(b"/Self").is_indirect());
     }
 
     #[test]
     fn remove_key_deletes_a_present_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        dict.remove_key(b"A");
-        assert!(dict.get_key(b"A").is_null());
+        dict.remove_key(b"/A");
+        assert!(dict.get_key(b"/A").is_null());
     }
 
     #[test]
     fn remove_key_on_a_missing_key_is_a_no_op() {
         let dict = ObjectHandle::dictionary(vec![]);
-        dict.remove_key(b"Missing");
-        assert!(dict.get_key(b"Missing").is_null());
+        dict.remove_key(b"/Missing");
+        assert!(dict.get_key(b"/Missing").is_null());
     }
 
     #[test]
     fn remove_key_on_a_non_dictionary_handle_is_a_no_op() {
         let scalar = ObjectHandle::integer(1);
-        scalar.remove_key(b"A");
+        scalar.remove_key(b"/A");
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -10110,16 +11398,17 @@ mod mutation_tests {
             .collect(),
         ));
 
-        owner.remove_key(b"A");
+        owner.remove_key(b"/A");
         assert_eq!(child.containing_object_refs(), vec![owner_ref]);
-        owner.remove_key(b"B");
+        owner.remove_key(b"/B");
         assert!(child.containing_object_refs().is_empty());
     }
 
     #[test]
     fn set_resolved_moves_dictionary_storage_without_cloning_it() {
         let owner = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
-        let key = vec![b'K'; 4_096];
+        let mut key = vec![b'K'; 4_096];
+        key[0] = b'/';
         let original_key_allocation = key.as_ptr();
         let value =
             ObjectValue::Dictionary([(key, ObjectHandle::integer(1))].into_iter().collect());
@@ -10128,7 +11417,10 @@ mod mutation_tests {
 
         assert!(owner.is_indirect());
         let slot = owner.0.borrow();
-        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &slot.state else {
+        let state = slot.state.clone();
+        drop(slot);
+        let state = state.borrow();
+        let ObjectState::Resolved(ObjectValue::Dictionary(entries)) = &*state else {
             panic!("test owner must resolve to the supplied dictionary"); // cov:ignore: successful set_resolved fixes this state
         };
         let resolved_key_allocation = entries
@@ -10223,7 +11515,7 @@ mod mutation_tests {
             [(b"Nested".to_vec(), nested.clone())].into_iter().collect(),
         ));
 
-        owner.replace_key(b"Nested", ObjectHandle::dictionary(vec![]));
+        owner.replace_key(b"/Nested", ObjectHandle::dictionary(vec![]));
 
         assert!(nested.containing_object_refs().is_empty());
         assert!(leaf.containing_object_refs().is_empty());
@@ -10243,7 +11535,7 @@ mod mutation_tests {
             [(b"Shared".to_vec(), shared.clone())].into_iter().collect(),
         ));
 
-        first.remove_key(b"Shared");
+        first.remove_key(b"/Shared");
 
         assert_eq!(shared.containing_object_refs(), vec![second_ref]);
     }
@@ -10337,8 +11629,8 @@ mod mutation_tests {
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
         let first = ObjectHandle::dictionary(vec![]);
         let second = ObjectHandle::dictionary(vec![]);
-        first.replace_key(b"Second", second.clone());
-        second.replace_key(b"First", first.clone());
+        first.replace_key(b"/Second", second.clone());
+        second.replace_key(b"/First", first.clone());
         owner.set_resolved(ObjectValue::Dictionary(
             [(b"First".to_vec(), first.clone())].into_iter().collect(),
         ));
@@ -10358,9 +11650,9 @@ mod mutation_tests {
     fn shallow_copy_mutation_does_not_affect_the_source() {
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let copy = original.shallow_copy().expect("dictionary copy");
-        copy.replace_key(b"A", ObjectHandle::integer(2));
-        assert_eq!(original.get_key(b"A").as_integer(), Some(1));
-        assert_eq!(copy.get_key(b"A").as_integer(), Some(2));
+        copy.replace_key(b"/A", ObjectHandle::integer(2));
+        assert_eq!(original.get_key(b"/A").as_integer(), Some(1));
+        assert_eq!(copy.get_key(b"/A").as_integer(), Some(2));
     }
 
     // Despite the name, qpdf's shallowCopy() recursively copies through
@@ -10375,13 +11667,13 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"Inner".to_vec(), ObjectHandle::integer(1))]),
         )]);
         let copy = original.shallow_copy().expect("dictionary copy");
-        copy.get_key(b"A")
-            .replace_key(b"Inner", ObjectHandle::integer(2));
+        copy.get_key(b"/A")
+            .replace_key(b"/Inner", ObjectHandle::integer(2));
         assert_eq!(
-            original.get_key(b"A").get_key(b"Inner").as_integer(),
+            original.get_key(b"/A").get_key(b"/Inner").as_integer(),
             Some(1)
         );
-        assert_eq!(copy.get_key(b"A").get_key(b"Inner").as_integer(), Some(2));
+        assert_eq!(copy.get_key(b"/A").get_key(b"/Inner").as_integer(), Some(2));
     }
 
     #[test]
@@ -10390,7 +11682,7 @@ mod mutation_tests {
         child.set_resolved(ObjectValue::Integer(1));
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), child.clone())]);
         let copy = original.shallow_copy().expect("dictionary copy");
-        assert!(copy.get_key(b"A").ptr_eq(&child));
+        assert!(copy.get_key(b"/A").ptr_eq(&child));
     }
 
     #[test]
@@ -10404,14 +11696,14 @@ mod mutation_tests {
     #[test]
     fn has_key_distinguishes_a_present_null_value_from_a_missing_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::null())]);
-        assert!(dict.has_key(b"A"));
-        assert!(!dict.has_key(b"Missing"));
+        assert!(dict.has_key(b"/A"));
+        assert!(!dict.has_key(b"/Missing"));
     }
 
     #[test]
     fn has_key_on_a_non_dictionary_handle_is_false() {
         let scalar = ObjectHandle::integer(1);
-        assert!(!scalar.has_key(b"A"));
+        assert!(!scalar.has_key(b"/A"));
     }
 
     #[test]
@@ -10420,8 +11712,8 @@ mod mutation_tests {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         scalar.merge_resources(&dict, None).expect("merge");
         dict.merge_resources(&scalar, None).expect("merge");
-        assert_eq!(dict.get_key(b"A").as_integer(), Some(1));
-        assert!(dict.get_key(b"B").is_null());
+        assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
+        assert!(dict.get_key(b"/B").is_null());
     }
 
     // qpdf privatizes an incoming resource value with `shallowCopy`
@@ -10475,8 +11767,8 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), source_sub.clone())]);
         let dest = ObjectHandle::dictionary(vec![]);
         dest.merge_resources(&other, None).expect("merge");
-        let installed = dest.get_key(b"Font");
-        assert_eq!(installed.get_key(b"F1").as_integer(), Some(1));
+        let installed = dest.get_key(b"/Font");
+        assert_eq!(installed.get_key(b"/F1").as_integer(), Some(1));
         assert!(!installed.ptr_eq(&source_sub)); // privatized, not shared
     }
 
@@ -10487,9 +11779,9 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F2".to_vec(), ObjectHandle::integer(2))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         dest.merge_resources(&other, None).expect("merge");
-        let font = dest.get_key(b"Font");
-        assert_eq!(font.get_key(b"F1").as_integer(), Some(1));
-        assert_eq!(font.get_key(b"F2").as_integer(), Some(2));
+        let font = dest.get_key(b"/Font");
+        assert_eq!(font.get_key(b"/F1").as_integer(), Some(1));
+        assert_eq!(font.get_key(b"/F2").as_integer(), Some(2));
     }
 
     #[test]
@@ -10500,7 +11792,7 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(99))]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         dest.merge_resources(&other, None).expect("merge");
-        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(dest.get_key(b"/Font").get_key(b"/F1").as_integer(), Some(1));
     }
 
     #[test]
@@ -10518,7 +11810,7 @@ mod mutation_tests {
         dest.merge_resources(&other, Some(&mut conflicts))
             .expect("merge");
         assert!(conflicts.is_empty());
-        assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
+        assert!(dest.get_key(b"/Font").get_key(b"/F1").ptr_eq(&shared));
     }
 
     #[test]
@@ -10540,13 +11832,13 @@ mod mutation_tests {
             .expect("merge");
         assert_eq!(
             conflicts
-                .get(b"Font".as_slice())
+                .get(b"/Font".as_slice())
                 .unwrap()
-                .get(b"F1".as_slice()),
-            Some(&b"F2".to_vec())
+                .get(b"/F1".as_slice()),
+            Some(&b"/F2".to_vec())
         );
         // F1 keeps its own original (unrelated) value; nothing overwrote it.
-        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(dest.get_key(b"/Font").get_key(b"/F1").as_integer(), Some(1));
     }
 
     #[test]
@@ -10559,13 +11851,13 @@ mod mutation_tests {
         dest.merge_resources(&other, Some(&mut conflicts))
             .expect("merge");
         let new_name = conflicts
-            .get(b"Font".as_slice())
-            .and_then(|m| m.get(b"F1".as_slice()))
+            .get(b"/Font".as_slice())
+            .and_then(|m| m.get(b"/F1".as_slice()))
             .expect("F1 conflict recorded");
-        assert_eq!(new_name, b"F1_1");
-        assert_eq!(dest.get_key(b"Font").get_key(b"F1").as_integer(), Some(1));
+        assert_eq!(new_name, b"/F1_1");
+        assert_eq!(dest.get_key(b"/Font").get_key(b"/F1").as_integer(), Some(1));
         assert_eq!(
-            dest.get_key(b"Font").get_key(new_name).as_integer(),
+            dest.get_key(b"/Font").get_key(new_name).as_integer(),
             Some(2)
         );
     }
@@ -10585,15 +11877,15 @@ mod mutation_tests {
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         shared_dest.merge_resources(&other, None).expect("merge");
         // shared_dest's own /Font is now a private direct copy...
-        assert!(shared_dest.get_key(b"Font").is_direct());
+        assert!(shared_dest.get_key(b"/Font").is_direct());
         assert_eq!(
-            shared_dest.get_key(b"Font").get_key(b"F2").as_integer(),
+            shared_dest.get_key(b"/Font").get_key(b"/F2").as_integer(),
             Some(2)
         );
         // ...and the other holder's /Font (and the original indirect object)
         // is untouched.
-        assert!(another_holder.get_key(b"Font").ptr_eq(&indirect_font));
-        assert!(indirect_font.get_key(b"F2").is_null());
+        assert!(another_holder.get_key(b"/Font").ptr_eq(&indirect_font));
+        assert!(indirect_font.get_key(b"/F2").is_null());
     }
 
     #[test]
@@ -10610,7 +11902,7 @@ mod mutation_tests {
             ]),
         )]);
         dest.merge_resources(&other, None).expect("merge");
-        let items = dest.get_key(b"ProcSet").as_array().unwrap();
+        let items = dest.get_key(b"/ProcSet").as_array().unwrap();
         let names: Vec<_> = items.iter().map(|i| i.as_name().unwrap()).collect();
         assert_eq!(names, vec![b"PDF".to_vec(), b"Text".to_vec()]);
     }
@@ -10638,7 +11930,7 @@ mod mutation_tests {
         dest.merge_resources(&other, None).expect("merge");
 
         let merged = dest
-            .get_key(b"ProcSet")
+            .get_key(b"/ProcSet")
             .as_array()
             .expect("merged ProcSet remains an array");
         assert!(merged[1].is_same_object_as(&retained));
@@ -10653,7 +11945,7 @@ mod mutation_tests {
             ObjectHandle::dictionary(vec![(b"F1".to_vec(), ObjectHandle::integer(2))]),
         )]);
         dest.merge_resources(&other, None).expect("merge");
-        assert_eq!(dest.get_key(b"Font").as_integer(), Some(1));
+        assert_eq!(dest.get_key(b"/Font").as_integer(), Some(1));
     }
 
     #[test]
@@ -10666,7 +11958,7 @@ mod mutation_tests {
         });
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
         assert_eq!(stream.as_stream_data(), Some(Rc::new(b"new data".to_vec())));
-        assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
+        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(8));
         assert_eq!(
             stream.with_value(|value| match value {
                 Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
@@ -10688,7 +11980,7 @@ mod mutation_tests {
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
 
-        assert!(!dict.has_key(b"Length"));
+        assert!(!dict.has_key(b"/Length"));
     }
 
     #[test]
@@ -10702,7 +11994,7 @@ mod mutation_tests {
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
 
-        assert!(!dict.has_key(b"Length"));
+        assert!(!dict.has_key(b"/Length"));
     }
 
     #[test]
@@ -10715,13 +12007,13 @@ mod mutation_tests {
         });
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
-        assert!(!dict.has_key(b"Length"));
+        assert!(!dict.has_key(b"/Length"));
 
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
-        assert_eq!(dict.get_key(b"Length").as_integer(), Some(8));
+        assert_eq!(dict.get_key(b"/Length").as_integer(), Some(8));
 
         stream.replace_stream_data(Rc::new(Vec::new()), None, None);
-        assert!(!dict.has_key(b"Length"));
+        assert!(!dict.has_key(b"/Length"));
     }
 
     #[test]
@@ -10744,7 +12036,7 @@ mod mutation_tests {
         assert!(!stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .has_key(b"Length"));
+            .has_key(b"/Length"));
     }
 
     #[test]
@@ -10763,8 +12055,8 @@ mod mutation_tests {
             Some(filter.clone()),
             Some(parms.clone()),
         );
-        assert!(dict.get_key(b"Filter").ptr_eq(&filter));
-        assert!(dict.get_key(b"DecodeParms").ptr_eq(&parms));
+        assert!(dict.get_key(b"/Filter").ptr_eq(&filter));
+        assert!(dict.get_key(b"/DecodeParms").ptr_eq(&parms));
     }
 
     #[test]
@@ -10780,7 +12072,7 @@ mod mutation_tests {
         });
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
         assert_eq!(
-            dict.get_key(b"Filter").as_name(),
+            dict.get_key(b"/Filter").as_name(),
             Some(b"FlateDecode".to_vec())
         );
     }
@@ -10859,10 +12151,10 @@ mod mutation_tests {
     fn replace_key_and_remove_key_mutate_a_resolved_indirect_handle() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
-        indirect.replace_key(b"A", ObjectHandle::integer(1));
-        assert_eq!(indirect.get_key(b"A").as_integer(), Some(1));
-        indirect.remove_key(b"A");
-        assert!(indirect.get_key(b"A").is_null());
+        indirect.replace_key(b"/A", ObjectHandle::integer(1));
+        assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
+        indirect.remove_key(b"/A");
+        assert!(indirect.get_key(b"/A").is_null());
     }
 
     #[test]
@@ -10920,18 +12212,18 @@ mod mutation_tests {
         ])));
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
 
-        direct.replace_key(b"Indirect", indirect.clone());
+        direct.replace_key(b"/Indirect", indirect.clone());
 
-        assert!(direct.get_key(b"Indirect").is_same_object_as(&indirect));
+        assert!(direct.get_key(b"/Indirect").is_same_object_as(&indirect));
         assert!(indirect.containing_object_refs().is_empty());
     }
 
     #[test]
     fn replace_key_and_remove_key_are_no_ops_on_an_unresolved_indirect_handle() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        indirect.replace_key(b"A", ObjectHandle::integer(1)); // must not panic
-        indirect.remove_key(b"A"); // must not panic
-        assert!(indirect.get_key(b"A").is_null());
+        indirect.replace_key(b"/A", ObjectHandle::integer(1)); // must not panic
+        indirect.remove_key(b"/A"); // must not panic
+        assert!(indirect.get_key(b"/A").is_null());
     }
 
     #[test]
@@ -10989,7 +12281,7 @@ mod mutation_tests {
         let other_font = ObjectHandle::dictionary(vec![(b"F1".to_vec(), shared.clone())]);
         let other = ObjectHandle::dictionary(vec![(b"Font".to_vec(), other_font)]);
         dest.merge_resources(&other, None).expect("merge");
-        assert!(dest.get_key(b"Font").get_key(b"F1").ptr_eq(&shared));
+        assert!(dest.get_key(b"/Font").get_key(b"/F1").ptr_eq(&shared));
     }
 
     #[test]
@@ -11001,7 +12293,7 @@ mod mutation_tests {
             ObjectHandle::array(vec![ObjectHandle::dictionary(vec![])]),
         )]);
         dest.merge_resources(&other, None).expect("merge");
-        assert!(dest.get_key(b"ProcSet").as_array().unwrap().is_empty());
+        assert!(dest.get_key(b"/ProcSet").as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -11037,12 +12329,12 @@ mod mutation_tests {
         dest.merge_resources(&other, Some(&mut conflicts))
             .expect("merge");
         let new_name = conflicts
-            .get(b"Font".as_slice())
-            .and_then(|m| m.get(b"F1".as_slice()))
+            .get(b"/Font".as_slice())
+            .and_then(|m| m.get(b"/F1".as_slice()))
             .expect("F1 conflict recorded");
-        assert_eq!(new_name, b"F1_2");
+        assert_eq!(new_name, b"/F1_2");
         assert_eq!(
-            dest.get_key(b"Font").get_key(new_name).as_integer(),
+            dest.get_key(b"/Font").get_key(new_name).as_integer(),
             Some(2)
         );
     }
@@ -11136,6 +12428,52 @@ mod warning_emission_tests {
         ));
     }
 
+    #[test]
+    fn array_mutators_emit_qpdf_warning_text_for_invalid_domains() {
+        let (array, recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::integer(1)]));
+
+        array.set_array_item(1, ObjectHandle::integer(2)).unwrap();
+        array
+            .insert_array_item(2, ObjectHandle::integer(3))
+            .unwrap();
+        let erased = array.erase_array_item_and_get_old(1).unwrap();
+
+        assert!(erased.is_null());
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "object 3 0: ignoring attempt to set out of bounds array item",
+                "object 3 0: ignoring attempt to insert out of bounds array item",
+                "object 3 0: ignoring attempt to erase out of bounds array item",
+            ]
+        );
+    }
+
+    #[test]
+    fn array_mutators_emit_type_warning_text_for_non_arrays() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
+
+        handle.set_array_item(0, ObjectHandle::integer(1)).unwrap();
+        handle
+            .set_array_items(vec![ObjectHandle::integer(2)])
+            .unwrap();
+        handle
+            .insert_array_item(0, ObjectHandle::integer(3))
+            .unwrap();
+        handle.append_array_item(ObjectHandle::integer(4)).unwrap();
+        let erased = handle.erase_array_item_and_get_old(0).unwrap();
+
+        assert!(erased.is_null());
+        assert_eq!(warnings(&recorder), [
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to set item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to replace items",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to insert item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to append item",
+            "object 3 0: operation for array attempted on object of type integer: ignoring attempt to erase item",
+        ]);
+    }
+
     /// A sink that appends every write to a shared buffer.
     struct ErrorRecordingSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -11211,7 +12549,7 @@ mod warning_emission_tests {
         // keep the silent result pinned until its separate migration lands.
         let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
 
-        assert!(handle.try_get_key(b"Type").unwrap().is_null());
+        assert!(handle.try_get_key(b"/Type").unwrap().is_null());
         assert!(handle.try_get_keys().unwrap().is_empty());
 
         assert!(warnings(&recorder).is_empty());
@@ -11230,10 +12568,10 @@ mod warning_emission_tests {
 
         assert_eq!(
             handle.try_get_keys().unwrap(),
-            [b"A".to_vec()].into_iter().collect::<BTreeSet<_>>()
+            [b"/A".to_vec()].into_iter().collect::<BTreeSet<_>>()
         );
-        assert_eq!(handle.try_get_key(b"A").unwrap().as_integer(), Some(1));
-        assert!(handle.try_get_key(b"Missing").unwrap().is_null());
+        assert_eq!(handle.try_get_key(b"/A").unwrap().as_integer(), Some(1));
+        assert!(handle.try_get_key(b"/Missing").unwrap().is_null());
         assert!(warnings(&recorder).is_empty());
     }
 
@@ -11657,7 +12995,7 @@ mod warning_emission_tests {
             handle_resolving(ObjectValue::Dictionary(std::collections::BTreeMap::new()));
         parent.set_description("object 5 0 at offset 253".to_owned(), 253);
 
-        let child = parent.try_get_key(b"EF").unwrap();
+        let child = parent.try_get_key(b"/EF").unwrap();
         child
             .type_warning("dictionary", "treating as empty")
             .unwrap();
@@ -11723,7 +13061,7 @@ mod warning_emission_tests {
     #[test]
     fn try_get_key_without_leading_slash_formats_key() {
         let parent = ObjectHandle::dictionary(vec![]);
-        let child = parent.try_get_key(b"NoSlash").unwrap();
+        let child = parent.try_get_key(b"/NoSlash").unwrap();
         assert_eq!(child.description(), " -> dictionary key /NoSlash");
     }
 
