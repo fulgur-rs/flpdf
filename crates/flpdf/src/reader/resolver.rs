@@ -837,6 +837,57 @@ impl<R: Read + Seek> ResolverHandle<R> {
         Ok(self.max_object_number().unwrap_or(0))
     }
 
+    /// Return qpdf's next generation-zero object identity.
+    ///
+    /// `QPDF::nextObjGen` first prepares the effective object cache through
+    /// `getObjectCount`, then allocates one above its greatest object number
+    /// and rejects the signed `int` boundary
+    /// (`libqpdf/QPDF.cc:1271-1283,1872-1880`; `QPDFObjGen.hh:41-74`).
+    /// Free xref entries and legacy-only values are deliberately absent from
+    /// this cache and therefore cannot raise the allocation ceiling.
+    #[allow(dead_code)]
+    pub(crate) fn next_obj_gen(&self) -> Result<ObjectRef> {
+        let max_object_id = self.get_object_count()?;
+        if max_object_id >= i32::MAX as u32 {
+            return Err(Error::Unsupported(
+                "max object id is too high to create new objects".to_string(),
+            ));
+        }
+        Ok(ObjectRef::new(max_object_id + 1, 0))
+    }
+
+    /// Register the existing handle allocation under qpdf's fresh object
+    /// identity, preserving the handle's shared storage instead of cloning its
+    /// value. This is the Rust equivalent of
+    /// `QPDF::makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`): the
+    /// handle aliases held by the caller and the canonical cache see the same
+    /// object after promotion.
+    #[allow(dead_code)]
+    pub(crate) fn make_indirect_from_object_handle(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        if !handle.is_direct() {
+            return Err(Error::Unsupported(
+                "cannot make an already-indirect ObjectHandle indirect".to_string(),
+            ));
+        }
+
+        let object_ref = self.next_obj_gen()?;
+        let promoted =
+            handle.promote_to_indirect(object_ref, self.pdf_unique_id, self.self_weak.clone());
+        let previous = self
+            .core
+            .borrow_mut()
+            .object_cache
+            .insert(object_ref, promoted.clone());
+        debug_assert!(
+            previous.is_none(),
+            "next_obj_gen must return a fresh ObjGen"
+        );
+        Ok(promoted)
+    }
+
     /// Whether a canonical handle occupies `number` at any generation.
     pub(crate) fn holds_object_number(&self, number: u32) -> bool {
         self.core
@@ -3321,6 +3372,34 @@ mod tests {
         );
         pdf.extend_from_slice(
             format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn unreferenced_high_free_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let catalog = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(b"xref\n0 100\n0000000000 65535 f \n");
+        pdf.extend_from_slice(format!("{catalog:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{pages:010} 00000 n \n").as_bytes());
+        pdf.extend_from_slice(format!("{page:010} 00000 n \n").as_bytes());
+        for _ in 4..100 {
+            pdf.extend_from_slice(b"0000000000 00000 f \n");
+        }
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 100 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
                 .as_bytes(),
         );
         pdf
@@ -10625,6 +10704,28 @@ mod tests {
                 .registered_handle(ObjectRef::new(0, u16::MAX))
                 .is_none(),
             "the xref free head must not become a canonical object"
+        );
+    }
+
+    #[test]
+    fn next_obj_gen_uses_a_parser_discovered_dangling_reference() {
+        let pdf = Pdf::open_mem_owned(dangling_reference_pdf_bytes()).expect("open");
+
+        assert_eq!(
+            pdf.resolver.next_obj_gen().expect("next dangling ObjGen"),
+            ObjectRef::new(100, 0)
+        );
+    }
+
+    #[test]
+    fn next_obj_gen_excludes_unreferenced_high_free_xref_entries() {
+        let pdf = Pdf::open_mem_owned(unreferenced_high_free_pdf_bytes()).expect("open");
+
+        assert_eq!(
+            pdf.resolver
+                .next_obj_gen()
+                .expect("next ObjGen after high free entry"),
+            ObjectRef::new(4, 0)
         );
     }
 

@@ -1534,6 +1534,28 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.get_object_count()
     }
 
+    /// Return the next qpdf-shaped generation-zero object identity from the
+    /// prepared canonical cache. Allocation itself belongs to the document's
+    /// resolver so legacy cache values cannot silently become object-number
+    /// inputs (`libqpdf/QPDF.cc:1271-1283,1872-1880`).
+    #[allow(dead_code)]
+    pub(crate) fn next_obj_gen(&self) -> Result<ObjectRef> {
+        self.resolver.next_obj_gen()
+    }
+
+    /// Promote and register an existing direct handle without cloning its
+    /// allocation or scheduling writer output. The writer-facing public
+    /// migration remains in `flpdf-25kg.3.6`; this method is the reusable
+    /// canonical primitive corresponding to qpdf's
+    /// `makeIndirectFromQPDFObject` (`libqpdf/QPDF.cc:1882-1888`).
+    #[allow(dead_code)]
+    pub(crate) fn make_indirect_from_object_handle(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ObjectHandle> {
+        self.resolver.make_indirect_from_object_handle(handle)
+    }
+
     pub(crate) fn is_canonical_object_handle(&self, handle: &ObjectHandle) -> bool {
         handle.object_ref().is_some_and(|object_ref| {
             self.resolver
@@ -6897,6 +6919,141 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         assert!(handle.is_indirect());
         assert_eq!(handle.object_ref(), Some(object_ref));
+    }
+
+    #[test]
+    fn next_obj_gen_uses_the_prepared_canonical_cache_and_qpdfs_signed_limit() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+
+        assert_eq!(
+            pdf.next_obj_gen().expect("first fresh object"),
+            ObjectRef::new(4, 0)
+        );
+
+        for generation in [1, 7] {
+            let high_generation = pdf.get_object_handle(ObjectRef::new(99, generation));
+            assert!(high_generation.is_indirect());
+        }
+        assert_eq!(
+            pdf.next_obj_gen().expect("object above every generation"),
+            ObjectRef::new(100, 0)
+        );
+
+        let max_object = pdf.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
+        assert!(max_object.is_indirect());
+        let error = pdf
+            .next_obj_gen()
+            .expect_err("qpdf rejects the INT_MAX allocation boundary");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: max object id is too high to create new objects"
+        );
+    }
+
+    #[test]
+    fn next_obj_gen_uses_the_effective_xref_stream_and_objstm_cache() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/three-page-objstm.pdf"
+        );
+        let pdf = Pdf::open_mem_owned(std::fs::read(fixture).expect("read ObjStm fixture"))
+            .expect("open ObjStm fixture");
+
+        // The pinned qpdf 11.9.0 fixture exposes object numbers 1 through 13
+        // through its effective xref stream and object stream.
+        assert_eq!(
+            pdf.next_obj_gen().expect("next ObjGen"),
+            ObjectRef::new(14, 0)
+        );
+    }
+
+    #[test]
+    fn make_indirect_from_object_handle_registers_the_same_shared_object_without_dirtying_it() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let direct = ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(7))]);
+        let alias = direct.clone();
+
+        let indirect = pdf
+            .make_indirect_from_object_handle(direct)
+            .expect("make indirect from the existing allocation");
+        let object_ref = indirect.object_ref().expect("fresh indirect ref");
+
+        assert_eq!(object_ref, ObjectRef::new(4, 0));
+        assert!(indirect.is_same_object_as(&alias));
+        assert!(alias.is_indirect());
+        assert_eq!(alias.object_ref(), Some(object_ref));
+        alias.replace_key(b"Value", ObjectHandle::integer(11));
+        assert_eq!(indirect.get_key(b"Value").as_integer(), Some(11));
+        assert!(!pdf.is_dirty(object_ref));
+
+        let all = pdf
+            .get_all_object_handles()
+            .expect("enumerate the canonical allocation");
+        let enumerated = all
+            .iter()
+            .find(|handle| handle.object_ref() == Some(object_ref))
+            .expect("fresh allocation must be in canonical enumeration");
+        assert!(enumerated.is_same_object_as(&indirect));
+    }
+
+    #[test]
+    fn repeated_make_indirect_from_object_handle_allocations_do_not_collide() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let first = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(1))
+            .expect("first allocation");
+        let second = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(2))
+            .expect("second allocation");
+
+        assert_eq!(first.object_ref(), Some(ObjectRef::new(4, 0)));
+        assert_eq!(second.object_ref(), Some(ObjectRef::new(5, 0)));
+        assert_eq!(first.as_integer(), Some(1));
+        assert_eq!(second.as_integer(), Some(2));
+    }
+
+    #[test]
+    fn make_indirect_from_object_handle_rejects_an_already_indirect_handle() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let indirect = pdf
+            .make_indirect_from_object_handle(ObjectHandle::integer(1))
+            .expect("initial allocation");
+        let original_ref = indirect.object_ref();
+
+        let error = pdf
+            .make_indirect_from_object_handle(indirect.clone())
+            .expect_err("an indirect handle cannot be promoted a second time");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: cannot make an already-indirect ObjectHandle indirect"
+        );
+        assert_eq!(indirect.object_ref(), original_ref);
+        assert_eq!(
+            pdf.next_obj_gen()
+                .expect("failed promotion is non-mutating"),
+            ObjectRef::new(5, 0)
+        );
+    }
+
+    #[test]
+    fn failed_make_indirect_at_int_max_leaves_the_direct_allocation_untouched() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
+        let direct = ObjectHandle::integer(42);
+        let alias = direct.clone();
+
+        let error = pdf
+            .make_indirect_from_object_handle(direct)
+            .expect_err("allocation must fail at INT_MAX");
+
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: max object id is too high to create new objects"
+        );
+        assert!(alias.is_direct());
+        assert_eq!(alias.object_ref(), None);
+        assert_eq!(alias.as_integer(), Some(42));
     }
 
     #[test]
