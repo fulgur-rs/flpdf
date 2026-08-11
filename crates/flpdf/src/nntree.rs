@@ -357,6 +357,11 @@ pub(crate) struct NNTreeCursor<K: TreeKey> {
     item_number: Option<usize>,
     raw: Option<(Object, Object)>,
     current: Option<(K::Key, Object)>,
+    /// qpdf's iterator retains `QPDFObjectHandle`s owned by one `QPDF`
+    /// (`QPDFObjectHandle.hh:852-872`, `NNTree.cc:30-73`). Keep the same
+    /// document boundary when the Rust API receives a cursor and a `Pdf`
+    /// separately.
+    pdf_id: Option<u64>,
     marker: PhantomData<K>,
 }
 
@@ -368,8 +373,29 @@ impl<K: TreeKey> NNTreeCursor<K> {
             item_number: None,
             raw: None,
             current: None,
+            pdf_id: None,
             marker: PhantomData,
         }
+    }
+
+    fn for_pdf(pdf_id: u64) -> Self {
+        let mut cursor = Self::empty();
+        cursor.pdf_id = Some(pdf_id);
+        cursor
+    }
+
+    fn ensure_pdf<R: Read + Seek>(&mut self, pdf: &Pdf<R>) -> Result<()> {
+        let pdf_id = pdf.unique_id();
+        match self.pdf_id {
+            None => self.pdf_id = Some(pdf_id),
+            Some(owner) if owner == pdf_id => {}
+            Some(_) => {
+                return Err(Error::Unsupported(
+                    "name/number tree cursor belongs to a different Pdf".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Whether traversal has selected an array slot.
@@ -429,6 +455,7 @@ impl<K: TreeKey> Clone for NNTreeCursor<K> {
             item_number: self.item_number,
             raw: self.raw.clone(),
             current: self.current.clone(),
+            pdf_id: self.pdf_id,
             marker: PhantomData,
         }
     }
@@ -1360,7 +1387,7 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn begin<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
-        let mut cursor = NNTreeCursor::empty();
+        let mut cursor = NNTreeCursor::for_pdf(pdf.unique_id());
         let root = self.root_handle(pdf)?;
         let result = self.descend(pdf, &mut cursor, root, true, true);
         self.finish_mutation(result)?;
@@ -1372,7 +1399,7 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     pub(crate) fn last<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<NNTreeCursor<K>> {
-        let mut cursor = NNTreeCursor::empty();
+        let mut cursor = NNTreeCursor::for_pdf(pdf.unique_id());
         let root = self.root_handle(pdf)?;
         let result = self.descend(pdf, &mut cursor, root, false, true);
         self.finish_mutation(result)?;
@@ -1384,6 +1411,7 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<()> {
+        cursor.ensure_pdf(pdf)?;
         let result = self.increment(pdf, cursor, false);
         self.finish_mutation(result)
     }
@@ -1393,6 +1421,7 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<()> {
+        cursor.ensure_pdf(pdf)?;
         let result = self.increment(pdf, cursor, true);
         self.finish_mutation(result)
     }
@@ -1494,6 +1523,7 @@ impl<K: TreeKey> NNTree<K> {
         key: K::Key,
         value: Object,
     ) -> Result<()> {
+        cursor.ensure_pdf(pdf)?;
         let mut allocator = ObjectAllocator::default();
         let value = self.lift_value(pdf, value)?;
         let result = self.insert_after_raw_with_allocator(
@@ -1563,6 +1593,7 @@ impl<K: TreeKey> NNTree<K> {
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<Option<Object>> {
+        cursor.ensure_pdf(pdf)?;
         let result = self.remove_at_inner(pdf, cursor);
         self.finish_mutation(result)
     }
@@ -2099,7 +2130,7 @@ impl<K: TreeKey> NNTree<K> {
         let root_diagnostic_ref = root.diagnostic_ref();
         let mut node = root;
         let mut seen: HashSet<NodeIdentity> = HashSet::new();
-        let mut cursor = NNTreeCursor::empty();
+        let mut cursor = NNTreeCursor::for_pdf(pdf.unique_id());
 
         loop {
             if self
@@ -2755,12 +2786,14 @@ struct ObjectAllocator {
 impl ObjectAllocator {
     fn next_number<R: Read + Seek>(&self, pdf: &Pdf<R>) -> u64 {
         self.next.unwrap_or_else(|| {
-            pdf.object_refs()
+            let legacy_max = pdf
+                .object_refs()
                 .into_iter()
                 .map(|object_ref| u64::from(object_ref.number))
                 .max()
-                .unwrap_or(0)
-                + 1
+                .unwrap_or(0);
+            let canonical_max = pdf.resolver.max_object_number().map(u64::from).unwrap_or(0);
+            legacy_max.max(canonical_max) + 1
         })
     }
 
@@ -3735,6 +3768,43 @@ mod tests {
     }
 
     #[test]
+    fn cursor_rejects_operations_after_the_tree_rebinds_to_another_pdf() {
+        let root_ref = ObjectRef::new(80, 0);
+        let mut pdf_one = empty_pdf();
+        let mut root_one = Dictionary::new();
+        root_one.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(1), Object::String(b"one".to_vec())]),
+        );
+        pdf_one.set_object(root_ref, Object::Dictionary(root_one));
+
+        let mut pdf_two = empty_pdf();
+        let mut root_two = Dictionary::new();
+        root_two.insert(
+            "Nums",
+            Object::Array(vec![Object::Integer(2), Object::String(b"two".to_vec())]),
+        );
+        pdf_two.set_object(root_ref, Object::Dictionary(root_two));
+
+        let mut tree = NNTree::<NumberKey>::new(Object::Reference(root_ref), false);
+        let mut cursor = tree.begin(&mut pdf_one).expect("cursor in first PDF");
+        tree.find(&mut pdf_two, &2, false)
+            .expect("rebind tree to second PDF");
+
+        let error = tree
+            .next(&mut pdf_two, &mut cursor)
+            .expect_err("a cursor from the first PDF must not traverse the second");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: name/number tree cursor belongs to a different Pdf"
+        );
+        assert_eq!(
+            cursor.current().map(|(key, value)| (*key, value.clone())),
+            Some((1, Object::String(b"one".to_vec())))
+        );
+    }
+
+    #[test]
     fn split_preflight_uses_qpdfs_signed_object_id_limit() {
         let mut pdf = empty_pdf();
         pdf.set_object(ObjectRef::new(i32::MAX as u32 - 1, 0), Object::Null);
@@ -3744,6 +3814,20 @@ mod tests {
             .ensure_available(&pdf, 1)
             .expect("INT_MAX itself is one available allocation");
         assert!(allocator.ensure_available(&pdf, 2).is_err());
+
+        let mut pdf_with_missing_max = empty_pdf();
+        let missing_max =
+            pdf_with_missing_max.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
+        missing_max.set_missing();
+        assert!(!pdf_with_missing_max
+            .object_refs()
+            .contains(&ObjectRef::new(i32::MAX as u32, 0)));
+        assert!(
+            ObjectAllocator::default()
+                .ensure_available(&pdf_with_missing_max, 1)
+                .is_err(),
+            "preflight must count a missing canonical handle at qpdf's signed limit"
+        );
     }
 
     #[test]
@@ -4563,6 +4647,7 @@ mod tests {
             item_number: Some(0),
             raw: None,
             current: None,
+            pdf_id: None,
             marker: PhantomData,
         };
         assert!(tree
@@ -4581,6 +4666,7 @@ mod tests {
             item_number: Some(0),
             raw: None,
             current: None,
+            pdf_id: None,
             marker: PhantomData,
         };
         assert!(tree.update_current(&mut pdf, &mut cursor, false).is_err());
@@ -4701,6 +4787,7 @@ mod tests {
                 item_number: Some(item_number),
                 raw: None,
                 current: Some((1, Object::Integer(1))),
+                pdf_id: None,
                 marker: PhantomData,
             }
         }
@@ -4736,6 +4823,7 @@ mod tests {
                 item_number: None,
                 raw: None,
                 current: None,
+                pdf_id: None,
                 marker: PhantomData,
             }
         }
