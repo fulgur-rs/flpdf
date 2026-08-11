@@ -647,6 +647,35 @@ impl HandleNumberTree {
             return Ok(());
         };
 
+        // qpdf 11.9.0 NNTreeIterator::deepen selects a non-empty /Nums array
+        // before looking at /Kids, even when both keys are present.
+        if let Some(nums) = dictionary.get(b"Nums".as_slice()) {
+            if let Some(items) = nums.try_as_array()? {
+                if !items.is_empty() {
+                    if items.len() % 2 != 0 {
+                        return Err(Error::parse(
+                            0,
+                            "Name/Number tree node: items array is too short",
+                        ));
+                    }
+                    for (pair_index, pair) in items.chunks_exact(2).enumerate() {
+                        let Some(key) = pair[0].try_as_integer()? else {
+                            let item_index = pair_index * 2;
+                            // qpdf 11.9.0 NNTreeIterator::increment warns about
+                            // a wrong-typed key and continues to the next pair.
+                            pdf.push_warning(structural_message(
+                                node.object_ref(),
+                                format!("item {item_index} has the wrong type"),
+                            ))?;
+                            continue;
+                        };
+                        entries.insert(key, pair[1].clone());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         if let Some(kids) = dictionary.get(b"Kids".as_slice()) {
             if let Some(kids) = kids.try_as_array()? {
                 for kid in kids {
@@ -656,27 +685,6 @@ impl HandleNumberTree {
             return Ok(());
         }
 
-        let Some(nums) = dictionary.get(b"Nums".as_slice()) else {
-            return Ok(());
-        };
-        let Some(items) = nums.try_as_array()? else {
-            return Ok(());
-        };
-        if items.len() % 2 != 0 {
-            return Err(Error::parse(
-                0,
-                "Name/Number tree node: items array is too short",
-            ));
-        }
-        for pair in items.chunks_exact(2) {
-            let Some(key) = pair[0].try_as_integer()? else {
-                return Err(Error::parse(
-                    0,
-                    "Name/Number tree node: key is not an integer",
-                ));
-            };
-            entries.insert(key, pair[1].clone());
-        }
         Ok(())
     }
 }
@@ -2869,10 +2877,66 @@ mod tests {
             )]),
             0,
         );
-        let key_error = non_integer_key
+        assert!(non_integer_key.entries(&mut pdf).unwrap().is_empty());
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics.entries();
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.message.contains("item 0 has the wrong type")));
+    }
+
+    #[test]
+    fn handle_number_tree_prefers_non_empty_nums_over_kids() {
+        let mut pdf = empty_pdf();
+        let child = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(8),
+                ObjectHandle::string(b"child".to_vec()),
+            ]),
+        )]);
+        let root = ObjectHandle::dictionary(vec![
+            (b"Kids".to_vec(), ObjectHandle::array(vec![child])),
+            (
+                b"Nums".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(4),
+                    ObjectHandle::string(b"local".to_vec()),
+                ]),
+            ),
+        ]);
+
+        let entries = HandleNumberTree::new(root, 1)
             .entries(&mut pdf)
-            .expect_err("number-tree keys must be integers");
-        assert!(key_error.to_string().contains("key is not an integer"));
+            .expect("non-empty local entries must be readable");
+
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn handle_number_tree_skips_wrong_number_keys_and_warns() {
+        let mut pdf = empty_pdf();
+        let root = ObjectHandle::dictionary(vec![(
+            b"Nums".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(4),
+                ObjectHandle::string(b"four".to_vec()),
+                ObjectHandle::string(b"not-an-integer".to_vec()),
+                ObjectHandle::integer(6),
+                ObjectHandle::integer(8),
+                ObjectHandle::string(b"eight".to_vec()),
+            ]),
+        )]);
+
+        let entries = HandleNumberTree::new(root, 0)
+            .entries(&mut pdf)
+            .expect("invalid keys must not discard valid pairs");
+
+        assert_eq!(entries.keys().copied().collect::<Vec<_>>(), vec![4, 8]);
+        let diagnostics = pdf.repair_diagnostics();
+        let warnings = diagnostics.entries();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("item 2 has the wrong type"));
     }
 
     #[test]
