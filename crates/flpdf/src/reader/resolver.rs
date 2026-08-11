@@ -87,8 +87,8 @@
 use super::{interpret_cf_from_handle, EncryptionMode, EncryptionState};
 use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
 use crate::parser::{
-    keyword_token_end, parse_live_file_object_with_decrypter,
-    parse_qpdf_direct_object_handle_with_diagnostics, LiveInput, LiveTokenSource, StringDecrypter,
+    parse_live_file_object_with_decrypter, parse_qpdf_direct_object_handle_with_diagnostics,
+    LiveInput, LiveTokenSource, StringDecrypter,
 };
 use crate::pipeline::aes::PlAesPdf;
 use crate::pipeline::rc4::PlRc4;
@@ -1000,6 +1000,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     /// The offset repair chose as qpdf-logical zero. See
     /// [`ResolverCore::header_offset`].
+    #[cfg(test)]
     pub(crate) fn header_offset(&self) -> usize {
         self.core.borrow().header_offset
     }
@@ -1679,9 +1680,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// The position advances by exactly what was appended, so `bytes` always
     /// mirrors `[scan start, current position)`.
     ///
-    /// This belongs only to legacy token consumers that still use
-    /// [`Self::scan_forward`]. File-object parsing has moved to the live
-    /// InputSource adapter and does not accumulate or retry its prefix.
+    /// This belongs to the bounded framing-token consumer below. File-object
+    /// body parsing and stream recovery use the live InputSource adapter and
+    /// do not accumulate the source prefix.
     fn refill(&self, bytes: &mut Vec<u8>) -> Result<bool> {
         let filled = bytes.len();
         let want = filled.max(INPUT_CHUNK);
@@ -1695,13 +1696,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// reports a complete result, then leave the position exactly where that
     /// result stopped consuming.
     ///
-    /// This remains a legacy token helper. `QPDFTokenizer` and `QPDFParser`
-    /// consume `m->file` a character at a time
+    /// This is only a bounded framing-token helper. `QPDFTokenizer` and
+    /// `QPDFParser` consume `m->file` a character at a time
     /// (`QPDFTokenizer::presentCharacter`, and `unreadCh` to give back the
     /// one character of overshoot — `libqpdf/QPDF.cc:1656` uses
     /// `seek(-1, SEEK_CUR)` for the same purpose), so qpdf never has to know
-    /// in advance how far an object reaches. The file-object path no longer
-    /// uses this helper: it advances through `LiveTokenSource` directly.
+    /// in advance how far an object reaches. The file-object body path
+    /// advances through `LiveTokenSource` directly; only its stream framing
+    /// token uses this bounded pull adapter.
     ///
     /// Its position remains live and its pull leaves the source after the
     /// consumed token. [`Self::read_window`]'s bounded-window shape is not
@@ -1760,28 +1762,22 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// `allow_eof` is also used by the live file-object tokenizer, whose
     /// trailing token is the direct equivalent of this stream-framing read.
     ///
-    /// One divergence stays: qpdf passes `allow_bad = true`
-    /// (`QPDF::readToken`, `:1536-1539`), so a *malformed* token is returned
-    /// as `tt_bad` and likewise reported as the missing keyword, whereas
-    /// `read_token(false, ..)` below turns it into an error. Widening that
-    /// changes every caller's error surface, so it is recorded rather than
-    /// taken here.
-    ///
-    /// This legacy helper still reports a slice-relative error for malformed
-    /// stream framing. File-object diagnostics no longer pass through it and
-    /// retain their absolute input offsets.
+    /// qpdf passes `allow_bad = true` (`QPDF::readToken`, `:1536-1539`), so a
+    /// *malformed* token is returned as `tt_bad` and likewise reported as the
+    /// missing keyword. Keep that policy here so the canonical stream path
+    /// can enter its recovery arm. qpdf's `QPDFTokenizer::nextToken` records
+    /// the input position before it skips whitespace and comments
+    /// (`libqpdf/QPDFTokenizer.cc:926-961`); return that attempted-read
+    /// position rather than the later token start for the same diagnostic.
     fn read_token_from_input(&self) -> Result<(Token, u64)> {
         let start = self.tell()?;
         self.scan_forward(|bytes| {
             let mut tokenizer = Tokenizer::new(bytes);
             tokenizer.allow_eof();
-            let token = tokenizer.read_token(false, 0)?;
+            let token = tokenizer.read_token(true, 0)?;
             Ok((token, tokenizer.position()))
         })
-        .map(|token| {
-            let offset = start.saturating_add(token.start as u64);
-            (token, offset)
-        })
+        .map(|token| (token, start))
     }
 
     /// Read one byte from the current position, or `None` at EOF.
@@ -2041,8 +2037,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
             // qpdf `:1386-1389`. A mismatched framing token is a QPDFExc and
             // enters the same recovery arm as an unusable `/Length`.
-            if !self.read_token_from_input()?.0.is_word_value(b"endstream") {
-                let error = Error::parse(stream_offset as usize, "expected endstream");
+            let (framing_token, framing_offset) = self.read_token_from_input()?;
+            if !framing_token.is_word_value(b"endstream") {
+                let error = Error::parse(framing_offset as usize, "expected endstream");
                 if !self.attempt_recovery() {
                     return Err(error);
                 }
@@ -2111,35 +2108,31 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// Port qpdf's `recoverStreamLength` (`libqpdf/QPDF.cc:1482-1524`).
     ///
     /// qpdf asks its input source to find the first `endstream` or `endobj`
-    /// token after `stream_offset`. The scan is over the resolver's logical
-    /// source bytes, but the live input position is restored before the
-    /// method returns. For `endobj`, qpdf rewinds to the token start so the
-    /// outer `readObject` consumes it; for `endstream`, it leaves the input
-    /// after the token.
+    /// token after `stream_offset` (`QPDF.cc:1482-1497`). The scan below is
+    /// the same `findFirst("end", ...)` shape, but consumes the resolver's
+    /// live source instead of copying the complete document for every damaged
+    /// stream. Candidate tokens are limited to qpdf's `max_len = 20`, and a
+    /// failed candidate advances by one byte so a valid token nested inside a
+    /// longer word remains discoverable. For `endobj`, qpdf rewinds to the
+    /// token start so the outer `readObject` consumes it; for `endstream`, it
+    /// leaves the input after the token.
     fn recover_stream_length(&self, stream_offset: u64) -> Result<usize> {
         self.push_warning_at(stream_offset, "attempting to recover stream length")?;
 
-        let header_offset = self.header_offset();
-        let raw_bytes = self.core.borrow_mut().read_underlying_bytes()?;
-        let logical_bytes = raw_bytes.get(header_offset..).unwrap_or(&[]);
-        let start = usize::try_from(stream_offset)
-            .unwrap_or(logical_bytes.len())
-            .min(logical_bytes.len());
-
-        let terminator = (start..logical_bytes.len()).find_map(|position| {
-            keyword_token_end(logical_bytes, position, b"endstream")
-                .map(|after| (position, after))
-                .or_else(|| {
-                    keyword_token_end(logical_bytes, position, b"endobj")
-                        .map(|_| (position, position))
-                })
-        });
-
+        let terminator = self.find_stream_recovery_terminator(stream_offset)?;
         let (length, next_position) = match terminator {
-            Some((position, next_position)) => (position.saturating_sub(start), next_position),
-            None => (0, logical_bytes.len()),
+            Some((position, next_position)) => (
+                usize::try_from(position.saturating_sub(stream_offset)).map_err(|_| {
+                    // cov:ignore-start: u64-to-usize overflow is unreachable on supported 64-bit CI; retain the defensive error for narrower targets
+                    Error::parse(usize::MAX, "recovered stream length is out of range")
+                })?, // cov:ignore-end
+                Some(next_position),
+            ),
+            None => (0, None),
         };
-        self.seek(next_position as u64)?;
+        if let Some(next_position) = next_position {
+            self.seek(next_position)?;
+        }
 
         if length == 0 {
             self.push_warning_at(
@@ -2150,6 +2143,56 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_warning_at(stream_offset, format!("recovered stream length: {length}"))?;
         }
         Ok(length)
+    }
+
+    /// The `PatternFinder`/`findEndstream` pair used by qpdf's
+    /// `recoverStreamLength`. `findFirst` first checks the complete `end`
+    /// prefix, so a byte that is not followed by `nd` never enters the
+    /// bounded tokenizer. A rejected full candidate still resumes at
+    /// `candidate + 1` rather than after the candidate token; the live input
+    /// rewinds within its buffer, crossing a buffer boundary only when that
+    /// is unavoidable.
+    fn find_stream_recovery_terminator(&self, stream_offset: u64) -> Result<Option<(u64, u64)>> {
+        let mut input = self.live_input();
+        input.seek(stream_offset)?;
+
+        loop {
+            let candidate = input.tell()?;
+            let Some(byte) = input.read_byte()? else {
+                return Ok(None);
+            };
+            if byte != b'e' {
+                continue;
+            }
+
+            let Some(next) = input.read_byte()? else {
+                return Ok(None);
+            };
+            if next != b'n' {
+                input.unread_byte()?;
+                continue;
+            }
+            let Some(next) = input.read_byte()? else {
+                return Ok(None);
+            };
+            if next != b'd' {
+                input.unread_byte()?;
+                input.unread_byte()?;
+                continue;
+            }
+
+            let (token, token_len, token_end) = read_stream_recovery_token(&mut input, b"end")?;
+            if &token[..token_len] == b"endstream" {
+                return Ok(Some((candidate, token_end)));
+            }
+            if &token[..token_len] == b"endobj" {
+                return Ok(Some((candidate, candidate)));
+            }
+
+            for _ in 1..token_len {
+                input.unread_byte()?;
+            }
+        }
     }
 
     /// qpdf `QPDF::validateStreamLineEnd` (`libqpdf/QPDF.cc:1400-1448`),
@@ -2425,6 +2468,38 @@ impl<R: Read + Seek> ResolverLiveInput<'_, R> {
     fn finish(&mut self) -> Result<()> {
         let position = self.tell()?;
         self.seek(position)
+    }
+}
+
+/// qpdf's `findEndstream` reads each complete `end` candidate with
+/// `readToken(input, 20)`. Recovery only needs to distinguish two word values,
+/// so retain at most the same twenty token bytes while leaving the live source
+/// at the equivalent post-token position. A delimiter is unread just as
+/// qpdf's `InputSource::fastUnread` does.
+const STREAM_RECOVERY_TOKEN_LIMIT: usize = 20;
+
+fn read_stream_recovery_token<I: LiveInput>(
+    input: &mut I,
+    prefix: &[u8],
+) -> Result<([u8; STREAM_RECOVERY_TOKEN_LIMIT], usize, u64)> {
+    let mut token = [0; STREAM_RECOVERY_TOKEN_LIMIT];
+    token[..prefix.len()].copy_from_slice(prefix);
+    let mut token_len = prefix.len();
+
+    loop {
+        if token_len == STREAM_RECOVERY_TOKEN_LIMIT {
+            return Ok((token, token_len, input.tell()?));
+        }
+
+        let Some(byte) = input.read_byte()? else {
+            return Ok((token, token_len, input.tell()?));
+        };
+        if crate::tokenizer::is_ws(byte) || crate::tokenizer::is_delimiter(byte) {
+            input.unread_byte()?;
+            return Ok((token, token_len, input.tell()?));
+        }
+        token[token_len] = byte;
+        token_len += 1;
     }
 }
 
@@ -6061,16 +6136,22 @@ mod tests {
 
     #[test]
     fn stream_recovery_without_a_terminator_treats_the_payload_as_empty() {
-        let resolver = resolver_over(b"payload without a framing token".to_vec());
-        assert_eq!(
-            resolver
-                .recover_stream_length(0)
-                .expect("recovery without a terminator"),
-            0
-        );
-        assert!(resolver.repair_diagnostics().entries().iter().any(
-            |entry| entry.message == "unable to recover stream data; treating stream as empty"
-        ));
+        for payload in [b"abc".as_slice(), b"e", b"enx", b"end"] {
+            let resolver = resolver_over(payload.to_vec());
+            assert_eq!(
+                resolver
+                    .recover_stream_length(0)
+                    .expect("recovery without a terminator"),
+                0,
+                "payload {payload:?} must not produce a terminator"
+            );
+            assert!(resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|entry| entry.message
+                    == "unable to recover stream data; treating stream as empty"));
+        }
     }
 
     #[test]
@@ -6412,6 +6493,7 @@ mod tests {
     struct CountingReader {
         inner: std::io::Cursor<Vec<u8>>,
         reads: usize,
+        seeks: usize,
     }
 
     impl CountingReader {
@@ -6419,6 +6501,7 @@ mod tests {
             Self {
                 inner: std::io::Cursor::new(bytes),
                 reads: 0,
+                seeks: 0,
             }
         }
     }
@@ -6432,6 +6515,27 @@ mod tests {
 
     impl std::io::Seek for CountingReader {
         fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.seeks += 1;
+            self.inner.seek(position)
+        }
+    }
+
+    struct RejectRewindReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        reject_rewind: bool,
+    }
+
+    impl std::io::Read for RejectRewindReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl std::io::Seek for RejectRewindReader {
+        fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            if self.reject_rewind && matches!(position, std::io::SeekFrom::Start(0)) {
+                return Err(std::io::Error::other("recovery must not rewind the source"));
+            }
             self.inner.seek(position)
         }
     }
@@ -7518,6 +7622,331 @@ mod tests {
             .any(|entry| entry.message == "recovered stream length: 4"));
     }
 
+    #[test]
+    fn canonical_stream_allows_a_malformed_framing_token_to_recover() {
+        let body = b"2 0 obj\n<< /Length 0 >>\nstream\n(\nendstream\nendobj\n".to_vec();
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            body.clone(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("qpdf allows a malformed framing token into recovery");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            b"(\n"
+        );
+        let messages: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert!(messages
+            .iter()
+            .any(|message| message == "expected endstream"));
+        assert!(messages
+            .iter()
+            .any(|message| message == "attempting to recover stream length"));
+        assert!(messages
+            .iter()
+            .any(|message| message == "recovered stream length: 2"));
+    }
+
+    #[test]
+    fn canonical_stream_recovery_repositions_before_endobj() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("endobj is a valid qpdf recovery terminator");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            b"abc\n"
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message == "recovered stream length: 4"));
+    }
+
+    #[test]
+    fn canonical_stream_recovery_respects_qpdf_candidate_token_limit() {
+        let mut payload = b"end".to_vec();
+        payload.extend_from_slice(&[b'x'; 17]);
+        let mut body = b"2 0 obj\n<< /Length 0 >>\nstream\n".to_vec();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("a long rejected candidate still finds nested endstream");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            payload.as_slice()
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message == "recovered stream length: 20"));
+    }
+
+    #[test]
+    fn canonical_stream_recovery_does_not_seek_for_each_non_prefix_candidate() {
+        let payload = vec![b'e'; 96];
+        let mut body = b"2 0 obj\n<< /Length 0 >>\nstream\n".to_vec();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"\nendstream\nendobj\n");
+        let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_with_options(
+            CountingReader::new(bytes),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let before = pdf.resolver.with_reader_mut(|reader| reader.seeks);
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("recovery must scan a long non-prefix payload");
+
+        let seeks = pdf.resolver.with_reader_mut(|reader| reader.seeks) - before;
+        assert!(seeks < payload.len() / 2);
+    }
+
+    #[test]
+    fn canonical_stream_malformed_framing_matches_pinned_qpdf() {
+        // cov:ignore-start: CI has pinned qpdf; this fallback is for developer hosts only.
+        if Command::new("qpdf").arg("--version").output().is_err() {
+            eprintln!("qpdf not available; skipping stream recovery differential");
+            return;
+        }
+        // cov:ignore-end
+
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 0 >>\nstream\n(\nendstream\nendobj\n".to_vec(),
+        ]);
+        let directory = tempfile::tempdir().expect("temporary qpdf fixture directory");
+        let path = directory.path().join("malformed-stream-framing.pdf");
+        fs::write(&path, &bytes).expect("write qpdf fixture");
+        let qpdf = Command::new("qpdf")
+            .args(["--check", "--warning-exit-0"])
+            .arg(&path)
+            .output()
+            .expect("run pinned qpdf");
+        let qpdf_diagnostics = String::from_utf8_lossy(&qpdf.stderr);
+        for expected in [
+            "expected endstream",
+            "attempting to recover stream length",
+            "recovered stream length: 2",
+        ] {
+            assert!(
+                qpdf_diagnostics.contains(expected),
+                "qpdf must report {expected:?} (status {}):\n{qpdf_diagnostics}",
+                qpdf.status
+            );
+        }
+
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        handle.try_dereference().expect("flpdf recovery");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            b"(\n"
+        );
+        let flpdf_diagnostics: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| entry.message.clone())
+            .collect();
+        assert_eq!(
+            flpdf_diagnostics,
+            vec![
+                "expected endstream".to_owned(),
+                "attempting to recover stream length".to_owned(),
+                "recovered stream length: 2".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_stream_diagnoses_the_attempted_framing_token_offset() {
+        let body = b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n".to_vec();
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset
+            + body
+                .windows(b"stream\n".len())
+                .position(|window| window == b"stream\n")
+                .expect("stream keyword")
+            + b"stream\n".len();
+        let attempted_offset =
+            u64::try_from(stream_offset + 1).expect("fixture offset fits qpdf offset");
+        let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("repair the bad framing length");
+
+        let diagnostics: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| (entry.message.clone(), entry.offset))
+            .collect();
+        assert_eq!(
+            diagnostics.first(),
+            Some(&("expected endstream".to_owned(), Some(attempted_offset)))
+        );
+    }
+
+    #[test]
+    fn canonical_stream_diagnoses_framing_before_ignored_whitespace_and_comments() {
+        let body =
+            b"2 0 obj\n<< /Length 1 >>\nstream\nx \n% ignored\nnot-endstream\nendstream\nendobj\n";
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset
+            + body
+                .windows(b"stream\n".len())
+                .position(|window| window == b"stream\n")
+                .expect("stream keyword")
+            + b"stream\n".len();
+        let attempted_offset =
+            u64::try_from(stream_offset + 1).expect("fixture offset fits qpdf offset");
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            body.to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("repair the bad framing length");
+
+        let diagnostics: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| (entry.message.clone(), entry.offset))
+            .collect();
+        assert_eq!(
+            diagnostics.first(),
+            Some(&("expected endstream".to_owned(), Some(attempted_offset)))
+        );
+    }
+
+    #[test]
+    fn canonical_stream_recovery_does_not_rewind_the_whole_source() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendstream\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_with_options(
+            RejectRewindReader {
+                inner: std::io::Cursor::new(bytes),
+                reject_rewind: false,
+            },
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        pdf.resolver.with_reader_mut(|reader| {
+            reader.reject_rewind = true;
+            assert!(
+                std::io::Seek::seek(reader, std::io::SeekFrom::Start(0)).is_err(),
+                "the guard must reject a whole-source rewind"
+            );
+        });
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("stream recovery scans the live source");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            b"abc\n"
+        );
+    }
+
     /// A `/Length` too large to be a position in the input is diagnosed
     /// without ever being allocated.
     ///
@@ -7590,7 +8019,7 @@ mod tests {
                         .as_slice(),
                     &b"abc"[..]
                 );
-                assert_eq!(warnings, ["(object 2 0, offset 90): expected endobj"]);
+                assert_eq!(warnings, ["(object 2 0, offset 89): expected endobj"]);
             },
         );
     }
