@@ -8,6 +8,23 @@ use crate::{Dictionary, Object, ObjectRef};
 
 type AesIvGenerator = dyn FnMut(&mut [u8; 16]) -> Result<(), getrandom::Error>;
 
+#[derive(Clone, Copy)]
+pub(crate) struct StreamDictOptions {
+    qdf: bool,
+    refiltered: bool,
+    encrypt_strings: bool,
+}
+
+impl StreamDictOptions {
+    pub(crate) const fn new(qdf: bool, refiltered: bool, encrypt_strings: bool) -> Self {
+        Self {
+            qdf,
+            refiltered,
+            encrypt_strings,
+        }
+    }
+}
+
 /// Writer-owned adapter that encrypts strings while an emitted object's data
 /// key is active, without changing the source [`Object`] tree.
 pub(crate) struct EncryptedStringEmitter {
@@ -85,15 +102,13 @@ impl EncryptedStringEmitter {
         emitted_ref: ObjectRef,
         object_stream_index: Option<u32>,
         dict: &Dictionary,
-        qdf: bool,
-        refiltered: bool,
-        encrypt_strings: bool,
+        options: StreamDictOptions,
     ) -> crate::Result<()> {
-        if !encrypt_strings {
-            if qdf {
+        if !options.encrypt_strings {
+            if options.qdf {
                 dict.write_pdf_stream_qdf(out, 0);
             } else {
-                dict.write_pdf_stream(out, refiltered);
+                dict.write_pdf_stream(out, options.refiltered);
             }
             return Ok(());
         }
@@ -113,10 +128,14 @@ impl EncryptedStringEmitter {
                         plaintext,
                     )
                 };
-                if qdf {
+                if options.qdf {
                     dict.try_write_pdf_stream_qdf_with_string_writer(out, 0, &mut write_string)
                 } else {
-                    dict.try_write_pdf_stream_with_string_writer(out, refiltered, &mut write_string)
+                    dict.try_write_pdf_stream_with_string_writer(
+                        out,
+                        options.refiltered,
+                        &mut write_string,
+                    )
                 }
             })
     }
@@ -223,7 +242,10 @@ pub(crate) fn write_encryption_dictionary(out: &mut Vec<u8>, dict: &Dictionary) 
 
 #[cfg(test)]
 mod tests {
-    use super::{serialize_encrypted_string, write_encryption_dictionary, EncryptedStringEmitter};
+    use super::{
+        serialize_encrypted_string, write_encryption_dictionary, EncryptedStringEmitter,
+        StreamDictOptions,
+    };
     use crate::encrypt_setup::{CopyEncryptionSource, EncryptMethod, EncryptParams};
     use crate::security::standard::{
         decrypt_cipher_bytes, per_object_key, ObjectKeyAlg, StringCipher,
@@ -445,7 +467,13 @@ mod tests {
             let mut emitter = EncryptedStringEmitter::from_context(&context);
             let mut out = Vec::new();
             emitter
-                .write_stream_dict(&mut out, emitted_ref, None, &dict, qdf, true, true)
+                .write_stream_dict(
+                    &mut out,
+                    emitted_ref,
+                    None,
+                    &dict,
+                    StreamDictOptions::new(qdf, true, true),
+                )
                 .expect("stream dictionary emission");
 
             let ciphertext = parse_dict_string(&out, "Label");
@@ -475,7 +503,13 @@ mod tests {
         let mut emitter = EncryptedStringEmitter::from_context(&context);
         let mut out = Vec::new();
         emitter
-            .write_stream_dict(&mut out, emitted_ref, None, &dict, false, false, false)
+            .write_stream_dict(
+                &mut out,
+                emitted_ref,
+                None,
+                &dict,
+                StreamDictOptions::new(false, false, false),
+            )
             .expect("cleartext stream dictionary emission");
 
         assert!(

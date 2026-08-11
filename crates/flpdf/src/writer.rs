@@ -2419,6 +2419,20 @@ pub(crate) fn reencode_stream_for_compress(
 /// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
 /// its lexicographic order with `/Length` last. Non-stream objects serialize
 /// normally. Shared by the legacy excluded-mode writer and the plain pipeline.
+pub(crate) struct StreamEncryptionOptions<'a> {
+    context: Option<&'a EncryptionContext>,
+    encrypt_strings: bool,
+}
+
+impl<'a> StreamEncryptionOptions<'a> {
+    pub(crate) const fn new(context: Option<&'a EncryptionContext>, encrypt_strings: bool) -> Self {
+        Self {
+            context,
+            encrypt_strings,
+        }
+    }
+}
+
 fn write_reencoded_object(
     bytes: &mut Vec<u8>,
     reencoded: &Object,
@@ -2426,18 +2440,21 @@ fn write_reencoded_object(
     options: &WriterOptions,
     encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
     emitted_ref: ObjectRef,
-    stream_encryption: Option<&EncryptionContext>,
-    encrypt_stream_strings: bool,
+    stream_encryption: StreamEncryptionOptions<'_>,
 ) -> Result<()> {
     match reencoded {
         Object::Stream(s) => {
             let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
                 && !source_filter_is_lone_flate
                 && is_lone_flate(s.dict.get("Filter"));
-            if let Some(ctx) = stream_encryption {
+            if let Some(ctx) = stream_encryption.context {
                 let mut dict = s.dict.clone();
                 let mut stream_length = s.data.len();
-                adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream_strings)?;
+                adjust_aes_stream_length(
+                    &mut stream_length,
+                    ctx,
+                    stream_encryption.encrypt_strings,
+                )?;
                 dict.insert(
                     "Length",
                     Object::Integer(i64::try_from(stream_length).map_err(|_| {
@@ -2452,9 +2469,11 @@ fn write_reencoded_object(
                         emitted_ref,
                         None,
                         &dict,
-                        false,
-                        refiltered,
-                        encrypt_stream_strings,
+                        encrypted_strings::StreamDictOptions::new(
+                            false,
+                            refiltered,
+                            stream_encryption.encrypt_strings,
+                        ),
                     )?;
                 } else {
                     dict.write_pdf_stream(bytes, refiltered);
@@ -2465,7 +2484,7 @@ fn write_reencoded_object(
                     options.newline_before_endstream,
                     emitted_ref,
                     ctx,
-                    encrypt_stream_strings,
+                    stream_encryption.encrypt_strings,
                     None,
                 )?;
             } else if let Some(emitter) = encrypted_strings {
@@ -2474,9 +2493,7 @@ fn write_reencoded_object(
                     emitted_ref,
                     None,
                     &s.dict,
-                    false,
-                    refiltered,
-                    true,
+                    encrypted_strings::StreamDictOptions::new(false, refiltered, true),
                 )?;
                 write_stream_payload(bytes, &s.data, options.newline_before_endstream);
             } else {
@@ -2629,8 +2646,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
                             options,
                             None,
                             output,
-                            None,
-                            true,
+                            StreamEncryptionOptions::new(None, true),
                         )?;
                         // cov:ignore-end
                     }
@@ -3549,8 +3565,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     options,
                     encrypted_strings.as_mut(),
                     emit_ref,
-                    stream_encryption,
-                    encrypt_stream,
+                    StreamEncryptionOptions::new(stream_encryption, encrypt_stream),
                 );
                 written?;
             }
@@ -4397,9 +4412,7 @@ fn write_stream_to_buf_qdf(
                 emitted_ref,
                 None,
                 &dict,
-                true,
-                false,
-                encrypt_stream_strings,
+                encrypted_strings::StreamDictOptions::new(true, false, encrypt_stream_strings),
             )?;
         } else {
             dict.write_pdf_stream_qdf(buf, 0);
@@ -4413,15 +4426,21 @@ fn write_stream_to_buf_qdf(
             encrypt_stream_strings,
             None,
         )?;
-        return Ok(add_newline);
+        Ok(add_newline)
     } else if let Some(emitter) = encrypted_strings {
-        emitter.write_stream_dict(buf, emitted_ref, None, &stream.dict, true, false, true)?;
+        emitter.write_stream_dict(
+            buf,
+            emitted_ref,
+            None,
+            &stream.dict,
+            encrypted_strings::StreamDictOptions::new(true, false, true),
+        )?;
         write_stream_payload(buf, &stream.data, policy);
-        return Ok(stream_framing_adds_newline(&stream.data, policy));
+        Ok(stream_framing_adds_newline(&stream.data, policy))
     } else {
         stream.dict.write_pdf_stream_qdf(buf, 0);
         write_stream_payload(buf, &stream.data, policy);
-        return Ok(stream_framing_adds_newline(&stream.data, policy));
+        Ok(stream_framing_adds_newline(&stream.data, policy))
     }
 }
 
