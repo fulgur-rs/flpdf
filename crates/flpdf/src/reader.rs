@@ -1423,16 +1423,15 @@ impl<R: Read + Seek> Pdf<R> {
             .into_iter()
             .filter_map(|handle| {
                 let object_ref = handle.object_ref()?;
-                if handle.is_missing()
-                    || matches!(self.cache.entry(object_ref), Some(CacheEntry::Missing))
-                {
+                let cache_entry = self.cache.entry(object_ref);
+                if handle.is_missing() || matches!(cache_entry, Some(CacheEntry::Missing)) {
                     return None;
                 }
                 if live_only
-                    && matches!(
-                        self.cache.entry(object_ref),
+                    && (matches!(
+                        cache_entry,
                         Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
-                    )
+                    ) || (cache_entry.is_none() && !handle.is_resolved()))
                 {
                     return None;
                 }
@@ -7518,6 +7517,22 @@ mod tests {
 
         assert!(pdf.object_refs().contains(&deleted_ref));
         assert!(!pdf.live_object_refs().contains(&deleted_ref));
+    }
+
+    #[test]
+    fn live_object_refs_excludes_unresolved_registry_only_slots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let placeholder_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(placeholder_ref);
+        let allocated = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("make indirect");
+        let allocated_ref = allocated.object_ref().expect("allocated ref");
+
+        assert!(!handle.is_resolved());
+        assert!(pdf.object_refs().contains(&placeholder_ref));
+        assert!(!pdf.live_object_refs().contains(&placeholder_ref));
+        assert!(pdf.live_object_refs().contains(&allocated_ref));
     }
 
     #[test]
