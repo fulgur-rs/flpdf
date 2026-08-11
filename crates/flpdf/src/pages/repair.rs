@@ -95,8 +95,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         }
         let parent = pages.try_get_key(b"/Parent")?;
         if parent.is_null() {
-            // cov:ignore: qpdf-compatible try_has_key hides direct and indirect null values first
-            break;
+            break; // cov:ignore: qpdf-compatible try_has_key hides direct and indirect null values first
         }
         if !warned {
             catalog.warn_if_possible(
