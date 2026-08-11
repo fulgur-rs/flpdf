@@ -177,6 +177,52 @@ fn tokenizer_emits_canonical_stream_recovery_warnings_once_with_qpdf_offsets() {
     );
 }
 
+#[test]
+fn tokenizer_reuses_canonical_page_stream_resolution_without_replaying_warnings() {
+    let cases = [
+        (
+            "chained-indirect-contents.pdf",
+            "(object 5 0, offset 232): expected endobj",
+            None,
+        ),
+        (
+            "encrypted-recovered-eol.pdf",
+            "(object 4 0, offset 236): stream dictionary lacks /Length key",
+            Some("(object 4 0, offset 229): stream dictionary lacks /Length key"),
+        ),
+    ];
+
+    for (filename, expected_warning, obsolete_warning) in cases {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fixture = fixture_dir().join("compat").join(filename);
+        fs::write(
+            dir.path().join(filename),
+            fs::read(&fixture).expect("read tokenizer warning fixture"),
+        )
+        .expect("write tokenizer warning fixture into tempdir");
+
+        let output = run(&[filename], dir.path());
+        assert!(
+            output.status.success(),
+            "unexpected exit status for {filename}: {:?}; stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches(expected_warning).count(),
+            1,
+            "canonical warning must be emitted once for {filename}: {stderr}"
+        );
+        if let Some(obsolete_warning) = obsolete_warning {
+            assert!(
+                !stderr.contains(obsolete_warning),
+                "legacy page-content offset must not be emitted for {filename}: {stderr}"
+            );
+        }
+    }
+}
+
 fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offsets: Vec<u64> = vec![0];

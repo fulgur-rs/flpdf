@@ -1,14 +1,13 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::Path;
 
 use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
-use flpdf::pages::page_content_bytes;
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
-use flpdf::{Object, ObjectHandle, Pdf, PdfOpenOptions};
+use flpdf::{Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult};
 
 use crate::common::test_driver_program_name_bytes;
 use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning};
@@ -227,7 +226,7 @@ fn process(
         .map(|prepared| prepared.pages)
         .unwrap_or_default();
     for (pageno, page_ref) in page_refs.iter().enumerate() {
-        let content = page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
+        let content = canonical_page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
         let label = format!("PAGE {}", pageno + 1);
         dump_tokens(
             &content,
@@ -249,16 +248,15 @@ fn process(
 
     let object_refs = pdf.object_refs();
     for obj_ref in object_refs {
-        // Resolve the canonical handle first so qpdf's stream-recovery
-        // diagnostics are emitted exactly once with their ObjectRef context.
-        // The legacy borrowed Object below is retained only at the
-        // filters::decode_stream_data boundary, whose API is still
-        // &Dictionary-shaped. Because the canonical resolver has already
-        // registered the handle, this compatibility read materializes that
-        // resolved value instead of parsing and warning a second time.
+        // Page content is already resolved through the canonical handle path
+        // above. Reusing that state is important for damaged content streams:
+        // resolving the same object through the legacy compatibility path and
+        // then through the canonical path would replay qpdf's warnings.
         let stream_handle = pdf.get_object_handle(obj_ref);
-        pdf.resolve_object_handle(&stream_handle)
-            .map_err(|e| e.to_string())?;
+        if !stream_handle.is_resolved() {
+            pdf.resolve_object_handle(&stream_handle)
+                .map_err(|e| e.to_string())?;
+        }
         let Some(stream_dict) = stream_handle.as_stream_dict() else {
             continue;
         };
@@ -299,6 +297,74 @@ fn process(
     );
 
     Ok(())
+}
+
+/// Pipe page contents through canonical [`ObjectHandle`]s before tokenizing.
+///
+/// qpdf's `QPDFPageObjectHelper::pipeContents` resolves the page's content
+/// holders and stream framing through the same canonical object cache later
+/// walked by `getAllObjects`. Keeping that order here means a malformed page
+/// stream is not parsed once by the legacy `page_content_bytes` compatibility
+/// API and a second time while classifying object streams.
+fn canonical_page_content_bytes<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> FlpdfResult<Vec<u8>> {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    if !page.has_key(b"/Contents") {
+        return Ok(Vec::new());
+    }
+
+    let contents = page.get_key(b"/Contents");
+    let mut streams = Vec::new();
+    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams)?;
+
+    let mut output = Vec::new();
+    let mut need_newline = false;
+    for stream in streams {
+        let dictionary = stream
+            .as_stream_dict()
+            .ok_or_else(|| {
+                Error::Unsupported(format!("content object on page {page_ref} is not a stream"))
+            })?
+            .materialize()?;
+        let Object::Dictionary(dictionary) = dictionary else {
+            return Err(Error::Unsupported(format!(
+                "content object on page {page_ref} has no stream dictionary"
+            )));
+        };
+        let encoded = stream.get_raw_stream_data()?;
+        let decoded = filters::decode_stream_data(&dictionary, encoded.as_ref())?;
+        if need_newline {
+            output.push(b'\n');
+        }
+        need_newline = decoded.last().copied().unwrap_or(0) != b'\n';
+        output.extend_from_slice(&decoded);
+    }
+    Ok(output)
+}
+
+fn collect_canonical_content_streams<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+    page_ref: ObjectRef,
+    streams: &mut Vec<ObjectHandle>,
+) -> FlpdfResult<()> {
+    let (value, _) = pdf.resolve_object_handle_to_terminal_ref(value)?;
+    if value.as_stream_dict().is_some() {
+        streams.push(value);
+        return Ok(());
+    }
+    if let Some(items) = value.as_array() {
+        for item in items {
+            collect_canonical_content_streams(pdf, &item, page_ref, streams)?;
+        }
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "/Contents on page {page_ref} is not a stream or array"
+    )))
 }
 
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
