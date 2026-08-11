@@ -1765,7 +1765,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// qpdf passes `allow_bad = true` (`QPDF::readToken`, `:1536-1539`), so a
     /// *malformed* token is returned as `tt_bad` and likewise reported as the
     /// missing keyword. Keep that policy here so the canonical stream path
-    /// can enter its recovery arm and retain the token's absolute offset.
+    /// can enter its recovery arm. qpdf's `QPDFTokenizer::nextToken` records
+    /// the input position before it skips whitespace and comments
+    /// (`libqpdf/QPDFTokenizer.cc:926-961`); return that attempted-read
+    /// position rather than the later token start for the same diagnostic.
     fn read_token_from_input(&self) -> Result<(Token, u64)> {
         let start = self.tell()?;
         self.scan_forward(|bytes| {
@@ -1774,10 +1777,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let token = tokenizer.read_token(true, 0)?;
             Ok((token, tokenizer.position()))
         })
-        .map(|token| {
-            let offset = start.saturating_add(token.start as u64);
-            (token, offset)
-        })
+        .map(|token| (token, start))
     }
 
     /// Read one byte from the current position, or `None` at EOF.
@@ -2146,10 +2146,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
     }
 
     /// The `PatternFinder`/`findEndstream` pair used by qpdf's
-    /// `recoverStreamLength`. `findFirst` searches every occurrence of the
-    /// first character, including occurrences inside a rejected token, so a
-    /// failed candidate resumes at `candidate + 1` rather than after the
-    /// candidate token.
+    /// `recoverStreamLength`. `findFirst` first checks the complete `end`
+    /// prefix, so a byte that is not followed by `nd` never enters the
+    /// bounded tokenizer. A rejected full candidate still resumes at
+    /// `candidate + 1` rather than after the candidate token; the live input
+    /// rewinds within its buffer, crossing a buffer boundary only when that
+    /// is unavoidable.
     fn find_stream_recovery_terminator(&self, stream_offset: u64) -> Result<Option<(u64, u64)>> {
         let mut input = self.live_input();
         input.seek(stream_offset)?;
@@ -2163,7 +2165,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 continue;
             }
 
-            let (token, token_len, token_end) = read_stream_recovery_token(&mut input, byte)?;
+            let Some(next) = input.read_byte()? else {
+                return Ok(None);
+            };
+            if next != b'n' {
+                input.unread_byte()?;
+                continue;
+            }
+            let Some(next) = input.read_byte()? else {
+                return Ok(None);
+            };
+            if next != b'd' {
+                input.unread_byte()?;
+                input.unread_byte()?;
+                continue;
+            }
+
+            let (token, token_len, token_end) = read_stream_recovery_token(&mut input, b"end")?;
             if &token[..token_len] == b"endstream" {
                 return Ok(Some((candidate, token_end)));
             }
@@ -2171,7 +2189,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 return Ok(Some((candidate, candidate)));
             }
 
-            input.seek(candidate.saturating_add(1))?;
+            for _ in 1..token_len {
+                input.unread_byte()?;
+            }
         }
     }
 
@@ -2451,20 +2471,20 @@ impl<R: Read + Seek> ResolverLiveInput<'_, R> {
     }
 }
 
-/// qpdf's `findEndstream` reads each candidate with `readToken(input, 20)`.
-/// Recovery only needs to distinguish two word values, so retain at most the
-/// same twenty token bytes while leaving the live source at the equivalent
-/// post-token position. A delimiter is unread just as qpdf's
-/// `InputSource::fastUnread` does.
+/// qpdf's `findEndstream` reads each complete `end` candidate with
+/// `readToken(input, 20)`. Recovery only needs to distinguish two word values,
+/// so retain at most the same twenty token bytes while leaving the live source
+/// at the equivalent post-token position. A delimiter is unread just as
+/// qpdf's `InputSource::fastUnread` does.
 const STREAM_RECOVERY_TOKEN_LIMIT: usize = 20;
 
 fn read_stream_recovery_token<I: LiveInput>(
     input: &mut I,
-    first_byte: u8,
+    prefix: &[u8],
 ) -> Result<([u8; STREAM_RECOVERY_TOKEN_LIMIT], usize, u64)> {
     let mut token = [0; STREAM_RECOVERY_TOKEN_LIMIT];
-    token[0] = first_byte;
-    let mut token_len = 1;
+    token[..prefix.len()].copy_from_slice(prefix);
+    let mut token_len = prefix.len();
 
     loop {
         if token_len == STREAM_RECOVERY_TOKEN_LIMIT {
@@ -6116,16 +6136,22 @@ mod tests {
 
     #[test]
     fn stream_recovery_without_a_terminator_treats_the_payload_as_empty() {
-        let resolver = resolver_over(b"payload without a framing token".to_vec());
-        assert_eq!(
-            resolver
-                .recover_stream_length(0)
-                .expect("recovery without a terminator"),
-            0
-        );
-        assert!(resolver.repair_diagnostics().entries().iter().any(
-            |entry| entry.message == "unable to recover stream data; treating stream as empty"
-        ));
+        for payload in [b"abc".as_slice(), b"e", b"enx", b"end"] {
+            let resolver = resolver_over(payload.to_vec());
+            assert_eq!(
+                resolver
+                    .recover_stream_length(0)
+                    .expect("recovery without a terminator"),
+                0,
+                "payload {payload:?} must not produce a terminator"
+            );
+            assert!(resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .any(|entry| entry.message
+                    == "unable to recover stream data; treating stream as empty"));
+        }
     }
 
     #[test]
@@ -6467,6 +6493,7 @@ mod tests {
     struct CountingReader {
         inner: std::io::Cursor<Vec<u8>>,
         reads: usize,
+        seeks: usize,
     }
 
     impl CountingReader {
@@ -6474,6 +6501,7 @@ mod tests {
             Self {
                 inner: std::io::Cursor::new(bytes),
                 reads: 0,
+                seeks: 0,
             }
         }
     }
@@ -6487,6 +6515,7 @@ mod tests {
 
     impl std::io::Seek for CountingReader {
         fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.seeks += 1;
             self.inner.seek(position)
         }
     }
@@ -7672,8 +7701,8 @@ mod tests {
 
     #[test]
     fn canonical_stream_recovery_respects_qpdf_candidate_token_limit() {
-        let mut payload = b"e".to_vec();
-        payload.extend_from_slice(&[b'x'; 19]);
+        let mut payload = b"end".to_vec();
+        payload.extend_from_slice(&[b'x'; 17]);
         let mut body = b"2 0 obj\n<< /Length 0 >>\nstream\n".to_vec();
         body.extend_from_slice(&payload);
         body.extend_from_slice(b"endstream\nendobj\n");
@@ -7703,6 +7732,32 @@ mod tests {
             .entries()
             .iter()
             .any(|entry| entry.message == "recovered stream length: 20"));
+    }
+
+    #[test]
+    fn canonical_stream_recovery_does_not_seek_for_each_non_prefix_candidate() {
+        let payload = vec![b'e'; 96];
+        let mut body = b"2 0 obj\n<< /Length 0 >>\nstream\n".to_vec();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"\nendstream\nendobj\n");
+        let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_with_options(
+            CountingReader::new(bytes),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let before = pdf.resolver.with_reader_mut(|reader| reader.seeks);
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("recovery must scan a long non-prefix payload");
+
+        let seeks = pdf.resolver.with_reader_mut(|reader| reader.seeks) - before;
+        assert!(seeks < payload.len() / 2);
     }
 
     #[test]
@@ -7785,6 +7840,49 @@ mod tests {
         let attempted_offset =
             u64::try_from(stream_offset + 1).expect("fixture offset fits qpdf offset");
         let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("repair the bad framing length");
+
+        let diagnostics: Vec<_> = pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|entry| (entry.message.clone(), entry.offset))
+            .collect();
+        assert_eq!(
+            diagnostics.first(),
+            Some(&("expected endstream".to_owned(), Some(attempted_offset)))
+        );
+    }
+
+    #[test]
+    fn canonical_stream_diagnoses_framing_before_ignored_whitespace_and_comments() {
+        let body =
+            b"2 0 obj\n<< /Length 1 >>\nstream\nx \n% ignored\nnot-endstream\nendstream\nendobj\n";
+        let body_offset = b"%PDF-1.4\n".len() + b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".len();
+        let stream_offset = body_offset
+            + body
+                .windows(b"stream\n".len())
+                .position(|window| window == b"stream\n")
+                .expect("stream keyword")
+            + b"stream\n".len();
+        let attempted_offset =
+            u64::try_from(stream_offset + 1).expect("fixture offset fits qpdf offset");
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            body.to_vec(),
+        ]);
         let mut pdf = Pdf::open_mem_owned_with_options(
             bytes,
             crate::PdfOpenOptions {
@@ -7921,7 +8019,7 @@ mod tests {
                         .as_slice(),
                     &b"abc"[..]
                 );
-                assert_eq!(warnings, ["(object 2 0, offset 90): expected endobj"]);
+                assert_eq!(warnings, ["(object 2 0, offset 89): expected endobj"]);
             },
         );
     }
