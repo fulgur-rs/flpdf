@@ -161,6 +161,45 @@ fn pdf_with_need_appearances_and_unread_default_resources() -> Vec<u8> {
     out
 }
 
+/// A direct intermediate /Pages node whose /Kids array is an indirect holder.
+/// qpdf dereferences that holder through the document before classifying the
+/// child as a page.
+fn pdf_with_direct_pages_node_kids_holder() -> Vec<u8> {
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    let objects = [
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+        (
+            2,
+            b"<< /Type /Pages /Kids [<< /Type /NotPages /Kids 6 0 R /Count 1 >>] /Count 1 >>"
+                .as_slice(),
+        ),
+        (6, b"[7 0 R]".as_slice()),
+        (
+            7,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".as_slice(),
+        ),
+    ];
+    for (number, body) in objects {
+        offsets.insert(number, out.len() as u64);
+        out.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_start = out.len() as u64;
+    out.extend_from_slice(b"xref\n0 8\n0000000000 65535 f \n");
+    for number in 1..=7 {
+        match offsets.get(&number) {
+            Some(offset) => out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+            None => out.extend_from_slice(b"0000000000 00000 f \n"),
+        }
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n").as_bytes(),
+    );
+    out
+}
+
 // ---------------------------------------------------------------------------
 // getAllPages() / pushInheritedAttributesToPages()
 // ---------------------------------------------------------------------------
@@ -1551,6 +1590,38 @@ fn get_all_pages_traverses_a_direct_intermediate_pages_node() {
     assert!(
         matches!(kids.first(), Some(Object::Dictionary(_))),
         "qpdf leaves a direct intermediate /Pages dictionary direct"
+    );
+}
+
+#[test]
+fn get_all_pages_resolves_an_indirect_kids_holder_under_a_direct_pages_node() {
+    let bytes = pdf_with_direct_pages_node_kids_holder();
+    if Command::new("qpdf").arg("--version").output().is_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("kids-holder.pdf");
+        fs::write(&input_path, &bytes).unwrap();
+        let output = Command::new("qpdf")
+            .arg("--show-pages")
+            .arg(&input_path)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 3)),
+            "qpdf failed to inspect the indirect /Kids-holder fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("page 1: 7 0 R"),
+            "qpdf must dereference the indirect /Kids holder before page classification: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let mut pdf = open(bytes);
+    assert_eq!(
+        PageDocumentHelper::new(&mut pdf).get_all_pages().unwrap(),
+        vec![ObjectRef::new(7, 0)],
+        "direct-node children must use the canonical resolver for indirect /Kids holders"
     );
 }
 
