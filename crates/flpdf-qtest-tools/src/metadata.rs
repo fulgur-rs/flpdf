@@ -8,21 +8,27 @@
 //! Oracle sources: `qpdf/test_xref.cc:7-44` and
 //! `qpdf/test_parsedoffset.cc:13-140` from the pinned qpdf 11.9.0 tree.
 
-use flpdf::{Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result, XrefEntry};
+use flpdf::{
+    EncryptedError, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result, XrefEntry,
+};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Cursor;
+use std::io::{self, Write as _};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-fn open(path: &Path) -> Result<Pdf<Cursor<Vec<u8>>>> {
-    let bytes = std::fs::read(path).map_err(|source| Error::FileIo {
+fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
+    let file = std::fs::File::open(path).map_err(|source| Error::FileIo {
         operation: "open",
         path: path.to_path_buf(),
         source,
     })?;
-    Pdf::open_mem_owned_with_options(
-        bytes,
+    Pdf::open_with_options(
+        file,
         PdfOpenOptions {
             repair: true,
+            allow_weak_crypto: true,
             suppress_warnings: true,
             description: path.display().to_string(),
             ..PdfOpenOptions::default()
@@ -31,60 +37,84 @@ fn open(path: &Path) -> Result<Pdf<Cursor<Vec<u8>>>> {
 }
 
 /// Render an open/parse error in the shape emitted by qpdf's helper binaries.
-pub fn display_error(path: &Path, error: &Error) -> String {
+pub fn display_error(path: &Path, error: &Error) -> Vec<u8> {
+    let mut message = Vec::new();
     match error {
         Error::FileIo {
             operation,
             path,
             source,
         } => {
-            let message = source
+            let source_message = source
                 .to_string()
                 .split_once(" (os error ")
                 .map_or_else(|| source.to_string(), |(message, _)| message.to_owned());
-            format!("{operation} {}: {message}", path.display())
+            message.extend_from_slice(operation.as_bytes());
+            message.push(b' ');
+            append_path(&mut message, path);
+            message.extend_from_slice(b": ");
+            message.extend_from_slice(source_message.as_bytes());
         }
         Error::OpenFailure {
             source,
             diagnostics,
         } => {
-            let mut message = String::new();
             for diagnostic in diagnostics.entries() {
                 write_diagnostic(&mut message, path, diagnostic);
             }
-            match source.as_ref() {
-                Error::Parse { message: error, .. } => {
-                    writeln!(message, "{}: {error}", path.display())
-                        .expect("writing to String cannot fail");
-                }
-                other => {
-                    writeln!(message, "{}: {}", path.display(), other)
-                        .expect("writing to String cannot fail");
-                }
+            append_error_with_path(&mut message, path, source);
+            if message.last() == Some(&b'\n') {
+                message.pop();
             }
-            message.pop();
-            message
         }
-        other => other.to_string(),
+        Error::Encrypted(EncryptedError::BadPassword) => {
+            append_path(&mut message, path);
+            message.extend_from_slice(b": invalid password");
+        }
+        other => message.extend_from_slice(other.to_string().as_bytes()),
+    }
+    message
+}
+
+fn append_path(output: &mut Vec<u8>, path: &Path) {
+    #[cfg(unix)]
+    {
+        output.extend_from_slice(path.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        output.extend_from_slice(path.to_string_lossy().as_bytes());
     }
 }
 
-fn write_diagnostic(output: &mut String, path: &Path, diagnostic: &flpdf::Diagnostic) {
-    output.push_str("WARNING: ");
-    output.push_str(&path.display().to_string());
+fn append_error_with_path(output: &mut Vec<u8>, path: &Path, error: &Error) {
+    append_path(output, path);
+    output.extend_from_slice(b": ");
+    match error {
+        Error::Parse { message, .. } => output.extend_from_slice(message.as_bytes()),
+        Error::Encrypted(EncryptedError::BadPassword) => {
+            output.extend_from_slice(b"invalid password")
+        }
+        other => output.extend_from_slice(other.to_string().as_bytes()),
+    }
+}
+
+fn write_diagnostic(output: &mut Vec<u8>, path: &Path, diagnostic: &flpdf::Diagnostic) {
+    output.extend_from_slice(b"WARNING: ");
+    append_path(output, path);
     if diagnostic.message.starts_with('(') {
-        output.push(' ');
+        output.push(b' ');
     } else if let Some(offset) = diagnostic.offset {
-        write!(output, " (offset {offset}): ").expect("writing to String cannot fail");
+        output.extend_from_slice(format!(" (offset {offset}): ").as_bytes());
     } else {
-        output.push_str(": ");
+        output.extend_from_slice(b": ");
     }
-    output.push_str(&diagnostic.message);
-    output.push('\n');
+    output.extend_from_slice(diagnostic.message.as_bytes());
+    output.push(b'\n');
 }
 
-fn repair_diagnostics<R: std::io::Read + std::io::Seek>(path: &Path, pdf: &Pdf<R>) -> String {
-    let mut output = String::new();
+fn repair_diagnostics<R: std::io::Read + std::io::Seek>(path: &Path, pdf: &Pdf<R>) -> Vec<u8> {
+    let mut output = Vec::new();
     for diagnostic in pdf.repair_diagnostics().entries() {
         write_diagnostic(&mut output, path, diagnostic);
     }
@@ -92,14 +122,26 @@ fn repair_diagnostics<R: std::io::Read + std::io::Seek>(path: &Path, pdf: &Pdf<R
 }
 
 /// Format qpdf's `test_xref` output and return recovery warnings separately.
-pub fn format_xref_with_diagnostics(path: &Path) -> Result<(String, String)> {
+pub fn format_xref_with_diagnostics(path: &Path) -> Result<(String, Vec<u8>)> {
     let pdf = open(path)?;
-    let warnings = repair_diagnostics(path, &pdf);
     let mut output = String::new();
     for (object_ref, entry) in pdf.get_xref_table() {
         write_xref_entry(&mut output, object_ref, entry);
     }
+    let warnings = repair_diagnostics(path, &pdf);
     Ok((output, warnings))
+}
+
+/// Write helper output without converting diagnostics or paths through UTF-8.
+pub fn write_metadata_output(output: &str, warnings: &[u8]) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    stderr.write_all(warnings)?;
+    stderr.flush()?;
+    drop(stderr);
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(output.as_bytes())?;
+    stdout.flush()
 }
 
 fn write_xref_entry(output: &mut String, object_ref: ObjectRef, entry: XrefEntry) {
@@ -145,11 +187,8 @@ fn metadata_object_ref(object: &ObjectHandle) -> Result<ObjectRef> {
         .ok_or_else(|| Error::Internal("get_all_objects returned a direct object".to_owned()))
 }
 
-fn walk(object: &ObjectHandle, group: usize, groups: &mut Vec<Vec<ParsedObject>>) {
-    if groups.len() <= group {
-        groups.resize_with(group + 1, Vec::new);
-    }
-    groups[group].push(ParsedObject {
+fn walk(object: &ObjectHandle, group: u32, groups: &mut BTreeMap<u32, Vec<ParsedObject>>) {
+    groups.entry(group).or_default().push(ParsedObject {
         offset: object.get_parsed_offset(),
         description: object_description(object),
     });
@@ -162,7 +201,7 @@ fn walk(object: &ObjectHandle, group: usize, groups: &mut Vec<Vec<ParsedObject>>
         }
     } else if let Some(entries) = object.as_dictionary() {
         for item in entries.into_values() {
-            if !item.is_indirect() {
+            if !item.is_indirect() && !item.is_null() {
                 walk(&item, group, groups);
             }
         }
@@ -171,10 +210,10 @@ fn walk(object: &ObjectHandle, group: usize, groups: &mut Vec<Vec<ParsedObject>>
     }
 }
 
-fn stream_group(object_ref: ObjectRef, entry: Option<XrefEntry>) -> Result<usize> {
+fn stream_group(object_ref: ObjectRef, entry: Option<XrefEntry>) -> Result<u32> {
     match entry {
         Some(XrefEntry::Uncompressed { .. }) => Ok(0),
-        Some(XrefEntry::Compressed { stream, .. }) => Ok(stream as usize),
+        Some(XrefEntry::Compressed { stream, .. }) => Ok(stream),
         Some(XrefEntry::Free { .. }) => Err(Error::Internal(format!(
             "{}/{} xref entry is free",
             object_ref.number, object_ref.generation
@@ -186,16 +225,13 @@ fn stream_group(object_ref: ObjectRef, entry: Option<XrefEntry>) -> Result<usize
     }
 }
 
-fn render_parsed_groups(groups: &mut [Vec<ParsedObject>]) -> String {
+fn render_parsed_groups(groups: &mut BTreeMap<u32, Vec<ParsedObject>>) -> String {
     let mut output = String::new();
-    for (group, objects) in groups.iter_mut().enumerate() {
-        if objects.is_empty() {
-            continue;
-        }
+    for (group, objects) in groups.iter_mut() {
         objects.sort_by(|left, right| {
             (left.offset, &left.description).cmp(&(right.offset, &right.description))
         });
-        if group == 0 {
+        if *group == 0 {
             output.push_str("--- objects not in streams ---\n");
         } else {
             writeln!(output, "--- objects in stream {group} ---")
@@ -209,12 +245,11 @@ fn render_parsed_groups(groups: &mut [Vec<ParsedObject>]) -> String {
 }
 
 /// Format qpdf's `test_parsedoffset` output and return recovery warnings separately.
-pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, String)> {
+pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Vec<u8>)> {
     let mut pdf = open(path)?;
-    let warnings = repair_diagnostics(path, &pdf);
-    let xref = pdf.get_xref_table();
     let objects = pdf.get_all_objects()?;
-    let mut groups: Vec<Vec<ParsedObject>> = Vec::new();
+    let xref = pdf.get_xref_table();
+    let mut groups: BTreeMap<u32, Vec<ParsedObject>> = BTreeMap::new();
 
     for object in objects {
         let object_ref = metadata_object_ref(&object)?;
@@ -224,6 +259,7 @@ pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, St
 
     let mut output = render_parsed_groups(&mut groups);
     output.push_str("succeeded\n");
+    let warnings = repair_diagnostics(path, &pdf);
     Ok((output, warnings))
 }
 
@@ -235,7 +271,7 @@ mod tests {
     #[test]
     fn diagnostics_match_qpdf_path_and_offset_formatting() {
         let path = Path::new("input.pdf");
-        let mut output = String::new();
+        let mut output = Vec::new();
         write_diagnostic(
             &mut output,
             path,
@@ -248,8 +284,8 @@ mod tests {
         );
         assert_eq!(
             output,
-            "WARNING: input.pdf (object 1 0, offset 7): object warning\n\
-             WARNING: input.pdf (offset 12): xref warning\n"
+            b"WARNING: input.pdf (object 1 0, offset 7): object warning\n\
+              WARNING: input.pdf (offset 12): xref warning\n"
         );
 
         let mut diagnostics = Diagnostics::default();
@@ -264,9 +300,18 @@ mod tests {
         };
         assert_eq!(
             display_error(path, &error),
-            "WARNING: input.pdf (object 1 0, offset 7): object warning\n\
-             WARNING: input.pdf (offset 12): xref warning\n\
-             input.pdf: terminal failure"
+            b"WARNING: input.pdf (object 1 0, offset 7): object warning\n\
+              WARNING: input.pdf (offset 12): xref warning\n\
+              input.pdf: terminal failure"
+        );
+    }
+
+    #[test]
+    fn bad_password_error_uses_qpdf_path_wording() {
+        let error = Error::Encrypted(EncryptedError::BadPassword);
+        assert_eq!(
+            display_error(Path::new("secret.pdf"), &error),
+            b"secret.pdf: invalid password"
         );
     }
 
@@ -322,18 +367,55 @@ mod tests {
 
     #[test]
     fn parsed_group_renderer_skips_empty_stream_slots() {
-        let mut groups = vec![
-            Vec::new(),
-            Vec::new(),
+        let mut groups = BTreeMap::from([(
+            2,
             vec![ParsedObject {
                 offset: 4,
                 description: "offset = 4 (0x4), indirect 7/0, integer".to_owned(),
             }],
-        ];
+        )]);
         assert_eq!(
             render_parsed_groups(&mut groups),
             "--- objects in stream 2 ---\n\
              offset = 4 (0x4), indirect 7/0, integer\n"
+        );
+    }
+
+    #[test]
+    fn dictionary_walk_skips_direct_null_values() {
+        let object = ObjectHandle::dictionary(vec![
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/Value".to_vec(), ObjectHandle::integer(7)),
+        ]);
+        let mut groups = BTreeMap::new();
+        walk(&object, 0, &mut groups);
+
+        let descriptions: Vec<_> = groups[&0]
+            .iter()
+            .map(|object| object.description.as_str())
+            .collect();
+        assert_eq!(descriptions.len(), 2);
+        assert!(descriptions
+            .iter()
+            .all(|description| !description.ends_with(", null")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn display_error_preserves_non_utf8_path_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let name = OsString::from_vec(b"missing-\xff.pdf".to_vec());
+        let path = Path::new(name.as_os_str());
+        let error = Error::FileIo {
+            operation: "open",
+            path: path.to_path_buf(),
+            source: std::io::Error::from_raw_os_error(libc::ENOENT),
+        };
+        assert_eq!(
+            display_error(path, &error),
+            b"open missing-\xff.pdf: No such file or directory"
         );
     }
 }
