@@ -65,6 +65,24 @@ fn test_parsedoffset_walks_direct_children_and_formats_qpdf_offsets() {
 }
 
 #[test]
+fn test_parsedoffset_groups_objects_in_object_streams() {
+    Command::cargo_bin("test_parsedoffset")
+        .expect("test_parsedoffset binary")
+        .arg(fixture_path("compat/three-page-objstm.pdf"))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--- objects in stream 1 ---"))
+        .stdout(predicates::str::contains(
+            "offset = 45 (0x2d), indirect 2/0, dictionary",
+        ))
+        .stdout(predicates::str::contains(
+            "offset = 61 (0x3d), indirect 3/0, dictionary",
+        ))
+        .stdout(predicates::str::contains("succeeded\n"))
+        .stderr("");
+}
+
+#[test]
 fn metadata_helpers_match_qpdf_usage_contracts() {
     Command::cargo_bin("test_xref")
         .expect("test_xref binary")
