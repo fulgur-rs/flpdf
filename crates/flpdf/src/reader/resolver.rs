@@ -559,6 +559,14 @@ impl<R: Read + Seek> Drop for ResolveMark<'_, R> {
 /// [`DocumentResolver`] a document's handles hold a `Weak` to.
 pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     core: RefCell<ResolverCore<R>>,
+    /// Source line endings included by canonical stream-boundary recovery.
+    ///
+    /// The recovered length follows qpdf's `recoverStreamLength` coordinate
+    /// and therefore includes the line ending immediately before
+    /// `endstream`. That byte is source framing for an encrypted stream, not
+    /// ciphertext; retain the distinction until pipe time so identity streams
+    /// keep their source bytes while RC4/AES stages receive only ciphertext.
+    recovered_stream_eols: RefCell<BTreeMap<ObjectRef, crate::parser::RecoveredStreamEol>>,
     /// A `Weak` to this same allocation, so minting a canonical handle can
     /// attach the resolver the handle will later call back into.
     ///
@@ -693,6 +701,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 encryption_parameters: Rc::new(RefCell::new(None)),
                 last_offset: 0,
             }),
+            recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
             pdf_unique_id,
         })
@@ -1773,6 +1782,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 will_retry,
             ),
             StreamDecryption::Rc4(key) => {
+                let length = length.saturating_sub(self.recovered_stream_eol_len(object_ref));
                 let mut decrypt = PlRc4::new("RC4 stream decryption", pipeline, &key)?;
                 self.pipe_stream_data_to_pipeline(
                     object_ref,
@@ -1784,6 +1794,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 )
             }
             StreamDecryption::Aes(key) => {
+                let length = length.saturating_sub(self.recovered_stream_eol_len(object_ref));
                 let mut decrypt = PlAesPdf::new_decrypt("AES stream decryption", pipeline, &key)?;
                 self.pipe_stream_data_to_pipeline(
                     object_ref,
@@ -2710,16 +2721,27 @@ impl<R: Read + Seek> ResolverHandle<R> {
         warning?;
 
         let terminator = self.find_stream_recovery_terminator(stream_offset)?;
-        let (length, next_position) = match terminator {
-            Some((position, next_position)) => (
-                usize::try_from(position.saturating_sub(stream_offset)).map_err(|_| {
-                    // cov:ignore-start: u64-to-usize overflow is unreachable on supported 64-bit CI; retain the defensive error for narrower targets
-                    Error::parse(usize::MAX, "recovered stream length is out of range")
-                })?, // cov:ignore-end
-                Some(next_position),
-            ),
-            None => (0, None),
+        let (length, next_position, recovered_eol) = match terminator {
+            Some((position, next_position)) => {
+                let recovered_eol = self.recovered_stream_eol_at(stream_offset, position)?;
+                (
+                    usize::try_from(position.saturating_sub(stream_offset)).map_err(|_| {
+                        // cov:ignore-start: u64-to-usize overflow is unreachable on supported 64-bit CI; retain the defensive error for narrower targets
+                        Error::parse(usize::MAX, "recovered stream length is out of range")
+                    })?, // cov:ignore-end
+                    Some(next_position),
+                    recovered_eol,
+                )
+            }
+            None => (0, None, None),
         };
+        if let Some(eol) = recovered_eol {
+            self.recovered_stream_eols
+                .borrow_mut()
+                .insert(object_ref, eol);
+        } else {
+            self.recovered_stream_eols.borrow_mut().remove(&object_ref);
+        }
         if let Some(next_position) = next_position {
             self.seek(next_position)?;
         }
@@ -2735,6 +2757,35 @@ impl<R: Read + Seek> ResolverHandle<R> {
             self.push_stream_warning(object_ref, stream_offset, message)?;
         }
         Ok(length)
+    }
+
+    fn recovered_stream_eol_at(
+        &self,
+        stream_offset: u64,
+        data_end: u64,
+    ) -> Result<Option<crate::parser::RecoveredStreamEol>> {
+        if data_end <= stream_offset {
+            return Ok(None);
+        }
+        let start = data_end.saturating_sub(2).max(stream_offset);
+        let width = usize::try_from(data_end - start).unwrap_or(2).min(2);
+        self.seek(start)?;
+        let mut suffix = [0u8; 2];
+        let read = self.read(&mut suffix[..width])?;
+        self.seek(data_end)?;
+        Ok(match read {
+            2 if suffix == *b"\r\n" => Some(crate::parser::RecoveredStreamEol::CrLf),
+            1..=2 if suffix[read - 1] == b'\n' => Some(crate::parser::RecoveredStreamEol::Lf),
+            1..=2 if suffix[read - 1] == b'\r' => Some(crate::parser::RecoveredStreamEol::Cr),
+            _ => None,
+        })
+    }
+
+    fn recovered_stream_eol_len(&self, object_ref: ObjectRef) -> usize {
+        self.recovered_stream_eols
+            .borrow()
+            .get(&object_ref)
+            .map_or(0, |eol| eol.as_bytes().len())
     }
 
     /// qpdf's `damagedPDF(input, offset, message)` warning carries the
@@ -3657,6 +3708,39 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         )
+    }
+
+    #[test]
+    fn canonical_stream_recovery_identifies_the_included_line_ending() {
+        let recover = |source: &[u8], data_end: u64| {
+            let resolver = ResolverHandle::new_shared(
+                Cursor::new(source.to_vec()),
+                0,
+                BTreeMap::new(),
+                false,
+                false,
+                Diagnostics::default(),
+                ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+                0,
+            );
+            resolver
+                .recovered_stream_eol_at(0, data_end)
+                .expect("line-ending probe")
+        };
+
+        assert_eq!(
+            recover(b"payload\r\nendstream", 9),
+            Some(crate::parser::RecoveredStreamEol::CrLf)
+        );
+        assert_eq!(
+            recover(b"payload\nendstream", 8),
+            Some(crate::parser::RecoveredStreamEol::Lf)
+        );
+        assert_eq!(
+            recover(b"payload\rendstream", 8),
+            Some(crate::parser::RecoveredStreamEol::Cr)
+        );
+        assert_eq!(recover(b"endstream", 0), None);
     }
 
     /// AC6 case 4: a resolver on which no authentication step has run at all

@@ -220,6 +220,17 @@ fn tokenizer_reuses_canonical_page_stream_resolution_without_replaying_warnings(
                 "legacy page-content offset must not be emitted for {filename}: {stderr}"
             );
         }
+        if filename == "encrypted-recovered-eol.pdf" {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("12343: word: Q"),
+                "expected the recovered page content to end with Q: {stdout}"
+            );
+            assert!(
+                !stdout.contains("12345: word:"),
+                "recovered AES framing must not be tokenized as page content: {stdout}"
+            );
+        }
     }
 }
 
@@ -248,6 +259,45 @@ fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
     stream_obj.extend_from_slice(content);
     stream_obj.extend_from_slice(b"\nendstream");
     push_obj(&mut out, &mut offsets, &stream_obj);
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+fn build_pdf_with_page_contents_array_cycle() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 1 1] >>",
+    );
+    // Object 4 resolves to an array that refers to itself. The collector must
+    // stop on the active recursion path rather than growing the call stack
+    // indefinitely while still allowing repeated non-cyclic references.
+    push_obj(&mut out, &mut offsets, b"[4 0 R]");
 
     let xref_start = out.len() as u64;
     let total = offsets.len();
@@ -329,6 +379,34 @@ fn tokenizer_repairs_page_tree_and_clones_duplicate_leaf() {
     assert!(
         stdout.contains("--- BEGIN PAGE 2 ---"),
         "expected PAGE 2 for the cloned duplicate leaf, got: {stdout}"
+    );
+}
+
+#[test]
+fn tokenizer_bounds_recursive_page_contents_collection() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("contents_cycle.pdf"),
+        build_pdf_with_page_contents_array_cycle(),
+    )
+    .expect("write contents_cycle.pdf into tempdir");
+
+    let output = run(&["contents_cycle.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "recursive /Contents must not abort tokenization: status={:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--- BEGIN PAGE 1 ---"),
+        "expected the page section even when /Contents is cyclic: {stdout}"
+    );
+    assert!(
+        !stdout.contains("word: q"),
+        "a cyclic array must not fabricate a content stream: {stdout}"
     );
 }
 

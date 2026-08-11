@@ -3100,6 +3100,34 @@ impl ObjectHandle {
         )
     }
 
+    /// Return decoded stream data through the canonical source pipeline.
+    ///
+    /// This is qpdf's `QPDFObjectHandle::getStreamData`
+    /// (`libqpdf/QPDFObjectHandle.cc:1289-1292`) over the same
+    /// `QPDF_Stream::pipeStreamData` path used by page-content piping
+    /// (`libqpdf/QPDFObjectHandle.cc:1710-1722`). Unlike
+    /// [`Self::get_raw_stream_data`], this path decrypts document-backed
+    /// streams before applying their filters, so recovered stream framing is
+    /// handled at the source boundary rather than being exposed as decoded
+    /// page content.
+    pub fn get_stream_data(&self, decode_level: DecodeLevel) -> Result<Rc<Vec<u8>>> {
+        let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
+        let mut filtering_attempted = false;
+        if !self.pipe_stream_data(
+            &mut buffer,
+            &mut filtering_attempted,
+            0,
+            decode_level,
+            false,
+            false,
+        )? {
+            return Err(Error::Unsupported(
+                "error getting decoded stream data".to_owned(),
+            ));
+        }
+        Ok(Rc::new(buffer.take_buffer()?))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pipe_stream_data_inner(
         &self,

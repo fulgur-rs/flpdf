@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::fs;
@@ -7,7 +8,9 @@ use std::path::Path;
 use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
-use flpdf::{Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult};
+use flpdf::{
+    DecodeLevel, Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult,
+};
 
 use crate::common::test_driver_program_name_bytes;
 use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning};
@@ -318,29 +321,18 @@ fn canonical_page_content_bytes<R: Read + Seek>(
 
     let contents = page.get_key(b"/Contents");
     let mut streams = Vec::new();
-    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams)?;
+    let mut active_arrays = BTreeSet::new();
+    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams, &mut active_arrays)?;
 
     let mut output = Vec::new();
     let mut need_newline = false;
     for stream in streams {
-        let dictionary = stream
-            .as_stream_dict()
-            .ok_or_else(|| {
-                Error::Unsupported(format!("content object on page {page_ref} is not a stream"))
-            })?
-            .materialize()?;
-        let Object::Dictionary(dictionary) = dictionary else {
-            return Err(Error::Unsupported(format!(
-                "content object on page {page_ref} has no stream dictionary"
-            )));
-        };
-        let encoded = stream.get_raw_stream_data()?;
-        let decoded = filters::decode_stream_data(&dictionary, encoded.as_ref())?;
+        let decoded = stream.get_stream_data(DecodeLevel::Specialized)?;
         if need_newline {
             output.push(b'\n');
         }
         need_newline = decoded.last().copied().unwrap_or(0) != b'\n';
-        output.extend_from_slice(&decoded);
+        output.extend_from_slice(decoded.as_ref());
     }
     Ok(output)
 }
@@ -350,21 +342,38 @@ fn collect_canonical_content_streams<R: Read + Seek>(
     value: &ObjectHandle,
     page_ref: ObjectRef,
     streams: &mut Vec<ObjectHandle>,
+    active_arrays: &mut BTreeSet<ObjectRef>,
 ) -> FlpdfResult<()> {
-    let (value, _) = pdf.resolve_object_handle_to_terminal_ref(value)?;
-    if value.as_stream_dict().is_some() {
-        streams.push(value);
-        return Ok(());
-    }
-    if let Some(items) = value.as_array() {
-        for item in items {
-            collect_canonical_content_streams(pdf, &item, page_ref, streams)?;
+    let (value, terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(value)?;
+    let array_ref = terminal_ref.filter(|_| value.as_array().is_some());
+    if let Some(array_ref) = array_ref {
+        if !active_arrays.insert(array_ref) {
+            return Ok(());
         }
-        return Ok(());
     }
-    Err(Error::Unsupported(format!(
-        "/Contents on page {page_ref} is not a stream or array"
-    )))
+
+    let result = (|| {
+        if value.as_stream_dict().is_some() {
+            streams.push(value);
+            return Ok(());
+        }
+
+        if let Some(items) = value.as_array() {
+            for item in items {
+                collect_canonical_content_streams(pdf, &item, page_ref, streams, active_arrays)?;
+            }
+            return Ok(());
+        }
+
+        Err(Error::Unsupported(format!(
+            "/Contents on page {page_ref} is not a stream or array"
+        )))
+    })();
+
+    if let Some(array_ref) = array_ref {
+        active_arrays.remove(&array_ref);
+    }
+    result
 }
 
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
