@@ -147,8 +147,8 @@ fn test_parsedoffset_rejects_an_enumerated_object_missing_from_xref() {
 #[test]
 fn test_parsedoffset_preserves_repair_warnings_before_post_enumeration_failure() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let mut input_bytes = fs::read(fixture_path("test_driver/repairable_input.pdf"))
-        .expect("read repairable input");
+    let mut input_bytes =
+        fs::read(fixture_path("test_driver/repairable_input.pdf")).expect("read repairable input");
     let marker = b"/QTest true >>";
     let marker_start = input_bytes
         .windows(marker.len())
