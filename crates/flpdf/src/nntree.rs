@@ -5,7 +5,7 @@
 
 use crate::pdf_string::{new_unicode_string, normalized_utf8_value, utf8_value};
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
@@ -579,6 +579,105 @@ impl NameTreeCursor {
 pub struct NumberTree {
     inner: NNTree<NumberKey>,
     cursor_owner: Arc<()>,
+}
+
+/// Read-only number-tree view over the canonical [`ObjectHandle`] graph.
+///
+/// The existing [`NumberTree`] is the legacy materialized-`Object` mutation
+/// surface. Page-label lookup needs qpdf's value identity instead: a `/Nums`
+/// value must remain the same indirect handle when the helper copies `/S` and
+/// `/P` into its reconstructed dictionary. This view owns only the root handle
+/// and walks `/Kids`/`/Nums` without crossing the legacy resolver boundary.
+pub(crate) struct HandleNumberTree {
+    root: ObjectHandle,
+    max_depth: usize,
+}
+
+impl HandleNumberTree {
+    pub(crate) fn new(root: ObjectHandle, max_depth: usize) -> Self {
+        Self { root, max_depth }
+    }
+
+    /// Return sorted explicit `/Nums` entries, preserving each value handle.
+    pub(crate) fn entries<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<BTreeMap<i64, ObjectHandle>> {
+        let mut entries = BTreeMap::new();
+        Self::collect(pdf, self.root.clone(), 0, self.max_depth, &mut entries)?;
+        Ok(entries)
+    }
+
+    /// Find the value at `key`, or the closest explicit key below it.
+    pub(crate) fn find_object_at_or_below<R: Read + Seek>(
+        &self,
+        pdf: &mut Pdf<R>,
+        key: i64,
+    ) -> Result<Option<(ObjectHandle, i64)>> {
+        let entries = self.entries(pdf)?;
+        let Some((actual_key, value)) = entries.range(..=key).next_back() else {
+            return Ok(None);
+        };
+        let offset = key.checked_sub(*actual_key).ok_or_else(|| {
+            Error::Unsupported("number-tree at-or-below offset overflow".to_string())
+        })?;
+        Ok(Some((value.clone(), offset)))
+    }
+
+    pub(crate) fn has_index<R: Read + Seek>(&self, pdf: &mut Pdf<R>, key: i64) -> Result<bool> {
+        Ok(self.entries(pdf)?.contains_key(&key))
+    }
+
+    fn collect<R: Read + Seek>(
+        pdf: &mut Pdf<R>,
+        node: ObjectHandle,
+        depth: usize,
+        max_depth: usize,
+        entries: &mut BTreeMap<i64, ObjectHandle>,
+    ) -> Result<()> {
+        if depth > max_depth {
+            return Err(Error::Unsupported(format!(
+                "number-tree exceeds maximum depth of {max_depth}"
+            )));
+        }
+
+        let node = pdf.resolve_object_handle_to_terminal(&node)?;
+        let Some(dictionary) = node.try_as_dictionary()? else {
+            return Ok(());
+        };
+
+        if let Some(kids) = dictionary.get(b"Kids".as_slice()) {
+            if let Some(kids) = kids.try_as_array()? {
+                for kid in kids {
+                    Self::collect(pdf, kid, depth + 1, max_depth, entries)?;
+                }
+            }
+            return Ok(());
+        }
+
+        let Some(nums) = dictionary.get(b"Nums".as_slice()) else {
+            return Ok(());
+        };
+        let Some(items) = nums.try_as_array()? else {
+            return Ok(());
+        };
+        if items.len() % 2 != 0 {
+            return Err(Error::parse(
+                0,
+                "Name/Number tree node: items array is too short",
+            ));
+        }
+        for pair in items.chunks_exact(2) {
+            let Some(key) = pair[0].try_as_integer()? else {
+                return Err(Error::parse(
+                    0,
+                    "Name/Number tree node: key is not an integer",
+                ));
+            };
+            entries.insert(key, pair[1].clone());
+        }
+        Ok(())
+    }
 }
 
 impl NumberTree {

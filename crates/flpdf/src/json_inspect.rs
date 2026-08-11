@@ -1202,7 +1202,7 @@ pub fn build_pages_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, Con
 fn label_dict_to_json(dict: &Dictionary) -> Result<Json, ConvertError> {
     // Derive /S, /P, /St via the shared (non-resolving) LabelRange parser to keep
     // a single source of truth. `from_dict` is byte-for-byte equivalent to the
-    // prior inline extraction; use it (not `from_dict_resolved`) to preserve the
+    // prior inline extraction; use it (not the live ObjectHandle route) to preserve the
     // existing non-resolving JSON behavior.
     let range = crate::page_label_document_helper::LabelRange::from_dict(dict);
     let style = match range.style.to_name() {

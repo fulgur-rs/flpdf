@@ -25,7 +25,7 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 | §4 | `QPDF_optimization.cc` | 🔀 `plan.rs` に埋没 | ✅ `optimization.rs` | `qxba.9.3` / `.9.4` |
 | §10 | `BitStream.cc` / `BitWriter.cc` | 🔀 `hint_stream.rs` に埋没 | ✅ `bit_stream.rs` / `bit_writer.rs` | `qxba.9.1` |
 
-**(b) 未完成の部品が ✅ になっていた 3 行 → 🔀**
+**(b) 未完成の部品が ✅ になっていた 2 行 → 🔀**
 
 いずれもモジュール doc 自身が未完成を申告しており、責務境界が一致しているとは
 言えない。D4 索引でも `correspondence` に分類されている。
@@ -34,7 +34,6 @@ pre-v1.0 の byte-identical 模倣方針（`CLAUDE.md`）に対し、flpdf の�
 |---|---|---|---|
 | §7 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | `filespec_helper.rs` | 「partial helper surface; 公開 API は未完成」 |
 | §7 | `QPDFEmbeddedFileDocumentHelper.cc` | `embedded_files.rs` | 「完全な公開ヘルパー境界を持たない」 |
-| §7 | `QPDFPageLabelDocumentHelper.cc` | `page_label_document_helper.rs` | 「公開 API 未完成 + single-implementation 監査未了」 |
 
 **(c) 責務の帰属誤り（§8 / §9）**
 
@@ -238,7 +237,7 @@ linearize 専用。`flpdf-g6hb` が必要とする `getCompressibleObjGens` は
 | `QPDFPageDocumentHelper.cc` | 158 | `page_document_helper.rs`(236) + `page_extract.rs`(`extract_pages`/`extract_page`) + `page_merge.rs`(`merge_documents`)。両モジュールとも `Pdf::empty()` へ委譲（`emptyPDF()` + `addPage()` の library-level 経路、doc に明記） | 🔀 `emptyPDF()` 自体（`QPDF.cc:34-51,290-293`）の canonical 実装は `engine.rs`(475: `Pdf::empty()` は `open_mem_owned` へ委譲し、両者で `emptyPDF()` / `processMemoryFile()` 相当の construction path を担う)。⚪ qpdf の `emptyPDF()` は default-construct 済み `QPDF` を遅延初期化する `void` メンバー関数だが、flpdf の `Pdf` に「未初期化」状態が無いため static factory（`Result<Self>` を返す）に置き換えている。バイト列・parse 経路（`open_mem_owned` = `processMemoryFile` 相当）は同一。QPDFJob 相当のバージョン蓄積（`max_input_version`）は library level のこれらの関数ではなく `job/`（`flpdf-jq0z`）が担う想定 |
 | `QPDFAnnotationObjectHelper.cc` | 226 | `annotation_helper.rs` + `page_annotation_enum.rs`(249) | 🔀 |
 | `QPDFOutlineDocumentHelper` / `QPDFOutlineObjectHelper` | 198 | `outline_document_helper.rs`(1499) + `outline.rs`(145) | ✅ |
-| `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(934) | 🔀 モジュール doc 自身が「公開 API 未完成 + single-implementation 監査未了」と申告。D1 / D2 未達 |
+| `QPDFPageLabelDocumentHelper.cc` | 134 | `page_label_document_helper.rs`(1037) + `nntree.rs` (`HandleNumberTree`) | ✅ canonical ObjectHandle route for `hasPageLabels`, `getLabelForPage`, `getLabelsForPageRange`, and `pageLabelDict`; typed page-operation adapters and JSON migration remain downstream |
 | `QPDFNameTreeObjectHelper` / `QPDFNumberTreeObjectHelper` / `NNTree.cc` | 1394 | `nntree.rs`（shared engine）+ `name_number_tree.rs`（compatibility wrapper）+ consumer adapters | ✅ |
 | `QPDFEmbeddedFileDocumentHelper.cc` | 122 | `embedded_files.rs`(678) | 🔀 モジュール doc 自身が「完全な公開ヘルパー境界を持たない」と申告。D1 未達 |
 | `QPDFFileSpecObjectHelper` / `QPDFEFStreamObjectHelper` | 280 | `filespec_helper.rs`(1324) | 🔀 モジュール doc 自身が「partial helper surface; 公開 API は未完成」と申告。D1 未達。なお `json_inspect.rs` が同じ責務を再実装しているため D2 も未達（`flpdf-q2fo` で解消） |
