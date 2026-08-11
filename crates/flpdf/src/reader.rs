@@ -1225,6 +1225,8 @@ impl<R: Read + Seek> Pdf<R> {
         // make a later resolve of this same ref keep observing the value
         // from *before* this call.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         let handle = self.get_object_handle(object_ref);
         let lifted = self.lift_for_set_object(&object, &handle);
         match lifted {
@@ -1258,6 +1260,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // holds.
                 self.legacy_materialized_memo
                     .insert(object_ref, object.clone());
+                self.legacy_materialized_replacement_refs.insert(object_ref);
             }
         }
 
@@ -1336,6 +1339,8 @@ impl<R: Read + Seek> Pdf<R> {
         // (cache already `Missing`, handle still `NotYetResolved`) would
         // leave stale compatibility data behind.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         self.handle_mutated_object_refs.remove(&object_ref);
         self.get_object_handle(object_ref).set_missing();
 
@@ -1650,6 +1655,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         self.mark_object_handle_mutated(object_ref);
         Ok(())
     }
@@ -1804,6 +1811,8 @@ impl<R: Read + Seek> Pdf<R> {
         // bridge. Discard any snapshot previously returned by resolve so the
         // next resolve and the writer materialize the changed live handle.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         self.handle_mutated_object_refs.insert(object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
@@ -1836,19 +1845,20 @@ impl<R: Read + Seek> Pdf<R> {
 
     fn reconcile_legacy_materialized_memos(&mut self) -> Result<()> {
         let pending: Vec<(ObjectRef, Object)> = self
-            .legacy_materialized_memo
+            .legacy_materialized_replacement_refs
             .iter()
-            .map(|(object_ref, object)| (*object_ref, object.clone()))
+            .filter_map(|object_ref| {
+                self.legacy_materialized_memo
+                    .get(object_ref)
+                    .cloned()
+                    .map(|object| (*object_ref, object))
+            })
             .collect();
 
         for (object_ref, replacement) in pending {
             let Some(handle) = self.resolver.registered_handle(object_ref) else {
                 continue;
             };
-            if handle.materialize()? == replacement {
-                continue;
-            }
-
             // `set_object`'s ordinary lift is bounded by MAX_INLINE_DEPTH,
             // while a value that already parsed successfully can be valid up
             // to MAX_PARSE_DEPTH. Rebuild the canonical value at that looser
@@ -1866,6 +1876,8 @@ impl<R: Read + Seek> Pdf<R> {
             handle.clear_description();
             handle.reset_parsed_offset();
             self.legacy_materialized_memo.remove(&object_ref);
+            self.legacy_materialized_replacement_refs
+                .remove(&object_ref);
         }
         Ok(())
     }
@@ -7801,6 +7813,44 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.object_ref() == Some(object_ref))
             .expect("replacement object remains enumerated");
+        assert_eq!(
+            found
+                .materialize()
+                .expect("materialize canonical replacement"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_a_deep_replacement_without_reading_old_stream_data() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open(ReadFailingCursor::new(bytes)).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve the original stream handle");
+        assert!(
+            handle.as_stream_data().is_none(),
+            "source stream data must remain lazy before reconciliation"
+        );
+
+        let mut replacement = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement.clone());
+        pdf.resolver
+            .with_reader_mut(|reader| reader.fail_reads = true);
+
+        let found = pdf
+            .get_all_objects()
+            .expect("reconcile the replacement without reading the old stream")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement handle is enumerated");
         assert_eq!(
             found
                 .materialize()

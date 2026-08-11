@@ -116,6 +116,12 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// [`Pdf::delete_object`] so the next resolve re-derives from the
     /// updated handle.
     pub(crate) legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
+    /// Entries in [`legacy_materialized_memo`] that are authoritative
+    /// caller-supplied replacements which still need to be lifted into the
+    /// canonical handle graph. Compatibility snapshots populated by
+    /// [`Pdf::resolve_borrowed`] are deliberately not included: reconciling
+    /// those must not materialize a lazy source stream just to compare it.
+    pub(crate) legacy_materialized_replacement_refs: BTreeSet<ObjectRef>,
     pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file

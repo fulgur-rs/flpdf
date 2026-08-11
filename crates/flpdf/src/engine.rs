@@ -156,6 +156,7 @@ impl<R: Read + Seek> Pdf<R> {
             foreign_object_maps: BTreeMap::new(),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
+            legacy_materialized_replacement_refs: BTreeSet::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             legacy_resolution_state_synced: loaded_state.already_reconstructed,
