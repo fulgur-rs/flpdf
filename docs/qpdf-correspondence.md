@@ -113,6 +113,15 @@ PR #613/#614 で実害を出しており、地図が誤ったままだと後続�
 
 ---
 
+### qtest metadata consumers (2026-08-12)
+
+`crates/flpdf-qtest-tools/src/metadata.rs` ports the pinned qpdf 11.9.0
+`qpdf/test_xref.cc:7-44` and `qpdf/test_parsedoffset.cc:13-140` helpers as
+thin consumers of `Pdf::get_xref_table`, `Pdf::get_all_objects`, and
+`ObjectHandle::get_parsed_offset`. It deliberately owns only grouping,
+sorting, formatting, and qpdf-shaped diagnostics; parsing, xref construction,
+resolution, and provenance stay in `flpdf`.
+
 ## 1. オブジェクトモデル
 
 | qpdf | 行 | flpdf | 状態 |

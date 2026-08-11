@@ -33,6 +33,14 @@ path = "src/bin/unicode_filenames.rs"
 name = "flpdf-test-tokenizer"
 path = "src/bin/tokenizer.rs"
 
+[[bin]]
+name = "test_xref"
+path = "src/bin/test_xref.rs"
+
+[[bin]]
+name = "test_parsedoffset"
+path = "src/bin/test_parsedoffset.rs"
+
 [lib]
 name = "flpdf_qtest_tools"
 path = "src/lib.rs"
