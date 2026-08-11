@@ -2333,8 +2333,11 @@ impl ObjectHandle {
     /// a logic error for a foreign or destroyed item. `Error::Internal` is the
     /// crate's logic-error boundary. A contextless qpdf warning is likewise
     /// returned as the existing `type_warning`/`object_warning` error.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+    /// This remains public because qpdf exposes the same live mutation on
+    /// `QPDFObjectHandle`; external canonical consumers must not replace an
+    /// indirect array through its parent dictionary or materialize it into
+    /// the legacy [`crate::Object`] model.
+    pub fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to set item")? {
             return Ok(());
         }
@@ -2366,8 +2369,7 @@ impl ObjectHandle {
     /// are then checked and attached one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
+    pub fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
             return Ok(());
         }
@@ -2409,8 +2411,7 @@ impl ObjectHandle {
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
     /// ownership or changing the array.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+    pub fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
             return Ok(());
         }
@@ -2443,8 +2444,7 @@ impl ObjectHandle {
 
     /// qpdf's `insertItemAndGetNew`: return the supplied handle after the
     /// same insertion/warning/ownership path as [`Self::insert_array_item`].
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn insert_array_item_and_get_new(
+    pub fn insert_array_item_and_get_new(
         &self,
         index: usize,
         value: ObjectHandle,
@@ -2455,8 +2455,7 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
+    pub fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
             return Ok(());
         }
@@ -2478,19 +2477,14 @@ impl ObjectHandle {
 
     /// qpdf's `appendItemAndGetNew`: return the supplied handle after the
     /// same append/warning/ownership path as [`Self::append_array_item`].
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn append_array_item_and_get_new(
-        &self,
-        value: ObjectHandle,
-    ) -> Result<ObjectHandle> {
+    pub fn append_array_item_and_get_new(&self, value: ObjectHandle) -> Result<ObjectHandle> {
         self.append_array_item(value.clone())?;
         Ok(value)
     }
 
     /// Erase one live array item, porting qpdf's `eraseItem`
     /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn erase_array_item(&self, index: usize) -> Result<()> {
+    pub fn erase_array_item(&self, index: usize) -> Result<()> {
         self.erase_array_item_and_get_old(index).map(|_| ())
     }
 
@@ -2498,8 +2492,7 @@ impl ObjectHandle {
     /// qpdf's `eraseItemAndGetOld` (`libqpdf/QPDFObjectHandle.cc:948-955`).
     /// Invalid positions and non-array receivers return a fresh null after
     /// emitting the corresponding qpdf warning.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
+    pub fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
         if !self.prepare_array_mutation("ignoring attempt to erase item")? {
             return Ok(ObjectHandle::null());
         }
