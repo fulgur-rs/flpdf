@@ -4851,6 +4851,36 @@ mod tests {
     }
 
     #[test]
+    fn edge_limits_follow_redirected_boundary_kids() {
+        let mut pdf = empty_pdf();
+        let holder_ref = ObjectRef::new(80, 0);
+        let terminal_ref = ObjectRef::new(81, 0);
+        pdf.set_object(
+            terminal_ref,
+            name_leaf(&[(b"alpha", 1)], Some((b"alpha", b"alpha"))),
+        );
+        pdf.set_object(holder_ref, Object::Reference(terminal_ref));
+
+        let mut parent = Dictionary::new();
+        parent.insert("Kids", Object::Array(vec![Object::Reference(holder_ref)]));
+        let parent = live_dictionary(&mut pdf, parent);
+        let tree = NNTree::<NameKey>::new(Object::Null, false);
+        let (first, last) = tree
+            .edge_limits(&mut pdf, &parent)
+            .unwrap()
+            .expect("redirected boundary kid has limits");
+
+        assert_eq!(
+            resolved_key::<NameKey, _>(&mut pdf, &first).unwrap(),
+            Some(b"alpha".to_vec())
+        );
+        assert_eq!(
+            resolved_key::<NameKey, _>(&mut pdf, &last).unwrap(),
+            Some(b"alpha".to_vec())
+        );
+    }
+
+    #[test]
     fn split_promotes_root_and_recursively_splits_parent_in_qpdf_order() {
         let mut pdf = empty_pdf();
         let mut root = Dictionary::new();
