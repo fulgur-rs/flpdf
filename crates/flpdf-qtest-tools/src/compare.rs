@@ -5,12 +5,19 @@
 //! when they differ, or `Err(flpdf::Error)` when a stream decode fails —
 //! matching qpdf's throw-on-decode-failure semantics, which the CLI turns
 //! into a stderr message + exit 2 with NO stdout dump.
+//!
+//! Oracle: qpdf 11.9.0 `compare-for-test/qpdf-test-compare.cc:46-105`.
+//! `unparseResolved` and null-entry suppression are defined by
+//! `libqpdf/QPDFObjectHandle.cc:1575-1593` and
+//! `libqpdf/QPDF_Dictionary.cc:59-69`.
 
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
-use flpdf::{Dictionary, Object, Pdf};
+use flpdf::{Dictionary, Object, ObjectHandle, Pdf};
 
-/// Compare two resolved [`Object`]s the way qpdf's `qpdf-test-compare` does.
+/// Compare two canonical [`ObjectHandle`]s the way qpdf's
+/// `qpdf-test-compare` does.
 ///
 /// Returns `Ok("")` when they match, `Ok("<label>: <reason>")` when they
 /// differ. `reason` is one of qpdf's fixed set: `different types`, `object
@@ -22,19 +29,11 @@ use flpdf::{Dictionary, Object, Pdf};
 /// `getStreamData()` and is caught by `main()` as an exit-2 error printed
 /// to stderr (with no stdout output).
 ///
-/// `actual_pdf` / `expected_pdf` are the source documents each object came
+/// `actual_pdf` / `expected_pdf` are the source documents each handle came
 /// from; the stream branch needs them to resolve indirect `/Filter`,
-/// `/DecodeParms`, and `/Type` values (qpdf's `QPDFObjectHandle::isName`
-/// auto-dereferences, so a filter chain given as `/Filter 4 0 R` — where
-/// object `4 0` is `/FlateDecode` — must still route through decompress).
-/// The non-stream branch ignores them.
-///
-/// Non-stream objects are compared by their [`Object::write_pdf`] bytes,
-/// which is the equivalent of qpdf's `unparseResolved()` on an already-
-/// resolved handle: nested [`Object::Reference`]s render as `N G R` and are
-/// not further dereferenced. Comparison by write-bytes (not [`PartialEq`])
-/// matches qpdf's `unparse`-based check — e.g. two "reals" that serialize
-/// the same are treated as equal even when their enum discriminants differ.
+/// `/DecodeParms`, and `/Type` values. Non-stream objects are compared by
+/// `ObjectHandle::unparse_resolved`, which is qpdf's `unparseResolved()`
+/// shape: nested indirect handles render as `N G R` and are not walked.
 ///
 /// Stream objects are compared by (a) their dictionaries with `/Length`
 /// stripped, then (b) their data — skipped when `/Type == /XRef`,
@@ -42,8 +41,8 @@ use flpdf::{Dictionary, Object, Pdf};
 /// `/FlateDecode` appears in `/Filter`, otherwise raw.
 pub fn compare_objects<A, E>(
     label: &str,
-    act: &Object,
-    exp: &Object,
+    act: &ObjectHandle,
+    exp: &ObjectHandle,
     actual_pdf: &mut Pdf<A>,
     expected_pdf: &mut Pdf<E>,
 ) -> flpdf::Result<String>
@@ -51,17 +50,15 @@ where
     A: Read + Seek,
     E: Read + Seek,
 {
-    if type_code(act) != type_code(exp) {
+    let act = actual_pdf.resolve_object_handle_to_terminal(act)?;
+    let exp = expected_pdf.resolve_object_handle_to_terminal(exp)?;
+    if act.type_code() != exp.type_code() {
         return Ok(format!("{label}: different types"));
     }
-    if let (Object::Stream(a_s), Object::Stream(e_s)) = (act, exp) {
-        return compare_streams(label, a_s, e_s, actual_pdf, expected_pdf);
+    if act.as_stream_dict().is_some() {
+        return compare_streams(label, &act, &exp, actual_pdf, expected_pdf);
     }
-    let mut a = Vec::new();
-    act.write_pdf(&mut a);
-    let mut e = Vec::new();
-    exp.write_pdf(&mut e);
-    if a != e {
+    if act.unparse_resolved() != exp.unparse_resolved() {
         return Ok(format!("{label}: object contents differ"));
     }
     Ok(String::new())
@@ -69,8 +66,8 @@ where
 
 fn compare_streams<A, E>(
     label: &str,
-    a_s: &flpdf::Stream,
-    e_s: &flpdf::Stream,
+    act: &ObjectHandle,
+    exp: &ObjectHandle,
     actual_pdf: &mut Pdf<A>,
     expected_pdf: &mut Pdf<E>,
 ) -> flpdf::Result<String>
@@ -78,127 +75,171 @@ where
     A: Read + Seek,
     E: Read + Seek,
 {
-    // Strip /Length before dict compare (Length necessarily differs between
-    // two runs whose compressed payload differs — even for identical decoded
-    // content). Cloning the dict is unavoidable (we need &mut Dictionary to
-    // strip, but only own &Stream); the stream's `data` payload is NOT
-    // cloned by this — it lives in `Stream.data`, outside the dict.
-    let mut a_dict = a_s.dict.clone();
-    let mut e_dict = e_s.dict.clone();
-    a_dict.remove(b"Length");
-    e_dict.remove(b"Length");
+    let act_dict = act
+        .as_stream_dict()
+        .ok_or_else(|| flpdf::Error::Internal("actual object lost its stream dictionary".into()))?
+        .shallow_copy()?;
+    let exp_dict = exp
+        .as_stream_dict()
+        .ok_or_else(|| flpdf::Error::Internal("expected object lost its stream dictionary".into()))?
+        .shallow_copy()?;
+    act_dict.remove_key(b"/Length");
+    exp_dict.remove_key(b"/Length");
 
-    // Resolve one-level indirect refs for the keys the stream comparison
-    // actually inspects (/Filter, /DecodeParms, /Type). qpdf's
-    // `QPDFObjectHandle::isName()` and `getStreamData()` auto-dereference;
-    // flpdf's accessors and `filters::decode_stream_data` do not, so we
-    // resolve here to keep the detect-then-decode pipeline consistent.
-    resolve_stream_keys(&mut a_dict, actual_pdf)?;
-    resolve_stream_keys(&mut e_dict, expected_pdf)?;
-
-    // Detect /XRef and /FlateDecode against `&a_dict` BEFORE moving it into
-    // Object::Dictionary for serialization — avoids a second clone.
-    let is_xref = is_xref_stream(&a_dict);
-    let uncompress = filter_uses_flatedecode(&a_dict);
-
-    let mut a_dict_bytes = Vec::new();
-    Object::Dictionary(a_dict.clone()).write_pdf(&mut a_dict_bytes);
-    let mut e_dict_bytes = Vec::new();
-    Object::Dictionary(e_dict.clone()).write_pdf(&mut e_dict_bytes);
-    if a_dict_bytes != e_dict_bytes {
+    // qpdf compares the unparsed dictionaries before it asks the stream
+    // handle to inspect /Type or /Filter. Keep indirect child handles in
+    // these copies so their `N G R` spelling remains visible.
+    if act_dict.unparse_resolved() != exp_dict.unparse_resolved() {
         return Ok(format!("{label}: stream dictionaries differ"));
     }
 
-    // qpdf skips the data body for xref streams: same dict is enough,
-    // because both writers will have derived the xref-body bytes from the
-    // (matching) live object set.
-    if is_xref {
+    if stream_is_xref(&act_dict, actual_pdf)? {
         return Ok(String::new());
     }
+    let uncompress = stream_uses_flatedecode(&act_dict, actual_pdf)?;
+    let act_data = raw_stream_data(act)?;
+    let exp_data = raw_stream_data(exp)?;
 
-    // Compare payload as `&[u8]` slices — never clone the raw bytes. When
-    // /FlateDecode is present, decompress both sides through flpdf's filter
-    // chain (which honors /DecodeParms / Predictor). qpdf's oracle throws
-    // from `getStreamData()` on decode failure and is caught by `main()` as
-    // exit 2 with stderr text and NO stdout output; propagating the error
-    // via `?` here achieves the same shape (the orchestrator's `?` reaches
-    // main's `Err(e) => eprintln!(...)` branch, which never dumps a file).
-    //
-    // Feeding decode_stream_data the *resolved* clones (a_dict / e_dict)
-    // rather than the raw `a_s.dict` is what makes the indirect-/Filter
-    // path decode correctly — flpdf::filters::decode_stream_data itself
-    // does not resolve references.
-    let decoded_a: Vec<u8>;
-    let decoded_e: Vec<u8>;
-    let (a_slice, e_slice): (&[u8], &[u8]) = if uncompress {
-        decoded_a = flpdf::filters::decode_stream_data(&a_dict, &a_s.data)?;
-        decoded_e = flpdf::filters::decode_stream_data(&e_dict, &e_s.data)?;
-        (&decoded_a, &decoded_e)
+    let decoded_act: Vec<u8>;
+    let decoded_exp: Vec<u8>;
+    let (act_bytes, exp_bytes): (&[u8], &[u8]) = if uncompress {
+        let act_decode_dict = materialize_decode_dictionary(&act_dict, actual_pdf)?;
+        let exp_decode_dict = materialize_decode_dictionary(&exp_dict, expected_pdf)?;
+        decoded_act = flpdf::filters::decode_stream_data(&act_decode_dict, act_data.as_ref())?;
+        decoded_exp = flpdf::filters::decode_stream_data(&exp_decode_dict, exp_data.as_ref())?;
+        (&decoded_act, &decoded_exp)
     } else {
-        (&a_s.data, &e_s.data)
+        (act_data.as_ref(), exp_data.as_ref())
     };
-    if a_slice.len() != e_slice.len() {
+    if act_bytes.len() != exp_bytes.len() {
         return Ok(format!("{label}: stream data size differs"));
     }
-    if a_slice != e_slice {
+    if act_bytes != exp_bytes {
         return Ok(format!("{label}: stream data differs"));
     }
     Ok(String::new())
 }
 
-// One-level dereference of the stream-relevant keys in `dict`, mutating in
-// place. If a key holds an `Object::Reference`, replace it with the
-// resolved Object (single hop — nested references inside the resolved
-// object are left as-is, matching qpdf's own one-shot `isName()` deref).
-// A missing key is left missing; a non-Reference value is left as-is.
-fn resolve_stream_keys<R: Read + Seek>(
-    dict: &mut Dictionary,
+fn raw_stream_data(handle: &ObjectHandle) -> flpdf::Result<Rc<Vec<u8>>> {
+    handle
+        .as_stream_data()
+        .map_or_else(|| handle.get_raw_stream_data(), Ok)
+}
+
+fn stream_is_xref<R: Read + Seek>(
+    stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
-) -> flpdf::Result<()> {
-    for key in [b"Filter".as_ref(), b"DecodeParms", b"Type"] {
-        if let Some(Object::Reference(r)) = dict.get(key) {
-            let r = *r;
-            let resolved = pdf.resolve(r)?;
-            dict.insert(key, resolved);
+) -> flpdf::Result<bool> {
+    let type_handle = stream_dict.get_key(b"/Type");
+    let type_handle = pdf.resolve_object_handle_to_terminal(&type_handle)?;
+    Ok(type_handle.as_name().is_some_and(|name| name == b"XRef"))
+}
+
+fn stream_uses_flatedecode<R: Read + Seek>(
+    stream_dict: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<bool> {
+    let filter = stream_dict.get_key(b"/Filter");
+    let filter = pdf.resolve_object_handle_to_terminal(&filter)?;
+    if filter.as_name().is_some_and(|name| name == b"FlateDecode") {
+        return Ok(true);
+    }
+    let Some(items) = filter.as_array() else {
+        return Ok(false);
+    };
+    for item in items {
+        let item = pdf.resolve_object_handle_to_terminal(&item)?;
+        if item.as_name().is_some_and(|name| name == b"FlateDecode") {
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
-fn is_xref_stream(d: &Dictionary) -> bool {
-    matches!(d.get(b"Type"), Some(Object::Name(n)) if n.as_slice() == b"XRef")
+// Materialize exactly at the still-legacy filters::decode_stream_data
+// boundary. Resolve the stream-level key and each array item first so the
+// legacy dictionary sees the same direct names that qpdf's accessors expose.
+fn materialize_decode_dictionary<R: Read + Seek>(
+    stream_dict: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<Dictionary> {
+    let entries = stream_dict
+        .as_dictionary()
+        .ok_or_else(|| flpdf::Error::Internal("stream dictionary is not a dictionary".into()))?;
+    let mut legacy = Dictionary::new();
+    for (key, value) in entries {
+        let value = if matches!(key.as_slice(), b"/Filter" | b"/DecodeParms" | b"/Type") {
+            materialize_resolved_for_legacy(&value, pdf, 0)?
+        } else {
+            legacyize_object(value.materialize()?)
+        };
+        let key = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+        legacy.insert(key, value);
+    }
+    Ok(legacy)
 }
 
-fn filter_uses_flatedecode(d: &Dictionary) -> bool {
-    match d.get(b"Filter") {
-        Some(Object::Name(n)) => n.as_slice() == b"FlateDecode",
-        Some(Object::Array(items)) => items
-            .iter()
-            .any(|it| matches!(it, Object::Name(n) if n.as_slice() == b"FlateDecode")),
-        _ => false,
+// ObjectHandle::materialize deliberately preserves an indirect child as an
+// Object::Reference. That is correct for unparse and for ordinary consumers,
+// but qpdf's filter accessors dereference each /Filter and /DecodeParms child
+// before decoding. Perform that one semantic conversion here, with a bound
+// so a malformed direct graph cannot turn this legacy bridge into unbounded
+// recursion.
+fn materialize_resolved_for_legacy<R: Read + Seek>(
+    handle: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+    depth: usize,
+) -> flpdf::Result<Object> {
+    if depth > 500 {
+        return Ok(Object::Null);
+    }
+    let handle = pdf.resolve_object_handle_to_terminal(handle)?;
+    if let Some(items) = handle.as_array() {
+        return Ok(Object::Array(
+            items
+                .iter()
+                .map(|item| materialize_resolved_for_legacy(item, pdf, depth + 1))
+                .collect::<flpdf::Result<Vec<_>>>()?,
+        ));
+    }
+    if let Some(entries) = handle.as_dictionary() {
+        let mut dict = Dictionary::new();
+        for (key, value) in entries {
+            let key = key.strip_prefix(b"/").unwrap_or(key.as_slice());
+            dict.insert(
+                key,
+                materialize_resolved_for_legacy(&value, pdf, depth + 1)?,
+            );
+        }
+        return Ok(Object::Dictionary(dict));
+    }
+    Ok(legacyize_object(handle.materialize()?))
+}
+
+// The canonical graph stores qpdf dictionary keys with their leading slash;
+// the still-legacy filters::decode_stream_data API predates that cutover and
+// looks up bare names. Keep this conversion at that one boundary, including
+// nested DecodeParms dictionaries, rather than teaching the canonical model a
+// second slashless key representation.
+fn legacyize_object(object: Object) -> Object {
+    match object {
+        Object::Array(values) => Object::Array(values.into_iter().map(legacyize_object).collect()),
+        Object::Dictionary(dict) => Object::Dictionary(legacyize_dictionary(dict)),
+        Object::Stream(mut stream) => {
+            stream.dict = legacyize_dictionary(stream.dict);
+            Object::Stream(stream)
+        }
+        scalar => scalar,
     }
 }
 
-// Numeric equivalence relation over Object variants — the actual numbers do
-// not need to match qpdf's `QPDFObject::object_type_e` enum values, only the
-// same→same relation. `Real` and `RealLiteral` share one code because both
-// are PDF reals (qpdf's `ot_real`); flpdf splits them internally so it can
-// preserve the source literal for byte-identical parity.
-fn type_code(o: &Object) -> u8 {
-    match o {
-        Object::Null => 0,
-        Object::Boolean(_) => 1,
-        Object::Integer(_) => 2,
-        Object::Real(_) | Object::RealLiteral { .. } => 3,
-        Object::Name(_) => 4,
-        Object::String(_) => 5,
-        Object::Array(_) => 6,
-        Object::Dictionary(_) => 7,
-        Object::Stream(_) => 8,
-        Object::Reference(_) => 9,
-        Object::Operator(_) => 10,
-        Object::InlineImage(_) => 11,
+fn legacyize_dictionary(dict: Dictionary) -> Dictionary {
+    let mut legacy = Dictionary::new();
+    for (key, value) in dict.iter() {
+        let key = key.strip_prefix(b"/").unwrap_or(key);
+        legacy.insert(key, legacyize_object(value.clone()));
     }
+    legacy
 }
 
 #[cfg(test)]
@@ -206,8 +247,9 @@ mod tests {
     use super::*;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
-    use flpdf::{ObjectRef, Stream};
+    use flpdf::{Dictionary, Object, ObjectHandle, ObjectRef, Stream};
     use std::io::{Cursor, Write};
+    use std::rc::Rc;
 
     // Reuse the flpdf-authored minimal fixture used elsewhere in the tree —
     // hand-computed xref offsets in a `const &[u8]` are too error-prone.
@@ -221,6 +263,43 @@ mod tests {
         Pdf::open_mem_owned(MINIMAL_PDF.to_vec()).expect("open dummy PDF")
     }
 
+    fn handle_from_object(pdf: &mut Pdf<Cursor<Vec<u8>>>, object: &Object) -> ObjectHandle {
+        match object {
+            Object::Null => ObjectHandle::null(),
+            Object::Boolean(value) => ObjectHandle::boolean(*value),
+            Object::Integer(value) => ObjectHandle::integer(*value),
+            Object::Real(value) => ObjectHandle::real(*value),
+            Object::RealLiteral { value, literal } => {
+                ObjectHandle::real_literal(*value, literal.clone())
+            }
+            Object::Name(value) => ObjectHandle::name(value.clone()),
+            Object::String(value) => ObjectHandle::string(value.clone()),
+            Object::Operator(value) => ObjectHandle::operator(value.clone()),
+            Object::InlineImage(value) => ObjectHandle::inline_image(value.clone()),
+            Object::Reference(object_ref) => pdf.get_object_handle(*object_ref),
+            Object::Array(values) => ObjectHandle::array(
+                values
+                    .iter()
+                    .map(|value| handle_from_object(pdf, value))
+                    .collect(),
+            ),
+            Object::Dictionary(dict) => ObjectHandle::dictionary(
+                dict.iter()
+                    .map(|(key, value)| {
+                        let mut canonical_key = Vec::with_capacity(key.len() + 1);
+                        canonical_key.push(b'/');
+                        canonical_key.extend_from_slice(key);
+                        (canonical_key, handle_from_object(pdf, value))
+                    })
+                    .collect(),
+            ),
+            Object::Stream(stream) => ObjectHandle::stream(
+                handle_from_object(pdf, &Object::Dictionary(stream.dict.clone())),
+                Rc::new(stream.data.clone()),
+            ),
+        }
+    }
+
     /// Test helper: unwrap the `flpdf::Result<String>` from `compare_objects`.
     /// Decode failures are exercised through a dedicated Err-path test rather
     /// than every match/diff assertion, so unwrapping here is safe and keeps
@@ -228,7 +307,9 @@ mod tests {
     fn cmp(label: &str, a: &Object, e: &Object) -> String {
         let mut a_pdf = dummy_pdf();
         let mut e_pdf = dummy_pdf();
-        compare_objects(label, a, e, &mut a_pdf, &mut e_pdf)
+        let a = handle_from_object(&mut a_pdf, a);
+        let e = handle_from_object(&mut e_pdf, e);
+        compare_objects(label, &a, &e, &mut a_pdf, &mut e_pdf)
             .expect("no decode failure in this scenario")
     }
 
@@ -250,6 +331,61 @@ mod tests {
         assert_eq!(
             cmp("obj", &Object::Integer(1), &Object::Name(b"n".to_vec())),
             "obj: different types"
+        );
+    }
+
+    #[test]
+    fn canonical_handle_compare_omits_null_dictionary_entries_like_qpdf() {
+        let with_null = ObjectHandle::dictionary(vec![
+            (b"/Null".to_vec(), ObjectHandle::null()),
+            (b"/Value".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let without_null =
+            ObjectHandle::dictionary(vec![(b"/Value".to_vec(), ObjectHandle::integer(1))]);
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+
+        assert_eq!(
+            compare_objects("handle", &with_null, &without_null, &mut a_pdf, &mut e_pdf,)
+                .expect("direct handle comparison must succeed"),
+            "",
+            "qpdf's QPDF_Dictionary::unparse omits direct null entries"
+        );
+    }
+
+    #[test]
+    fn canonical_handle_compare_resolves_indirect_filter_array_items() {
+        let source = b"handle filter array";
+        let compressed_a = zlib(source, Compression::none());
+        let compressed_e = zlib(source, Compression::best());
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        a_pdf.set_object(ObjectRef::new(1, 0), Object::Name(b"FlateDecode".to_vec()));
+        e_pdf.set_object(ObjectRef::new(1, 0), Object::Name(b"FlateDecode".to_vec()));
+        let a_filter = a_pdf.get_object_handle(ObjectRef::new(1, 0));
+        let e_filter = e_pdf.get_object_handle(ObjectRef::new(1, 0));
+        let a_dict = ObjectHandle::dictionary(vec![
+            (b"/Filter".to_vec(), ObjectHandle::array(vec![a_filter])),
+            (
+                b"/Length".to_vec(),
+                ObjectHandle::integer(compressed_a.len() as i64),
+            ),
+        ]);
+        let e_dict = ObjectHandle::dictionary(vec![
+            (b"/Filter".to_vec(), ObjectHandle::array(vec![e_filter])),
+            (
+                b"/Length".to_vec(),
+                ObjectHandle::integer(compressed_e.len() as i64),
+            ),
+        ]);
+        let actual = ObjectHandle::stream(a_dict, Rc::new(compressed_a));
+        let expected = ObjectHandle::stream(e_dict, Rc::new(compressed_e));
+
+        assert_eq!(
+            compare_objects("handle stream", &actual, &expected, &mut a_pdf, &mut e_pdf,)
+                .expect("indirect filter array items must decode"),
+            "",
+            "qpdf's filter inspection dereferences array items before isName"
         );
     }
 
@@ -429,38 +565,36 @@ mod tests {
         // multi-filter round-trip in an e2e test). An Array /Filter whose
         // first element is /FlateDecode must route through the decompress
         // path.
-        let mut d = Dictionary::new();
-        d.insert(
-            b"Filter",
-            Object::Array(vec![
-                Object::Name(b"FlateDecode".to_vec()),
-                Object::Name(b"ASCIIHexDecode".to_vec()),
+        let mut pdf = dummy_pdf();
+        let d = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+                ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
             ]),
-        );
+        )]);
         assert!(
-            filter_uses_flatedecode(&d),
+            stream_uses_flatedecode(&d, &mut pdf).expect("direct filter array is readable"),
             "FlateDecode-first Array must trigger decompress"
         );
         // And a positional variant: FlateDecode not first.
-        let mut d2 = Dictionary::new();
-        d2.insert(
-            b"Filter",
-            Object::Array(vec![
-                Object::Name(b"ASCIIHexDecode".to_vec()),
-                Object::Name(b"FlateDecode".to_vec()),
+        let d2 = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
             ]),
-        );
+        )]);
         assert!(
-            filter_uses_flatedecode(&d2),
+            stream_uses_flatedecode(&d2, &mut pdf).expect("direct filter array is readable"),
             "FlateDecode anywhere in Array must trigger decompress"
         );
         // Negative: no FlateDecode.
-        let mut d3 = Dictionary::new();
-        d3.insert(
-            b"Filter",
-            Object::Array(vec![Object::Name(b"ASCIIHexDecode".to_vec())]),
-        );
-        assert!(!filter_uses_flatedecode(&d3));
+        let d3 = ObjectHandle::dictionary(vec![(
+            b"/Filter".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::name(b"ASCIIHexDecode".to_vec())]),
+        )]);
+        assert!(!stream_uses_flatedecode(&d3, &mut pdf).unwrap());
     }
 
     #[test]
@@ -506,6 +640,8 @@ mod tests {
         let mut e_pdf = dummy_pdf();
         e_pdf.set_object(ObjectRef::new(1, 0), Object::Name(b"FlateDecode".to_vec()));
 
+        let a = handle_from_object(&mut a_pdf, &a);
+        let e = handle_from_object(&mut e_pdf, &e);
         assert_eq!(
             compare_objects("indirect", &a, &e, &mut a_pdf, &mut e_pdf)
                 .expect("resolution + decode must succeed"),
@@ -534,6 +670,8 @@ mod tests {
         let e = make(bogus);
         let mut a_pdf = dummy_pdf();
         let mut e_pdf = dummy_pdf();
+        let a = handle_from_object(&mut a_pdf, &a);
+        let e = handle_from_object(&mut e_pdf, &e);
         assert!(compare_objects("8 0", &a, &e, &mut a_pdf, &mut e_pdf).is_err());
     }
 

@@ -6,10 +6,12 @@
 //! encryption dict (strip `/O /OE /U /UE /Perms`), then walks the live
 //! object refs in ascending `(number, generation)` order and delegates each
 //! pair to [`compare_objects`].
+//!
+//! Oracle: qpdf 11.9.0 `compare-for-test/qpdf-test-compare.cc:148-181`.
 
-use flpdf::{Object, Pdf, PdfOpenOptions};
+use flpdf::{Pdf, PdfOpenOptions};
 
-use crate::clean::{clean_encryption, clean_trailer};
+use crate::clean::{clean_encryption_handle, clean_trailer_handle};
 use crate::compare::compare_objects;
 
 /// Compare two in-memory PDFs the way qpdf's `qpdf-test-compare` compares
@@ -53,17 +55,17 @@ pub fn compare_files(
     let mut actual = Pdf::open_mem_owned_with_options(actual_bytes.to_vec(), open_options())?;
     let mut expected = Pdf::open_mem_owned_with_options(expected_bytes.to_vec(), open_options())?;
 
-    // Trailer compare: clone → clean → serialize-compare via `compare_objects`.
-    // Cloning the trailer is unavoidable — `trailer()` returns `&Dictionary`
-    // and `clean_trailer` needs `&mut Dictionary` — but the trailer is small.
-    let mut act_trailer = actual.trailer().clone();
-    let mut exp_trailer = expected.trailer().clone();
-    clean_trailer(&mut act_trailer);
-    clean_trailer(&mut exp_trailer);
+    // qpdf's getTrailer() returns a live ObjectHandle. Build that canonical
+    // view before cleaning so trailer masking and the later object walk share
+    // the same identity graph rather than cloning a legacy Dictionary.
+    let act_trailer = actual.trailer_handle();
+    let exp_trailer = expected.trailer_handle();
+    clean_trailer_handle(&mut actual, &act_trailer)?;
+    clean_trailer_handle(&mut expected, &exp_trailer)?;
     let trailer_diff = compare_objects(
         "trailer",
-        &Object::Dictionary(act_trailer),
-        &Object::Dictionary(exp_trailer),
+        &act_trailer,
+        &exp_trailer,
         &mut actual,
         &mut expected,
     )?;
@@ -71,8 +73,8 @@ pub fn compare_files(
         return Ok(Some(trailer_diff));
     }
 
-    clean_encryption(&mut actual)?;
-    clean_encryption(&mut expected)?;
+    clean_encryption_handle(&mut actual, &act_trailer)?;
+    clean_encryption_handle(&mut expected, &exp_trailer)?;
 
     let a_refs = actual.live_object_refs();
     let e_refs = expected.live_object_refs();
@@ -83,9 +85,11 @@ pub fn compare_files(
         if a_ref != e_ref {
             return Ok(Some("different object IDs".to_string()));
         }
-        // `resolve` returns an owned Object; do NOT clone — pass by `&`.
-        let a_obj = actual.resolve(*a_ref)?;
-        let e_obj = expected.resolve(*e_ref)?;
+        // qpdf's getAllObjects() returns canonical handles. Do not materialize
+        // an Object snapshot here; compare_objects resolves only the current
+        // top-level handle and keeps nested references indirect.
+        let a_obj = actual.get_object_handle(*a_ref);
+        let e_obj = expected.get_object_handle(*e_ref);
         // qpdf's `QPDFObjGen::unparse()` emits "N G" (no trailing R);
         // `ObjectRef::Display` emits "N G R". Format explicitly to mirror
         // qpdf so per-object labels match the oracle byte-for-byte.
