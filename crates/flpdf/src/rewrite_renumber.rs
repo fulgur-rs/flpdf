@@ -304,7 +304,11 @@ fn collect_canonical_enqueue_refs<R: Read + Seek>(
 ) -> crate::Result<()> {
     if let Some(object_ref) = handle.object_ref() {
         ensure_canonical_owner(pdf, handle)?;
-        found.push(object_ref);
+        // qpdf treats `0 0 R` as a direct null at every child position
+        // (QPDFObjectHandle.cc:344-350); it is not an object to enqueue.
+        if object_ref.number != 0 {
+            found.push(object_ref);
+        }
         return Ok(());
     }
     collect_canonical_children(pdf, handle, depth, skip_length, found)
@@ -1358,6 +1362,18 @@ mod tests {
         .expect_err("over-deep canonical inline values must be rejected");
         assert!(matches!(error, Error::Unsupported(message)
             if message.contains("canonical enqueue collection")));
+    }
+
+    #[test]
+    fn canonical_enqueue_collection_ignores_object_zero() {
+        let mut pdf = Pdf::empty().expect("empty PDF");
+        let zero = pdf.get_object_handle(ObjectRef::new(0, 0));
+        let mut found = Vec::new();
+
+        collect_canonical_enqueue_refs(&mut pdf, &zero, 0, true, &mut found)
+            .expect("object zero is a direct null in the canonical writer");
+
+        assert!(found.is_empty());
     }
 
     #[test]

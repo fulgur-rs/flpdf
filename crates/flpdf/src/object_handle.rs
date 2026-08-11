@@ -3813,6 +3813,12 @@ fn write_child_with_ref_map(
     map: &ObjectRefMap<'_>,
 ) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
+        if object_ref.number == 0 {
+            // qpdf's direct-null identity is object number zero, not an
+            // output reference (QPDFObjectHandle.cc:344-350).
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
         let mapped = map(object_ref)?;
         out.extend_from_slice(mapped.to_string().as_bytes());
         return Ok(());
@@ -3863,8 +3869,12 @@ fn unparse_object_value_with_ref_map(
             unparse_object_walk_with_ref_map(stream_dict, out, map)?;
         }
         ObjectValue::Reference(object_ref) => {
-            let mapped = map(*object_ref)?;
-            out.extend_from_slice(mapped.to_string().as_bytes());
+            if object_ref.number == 0 {
+                out.extend_from_slice(b"null");
+            } else {
+                let mapped = map(*object_ref)?;
+                out.extend_from_slice(mapped.to_string().as_bytes());
+            }
         }
         _ => unparse_object_value(value, out)?,
     }
@@ -8797,6 +8807,31 @@ mod unparse_object_tests {
             .unparse_stream_body_with_ref_map(&mut non_dictionary, false, &map)
             .unwrap();
         assert_eq!(non_dictionary, b"<< >>");
+    }
+
+    #[test]
+    fn mapped_unparse_inlines_object_zero_as_null() {
+        let array = ObjectHandle::array(vec![ObjectHandle::new_indirect_unresolved(
+            ObjectRef::new(0, 0),
+            0,
+        )]);
+        let map = |_object_ref| -> crate::Result<ObjectRef> {
+            panic!("object zero must not be sent through the output reference map")
+        };
+
+        let mut array_out = Vec::new();
+        array
+            .unparse_object_with_ref_map(&mut array_out, &map)
+            .unwrap();
+        assert_eq!(array_out, b"[ null ]");
+
+        let reference = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        reference.set_resolved(ObjectValue::Reference(ObjectRef::new(0, 0)));
+        let mut reference_out = Vec::new();
+        reference
+            .unparse_object_with_ref_map(&mut reference_out, &map)
+            .unwrap();
+        assert_eq!(reference_out, b"null");
     }
 
     #[test]

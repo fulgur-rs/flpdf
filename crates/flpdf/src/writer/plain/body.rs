@@ -228,10 +228,16 @@ fn canonical_stream_output<R: Read + Seek>(
             true,
             false,
         )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
-        if !success {
+        let data = if !success {
+            // QPDFWriter retries a failed filter pipeline against a fresh raw
+            // source (QPDFWriter.cc:1287-1314). The first pipeline may have
+            // consumed or partially filled its destination, so do not emit
+            // that buffer when filtering fails.
             filtering_attempted = false;
-        }
-        let data = buffer.take_buffer()?.to_vec();
+            source_for_pipe.get_raw_stream_data()?.as_ref().clone()
+        } else {
+            buffer.take_buffer()?.to_vec()
+        };
         (data, filtering_attempted)
     };
 
@@ -265,7 +271,7 @@ fn canonical_is_lone_flate(dict: &ObjectHandle) -> crate::Result<bool> {
     if filter.try_is_null()? {
         return Ok(false);
     }
-    if filter.try_is_name_and_equals(b"FlateDecode")? {
+    if filter.try_is_name_and_equals(b"FlateDecode")? || filter.try_is_name_and_equals(b"Fl")? {
         return Ok(true);
     }
     Ok(false)
@@ -462,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_stream_output_drops_filtering_after_a_source_decode_failure() {
+    fn canonical_stream_output_retries_with_the_raw_payload_after_a_source_decode_failure() {
         let mut bytes = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec();
         let bodies: [(u32, &[u8]); 4] = [
             (1, b"<< /Type /Catalog /Pages 2 0 R >>"),
@@ -500,10 +506,37 @@ mod tests {
             ..WriterOptions::default()
         };
 
-        let (_, data, refiltered) =
+        let (dict, data, refiltered) =
             canonical_stream_output(&mut pdf, &stream, &options, ObjectRef::new(4, 0)).unwrap();
 
-        assert!(data.is_empty());
+        assert_eq!(data, b"abc");
+        assert!(!refiltered);
+        assert!(dict
+            .get_key(b"Filter")
+            .try_is_name_and_equals(b"FlateDecode")
+            .unwrap());
+    }
+
+    #[test]
+    fn canonical_stream_output_recognizes_a_lone_flate_abbreviation() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), ObjectHandle::name(b"Fl".to_vec())),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+
+        assert!(canonical_is_lone_flate(&dict).unwrap());
+
+        let mut pdf = Pdf::empty().unwrap();
+        let stream = ObjectHandle::stream(dict, Rc::new(b"abc".to_vec()));
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            ..WriterOptions::default()
+        };
+
+        let (_, data, refiltered) =
+            canonical_stream_output(&mut pdf, &stream, &options, ObjectRef::new(1, 0)).unwrap();
+
+        assert_eq!(data, b"abc");
         assert!(!refiltered);
     }
 
