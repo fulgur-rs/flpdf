@@ -484,6 +484,19 @@ mod tests {
         let legacy_stream = legacy_stream.as_stream().expect("stream remains a stream");
         assert!(legacy_stream.dict.get(b"Length").is_some());
 
+        let mut dictionary = Dictionary::new();
+        dictionary.insert(b"/Nested", Object::Integer(4));
+        let legacy_dictionary = legacyize_object(Object::Dictionary(dictionary));
+        let legacy_dictionary = legacy_dictionary
+            .as_dict()
+            .expect("dictionary remains a dictionary");
+        assert_eq!(
+            legacy_dictionary
+                .get(b"Nested")
+                .and_then(Object::as_integer),
+            Some(4)
+        );
+
         let bounded = materialize_resolved_for_legacy(&ObjectHandle::integer(1), &mut pdf, 501)
             .expect("depth guard returns a null value");
         assert!(matches!(bounded, Object::Null));
