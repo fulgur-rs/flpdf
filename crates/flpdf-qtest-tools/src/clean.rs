@@ -442,6 +442,40 @@ mod tests {
     }
 
     #[test]
+    fn clean_trailer_handle_leaves_non_array_id_unchanged() {
+        let mut pdf = Pdf::empty().expect("create an empty PDF");
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::string(b"not an array".to_vec()),
+        )]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("non-array /ID is a no-op");
+
+        assert_eq!(
+            trailer.get_key(b"/ID").as_string(),
+            Some(b"not an array".to_vec())
+        );
+    }
+
+    #[test]
+    fn clean_trailer_handle_leaves_wrong_length_id_unchanged() {
+        let mut pdf = Pdf::empty().expect("create an empty PDF");
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::string(b"only".to_vec())]),
+        )]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("wrong-length /ID is a no-op");
+
+        let items = trailer
+            .get_key(b"/ID")
+            .as_array()
+            .expect("/ID remains an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_string(), Some(b"only".to_vec()));
+    }
+
+    #[test]
     fn clean_trailer_handle_mutates_an_indirect_id_array_in_place() {
         let mut pdf = Pdf::empty().expect("create an empty PDF");
         let id_ref = ObjectRef::new(9, 0);

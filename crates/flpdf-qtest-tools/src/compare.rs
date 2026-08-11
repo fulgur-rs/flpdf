@@ -335,6 +335,48 @@ mod tests {
     }
 
     #[test]
+    fn handle_from_object_covers_scalar_and_container_variants() {
+        assert_eq!(cmp("null", &Object::Null, &Object::Null), "");
+        assert_eq!(
+            cmp("bool", &Object::Boolean(true), &Object::Boolean(true)),
+            ""
+        );
+        assert_eq!(cmp("real", &Object::Real(1.25), &Object::Real(1.25)), "");
+        assert_eq!(
+            cmp(
+                "name",
+                &Object::Name(b"Name".to_vec()),
+                &Object::Name(b"Name".to_vec()),
+            ),
+            ""
+        );
+        assert_eq!(
+            cmp(
+                "operator",
+                &Object::Operator(b"q".to_vec()),
+                &Object::Operator(b"q".to_vec()),
+            ),
+            ""
+        );
+        assert_eq!(
+            cmp(
+                "inline-image",
+                &Object::InlineImage(b"BI ID EI".to_vec()),
+                &Object::InlineImage(b"BI ID EI".to_vec()),
+            ),
+            ""
+        );
+        assert_eq!(
+            cmp(
+                "array",
+                &Object::Array(vec![Object::Integer(1)]),
+                &Object::Array(vec![Object::Integer(1)]),
+            ),
+            ""
+        );
+    }
+
+    #[test]
     fn canonical_handle_compare_omits_null_dictionary_entries_like_qpdf() {
         let with_null = ObjectHandle::dictionary(vec![
             (b"/Null".to_vec(), ObjectHandle::null()),
@@ -387,6 +429,64 @@ mod tests {
             "",
             "qpdf's filter inspection dereferences array items before isName"
         );
+    }
+
+    #[test]
+    fn legacy_decode_boundary_normalizes_nested_keys_and_container_values() {
+        let mut pdf = dummy_pdf();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![(b"/Predictor".to_vec(), ObjectHandle::integer(1))]),
+            ),
+            (
+                b"/Other".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::integer(7)]),
+            ),
+        ]);
+
+        let legacy = materialize_decode_dictionary(&stream_dict, &mut pdf)
+            .expect("legacy decode boundary materializes nested values");
+        let parms = legacy
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("DecodeParms uses legacy key spelling");
+        assert_eq!(
+            parms.get(b"Predictor").and_then(Object::as_integer),
+            Some(1)
+        );
+        let other = legacy
+            .get(b"Other")
+            .and_then(Object::as_array)
+            .expect("ordinary container values are legacyized");
+        assert_eq!(other[0].as_integer(), Some(7));
+    }
+
+    #[test]
+    fn legacy_bridge_handles_stream_values_and_depth_guard() {
+        let mut pdf = dummy_pdf();
+        let nested = ObjectHandle::dictionary(vec![(
+            b"/Array".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(3)]),
+        )]);
+        let resolved = materialize_resolved_for_legacy(&nested, &mut pdf, 0)
+            .expect("nested dictionary resolves at the legacy boundary");
+        let resolved = resolved.as_dict().expect("nested dictionary materializes");
+        assert!(resolved.get(b"Array").and_then(Object::as_array).is_some());
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert(b"/Length", Object::Integer(0));
+        let legacy_stream = legacyize_object(Object::Stream(Stream::new(stream_dict, Vec::new())));
+        let legacy_stream = legacy_stream.as_stream().expect("stream remains a stream");
+        assert!(legacy_stream.dict.get(b"Length").is_some());
+
+        let bounded = materialize_resolved_for_legacy(&ObjectHandle::integer(1), &mut pdf, 501)
+            .expect("depth guard returns a null value");
+        assert!(matches!(bounded, Object::Null));
     }
 
     #[test]
