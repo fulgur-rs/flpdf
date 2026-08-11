@@ -666,7 +666,7 @@ impl HandleNumberTree {
                             pdf.push_warning(structural_message(
                                 node.object_ref(),
                                 format!("item {item_index} has the wrong type"),
-                            ))?;
+                            ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
                             continue;
                         };
                         entries.insert(key, pair[1].clone());
