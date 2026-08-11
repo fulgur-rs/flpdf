@@ -88,7 +88,9 @@ type FilterWarningCallback = Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 's
 /// (`QPDFObjectHandle.cc:997-1009`) for every non-null object, and it is
 /// *`getKeys`* — not `setDecodeParms` — that warns
 /// `typeWarning("dictionary", "treating as empty")` (`:1005`) and hands back
-/// an empty key set.
+/// an empty key set. Live parser handles forward that warning through their
+/// document resolver; a contextless programmatic handle retains qpdf's
+/// throwing `typeWarning` branch.
 ///
 /// **Entry order is not part of this type's contract.** qpdf iterates
 /// `getKeys()`'s `std::set<std::string>`, so it sees keys sorted. The `Object`
@@ -2319,6 +2321,7 @@ pub(crate) mod tests {
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
     };
+    use crate::object_handle::warning_emission_tests::handle_resolving;
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
@@ -4042,7 +4045,17 @@ pub(crate) mod tests {
     fn handle_reader_matches_object_reader_for_every_filter_shape() {
         for (label, filter, parms) in shape_corpus() {
             let filter_handle = handle_from_object(filter.as_ref());
-            let parms_handle = handle_from_object(parms.as_ref());
+            // qpdf's parser stamps the document context on a direct scalar
+            // child. Keep that context for the one row whose consuming
+            // `getKeys()` call emits a recoverable type warning; all other
+            // direct rows are unchanged shape comparisons.
+            let (parms_handle, _parms_resolver) = if label == "present non-dictionary /DecodeParms"
+            {
+                let (handle, resolver) = handle_resolving(ObjectValue::Integer(1));
+                (handle, Some(resolver))
+            } else {
+                (handle_from_object(parms.as_ref()), None)
+            };
             // Every limit, because the two chain counts only show up under a
             // cap — `Some(16)` reaches the array arm's count, `Some(0)` also
             // reaches the trailing one — while every other row must be
@@ -4156,10 +4169,9 @@ pub(crate) mod tests {
         // an accepted unfiltered stream in place of a rejected document — and
         // would collapse a scalar `/DecodeParms` from `Present` to `Absent`,
         // erasing the distinction `QPDFStreamFilter::setDecodeParms`
-        // (`libqpdf/QPDFStreamFilter.cc:3-7`) rejects on. The divergence is
-        // pre-existing — `try_as_array` already answered `None` — and is
-        // pinned here so the length accessor cannot quietly adopt qpdf's
-        // treat-as-empty while looking like a pure resource change.
+        // (`libqpdf/QPDFStreamFilter.cc:3-7`) rejects on. The shape reader
+        // keeps the present scalar, and its consuming `getKeys()` call emits
+        // qpdf's recoverable type warning before returning an empty key set.
         assert_eq!(
             decode_filter_specs_from_handle(&ObjectHandle::integer(1), &ObjectHandle::null(), None)
                 .unwrap_err()
@@ -4167,9 +4179,10 @@ pub(crate) mod tests {
             "unsupported PDF feature: stream filter type is not name or array"
         );
 
+        let (decode_params, _resolver) = handle_resolving(ObjectValue::Integer(1));
         let specs = decode_filter_specs_from_handle(
             &ObjectHandle::name(b"FlateDecode".to_vec()),
-            &ObjectHandle::integer(1),
+            &decode_params,
             None,
         )
         .expect("a non-array /DecodeParms is replicated per filter, not rejected");
@@ -5729,8 +5742,10 @@ pub(crate) mod tests {
     /// The `42` row exits 3 because `getKeys` warns `typeWarning("dictionary",
     /// "treating as empty")` (`QPDFObjectHandle.cc:1005`) and hands back an
     /// empty key set; the data is still filtered, so it is an acceptance.
-    /// flpdf reproduces the empty key set, not the diagnostic — the same
-    /// present non-dictionary reduces to `Present` with no entries.
+    /// flpdf's live parser handles now emit the same warning through their
+    /// document resolver before reducing the value to `Present` with no
+    /// entries. A contextless programmatic handle retains qpdf's throwing
+    /// `typeWarning` branch.
     ///
     /// The probes used direct values throughout. A dangling indirect reference
     /// resolves to null silently and `getKeys` then drops the key, so an

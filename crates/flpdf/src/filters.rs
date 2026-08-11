@@ -1026,9 +1026,11 @@ fn apply_single_filter_encode(
 mod tests {
     use super::*;
     use crate::object_handle::identity_tests::resolver_bearing_handle;
+    use crate::object_handle::warning_emission_tests::{handle_resolving, WarningRecorder};
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::stream_filter::{tests::handle_from_object, ParamValue};
+    use std::rc::Rc;
 
     #[test]
     fn decode_limits_default_to_unbounded_output_and_sixteen_filters() {
@@ -3940,18 +3942,24 @@ mod tests {
                 dictionary
             }
 
-            fn native_dictionary(&self) -> ObjectHandle {
+            fn native_dictionary(&self) -> (ObjectHandle, Option<Rc<WarningRecorder>>) {
                 let mut entries = Vec::new();
                 if let Some(filter) = &self.filter {
                     entries.push((b"Filter".to_vec(), handle_from_object(Some(filter))));
                 }
+                let mut decode_params_resolver = None;
                 if let Some(decode_params) = &self.decode_params {
-                    entries.push((
-                        b"DecodeParms".to_vec(),
-                        handle_from_object(Some(decode_params)),
-                    ));
+                    let decode_params_handle =
+                        if self.label == "present non-dictionary /DecodeParms" {
+                            let (handle, resolver) = handle_resolving(ObjectValue::Integer(1));
+                            decode_params_resolver = Some(resolver);
+                            handle
+                        } else {
+                            handle_from_object(Some(decode_params))
+                        };
+                    entries.push((b"DecodeParms".to_vec(), decode_params_handle));
                 }
-                ObjectHandle::dictionary(entries)
+                (ObjectHandle::dictionary(entries), decode_params_resolver)
             }
         }
 
@@ -4209,7 +4217,7 @@ mod tests {
         fn legacy_and_native_entry_points_agree_on_every_corpus_row() {
             for row in corpus() {
                 let legacy = row.legacy_dictionary();
-                let native = row.native_dictionary();
+                let (native, _native_resolver) = row.native_dictionary();
                 for max_filter_chain in [None, Some(16), Some(0)] {
                     for max_output in [None, Some(1999), Some(2000)] {
                         let limits = DecodeLimits {
@@ -4305,6 +4313,8 @@ mod tests {
                     stream_data: stream_data.clone(),
                 };
                 let (unread_row, empty_row) = (row(&unread), row(&empty));
+                let (unread_native, _unread_resolver) = unread_row.native_dictionary();
+                let (empty_native, _empty_resolver) = empty_row.native_dictionary();
 
                 for max_filter_chain in [None, Some(16), Some(0)] {
                     for max_output in [None, Some(1), Some(2000)] {
@@ -4345,12 +4355,12 @@ mod tests {
                         );
                         assert_eq!(
                             comparable_outcome(decode_stream_data_recovering_from_handle(
-                                &unread_row.native_dictionary(),
+                                &unread_native,
                                 &unread_row.stream_data,
                                 limits,
                             )),
                             comparable_outcome(decode_stream_data_recovering_from_handle(
-                                &empty_row.native_dictionary(),
+                                &empty_native,
                                 &empty_row.stream_data,
                                 limits,
                             )),
@@ -4358,12 +4368,12 @@ mod tests {
                         );
                         assert_eq!(
                             comparable_bytes(decode_stream_data_from_handle(
-                                &unread_row.native_dictionary(),
+                                &unread_native,
                                 &unread_row.stream_data,
                                 limits,
                             )),
                             comparable_bytes(decode_stream_data_from_handle(
-                                &empty_row.native_dictionary(),
+                                &empty_native,
                                 &empty_row.stream_data,
                                 limits,
                             )),
@@ -4398,8 +4408,9 @@ mod tests {
             let outcomes: Vec<Vec<ComparableEvent>> = corpus()
                 .iter()
                 .filter_map(|row| {
+                    let (native, _native_resolver) = row.native_dictionary();
                     decode_stream_data_recovering_from_handle(
-                        &row.native_dictionary(),
+                        &native,
                         &row.stream_data,
                         DecodeLimits::default(),
                     )

@@ -2305,18 +2305,21 @@ impl<R: Read + Seek> Pdf<R> {
                 // pre-existing dictionary handle instead, via
                 // `Pdf::lift_for_set_object`, so an established parsed offset
                 // is not lost on a plain round trip.
-                Object::Stream(stream) => ObjectValue::Stream {
-                    stream_dict: ObjectHandle::from_value(ObjectValue::Dictionary(
-                        self.lift_dictionary_bounded_with_options(
-                            &stream.dict,
-                            depth,
-                            max_depth,
-                            allow_content_tokens,
-                        )?,
-                    )),
-                    stream_data: Some(Rc::new(stream.data.clone())),
-                    stream_length: 0,
-                },
+                Object::Stream(stream) => {
+                    let stream_dict = self.lift_dictionary_bounded_with_options(
+                        &stream.dict,
+                        depth,
+                        max_depth,
+                        allow_content_tokens,
+                    )?;
+                    ObjectValue::Stream {
+                        stream_dict: self
+                            .resolver
+                            .direct_object_handle(ObjectValue::Dictionary(stream_dict)),
+                        stream_data: Some(Rc::new(stream.data.clone())),
+                        stream_length: 0,
+                    }
+                }
                 // A bare top-level reference never comes from a file/ObjStm
                 // parse (`top_level_no_reference` integerizes it there,
                 // matching qpdf), but `Pdf::set_object` callers pass one
@@ -2379,8 +2382,9 @@ impl<R: Read + Seek> Pdf<R> {
     // reference (via `Pdf::get_object_handle`), preserving identity with any
     // other handle already registered for the same object — it is left
     // unresolved, not eagerly followed. Any other value is lifted directly
-    // and wrapped in a fresh direct handle. `max_depth` bounds inline nesting
-    // the same way `lift_bounded` does — see its own comment.
+    // and wrapped in a fresh direct handle carrying this document's weak
+    // context. `max_depth` bounds inline nesting the same way `lift_bounded`
+    // does — see its own comment.
     pub(crate) fn lift_to_handle_bounded(
         &mut self,
         object: &Object,
@@ -2402,7 +2406,7 @@ impl<R: Read + Seek> Pdf<R> {
             direct => {
                 let value =
                     self.lift_bounded_with_options(direct, depth, max_depth, allow_content_tokens)?;
-                Ok(ObjectHandle::from_value(value))
+                Ok(self.resolver.direct_object_handle(value))
             }
         }
     }

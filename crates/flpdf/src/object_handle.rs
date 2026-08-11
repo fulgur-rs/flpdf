@@ -1668,11 +1668,8 @@ impl ObjectHandle {
     /// owned before child resolution, so no container borrow crosses a
     /// resolver call.
     ///
-    /// A non-dictionary receiver yields an empty set. qpdf additionally
-    /// raises `typeWarning("dictionary", "treating as empty")` at `:1000`;
-    /// this accessor remains silent until its consumer migration calls
-    /// [`Self::type_warning`]. Live parser direct values now reach their
-    /// owning document; explicit and programmatic direct values do not.
+    /// A non-dictionary receiver yields an empty set after raising qpdf's
+    /// `typeWarning("dictionary", "treating as empty")` at `:1000`.
     ///
     /// # Errors
     ///
@@ -1681,6 +1678,7 @@ impl ObjectHandle {
     pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         self.try_dereference()?;
         let Some(entries) = self.as_dictionary() else {
+            self.type_warning("dictionary", "treating as empty")?;
             return Ok(BTreeSet::new());
         };
         let mut result = BTreeSet::new();
@@ -1909,9 +1907,7 @@ impl ObjectHandle {
     /// yields null. qpdf additionally raises
     /// `typeWarning("dictionary", "returning null for attempted key
     /// retrieval")` at `:984`, and gives its null a child description naming
-    /// the key; this accessor remains silent until its consumer migration
-    /// calls [`Self::type_warning`]. Live parser direct values now reach
-    /// their owning document; explicit and programmatic direct values do not.
+    /// the key.
     ///
     /// `key` must be qpdf's decoded, canonical dictionary key including its
     /// leading `/` (for example, `/Type`). Lookup is exact; a slashless key is
@@ -1923,13 +1919,16 @@ impl ObjectHandle {
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
-        let child = self.with_value(|value| match value {
-            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
-            _ => None,
+        let (is_dictionary, child) = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
+            _ => (false, None),
         });
         if let Some(child) = child {
             Ok(child)
         } else {
+            if !is_dictionary {
+                self.type_warning("dictionary", "returning null for attempted key retrieval")?;
+            }
             let key_str = String::from_utf8_lossy(key);
             let null = ObjectHandle::null();
             let var_descr = if key_str.starts_with('/') {
@@ -6163,7 +6162,13 @@ pub(crate) mod identity_tests {
 
         let (scalar, _scalar_resolver, scalar_calls) =
             logged_resolver_bearing_handle(ObjectValue::Integer(7));
-        assert_eq!(scalar.try_get_keys().unwrap(), BTreeSet::<Vec<u8>>::new());
+        assert!(matches!(
+            scalar.try_get_keys().unwrap_err(),
+            Error::Internal(message)
+                if message == "warning raised through a resolver with no document warning sink: \
+                    object 20 0: operation for dictionary attempted on object of type integer: \
+                    treating as empty"
+        ));
         assert_eq!(*scalar_calls.borrow(), vec![ObjectRef::new(20, 0)]);
     }
 
@@ -12512,11 +12517,11 @@ mod mutation_tests {
 }
 
 #[cfg(test)]
-mod warning_emission_tests {
+pub(crate) mod warning_emission_tests {
     use super::*;
 
     /// A document that records every warning an object emits through it.
-    struct WarningRecorder {
+    pub(crate) struct WarningRecorder {
         value: ObjectValue,
         warnings: RefCell<Vec<String>>,
     }
@@ -12539,7 +12544,7 @@ mod warning_emission_tests {
 
     /// An indirect handle that resolves to `value`, paired with the document
     /// it warns through.
-    fn handle_resolving(value: ObjectValue) -> (ObjectHandle, Rc<WarningRecorder>) {
+    pub(crate) fn handle_resolving(value: ObjectValue) -> (ObjectHandle, Rc<WarningRecorder>) {
         let recorder = Rc::new(WarningRecorder {
             value,
             warnings: RefCell::new(Vec::new()),
@@ -12708,22 +12713,26 @@ mod warning_emission_tests {
     }
 
     #[test]
-    fn get_key_on_a_non_dictionary_returns_null_without_warning_yet() {
+    fn dictionary_accessors_warn_on_a_non_dictionary_receiver() {
         // qpdf raises `typeWarning("dictionary", "returning null for
         // attempted key retrieval")` here (`libqpdf/QPDFObjectHandle.cc:984`)
         // and its receiver always has a context, because `QPDFParser` stamps
         // the owning document on every value it creates
-        // (`libqpdf/QPDFParser.cc:416-442`). This accessor does not yet call
-        // `type_warning`, so emitting is still deferred even though live
-        // parser direct children now carry the context qpdf supplies. The
-        // consuming `/DecodeParms` read reaches exactly that future consumer;
-        // keep the silent result pinned until its separate migration lands.
+        // (`libqpdf/QPDFParser.cc:416-442`). Both accessors now call
+        // `type_warning`, while the result shapes remain qpdf's null/empty
+        // fallbacks.
         let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
 
         assert!(handle.try_get_key(b"/Type").unwrap().is_null());
         assert!(handle.try_get_keys().unwrap().is_empty());
 
-        assert!(warnings(&recorder).is_empty());
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "object 3 0: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval",
+                "object 3 0: operation for dictionary attempted on object of type integer: treating as empty",
+            ]
+        );
     }
 
     #[test]
@@ -13209,6 +13218,19 @@ mod warning_emission_tests {
         child
             .type_warning("dictionary", "treating as empty")
             .unwrap();
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn dictionary_accessors_warn_through_a_direct_child_context() {
+        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let child = ObjectHandle::integer(10);
+        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
+
+        assert!(child.try_get_keys().unwrap().is_empty());
         assert_eq!(
             warnings(&recorder),
             ["operation for dictionary attempted on object of type integer: treating as empty"]
