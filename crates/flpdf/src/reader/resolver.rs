@@ -2995,144 +2995,150 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     /// `parser.rs` wraps `Parser::object`: this is the frame that appears
     /// exactly once per level, so protecting it protects every level.
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+        // Keep this boundary small: enter the large dispatch frame only after
+        // maybe_grow has had a chance to switch away from a small caller stack.
         stacker::maybe_grow(
             super::READER_STACK_RED_ZONE,
             super::READER_STACK_GROWTH_SIZE,
-            || {
-                // ---- phase 1: short borrows only ----
+            || self.resolve_indirect_inner(object_ref, handle),
+        )
+    }
+}
 
-                // Bound to a named local, not to `_`: the mark must live until
-                // this method returns or unwinds, and `let Some(_) = ..` would
-                // drop it at the end of this statement.
-                let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
-                    // qpdf's order: warn, then cache null
-                    // (`libqpdf/QPDF.cc:1710-1711`). Neither call may hold a
-                    // borrow across the other — `push_warning` takes its own
-                    // `borrow_mut`.
-                    self.push_warning(format!(
-                        "loop detected resolving object {} {}",
-                        object_ref.number, object_ref.generation
-                    ))?;
-                    handle.set_missing();
-                    return Ok(());
-                };
-                let entry = self.xref_entry(object_ref);
+impl<R: Read + Seek> ResolverHandle<R> {
+    fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
+        // ---- phase 1: short borrows only ----
 
-                if entry.is_none() && self.has_default_xref_entry(object_ref) {
-                    self.push_warning(format!(
-                        "object {}/{} has unexpected xref entry type",
-                        object_ref.number, object_ref.generation
-                    ))?;
+        // Bound to a named local, not to `_`: the mark must live until
+        // this method returns or unwinds, and `let Some(_) = ..` would
+        // drop it at the end of this statement.
+        let Some(_mark) = ResolveMark::begin(&self.core, object_ref) else {
+            // qpdf's order: warn, then cache null
+            // (`libqpdf/QPDF.cc:1710-1711`). Neither call may hold a
+            // borrow across the other — `push_warning` takes its own
+            // `borrow_mut`.
+            self.push_warning(format!(
+                "loop detected resolving object {} {}",
+                object_ref.number, object_ref.generation
+            ))?;
+            handle.set_missing();
+            return Ok(());
+        };
+        let entry = self.xref_entry(object_ref);
+
+        if entry.is_none() && self.has_default_xref_entry(object_ref) {
+            self.push_warning(format!(
+                "object {}/{} has unexpected xref entry type",
+                object_ref.number, object_ref.generation
+            ))?;
+            handle.set_missing();
+            return Ok(());
+        }
+
+        // ---- phase 2: no borrow is held across this ----
+        let result = match entry {
+            Some(XrefEntry::Uncompressed { offset }) => {
+                // qpdf's dedicated zero-offset arm
+                // (`libqpdf/QPDF.cc:1571-1575`) treats a bogus live
+                // type-1 entry as null before attempting I/O. In
+                // particular, it must not turn this known sentinel
+                // into a resolution-time xref-recovery trigger.
+                if offset == 0 {
+                    self.push_warning_at(0, "object has offset 0")?;
                     handle.set_missing();
                     return Ok(());
                 }
-
-                // ---- phase 2: no borrow is held across this ----
-                let result = match entry {
-                    Some(XrefEntry::Uncompressed { offset }) => {
-                        // qpdf's dedicated zero-offset arm
-                        // (`libqpdf/QPDF.cc:1571-1575`) treats a bogus live
-                        // type-1 entry as null before attempting I/O. In
-                        // particular, it must not turn this known sentinel
-                        // into a resolution-time xref-recovery trigger.
-                        if offset == 0 {
-                            self.push_warning_at(0, "object has offset 0")?;
+                let attempt_recovery = self.attempt_recovery();
+                match self.read_object_at_offset_with_description(
+                    offset,
+                    object_ref,
+                    true,
+                    attempt_recovery,
+                ) {
+                    Ok(parsed) => {
+                        let parsed_ref = parsed.object_ref;
+                        self.cache_parsed_object(parsed);
+                        if parsed_ref != object_ref {
+                            // qpdf's common resolve tail sees the
+                            // requested slot still unresolved after
+                            // caching the header's actual generation.
                             handle.set_missing();
-                            return Ok(());
                         }
-                        let attempt_recovery = self.attempt_recovery();
-                        match self.read_object_at_offset_with_description(
-                            offset,
-                            object_ref,
-                            true,
-                            attempt_recovery,
-                        ) {
-                            Ok(parsed) => {
+                        Ok(())
+                    }
+                    Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
+                    Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
+                        match self.reconstruct_xref_and_retry(error, object_ref) {
+                            Ok(Some(parsed)) => {
                                 let parsed_ref = parsed.object_ref;
                                 self.cache_parsed_object(parsed);
                                 if parsed_ref != object_ref {
-                                    // qpdf's common resolve tail sees the
-                                    // requested slot still unresolved after
-                                    // caching the header's actual generation.
                                     handle.set_missing();
                                 }
                                 Ok(())
                             }
-                            Err(ReadObjectAtOffsetError::Body(error)) => Err(error),
-                            Err(ReadObjectAtOffsetError::Header(error)) if attempt_recovery => {
-                                match self.reconstruct_xref_and_retry(error, object_ref) {
-                                    Ok(Some(parsed)) => {
-                                        let parsed_ref = parsed.object_ref;
-                                        self.cache_parsed_object(parsed);
-                                        if parsed_ref != object_ref {
-                                            handle.set_missing();
-                                        }
-                                        Ok(())
-                                    }
-                                    Ok(None) => {
-                                        let warning = format!(
+                            Ok(None) => {
+                                let warning = format!(
                                             "object {} {} not found in file after regenerating cross reference table",
                                             object_ref.number, object_ref.generation
                                         );
-                                        self.push_warning(warning)?;
-                                        handle.set_missing();
-                                        Ok(())
-                                    }
-                                    // cov:ignore-start: resolution-time reconstruct_xref records only type-1 entries; type-2 retry handoff belongs to xref-stream recovery before resolution
-                                    Err(err) if matches!(&err, Error::Unsupported(_)) => {
-                                        // Reconstruction can replace the
-                                        // requested type-1 entry with a
-                                        // type-2 entry. qpdf's retry then
-                                        // enters `resolveObjectsInStream`
-                                        // rather than treating the source
-                                        // class as unsupported.
-                                        if let Some(XrefEntry::Compressed { stream, .. }) =
-                                            self.xref_entry(object_ref)
-                                        {
-                                            self.resolve_object_stream_or_null(stream, handle)
-                                        } else {
-                                            Err(err)
-                                        }
-                                    }
-                                    // cov:ignore-end
-                                    Err(err) => Err(err),
+                                self.push_warning(warning)?;
+                                handle.set_missing();
+                                Ok(())
+                            }
+                            // cov:ignore-start: resolution-time reconstruct_xref records only type-1 entries; type-2 retry handoff belongs to xref-stream recovery before resolution
+                            Err(err) if matches!(&err, Error::Unsupported(_)) => {
+                                // Reconstruction can replace the
+                                // requested type-1 entry with a
+                                // type-2 entry. qpdf's retry then
+                                // enters `resolveObjectsInStream`
+                                // rather than treating the source
+                                // class as unsupported.
+                                if let Some(XrefEntry::Compressed { stream, .. }) =
+                                    self.xref_entry(object_ref)
+                                {
+                                    self.resolve_object_stream_or_null(stream, handle)
+                                } else {
+                                    Err(err)
                                 }
                             }
-                            Err(ReadObjectAtOffsetError::Header(error)) => Err(error),
+                            // cov:ignore-end
+                            Err(err) => Err(err),
                         }
                     }
-                    Some(XrefEntry::Compressed { stream, .. }) => {
-                        self.resolve_object_stream_or_null(stream, handle)
-                    }
-                    Some(XrefEntry::Free { .. }) => {
-                        handle.set_missing();
-                        Ok(())
-                    }
-                    None => {
-                        // qpdf QPDF::resolve fallback (QPDF.cc:1745-1748):
-                        // Absent entries resolve to null without invoking reconstruction.
-                        handle.set_missing();
-                        Ok(())
-                    }
-                };
-
-                match result {
-                    Ok(()) => Ok(()),
-                    Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
-                        // qpdf catches QPDFExc/std::exception around both
-                        // resolve dispatch arms, warns, and lets the common
-                        // tail install a null cache value
-                        // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
-                        // flpdf's structural equivalent; I/O, encryption,
-                        // and diagnostic-channel failures remain caller errors.
-                        self.push_warning(error.to_string())?;
-                        handle.set_missing();
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
+                    Err(ReadObjectAtOffsetError::Header(error)) => Err(error),
                 }
-            },
-        )
+            }
+            Some(XrefEntry::Compressed { stream, .. }) => {
+                self.resolve_object_stream_or_null(stream, handle)
+            }
+            Some(XrefEntry::Free { .. }) => {
+                handle.set_missing();
+                Ok(())
+            }
+            None => {
+                // qpdf QPDF::resolve fallback (QPDF.cc:1745-1748):
+                // Absent entries resolve to null without invoking reconstruction.
+                handle.set_missing();
+                Ok(())
+            }
+        };
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
+                // qpdf catches QPDFExc/std::exception around both
+                // resolve dispatch arms, warns, and lets the common
+                // tail install a null cache value
+                // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
+                // flpdf's structural equivalent; I/O, encryption,
+                // and diagnostic-channel failures remain caller errors.
+                self.push_warning(error.to_string())?;
+                handle.set_missing();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 
