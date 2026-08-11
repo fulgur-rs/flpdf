@@ -532,7 +532,7 @@ mod tests {
 
         assert_eq!(data, b"metadata");
         assert!(!refiltered);
-        assert!(!dict.try_has_key(b"Filter").unwrap());
+        assert!(!dict.try_has_key(b"/Filter").unwrap());
     }
 
     #[test]

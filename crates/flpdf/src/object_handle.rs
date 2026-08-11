@@ -2048,10 +2048,11 @@ impl ObjectHandle {
     /// deep-copies their subtrees. Each input key is normalized to qpdf's
     /// decoded canonical name string, including the leading `/`.
     pub fn dictionary(entries: Vec<(Vec<u8>, ObjectHandle)>) -> Self {
-        Self::new_direct(
-            ObjectValue::Dictionary(entries.into_iter().collect()),
-            NO_PARSED_OFFSET,
-        )
+        let entries = entries
+            .into_iter()
+            .map(|(key, value)| (canonical_dictionary_key(&key), value))
+            .collect();
+        Self::new_direct(ObjectValue::Dictionary(entries), NO_PARSED_OFFSET)
     }
 
     /// Construct a direct stream value from `dict` (a dictionary handle —
@@ -6806,6 +6807,16 @@ mod object_value_tests {
         let dict = ObjectHandle::dictionary(vec![(b"Key".to_vec(), value.clone())]);
         let entries = dict.as_dictionary().expect("dictionary");
         assert!(entries.get(b"/Key".as_slice()).unwrap().ptr_eq(&value));
+    }
+
+    #[test]
+    fn dictionary_handle_normalizes_aliases_before_last_value_wins_collection() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"K".to_vec(), ObjectHandle::integer(1)),
+            (b"/K".to_vec(), ObjectHandle::integer(2)),
+        ]);
+
+        assert_eq!(dict.get_key(b"/K").as_integer(), Some(2));
     }
 
     #[test]
