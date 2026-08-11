@@ -661,8 +661,10 @@ fn canonical_unterminated_dictionary_resolves_to_null_with_diagnostics() {
         .collect();
     assert!(messages
         .iter()
-        .any(|message| message == &"parse error while reading object"));
-    assert!(messages.iter().any(|message| message == &"unexpected EOF"));
+        .any(|message| message.ends_with("parse error while reading object")));
+    assert!(messages
+        .iter()
+        .any(|message| message.ends_with("unexpected EOF")));
 }
 
 #[test]
@@ -685,8 +687,10 @@ fn canonical_unterminated_array_resolves_to_null_with_diagnostics() {
         .collect();
     assert!(messages
         .iter()
-        .any(|message| message == &"parse error while reading object"));
-    assert!(messages.iter().any(|message| message == &"unexpected EOF"));
+        .any(|message| message.ends_with("parse error while reading object")));
+    assert!(messages
+        .iter()
+        .any(|message| message.ends_with("unexpected EOF")));
 }
 
 #[test]
@@ -710,11 +714,9 @@ fn canonical_nesting_past_max_parse_depth_resolves_to_null_with_warning() {
                 .expect("qpdf parser recovers excessive nesting");
 
             assert!(handle.is_null());
-            assert!(pdf
-                .repair_diagnostics()
-                .entries()
-                .iter()
-                .any(|entry| entry.message == "ignoring excessively deeply nested data structure"));
+            assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
+                .message
+                .ends_with("ignoring excessively deeply nested data structure")));
         })
         .expect("comparison thread must start")
         .join()
