@@ -9309,11 +9309,10 @@ mod tests {
         // `ObjectHandle` are not `Send`, the same reason `reader.rs`'s
         // `trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound`
         // builds its tree in the spawned thread.
-        let stack_size = if cfg!(windows) {
-            8 * 1024 * 1024
-        } else {
-            256 * 1024
-        };
+        #[cfg(windows)]
+        let stack_size = 8 * 1024 * 1024;
+        #[cfg(not(windows))]
+        let stack_size = 256 * 1024;
         std::thread::Builder::new()
             .stack_size(stack_size)
             .spawn(|| {
