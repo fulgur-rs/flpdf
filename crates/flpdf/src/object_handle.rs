@@ -66,14 +66,11 @@ use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
 
 /// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
-#[allow(dead_code)]
 pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
 
 /// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
-#[allow(dead_code)]
 pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
-#[allow(dead_code)]
 struct StreamFilterPlan {
     filters: Vec<Box<dyn StreamFilter>>,
     specialized_compression: bool,
@@ -350,6 +347,8 @@ impl std::fmt::Debug for ObjectHandle {
             .field("object_ref", &slot.object_ref)
             .field("state", &state)
             .field("parsed_offset", &slot.parsed_offset)
+            .field("end_before_space", &slot.end_before_space)
+            .field("end_after_space", &slot.end_after_space)
             .finish()
     }
 }
@@ -423,6 +422,8 @@ struct ObjectSlot {
     active_pdf_unique_id: Option<u64>,
     resolver: Option<Weak<dyn DocumentResolver>>,
     parsed_offset: i64,
+    end_before_space: i64,
+    end_after_space: i64,
     pdf_unique_ids: BTreeSet<u64>,
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
     description: Option<ObjectDescription>,
@@ -744,6 +745,8 @@ impl ObjectHandle {
             active_pdf_unique_id: pdf_unique_id,
             resolver,
             parsed_offset: NO_PARSED_OFFSET,
+            end_before_space: NO_PARSED_OFFSET,
+            end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
@@ -765,6 +768,8 @@ impl ObjectHandle {
             active_pdf_unique_id: None,
             resolver,
             parsed_offset,
+            end_before_space: NO_PARSED_OFFSET,
+            end_after_space: NO_PARSED_OFFSET,
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
@@ -930,15 +935,22 @@ impl ObjectHandle {
     /// fields remain attached to the promoted value
     /// (`libqpdf/QPDF.cc:1882-1898`).
     pub(crate) fn copy_description_and_parsed_offset_to(&self, target: &Self) {
-        let (description, parsed_offset) = {
+        let (description, parsed_offset, end_before_space, end_after_space) = {
             let slot = self.0.borrow();
-            (slot.description.clone(), slot.parsed_offset)
+            (
+                slot.description.clone(),
+                slot.parsed_offset,
+                slot.end_before_space,
+                slot.end_after_space,
+            )
         };
         let mut target_slot = target.0.borrow_mut();
         target_slot.description = description;
         if target_slot.parsed_offset < 0 {
             target_slot.parsed_offset = parsed_offset;
         }
+        target_slot.end_before_space = end_before_space;
+        target_slot.end_after_space = end_after_space;
     }
 
     /// Mark this indirect handle's value as resolved to `value`. A no-op for
@@ -1018,6 +1030,8 @@ impl ObjectHandle {
                     _ => None,
                 };
                 slot.parsed_offset = NO_PARSED_OFFSET;
+                slot.end_before_space = NO_PARSED_OFFSET;
+                slot.end_after_space = NO_PARSED_OFFSET;
                 slot.description = None;
                 old_value
             };
@@ -1077,16 +1091,22 @@ impl ObjectHandle {
                 ObjectState::Resolved(value) => {
                     slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
                     Some(value)
                 }
                 ObjectState::NotYetResolved => {
                     slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
                     None
                 }
                 ObjectState::Destroyed => {
                     slot.description = None;
                     slot.parsed_offset = NO_PARSED_OFFSET;
+                    slot.end_before_space = NO_PARSED_OFFSET;
+                    slot.end_after_space = NO_PARSED_OFFSET;
                     None
                 }
             }
@@ -1685,6 +1705,22 @@ impl ObjectHandle {
         if slot.parsed_offset < 0 {
             slot.parsed_offset = offset;
         }
+    }
+
+    /// Record qpdf's source extent metadata updated alongside a cache value by
+    /// `QPDF::updateCache` (`libqpdf/QPDF.cc:1843-1858`). These offsets are
+    /// distinct from the value's parsed/token offset: they bracket the
+    /// indirect object's `endobj` token and the whitespace following it.
+    pub(crate) fn set_end_offsets(&self, end_before_space: i64, end_after_space: i64) {
+        let mut slot = self.0.borrow_mut();
+        slot.end_before_space = end_before_space;
+        slot.end_after_space = end_after_space;
+    }
+
+    /// Return qpdf's cached source extent metadata for this value.
+    pub(crate) fn end_offsets(&self) -> (i64, i64) {
+        let slot = self.0.borrow();
+        (slot.end_before_space, slot.end_after_space)
     }
 
     /// Construct a direct null value.
@@ -2469,7 +2505,7 @@ impl ObjectHandle {
     /// the stream filters are added in reverse `/Filter` order. The source
     /// is finally dispatched through the completed chain without a legacy
     /// `Object` materialization.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pipe_stream_data(
         &self,
         pipeline: &mut dyn Pipeline,
@@ -2594,7 +2630,6 @@ impl ObjectHandle {
         Ok(success)
     }
 
-    #[allow(dead_code)]
     fn prepare_stream_filter_plan(
         &self,
         stream_dict: &ObjectHandle,
