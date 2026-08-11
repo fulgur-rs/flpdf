@@ -183,8 +183,7 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// the document was opened with, not whether recovery actually ran —
     /// qpdf's own flag is likewise setter-controlled, and it tracks a
     /// reconstruct that happened in a separate member
-    /// (`m->reconstructed_xref`, `QPDF.hh:1480`) that flpdf does not port
-    /// here.
+    /// (`m->reconstructed_xref`, `QPDF.hh:1480`).
     attempt_recovery: bool,
     /// qpdf `m->reconstructed_xref` (`include/qpdf/QPDF.hh:1480`).
     ///
@@ -193,6 +192,10 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// Prevents infinite reconstruction loops if parsing a reconstructed object
     /// fails again.
     reconstructed_xref: bool,
+    /// qpdf `m->fixed_dangling_refs` (`include/qpdf/QPDF.hh:1483`). Set only
+    /// after the effective xref table has been completely prepared; qpdf
+    /// clears it when reconstruction changes that table.
+    fixed_dangling_refs: bool,
     /// qpdf `m->warnings` (`include/qpdf/QPDF.hh:1475`), the list `QPDF::warn`
     /// appends to and `QPDF::getWarnings` hands back.
     ///
@@ -668,6 +671,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // so a second full scan is not performed for an object from an
                 // already-recovered table.
                 reconstructed_xref: already_reconstructed,
+                fixed_dangling_refs: false,
                 repair_diagnostics,
                 logger,
                 suppress_warnings,
@@ -786,6 +790,53 @@ impl<R: Read + Seek> ResolverHandle<R> {
             .map(|object_ref| object_ref.number)
     }
 
+    /// Resolve every unresolved entry in the effective xref table, matching
+    /// qpdf's `QPDF::resolveXRefTable` (`libqpdf/QPDF.cc:1239-1254`). A
+    /// resolution-time xref reconstruction invalidates the in-progress walk;
+    /// the caller reruns it against the rebuilt table before marking the cache
+    /// prepared.
+    #[allow(dead_code)]
+    fn resolve_xref_table(&self) -> Result<bool> {
+        let may_change = !self.reconstructed_xref();
+        for object_ref in self.xref_refs() {
+            let handle = self.get_object_handle(object_ref);
+            if handle.is_resolved() {
+                continue;
+            }
+            handle.try_dereference()?;
+            if may_change && self.reconstructed_xref() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Ensure every effective xref object and every parser-discovered
+    /// dangling reference is represented in the canonical cache, matching
+    /// qpdf's `QPDF::fixDanglingReferences` (`libqpdf/QPDF.cc:1258-1269`).
+    /// Repeated calls are a no-op after the fixed state has been recorded.
+    #[allow(dead_code)]
+    pub(crate) fn fix_dangling_references(&self) -> Result<()> {
+        if self.core.borrow().fixed_dangling_refs {
+            return Ok(());
+        }
+
+        if !self.resolve_xref_table()? {
+            self.resolve_xref_table()?;
+        }
+
+        self.core.borrow_mut().fixed_dangling_refs = true;
+        Ok(())
+    }
+
+    /// Return the greatest object number in the prepared canonical cache,
+    /// matching qpdf's `QPDF::getObjectCount` (`libqpdf/QPDF.cc:1271-1283`).
+    #[allow(dead_code)]
+    pub(crate) fn get_object_count(&self) -> Result<u32> {
+        self.fix_dangling_references()?;
+        Ok(self.max_object_number().unwrap_or(0))
+    }
+
     /// Whether a canonical handle occupies `number` at any generation.
     pub(crate) fn holds_object_number(&self, number: u32) -> bool {
         self.core
@@ -848,7 +899,11 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Err(trigger_error);
         }
 
-        self.core.borrow_mut().reconstructed_xref = true;
+        {
+            let mut core = self.core.borrow_mut();
+            core.reconstructed_xref = true;
+            core.fixed_dangling_refs = false;
+        }
 
         // Push repair warnings (QPDF.cc:528-530)
         self.push_warning("file is damaged")?;
@@ -3210,6 +3265,62 @@ mod tests {
         );
         pdf.extend_from_slice(
             format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn dangling_reference_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let catalog = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Dangling 99 0 R >>\nendobj\n",
+        );
+        let pages = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{catalog:010} 00000 n \n{pages:010} 00000 n \n{page:010} 00000 n \n",
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
+    fn free_reference_pdf_bytes() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+
+        let catalog = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R /Free 4 1 R >>\nendobj\n");
+        let pages = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let page = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+
+        let xref_start = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{catalog:010} 00000 n \n{pages:010} 00000 n \n{page:010} 00000 n \n0000000000 00001 f \n",
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
                 .as_bytes(),
         );
         pdf
@@ -10405,5 +10516,166 @@ mod tests {
             .entries()
             .iter()
             .any(|entry| entry.message.contains("input ended before")));
+    }
+
+    #[test]
+    fn get_object_count_prepares_every_effective_xref_object_and_is_idempotent() {
+        let pdf = Pdf::open(CountingReader::new(minimal_pdf_bytes())).expect("open");
+        let reads_before = pdf.resolver.with_reader_mut(|reader| reader.reads);
+
+        assert_eq!(pdf.resolver.max_object_number(), None);
+
+        let first = pdf.get_object_count().expect("prepare object cache");
+        assert_eq!(first, 3);
+        for object_ref in [
+            ObjectRef::new(1, 0),
+            ObjectRef::new(2, 0),
+            ObjectRef::new(3, 0),
+        ] {
+            let handle = pdf
+                .resolver
+                .registered_handle(object_ref)
+                .expect("every live xref entry must be registered");
+            assert!(handle.is_resolved(), "{object_ref:?} must be resolved");
+        }
+        assert!(
+            pdf.resolver
+                .registered_handle(ObjectRef::new(0, u16::MAX))
+                .is_none(),
+            "free xref entries must not become canonical objects"
+        );
+
+        let reads_after_first = pdf.resolver.with_reader_mut(|reader| reader.reads);
+        let second = pdf.get_object_count().expect("idempotent preparation");
+        assert_eq!(second, first);
+        assert_eq!(
+            pdf.resolver.with_reader_mut(|reader| reader.reads),
+            reads_after_first,
+            "a fixed preparation must not resolve the xref table again"
+        );
+        assert!(reads_after_first > reads_before);
+    }
+
+    #[test]
+    fn get_object_count_returns_zero_for_an_empty_canonical_cache() {
+        let resolver = bare_resolver();
+
+        assert_eq!(resolver.get_object_count().expect("empty cache"), 0);
+        assert_eq!(
+            resolver
+                .get_object_count()
+                .expect("fixed empty cache remains empty"),
+            0
+        );
+    }
+
+    #[test]
+    fn get_object_count_rescans_after_xref_reconstruction() {
+        let pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_discovers_unindexed_object_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open recovery fixture");
+
+        assert_eq!(pdf.get_object_count().expect("prepare after recovery"), 3);
+        assert!(pdf.reconstructed_xref());
+        for object_ref in [
+            ObjectRef::new(1, 0),
+            ObjectRef::new(2, 0),
+            ObjectRef::new(3, 0),
+        ] {
+            let handle = pdf
+                .resolver
+                .registered_handle(object_ref)
+                .expect("reconstructed xref entry must be registered");
+            assert!(handle.is_resolved(), "{object_ref:?} must be resolved");
+        }
+    }
+
+    #[test]
+    fn get_object_count_keeps_parser_discovered_dangling_reference_in_canonical_cache() {
+        let pdf = Pdf::open_mem_owned(dangling_reference_pdf_bytes()).expect("open");
+
+        assert_eq!(
+            pdf.get_object_count().expect("prepare dangling references"),
+            99
+        );
+        let dangling = pdf
+            .resolver
+            .registered_handle(ObjectRef::new(99, 0))
+            .expect("the parser must register a valid dangling reference");
+        assert!(!dangling.is_resolved());
+    }
+
+    #[test]
+    fn get_object_count_keeps_a_referenced_free_objgen_as_dangling_only() {
+        let pdf = Pdf::open_mem_owned(free_reference_pdf_bytes()).expect("open");
+
+        assert_eq!(pdf.get_object_count().expect("prepare free reference"), 4);
+        let free = pdf
+            .resolver
+            .registered_handle(ObjectRef::new(4, 1))
+            .expect("the parser must retain a referenced free ObjGen");
+        assert!(!free.is_resolved());
+        assert!(
+            pdf.resolver
+                .registered_handle(ObjectRef::new(0, u16::MAX))
+                .is_none(),
+            "the xref free head must not become a canonical object"
+        );
+    }
+
+    #[test]
+    fn get_object_count_prepares_the_pinned_xref_stream_and_objstm_fixture() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/compat/three-page-objstm.pdf"
+        );
+        let pdf = Pdf::open_mem_owned(std::fs::read(fixture).expect("read ObjStm fixture"))
+            .expect("open ObjStm fixture");
+
+        // qpdf 11.9.0 --show-xref reports 1/0 through 13/0 for this fixture.
+        assert_eq!(pdf.get_object_count().expect("prepare xref stream"), 13);
+        for object_ref in pdf.resolver.xref_refs() {
+            assert!(
+                pdf.resolver
+                    .registered_handle(object_ref)
+                    .is_some_and(|handle| handle.is_resolved()),
+                "effective xref object {object_ref:?} must be resolved"
+            );
+        }
+    }
+
+    #[test]
+    fn get_object_count_keeps_an_objstm_decode_failure_on_qpdfs_null_path() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let member_ref = ObjectRef::new(7, 0);
+        pdf.resolver.insert_xref_entry(
+            member_ref,
+            XrefEntry::Compressed {
+                stream: 9,
+                index: 0,
+            },
+        );
+
+        assert_eq!(
+            pdf.get_object_count().expect("prepare malformed ObjStm"),
+            9,
+            "the missing ObjStm parent is itself a canonical dangling cache entry"
+        );
+        assert!(pdf
+            .resolver
+            .registered_handle(member_ref)
+            .is_some_and(|handle| handle.is_null()));
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("supposed object stream 9 is not a stream")));
     }
 }
