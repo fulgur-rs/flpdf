@@ -8816,8 +8816,7 @@ mod unparse_object_tests {
             0,
         )]);
         let map = |_object_ref| -> crate::Result<ObjectRef> {
-            panic!("object zero must not be sent through the output reference map")
-            // cov:ignore: this guard is intentionally unreachable; the test proves the map is not called
+            panic!("object zero map call") // cov:ignore: intentional panic guard
         };
 
         let mut array_out = Vec::new();
