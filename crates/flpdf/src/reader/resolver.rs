@@ -2123,8 +2123,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let (length, next_position) = match terminator {
             Some((position, next_position)) => (
                 usize::try_from(position.saturating_sub(stream_offset)).map_err(|_| {
+                    // cov:ignore-start: u64-to-usize overflow is unreachable on supported 64-bit CI; retain the defensive error for narrower targets
                     Error::parse(usize::MAX, "recovered stream length is out of range")
-                })?,
+                })?, // cov:ignore-end
                 Some(next_position),
             ),
             None => (0, None),
@@ -7637,6 +7638,74 @@ mod tests {
     }
 
     #[test]
+    fn canonical_stream_recovery_repositions_before_endobj() {
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            b"2 0 obj\n<< /Length 1 >>\nstream\nabc\nendobj\n".to_vec(),
+        ]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("endobj is a valid qpdf recovery terminator");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            b"abc\n"
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message == "recovered stream length: 4"));
+    }
+
+    #[test]
+    fn canonical_stream_recovery_respects_qpdf_candidate_token_limit() {
+        let mut payload = b"e".to_vec();
+        payload.extend_from_slice(&[b'x'; 19]);
+        let mut body = b"2 0 obj\n<< /Length 0 >>\nstream\n".to_vec();
+        body.extend_from_slice(&payload);
+        body.extend_from_slice(b"endstream\nendobj\n");
+        let bytes = pdf_with_bodies(&[b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(), body]);
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            bytes,
+            crate::PdfOpenOptions {
+                repair: true,
+                ..crate::PdfOpenOptions::default()
+            },
+        )
+        .expect("open repair fixture");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+
+        handle
+            .try_dereference()
+            .expect("a long rejected candidate still finds nested endstream");
+        assert_eq!(
+            handle
+                .get_raw_stream_data()
+                .expect("read recovered stream data")
+                .as_slice(),
+            payload.as_slice()
+        );
+        assert!(pdf
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|entry| entry.message == "recovered stream length: 20"));
+    }
+
+    #[test]
     fn canonical_stream_malformed_framing_matches_pinned_qpdf() {
         // cov:ignore-start: CI has pinned qpdf; this fallback is for developer hosts only.
         if Command::new("qpdf").arg("--version").output().is_err() {
@@ -7759,8 +7828,13 @@ mod tests {
             },
         )
         .expect("open repair fixture");
-        pdf.resolver
-            .with_reader_mut(|reader| reader.reject_rewind = true);
+        pdf.resolver.with_reader_mut(|reader| {
+            reader.reject_rewind = true;
+            assert!(
+                std::io::Seek::seek(reader, std::io::SeekFrom::Start(0)).is_err(),
+                "the guard must reject a whole-source rewind"
+            );
+        });
         let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
 
         handle
