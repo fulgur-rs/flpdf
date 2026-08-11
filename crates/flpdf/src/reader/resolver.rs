@@ -3023,6 +3023,29 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 }
 
 impl<R: Read + Seek> ResolverHandle<R> {
+    /// Keep the resolve-time catch and null fallback out of the recursive
+    /// dispatch frame. The `/Length` resolver can re-enter this frame once
+    /// per indirect link, so even a small local-layout change compounds on
+    /// the deep-chain path.
+    #[inline(never)]
+    fn finish_indirect_resolution(&self, handle: &ObjectHandle, result: Result<()>) -> Result<()> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
+                // qpdf catches QPDFExc/std::exception around both
+                // resolve dispatch arms, warns, and lets the common
+                // tail install a null cache value
+                // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
+                // flpdf's structural equivalent; I/O, encryption,
+                // and diagnostic-channel failures remain caller errors.
+                self.push_caught_resolution_warning(error)?;
+                handle.set_missing();
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     #[inline(never)]
     fn resolve_indirect_inner(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         // ---- phase 1: short borrows only ----
@@ -3142,21 +3165,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         };
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(error) if Self::is_qpdf_caught_resolution_error(&error) => {
-                // qpdf catches QPDFExc/std::exception around both
-                // resolve dispatch arms, warns, and lets the common
-                // tail install a null cache value
-                // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
-                // flpdf's structural equivalent; I/O, encryption,
-                // and diagnostic-channel failures remain caller errors.
-                self.push_caught_resolution_warning(error)?;
-                handle.set_missing();
-                Ok(())
-            }
-            Err(error) => Err(error),
-        }
+        self.finish_indirect_resolution(handle, result)
     }
 }
 
