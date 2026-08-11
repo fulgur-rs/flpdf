@@ -8,7 +8,7 @@ use crate::writer::plain::xref::{BodyLayout, CompressedLocation};
 use crate::writer::WriterOptions;
 use crate::writer::{
     reencode_stream_for_compress, serialize, write_reencoded_object, CompressStreams,
-    QPDF_BINARY_MARKER,
+    StreamEncryptionOptions, QPDF_BINARY_MARKER,
 };
 use crate::{Object, Pdf};
 
@@ -62,6 +62,7 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                             options,
                             None,
                             *output,
+                            StreamEncryptionOptions::new(None, true),
                         )?; // cov:ignore: no emitter means this validated stream serializer is infallible
                     }
                     other => other.write_pdf(&mut bytes),

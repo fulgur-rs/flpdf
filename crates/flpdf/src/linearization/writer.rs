@@ -694,7 +694,13 @@ fn append_body_object(
     // primary hint stream keeps its newline via the separate
     // `append_hint_stream_object`, matching qpdf's hint-stream framing.
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_stream_dict(bytes, new_ref, None, &s.dict, false, refiltered)?;
+        emitter.write_stream_dict(
+            bytes,
+            new_ref,
+            None,
+            &s.dict,
+            crate::writer::encrypted_strings::StreamDictOptions::new(false, refiltered, true),
+        )?; // cov:ignore: the encrypted-dictionary route executes; this call continuation has no counter.
         crate::writer::serialize::write_stream_payload(
             bytes,
             &s.data,
@@ -8690,6 +8696,55 @@ mod tests {
             "/Metadata stream must decode back to its original plaintext through \
              /FlateDecode once /Crypt has been stripped"
         );
+    }
+
+    #[test]
+    fn append_body_object_emits_encrypted_stream_dictionary() {
+        use crate::writer::{EncryptionContext, WriteCipher};
+
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::ObjectKeyAlg::Aes),
+            encryption_v: 4,
+            encryption_r: 4,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut dict = Dictionary::new();
+        dict.insert("Label", Object::String(b"linearized label".to_vec()));
+        dict.insert("Length", Object::Integer(7));
+        let object = Object::Stream(crate::Stream::new(dict, b"payload".to_vec()));
+        let options = WriterOptions {
+            compress_streams: crate::writer::CompressStreams::No,
+            ..WriterOptions::default()
+        };
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let mut bytes = Vec::new();
+
+        let offset = append_body_object(
+            &mut bytes,
+            ObjectRef::new(7, 0),
+            ObjectRef::new(7, 0),
+            object,
+            &options,
+            None,
+            Some(&context),
+            Some(&mut emitter),
+        )
+        .expect("linearized encrypted body stream");
+
+        assert_eq!(offset, 0);
+        assert!(bytes
+            .windows(b"\nstream\n".len())
+            .any(|w| w == b"\nstream\n"));
+        assert!(bytes.ends_with(b"\nendobj\n"));
+        assert!(!bytes
+            .windows(b"linearized label".len())
+            .any(|w| w == b"linearized label"));
     }
 
     /// Task 8: the hint stream is encrypted like any other stream payload —

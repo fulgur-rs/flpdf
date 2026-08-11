@@ -153,6 +153,19 @@ qpdf は 1 クラスで standard / linearized / encrypted / objstm を統一的�
 経路にしか入らない構造的リスクがここに集中している。`emit_canonical_pdf_inner`
 は単独で約 1,250 行。
 
+`flpdf-3yn9.12` の stream encryption 対応は、`QPDFWriter.cc:935-999` の
+`PipelinePopper`/`pushEncryptionFilter`/`adjustAESStreamLength` を
+`writer.rs::run_writer_pipeline`、`pipe_writer_stream_payload`、
+`adjust_aes_stream_length` に対応させる。`QPDFWriter.cc:1239-1314` の
+`willFilterStream` 相当は既存の `reencode_stream_for_compress` の結果をそのまま
+消費し、`QPDFWriter.cc:1528-1560` の cleartext metadata 分岐は
+`stream_encryption` と `encrypt_stream` を通じて dictionary string、payload、
+AES `/Length` 調整を同時に平文化する。dictionary の string serializer は
+`writer/encrypted_strings.rs::EncryptedStringEmitter::write_stream_dict` の
+`encrypt_strings` 引数で key-clear を表現する。linearization の hint stream は
+layout 非対象のため旧 in-place bridge を維持し、canonical full-rewrite と ObjStm
+container は新しい pipeline route を使う。
+
 **renumber は重複していない**: `rewrite_renumber.rs` は `linearization/plan.rs` からも
 使われる共有機構で、`linearization/renumber.rs` はその上に載る最終採番層。qpdf の
 `obj_renumber` 1 本に対して 2 層構造だが、二重実装ではない。

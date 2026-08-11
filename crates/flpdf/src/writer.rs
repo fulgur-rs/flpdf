@@ -39,6 +39,7 @@ where
 }
 
 use crate::pdf_version::{parse_pdf_version, PdfVersion, PDF_1_2, PDF_1_5};
+use crate::pipeline::{Pipeline, PlString};
 use crate::{filters, Dictionary, Object, ObjectRef, Pdf, Result, XrefEntry, XrefForm};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2043,20 +2044,154 @@ pub(crate) fn cipher_needs_aes_iv(cipher: WriteCipher) -> bool {
     )
 }
 
-/// Encrypt a stream's payload bytes in place (after filter re-encoding) and
-/// update its `/Length` entry. AES grows the buffer by 16 bytes (IV prefix)
-/// plus up to one full block of PKCS#7 padding.
+/// Apply qpdf's `QPDFWriter::adjustAESStreamLength` rule before a stream
+/// dictionary is unparsed (`libqpdf/QPDFWriter.cc:965-973`).
+fn writer_has_current_data_key(ctx: &EncryptionContext) -> bool {
+    match ctx.cipher {
+        WriteCipher::PerObject(_) => true,
+        WriteCipher::FileKeyAes256 => !ctx.file_key.is_empty(),
+    }
+}
+
+fn adjust_aes_stream_length(
+    length: &mut usize,
+    ctx: &EncryptionContext,
+    encrypt_stream: bool,
+) -> Result<()> {
+    if encrypt_stream && writer_has_current_data_key(ctx) && cipher_needs_aes_iv(ctx.cipher) {
+        let padding = 32 - (*length & 0xf);
+        *length = (*length).checked_add(padding).ok_or_else(|| {
+            // cov:ignore-start: allocating a Vec large enough to overflow usize is infeasible.
+            crate::Error::Unsupported("encrypted stream /Length overflows usize".to_string())
+            // cov:ignore-end
+        })?; // cov:ignore: llvm-cov attributes this continuation to the unreachable overflow arm.
+    }
+    Ok(())
+}
+
+/// Finish a writer pipeline even when its write phase fails. qpdf's
+/// `PipelinePopper` calls `finish` from its destructor before it restores the
+/// previous stack frame (`libqpdf/QPDFWriter.cc:925-963`).
+fn run_writer_pipeline(pipeline: &mut dyn Pipeline, data: &[u8]) -> Result<()> {
+    let write_result = pipeline.write(data);
+    let finish_result = pipeline.finish();
+    if let Err(error) = write_result {
+        return Err(error.into());
+    }
+    finish_result.map_err(Into::into)
+}
+
+/// Feed one emitted stream through qpdf's conditional encryption stage and
+/// write it directly to the final output sink. The `Count` stage preserves
+/// qpdf's last-byte framing decision while `PlString` is the output sink.
+fn pipe_writer_stream_payload(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    object_ref: ObjectRef,
+    ctx: &EncryptionContext,
+    encrypt_stream: bool,
+    explicit_iv: Option<[u8; 16]>,
+) -> Result<u8> {
+    let mut sink = PlString::new("writer stream output", None, out);
+    let mut count = crate::pipeline::count::Count::new("writer stream count", &mut sink);
+    let explicit_iv = explicit_iv.or_else(|| {
+        (ctx.static_aes_iv && cipher_needs_aes_iv(ctx.cipher))
+            .then(crate::pipeline::aes::static_initialization_vector)
+    });
+
+    if !encrypt_stream {
+        run_writer_pipeline(&mut count, data)?;
+        return Ok(count.last_byte());
+    }
+
+    let mut state = encryption_state::WriterEncryptionState::new(
+        true,
+        ctx.file_key.clone(),
+        cipher_needs_aes_iv(ctx.cipher),
+        ctx.encryption_v,
+        ctx.encryption_r,
+    );
+    state.with_object_data_key(object_ref.number, None, |state| {
+        let key = state.current_data_key().ok_or_else(|| {
+            // cov:ignore-start: with_object_data_key always installs a data key before this closure.
+            crate::Error::Internal(
+                "QPDFWriter stream encryption data key was not initialized".to_string(),
+            )
+            // cov:ignore-end
+        })?; // cov:ignore: llvm-cov attributes this continuation to the impossible error arm.
+        if key.is_empty() {
+            run_writer_pipeline(&mut count, data)?;
+            return Ok(());
+        }
+
+        match ctx.cipher {
+            WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4) => {
+                let mut stage =
+                    crate::pipeline::rc4::PlRc4::new("rc4 stream encryption", &mut count, key)?;
+                run_writer_pipeline(&mut stage, data)
+            }
+            WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Aes)
+            | WriteCipher::FileKeyAes256 => {
+                if let Some(iv) = explicit_iv {
+                    count.write(&iv)?;
+                    let mut stage = crate::pipeline::aes::PlAesPdf::new_encrypt(
+                        "aes stream encryption",
+                        &mut count,
+                        key,
+                    )?;
+                    stage.set_iv(&iv)?;
+                    run_writer_pipeline(&mut stage, data)
+                } else {
+                    let mut stage = crate::pipeline::aes::PlAesPdf::new_encrypt(
+                        "aes stream encryption",
+                        &mut count,
+                        key,
+                    )?; // cov:ignore: the no-explicit-IV AES route executes; this call continuation has no counter.
+                    run_writer_pipeline(&mut stage, data)
+                }
+            }
+        }
+    })?;
+
+    Ok(count.last_byte())
+}
+
+/// Write a stream payload through the qpdf-shaped writer pipeline, including
+/// the final `endstream` framing decision based on the pipeline's last byte.
+fn write_stream_payload_with_pipeline(
+    out: &mut Vec<u8>,
+    data: &[u8],
+    policy: NewlineBeforeEndstream,
+    object_ref: ObjectRef,
+    ctx: &EncryptionContext,
+    encrypt_stream: bool,
+    explicit_iv: Option<[u8; 16]>,
+) -> Result<bool> {
+    out.extend_from_slice(b"\nstream\n");
+    let last_byte =
+        pipe_writer_stream_payload(out, data, object_ref, ctx, encrypt_stream, explicit_iv)?;
+    let add_newline = match policy {
+        NewlineBeforeEndstream::Yes => true,
+        NewlineBeforeEndstream::No => last_byte != b'\n',
+        NewlineBeforeEndstream::Never => false,
+    };
+    if add_newline {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"endstream");
+    Ok(add_newline)
+}
+
+/// Legacy in-place stream encryption bridge retained for the linearized writer
+/// and its convergence-loop helpers. The canonical full-rewrite stream path
+/// uses [`pipe_writer_stream_payload`] so encryption remains a qpdf-shaped
+/// pipeline stage instead of materializing a replacement buffer.
 ///
-/// Draws a fresh AES IV internally on every call (or the fixed test vector
-/// under `ctx.static_aes_iv`) and delegates to
-/// [`encrypt_stream_payload_with_iv`] for the actual encryption. This is the
-/// right behavior for every caller except one: `crate::linearization::writer`
-/// re-invokes the hint-stream emitter once per convergence-loop pass, so a
-/// fresh-per-call IV here would mean the hint stream's own ciphertext framing
-/// could vary pass-to-pass for the same plaintext — that caller uses
-/// [`encrypt_stream_payload_with_iv`] directly with a single IV drawn once
-/// per `write_linearized` invocation instead (see
-/// `crate::linearization::writer::append_hint_stream_object`'s doc).
+/// This bridge draws a fresh AES IV internally on every call (or the fixed
+/// test vector under `ctx.static_aes_iv`) and delegates to
+/// [`encrypt_stream_payload_with_iv`]. The linearized hint-stream emitter uses
+/// the latter directly with one IV per `write_linearized` invocation so its
+/// repeated convergence passes see identical ciphertext.
 pub(crate) fn encrypt_stream_payload_for_writer(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
@@ -2087,14 +2222,11 @@ pub(crate) fn encrypt_stream_payload_for_writer(
 /// byte count. `iv` is used verbatim for AES ciphers; RC4 has no IV concept
 /// and ignores it.
 ///
-/// Exposed as a separate primitive so a caller that needs the *same*
+/// Exposed as a separate legacy primitive so a caller that needs the *same*
 /// ciphertext across repeated calls (the linearized writer's hint stream,
 /// re-emitted once per convergence-loop pass) can supply one IV instead of
-/// getting a fresh random draw every call. Every other caller goes through
-/// [`encrypt_stream_payload_for_writer`], which draws the IV itself
-/// (once per call, as before this split) and forwards here — this function
-/// has no IV-selection policy of its own, so extracting it changes no
-/// caller's behavior.
+/// getting a fresh random draw every call. The canonical full-rewrite path
+/// does not use this buffer-replacement route.
 pub(crate) fn encrypt_stream_payload_with_iv(
     object_ref: ObjectRef,
     stream: &mut crate::Stream,
@@ -2291,6 +2423,20 @@ pub(crate) fn reencode_stream_for_compress(
 /// (`write_stream_to_buf_qpdf_order`); an already-Flate or preserved source keeps
 /// its lexicographic order with `/Length` last. Non-stream objects serialize
 /// normally. Shared by the legacy excluded-mode writer and the plain pipeline.
+pub(crate) struct StreamEncryptionOptions<'a> {
+    context: Option<&'a EncryptionContext>,
+    encrypt_strings: bool,
+}
+
+impl<'a> StreamEncryptionOptions<'a> {
+    pub(crate) const fn new(context: Option<&'a EncryptionContext>, encrypt_strings: bool) -> Self {
+        Self {
+            context,
+            encrypt_strings,
+        }
+    }
+}
+
 fn write_reencoded_object(
     bytes: &mut Vec<u8>,
     reencoded: &Object,
@@ -2298,14 +2444,63 @@ fn write_reencoded_object(
     options: &WriterOptions,
     encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
     emitted_ref: ObjectRef,
+    stream_encryption: StreamEncryptionOptions<'_>,
 ) -> Result<()> {
     match reencoded {
         Object::Stream(s) => {
             let refiltered = matches!(effective_stream_policy(options), Some(CompressStreams::Yes))
                 && !source_filter_is_lone_flate
                 && is_lone_flate(s.dict.get("Filter"));
-            if let Some(emitter) = encrypted_strings {
-                emitter.write_stream_dict(bytes, emitted_ref, None, &s.dict, false, refiltered)?;
+            if let Some(ctx) = stream_encryption.context {
+                let mut dict = s.dict.clone();
+                let mut stream_length = s.data.len();
+                adjust_aes_stream_length(
+                    &mut stream_length,
+                    ctx,
+                    stream_encryption.encrypt_strings,
+                )?; // cov:ignore: covered route; llvm-cov has no counter for this multiline argument.
+                dict.insert(
+                    "Length",
+                    Object::Integer(i64::try_from(stream_length).map_err(|_| {
+                        // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
+                        crate::Error::Unsupported(
+                            "encrypted stream /Length does not fit in i64".to_string(),
+                        )
+                        // cov:ignore-end
+                    })?), // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
+                );
+                if let Some(emitter) = encrypted_strings {
+                    emitter.write_stream_dict(
+                        bytes,
+                        emitted_ref,
+                        None,
+                        &dict,
+                        encrypted_strings::StreamDictOptions::new(
+                            false,
+                            refiltered,
+                            stream_encryption.encrypt_strings,
+                        ),
+                    )?; // cov:ignore: the encrypted-dictionary route executes; this call continuation has no counter.
+                } else {
+                    dict.write_pdf_stream(bytes, refiltered);
+                }
+                write_stream_payload_with_pipeline(
+                    bytes,
+                    &s.data,
+                    options.newline_before_endstream,
+                    emitted_ref,
+                    ctx,
+                    stream_encryption.encrypt_strings,
+                    None,
+                )?; // cov:ignore: the encrypted-payload route executes; this call continuation has no counter.
+            } else if let Some(emitter) = encrypted_strings {
+                emitter.write_stream_dict(
+                    bytes,
+                    emitted_ref,
+                    None,
+                    &s.dict,
+                    encrypted_strings::StreamDictOptions::new(false, refiltered, true),
+                )?; // cov:ignore: the dictionary-only route executes; this call continuation has no counter.
                 write_stream_payload(bytes, &s.data, options.newline_before_endstream);
             } else {
                 s.dict.write_pdf_stream(bytes, refiltered);
@@ -2457,6 +2652,7 @@ fn write_pclm<R: Read + Seek, W: Write>(
                             options,
                             None,
                             output,
+                            StreamEncryptionOptions::new(None, true),
                         )?;
                         // cov:ignore-end
                     }
@@ -3280,9 +3476,9 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // than flpdf's unconditional decode/re-encode.
             // Re-encode per the compress policy via the shared choke point so
             // excluded modes and the plain pipeline cannot drift on qpdf's
-            // re-filter rules. `reencoded` is owned and `mut` because the
-            // encryption step below may rewrite the stream payload in place.
-            let (mut reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
+            // re-filter rules. The resulting raw buffer is consumed directly
+            // by the writer pipeline below; encryption does not mutate it.
+            let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
                 stream,
                 options,
                 qpdf_null_visibility,
@@ -3291,25 +3487,16 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                 true,
             );
 
-            // flpdf-9hc.4.9: encrypt the stream payload AFTER any filter
-            // re-encoding, so the encryption operates on the on-disk bytes.
-            // /Length is updated to the encrypted byte count (AES-CBC adds a
-            // 16-byte IV prefix and PKCS#7 padding). Skip for the /Encrypt
-            // object itself.
-            // The encryption key derives from emit_ref (the number the file
-            // header records). ctx.metadata_ref is an ORIGINAL ref, compared
-            // against old_ref.
-            if let Some(ctx) = &encrypt_ctx {
-                if emit_ref != ctx.encrypt_ref {
-                    if let Object::Stream(ref mut s) = reencoded {
-                        if !ctx.encrypt_metadata && ctx.metadata_ref == Some(*old_ref) {
-                            // /Length stays as the un-encrypted byte count.
-                        } else {
-                            encrypt_stream_payload_for_writer(emit_ref, s, ctx)?;
-                        }
-                    }
-                }
-            }
+            // qpdf obtains the filtered/raw buffer first, then decides whether
+            // the current stream is encrypted immediately before dictionary
+            // unparse (`QPDFWriter.cc:1528-1557`).  Cleartext metadata keeps the
+            // writer pipeline active but has no encryption stage after qpdf's
+            // `cur_data_key.clear()`.
+            let stream_encryption = encrypt_ctx
+                .as_ref()
+                .filter(|ctx| emit_ref != ctx.encrypt_ref);
+            let encrypt_stream = stream_encryption
+                .is_some_and(|ctx| ctx.encrypt_metadata || ctx.metadata_ref != Some(*old_ref));
 
             if options.qdf {
                 if let Object::Stream(ref s) = reencoded {
@@ -3323,9 +3510,19 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     // qpdf's QDF holder stores the raw payload length. When
                     // stream framing adds one LF, `%QDF: ignore_newline` tells
                     // fix-qdf to exclude that byte from its measured length.
-                    let len_value = i64::try_from(s.data.len()).unwrap_or(i64::MAX);
-                    let ignore_newline =
-                        stream_framing_adds_newline(&s.data, options.newline_before_endstream);
+                    let len_value = if let Some(ctx) = stream_encryption {
+                        let mut stream_length = s.data.len();
+                        adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream)?;
+                        i64::try_from(stream_length).map_err(|_| {
+                            // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
+                            crate::Error::Unsupported(
+                                "encrypted stream /Length does not fit in i64".to_string(),
+                            )
+                            // cov:ignore-end
+                        })? // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
+                    } else {
+                        i64::try_from(s.data.len()).unwrap_or(i64::MAX)
+                    };
                     // The holder number was assigned by the QDF emission pre-scan
                     // as the slot immediately following this stream's emission slot.
                     let holder_num =
@@ -3341,20 +3538,24 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                                     emit_ref.number
                                 ))
                             })?; // cov:ignore-end
-                    qdf_holder_to_emit = Some((holder_num, len_value, ignore_newline));
+                    qdf_holder_to_emit = Some((holder_num, len_value, false));
 
                     let mut holder_stream = s.clone();
                     holder_stream
                         .dict
                         .insert("Length", Object::Reference(ObjectRef::new(holder_num, 0)));
-                    let written = write_stream_to_buf_qdf(
+                    let added_newline = write_stream_to_buf_qdf(
                         &mut bytes,
                         &holder_stream,
                         options.newline_before_endstream,
                         encrypted_strings.as_mut(),
                         emit_ref,
+                        stream_encryption,
+                        encrypt_stream,
                     );
-                    written?;
+                    if let Some((_, _, ignore_newline)) = qdf_holder_to_emit.as_mut() {
+                        *ignore_newline = added_newline?;
+                    } // cov:ignore: llvm-cov reports this executed QDF holder branch brace as uncovered.
                 } else {
                     // cov:ignore-start: unreachable — this arm is inside the
                     // stream branch and reencode_stream_for_compress always
@@ -3372,6 +3573,7 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
                     options,
                     encrypted_strings.as_mut(),
                     emit_ref,
+                    StreamEncryptionOptions::new(stream_encryption, encrypt_stream),
                 );
                 written?;
             }
@@ -3444,16 +3646,38 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
         );
         let body = emitted?;
         let mut stream = object_streams::wrap_objstm_body(&body, options.compress_streams)?;
+
+        let emit_offset = bytes.len();
+        bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
         // Encrypt the ObjStm container as a single blob (PDF 1.7 §7.5.7).
         // Member objects' strings are NOT individually encrypted; the container
         // stream's encryption covers them all.
         if let Some(ctx) = &encrypt_ctx {
-            encrypt_stream_payload_for_writer(container_ref, &mut stream, ctx)?;
+            let mut stream_length = stream.data.len();
+            adjust_aes_stream_length(&mut stream_length, ctx, true)?;
+            stream.dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(stream_length).map_err(|_| {
+                    // cov:ignore-start: an allocatable ObjStm length cannot exceed i64::MAX.
+                    crate::Error::Unsupported(
+                        "encrypted ObjStm /Length does not fit in i64".to_string(),
+                    )
+                    // cov:ignore-end
+                })?), // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
+            );
+            stream.dict.write_pdf(&mut bytes);
+            write_stream_payload_with_pipeline(
+                &mut bytes,
+                &stream.data,
+                options.newline_before_endstream,
+                container_ref,
+                ctx,
+                true,
+                None,
+            )?; // cov:ignore: the encrypted ObjStm route executes; this call continuation has no counter.
+        } else {
+            write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
         }
-
-        let emit_offset = bytes.len();
-        bytes.extend_from_slice(format!("{} 0 obj\n", container_ref.number).as_bytes());
-        write_stream_to_buf(&mut bytes, &stream, options.newline_before_endstream);
         bytes.extend_from_slice(b"\nendobj\n");
         // QDF inter-object blank-line separator (flpdf-9hc.6.10). qdf mode
         // emits no ObjStm containers (6.2), so this is a consistency guard.
@@ -4165,26 +4389,71 @@ fn normalize_direct_content_value(value: &mut Object, options: &WriterOptions) {
 /// serialized with the qpdf `--qdf` multi-line / sorted-key layout
 /// ([`Dictionary::write_pdf_qdf`]) instead of the compact form. Used only on
 /// the qdf full-rewrite path; preserves the 6.1-era stream invariants
-/// (raw `data`, `/Length` already correct in `dict`).
+/// (raw `data`; encrypted `/Length` is derived immediately before unparse).
 fn write_stream_to_buf_qdf(
     buf: &mut Vec<u8>,
     stream: &crate::Stream,
     policy: NewlineBeforeEndstream,
     encrypted_strings: Option<&mut encrypted_strings::EncryptedStringEmitter>,
     emitted_ref: ObjectRef,
-) -> Result<()> {
+    stream_encryption: Option<&EncryptionContext>,
+    encrypt_stream_strings: bool,
+) -> Result<bool> {
     // qpdf --qdf pulls /Length past every other (alphabetically-sorted) key so
     // the length indirect reference sits immediately before `>>`; use the
     // /Length-last QDF serializer here (mirrors non-QDF write_pdf_stream).
-    if let Some(emitter) = encrypted_strings {
-        emitter.write_stream_dict(buf, emitted_ref, None, &stream.dict, true, false)?;
+    if let Some(ctx) = stream_encryption {
+        let mut dict = stream.dict.clone();
+        if !matches!(dict.get("Length"), Some(Object::Reference(_))) {
+            let mut stream_length = stream.data.len();
+            adjust_aes_stream_length(&mut stream_length, ctx, encrypt_stream_strings)?;
+            dict.insert(
+                "Length",
+                Object::Integer(i64::try_from(stream_length).map_err(|_| {
+                    // cov:ignore-start: an allocatable stream length cannot exceed i64::MAX.
+                    crate::Error::Unsupported(
+                        "encrypted stream /Length does not fit in i64".to_string(),
+                    )
+                    // cov:ignore-end
+                })?), // cov:ignore: llvm-cov attributes this continuation to the impossible overflow arm.
+            );
+        }
+        if let Some(emitter) = encrypted_strings {
+            emitter.write_stream_dict(
+                buf,
+                emitted_ref,
+                None,
+                &dict,
+                encrypted_strings::StreamDictOptions::new(true, false, encrypt_stream_strings),
+            )?; // cov:ignore: the encrypted-dictionary route executes; this call continuation has no counter.
+        } else {
+            dict.write_pdf_stream_qdf(buf, 0);
+        }
+        let add_newline = write_stream_payload_with_pipeline(
+            buf,
+            &stream.data,
+            policy,
+            emitted_ref,
+            ctx,
+            encrypt_stream_strings,
+            None,
+        )?; // cov:ignore: the encrypted-payload route executes; this call continuation has no counter.
+        Ok(add_newline)
+    } else if let Some(emitter) = encrypted_strings {
+        emitter.write_stream_dict(
+            buf,
+            emitted_ref,
+            None,
+            &stream.dict,
+            encrypted_strings::StreamDictOptions::new(true, false, true),
+        )?; // cov:ignore: the dictionary-only route executes; this call continuation has no counter.
+        write_stream_payload(buf, &stream.data, policy);
+        Ok(stream_framing_adds_newline(&stream.data, policy))
     } else {
         stream.dict.write_pdf_stream_qdf(buf, 0);
+        write_stream_payload(buf, &stream.data, policy);
+        Ok(stream_framing_adds_newline(&stream.data, policy))
     }
-    // Stream framing + newline-before-endstream policy is identical to the
-    // compact path; only the dict serialization differs in qdf mode.
-    write_stream_payload(buf, &stream.data, policy);
-    Ok(())
 }
 
 /// Emit the rebuilt full-rewrite trailer in qpdf `--qdf` formatting:
@@ -4265,6 +4534,48 @@ mod tests {
     use crate::rewrite_renumber::CatalogFirstRenumber;
     use std::io::Cursor;
     use std::sync::Arc;
+
+    struct FinishAfterWriteError {
+        finishes: usize,
+    }
+
+    impl crate::pipeline::Pipeline for FinishAfterWriteError {
+        // cov:ignore-start: run_writer_pipeline never queries test-double identifiers.
+        fn identifier(&self) -> &str {
+            "finish-after-write-error"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, _data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            Err(crate::pipeline::PipelineError::runtime("write failed"))
+        }
+
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            self.finishes += 1;
+            Ok(())
+        }
+    }
+
+    struct FinishErrorPipeline {
+        finishes: usize,
+    }
+
+    impl crate::pipeline::Pipeline for FinishErrorPipeline {
+        // cov:ignore-start: run_writer_pipeline never queries test-double identifiers.
+        fn identifier(&self) -> &str {
+            "finish-error"
+        }
+        // cov:ignore-end
+
+        fn write(&mut self, _data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            self.finishes += 1;
+            Err(crate::pipeline::PipelineError::runtime("finish failed"))
+        }
+    }
 
     #[test]
     fn content_array_holder_collection_uses_one_cumulative_ref_depth_budget() {
@@ -6360,6 +6671,384 @@ mod tests {
             .expect("RC4 inverse transform");
         assert_eq!(stream.data.as_ptr(), original_ptr);
         assert_eq!(stream.data, plaintext);
+    }
+
+    #[test]
+    fn aes_stream_pipeline_reports_invalid_key_as_internal_error() {
+        let object_ref = ObjectRef::new(7, 0);
+        let ctx = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 31],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut output = Vec::new();
+        let error = pipe_writer_stream_payload(
+            &mut output,
+            b"payload",
+            object_ref,
+            &ctx,
+            true,
+            Some([0u8; 16]),
+        )
+        .expect_err("invalid AES key length must fail before plaintext fallback");
+
+        assert!(
+            matches!(error, crate::Error::Internal(message) if message.contains("key must be 16 or 32 bytes"))
+        );
+    }
+
+    #[test]
+    fn adjust_aes_stream_length_matches_qpdf_formula_and_gates() {
+        let context = |cipher| EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 32],
+            cipher,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        let mut aes_length = 82;
+        adjust_aes_stream_length(&mut aes_length, &context(WriteCipher::FileKeyAes256), true)
+            .expect("AES length adjustment");
+        assert_eq!(aes_length, 112, "qpdf's 82-byte AES probe grows to 112");
+
+        let mut rc4_length = 82;
+        adjust_aes_stream_length(
+            &mut rc4_length,
+            &context(WriteCipher::PerObject(
+                crate::security::standard::ObjectKeyAlg::Rc4,
+            )),
+            true,
+        )
+        .expect("RC4 length check");
+        assert_eq!(rc4_length, 82, "RC4 has no IV or block padding");
+
+        let mut cleartext_length = 82;
+        adjust_aes_stream_length(
+            &mut cleartext_length,
+            &context(WriteCipher::FileKeyAes256),
+            false,
+        )
+        .expect("cleartext length check");
+        assert_eq!(cleartext_length, 82, "cleartext metadata stays raw");
+
+        let mut empty_key_length = 82;
+        let mut empty_key_context = context(WriteCipher::FileKeyAes256);
+        empty_key_context.file_key.clear();
+        adjust_aes_stream_length(&mut empty_key_length, &empty_key_context, true)
+            .expect("empty-key length check");
+        assert_eq!(
+            empty_key_length, 82,
+            "an empty V=5 key has no current stage"
+        );
+    }
+
+    #[test]
+    fn writer_pipeline_without_stage_finishes_empty_payload() {
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 16],
+            cipher: WriteCipher::PerObject(crate::security::standard::ObjectKeyAlg::Rc4),
+            encryption_v: 1,
+            encryption_r: 2,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: false,
+            encrypt_metadata: false,
+            metadata_ref: Some(ObjectRef::new(4, 0)),
+        };
+        let mut output = Vec::new();
+
+        let last_byte = pipe_writer_stream_payload(
+            &mut output,
+            &[],
+            ObjectRef::new(4, 0),
+            &context,
+            false,
+            None,
+        )
+        .expect("stage-free pipeline");
+
+        assert!(output.is_empty());
+        assert_eq!(
+            last_byte, 0,
+            "Count starts at qpdf's empty-payload sentinel"
+        );
+    }
+
+    #[test]
+    fn writer_pipeline_with_empty_key_skips_encryption_stage() {
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: Vec::new(),
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut output = Vec::new();
+
+        pipe_writer_stream_payload(
+            &mut output,
+            b"empty-key payload",
+            ObjectRef::new(7, 0),
+            &context,
+            true,
+            Some([0u8; 16]),
+        )
+        .expect("empty current key must use the active pipeline without a stage");
+
+        assert_eq!(output, b"empty-key payload");
+    }
+
+    #[test]
+    fn aes_writer_pipeline_matches_block_boundary_lengths() {
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 32],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+
+        for (plain_length, expected_wire_length) in [
+            (0, 32),
+            (1, 32),
+            (15, 32),
+            (16, 48),
+            (17, 48),
+            (31, 48),
+            (32, 64),
+        ] {
+            let mut output = Vec::new();
+            pipe_writer_stream_payload(
+                &mut output,
+                &vec![0x41; plain_length],
+                ObjectRef::new(7, 0),
+                &context,
+                true,
+                Some([0u8; 16]),
+            )
+            .expect("AES block-boundary payload");
+            assert_eq!(
+                output.len(),
+                expected_wire_length,
+                "AES wire length for {plain_length} plaintext bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn aes_writer_pipeline_generates_random_iv_and_honors_yes_newline() {
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 32],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: false,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut output = Vec::new();
+
+        let added_newline = write_stream_payload_with_pipeline(
+            &mut output,
+            b"random-IV payload",
+            NewlineBeforeEndstream::Yes,
+            ObjectRef::new(7, 0),
+            &context,
+            true,
+            None,
+        )
+        .expect("AES pipeline with an OS-generated IV");
+
+        assert!(added_newline);
+        assert!(output.starts_with(b"\nstream\n"));
+        assert!(output.ends_with(b"\nendstream"));
+    }
+
+    #[test]
+    fn write_reencoded_object_covers_encrypted_stream_routes() {
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 32],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut dict = Dictionary::new();
+        dict.insert("Label", Object::String(b"reencoded label".to_vec()));
+        dict.insert("Length", Object::Integer(7));
+        let stream = Object::Stream(crate::Stream::new(dict, b"payload".to_vec()));
+        let options = WriterOptions {
+            compress_streams: CompressStreams::No,
+            ..WriterOptions::default()
+        };
+        let emitted_ref = ObjectRef::new(7, 0);
+
+        let mut plain_dict_bytes = Vec::new();
+        write_reencoded_object(
+            &mut plain_dict_bytes,
+            &stream,
+            false,
+            &options,
+            None,
+            emitted_ref,
+            StreamEncryptionOptions::new(Some(&context), true),
+        )
+        .expect("encrypted stream with a plain dictionary emitter");
+        assert!(plain_dict_bytes.ends_with(b"endstream"));
+
+        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
+        let mut encrypted_dict_bytes = Vec::new();
+        write_reencoded_object(
+            &mut encrypted_dict_bytes,
+            &stream,
+            false,
+            &options,
+            Some(&mut emitter),
+            emitted_ref,
+            StreamEncryptionOptions::new(Some(&context), true),
+        )
+        .expect("encrypted stream with an encrypted dictionary emitter");
+        assert!(encrypted_dict_bytes.ends_with(b"endstream"));
+
+        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
+        let mut encrypted_only_dict_bytes = Vec::new();
+        write_reencoded_object(
+            &mut encrypted_only_dict_bytes,
+            &stream,
+            false,
+            &options,
+            Some(&mut emitter),
+            emitted_ref,
+            StreamEncryptionOptions::new(None, true),
+        )
+        .expect("stream with an encrypted dictionary and plain payload");
+        assert!(encrypted_only_dict_bytes.ends_with(b"endstream"));
+    }
+
+    #[test]
+    fn write_stream_to_buf_qdf_covers_encrypted_and_plain_routes() {
+        let context = EncryptionContext {
+            encrypt_dict: Dictionary::new(),
+            file_key: vec![0x11; 32],
+            cipher: WriteCipher::FileKeyAes256,
+            encryption_v: 5,
+            encryption_r: 6,
+            encrypt_ref: ObjectRef::new(99, 0),
+            id0: Vec::new(),
+            static_aes_iv: true,
+            encrypt_metadata: true,
+            metadata_ref: None,
+        };
+        let mut dict = Dictionary::new();
+        dict.insert("Label", Object::String(b"qdf label".to_vec()));
+        let stream = crate::Stream::new(dict, b"payload".to_vec());
+        let emitted_ref = ObjectRef::new(7, 0);
+
+        let mut out = Vec::new();
+        write_stream_to_buf_qdf(
+            &mut out,
+            &stream,
+            NewlineBeforeEndstream::No,
+            None,
+            emitted_ref,
+            Some(&context),
+            true,
+        )
+        .expect("QDF encrypted payload with a plain dictionary");
+        assert!(out.ends_with(b"endstream"));
+
+        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
+        let mut out = Vec::new();
+        write_stream_to_buf_qdf(
+            &mut out,
+            &stream,
+            NewlineBeforeEndstream::No,
+            Some(&mut emitter),
+            emitted_ref,
+            Some(&context),
+            true,
+        )
+        .expect("QDF encrypted payload and dictionary");
+        assert!(out.ends_with(b"endstream"));
+
+        let mut emitter = encrypted_strings::EncryptedStringEmitter::from_context(&context);
+        let mut out = Vec::new();
+        write_stream_to_buf_qdf(
+            &mut out,
+            &stream,
+            NewlineBeforeEndstream::No,
+            Some(&mut emitter),
+            emitted_ref,
+            None,
+            true,
+        )
+        .expect("QDF encrypted dictionary with a plain payload");
+        assert!(out.ends_with(b"endstream"));
+
+        let mut out = Vec::new();
+        write_stream_to_buf_qdf(
+            &mut out,
+            &stream,
+            NewlineBeforeEndstream::No,
+            None,
+            emitted_ref,
+            None,
+            false,
+        )
+        .expect("plain QDF stream");
+        assert!(out.ends_with(b"endstream"));
+    }
+
+    #[test]
+    fn writer_pipeline_finishes_after_downstream_write_error() {
+        let mut pipeline = FinishAfterWriteError { finishes: 0 };
+        let error = run_writer_pipeline(&mut pipeline, b"payload")
+            .expect_err("downstream write failure must propagate");
+
+        assert!(matches!(error, crate::Error::System(message) if message == "write failed"));
+        assert_eq!(pipeline.finishes, 1, "finish must balance a failed write");
+    }
+
+    #[test]
+    fn writer_pipeline_propagates_downstream_finish_error() {
+        let mut pipeline = FinishErrorPipeline { finishes: 0 };
+        let error = run_writer_pipeline(&mut pipeline, b"payload")
+            .expect_err("downstream finish failure must propagate");
+
+        assert!(matches!(error, crate::Error::System(message) if message == "finish failed"));
+        assert_eq!(pipeline.finishes, 1);
     }
 
     #[test]
