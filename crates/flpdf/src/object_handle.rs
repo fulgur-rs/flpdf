@@ -2505,6 +2505,7 @@ impl ObjectHandle {
     /// the stream filters are added in reverse `/Filter` order. The source
     /// is finally dispatched through the completed chain without a legacy
     /// `Object` materialization.
+    #[allow(dead_code)] // writer/inspection consumers are not on the canonical resolver route yet.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pipe_stream_data(
         &self,
@@ -2514,6 +2515,53 @@ impl ObjectHandle {
         decode_level: DecodeLevel,
         suppress_warnings: bool,
         will_retry: bool,
+    ) -> Result<bool> {
+        self.pipe_stream_data_inner(
+            pipeline,
+            filtering_attempted,
+            encode_flags,
+            decode_level,
+            suppress_warnings,
+            will_retry,
+            false,
+        )
+    }
+
+    /// The object-stream resolver uses qpdf's resolve-time catch boundary for
+    /// codec failures raised while decoding replaced stream data. Ordinary
+    /// callers keep the original pipeline error so writer and inspection
+    /// paths do not silently turn their own sink failures into recovery.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pipe_stream_data_for_object_stream(
+        &self,
+        pipeline: &mut dyn Pipeline,
+        filtering_attempted: &mut bool,
+        encode_flags: u32,
+        decode_level: DecodeLevel,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        self.pipe_stream_data_inner(
+            pipeline,
+            filtering_attempted,
+            encode_flags,
+            decode_level,
+            suppress_warnings,
+            will_retry,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipe_stream_data_inner(
+        &self,
+        pipeline: &mut dyn Pipeline,
+        filtering_attempted: &mut bool,
+        encode_flags: u32,
+        decode_level: DecodeLevel,
+        suppress_warnings: bool,
+        will_retry: bool,
+        recover_codec_errors: bool,
     ) -> Result<bool> {
         self.try_dereference()?;
         let Some((stream_dict, stream_data, stream_length)) =
@@ -2541,6 +2589,7 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
+                false,
             );
         }
 
@@ -2552,6 +2601,7 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
+                false,
             );
         };
         if (plan.lossy_compression && decode_level < DecodeLevel::All)
@@ -2564,11 +2614,13 @@ impl ObjectHandle {
                 pipeline,
                 suppress_warnings,
                 will_retry,
+                false,
             );
         }
 
         *filtering_attempted = true;
         let mut head = PipelineRef::Borrowed(pipeline);
+        let warning_delivery_error: Rc<RefCell<Option<Error>>> = Rc::new(RefCell::new(None));
         let normalization_warnings =
             if encode_flags & STREAM_ENCODE_NORMALIZE != 0 && !suppress_warnings {
                 Some(Rc::new(RefCell::new(Vec::new())))
@@ -2598,10 +2650,16 @@ impl ObjectHandle {
 
         for filter in plan.filters.iter_mut().rev() {
             let warning_handle = self.clone();
+            let warning_delivery_error = Rc::clone(&warning_delivery_error);
             filter.set_warning_callback(Box::new(move |message, _code| {
-                warning_handle
-                    .object_warning(message)
-                    .map_err(|error| PipelineError::runtime(error.to_string()))
+                match warning_handle.object_warning(message) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        *warning_delivery_error.borrow_mut() = Some(error);
+                        Err(PipelineError::runtime(error_message))
+                    }
+                }
             }));
             head = match filter.decode_pipeline_owned(head)? {
                 OwnedDecodePipeline::Stage(stage) => PipelineRef::Owned(stage),
@@ -2609,14 +2667,17 @@ impl ObjectHandle {
             };
         }
 
-        let success = self.pipe_stream_source(
-            &stream_dict,
-            stream_data,
-            stream_length,
-            &mut head,
-            suppress_warnings,
-            will_retry,
-        )?;
+        let success = self
+            .pipe_stream_source(
+                &stream_dict,
+                stream_data,
+                stream_length,
+                &mut head,
+                suppress_warnings,
+                will_retry,
+                recover_codec_errors,
+            )
+            .map_err(|error| warning_delivery_error.borrow_mut().take().unwrap_or(error))?;
         if !success {
             *filtering_attempted = false;
         }
@@ -2775,9 +2836,11 @@ impl ObjectHandle {
             pipeline,
             false,
             false,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pipe_stream_source(
         &self,
         stream_dict: &ObjectHandle,
@@ -2786,10 +2849,15 @@ impl ObjectHandle {
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
         will_retry: bool,
+        recover_codec_errors: bool,
     ) -> Result<bool> {
         if let Some(stream_data) = stream_data {
-            pipeline.write(&stream_data)?;
-            pipeline.finish()?;
+            pipeline
+                .write(&stream_data)
+                .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
+            pipeline
+                .finish()
+                .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
             return Ok(true);
         }
 
@@ -2824,6 +2892,18 @@ impl ObjectHandle {
             suppress_warnings,
             will_retry,
         )
+    }
+
+    fn map_stream_pipeline_error(error: PipelineError, recover_codec_errors: bool) -> Error {
+        if recover_codec_errors {
+            if let PipelineError::Runtime(message) = error {
+                return Error::Unsupported(format!(
+                    "error decoding stream data: {}",
+                    message.into_string_lossy()
+                ));
+            }
+        }
+        error.into()
     }
 
     /// The value as raw operator bytes if this handle's value — its own if
@@ -9007,6 +9087,18 @@ mod mutation_tests {
         assert!(success);
         assert!(filtering_attempted);
         assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn stream_pipeline_error_mapping_keeps_non_codec_errors_fatal() {
+        assert!(matches!(
+            ObjectHandle::map_stream_pipeline_error(PipelineError::logic("sink failed"), true),
+            Error::Internal(message) if message == "sink failed"
+        ));
+        assert!(matches!(
+            ObjectHandle::map_stream_pipeline_error(PipelineError::runtime("sink failed"), false),
+            Error::System(message) if message == "sink failed"
+        ));
     }
 
     #[test]

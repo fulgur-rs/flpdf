@@ -1163,7 +1163,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
         let mut decoded_stream = crate::pipeline::buffer::Buffer::new("object stream", None);
         let mut filtering_attempted = false;
-        let _success = stream_handle.pipe_stream_data(
+        let _success = stream_handle.pipe_stream_data_for_object_stream(
             &mut decoded_stream,
             &mut filtering_attempted,
             0,
@@ -1293,7 +1293,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // `resolveObjectsInStream`, warns, and lets its common tail
                 // cache the requested object as null (`QPDF.cc:1724-1750`).
                 self.push_warning(error.to_string())?;
-                handle.set_missing();
+                if !handle.is_resolved() {
+                    handle.set_missing();
+                }
             }
             Err(ObjectStreamResolutionError::Operation(error)) => return Err(error),
         }
@@ -1302,6 +1304,21 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
     fn is_qpdf_caught_resolution_error(error: &Error) -> bool {
         matches!(error, Error::Parse { .. } | Error::Unsupported(_))
+    }
+
+    /// Preserve the source position carried by qpdf's `QPDFExc` when its
+    /// resolve catch turns a structural failure into a warning. qpdf's
+    /// `QPDF::warn` receives the exception unchanged (`QPDF.cc:1737-1741`),
+    /// so the diagnostic keeps the exception offset rather than rendering it
+    /// into the message text. Offsetless failures retain the existing text
+    /// path.
+    fn push_caught_resolution_warning(&self, error: Error) -> Result<()> {
+        match error {
+            Error::Parse { offset, message } => {
+                self.push_warning_at(u64::try_from(offset).unwrap_or(u64::MAX), message)
+            }
+            error => self.push_warning(error.to_string()),
+        }
     }
 
     /// Apply qpdf's `updateCache` result to the already-vended canonical slot.
@@ -3134,7 +3151,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // (`QPDF.cc:1737-1749`). Parse/unsupported errors are
                 // flpdf's structural equivalent; I/O, encryption,
                 // and diagnostic-channel failures remain caller errors.
-                self.push_warning(error.to_string())?;
+                self.push_caught_resolution_warning(error)?;
                 handle.set_missing();
                 Ok(())
             }
@@ -6318,6 +6335,121 @@ mod tests {
     }
 
     #[test]
+    fn an_object_stream_resolves_a_codec_failure_to_null_with_a_warning() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"not zlib data".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        resolver
+            .get_object_handle(member_ref)
+            .try_dereference()
+            .expect("qpdf catches a codec failure and resolves the member to null");
+        assert!(resolver.get_object_handle(member_ref).is_null());
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("incorrect header check")));
+    }
+
+    #[test]
+    fn an_object_stream_codec_warning_delivery_failure_still_propagates() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = vec![0x78];
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        assert!(matches!(
+            resolver
+                .get_object_handle(member_ref)
+                .try_dereference()
+                .expect_err("codec warning delivery must remain a caller error"),
+            Error::System(message) if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
     fn an_object_stream_with_wrong_type_warns_and_still_resolves() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
@@ -6573,6 +6705,82 @@ mod tests {
             .try_dereference()
             .expect("qpdf catches a member parse error and resolves it to null");
         assert!(resolver.get_object_handle(member_ref).is_null());
+        assert!(resolver
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("parse error")));
+    }
+
+    #[test]
+    fn an_objstm_failure_does_not_overwrite_a_member_cached_before_it() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let requested_ref = ObjectRef::new(7, 0);
+        let malformed_ref = ObjectRef::new(8, 0);
+        let valid_member = b"<< /Value 1 >>";
+        let malformed_member = b"[ 2147483648 0 R ]";
+        let header = format!("7 0 8 {} ", valid_member.len()).into_bytes();
+        let mut stream_data = header.clone();
+        stream_data.extend_from_slice(valid_member);
+        stream_data.extend_from_slice(malformed_member);
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(2)),
+            (
+                b"First".to_vec(),
+                ObjectHandle::integer(header.len() as i64),
+            ),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(Vec::<u8>::new()),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    requested_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+                (
+                    malformed_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 1,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
+            0,
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+            });
+
+        let requested = resolver.get_object_handle(requested_ref);
+        requested
+            .try_dereference()
+            .expect("qpdf warns about a later member and keeps the earlier cache entry");
+        assert_eq!(
+            requested
+                .try_get_key(b"Value")
+                .expect("the earlier member remains a dictionary")
+                .as_integer(),
+            Some(1)
+        );
+        assert!(!requested.is_null());
         assert!(resolver
             .repair_diagnostics()
             .entries()
@@ -8145,6 +8353,55 @@ mod tests {
             .find(|entry| entry.message == "unexpected )")
             .expect("qpdf tokenizer warning");
         assert_eq!(warning.offset, Some(malformed_at as u64));
+    }
+
+    #[test]
+    fn a_caught_parse_failure_preserves_its_warning_offset() {
+        let malformed_body = b"2 0 obj\n[ 2147483648 0 R ]\nendobj\n";
+        let bytes = pdf_with_bodies(&[
+            b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec(),
+            malformed_body.to_vec(),
+        ]);
+        let malformed_at = bytes
+            .windows(b"2147483648".len())
+            .position(|window| window == b"2147483648")
+            .expect("the fixture must contain the malformed integer");
+
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+        handle
+            .try_dereference()
+            .expect("qpdf catches a body parse failure and resolves to null");
+        assert!(handle.is_null());
+
+        let diagnostics = pdf.repair_diagnostics();
+        let warning = diagnostics
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry
+                    .message
+                    .contains("integer out of range converting 2147483648")
+            })
+            .expect("the caught parse failure must be warned");
+        assert_eq!(warning.offset, Some(malformed_at as u64));
+    }
+
+    #[test]
+    fn a_caught_offsetless_resolution_failure_keeps_the_existing_warning_path() {
+        let resolver = bare_resolver();
+        resolver
+            .push_caught_resolution_warning(Error::Unsupported(
+                "unfilterable object stream".to_owned(),
+            ))
+            .expect("the offsetless warning should reach the document sink");
+
+        let diagnostics = resolver.repair_diagnostics();
+        assert_eq!(diagnostics.entries()[0].offset, None);
+        assert_eq!(
+            diagnostics.entries()[0].message,
+            "unsupported PDF feature: unfilterable object stream"
+        );
     }
 
     /// A recoverable diagnostic raised *inside* the body's parse reaches the
