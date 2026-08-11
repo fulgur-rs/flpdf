@@ -3014,11 +3014,12 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()> {
         // Keep this boundary small: enter the large dispatch frame only after
         // maybe_grow has had a chance to switch away from a small caller stack.
-        stacker::maybe_grow(
+        let result = stacker::maybe_grow(
             super::READER_STACK_RED_ZONE,
             super::READER_STACK_GROWTH_SIZE,
             || self.resolve_indirect_inner(object_ref, handle),
-        )
+        );
+        self.finish_indirect_resolution(handle, result)
     }
 }
 
@@ -3165,7 +3166,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }
         };
 
-        self.finish_indirect_resolution(handle, result)
+        result
     }
 }
 
