@@ -998,6 +998,18 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.xref_entries()
     }
 
+    /// Return qpdf's effective source cross-reference table.
+    ///
+    /// This is the reader-owned table represented by qpdf's
+    /// `QPDF::getXRefTable` (`libqpdf/QPDF.cc:2370-2377`), not a writer
+    /// reconstruction or a table derived from resolved values. The returned
+    /// map is a snapshot because the resolver owns the table behind interior
+    /// mutability; resolution-time recovery is reflected in a subsequent
+    /// snapshot.
+    pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
+        self.resolver.xref_entries()
+    }
+
     /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
     ///
     /// This is normally the absolute offset in the original input. When repair
@@ -1806,39 +1818,29 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    // This implements the ordering/registration contract of qpdf's
-    // `getAllObjects()` (`libqpdf/QPDF.cc:1285-1294`) only. qpdf's own
-    // dangling-reference preparation additionally walks every live object's
-    // content to discover and register references that are syntactically
-    // valid but have no live xref/cache target — that step ties into
-    // xref/recovery semantics this layer does not own, and is out of scope
-    // here; full dangling-reference-preparation parity is flpdf-egzr.3.3's
-    // deliverable.
-    //
-    // qpdf's `m->xref_table` never contains free ("f"/type-0) entries in the
-    // first place (`insertFreeXrefEntry` records them in a separate
-    // `deleted_objects` set, never in `xref_table`), so `getAllObjects` never
-    // sees them. The reader's source table now follows that effective-table
-    // contract, so no Free predicate is needed at this boundary.
-    /// Every indirect object known to this document.
+    /// Return qpdf's complete canonical object cache in `ObjectRef` order.
     ///
-    /// The result is the union of every reference already registered in the
-    /// canonical handle cache (see [`Pdf::get_object_handle`]) and every
-    /// reference recorded in the effective source cross-reference table,
-    /// registering any of the latter that is not yet cached. Returned in
-    /// `ObjectRef` order (ascending object number, then generation); every
-    /// handle in the result is indirect ([`ObjectHandle::is_indirect`]).
-    ///
-    /// # Errors
-    ///
-    /// This method never returns an error: every candidate reference is
-    /// registered via [`Pdf::get_object_handle`], which cannot fail.
-    pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
-        let refs_to_register = self.resolver.xref_refs();
-        for object_ref in refs_to_register {
-            self.get_object_handle(object_ref);
-        }
+    /// `QPDF::getAllObjects` first calls `fixDanglingReferences` and then
+    /// walks `m->obj_cache` (`libqpdf/QPDF.cc:1258-1294`). The canonical
+    /// resolver performs that preparation here: every effective source-xref
+    /// object is resolved, and parser-discovered dangling references are
+    /// retained as canonical indirect handles. Free rows are not in the
+    /// effective source table, matching qpdf's `insertFreeXrefEntry` split
+    /// between `xref_table` and `deleted_objects`.
+    pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
+        self.resolver.fix_dangling_references()?;
         Ok(self.resolver.all_object_handles())
+    }
+
+    /// Compatibility name for the canonical qpdf object enumeration.
+    ///
+    /// New consumers should use [`Self::get_all_objects`]. This forwarding
+    /// name remains only while the remaining consumer-cutover slices move off
+    /// the pre-qpdf naming; it has exactly the same preparation and ordering
+    /// contract.
+    ///
+    pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+        self.get_all_objects()
     }
 
     /// Resolve `handle` in place if it is an unresolved indirect handle.
