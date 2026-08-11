@@ -284,12 +284,11 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let mut content = String::new();
     let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut dest_acroform_dr: Option<ObjectRef> = None;
-    // `dr_map` lifetime is per-destination (created by the caller,
-    // `apply_aggregated_sources`, and threaded through every page). qpdf's
-    // resource-name rename reuse is dest-scoped, not page-scoped: the same
-    // colliding source object must yield the same renamed dest name every
-    // time it lands on `dest_acroform_dr`, otherwise every page mints a
-    // fresh `_N` suffix and byte parity breaks.
+    // `dr_map` is threaded through every page so the current placement's
+    // rename table reaches field and appearance-stream rewriting. qpdf
+    // rebuilds its source-object identity map for each transform/merge call
+    // from the current destination dictionary; the destination `/DR` itself
+    // persists, so a still-live alias is reused without minting a new suffix.
     for (name, xref, template) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
         let (fragment, cm) =
@@ -693,11 +692,11 @@ fn apply_aggregated_sources<R: Read + Seek>(
     // Snapshot the dest page refs once; the patches mutate page dicts in place
     // but never reorder or remove page objects, so 1-based numbers stay valid.
     let dest_pages = page_refs(dest)?;
-    // One `dr_map` per destination document, threaded through every per-page
-    // call. Mirrors qpdf's dest-scoped resource-name reuse (see the invariant
-    // note on `merge_resources_shallow`): the same colliding source object
-    // must yield the same renamed dest name across every page it lands on,
-    // rather than growing a fresh `_N` suffix per page.
+    // One `dr_map` is threaded through every per-page call so the current
+    // placement's rename table reaches its field/AP consumers. Each qpdf
+    // merge call rebuilds source-object identity from the current destination
+    // `/DR`; a prior alias is reused only while that alias still names the
+    // same source object.
     let mut dr_map = crate::overlay_annotations::DrMap::new();
     for (dest_page, sources) in by_page {
         let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
@@ -1711,16 +1710,13 @@ mod byte_gate {
     }
     // cov:ignore-end
 
-    /// Record the qpdf divergence for a destination `/DR/Font` whose direct
-    /// category dictionary contains an indirect nested dictionary and an
-    /// existing `/F1_1` key. qpdf's `getResourceNames` sees only keys inside
-    /// the nested dictionary (`QPDFObjectHandle.cc:1155-1172`), so its
-    /// `mergeResources` collision path chooses `/F1_1` and overwrites the
-    /// existing direct key. flpdf's `unique_dr_name` scans the direct
-    /// category keys and chooses `/F1_2` instead. This is evidence for the
-    /// follow-up parity fix; it is intentionally not a byte-identity gate.
+    /// Overlay a destination `/DR/Font` whose direct category dictionary
+    /// contains an indirect nested dictionary and an existing `/F1_1` key.
+    /// qpdf's `getResourceNames` sees only keys inside the nested dictionary
+    /// (`QPDFObjectHandle.cc:1155-1172`), so its `mergeResources` collision
+    /// path chooses `/F1_1` and overwrites the existing direct key.
     #[test]
-    fn overlay_copy_annotations_indirect_font_hidden_collision_records_qpdf_divergence() {
+    fn overlay_copy_annotations_indirect_font_hidden_collision_is_byte_identical_qdf() {
         let mut dest = fixture("overlay-dr-merge-hidden-collision.pdf");
         let mut src = fixture("form-fields-and-annotations.pdf");
         let (version, max_ext) = accumulate_max(&mut dest, &mut src).get_version();
@@ -1740,10 +1736,7 @@ mod byte_gate {
         });
         let expected = golden("overlay-dr-merge-hidden-collision.pdf");
 
-        assert_ne!(
-            actual, expected,
-            "the hidden collision must remain a recorded qpdf/flpdf divergence"
-        );
+        assert_byte_identical(&actual, "overlay-dr-merge-hidden-collision.pdf");
         // Inspect the copied field dictionaries themselves. A whole-file
         // marker search is insufficient because the same operand also occurs
         // in copied AP stream content and could mask a broken `/DA` rewrite.
@@ -1763,14 +1756,14 @@ mod byte_gate {
             );
             qdf_object_contains(
                 flpdf_field,
-                b"/DA (0 0.4 0 rg /F1_2 18 Tf)",
+                b"/DA (0 0.4 0 rg /F1_1 18 Tf)",
                 "flpdf copied field /DA",
             );
             assert!(
                 !flpdf_field
-                    .windows(b"/F1_1 18 Tf".len())
-                    .any(|window| window == b"/F1_1 18 Tf"),
-                "flpdf copied field must expose its direct-key scan as /F1_2"
+                    .windows(b"/F1_2 18 Tf".len())
+                    .any(|window| window == b"/F1_2 18 Tf"),
+                "flpdf copied field must not use /F1_2 in /DA"
             );
         }
 
@@ -1790,17 +1783,14 @@ mod byte_gate {
         );
 
         let flpdf_dr = qdf_object(&actual, 4);
-        qdf_object_contains(
-            flpdf_dr,
-            b"/F1 10 0 R",
-            "flpdf /DR original Helvetica mapping",
+        qdf_object_contains(flpdf_dr, b"/F1 10 0 R", "flpdf /DR Helvetica mapping");
+        qdf_object_contains(flpdf_dr, b"/F1_1 11 0 R", "flpdf /DR Courier mapping");
+        assert!(
+            !flpdf_dr
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "flpdf /DR must not map Courier through /F1_2"
         );
-        qdf_object_contains(
-            flpdf_dr,
-            b"/F1_1 10 0 R",
-            "flpdf /DR hidden direct-key mapping",
-        );
-        qdf_object_contains(flpdf_dr, b"/F1_2 11 0 R", "flpdf /DR Courier mapping");
 
         let qpdf_ap_resources = qdf_object(&expected, 31);
         qdf_object_contains(
@@ -1818,14 +1808,14 @@ mod byte_gate {
         let flpdf_ap_resources = qdf_object(&actual, 31);
         qdf_object_contains(
             flpdf_ap_resources,
-            b"/F1_2 11 0 R",
+            b"/F1_1 11 0 R",
             "flpdf AP `/Resources` Courier mapping",
         );
         assert!(
             !flpdf_ap_resources
-                .windows(b"/F1_1 11 0 R".len())
-                .any(|window| window == b"/F1_1 11 0 R"),
-            "flpdf AP `/Resources` must expose /F1_2"
+                .windows(b"/F1_2 11 0 R".len())
+                .any(|window| window == b"/F1_2 11 0 R"),
+            "flpdf AP `/Resources` must not use /F1_2"
         );
     }
 
