@@ -560,7 +560,7 @@ fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
 
     assert_eq!(
         error.to_string(),
-        "unsupported PDF feature: object-number space exhausted"
+        "unsupported PDF feature: max object id is too high to create new objects"
     );
     assert_eq!(
         tree.as_map(&mut pdf).expect("map after failed insert"),
