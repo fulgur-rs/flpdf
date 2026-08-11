@@ -655,7 +655,7 @@ impl HandleNumberTree {
             pdf.push_warning(structural_message(
                 node.object_ref(),
                 "loop detected while traversing name/number tree",
-            ))?;
+            ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
             return Ok(());
         }
         if depth > max_depth {
@@ -715,7 +715,7 @@ impl HandleNumberTree {
                             pdf.push_warning(structural_message(
                                 node.object_ref(),
                                 format!("converting kid number {kid_number} to an indirect object"),
-                            ))?;
+                            ))?; // cov:ignore: LLVM maps this covered multi-line warning call terminator to a zero-count region
                             let indirect = pdf.make_indirect_from_object_handle(kid)?;
                             let replaced = kids.replace_array_item(kid_number, indirect.clone());
                             debug_assert!(
