@@ -87,7 +87,17 @@ impl EncryptedStringEmitter {
         dict: &Dictionary,
         qdf: bool,
         refiltered: bool,
+        encrypt_strings: bool,
     ) -> crate::Result<()> {
+        if !encrypt_strings {
+            if qdf {
+                dict.write_pdf_stream_qdf(out, 0);
+            } else {
+                dict.write_pdf_stream(out, refiltered);
+            }
+            return Ok(());
+        }
+
         let cipher = self.cipher;
         let static_aes_iv = self.static_aes_iv;
         let aes_iv_generator = self.aes_iv_generator.as_mut();
@@ -435,7 +445,7 @@ mod tests {
             let mut emitter = EncryptedStringEmitter::from_context(&context);
             let mut out = Vec::new();
             emitter
-                .write_stream_dict(&mut out, emitted_ref, None, &dict, qdf, true)
+                .write_stream_dict(&mut out, emitted_ref, None, &dict, qdf, true, true)
                 .expect("stream dictionary emission");
 
             let ciphertext = parse_dict_string(&out, "Label");
@@ -444,6 +454,35 @@ mod tests {
                 b"stream label"
             );
         }
+    }
+
+    #[test]
+    fn cleartext_stream_dictionary_keeps_nested_strings_plain() {
+        let emitted_ref = ObjectRef::new(12, 0);
+        let context = fixed_context(
+            vec![0x21; 16],
+            WriteCipher::PerObject(ObjectKeyAlg::Aes),
+            4,
+            4,
+        );
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "MetadataMarker",
+            Object::String(b"metadata-dictionary-secret".to_vec()),
+        );
+        dict.insert("Length", Object::Integer(5));
+
+        let mut emitter = EncryptedStringEmitter::from_context(&context);
+        let mut out = Vec::new();
+        emitter
+            .write_stream_dict(&mut out, emitted_ref, None, &dict, false, false, false)
+            .expect("cleartext stream dictionary emission");
+
+        assert!(
+            out.windows(b"metadata-dictionary-secret".len())
+                .any(|window| window == b"metadata-dictionary-secret"),
+            "cleartext metadata dictionary strings must bypass the object cipher"
+        );
     }
 
     #[test]

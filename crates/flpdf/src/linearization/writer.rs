@@ -694,7 +694,7 @@ fn append_body_object(
     // primary hint stream keeps its newline via the separate
     // `append_hint_stream_object`, matching qpdf's hint-stream framing.
     if let Some(emitter) = encrypted_string_emitter {
-        emitter.write_stream_dict(bytes, new_ref, None, &s.dict, false, refiltered)?;
+        emitter.write_stream_dict(bytes, new_ref, None, &s.dict, false, refiltered, true)?;
         crate::writer::serialize::write_stream_payload(
             bytes,
             &s.data,

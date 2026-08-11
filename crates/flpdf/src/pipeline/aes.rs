@@ -78,8 +78,9 @@ impl Cipher {
 
 /// qpdf `Pl_AES_PDF` (`libqpdf/qpdf/Pl_AES_PDF.hh:12-60`).
 ///
-// No production caller until `QPDF::pipeStreamData`'s decrypt path is ported;
-// the same not-yet-wired state `PlRc4` and the other `Pl_*` stages carry.
+// The reader's `QPDF::pipeStreamData`-shaped decrypt path and the canonical
+// writer stream-encryption path both use this stage. Key-wrap and string
+// helpers also reuse it for their block semantics.
 #[allow(dead_code)]
 pub(crate) struct PlAesPdf<'a> {
     identifier: String,
