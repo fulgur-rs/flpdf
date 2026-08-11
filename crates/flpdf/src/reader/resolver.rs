@@ -3155,7 +3155,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::Cursor;
-    use std::process::Command;
+    use std::process::Command; // cov:ignore: test-only import has no executable LLVM counter.
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -9293,7 +9293,9 @@ mod tests {
     /// 4000. Pinning it on a 256 KiB thread makes the assertion independent of
     /// whichever default a runner happens to give, and reproduces the
     /// situation `lift_bounded`'s own wrap exists for: a caller that does not
-    /// own the thread it is called on.
+    /// own the thread it is called on. Unix pins 256 KiB; Windows uses a
+    /// larger initial stack because stacker's fiber backend has larger debug
+    /// frames before it can switch to a grown fiber.
     ///
     /// The expected outcome is a *diagnosis*: link 1's `/Length` resolves to
     /// link 2, which is a stream rather than an integer. qpdf reaches the same
@@ -9307,8 +9309,13 @@ mod tests {
         // `ObjectHandle` are not `Send`, the same reason `reader.rs`'s
         // `trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound`
         // builds its tree in the spawned thread.
+        let stack_size = if cfg!(windows) {
+            8 * 1024 * 1024
+        } else {
+            256 * 1024
+        };
         std::thread::Builder::new()
-            .stack_size(256 * 1024)
+            .stack_size(stack_size)
             .spawn(|| {
                 let bytes = chained_indirect_length_pdf_bytes(4000);
                 let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
