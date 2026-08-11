@@ -2304,7 +2304,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         try_recovery: bool,
     ) -> std::result::Result<ParsedObjectAtOffset, ReadObjectAtOffsetError> {
         self.seek(offset).map_err(ReadObjectAtOffsetError::Body)?;
-        let (found, parsed, trailing) = {
+        let (found, parsed, trailing, object_header_offset) = {
             let mut input = self.live_input();
             let mut tokenizer = LiveTokenSource::new(&mut input);
             let number = read_live_header_integer(
@@ -2328,7 +2328,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     "expected obj",
                 )));
             }
+            // qpdf consumes the object header before entering QPDF::readObject,
+            // which captures `m->file->tell()` at this exact point
+            // (`libqpdf/QPDF.cc:1331-1335`). Keep this separate from `offset`,
+            // the xref/object-start position used by header diagnostics.
             drop(tokenizer);
+            let object_header_offset = input.tell().map_err(ReadObjectAtOffsetError::Header)?;
 
             let found = u32::try_from(number)
                 .ok()
@@ -2386,7 +2391,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 None
             };
             input.finish().map_err(ReadObjectAtOffsetError::Body)?;
-            (found, parsed, trailing)
+            (found, parsed, trailing, object_header_offset)
         };
 
         if found.is_some_and(|object_ref| object_ref.number == 0) {
@@ -2475,7 +2480,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         if trailing.is_word_value(b"stream") {
             let stream_description = self.stream_description(found);
             let (value, parsed_offset) = self
-                .read_stream(value, parsed_offset, description, offset, found)
+                .read_stream(
+                    value,
+                    parsed_offset,
+                    description,
+                    object_header_offset,
+                    found,
+                )
                 .map_err(ReadObjectAtOffsetError::Body)?;
             let (end_before_space, end_after_space) = if capture_end_offsets {
                 self.object_end_offsets()
@@ -2562,7 +2573,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         dict: ObjectValue,
         dict_offset: i64,
         dict_description: String,
-        object_offset: u64,
+        object_header_offset: u64,
         object_ref: ObjectRef,
     ) -> Result<(ObjectValue, i64)> {
         self.validate_stream_line_end()?;
@@ -2587,7 +2598,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(&error, object_offset, object_ref)?;
+                self.warn_stream_failure(&error, object_header_offset, object_ref)?;
                 recovered = true;
                 self.recover_stream_length(stream_offset, object_ref)?
             }
@@ -2612,7 +2623,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 if !self.stream_recovery_enabled() {
                     return Err(error);
                 }
-                self.warn_stream_failure(&error, object_offset, object_ref)?;
+                self.warn_stream_failure(&error, object_header_offset, object_ref)?;
                 length = self.recover_stream_length(stream_offset, object_ref)?;
             }
         }
@@ -2665,16 +2676,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
     fn warn_stream_failure(
         &self,
         error: &Error,
-        object_offset: u64,
+        object_header_offset: u64,
         object_ref: ObjectRef,
     ) -> Result<()> {
         let Error::Parse { offset, message } = error else {
             return Ok(());
         };
         let warning_offset = if message == "expected endstream" {
-            u64::try_from(*offset).unwrap_or(object_offset)
+            u64::try_from(*offset).unwrap_or(object_header_offset)
         } else {
-            object_offset
+            object_header_offset
         };
         self.push_stream_warning(object_ref, warning_offset, message)
     }
@@ -9013,6 +9024,71 @@ mod tests {
         assert_eq!(found.as_integer(), Some(42));
         assert!(found.is_resolved());
         assert!(found.is_same_object_as(&pdf.get_object_handle(ObjectRef::new(7, 0))));
+    }
+
+    /// qpdf captures the offset after the indirect-object header before it
+    /// enters `QPDF::readObject`; stream `/Length` failures therefore use the
+    /// post-`obj` position rather than the xref/object-start position
+    /// (`libqpdf/QPDF.cc:1331-1335,1360-1399`). Recovery warnings still use
+    /// the stream data position captured by `readStream`.
+    #[test]
+    fn canonical_stream_length_warnings_use_qpdfs_post_header_offset() {
+        let catalog = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let object_start = b"%PDF-1.4\n".len() as u64 + catalog.len() as u64;
+        let header_offset = object_start + b"2 0 obj".len() as u64;
+
+        for dictionary in [
+            b"<< /Type /X >>".as_slice(),
+            b"<< /Length /X >>".as_slice(),
+            b"<< /Length -5 >>".as_slice(),
+        ] {
+            let mut body = b"2 0 obj\n".to_vec();
+            body.extend_from_slice(dictionary);
+            body.extend_from_slice(b"\nstream\nabc\nendstream\nendobj\n");
+            let stream_offset = object_start
+                + body
+                    .windows(b"stream\n".len())
+                    .position(|window| window == b"stream\n")
+                    .expect("stream keyword") as u64
+                + b"stream\n".len() as u64;
+            let expected_length_warning = match dictionary {
+                b"<< /Type /X >>" => "stream dictionary lacks /Length key",
+                b"<< /Length /X >>" => "/Length key in stream dictionary is not an integer",
+                b"<< /Length -5 >>" => "/Length key in stream dictionary is out of range",
+                // cov:ignore: dictionary is one of the three literals above
+                _ => unreachable!("all malformed length cases are listed"),
+            };
+
+            let mut pdf = Pdf::open_mem_owned_with_options(
+                pdf_with_bodies(&[catalog.to_vec(), body]),
+                crate::PdfOpenOptions {
+                    repair: true,
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .expect("open repair fixture");
+            let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+            handle
+                .try_dereference()
+                .expect("repair mode recovers an unusable stream length");
+
+            let messages: Vec<_> = pdf
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect();
+            assert_eq!(
+                messages,
+                vec![
+                    format!("(object 2 0, offset {header_offset}): {expected_length_warning}"),
+                    format!(
+                        "(object 2 0, offset {stream_offset}): attempting to recover stream length"
+                    ),
+                    format!("(object 2 0, offset {stream_offset}): recovered stream length: 4"),
+                ]
+            );
+        }
     }
 
     /// Every way `/Length` can fail to yield a byte count.
