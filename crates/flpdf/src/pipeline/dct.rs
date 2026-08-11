@@ -1,10 +1,10 @@
 //! qpdf correspondence: `Pl_DCT` buffers compressed input and decodes it on `finish`, emitting one decoded scanline at a time to the next pipeline.
 
 use super::buffer::Buffer;
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 
 #[cfg(feature = "qpdf-libjpeg-compat")]
-#[allow(unsafe_code)]
+#[allow(dead_code, unsafe_code)]
 mod jpeg_compat {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_int, c_uchar, c_void};
@@ -336,17 +336,19 @@ mod jpeg_compat {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) struct PlDct<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     buffer: Buffer<'static>,
 }
 
+#[allow(dead_code)]
 impl<'a> PlDct<'a> {
-    pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
+    pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             buffer: Buffer::new("DCT buffer", None),
         }
     }
@@ -379,7 +381,7 @@ impl Pipeline for PlDct<'_> {
         }
 
         #[cfg(feature = "qpdf-libjpeg-compat")]
-        return jpeg_compat::decode_scanlines(&self.identifier, &data, self.next);
+        return jpeg_compat::decode_scanlines(&self.identifier, &data, &mut self.next);
 
         #[cfg(not(feature = "qpdf-libjpeg-compat"))]
         {

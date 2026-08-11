@@ -48,10 +48,37 @@
 // bytes or diagnostics; invalid array access (where qpdf warns) is outside the
 // try_array_item contract. See docs/qpdf-correspondence.md.
 
+use crate::{
+    content_normalizer::ContentNormalizerPipeline,
+    pipeline::{
+        flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE},
+        Pipeline, PipelineError, PipelineRef,
+    },
+    stream_filter::{
+        decode_params_from_handle, normalize_filter_name, stream_filter_for, OwnedDecodePipeline,
+        StreamFilter, DECODE_PARMS_LENGTH_ERROR, FILTER_TYPE_ERROR,
+    },
+    writer::DecodeLevel,
+};
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
+
+/// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
+#[allow(dead_code)]
+pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
+
+/// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
+#[allow(dead_code)]
+pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
+
+#[allow(dead_code)]
+struct StreamFilterPlan {
+    filters: Vec<Box<dyn StreamFilter>>,
+    specialized_compression: bool,
+    lossy_compression: bool,
+}
 
 /// The no-offset sentinel qpdf uses for values that were not parsed from a
 /// source position (`QPDFValue`'s parsed offset starts at `-1` and is set
@@ -2425,6 +2452,255 @@ impl ObjectHandle {
         })
     }
 
+    /// Pipe this stream through qpdf's filter branch.
+    ///
+    /// This is the `QPDFObjectHandle::pipeStreamData` entry point
+    /// (`libqpdf/QPDFObjectHandle.cc:1300-1341`) over the
+    /// `QPDF_Stream::filterable` and reverse-stage construction owned here
+    /// (`libqpdf/QPDF_Stream.cc:379-569`). `filtering_attempted` is the
+    /// qpdf out-parameter: it records a usable installed filter branch and is
+    /// cleared if the source branch fails; the returned bool is overall
+    /// source-pipeline success. Keeping those results separate is what lets a
+    /// writer retry a failed filtering decision with raw bytes
+    /// (`libqpdf/QPDFWriter.cc:1239-1314`).
+    ///
+    /// `encode_flags` uses [`STREAM_ENCODE_COMPRESS`] and
+    /// [`STREAM_ENCODE_NORMALIZE`]. The output stages are built first, then
+    /// the stream filters are added in reverse `/Filter` order. The source
+    /// is finally dispatched through the completed chain without a legacy
+    /// `Object` materialization.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn pipe_stream_data(
+        &self,
+        pipeline: &mut dyn Pipeline,
+        filtering_attempted: &mut bool,
+        encode_flags: u32,
+        decode_level: DecodeLevel,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        self.try_dereference()?;
+        let Some((stream_dict, stream_data, stream_length)) =
+            self.with_value(|value| match value {
+                Some(ObjectValue::Stream {
+                    stream_dict,
+                    stream_data,
+                    stream_length,
+                }) => Some((stream_dict.clone(), stream_data.clone(), *stream_length)),
+                _ => None,
+            })
+        else {
+            return Err(Error::Internal(
+                "pipeStreamData called for non-stream".to_owned(),
+            ));
+        };
+
+        *filtering_attempted = false;
+        let filter_requested = encode_flags != 0 || !matches!(decode_level, DecodeLevel::None);
+        if !filter_requested {
+            return self.pipe_stream_source(
+                &stream_dict,
+                stream_data,
+                stream_length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            );
+        }
+
+        let Some(mut plan) = self.prepare_stream_filter_plan(&stream_dict)? else {
+            return self.pipe_stream_source(
+                &stream_dict,
+                stream_data,
+                stream_length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            );
+        };
+        if (plan.lossy_compression && decode_level < DecodeLevel::All)
+            || (plan.specialized_compression && decode_level < DecodeLevel::Specialized)
+        {
+            return self.pipe_stream_source(
+                &stream_dict,
+                stream_data,
+                stream_length,
+                pipeline,
+                suppress_warnings,
+                will_retry,
+            );
+        }
+
+        *filtering_attempted = true;
+        let mut head = PipelineRef::Borrowed(pipeline);
+        let normalization_warnings =
+            if encode_flags & STREAM_ENCODE_NORMALIZE != 0 && !suppress_warnings {
+                Some(Rc::new(RefCell::new(Vec::new())))
+            } else {
+                None
+            };
+        if encode_flags & STREAM_ENCODE_COMPRESS != 0 {
+            let compress = Flate::new(
+                "compress stream",
+                head,
+                FlateAction::Deflate,
+                DEFAULT_OUT_BUFFER_SIZE,
+            )?; // cov:ignore: fixed nonzero output buffer makes Flate::new's failure branch untestable here
+            head = PipelineRef::Owned(Box::new(compress));
+        }
+        if encode_flags & STREAM_ENCODE_NORMALIZE != 0 {
+            let mut normalizer = ContentNormalizerPipeline::new("normalizer", head);
+            if let Some(warnings) = normalization_warnings.as_ref() {
+                let warnings = Rc::clone(warnings);
+                normalizer.set_warning_callback(Box::new(move |message| {
+                    warnings.borrow_mut().push(message.to_owned());
+                    Ok(())
+                }));
+            }
+            head = PipelineRef::Owned(Box::new(normalizer));
+        }
+
+        for filter in plan.filters.iter_mut().rev() {
+            let warning_handle = self.clone();
+            filter.set_warning_callback(Box::new(move |message, _code| {
+                warning_handle
+                    .object_warning(message)
+                    .map_err(|error| PipelineError::runtime(error.to_string()))
+            }));
+            head = match filter.decode_pipeline_owned(head)? {
+                OwnedDecodePipeline::Stage(stage) => PipelineRef::Owned(stage),
+                OwnedDecodePipeline::NoStage(next) => next,
+            };
+        }
+
+        let success = self.pipe_stream_source(
+            &stream_dict,
+            stream_data,
+            stream_length,
+            &mut head,
+            suppress_warnings,
+            will_retry,
+        )?;
+        if !success {
+            *filtering_attempted = false;
+        }
+        if success {
+            if let Some(warnings) = normalization_warnings {
+                for warning in warnings.borrow_mut().drain(..) {
+                    self.object_warning(&warning)?;
+                }
+            }
+        }
+        Ok(success)
+    }
+
+    #[allow(dead_code)]
+    fn prepare_stream_filter_plan(
+        &self,
+        stream_dict: &ObjectHandle,
+    ) -> Result<Option<StreamFilterPlan>> {
+        let filter = stream_dict.try_get_key(b"Filter")?;
+        let filter_names = if filter.try_is_null()? {
+            Vec::new()
+        } else if let Some(name) = filter.try_as_name()? {
+            vec![name]
+        } else if let Some(count) = filter.try_array_len()? {
+            let mut names = Vec::with_capacity(count);
+            let mut malformed = false;
+            for index in 0..count {
+                let item = filter.try_array_item(index)?.ok_or_else(|| {
+                    // cov:ignore-start: immutable array length and item lookup cannot diverge
+                    Error::Internal("filter array item disappeared during inspection".to_owned())
+                    // cov:ignore-end
+                    // cov:ignore-start: LLVM attributes the unreachable defensive closure result here
+                })?;
+                // cov:ignore-end
+                if let Some(name) = item.try_as_name()? {
+                    names.push(name);
+                } else {
+                    malformed = true;
+                }
+            }
+            if malformed {
+                self.object_warning(FILTER_TYPE_ERROR)?;
+                return Ok(None);
+            }
+            names
+        } else {
+            self.object_warning(FILTER_TYPE_ERROR)?;
+            return Ok(None);
+        };
+
+        // qpdf ignores /DecodeParms entirely when /Filter is empty.
+        if filter_names.is_empty() {
+            return Ok(Some(StreamFilterPlan {
+                filters: Vec::new(),
+                specialized_compression: false,
+                lossy_compression: false,
+            }));
+        }
+
+        // qpdf looks up every factory before it reads /DecodeParms. Keeping
+        // this ordering is observable for an unknown filter paired with a
+        // dangling or mismatched parameter object.
+        let mut filters = Vec::with_capacity(filter_names.len());
+        for name in &filter_names {
+            let normalized_name = normalize_filter_name(name);
+            let Some(filter) = stream_filter_for(normalized_name) else {
+                return Ok(None);
+            };
+            filters.push(filter);
+        }
+
+        let decode_params = stream_dict.try_get_key(b"DecodeParms")?;
+        let decode_param_handles = if decode_params.try_is_null()? {
+            vec![ObjectHandle::null(); filter_names.len()]
+        } else if let Some(count) = decode_params.try_array_len()? {
+            if count == 0 {
+                vec![ObjectHandle::null(); filter_names.len()]
+            } else {
+                if count != filter_names.len() {
+                    self.object_warning(DECODE_PARMS_LENGTH_ERROR)?;
+                    return Ok(None);
+                }
+                let mut handles = Vec::with_capacity(count);
+                for index in 0..count {
+                    // cov:ignore-start: llvm-cov attributes this defensive closure to the call line
+                    handles.push(decode_params.try_array_item(index)?.ok_or_else(|| {
+                        Error::Internal(
+                            "decode parameters array item disappeared during inspection".to_owned(),
+                        )
+                    })?);
+                    // cov:ignore-end
+                }
+                handles
+            }
+        } else {
+            vec![decode_params; filter_names.len()]
+        };
+
+        let mut plan = StreamFilterPlan {
+            filters: Vec::with_capacity(filter_names.len()),
+            specialized_compression: false,
+            lossy_compression: false,
+        };
+        for ((name, mut filter), decode_params) in filter_names
+            .into_iter()
+            .zip(filters)
+            .zip(decode_param_handles)
+        {
+            let filter_name = normalize_filter_name(&name);
+            let decode_params = decode_params_from_handle(&decode_params, filter_name)?;
+            if !filter.set_decode_params(&decode_params) {
+                return Ok(None);
+            }
+            plan.specialized_compression |= filter.is_specialized_compression();
+            plan.lossy_compression |= filter.is_lossy_compression();
+            plan.filters.push(filter);
+        }
+        Ok(Some(plan))
+    }
+
     /// qpdf `QPDF_Stream::getRawStreamData` (`libqpdf/QPDF_Stream.cc:362-376`).
     ///
     /// Replaced stream data is written directly; original data is read through
@@ -2457,6 +2733,25 @@ impl ObjectHandle {
             ));
         };
 
+        self.pipe_stream_source(
+            &stream_dict,
+            stream_data,
+            stream_length,
+            pipeline,
+            false,
+            false,
+        )
+    }
+
+    fn pipe_stream_source(
+        &self,
+        stream_dict: &ObjectHandle,
+        stream_data: Option<Rc<Vec<u8>>>,
+        stream_length: usize,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
         if let Some(stream_data) = stream_data {
             pipeline.write(&stream_data)?;
             pipeline.finish()?;
@@ -2489,10 +2784,10 @@ impl ObjectHandle {
             object_ref,
             parsed_offset,
             stream_length,
-            &stream_dict,
+            stream_dict,
             pipeline,
-            false,
-            false,
+            suppress_warnings,
+            will_retry,
         )
     }
 
@@ -8575,6 +8870,900 @@ mod unparse_object_tests {
 #[cfg(test)]
 mod mutation_tests {
     use super::*;
+
+    struct SourcePipeResolver {
+        value: ObjectValue,
+        bytes: Vec<u8>,
+        calls: RefCell<Vec<(bool, bool)>>,
+        warnings: RefCell<Vec<String>>,
+        fail_first: bool,
+        fail_with_error: bool,
+    }
+
+    impl DocumentResolver for SourcePipeResolver {
+        fn warn(&self, message: String) -> crate::Result<()> {
+            self.warnings.borrow_mut().push(message);
+            Ok(())
+        }
+
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            handle.set_resolved(self.value.clone());
+            Ok(())
+        }
+
+        fn pipe_stream_data(
+            &self,
+            _object_ref: ObjectRef,
+            _offset: i64,
+            _length: usize,
+            _stream_dict: &ObjectHandle,
+            pipeline: &mut dyn Pipeline,
+            suppress_warnings: bool,
+            will_retry: bool,
+        ) -> crate::Result<bool> {
+            self.calls
+                .borrow_mut()
+                .push((suppress_warnings, will_retry));
+            if self.fail_with_error {
+                return Err(crate::Error::Internal("source pipe failure".to_owned()));
+            }
+            if self.fail_first && self.calls.borrow().len() == 1 {
+                return Ok(false);
+            }
+            pipeline.write(&self.bytes)?;
+            pipeline.finish()?;
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn pipe_stream_data_rejects_a_non_stream_handle() {
+        let scalar = ObjectHandle::integer(7);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        let error = scalar
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::None,
+                false,
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "pipeStreamData called for non-stream"
+        ));
+    }
+
+    #[test]
+    fn pipe_stream_data_decodes_replaced_flate_through_the_sink() {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let stream = ObjectHandle::stream(
+            dict,
+            Rc::new(vec![
+                0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
+            ]),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        let success = stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .expect("replaced stream should decode");
+
+        assert!(success);
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn pipe_stream_data_builds_reverse_decoder_chain() {
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ]),
+            ),
+            (b"DecodeParms".to_vec(), ObjectHandle::array(vec![])),
+        ]);
+        let stream = ObjectHandle::stream(dict, Rc::new(b"789ccb48cdc9c90700062c0215>".to_vec()));
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn pipe_stream_data_reads_original_source_through_the_filter_chain() {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let encoded = vec![
+            0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
+        ];
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: dict,
+                stream_data: None,
+                stream_length: encoded.len(),
+            },
+            bytes: encoded,
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"hello");
+        assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
+    fn pipe_stream_data_propagates_a_filtered_source_error() {
+        let raw = b"source error".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                )]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw,
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: true,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        let error = stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "source pipe failure"
+        ));
+        assert!(filtering_attempted);
+        assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
+    fn pipe_stream_data_resolves_filter_and_decode_parameter_values_through_the_document() {
+        let (filter, _filter_resolver) = super::identity_tests::resolver_bearing_handle(
+            ObjectValue::Name(b"FlateDecode".to_vec()),
+        );
+        let (predictor, _predictor_resolver) =
+            super::identity_tests::resolver_bearing_handle(ObjectValue::Integer(1));
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), filter),
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![(b"Predictor".to_vec(), predictor)]),
+            ),
+        ]);
+        let stream = ObjectHandle::stream(
+            dict,
+            Rc::new(vec![
+                0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x06, 0x2c, 0x02, 0x15,
+            ]),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn pipe_stream_data_reports_filter_failure_separately_for_raw_retry() {
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Filter".to_vec(),
+            ObjectHandle::name(b"FlateDecode".to_vec()),
+        )]);
+        let raw = vec![1, 2, 3, 4];
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: dict,
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw.clone(),
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: true,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+
+        let mut failed_sink = crate::pipeline::buffer::Buffer::new("failed", None);
+        let mut filtering_attempted = false;
+        assert!(!stream
+            .pipe_stream_data(
+                &mut failed_sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+        // qpdf clears its filtering flag when the original source reports a
+        // failure, even though the filter chain was constructed. The caller
+        // uses the false result and flag to enter the raw retry path.
+        assert!(!filtering_attempted);
+
+        let mut retry_sink = crate::pipeline::buffer::Buffer::new("retry", None);
+        assert!(stream
+            .pipe_stream_data(
+                &mut retry_sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::None,
+                false,
+                true,
+            )
+            .unwrap());
+        assert!(!filtering_attempted);
+        assert_eq!(retry_sink.take_buffer().unwrap(), raw);
+        assert_eq!(
+            resolver.calls.borrow().as_slice(),
+            &[(false, false), (false, true)]
+        );
+    }
+
+    #[test]
+    fn pipe_stream_data_preserves_an_unsupported_filter_without_attempting_filtering() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"UnknownDecode".to_vec()),
+            )]),
+            Rc::new(b"raw".to_vec()),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"raw");
+    }
+
+    #[test]
+    fn pipe_stream_data_checks_unknown_factory_before_decode_parms_shape() {
+        let raw = b"raw unknown".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![
+                    (
+                        b"Filter".to_vec(),
+                        ObjectHandle::name(b"UnknownDecode".to_vec()),
+                    ),
+                    (
+                        b"DecodeParms".to_vec(),
+                        ObjectHandle::array(vec![ObjectHandle::null(), ObjectHandle::null()]),
+                    ),
+                ]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw.clone(),
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), raw);
+        assert!(resolver.warnings.borrow().is_empty());
+    }
+
+    #[test]
+    fn pipe_stream_data_warns_for_mismatched_decode_parms_before_source() {
+        let raw = b"raw mismatch".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![
+                    (
+                        b"Filter".to_vec(),
+                        ObjectHandle::array(vec![
+                            ObjectHandle::name(b"FlateDecode".to_vec()),
+                            ObjectHandle::name(b"ASCIIHexDecode".to_vec()),
+                        ]),
+                    ),
+                    (
+                        b"DecodeParms".to_vec(),
+                        ObjectHandle::array(vec![ObjectHandle::null()]),
+                    ),
+                ]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw.clone(),
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), raw);
+        assert_eq!(
+            resolver.warnings.borrow().as_slice(),
+            &["object 20 0: stream /DecodeParms length is inconsistent with filters"]
+        );
+    }
+
+    #[test]
+    fn pipe_stream_data_applies_aligned_decode_parms_across_filter_stages() {
+        let inner = crate::stream_filter::encode_flate(b"hello").unwrap();
+        let encoded = crate::stream_filter::encode_flate(&inner).unwrap();
+        let dict = ObjectHandle::dictionary(vec![
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ]),
+            ),
+            (
+                b"DecodeParms".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::dictionary(vec![(
+                        b"Predictor".to_vec(),
+                        ObjectHandle::integer(1),
+                    )]),
+                    ObjectHandle::dictionary(vec![(
+                        b"Predictor".to_vec(),
+                        ObjectHandle::integer(1),
+                    )]),
+                ]),
+            ),
+        ]);
+        let stream = ObjectHandle::stream(dict, Rc::new(encoded));
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"hello");
+    }
+
+    #[test]
+    fn pipe_stream_data_keeps_crypt_as_a_no_stage_after_filterability() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (b"Filter".to_vec(), ObjectHandle::name(b"Crypt".to_vec())),
+                (
+                    b"DecodeParms".to_vec(),
+                    ObjectHandle::dictionary(vec![(
+                        b"Name".to_vec(),
+                        ObjectHandle::name(b"Identity".to_vec()),
+                    )]),
+                ),
+            ]),
+            Rc::new(b"already clear".to_vec()),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"already clear");
+    }
+
+    #[test]
+    fn pipe_stream_data_reports_flate_warnings_through_the_object_sink() {
+        let raw = vec![0x78];
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                )]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw,
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert!(sink.take_buffer().unwrap().is_empty());
+        assert_eq!(
+            resolver.warnings.borrow().as_slice(),
+            &["object 20 0: input stream is complete but output may still be valid"]
+        );
+    }
+
+    #[test]
+    fn pipe_stream_data_reports_normalizer_warnings_only_after_source_success() {
+        let raw = b"<0g".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw.clone(),
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                STREAM_ENCODE_NORMALIZE,
+                crate::writer::DecodeLevel::None,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), raw);
+        assert_eq!(
+            resolver.warnings.borrow().as_slice(),
+            &[
+                "object 20 0: content normalization encountered bad tokens",
+                "object 20 0: normalized content ended with a bad token; you may be able to resolve this by coalescing content streams in combination with normalizing content. From the command line, specify --coalesce-contents",
+                "object 20 0: Resulting stream data may be corrupted but is may still useful for manual inspection. For more information on this warning, search for content normalization in the manual.",
+            ]
+        );
+
+        resolver.warnings.borrow_mut().clear();
+        let mut suppressed_sink = crate::pipeline::buffer::Buffer::new("suppressed", None);
+        assert!(stream
+            .pipe_stream_data(
+                &mut suppressed_sink,
+                &mut filtering_attempted,
+                STREAM_ENCODE_NORMALIZE,
+                crate::writer::DecodeLevel::None,
+                true,
+                false,
+            )
+            .unwrap());
+        assert!(filtering_attempted);
+        assert_eq!(suppressed_sink.take_buffer().unwrap(), raw);
+        assert!(resolver.warnings.borrow().is_empty());
+    }
+
+    #[test]
+    fn pipe_stream_data_gates_specialized_filters_by_decode_level() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"DCTDecode".to_vec()),
+            )]),
+            Rc::new(b"jpeg bytes".to_vec()),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"jpeg bytes");
+    }
+
+    #[test]
+    fn pipe_stream_data_gates_non_lossy_specialized_filters_separately() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"RunLengthDecode".to_vec()),
+            )]),
+            Rc::new(vec![0xff, b'A', 0x80]),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), vec![0xff, b'A', 0x80]);
+    }
+
+    #[test]
+    fn pipe_stream_data_accepts_a_qpdf_unbounded_filter_chain() {
+        let filter_count = 17;
+        let mut filters = Vec::with_capacity(filter_count);
+        let mut encoded = b"A".to_vec();
+        for _ in 0..filter_count {
+            let mut wrapped = Vec::with_capacity(encoded.len() * 2 + 1);
+            for byte in encoded {
+                wrapped.extend_from_slice(format!("{byte:02x}").as_bytes());
+            }
+            wrapped.push(b'>');
+            encoded = wrapped;
+            filters.push(ObjectHandle::name(b"ASCIIHexDecode".to_vec()));
+        }
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"Filter".to_vec(), ObjectHandle::array(filters))]),
+            Rc::new(encoded),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"A");
+    }
+
+    #[test]
+    fn pipe_stream_data_warns_and_retries_raw_for_a_malformed_filter_shape() {
+        let raw = b"raw malformed".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::integer(7),
+                )]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw.clone(),
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), raw);
+        assert_eq!(
+            resolver.warnings.borrow().as_slice(),
+            &["object 20 0: stream filter type is not name or array"]
+        );
+    }
+
+    #[test]
+    fn pipe_stream_data_warns_for_a_non_name_filter_array_item() {
+        let raw = b"raw malformed array".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::name(b"FlateDecode".to_vec()),
+                        ObjectHandle::integer(7),
+                    ]),
+                )]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw.clone(),
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: false,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::Generalized,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), raw);
+        assert_eq!(
+            resolver.warnings.borrow().as_slice(),
+            &["object 20 0: stream filter type is not name or array"]
+        );
+    }
+
+    #[test]
+    fn pipe_stream_data_rejects_present_decode_parms_for_dct_before_stage_build() {
+        let stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"DCTDecode".to_vec()),
+                ),
+                (
+                    b"DecodeParms".to_vec(),
+                    ObjectHandle::dictionary(vec![(
+                        b"Predictor".to_vec(),
+                        ObjectHandle::integer(1),
+                    )]),
+                ),
+            ]),
+            Rc::new(b"raw jpeg".to_vec()),
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = true;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::All,
+                false,
+                false,
+            )
+            .unwrap());
+
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().unwrap(), b"raw jpeg");
+    }
+
+    #[test]
+    fn pipe_stream_data_normalizes_before_compressing_output() {
+        let stream =
+            ObjectHandle::stream(ObjectHandle::dictionary(vec![]), Rc::new(b"q\rQ".to_vec()));
+        let mut sink = crate::pipeline::buffer::Buffer::new("sink", None);
+        let mut filtering_attempted = false;
+
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                STREAM_ENCODE_COMPRESS | STREAM_ENCODE_NORMALIZE,
+                crate::writer::DecodeLevel::None,
+                false,
+                false,
+            )
+            .unwrap());
+
+        let compressed = sink.take_buffer().unwrap();
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::ZlibDecoder::new(compressed.as_slice()),
+            &mut decoded,
+        )
+        .unwrap();
+        assert!(filtering_attempted);
+        assert_eq!(decoded, b"q\nQ");
+    }
 
     #[test]
     fn object_value_clone_preserves_scalar_content() {

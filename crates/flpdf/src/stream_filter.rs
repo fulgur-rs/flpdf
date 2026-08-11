@@ -73,6 +73,8 @@ pub(crate) const DECODE_OUTPUT_LIMIT_PREFIX: &str = "decoded output exceeds conf
 /// routed through the registry — two literals could only ever happen to agree.
 pub(crate) const CRYPT_STAGE_UNSUPPORTED: &str = "unsupported stream filter: Crypt";
 
+type FilterWarningCallback = Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 'static>;
+
 /// Bounded `/DecodeParms` view: everything `StreamFilter::set_decode_params`
 /// needs, with no `Object` or `ObjectHandle` left in it.
 ///
@@ -196,7 +198,7 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
 /// `QPDF_Stream::filterable`'s `warn("stream filter type is not name or
 /// array")` (`libqpdf/QPDF_Stream.cc:413`). flpdf raises the same text as an
 /// error instead of a warning; see plan decision D3 of `flpdf-25kg.3.4`.
-const FILTER_TYPE_ERROR: &str = "stream filter type is not name or array";
+pub(crate) const FILTER_TYPE_ERROR: &str = "stream filter type is not name or array";
 
 /// `QPDF_Stream::filterable`'s `warn("stream /DecodeParms length is
 /// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised as an
@@ -213,7 +215,8 @@ const FILTER_TYPE_ERROR: &str = "stream filter type is not name or array";
 /// beads `flpdf-vatj` (P2); not fixed here, because Task 5's contract is that
 /// the two readers keep the same branch order. Both readers diverge from qpdf
 /// *identically*, so the legacy-vs-native equivalence gate stays valid.
-const DECODE_PARMS_LENGTH_ERROR: &str = "stream /DecodeParms length is inconsistent with filters";
+pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
+    "stream /DecodeParms length is inconsistent with filters";
 
 /// Reject a `/Filter` chain longer than `maximum`.
 ///
@@ -673,7 +676,10 @@ fn is_crypt_filter(filter_name: &[u8]) -> bool {
 /// [`decode_params_from_consuming_handle`] once per consuming stage and takes
 /// at most one shared snapshot for all non-consuming stages.
 ///
-fn decode_params_from_handle(params: &ObjectHandle, filter_name: &[u8]) -> Result<DecodeParams> {
+pub(crate) fn decode_params_from_handle(
+    params: &ObjectHandle,
+    filter_name: &[u8],
+) -> Result<DecodeParams> {
     if params.try_is_null()? {
         return Ok(DecodeParams::Absent);
     }
@@ -1055,6 +1061,7 @@ pub(crate) fn expect_first_filter_input(data: &[u8]) {
 /// `pipe_decode` owns construction and completion of the filter's decode
 /// pipeline. A whole-buffer result keeps flpdf's public API stable while the
 /// individual codecs are migrated to incremental `Pipeline` stages.
+#[allow(dead_code)]
 pub(crate) trait StreamFilter {
     /// Port of `QPDFStreamFilter::setDecodeParms`
     /// (`libqpdf/QPDFStreamFilter.cc:3-7`), whose whole body is
@@ -1113,13 +1120,31 @@ pub(crate) trait StreamFilter {
     /// installation sits *outside* the `if (decode_pipeline)` guard, so a
     /// filter contributing no stage leaves the stage the preceding iteration
     /// installed as the chain head and lets it take the callback again.
-    // Production decoding still runs through pipe_decode_recovering, so nothing
-    // outside tests calls this yet.
-    #[allow(dead_code)]
+    // The qpdf-shaped ObjectHandle consumer owns the production-style caller;
+    // the public legacy decode helpers still use pipe_decode_recovering.
     fn decode_pipeline<'a>(
         &mut self,
         next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>>;
+    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        match self.decode_pipeline_owned(PipelineRef::Borrowed(next))? {
+            OwnedDecodePipeline::Stage(stage) => Ok(Some(stage)),
+            OwnedDecodePipeline::NoStage(_) => Ok(None),
+        }
+    }
+
+    /// Construct the same stage with a downstream pipeline that may already
+    /// own inner stages. The borrowed [`Self::decode_pipeline`] surface keeps
+    /// qpdf's `Pipeline*` shape for primitive callers; this companion is the
+    /// Rust ownership seam used by `QPDF_Stream::pipeStreamData`'s reverse
+    /// chain construction.
+    fn decode_pipeline_owned<'a>(
+        &mut self,
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>>;
+
+    /// Install the qpdf `QPDF_Stream::pipeStreamData` warning callback on a
+    /// filter that constructs a Flate stage. Other filters ignore it.
+    fn set_warning_callback(&mut self, _callback: FilterWarningCallback) {}
 
     fn pipe_decode_recovering(
         &mut self,
@@ -1154,6 +1179,15 @@ pub(crate) trait StreamFilter {
     }
 }
 
+/// Result of constructing a stage around a downstream pipeline that may
+/// already own inner stages. `NoStage` returns the downstream slot so the
+/// caller can keep threading it through a filter such as qpdf's `Crypt`.
+#[allow(dead_code)]
+pub(crate) enum OwnedDecodePipeline<'a> {
+    Stage(Box<dyn Pipeline + 'a>),
+    NoStage(PipelineRef<'a>),
+}
+
 /// Rust equivalent of qpdf's `SF_FlateLzwDecode`.
 ///
 /// One filter serves `FlateDecode` and `LZWDecode`, owns the shared predictor
@@ -1165,6 +1199,7 @@ struct FlateLzwStreamFilter {
     colors: i32,
     bits_per_component: i32,
     early_code_change: bool,
+    warning_callback: Option<FilterWarningCallback>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1197,6 +1232,7 @@ impl FlateLzwStreamFilter {
             colors: 1,
             bits_per_component: 8,
             early_code_change: true,
+            warning_callback: None,
         }
     }
 }
@@ -1489,6 +1525,10 @@ impl StreamFilter for FlateLzwStreamFilter {
         filterable
     }
 
+    fn set_warning_callback(&mut self, callback: FilterWarningCallback) {
+        self.warning_callback = Some(callback);
+    }
+
     fn preflight_decode_pipeline(&self) -> Result<()> {
         if let Some(geometry) = self.decode_predictor_geometry()? {
             let mut sink = OutputBuffer::new(None);
@@ -1502,28 +1542,30 @@ impl StreamFilter for FlateLzwStreamFilter {
     /// the parameters call for one, with `next` reassigned to it, then the
     /// codec wrapping whichever `next` resulted. The codec is what the caller
     /// receives.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
         let next: PipelineRef<'a> = match self.decode_predictor_geometry()? {
             Some(geometry) => make_predictor_pipeline(geometry, next, PredictorAction::Decode)?,
-            None => PipelineRef::Borrowed(next),
+            None => next,
         };
         let stage: Box<dyn Pipeline + 'a> = if self.lzw {
             Box::new(LzwDecoder::new("lzw decode", next, self.early_code_change))
         } else {
-            Box::new(
-                Flate::new(
-                    "stream inflate",
-                    next,
-                    FlateAction::Inflate,
-                    DEFAULT_OUT_BUFFER_SIZE,
-                )
-                .map_err(map_pipeline_error)?,
+            let mut flate = Flate::new(
+                "stream inflate",
+                next,
+                FlateAction::Inflate,
+                DEFAULT_OUT_BUFFER_SIZE,
             )
+            .map_err(map_pipeline_error)?;
+            if let Some(callback) = self.warning_callback.take() {
+                flate.set_warn_callback(callback);
+            }
+            Box::new(flate)
         };
-        Ok(Some(stage))
+        Ok(OwnedDecodePipeline::Stage(stage))
     }
 
     fn pipe_decode_recovering(
@@ -1634,9 +1676,10 @@ impl FlateLzwStreamFilter {
 
 fn make_predictor_pipeline<'a>(
     geometry: PredictorGeometry,
-    next: &'a mut dyn Pipeline,
+    next: impl Into<PipelineRef<'a>>,
     action: PredictorAction,
 ) -> Result<PipelineRef<'a>> {
+    let next = next.into();
     let pipeline = match (geometry.kind, action) {
         (PredictorKind::Png, PredictorAction::Encode) => Box::new(
             PngFilter::new(
@@ -1699,11 +1742,14 @@ struct Ascii85StreamFilter;
 impl StreamFilter for Ascii85StreamFilter {
     /// Mirrors `SF_ASCII85Decode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_ASCII85Decode.hh:14-19`), a single `Pl_ASCII85Decoder`.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(Some(Box::new(Ascii85Decoder::new("ascii85 decode", next))))
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::Stage(Box::new(Ascii85Decoder::new(
+            "ascii85 decode",
+            next,
+        ))))
     }
 
     fn pipe_decode_recovering(
@@ -1722,11 +1768,11 @@ impl StreamFilter for AsciiHexStreamFilter {
     /// Mirrors `SF_ASCIIHexDecode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_ASCIIHexDecode.hh:14-19`), a single
     /// `Pl_ASCIIHexDecoder`.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(Some(Box::new(AsciiHexDecoder::new(
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::Stage(Box::new(AsciiHexDecoder::new(
             "asciiHex decode",
             next,
         ))))
@@ -1748,11 +1794,11 @@ impl StreamFilter for RunLengthStreamFilter {
     /// Mirrors `SF_RunLengthDecode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_RunLengthDecode.hh:14-20`), a single `Pl_RunLength`
     /// in its decode action.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(Some(Box::new(RunLength::new(
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::Stage(Box::new(RunLength::new(
             "runlength decode",
             next,
             RunLengthAction::Decode,
@@ -1778,11 +1824,14 @@ struct DctStreamFilter;
 impl StreamFilter for DctStreamFilter {
     /// Mirrors `SF_DCTDecode::getDecodePipeline`
     /// (`libqpdf/qpdf/SF_DCTDecode.hh:14-19`), a single `Pl_DCT` decode stage.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(Some(Box::new(PlDct::new("DCT decode", next))))
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::Stage(Box::new(PlDct::new(
+            "DCT decode",
+            next,
+        ))))
     }
 
     // The whole-buffer route remains the existing passthrough route for this
@@ -1922,11 +1971,11 @@ impl StreamFilter for CryptStreamFilter {
     /// absent but wrong, and silently so — ciphertext would pass through as
     /// plaintext with neither an error nor a warning, which is why the
     /// decode route below refuses instead of returning the bytes.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        _next: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(None)
+        _next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::NoStage(_next))
     }
 
     /// Refuse to decode, reporting [`CRYPT_STAGE_UNSUPPORTED`].
@@ -1957,11 +2006,11 @@ struct TestStreamFilter;
 impl StreamFilter for TestStreamFilter {
     // Passes data through untouched, so it builds no stage of its own —
     // qpdf's nullptr, which leaves the caller writing straight to `next`.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        _: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(None)
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::NoStage(next))
     }
 
     fn pipe_decode_recovering(
@@ -1981,11 +2030,11 @@ struct BorrowedInputProbe;
 impl StreamFilter for BorrowedInputProbe {
     // The probe only inspects the input buffer it is handed; it transforms
     // nothing, so it contributes no stage.
-    fn decode_pipeline<'a>(
+    fn decode_pipeline_owned<'a>(
         &mut self,
-        _: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
-        Ok(None)
+        next: PipelineRef<'a>,
+    ) -> Result<OwnedDecodePipeline<'a>> {
+        Ok(OwnedDecodePipeline::NoStage(next))
     }
 
     fn pipe_decode_recovering(
@@ -2007,10 +2056,7 @@ struct PostPreflightFailure;
 #[cfg(test)]
 impl StreamFilter for PostPreflightFailure {
     // Fails on every route past the preflight, the decode route included.
-    fn decode_pipeline<'a>(
-        &mut self,
-        _: &'a mut dyn Pipeline,
-    ) -> Result<Option<Box<dyn Pipeline + 'a>>> {
+    fn decode_pipeline_owned<'a>(&mut self, _: PipelineRef<'a>) -> Result<OwnedDecodePipeline<'a>> {
         Err(Error::Internal(
             "test post-preflight decode failure".to_string(),
         ))
@@ -5535,10 +5581,11 @@ pub(crate) mod tests {
     /// contributes the streaming stage; its legacy whole-buffer route remains
     /// passthrough-only until that route is cut over.
     ///
-    /// The registration is not reached by a production decode:
-    /// `filters::prepare_decode_filters` routes a `Crypt` spec to
-    /// `PreparedStage::Crypt` before this lookup. This asserts it directly so
-    /// it cannot silently disappear for want of a caller.
+    /// The legacy `filters::prepare_decode_filters` route still routes a
+    /// `Crypt` spec to `PreparedStage::Crypt` before this lookup. The
+    /// qpdf-shaped `ObjectHandle::pipe_stream_data` route reaches this factory
+    /// directly, and this asserts the registration so it cannot silently
+    /// disappear from that caller.
     #[test]
     fn factory_returns_the_crypt_filter() {
         assert!(stream_filter_for(b"Crypt").is_some());
@@ -6553,9 +6600,8 @@ pub(crate) mod tests {
     /// Every registered test double answers `decode_pipeline` the way its own
     /// `pipe_decode_recovering` behaves.
     ///
-    /// The trait declares `decode_pipeline` without a default, so these doubles
-    /// carry bodies purely to satisfy it — and an unexercised body is free to
-    /// drift from the double's stated role. `PostPreflightFailure` is the one
+    /// The owned stage factory is required by the trait, while the borrowed
+    /// `decode_pipeline` adapter is shared. `PostPreflightFailure` is the one
     /// whose role reaches past "contributes no stage": it exists to fail on
     /// *every* route past the preflight, and only the whole-buffer half of that
     /// claim is checked elsewhere

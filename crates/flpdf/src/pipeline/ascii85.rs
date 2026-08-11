@@ -1,10 +1,10 @@
 //! qpdf correspondence: Pl_ASCII85Decoder.cc incremental decode state, output, error, and finish semantics.
 
-use super::{Pipeline, PipelineError, PipelineResult};
+use super::{Pipeline, PipelineError, PipelineRef, PipelineResult};
 
 pub(crate) struct Ascii85Decoder<'a> {
     identifier: String,
-    next: &'a mut dyn Pipeline,
+    next: PipelineRef<'a>,
     inbuf: [u8; 5],
     pos: usize,
     eod: u8,
@@ -12,10 +12,10 @@ pub(crate) struct Ascii85Decoder<'a> {
 
 #[allow(dead_code)]
 impl<'a> Ascii85Decoder<'a> {
-    pub(crate) fn new(identifier: impl Into<String>, next: &'a mut dyn Pipeline) -> Self {
+    pub(crate) fn new(identifier: impl Into<String>, next: impl Into<PipelineRef<'a>>) -> Self {
         Self {
             identifier: identifier.into(),
-            next,
+            next: next.into(),
             inbuf: [b'u'; 5],
             pos: 0,
             eod: 0,
