@@ -2678,6 +2678,13 @@ impl ObjectHandle {
                 recover_codec_errors,
             )
             .map_err(|error| warning_delivery_error.borrow_mut().take().unwrap_or(error))?;
+        if let Some(error) = warning_delivery_error.borrow_mut().take() {
+            // A source-backed decoder can recover its codec failure and
+            // return `false` after the warning callback itself failed. Keep
+            // that callback error visible to the resolver instead of
+            // converting the member to qpdf's ordinary null fallback.
+            return Err(error);
+        }
         if !success {
             *filtering_attempted = false;
         }

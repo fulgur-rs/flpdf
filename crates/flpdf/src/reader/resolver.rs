@@ -1292,7 +1292,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 // `QPDF::resolve` catches the QPDFExc raised by
                 // `resolveObjectsInStream`, warns, and lets its common tail
                 // cache the requested object as null (`QPDF.cc:1724-1750`).
-                self.push_warning(error.to_string())?;
+                self.push_caught_resolution_warning(error)?;
                 if !handle.is_resolved() {
                     handle.set_missing();
                 }
@@ -6460,6 +6460,66 @@ mod tests {
     }
 
     #[test]
+    fn an_object_stream_source_codec_warning_delivery_failure_still_propagates() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = vec![0x78];
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+            (
+                b"Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+        ]);
+        let logger = crate::QPDFLogger::create();
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            crate::pipeline::test_support::NthWriteFailure::new(1),
+        )));
+        let mut source = vec![0];
+        source.extend_from_slice(&stream_data);
+        let resolver = ResolverHandle::new_shared(
+            Cursor::new(source),
+            0,
+            BTreeMap::from([
+                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
+                (
+                    member_ref,
+                    XrefEntry::Compressed {
+                        stream: stream_ref.number,
+                        index: 0,
+                    },
+                ),
+            ]),
+            false,
+            false,
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, String::new()),
+            0,
+        );
+        let stream = resolver.get_object_handle(stream_ref);
+        stream.set_resolved(ObjectValue::Stream {
+            stream_dict,
+            stream_data: None,
+            stream_length: stream_data.len(),
+        });
+        stream.set_parsed_offset_if_unset(1);
+
+        assert!(matches!(
+            resolver
+                .get_object_handle(member_ref)
+                .try_dereference()
+                .expect_err("source-backed codec warning delivery must remain a caller error"),
+            Error::System(message) if message == "sink write failure 1"
+        ));
+    }
+
+    #[test]
     fn an_object_stream_with_wrong_type_warns_and_still_resolves() {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
@@ -6719,7 +6779,12 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("parse error")));
+            .any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("integer out of range converting 2147483648")
+                    && diagnostic.offset.is_some()
+            }));
     }
 
     #[test]
@@ -6795,7 +6860,11 @@ mod tests {
             .repair_diagnostics()
             .entries()
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("parse error")));
+            .any(|diagnostic| {
+                diagnostic
+                    .message
+                    .contains("integer out of range converting 2147483648")
+            }));
     }
 
     #[test]
