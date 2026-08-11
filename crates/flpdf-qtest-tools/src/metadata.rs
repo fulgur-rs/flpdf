@@ -9,7 +9,7 @@
 //! `qpdf/test_parsedoffset.cc:13-140` from the pinned qpdf 11.9.0 tree.
 
 use flpdf::{
-    EncryptedError, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result, XrefEntry,
+    Diagnostics, EncryptedError, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, XrefEntry,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -18,13 +18,33 @@ use std::io::{self, Write as _};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+/// Failure from a metadata helper, retaining whether it happened during open
+/// or after object enumeration had already begun.
+#[derive(Debug)]
+pub enum MetadataError {
+    Flpdf(Error),
+    PostEnumeration {
+        source: Error,
+        diagnostics: Diagnostics,
+    },
+}
+
+/// Result type used by the metadata helper formatting boundary.
+pub type Result<T> = std::result::Result<T, MetadataError>;
+
+impl From<Error> for MetadataError {
+    fn from(error: Error) -> Self {
+        Self::Flpdf(error)
+    }
+}
+
 fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
     let file = std::fs::File::open(path).map_err(|source| Error::FileIo {
         operation: "open",
         path: path.to_path_buf(),
         source,
     })?;
-    Pdf::open_with_options(
+    Ok(Pdf::open_with_options(
         file,
         PdfOpenOptions {
             repair: true,
@@ -33,12 +53,31 @@ fn open(path: &Path) -> Result<Pdf<std::fs::File>> {
             description: path.display().to_string(),
             ..PdfOpenOptions::default()
         },
-    )
+    )?)
 }
 
 /// Render an open/parse error in the shape emitted by qpdf's helper binaries.
-pub fn display_error(path: &Path, error: &Error) -> Vec<u8> {
+pub fn display_error(path: &Path, error: &MetadataError) -> Vec<u8> {
     let mut message = Vec::new();
+    match error {
+        MetadataError::Flpdf(error) => display_flpdf_error(&mut message, path, error),
+        MetadataError::PostEnumeration {
+            source,
+            diagnostics,
+        } => {
+            for diagnostic in diagnostics.entries() {
+                write_diagnostic(&mut message, path, diagnostic);
+            }
+            append_error_without_path(&mut message, source);
+            if message.last() == Some(&b'\n') {
+                message.pop();
+            }
+        }
+    }
+    message
+}
+
+fn display_flpdf_error(message: &mut Vec<u8>, path: &Path, error: &Error) {
     match error {
         Error::FileIo {
             operation,
@@ -51,7 +90,7 @@ pub fn display_error(path: &Path, error: &Error) -> Vec<u8> {
                 .map_or_else(|| source.to_string(), |(message, _)| message.to_owned());
             message.extend_from_slice(operation.as_bytes());
             message.push(b' ');
-            append_path(&mut message, path);
+            append_path(message, path);
             message.extend_from_slice(b": ");
             message.extend_from_slice(source_message.as_bytes());
         }
@@ -60,20 +99,26 @@ pub fn display_error(path: &Path, error: &Error) -> Vec<u8> {
             diagnostics,
         } => {
             for diagnostic in diagnostics.entries() {
-                write_diagnostic(&mut message, path, diagnostic);
+                write_diagnostic(message, path, diagnostic);
             }
-            append_error_with_path(&mut message, path, source);
+            append_error_with_path(message, path, source);
             if message.last() == Some(&b'\n') {
                 message.pop();
             }
         }
-        Error::Encrypted(EncryptedError::BadPassword) => {
-            append_path(&mut message, path);
-            message.extend_from_slice(b": invalid password");
+        Error::Encrypted(encrypted) => {
+            append_path(message, path);
+            message.extend_from_slice(b": ");
+            append_encrypted_detail(message, encrypted);
+        }
+        Error::Io(_) => {
+            // qpdf's FileInputSource reports the operation and requested
+            // initial read size, not Rust's `I/O error: ... (os error N)`.
+            append_path(message, path);
+            message.extend_from_slice(b": read 1024 bytes");
         }
         other => message.extend_from_slice(other.to_string().as_bytes()),
     }
-    message
 }
 
 fn append_path(output: &mut Vec<u8>, path: &Path) {
@@ -92,10 +137,27 @@ fn append_error_with_path(output: &mut Vec<u8>, path: &Path, error: &Error) {
     output.extend_from_slice(b": ");
     match error {
         Error::Parse { message, .. } => output.extend_from_slice(message.as_bytes()),
-        Error::Encrypted(EncryptedError::BadPassword) => {
-            output.extend_from_slice(b"invalid password")
-        }
+        Error::Encrypted(encrypted) => append_encrypted_detail(output, encrypted),
+        Error::Io(_) => output.extend_from_slice(b"read 1024 bytes"),
+        Error::OpenFailure { source, .. } => append_error_without_path(output, source),
         other => output.extend_from_slice(other.to_string().as_bytes()),
+    }
+}
+
+fn append_error_without_path(output: &mut Vec<u8>, error: &Error) {
+    match error {
+        Error::Parse { message, .. } => output.extend_from_slice(message.as_bytes()),
+        Error::Encrypted(encrypted) => append_encrypted_detail(output, encrypted),
+        Error::OpenFailure { source, .. } => append_error_without_path(output, source),
+        other => output.extend_from_slice(other.to_string().as_bytes()),
+    }
+}
+
+fn append_encrypted_detail(output: &mut Vec<u8>, error: &EncryptedError) {
+    if matches!(error, EncryptedError::BadPassword) {
+        output.extend_from_slice(b"invalid password");
+    } else {
+        output.extend_from_slice(error.to_string().as_bytes());
     }
 }
 
@@ -104,7 +166,7 @@ fn write_diagnostic(output: &mut Vec<u8>, path: &Path, diagnostic: &flpdf::Diagn
     append_path(output, path);
     if diagnostic.message.starts_with('(') {
         output.push(b' ');
-    } else if let Some(offset) = diagnostic.offset {
+    } else if let Some(offset) = diagnostic.offset.filter(|offset| *offset > 0) {
         output.extend_from_slice(format!(" (offset {offset}): ").as_bytes());
     } else {
         output.extend_from_slice(b": ");
@@ -181,7 +243,7 @@ fn object_description(object: &ObjectHandle) -> String {
     )
 }
 
-fn metadata_object_ref(object: &ObjectHandle) -> Result<ObjectRef> {
+fn metadata_object_ref(object: &ObjectHandle) -> std::result::Result<ObjectRef, Error> {
     object
         .object_ref()
         .ok_or_else(|| Error::Internal("get_all_objects returned a direct object".to_owned()))
@@ -210,7 +272,10 @@ fn walk(object: &ObjectHandle, group: u32, groups: &mut BTreeMap<u32, Vec<Parsed
     }
 }
 
-fn stream_group(object_ref: ObjectRef, entry: Option<XrefEntry>) -> Result<u32> {
+fn stream_group(
+    object_ref: ObjectRef,
+    entry: Option<XrefEntry>,
+) -> std::result::Result<u32, Error> {
     match entry {
         Some(XrefEntry::Uncompressed { .. }) => Ok(0),
         Some(XrefEntry::Compressed { stream, .. }) => Ok(stream),
@@ -247,7 +312,7 @@ fn render_parsed_groups(groups: &mut BTreeMap<u32, Vec<ParsedObject>>) -> String
 /// Format qpdf's `test_parsedoffset` output and return recovery warnings separately.
 pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Vec<u8>)> {
     let mut pdf = open(path)?;
-    let result = (|| {
+    let result: std::result::Result<String, Error> = (|| {
         let objects = pdf.get_all_objects()?;
         let xref = pdf.get_xref_table();
         let mut groups: BTreeMap<u32, Vec<ParsedObject>> = BTreeMap::new();
@@ -275,10 +340,10 @@ pub fn format_parsed_offsets_with_diagnostics(path: &Path) -> Result<(String, Ve
             // reconstructing the effective xref table.
             let diagnostics = pdf.repair_diagnostics();
             if diagnostics.entries().is_empty() {
-                Err(error)
+                Err(MetadataError::from(error))
             } else {
-                Err(Error::OpenFailure {
-                    source: Box::new(error),
+                Err(MetadataError::PostEnumeration {
+                    source: error,
                     diagnostics,
                 })
             }
@@ -305,10 +370,16 @@ mod tests {
             path,
             &Diagnostic::warning("xref warning", Some(12)),
         );
+        write_diagnostic(
+            &mut output,
+            path,
+            &Diagnostic::warning("zero offset warning", Some(0)),
+        );
         assert_eq!(
             output,
             b"WARNING: input.pdf (object 1 0, offset 7): object warning\n\
-              WARNING: input.pdf (offset 12): xref warning\n"
+              WARNING: input.pdf (offset 12): xref warning\n\
+              WARNING: input.pdf: zero offset warning\n"
         );
 
         let mut diagnostics = Diagnostics::default();
@@ -322,7 +393,7 @@ mod tests {
             diagnostics,
         };
         assert_eq!(
-            display_error(path, &error),
+            display_error(path, &MetadataError::from(error)),
             b"WARNING: input.pdf (object 1 0, offset 7): object warning\n\
               WARNING: input.pdf (offset 12): xref warning\n\
               input.pdf: terminal failure"
@@ -333,8 +404,40 @@ mod tests {
     fn bad_password_error_uses_qpdf_path_wording() {
         let error = Error::Encrypted(EncryptedError::BadPassword);
         assert_eq!(
-            display_error(Path::new("secret.pdf"), &error),
+            display_error(
+                Path::new("secret.pdf"),
+                &MetadataError::from(error),
+            ),
             b"secret.pdf: invalid password"
+        );
+    }
+
+    #[test]
+    fn every_encrypted_open_error_uses_the_input_path() {
+        let error = Error::Encrypted(EncryptedError::UnsupportedHandler {
+            filter: "Standard".to_owned(),
+            v: 4,
+            r: 4,
+            cfm: Some("Unknown".to_owned()),
+        });
+        assert_eq!(
+            display_error(
+                Path::new("secret.pdf"),
+                &MetadataError::from(error),
+            ),
+            b"secret.pdf: unsupported encryption handler: filter=Standard, V=4, R=4, CFM=Some(\"Unknown\")"
+        );
+    }
+
+    #[test]
+    fn read_errors_use_qpdf_file_input_wording() {
+        let error = Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR));
+        assert_eq!(
+            display_error(
+                Path::new("directory.pdf"),
+                &MetadataError::from(error),
+            ),
+            b"directory.pdf: read 1024 bytes"
         );
     }
 
@@ -437,7 +540,7 @@ mod tests {
             source: std::io::Error::from_raw_os_error(libc::ENOENT),
         };
         assert_eq!(
-            display_error(path, &error),
+            display_error(path, &MetadataError::from(error)),
             b"open missing-\xff.pdf: No such file or directory"
         );
     }

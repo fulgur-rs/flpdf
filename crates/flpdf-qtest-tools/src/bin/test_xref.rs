@@ -10,11 +10,17 @@ fn report_write_error(error: io::Error) -> ExitCode {
     ExitCode::from(2)
 }
 
+fn report_usage_error() -> ExitCode {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "usage: test_xref INPUT.pdf");
+    let _ = stderr.flush();
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().collect();
     if args.len() != 2 {
-        eprintln!("usage: test_xref INPUT.pdf");
-        return ExitCode::from(2);
+        return report_usage_error();
     }
 
     let path = PathBuf::from(&args[1]);

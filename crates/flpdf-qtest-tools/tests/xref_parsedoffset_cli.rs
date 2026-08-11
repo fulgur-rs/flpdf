@@ -1,5 +1,7 @@
 use assert_cmd::Command;
 use std::fs;
+#[cfg(unix)]
+use std::process::{Command as ProcessCommand, Stdio};
 
 fn fixture_path(name: &str) -> String {
     format!("{}/../../tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -99,6 +101,25 @@ fn metadata_helpers_match_qpdf_usage_contracts() {
         .stderr("Usage: test_parsedoffset INPUT.pdf\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn metadata_usage_write_failures_do_not_panic() {
+    for binary in [
+        env!("CARGO_BIN_EXE_test_xref"),
+        env!("CARGO_BIN_EXE_test_parsedoffset"),
+    ] {
+        let stderr = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full");
+        let status = ProcessCommand::new(binary)
+            .stderr(Stdio::from(stderr))
+            .status()
+            .expect("run metadata helper");
+        assert_eq!(status.code(), Some(2), "helper must return usage status");
+    }
+}
+
 #[test]
 fn test_xref_reports_missing_input_with_qpdf_open_wording() {
     Command::cargo_bin("test_xref")
@@ -108,6 +129,18 @@ fn test_xref_reports_missing_input_with_qpdf_open_wording() {
         .code(2)
         .stdout("")
         .stderr("open /definitely/missing/flpdf-metadata.pdf: No such file or directory\n");
+}
+
+#[test]
+fn test_xref_reports_read_failures_with_qpdf_file_input_wording() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    Command::cargo_bin("test_xref")
+        .expect("test_xref binary")
+        .arg(directory.path())
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(format!("{}: read 1024 bytes\n", directory.path().display()));
 }
 
 #[test]
@@ -180,8 +213,46 @@ fn test_parsedoffset_preserves_repair_warnings_before_post_enumeration_failure()
         "repair warnings must precede the terminal error: {stderr}"
     );
     assert!(
-        stderr.ends_with(&format!("{path}: 99/0 is not found in xref table\n")),
+        stderr.ends_with("99/0 is not found in xref table\n"),
         "the post-enumeration error must remain visible: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&format!("{path}: 99/0 is not found in xref table")),
+        "post-enumeration errors must not be reclassified as open failures: {stderr}"
+    );
+}
+
+#[test]
+fn encrypted_authentication_failure_preserves_repair_warnings() {
+    let mut input_bytes =
+        fs::read(fixture_path("encrypted/v5-aes-256-r6.pdf")).expect("read encrypted fixture");
+    let xref_header = input_bytes
+        .windows(b"xref\n0 4\n".len())
+        .position(|window| window == b"xref\n0 4\n")
+        .expect("xref header");
+    input_bytes[xref_header + b"xref\n0 ".len()] = b'X';
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("damaged-encrypted.pdf");
+    fs::write(&input, input_bytes).expect("write damaged encrypted input");
+    let path = input.display();
+
+    let output = Command::cargo_bin("test_xref")
+        .expect("test_xref binary")
+        .arg(&input)
+        .output()
+        .expect("run test_xref");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("WARNING: {path}:")),
+        "authentication failure must retain repair warnings: {stderr}"
+    );
+    assert!(
+        stderr.ends_with(&format!("{path}: invalid password\n")),
+        "terminal authentication error must retain qpdf path wording: {stderr}"
     );
 }
 
