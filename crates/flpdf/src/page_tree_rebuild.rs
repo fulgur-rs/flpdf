@@ -502,6 +502,30 @@ mod tests {
         out
     }
 
+    /// A root `/Pages` node whose only `/Kids` entry is a direct `/Page`
+    /// dictionary. qpdf's page enumeration promotes that live handle to the
+    /// first available indirect object before a later rebuild allocates a
+    /// duplicate selection slot.
+    fn build_direct_leaf_pdf() -> Vec<u8> {
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let off1 = out.len() as u64;
+        out.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = out.len() as u64;
+        out.extend_from_slice(
+            b"2 0 obj\n<< /Type /Pages /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] /Count 1 >>\nendobj\n",
+        );
+
+        let xref_start = out.len() as u64;
+        out.extend_from_slice(b"xref\n0 3\n0000000000 65535 f \n");
+        out.extend_from_slice(format!("{off1:010} 00000 n \n").as_bytes());
+        out.extend_from_slice(format!("{off2:010} 00000 n \n").as_bytes());
+        out.extend_from_slice(
+            format!("trailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
     fn open(bytes: Vec<u8>) -> Pdf<Cursor<Vec<u8>>> {
         Pdf::open(Cursor::new(bytes)).expect("PDF should parse")
     }
@@ -691,6 +715,35 @@ mod tests {
 
         let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
         assert_eq!(root.get("Count"), Some(&Object::Integer(2)));
+    }
+
+    #[test]
+    fn duplicate_selection_allocates_after_canonical_direct_promotion() {
+        let mut pdf = open(build_direct_leaf_pdf());
+
+        // This is the lower-layer sequence from the review: page enumeration
+        // first promotes the direct leaf, then rebuild receives its canonical
+        // reference twice. The allocator must see that promoted reference.
+        let prepared = crate::pages::repair::prepare_for_optimization(&mut pdf)
+            .expect("page preparation must succeed")
+            .expect("fixture has a page tree");
+        assert_eq!(prepared.pages, vec![ObjectRef::new(3, 0)]);
+
+        let result = rebuild_page_tree(&mut pdf, &[ObjectRef::new(3, 0), ObjectRef::new(3, 0)])
+            .expect("duplicate rebuild must succeed");
+        assert_eq!(
+            result.new_kids,
+            vec![ObjectRef::new(3, 0), ObjectRef::new(4, 0)]
+        );
+
+        let root = dict_of(&mut pdf, ObjectRef::new(2, 0));
+        assert_eq!(
+            root.get("Kids"),
+            Some(&Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Reference(ObjectRef::new(4, 0)),
+            ]))
+        );
     }
 
     #[test]

@@ -76,18 +76,20 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     }
 
     // qpdf corrects a catalog that points into the tree by following
-    // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Only indirect
-    // nodes contribute ObjGen identity to the loop guard; direct dictionaries
-    // are followed in place as ordinary QPDFObjectHandles.
-    let mut seen_parent = BTreeSet::new();
+    // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Track canonical
+    // handle identity so the guard covers both indirect ObjGen slots and
+    // direct dictionaries that share the same live allocation.
+    let mut seen_parent: Vec<ObjectHandle> = Vec::new();
     let mut changed_pages = false;
     let mut warned = false;
     loop {
-        if let Some(object_ref) = pages.object_ref() {
-            if !seen_parent.insert(object_ref) {
-                break;
-            }
+        if seen_parent
+            .iter()
+            .any(|seen| seen.is_same_object_as(&pages))
+        {
+            break;
         }
+        seen_parent.push(pages.clone());
         if !pages.try_has_key(b"/Parent")? {
             break;
         }
@@ -234,6 +236,10 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 format!("kid {index} (from 0) is direct; converting to indirect").as_str(),
             )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
             kid = promote_page_handle(pdf, kid)?;
+            let promoted_ref = kid
+                .object_ref()
+                .expect("promote_page_handle returns an indirect handle");
+            state.seen.insert(promoted_ref);
             kids.set_array_item(index, kid.clone())?;
             pdf.mark_object_handle_dirty(&kids)?;
         } else if let Some(object_ref) = kid.object_ref() {
@@ -308,6 +314,7 @@ fn is_rectangle_handle(value: &ObjectHandle) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::object::{Dictionary, Object};
+    use crate::object_handle::ObjectHandle;
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -3356,6 +3363,46 @@ mod tests {
     }
 
     #[test]
+    fn repeated_alias_of_direct_page_is_cloned_after_promotion() {
+        let mut pdf = Pdf::open(Cursor::new(pdf_with_direct_leaf_kid())).expect("valid PDF");
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let original_kids = pages.try_get_key(b"/Kids").expect("pages /Kids lookup");
+        let direct_page = original_kids
+            .try_array_item(0)
+            .expect("direct /Kids lookup")
+            .expect("direct page");
+        assert!(direct_page.is_direct());
+
+        // Keep the same live direct handle in both slots. Promoting the first
+        // slot changes the shared handle's identity for the second slot too,
+        // so the second occurrence must enter the duplicate branch.
+        pages.replace_key(
+            b"/Kids",
+            ObjectHandle::array(vec![direct_page.clone(), direct_page]),
+        );
+        pdf.mark_object_handle_dirty(&pages)
+            .expect("mark modified /Pages");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("page preparation must succeed")
+            .expect("fixture has a page tree");
+        assert_eq!(
+            prepared.pages,
+            vec![ObjectRef::new(4, 0), ObjectRef::new(5, 0)],
+            "the repeated direct handle must produce an original and a clone"
+        );
+
+        let kids = pages
+            .try_get_key(b"/Kids")
+            .expect("repaired /Kids lookup")
+            .try_as_array()
+            .expect("repaired /Kids array")
+            .expect("repaired /Kids must be an array");
+        assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
+        assert_eq!(kids[1].object_ref(), Some(ObjectRef::new(5, 0)));
+    }
+
+    #[test]
     fn null_kids_is_absent_when_classifying_a_direct_leaf() {
         for (label, kids) in [
             ("direct null", Object::Null),
@@ -3916,6 +3963,43 @@ mod tests {
             Some(&Object::Reference(ObjectRef::new(2, 0))),
             "a /Parent cycle must leave /Pages at the node where the guard broke (2 0 R)"
         );
+    }
+
+    #[test]
+    fn direct_parent_cycle_terminates() {
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve catalog");
+        let page = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        // Direct dictionaries cannot encode this cycle in serialized PDF
+        // syntax, but canonical handles can share the same live allocations.
+        // This is the exact identity case that an ObjGen-only loop guard misses.
+        let first = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(vec![page])),
+            (b"Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let second = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Parent".to_vec(), first.clone()),
+        ]);
+        first.replace_key(b"/Parent", second.clone());
+        catalog.replace_key(b"/Pages", first.clone());
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark modified catalog");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("direct parent cycle must terminate")
+            .expect("fixture has a page tree");
+        assert_eq!(
+            prepared.root,
+            PageTreeRoot::Direct {
+                catalog: ObjectRef::new(1, 0)
+            }
+        );
+        assert_eq!(prepared.pages, vec![ObjectRef::new(4, 0)]);
     }
 
     /// The catalog's `/Pages` (obj 2, a valid `/Kids`-bearing root) carries a
