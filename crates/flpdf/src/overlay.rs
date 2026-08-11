@@ -284,12 +284,11 @@ pub(crate) fn apply_overlays_to_page<R: Read + Seek>(
     let mut content = String::new();
     let mut new_top_fields: Vec<ObjectRef> = Vec::new();
     let mut dest_acroform_dr: Option<ObjectRef> = None;
-    // `dr_map` lifetime is per-destination (created by the caller,
-    // `apply_aggregated_sources`, and threaded through every page). qpdf's
-    // resource-name rename reuse is dest-scoped, not page-scoped: the same
-    // colliding source object must yield the same renamed dest name every
-    // time it lands on `dest_acroform_dr`, otherwise every page mints a
-    // fresh `_N` suffix and byte parity breaks.
+    // `dr_map` is threaded through every page so the current placement's
+    // rename table reaches field and appearance-stream rewriting. qpdf
+    // rebuilds its source-object identity map for each transform/merge call
+    // from the current destination dictionary; the destination `/DR` itself
+    // persists, so a still-live alias is reused without minting a new suffix.
     for (name, xref, template) in &underlay_names {
         let (bbox, fmatrix) = fo_bbox_and_matrix(dest, *xref)?;
         let (fragment, cm) =
@@ -693,11 +692,11 @@ fn apply_aggregated_sources<R: Read + Seek>(
     // Snapshot the dest page refs once; the patches mutate page dicts in place
     // but never reorder or remove page objects, so 1-based numbers stay valid.
     let dest_pages = page_refs(dest)?;
-    // One `dr_map` per destination document, threaded through every per-page
-    // call. Mirrors qpdf's dest-scoped resource-name reuse (see the invariant
-    // note on `merge_resources_shallow`): the same colliding source object
-    // must yield the same renamed dest name across every page it lands on,
-    // rather than growing a fresh `_N` suffix per page.
+    // One `dr_map` is threaded through every per-page call so the current
+    // placement's rename table reaches its field/AP consumers. Each qpdf
+    // merge call rebuilds source-object identity from the current destination
+    // `/DR`; a prior alias is reused only while that alias still names the
+    // same source object.
     let mut dr_map = crate::overlay_annotations::DrMap::new();
     for (dest_page, sources) in by_page {
         let dest_ref = page_ref_for(&dest_pages, dest_page, "destination")?;
