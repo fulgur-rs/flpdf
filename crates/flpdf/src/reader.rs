@@ -7804,6 +7804,43 @@ mod tests {
     }
 
     #[test]
+    fn get_all_objects_skips_invalid_or_stateful_parsed_xref_stream_handles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let historical = Object::Integer(7);
+
+        for object_ref in [ObjectRef::new(0, 0), ObjectRef::new(99, u16::MAX)] {
+            pdf.qpdf_parsed_xref_streams
+                .insert(object_ref, historical.clone());
+        }
+
+        let removed_ref = ObjectRef::new(100, 0);
+        pdf.qpdf_removed_refs.insert(removed_ref);
+        pdf.qpdf_parsed_xref_streams
+            .insert(removed_ref, historical.clone());
+
+        let xref_ref = ObjectRef::new(1, 0);
+        pdf.qpdf_parsed_xref_streams
+            .insert(xref_ref, historical.clone());
+
+        let resolved_ref = ObjectRef::new(101, 0);
+        let resolved = pdf.get_object_handle(resolved_ref);
+        resolved.set_resolved(ObjectValue::Integer(42));
+        pdf.qpdf_parsed_xref_streams
+            .insert(resolved_ref, historical.clone());
+
+        let missing_ref = ObjectRef::new(102, 0);
+        let missing = pdf.get_object_handle(missing_ref);
+        missing.set_missing();
+        pdf.qpdf_parsed_xref_streams.insert(missing_ref, historical);
+
+        pdf.get_all_objects()
+            .expect("skip invalid and already-stateful cached entries");
+
+        assert_eq!(resolved.as_integer(), Some(42));
+        assert!(missing.is_missing());
+    }
+
+    #[test]
     fn get_all_objects_registers_trailer_only_dangling_references() {
         let mut pdf = Pdf::open_mem_owned(trailer_only_dangling_info_pdf()).expect("open");
         assert!(pdf
