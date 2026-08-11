@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -121,6 +122,59 @@ fn tokenizer_emits_repair_warnings_to_stderr() {
     assert!(stderr.contains(
         "WARNING: repairable_input.pdf: Attempting to reconstruct cross-reference table"
     ));
+}
+
+#[test]
+fn tokenizer_emits_canonical_stream_recovery_warnings_once_with_qpdf_offsets() {
+    // The fixture contains malformed stream lengths in both direct and object
+    // stream objects. Resolve each canonical handle before crossing into the
+    // legacy decode boundary: qpdf emits one warning sequence per object, and
+    // its /Length warning offset is the post-obj header position.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let fixture = fixture_dir()
+        .join("compat")
+        .join("null-length-framing-matrix-objstm.pdf");
+    fs::write(
+        dir.path().join("null-length-framing-matrix-objstm.pdf"),
+        fs::read(fixture).expect("read malformed stream fixture"),
+    )
+    .expect("write malformed stream fixture into tempdir");
+
+    let output = run(&["null-length-framing-matrix-objstm.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("WARNING:"))
+        .collect();
+    assert_eq!(
+        warning_lines.len(),
+        36,
+        "unexpected warning output: {stderr}"
+    );
+    assert_eq!(
+        warning_lines.iter().collect::<HashSet<_>>().len(),
+        warning_lines.len(),
+        "canonical and legacy stream reads must not duplicate warnings: {stderr}"
+    );
+    assert!(
+        warning_lines.iter().any(|line| {
+            line.contains("(object 5 0, offset 76): stream dictionary lacks /Length key")
+        }),
+        "qpdf's post-header offset must be preserved: {stderr}"
+    );
+    assert!(
+        !warning_lines.iter().any(|line| {
+            line.contains("(object 5 0, offset 69): stream dictionary lacks /Length key")
+        }),
+        "the xref/object-start offset must not replace qpdf's readObject offset: {stderr}"
+    );
 }
 
 fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {

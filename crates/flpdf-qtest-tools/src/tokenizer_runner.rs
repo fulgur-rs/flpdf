@@ -249,25 +249,13 @@ fn process(
 
     let object_refs = pdf.object_refs();
     for obj_ref in object_refs {
-        // Prime the canonical resolver through the legacy borrowed entry
-        // point first. Besides identifying non-stream objects, this keeps
-        // stream-framing diagnostics attributed to their source object; a
-        // direct ObjectHandle resolution would otherwise lose that qpdf
-        // context on malformed /Length inputs.
-        let is_stream = matches!(
-            pdf.resolve_borrowed(obj_ref).map_err(|e| e.to_string())?,
-            Object::Stream(_)
-        );
-        if !is_stream {
-            continue;
-        }
-
-        // Resolve the canonical handle for classification without
-        // materializing or cloning its raw payload. The legacy borrowed
-        // Object below is retained only at the filters::decode_stream_data
-        // boundary, whose API is still &Dictionary-shaped. The second
-        // borrowed access is intentional: that boundary needs the live
-        // Stream view, while the handle above owns qpdf-shaped inspection.
+        // Resolve the canonical handle first so qpdf's stream-recovery
+        // diagnostics are emitted exactly once with their ObjectRef context.
+        // The legacy borrowed Object below is retained only at the
+        // filters::decode_stream_data boundary, whose API is still
+        // &Dictionary-shaped. Because the canonical resolver has already
+        // registered the handle, this compatibility read materializes that
+        // resolved value instead of parsing and warning a second time.
         let stream_handle = pdf.get_object_handle(obj_ref);
         pdf.resolve_object_handle(&stream_handle)
             .map_err(|e| e.to_string())?;
@@ -479,16 +467,6 @@ mod tests {
 
     #[test]
     fn resolve_objstm_type_true_for_direct_name() {
-        let mut pdf = open_minimal_pdf();
-        let dict = ObjectHandle::dictionary(vec![(
-            b"Type".to_vec(),
-            ObjectHandle::name(b"ObjStm".to_vec()),
-        )]);
-        assert!(resolve_objstm_type(&mut pdf, &dict));
-    }
-
-    #[test]
-    fn resolve_objstm_type_accepts_an_object_handle_dictionary() {
         let mut pdf = open_minimal_pdf();
         let dict = ObjectHandle::dictionary(vec![(
             b"Type".to_vec(),
