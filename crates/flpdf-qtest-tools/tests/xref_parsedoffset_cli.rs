@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use std::fs;
+use std::path::Path;
 #[cfg(unix)]
 use std::process::{Command as ProcessCommand, Stdio};
 
@@ -104,6 +105,12 @@ fn metadata_helpers_match_qpdf_usage_contracts() {
 #[cfg(unix)]
 #[test]
 fn metadata_usage_write_failures_do_not_panic() {
+    let dev_full = Path::new("/dev/full");
+    if !dev_full.exists() {
+        eprintln!("skipping metadata /dev/full write-failure test: device is unavailable");
+        return;
+    }
+
     for binary in [
         env!("CARGO_BIN_EXE_test_xref"),
         env!("CARGO_BIN_EXE_test_parsedoffset"),
@@ -122,15 +129,22 @@ fn metadata_usage_write_failures_do_not_panic() {
 
 #[test]
 fn test_xref_reports_missing_input_with_qpdf_open_wording() {
-    Command::cargo_bin("test_xref")
+    let assertion = Command::cargo_bin("test_xref")
         .expect("test_xref binary")
         .arg("/definitely/missing/flpdf-metadata.pdf")
         .assert()
         .code(2)
-        .stdout("")
-        .stderr("open /definitely/missing/flpdf-metadata.pdf: No such file or directory\n");
+        .stdout("");
+
+    #[cfg(unix)]
+    assertion.stderr("open /definitely/missing/flpdf-metadata.pdf: No such file or directory\n");
+    #[cfg(windows)]
+    assertion.stderr(
+        "open /definitely/missing/flpdf-metadata.pdf: The system cannot find the path specified.\n",
+    );
 }
 
+#[cfg(unix)]
 #[test]
 fn test_xref_reports_read_failures_with_qpdf_file_input_wording() {
     let directory = tempfile::tempdir().expect("temporary directory");
@@ -141,6 +155,22 @@ fn test_xref_reports_read_failures_with_qpdf_file_input_wording() {
         .code(2)
         .stdout("")
         .stderr(format!("{}: read 1024 bytes\n", directory.path().display()));
+}
+
+#[cfg(windows)]
+#[test]
+fn test_xref_reports_directory_open_failures_with_native_wording() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    Command::cargo_bin("test_xref")
+        .expect("test_xref binary")
+        .arg(directory.path())
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(format!(
+            "open {}: Access is denied.\n",
+            directory.path().display()
+        ));
 }
 
 #[test]
