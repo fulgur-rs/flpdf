@@ -55,6 +55,12 @@ pub(crate) enum IdPlan {
 pub(crate) struct TrailerPlan {
     pub(crate) form: XrefForm,
     pub(crate) dictionary: Dictionary,
+    /// Canonical trailer entries from the live ObjectHandle graph. Keys remain
+    /// decoded until emission so qpdf's raw-name sort is preserved.
+    /// The legacy dictionary remains for non-canonical writer routes and for
+    /// writer-owned `/ID` materialization; canonical plain writes must not
+    /// reconstruct their extension entries from that stale snapshot.
+    pub(crate) canonical_entries: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     pub(crate) root: ObjectRef,
     pub(crate) id: IdPlan,
     pub(crate) structural_filtered: bool,
@@ -241,29 +247,77 @@ fn append_classic_xref_and_trailer(
         }
     }
 
-    let mut dictionary = trailer.dictionary.clone();
-    dictionary.insert("Root", Object::Reference(trailer.root));
-    dictionary.insert("Size", Object::Integer(i64::from(size)));
-    if matches!(&trailer.id, IdPlan::Deterministic { .. }) {
-        // `write_pdf_trailer` calls its ID writer only when this key exists.
-        // The inline writer replaces this placeholder with the real array.
-        dictionary.insert("ID", Object::Array(Vec::new()));
-    }
     bytes.extend_from_slice(b"trailer ");
-    match &trailer.id {
-        IdPlan::Materialized => dictionary.write_pdf_trailer(bytes, None),
-        IdPlan::Deterministic {
-            source_id0,
-            info_suffix,
-        } => {
-            let mut id_writer = |out: &mut Vec<u8>| {
-                write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
-            };
-            dictionary.write_pdf_trailer(bytes, Some(&mut id_writer));
+    if let Some(canonical) = trailer.canonical_entries.as_deref() {
+        write_canonical_classic_trailer(bytes, trailer, size, canonical);
+    } else {
+        let mut dictionary = trailer.dictionary.clone();
+        dictionary.insert("Root", Object::Reference(trailer.root));
+        dictionary.insert("Size", Object::Integer(i64::from(size)));
+        if matches!(&trailer.id, IdPlan::Deterministic { .. }) {
+            // `write_pdf_trailer` calls its ID writer only when this key exists.
+            // The inline writer replaces the placeholder with the real array.
+            dictionary.insert("ID", Object::Array(Vec::new()));
+        }
+        match &trailer.id {
+            IdPlan::Materialized => dictionary.write_pdf_trailer(bytes, None),
+            IdPlan::Deterministic {
+                source_id0,
+                info_suffix,
+            } => {
+                let mut id_writer = |out: &mut Vec<u8>| {
+                    write_deterministic_id_inline(out, info_suffix, source_id0.as_deref())
+                };
+                dictionary.write_pdf_trailer(bytes, Some(&mut id_writer));
+            }
         }
     }
     bytes.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     written_xref_table(layout, size)
+}
+
+fn write_canonical_classic_trailer(
+    bytes: &mut Vec<u8>,
+    trailer: &TrailerPlan,
+    size: u32,
+    canonical: &[(Vec<u8>, Vec<u8>)],
+) {
+    let mut entries = canonical.to_vec();
+    entries.push((
+        b"/Root".to_vec(),
+        format!("{} {} R", trailer.root.number, trailer.root.generation).into_bytes(),
+    ));
+    entries.push((b"/Size".to_vec(), size.to_string().into_bytes()));
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    bytes.extend_from_slice(b"<<");
+    for (key, value) in entries {
+        bytes.push(b' ');
+        bytes.push(b'/');
+        crate::object::write_name_escaped(bytes, key.strip_prefix(b"/").unwrap_or(&key));
+        bytes.push(b' ');
+        bytes.extend_from_slice(&value);
+    }
+
+    if matches!(&trailer.id, IdPlan::Materialized) {
+        if let Some(id) = trailer.dictionary.get("ID") {
+            bytes.extend_from_slice(b" /ID ");
+            crate::object::write_id_style_value(bytes, id);
+        }
+    } else if let IdPlan::Deterministic {
+        source_id0,
+        info_suffix,
+    } = &trailer.id
+    {
+        bytes.extend_from_slice(b" /ID ");
+        write_deterministic_id_inline(bytes, info_suffix, source_id0.as_deref());
+    }
+
+    if let Some(encrypt) = trailer.dictionary.get("Encrypt") {
+        bytes.extend_from_slice(b" /Encrypt ");
+        encrypt.write_pdf(bytes);
+    }
+    bytes.extend_from_slice(b" >>");
 }
 
 fn written_xref_table(
@@ -345,6 +399,7 @@ mod tests {
         TrailerPlan {
             form,
             dictionary: Dictionary::new(),
+            canonical_entries: None,
             root: ObjectRef::new(1, 0),
             id: IdPlan::Materialized,
             structural_filtered: false,
@@ -365,6 +420,33 @@ mod tests {
               trailer << /Root 1 0 R /Size 2 >>\n\
               startxref\n4\n%%EOF\n"
         );
+    }
+
+    #[test]
+    fn canonical_classic_trailer_writes_deterministic_id_and_encrypt() {
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout.uncompressed.insert(1, (0, 0));
+        let mut dictionary = Dictionary::new();
+        dictionary.insert("Encrypt", Object::Reference(ObjectRef::new(8, 0)));
+        let trailer = TrailerPlan {
+            form: XrefForm::Table,
+            dictionary,
+            canonical_entries: Some(vec![(b"/Added".to_vec(), b"true".to_vec())]),
+            root: ObjectRef::new(1, 0),
+            id: IdPlan::Deterministic {
+                source_id0: Some(vec![0x01, 0x02]),
+                info_suffix: vec![0x03, 0x04],
+            },
+            structural_filtered: false,
+        };
+
+        append_xref_and_trailer(&mut bytes, &layout, &trailer).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("/Added true"));
+        assert!(text.contains("/ID [<"));
+        assert!(text.contains("] /Encrypt 8 0 R >>"));
     }
 
     #[test]
