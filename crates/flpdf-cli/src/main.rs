@@ -5112,11 +5112,17 @@ fn probe_encryption(
         // A wrong/empty password: the document is definitely encrypted, we
         // just have not authenticated it. qpdf treats this as "encrypted,
         // password required".
-        Err(flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)) => {
-            Ok(EncryptionProbe::EncryptedAuthFailed)
-        }
+        Err(error) if is_bad_password_error(&error) => Ok(EncryptionProbe::EncryptedAuthFailed),
         Err(other) => Err(other.into()),
     }
+}
+
+fn is_bad_password_error(error: &flpdf::Error) -> bool {
+    let source = error.open_failure().map_or(error, |(source, _)| source);
+    matches!(
+        source,
+        flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
+    )
 }
 
 /// `is-encrypted FILE`: exit 0 if encrypted, exit 2 if not.
@@ -5593,10 +5599,7 @@ fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
-    if matches!(
-        error,
-        flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
-    ) {
+    if is_bad_password_error(&error) {
         return "encrypted PDF: incorrect password; retry with --password or --password-file"
             .into();
     }
@@ -6059,6 +6062,31 @@ mod tests {
             chunks.concat(),
             b"page 1: 3 0 R\n  media-box: [ 0 0 612 792 ]\n  resources: << /Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] >>\n  contents: 7 0 R\n  rotate: 0\n"
         );
+    }
+
+    #[test]
+    fn probe_encryption_classifies_bad_password_after_repair_warnings() {
+        let mut input =
+            include_bytes!("../../../tests/fixtures/compat/encrypted-r4-three-page.pdf").to_vec();
+        let xref = input
+            .windows(4)
+            .position(|window| window == b"xref")
+            .expect("encrypted fixture should contain an xref keyword");
+        input[xref + 2] = b'X';
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("damaged-encrypted.pdf");
+        std::fs::write(&path, input).expect("write damaged encrypted fixture");
+        let outcome = probe_encryption(
+            &path,
+            true,
+            &PasswordArgs {
+                password: Some("wrong".to_owned()),
+                ..PasswordArgs::default()
+            },
+        );
+
+        assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
     }
 
     #[test]
