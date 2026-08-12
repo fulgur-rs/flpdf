@@ -1844,11 +1844,34 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.insert(object_ref);
     }
 
-    /// Mark the canonical owner of `handle` dirty after an in-place
-    /// [`ObjectHandle`] mutation. Direct children carry their indirect
-    /// containment refs from resolution/insertion, so this never resolves
+    /// Mark the canonical indirect owner or owners of `handle` dirty after an
+    /// in-place [`ObjectHandle`] mutation.
+    ///
+    /// This is the owner-aware dirty operation for qpdf-shaped live-handle
+    /// mutations. An indirect array or dictionary has its own [`ObjectRef`],
+    /// so passing that handle is equivalent to calling
+    /// [`Self::mark_object_dirty`] with its reference. A direct array or
+    /// dictionary nested inside an indirect object has no reference of its
+    /// own; passing that direct child marks every containing indirect owner
+    /// tracked by the handle graph. This is the form callers need after
+    /// mutating a direct child array, for example with
+    /// [`ObjectHandle::append_array_item`].
+    ///
+    /// Direct-child containment is recorded when the child is resolved from
+    /// or inserted into a live indirect object. A detached direct child has no
+    /// writer owner and therefore marks nothing. This method never resolves
     /// unrelated objects merely to rediscover an owner.
-    pub(crate) fn mark_object_handle_dirty(&mut self, handle: &ObjectHandle) -> Result<()> {
+    ///
+    /// Like qpdf's `QPDFObjectHandle` ownership checks, a handle from another
+    /// [`Pdf`] is rejected rather than treating an equal-numbered object in
+    /// this document as its owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when `handle` belongs to another
+    /// document or is otherwise not a canonical handle owned by this
+    /// document.
+    pub fn mark_object_handle_dirty(&mut self, handle: &ObjectHandle) -> Result<()> {
         if let Some(object_ref) = handle.object_ref() {
             if !self.is_canonical_object_handle(handle) {
                 return Err(Error::Unsupported(
