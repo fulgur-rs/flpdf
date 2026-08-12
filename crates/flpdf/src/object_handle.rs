@@ -2337,8 +2337,16 @@ impl ObjectHandle {
     /// `QPDFObjectHandle`; external canonical consumers must not replace an
     /// indirect array through its parent dictionary or materialize it into
     /// the legacy [`crate::Object`] model.
+    ///
+    /// As with [`Self::replace_key`], this mutates the live handle graph but
+    /// cannot notify the owning [`crate::Pdf`]. After mutating a registered
+    /// indirect handle, call [`crate::Pdf::mark_object_dirty`] with its
+    /// object reference so the canonical writer observes the change.
     pub fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to set item")? {
+            return Ok(());
+        }
+        if self.is_direct_value_alias(&value) {
             return Ok(());
         }
 
@@ -2369,8 +2377,13 @@ impl ObjectHandle {
     /// are then checked and attached one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
     pub fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
+            return Ok(());
+        }
+        if items.iter().any(|item| self.is_direct_value_alias(item)) {
             return Ok(());
         }
 
@@ -2411,8 +2424,13 @@ impl ObjectHandle {
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
     /// ownership or changing the array.
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
     pub fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
+            return Ok(());
+        }
+        if self.is_direct_value_alias(&value) {
             return Ok(());
         }
 
@@ -2455,8 +2473,13 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
     pub fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
+            return Ok(());
+        }
+        if self.is_direct_value_alias(&value) {
             return Ok(());
         }
 
@@ -2484,6 +2507,8 @@ impl ObjectHandle {
 
     /// Erase one live array item, porting qpdf's `eraseItem`
     /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
     pub fn erase_array_item(&self, index: usize) -> Result<()> {
         self.erase_array_item_and_get_old(index).map(|_| ())
     }
@@ -2491,7 +2516,11 @@ impl ObjectHandle {
     /// Erase one live array item and return its original handle, porting
     /// qpdf's `eraseItemAndGetOld` (`libqpdf/QPDFObjectHandle.cc:948-955`).
     /// Invalid positions and non-array receivers return a fresh null after
-    /// emitting the corresponding qpdf warning.
+    /// emitting the corresponding qpdf warning when the handle has document
+    /// warning context. A direct/contextless handle cannot route that warning
+    /// and therefore returns the existing `Error::System` boundary instead.
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
     pub fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
         if !self.prepare_array_mutation("ignoring attempt to erase item")? {
             return Ok(ObjectHandle::null());
@@ -11245,6 +11274,51 @@ mod mutation_tests {
             .unwrap()
             .unwrap()
             .is_same_object_as(&appended));
+    }
+
+    #[test]
+    fn public_array_mutators_ignore_direct_self_aliases() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+
+        array
+            .set_array_item(0, array.clone())
+            .expect("direct self replacement is ignored");
+        array
+            .set_array_items(vec![array.clone()])
+            .expect("direct self replacement list is ignored");
+        array
+            .insert_array_item(0, array.clone())
+            .expect("direct self insertion is ignored");
+        array
+            .append_array_item(array.clone())
+            .expect("direct self append is ignored");
+
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert_eq!(
+            array.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn loaded_clean_array_mutation_requires_explicit_dirty_mark() {
+        let mut pdf = crate::Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+        )
+        .expect("open minimal PDF");
+        let pages_ref = ObjectRef::new(2, 0);
+        let pages = pdf.get_object_handle(pages_ref);
+        pdf.resolve_object_handle(&pages)
+            .expect("resolve loaded Pages object");
+        let kids = pages.get_key(b"/Kids");
+
+        assert!(pdf.dirty_object_refs().is_empty());
+        kids.append_array_item(ObjectHandle::integer(4))
+            .expect("mutate the loaded array");
+        assert!(pdf.dirty_object_refs().is_empty());
+
+        pdf.mark_object_dirty(pages_ref);
+        assert_eq!(pdf.dirty_object_refs(), vec![pages_ref]);
     }
 
     #[test]
