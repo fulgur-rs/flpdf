@@ -406,6 +406,20 @@ fn remove_consumed_crypt_stages(dict: &mut Dictionary) {
             dict.remove("DecodeParms");
         }
         Object::Array(values) => {
+            if let Some(Object::Array(params)) = dict.get("DecodeParms") {
+                // qpdf validates the original filter/parameter positions
+                // before any consumed Crypt stage is removed
+                // (`QPDF_Stream.cc:452-464`). Preserve the mismatch so the
+                // decoder rejects the stream instead of accepting a
+                // shortened, apparently aligned chain.
+                // qpdf treats an empty DecodeParms array as a null scalar
+                // before expanding it across the original filter list
+                // (`QPDF_Stream.cc:443-445`), so only non-empty arrays can
+                // represent a positional mismatch here.
+                if !params.is_empty() && params.len() != filters.len() {
+                    return;
+                }
+            }
             let remaining: Vec<Object> = values
                 .into_iter()
                 .enumerate()
@@ -1169,7 +1183,10 @@ mod tests {
 
         assert_eq!(
             dict.get("Filter"),
-            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+            Some(&Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+            ]))
         );
         assert_eq!(
             dict.get("DecodeParms"),
