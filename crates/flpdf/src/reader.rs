@@ -440,13 +440,22 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // Stack-growth protection for this module's two recursive hubs: `lift_bounded`
 // here, and `ResolverHandle::resolve_indirect` in the `resolver` child module,
 // which reaches these as `super::READER_STACK_RED_ZONE`/
-// `super::READER_STACK_GROWTH_SIZE`. The values mirror `parser.rs`'s own
-// `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` (kept as separate local constants
-// rather than imported cross-module, matching this crate's existing per-module
-// duplication of the same two numbers in `object_handle.rs`); `resolver.rs`
-// shares *these* rather than minting a third pair because it is a child of this
-// module, not a module across the crate from it.
+// `super::READER_STACK_GROWTH_SIZE`. The red-zone value mirrors
+// `parser.rs`'s own `STACK_RED_ZONE` (kept as a separate local constant rather
+// than imported cross-module, matching this crate's existing per-module
+// duplication in `object_handle.rs`); `resolver.rs` shares *these* rather
+// than minting a third pair because it is a child of this module, not a module
+// across the crate from it.
 const READER_STACK_RED_ZONE: usize = 32 * 1024;
+// Windows' stacker backend runs the callback on a fiber with exactly the
+// requested stack size. The resolver's object-attributed diagnostics add
+// enough frame state that the existing 4000-link regression can exhaust a
+// 1 MiB fiber, even though the same growth boundary is sufficient on Unix.
+// Keep the larger fiber local to Windows; the normal thread stack is still
+// bounded by the caller's own thread configuration.
+#[cfg(windows)]
+const READER_STACK_GROWTH_SIZE: usize = 8 * 1024 * 1024;
+#[cfg(not(windows))]
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
 impl<R: Read + Seek> Pdf<R> {
