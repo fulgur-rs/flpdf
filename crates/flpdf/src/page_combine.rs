@@ -55,6 +55,12 @@ use crate::{Error, PagePlan, PageRange, Pdf, PdfOpenOptions, Result};
 use std::io::{BufReader, Read, Seek};
 use std::path::PathBuf;
 
+fn open_failure_source(error: &Error) -> &Error {
+    error
+        .open_failure()
+        .map_or(error, |(source, _diagnostics)| source)
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -163,14 +169,15 @@ impl CombinedPlan {
     ///
     /// Each spec is opened with [`Pdf::open_with_options`] using the supplied
     /// password (if any). Bad passwords produce [`Error::Encrypted`] with an
-    /// actionable message.
+    /// actionable message, or [`Error::OpenFailure`] wrapping that terminal
+    /// source when qpdf-compatible open diagnostics were collected first.
     ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] when `specs` is empty.
     /// - [`Error::Io`] when a file cannot be opened.
-    /// - [`Error::Encrypted`] when a password is wrong or encryption is
-    ///   unsupported.
+    /// - [`Error::Encrypted`] (possibly wrapped by [`Error::OpenFailure`]) when
+    ///   a password is wrong or encryption is unsupported.
     /// - Any error from [`PagePlan::build`].
     pub fn from_specs(specs: Vec<InputSpec>) -> Result<Self> {
         if specs.is_empty() {
@@ -202,16 +209,21 @@ impl CombinedPlan {
                     .unwrap_or_default(),
                 ..PdfOpenOptions::default()
             };
-            // Preserve Error::Encrypted so CLI layers can pattern-match on it
-            // for exit-code decisions (e.g. bad password vs. unsupported feature).
-            // Only Unsupported/Parse are promoted to Unsupported with input context.
-            let pdf = Pdf::open_with_options(reader, opts).map_err(|e| match e {
-                Error::Encrypted(_) => e,
-                Error::Io(_) => e,
-                other => {
-                    Error::Unsupported(format!("input {i} ('{}'): {other}", spec.path.display()))
-                }
-            })?;
+            // Preserve the terminal Error::Encrypted / Error::Io classification
+            // even when repair diagnostics wrap it in Error::OpenFailure, so
+            // CLI layers can still distinguish bad passwords from unsupported
+            // features. Only Unsupported/Parse are promoted to Unsupported
+            // with input context.
+            let pdf =
+                Pdf::open_with_options(reader, opts).map_err(|e| {
+                    match open_failure_source(&e) {
+                        Error::Encrypted(_) | Error::Io(_) => e,
+                        _ => Error::Unsupported(format!(
+                            "input {i} ('{}'): {e}",
+                            spec.path.display()
+                        )),
+                    }
+                })?;
             opened.push((pdf, spec.range.clone()));
         }
 
@@ -592,6 +604,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_specs_preserves_encrypted_authentication_after_open_diagnostics() {
+        let mut bytes = encrypted_v1_owner_password_fixture();
+        let size = bytes
+            .windows(b"/Size 3".len())
+            .position(|window| window == b"/Size 3")
+            .expect("encrypted fixture should contain a trailer size");
+        bytes[size + b"/Size ".len()] = b'2';
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let input = directory.path().join("encrypted.pdf");
+        std::fs::write(&input, bytes).expect("write encrypted fixture");
+        let error = CombinedPlan::from_specs(vec![InputSpec::new(
+            &input,
+            Some("wrong".to_owned()),
+            PageRange::parse("").expect("all pages range"),
+        )])
+        .expect_err("wrong password must fail");
+
+        let (source, diagnostics) = error
+            .open_failure()
+            .expect("repair diagnostics must stay attached to auth failure");
+        assert!(matches!(
+            source,
+            Error::Encrypted(crate::EncryptedError::BadPassword)
+        ));
+        assert!(!diagnostics.entries().is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // from_specs — happy path (write a real file to disk and read it back)
     // -----------------------------------------------------------------------
@@ -648,5 +689,25 @@ mod tests {
 
         // Clean up temp directory (and its files).
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn encrypted_v1_owner_password_fixture() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.7\n".to_vec();
+        let obj1_offset = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let obj2_offset = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 >>\nendobj\n");
+        let xref_offset = bytes.len();
+        let trailer = b"trailer\n<< /Size 3 /Root 1 0 R /Encrypt << /Filter /Standard /V 1 /R 2 /Length 40 /P -3904 /O <94e8094419662a774442fb072e3d9f19e9d130ec09a4d0061e78fe920f7ab62f> /U <13f520c882d052bf57b416b747c13979bded7ea31240fe41928852aca3894c49> >> /ID [<000102030405060708090a0b0c0d0e0f><000102030405060708090a0b0c0d0e0f>] >>\nstartxref\n";
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 3\n0000000000 65535 f \n{obj1_offset:010} 00000 n \n{obj2_offset:010} 00000 n \n"
+            )
+            .as_bytes(),
+        );
+        bytes.extend_from_slice(trailer);
+        bytes.extend_from_slice(xref_offset.to_string().as_bytes());
+        bytes.extend_from_slice(b"\n%%EOF\n");
+        bytes
     }
 }
