@@ -68,16 +68,28 @@ int main()
 
         auto all_objects = pdf.getAllObjects();
         require(all_objects.size() == 5, "new streams changed the expected object count");
-        auto is_registered = [&all_objects](QPDFObjectHandle const& stream) {
-            return std::any_of(
+        auto registered_handle = [&all_objects](QPDFObjectHandle const& stream) {
+            auto it = std::find_if(
                 all_objects.begin(),
                 all_objects.end(),
                 [&stream](QPDFObjectHandle const& object) {
                     return object.getObjGen() == stream.getObjGen();
                 });
+            require(it != all_objects.end(), "stream was not registered");
+            return *it;
         };
-        require(is_registered(with_data), "buffer stream was not registered");
-        require(is_registered(empty_data), "empty buffer stream was not registered");
+        auto registered_with_data = registered_handle(with_data);
+        auto registered_empty_data = registered_handle(empty_data);
+        registered_with_data.getDict().replaceKey(
+            "/Marker", QPDFObjectHandle::newInteger(11));
+        require(
+            with_data.getDict().getKey("/Marker").getIntValue() == 11,
+            "registered buffer stream is disconnected from returned handle");
+        registered_empty_data.getDict().replaceKey(
+            "/Marker", QPDFObjectHandle::newInteger(13));
+        require(
+            empty_data.getDict().getKey("/Marker").getIntValue() == 13,
+            "registered empty buffer stream is disconnected from returned handle");
 
         std::cout << "qpdf new stream probe: ok\n";
         return 0;
