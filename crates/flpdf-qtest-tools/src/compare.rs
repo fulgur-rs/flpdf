@@ -93,9 +93,9 @@ where
 
     // qpdf's dictionary unparse calls `isNull()` for each entry before it
     // emits the entry (`QPDF_Dictionary.cc:59-69`). Resolve dictionary
-    // children on both sides for that null-suppression decision, but keep
-    // array elements opaque: an array's `unparse()` emits each child as an
-    // indirect reference without dereferencing it.
+    // children on both sides for that null-suppression decision. Direct
+    // containers inside arrays are walked recursively, while indirect array
+    // elements remain opaque and retain their `N G R` spelling.
     let mut actual_seen = Vec::new();
     resolve_compare_children(&act_dict, actual_pdf, &mut actual_seen, 0)?;
     let mut expected_seen = Vec::new();
@@ -163,21 +163,27 @@ fn stream_uses_flatedecode<R: Read + Seek>(
     // qpdf's compare-for-test path uses `isNameAndEquals("/FlateDecode")`
     // here, so abbreviated names such as `/Fl` must stay on raw-data compare.
     Ok(resolved_filter_names_exact(stream_dict, pdf)?
+        .names
         .iter()
         .any(|name| name == b"FlateDecode"))
+}
+
+struct ResolvedFilterNames {
+    names: Vec<Vec<u8>>,
+    valid: bool,
 }
 
 fn resolved_filter_names<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
-) -> flpdf::Result<Vec<Vec<u8>>> {
+) -> flpdf::Result<ResolvedFilterNames> {
     resolved_filter_names_with_normalization(stream_dict, pdf, true)
 }
 
 fn resolved_filter_names_exact<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
-) -> flpdf::Result<Vec<Vec<u8>>> {
+) -> flpdf::Result<ResolvedFilterNames> {
     resolved_filter_names_with_normalization(stream_dict, pdf, false)
 }
 
@@ -185,31 +191,45 @@ fn resolved_filter_names_with_normalization<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
     normalize: bool,
-) -> flpdf::Result<Vec<Vec<u8>>> {
+) -> flpdf::Result<ResolvedFilterNames> {
     let filter = pdf.resolve_object_handle_to_terminal(&stream_dict.get_key(b"/Filter"))?;
     if let Some(name) = filter.as_name() {
-        return Ok(vec![if normalize {
-            normalize_filter_name(&name).to_vec()
-        } else {
-            name.to_vec()
-        }]);
-    }
-    let Some(items) = filter.as_array() else {
-        return Ok(Vec::new());
-    };
-    let mut names = Vec::with_capacity(items.len());
-    for item in items {
-        let item = pdf.resolve_object_handle_to_terminal(&item)?;
-        let Some(name) = item.as_name() else {
-            continue;
-        };
-        names.push(if normalize {
-            normalize_filter_name(&name).to_vec()
-        } else {
-            name.to_vec()
+        return Ok(ResolvedFilterNames {
+            names: vec![if normalize {
+                normalize_filter_name(&name).to_vec()
+            } else {
+                name.to_vec()
+            }],
+            valid: is_known_filter_name(&name),
         });
     }
-    Ok(names)
+    let Some(items) = filter.as_array() else {
+        return Ok(ResolvedFilterNames {
+            names: Vec::new(),
+            valid: filter.is_null(),
+        });
+    };
+    let mut names = Vec::with_capacity(items.len());
+    let mut valid = true;
+    for item in items {
+        let item = pdf.resolve_object_handle_to_terminal(&item)?;
+        if let Some(name) = item.as_name() {
+            names.push(if normalize {
+                normalize_filter_name(&name).to_vec()
+            } else {
+                name.to_vec()
+            });
+            valid &= is_known_filter_name(&name);
+        } else {
+            // qpdf validates every Filter array item in its original
+            // position (QPDF_Stream.cc:396-415). Keep an empty slot for an
+            // invalid item so the legacy DecodeParms bridge cannot assign a
+            // later filter's parameter dictionary to the wrong index.
+            names.push(Vec::new());
+            valid = false;
+        }
+    }
+    Ok(ResolvedFilterNames { names, valid })
 }
 
 fn normalize_filter_name(name: &[u8]) -> &[u8] {
@@ -223,6 +243,19 @@ fn normalize_filter_name(name: &[u8]) -> &[u8] {
         b"DCT" => b"DCTDecode",
         name => name,
     }
+}
+
+fn is_known_filter_name(name: &[u8]) -> bool {
+    matches!(
+        normalize_filter_name(name),
+        b"Crypt"
+            | b"FlateDecode"
+            | b"LZWDecode"
+            | b"RunLengthDecode"
+            | b"DCTDecode"
+            | b"ASCII85Decode"
+            | b"ASCIIHexDecode"
+    )
 }
 
 // Materialize exactly at the still-legacy filters::decode_stream_data
@@ -240,7 +273,10 @@ fn materialize_decode_dictionary<R: Read + Seek>(
     for (key, value) in entries {
         let value = match key.as_slice() {
             b"/Filter" => materialize_resolved_for_legacy(&value, pdf, 0)?,
-            b"/DecodeParms" => materialize_decode_params_for_legacy(&value, &filter_names, pdf)?,
+            b"/DecodeParms" if filter_names.valid => {
+                materialize_decode_params_for_legacy(&value, &filter_names.names, pdf)?
+            }
+            b"/DecodeParms" => materialize_legacy_without_resolution(&value)?,
             // `/Type` is inspected by qpdf separately for the xref-stream
             // fast path; it is not a filter decode parameter. Preserve its
             // indirect spelling here (`QPDF_Stream.cc:379-484`).
@@ -420,16 +456,36 @@ fn resolve_compare_children<R: Read + Seek>(
     {
         return Ok(());
     }
+    if let Some(items) = handle.as_array() {
+        seen.push(handle.clone());
+        for child in items {
+            // qpdf's array unparse leaves indirect elements as `N G R`; only
+            // direct containers can contain descendants that need a
+            // dictionary null-suppression walk.
+            if !child.is_direct() {
+                continue;
+            }
+            let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
+            if terminal.as_dictionary().is_some() || terminal.as_array().is_some() {
+                resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
+            }
+        }
+        seen.pop();
+        return Ok(());
+    }
     let Some(entries) = handle.as_dictionary() else {
-        // qpdf's array unparse leaves indirect elements as `N G R`; only
-        // dictionary entries are dereferenced to decide whether a null entry
-        // should be omitted.
         return Ok(());
     };
     seen.push(handle.clone());
     for child in entries.into_values() {
+        let child_is_direct = child.is_direct();
         let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
-        if terminal.as_dictionary().is_some() {
+        if child_is_direct && (terminal.as_dictionary().is_some() || terminal.as_array().is_some())
+        {
+            // qpdf's dictionary unparse resolves an immediate child for its
+            // null-suppression decision, but an indirect dictionary child is
+            // serialized as `N G R` and its descendants remain opaque to the
+            // compare-for-test walk. Recurse only through direct containers.
             resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
         }
     }
@@ -700,6 +756,58 @@ mod tests {
     }
 
     #[test]
+    fn canonical_handle_compare_resolves_nulls_in_a_direct_dictionary_inside_an_array() {
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        let a_missing = a_pdf.get_object_handle(ObjectRef::new(99, 0));
+        let e_missing = e_pdf.get_object_handle(ObjectRef::new(100, 0));
+        let actual = ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+            b"/Null".to_vec(),
+            a_missing,
+        )])]);
+        let expected = ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+            b"/Null".to_vec(),
+            e_missing,
+        )])]);
+
+        assert_eq!(
+            compare_objects("array-dict", &actual, &expected, &mut a_pdf, &mut e_pdf,)
+                .expect("direct dictionary in an array must be comparable"),
+            "",
+            "qpdf recursively unparses direct dictionaries inside arrays"
+        );
+    }
+
+    #[test]
+    fn canonical_handle_compare_resolves_nulls_in_a_dictionary_array_value() {
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        let a_missing = a_pdf.get_object_handle(ObjectRef::new(99, 0));
+        let e_missing = e_pdf.get_object_handle(ObjectRef::new(100, 0));
+        let actual = ObjectHandle::dictionary(vec![(
+            b"/Nested".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                b"/Null".to_vec(),
+                a_missing,
+            )])]),
+        )]);
+        let expected = ObjectHandle::dictionary(vec![(
+            b"/Nested".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                b"/Null".to_vec(),
+                e_missing,
+            )])]),
+        )]);
+
+        assert_eq!(
+            compare_objects("dict-array", &actual, &expected, &mut a_pdf, &mut e_pdf,)
+                .expect("array-valued dictionary must be comparable"),
+            "",
+            "qpdf recursively unparses direct array-valued dictionary contents"
+        );
+    }
+
+    #[test]
     fn canonical_stream_compare_suppresses_null_dictionary_entries_on_both_sides() {
         let mut a_pdf = dummy_pdf();
         let mut e_pdf = dummy_pdf();
@@ -724,6 +832,57 @@ mod tests {
             compare_objects("stream", &actual, &expected, &mut a_pdf, &mut e_pdf,)
                 .expect("stream dictionary null suppression must succeed"),
             ""
+        );
+    }
+
+    #[test]
+    fn compare_does_not_descend_into_an_indirect_dictionary_child() {
+        fn build_pdf_and_nested_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+            let nested_ref = ObjectRef::new(10, 0);
+            let chain_start = ObjectRef::new(11, 0);
+            let mut nested = Dictionary::new();
+            nested.insert(b"Bad", Object::Reference(chain_start));
+            pdf.set_object(nested_ref, Object::Dictionary(nested));
+
+            let mut current = chain_start;
+            for number in 0..70 {
+                let next = ObjectRef::new(100 + number, 0);
+                pdf.set_object(current, Object::Reference(next));
+                current = next;
+            }
+            pdf.set_object(current, Object::Integer(1));
+
+            let nested_handle = pdf.get_object_handle(nested_ref);
+            ObjectHandle::dictionary(vec![(b"/Nested".to_vec(), nested_handle)])
+        }
+
+        let mut actual_pdf = dummy_pdf();
+        let mut expected_pdf = dummy_pdf();
+        let actual = build_pdf_and_nested_handle(&mut actual_pdf);
+        let expected = build_pdf_and_nested_handle(&mut expected_pdf);
+        let actual_before = actual_pdf.repair_diagnostics().entries().len();
+        let expected_before = expected_pdf.repair_diagnostics().entries().len();
+
+        assert_eq!(
+            compare_objects(
+                "nested",
+                &actual,
+                &expected,
+                &mut actual_pdf,
+                &mut expected_pdf,
+            )
+            .expect("an indirect child dictionary is still comparable"),
+            ""
+        );
+        assert_eq!(
+            actual_pdf.repair_diagnostics().entries().len(),
+            actual_before,
+            "qpdf compares the indirect child as N G R without resolving its descendants"
+        );
+        assert_eq!(
+            expected_pdf.repair_diagnostics().entries().len(),
+            expected_before,
+            "qpdf compares the indirect child as N G R without resolving its descendants"
         );
     }
 
@@ -865,6 +1024,67 @@ mod tests {
         assert_eq!(
             parms.get(b"EarlyChange").and_then(Object::as_integer),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn legacy_decode_boundary_keeps_decode_params_shallow_for_invalid_filters() {
+        let mut pdf = dummy_pdf();
+        let second_missing = pdf.get_object_handle(ObjectRef::new(99, 0));
+        let third_missing = pdf.get_object_handle(ObjectRef::new(100, 0));
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::integer(7),
+                    ObjectHandle::name(b"LZWDecode".to_vec()),
+                ]),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::dictionary(vec![(
+                        b"/Predictor".to_vec(),
+                        ObjectHandle::integer(1),
+                    )]),
+                    ObjectHandle::dictionary(vec![(b"/EarlyChange".to_vec(), second_missing)]),
+                    ObjectHandle::dictionary(vec![(
+                        b"/EarlyChange".to_vec(),
+                        third_missing.clone(),
+                    )]),
+                ]),
+            ),
+        ]);
+
+        let legacy = materialize_decode_dictionary(&stream_dict, &mut pdf)
+            .expect("invalid intermediate Filter item still reaches the legacy boundary");
+        let params = legacy
+            .get(b"DecodeParms")
+            .and_then(Object::as_array)
+            .expect("DecodeParms array remains positional");
+        assert_eq!(params.len(), 3);
+        assert!(matches!(
+            params[1]
+                .as_dict()
+                .and_then(|dict| dict.get(b"EarlyChange")),
+            Some(Object::Reference(ObjectRef {
+                number: 99,
+                generation: 0
+            }))
+        ));
+        assert_eq!(
+            params[2]
+                .as_dict()
+                .and_then(|dict| dict.get(b"EarlyChange")),
+            Some(&Object::Reference(ObjectRef {
+                number: 100,
+                generation: 0
+            }))
+        );
+        assert!(
+            !third_missing.is_resolved(),
+            "an invalid Filter chain must not resolve later DecodeParms children"
         );
     }
 

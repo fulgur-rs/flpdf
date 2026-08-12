@@ -4,11 +4,10 @@ use std::fs;
 use std::io::{self, Read, Seek};
 use std::path::Path;
 
-use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
 use flpdf::{
-    DecodeLevel, Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult,
+    DecodeLevel, Error, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult,
 };
 
 use crate::common::test_driver_program_name_bytes;
@@ -265,23 +264,34 @@ fn process(
         if !resolve_objstm_type(&mut pdf, &stream_dict) {
             continue;
         }
-        let Object::Stream(stream) = pdf.resolve_borrowed(obj_ref).map_err(|e| e.to_string())?
-        else {
-            continue;
+        // qpdf's test_tokenizer calls getStreamData on the same canonical
+        // object it just inspected. Do not cross back through
+        // Pdf::resolve_borrowed here: a stream-length recovery on the
+        // ObjStm container would otherwise run a second time through the
+        // legacy source/xref route and emit a second warning sequence.
+        let decoded = match stream_handle.get_stream_data(DecodeLevel::Specialized) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                let _ = emit_new_diagnostics(
+                    &pdf,
+                    &mut diagnostics_written,
+                    &filename_diagnostic,
+                    stdout,
+                    stderr,
+                );
+                return Err(e.to_string());
+            }
         };
-        let decoded = filters::decode_stream_data_recovering_with_limits(
-            &stream.dict,
-            &stream.data,
-            DecodeLimits {
-                max_output: None,
-                max_filter_chain: None,
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        report_stream_events(&decoded.events, stderr);
+        let _ = emit_new_diagnostics(
+            &pdf,
+            &mut diagnostics_written,
+            &filename_diagnostic,
+            stdout,
+            stderr,
+        );
         let label = format!("OBJECT STREAM {}", obj_ref.number);
         dump_tokens(
-            &decoded.data,
+            decoded.as_ref(),
             &label,
             max_len,
             include_ignorable,
@@ -382,24 +392,6 @@ fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHan
         return false;
     };
     matches!(type_handle.as_name(), Some(name) if name.as_slice() == b"ObjStm")
-}
-
-// qpdf's test_tokenizer.cc prints nothing of the kind; these diagnostics are
-// an flpdf-qtest-tools addition for visibility into a recovering decode. They
-// go to stderr, not stdout, so they never pollute the token dump that is
-// compared against qpdf's stdout.
-fn report_stream_events(events: &[StreamDecodeEvent], stderr: &mut dyn io::Write) {
-    for event in events {
-        match event {
-            StreamDecodeEvent::Warning(w) => {
-                let _ = writeln!(stderr, "WARNING: {} (code {})", w.message, w.code);
-            }
-            StreamDecodeEvent::Error(e) => {
-                let _ = writeln!(stderr, "ERROR: {e}");
-            }
-            StreamDecodeEvent::Data(_) => {}
-        }
-    }
 }
 
 fn dump_tokens(
@@ -525,8 +517,7 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flpdf::filters::StreamDecodeWarning;
-    use flpdf::{Error, ObjectHandle, ObjectRef};
+    use flpdf::{Object, ObjectHandle, ObjectRef};
 
     fn open_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let bytes: &[u8] = b"%PDF-1.4\n\
@@ -630,23 +621,6 @@ mod tests {
     fn find_endstream_returns_none_when_absent() {
         let data = b"no match here";
         assert_eq!(find_endstream(data, 0), None);
-    }
-
-    #[test]
-    fn report_stream_events_writes_warnings_and_errors_to_stderr() {
-        let events = vec![
-            StreamDecodeEvent::Warning(StreamDecodeWarning {
-                message: "truncated stream".into(),
-                code: -5,
-            }),
-            StreamDecodeEvent::Error(Error::parse(0, "boom")),
-            StreamDecodeEvent::Data(vec![1, 2, 3]),
-        ];
-        let mut stderr = Vec::new();
-        report_stream_events(&events, &mut stderr);
-        let stderr = String::from_utf8(stderr).unwrap();
-        assert!(stderr.contains("WARNING: truncated stream (code -5)"));
-        assert!(stderr.contains("boom"));
     }
 
     #[test]
