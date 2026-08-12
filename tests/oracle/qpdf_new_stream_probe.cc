@@ -26,6 +26,7 @@ int main()
 
         auto empty = pdf.newStream();
         require(empty.isIndirect(), "newStream did not create an indirect object");
+        require(empty.getOwningQPDF() == &pdf, "newStream owner differs");
         require(
             empty.getObjGen().getObj() == 3,
             "newStream object number differs: " + std::to_string(empty.getObjGen().getObj()));
@@ -58,9 +59,23 @@ int main()
                 with_data_raw->getBuffer() + with_data_raw->getSize(),
                 data->getBuffer()),
             "buffer payload differs");
+        data->getBuffer()[0] = 'z';
+        auto mutated_data_raw = with_data.getRawStreamData();
+        auto mutated_payload = std::string("zbc");
+        require(
+            mutated_data_raw->getSize() == mutated_payload.size(),
+            "mutated buffer data size differs");
+        require(
+            std::equal(
+                mutated_data_raw->getBuffer(),
+                mutated_data_raw->getBuffer() + mutated_data_raw->getSize(),
+                mutated_payload.begin()),
+            "buffer mutation was not retained by stream");
+        require(with_data.getOwningQPDF() == &pdf, "buffer newStream owner differs");
 
         auto empty_data = pdf.newStream(std::make_shared<Buffer>());
         require(empty_data.isIndirect(), "empty buffer newStream is not indirect");
+        require(empty_data.getOwningQPDF() == &pdf, "empty buffer newStream owner differs");
         require(!empty_data.getDict().hasKey("/Length"), "empty buffer retained /Length");
         require(
             empty_data.getRawStreamData()->getSize() == 0,
