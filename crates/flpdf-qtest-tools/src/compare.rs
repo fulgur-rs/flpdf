@@ -93,9 +93,9 @@ where
 
     // qpdf's dictionary unparse calls `isNull()` for each entry before it
     // emits the entry (`QPDF_Dictionary.cc:59-69`). Resolve dictionary
-    // children on both sides for that null-suppression decision, but keep
-    // array elements opaque: an array's `unparse()` emits each child as an
-    // indirect reference without dereferencing it.
+    // children on both sides for that null-suppression decision. Direct
+    // containers inside arrays are walked recursively, while indirect array
+    // elements remain opaque and retain their `N G R` spelling.
     let mut actual_seen = Vec::new();
     resolve_compare_children(&act_dict, actual_pdf, &mut actual_seen, 0)?;
     let mut expected_seen = Vec::new();
@@ -456,17 +456,32 @@ fn resolve_compare_children<R: Read + Seek>(
     {
         return Ok(());
     }
+    if let Some(items) = handle.as_array() {
+        seen.push(handle.clone());
+        for child in items {
+            // qpdf's array unparse leaves indirect elements as `N G R`; only
+            // direct containers can contain descendants that need a
+            // dictionary null-suppression walk.
+            if !child.is_direct() {
+                continue;
+            }
+            let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
+            if terminal.as_dictionary().is_some() || terminal.as_array().is_some() {
+                resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
+            }
+        }
+        seen.pop();
+        return Ok(());
+    }
     let Some(entries) = handle.as_dictionary() else {
-        // qpdf's array unparse leaves indirect elements as `N G R`; only
-        // dictionary entries are dereferenced to decide whether a null entry
-        // should be omitted.
         return Ok(());
     };
     seen.push(handle.clone());
     for child in entries.into_values() {
         let child_is_direct = child.is_direct();
         let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
-        if child_is_direct && terminal.as_dictionary().is_some() {
+        if child_is_direct && (terminal.as_dictionary().is_some() || terminal.as_array().is_some())
+        {
             // qpdf's dictionary unparse resolves an immediate child for its
             // null-suppression decision, but an indirect dictionary child is
             // serialized as `N G R` and its descendants remain opaque to the
@@ -737,6 +752,58 @@ mod tests {
         assert!(
             !a_missing.is_resolved() && !e_missing.is_resolved(),
             "qpdf array unparse keeps indirect children as references"
+        );
+    }
+
+    #[test]
+    fn canonical_handle_compare_resolves_nulls_in_a_direct_dictionary_inside_an_array() {
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        let a_missing = a_pdf.get_object_handle(ObjectRef::new(99, 0));
+        let e_missing = e_pdf.get_object_handle(ObjectRef::new(100, 0));
+        let actual = ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+            b"/Null".to_vec(),
+            a_missing,
+        )])]);
+        let expected = ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+            b"/Null".to_vec(),
+            e_missing,
+        )])]);
+
+        assert_eq!(
+            compare_objects("array-dict", &actual, &expected, &mut a_pdf, &mut e_pdf,)
+                .expect("direct dictionary in an array must be comparable"),
+            "",
+            "qpdf recursively unparses direct dictionaries inside arrays"
+        );
+    }
+
+    #[test]
+    fn canonical_handle_compare_resolves_nulls_in_a_dictionary_array_value() {
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        let a_missing = a_pdf.get_object_handle(ObjectRef::new(99, 0));
+        let e_missing = e_pdf.get_object_handle(ObjectRef::new(100, 0));
+        let actual = ObjectHandle::dictionary(vec![(
+            b"/Nested".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                b"/Null".to_vec(),
+                a_missing,
+            )])]),
+        )]);
+        let expected = ObjectHandle::dictionary(vec![(
+            b"/Nested".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::dictionary(vec![(
+                b"/Null".to_vec(),
+                e_missing,
+            )])]),
+        )]);
+
+        assert_eq!(
+            compare_objects("dict-array", &actual, &expected, &mut a_pdf, &mut e_pdf,)
+                .expect("array-valued dictionary must be comparable"),
+            "",
+            "qpdf recursively unparses direct array-valued dictionary contents"
         );
     }
 
