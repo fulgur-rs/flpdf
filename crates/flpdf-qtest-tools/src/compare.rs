@@ -160,7 +160,9 @@ fn stream_uses_flatedecode<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<bool> {
-    Ok(resolved_filter_names(stream_dict, pdf)?
+    // qpdf's compare-for-test path uses `isNameAndEquals("/FlateDecode")`
+    // here, so abbreviated names such as `/Fl` must stay on raw-data compare.
+    Ok(resolved_filter_names_exact(stream_dict, pdf)?
         .iter()
         .any(|name| name == b"FlateDecode"))
 }
@@ -169,9 +171,28 @@ fn resolved_filter_names<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<Vec<Vec<u8>>> {
+    resolved_filter_names_with_normalization(stream_dict, pdf, true)
+}
+
+fn resolved_filter_names_exact<R: Read + Seek>(
+    stream_dict: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<Vec<Vec<u8>>> {
+    resolved_filter_names_with_normalization(stream_dict, pdf, false)
+}
+
+fn resolved_filter_names_with_normalization<R: Read + Seek>(
+    stream_dict: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+    normalize: bool,
+) -> flpdf::Result<Vec<Vec<u8>>> {
     let filter = pdf.resolve_object_handle_to_terminal(&stream_dict.get_key(b"/Filter"))?;
     if let Some(name) = filter.as_name() {
-        return Ok(vec![normalize_filter_name(&name).to_vec()]);
+        return Ok(vec![if normalize {
+            normalize_filter_name(&name).to_vec()
+        } else {
+            name.to_vec()
+        }]);
     }
     let Some(items) = filter.as_array() else {
         return Ok(Vec::new());
@@ -182,7 +203,11 @@ fn resolved_filter_names<R: Read + Seek>(
         let Some(name) = item.as_name() else {
             continue;
         };
-        names.push(normalize_filter_name(&name).to_vec());
+        names.push(if normalize {
+            normalize_filter_name(&name).to_vec()
+        } else {
+            name.to_vec()
+        });
     }
     Ok(names)
 }
@@ -1129,6 +1154,28 @@ mod tests {
         let a = make(compressed_a);
         let e = make(compressed_e);
         assert_eq!(cmp("5 0", &a, &e), "");
+    }
+
+    #[test]
+    fn abbreviated_flate_filter_stays_on_raw_compare_path() {
+        let source = b"the abbreviated Flate filter must not select qpdf's decoded comparison path";
+        let compressed_a = zlib(source, Compression::fast());
+        let compressed_e = zlib(source, Compression::best());
+        assert_ne!(
+            compressed_a, compressed_e,
+            "test premise: compressed bytes differ"
+        );
+
+        let make = |data: Vec<u8>| {
+            let mut d = Dictionary::new();
+            d.insert(b"Filter", Object::Name(b"Fl".to_vec()));
+            d.insert(b"Length", Object::Integer(data.len() as i64));
+            Object::Stream(Stream::new(d, data))
+        };
+        assert_eq!(
+            cmp("abbreviated", &make(compressed_a), &make(compressed_e)),
+            "abbreviated: stream data differs"
+        );
     }
 
     #[test]
