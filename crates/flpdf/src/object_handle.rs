@@ -2335,6 +2335,10 @@ impl ObjectHandle {
     /// a logic error for a foreign or destroyed item. `Error::Internal` is the
     /// crate's logic-error boundary. A contextless qpdf warning is likewise
     /// returned as the existing `type_warning`/`object_warning` error.
+    /// For process safety, flpdf also ignores a direct item whose direct-child
+    /// graph already reaches this array; qpdf's `setAt` does not detect that
+    /// cycle, but qpdf's later `makeDirect` traversal does reject loops with a
+    /// visited set (`libqpdf/QPDFObjectHandle.cc:2091-2133`).
     /// This remains public because qpdf exposes the same live mutation on
     /// `QPDFObjectHandle`; external canonical consumers must not replace an
     /// indirect array through its parent dictionary or materialize it into
@@ -2359,7 +2363,7 @@ impl ObjectHandle {
             return self.object_warning("ignoring attempt to set out of bounds array item");
         }
 
-        if self.is_direct_value_alias(&value) {
+        if self.would_create_direct_cycle(&value) {
             return Ok(());
         }
 
@@ -2383,6 +2387,9 @@ impl ObjectHandle {
     /// are then checked and attached one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
+    /// A direct replacement that would make the array graph cyclic is ignored
+    /// as the flpdf process-safety boundary; qpdf's `setFromVector` itself
+    /// checks ownership only.
     /// As with [`Self::replace_key`], call
     /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
     /// mutation. The helper marks this array when it is indirect, or its
@@ -2391,7 +2398,10 @@ impl ObjectHandle {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
             return Ok(());
         }
-        if items.iter().any(|item| self.is_direct_value_alias(item)) {
+        if items
+            .iter()
+            .any(|item| self.would_create_direct_cycle(item))
+        {
             return Ok(());
         }
 
@@ -2431,7 +2441,10 @@ impl ObjectHandle {
     /// Insert one item at an inclusive array position, porting qpdf's
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
-    /// ownership or changing the array.
+    /// ownership or changing the array. A direct item whose descendants
+    /// already reach this array is ignored to keep recursive live-handle
+    /// walkers terminating; qpdf's `insert` does not perform this cycle
+    /// check.
     /// As with [`Self::replace_key`], call
     /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
     /// mutation. The helper marks this array when it is indirect, or its
@@ -2448,7 +2461,7 @@ impl ObjectHandle {
             return self.object_warning("ignoring attempt to insert out of bounds array item");
         }
 
-        if self.is_direct_value_alias(&value) {
+        if self.would_create_direct_cycle(&value) {
             return Ok(());
         }
 
@@ -2484,6 +2497,9 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
+    /// A direct item whose descendants already reach this array is ignored to
+    /// keep recursive live-handle walkers terminating; qpdf's `push_back`
+    /// checks ownership but does not perform this cycle check.
     /// As with [`Self::replace_key`], call
     /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
     /// mutation. The helper marks this array when it is indirect, or its
@@ -2492,7 +2508,7 @@ impl ObjectHandle {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
             return Ok(());
         }
-        if self.is_direct_value_alias(&value) {
+        if self.would_create_direct_cycle(&value) {
             return Ok(());
         }
 
@@ -2620,7 +2636,7 @@ impl ObjectHandle {
     /// shared handle identity. Returns `false` when this handle is not an
     /// array or `index` is out of bounds.
     pub(crate) fn replace_array_item(&self, index: usize, value: ObjectHandle) -> bool {
-        if self.is_direct_value_alias(&value) {
+        if self.would_create_direct_cycle(&value) {
             return false; // cov:ignore: exercised by replace_array_item_preserves_identity_and_rejects_invalid_slots but attributed to closure setup
         }
         let old_value = self.with_value_mut(|current| {
@@ -2645,7 +2661,10 @@ impl ObjectHandle {
     /// handle itself. Returns `false` for a non-array handle or when the
     /// replacement would create a direct value-alias cycle.
     pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
-        if items.iter().any(|item| self.is_direct_value_alias(item)) {
+        if items
+            .iter()
+            .any(|item| self.would_create_direct_cycle(item))
+        {
             return false; // cov:ignore: internal callers only replay materialized child arrays
         }
         let old_items = self.with_value_mut(|current| {
@@ -2677,6 +2696,43 @@ impl ObjectHandle {
         let self_state = self.0.borrow().state.clone();
         let other_state = other.0.borrow().state.clone();
         Rc::ptr_eq(&self_state, &other_state)
+    }
+
+    /// Return whether inserting `candidate` as a direct child would make a
+    /// direct-child path reach `self`. Indirect handles are recursion
+    /// boundaries in the same way they are for materialization and unparse,
+    /// so an indirect candidate or an indirect descendant is not traversed.
+    /// The visited set also makes this guard total if a pre-existing direct
+    /// cycle came from a dictionary path or an internal caller.
+    fn would_create_direct_cycle(&self, candidate: &Self) -> bool {
+        if !candidate.is_direct() {
+            return false;
+        }
+
+        let target_state = self.0.borrow().state.clone();
+        let target_id = Rc::as_ptr(&target_state) as usize;
+        let mut pending = vec![candidate.clone()];
+        let mut visited = BTreeSet::new();
+
+        while let Some(handle) = pending.pop() {
+            let state = handle.0.borrow().state.clone();
+            let identity = Rc::as_ptr(&state) as usize;
+            if identity == target_id {
+                return true;
+            }
+            if !visited.insert(identity) {
+                continue;
+            }
+            let children = match &*state.borrow() {
+                ObjectState::Resolved(value) => Self::direct_children(value),
+                ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => {
+                    Vec::new()
+                }
+            };
+            pending.extend(children.into_iter().filter(|child| child.is_direct()));
+        }
+
+        false
     }
 
     fn direct_children(value: &ObjectValue) -> Vec<ObjectHandle> {
@@ -11338,6 +11394,57 @@ mod mutation_tests {
             array.try_array_item(0).unwrap().unwrap().as_integer(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn public_array_mutators_ignore_multi_hop_direct_cycles() {
+        let first = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let second = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
+        first
+            .set_array_item(0, second.clone())
+            .expect("first direct array accepts second");
+        second
+            .set_array_item(0, first.clone())
+            .expect("reciprocal set is ignored");
+        assert_eq!(
+            second.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(2)
+        );
+
+        let first = ObjectHandle::array(vec![]);
+        let second = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
+        first
+            .insert_array_item(0, second.clone())
+            .expect("first direct array accepts second");
+        second
+            .insert_array_item(0, first.clone())
+            .expect("reciprocal insert is ignored");
+        assert_eq!(second.try_array_len().unwrap(), Some(1));
+        assert_eq!(
+            second.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(3)
+        );
+
+        let first = ObjectHandle::array(vec![]);
+        let second = ObjectHandle::array(vec![ObjectHandle::integer(4)]);
+        first
+            .append_array_item(second.clone())
+            .expect("first direct array accepts second");
+        second
+            .append_array_item(first.clone())
+            .expect("reciprocal append is ignored");
+        assert_eq!(second.try_array_len().unwrap(), Some(1));
+        assert_eq!(
+            second.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(4)
+        );
+
+        let repeated = ObjectHandle::integer(5);
+        let candidate = ObjectHandle::array(vec![repeated.clone(), repeated]);
+        let target = ObjectHandle::array(vec![]);
+        target
+            .append_array_item(candidate)
+            .expect("repeated direct children do not form a cycle");
     }
 
     #[test]
