@@ -2428,8 +2428,14 @@ impl<R: Read + Seek> ResolverHandle<R> {
         }
 
         if let Some(empty_offset) = parsed.empty {
-            self.push_warning_at(empty_offset, "empty object treated as null")
-                .map_err(ReadObjectAtOffsetError::Body)?;
+            self.push_warning_at(
+                empty_offset,
+                format!(
+                    "(object {} {}, offset {empty_offset}): empty object treated as null",
+                    found.number, found.generation
+                ),
+            )
+            .map_err(ReadObjectAtOffsetError::Body)?;
             let (value, parsed_offset) = parsed
                 .value
                 .into_direct_value()
@@ -8627,7 +8633,7 @@ mod tests {
             );
             assert_eq!(
                 warnings,
-                ["empty object treated as null"],
+                ["(object 2 0, offset 53): empty object treated as null"],
                 "qpdf warns and returns before framing the `endobj` token"
             );
         });

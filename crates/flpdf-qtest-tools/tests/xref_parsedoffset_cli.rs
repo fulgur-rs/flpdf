@@ -68,6 +68,38 @@ fn test_parsedoffset_walks_direct_children_and_formats_qpdf_offsets() {
 }
 
 #[test]
+fn test_parsedoffset_attributes_empty_object_warnings_to_the_object() {
+    let mut input_bytes = b"%PDF-1.7\n".to_vec();
+    let object1_offset = input_bytes.len();
+    input_bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+    let object2_offset = input_bytes.len();
+    input_bytes.extend_from_slice(b"2 0 obj\nendobj\n");
+    let empty_offset = object2_offset + b"2 0 obj\n".len();
+    let xref_offset = input_bytes.len();
+    input_bytes.extend_from_slice(
+        format!(
+            "xref\n0 3\n0000000000 65535 f \n{object1_offset:010} 00000 n \n{object2_offset:010} 00000 n \ntrailer\n<< /Size 3 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let input = directory.path().join("empty-object.pdf");
+    fs::write(&input, input_bytes).expect("write empty-object fixture");
+    let path = input.display();
+    let expected_warning = format!(
+        "WARNING: {path} (object 2 0, offset {empty_offset}): empty object treated as null\n"
+    );
+
+    Command::cargo_bin("test_parsedoffset")
+        .expect("test_parsedoffset binary")
+        .arg(&input)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(expected_warning));
+}
+
+#[test]
 fn test_parsedoffset_groups_objects_in_object_streams() {
     Command::cargo_bin("test_parsedoffset")
         .expect("test_parsedoffset binary")
