@@ -2335,10 +2335,10 @@ impl ObjectHandle {
     /// a logic error for a foreign or destroyed item. `Error::Internal` is the
     /// crate's logic-error boundary. A contextless qpdf warning is likewise
     /// returned as the existing `type_warning`/`object_warning` error.
-    /// For process safety, flpdf also ignores a direct item whose direct-child
-    /// graph already reaches this array; qpdf's `setAt` does not detect that
-    /// cycle, but qpdf's later `makeDirect` traversal does reject loops with a
-    /// visited set (`libqpdf/QPDFObjectHandle.cc:2091-2133`).
+    /// For process safety, flpdf rejects a direct item whose direct-child graph
+    /// already reaches this array with [`Error::Internal`]. qpdf's `setAt`
+    /// does not detect that cycle, but qpdf's later `makeDirect` traversal does
+    /// reject loops with a visited set (`libqpdf/QPDFObjectHandle.cc:2091-2133`).
     /// This remains public because qpdf exposes the same live mutation on
     /// `QPDFObjectHandle`; external canonical consumers must not replace an
     /// indirect array through its parent dictionary or materialize it into
@@ -2364,7 +2364,7 @@ impl ObjectHandle {
         }
 
         if self.would_create_direct_cycle(&value) {
-            return Ok(());
+            return Err(Self::direct_cycle_error());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -2387,9 +2387,9 @@ impl ObjectHandle {
     /// are then checked and attached one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
-    /// A direct replacement that would make the array graph cyclic is ignored
-    /// as the flpdf process-safety boundary; qpdf's `setFromVector` itself
-    /// checks ownership only.
+    /// A direct replacement that would make the array graph cyclic returns
+    /// [`Error::Internal`] as the flpdf process-safety boundary; qpdf's
+    /// `setFromVector` itself checks ownership only.
     /// As with [`Self::replace_key`], call
     /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
     /// mutation. The helper marks this array when it is indirect, or its
@@ -2402,7 +2402,7 @@ impl ObjectHandle {
             .iter()
             .any(|item| self.would_create_direct_cycle(item))
         {
-            return Ok(());
+            return Err(Self::direct_cycle_error());
         }
 
         let expected_len = items.len();
@@ -2442,9 +2442,9 @@ impl ObjectHandle {
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
     /// ownership or changing the array. A direct item whose descendants
-    /// already reach this array is ignored to keep recursive live-handle
-    /// walkers terminating; qpdf's `insert` does not perform this cycle
-    /// check.
+    /// already reach this array returns [`Error::Internal`] to keep recursive
+    /// live-handle walkers terminating; qpdf's `insert` does not perform this
+    /// cycle check.
     /// As with [`Self::replace_key`], call
     /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
     /// mutation. The helper marks this array when it is indirect, or its
@@ -2462,7 +2462,7 @@ impl ObjectHandle {
         }
 
         if self.would_create_direct_cycle(&value) {
-            return Ok(());
+            return Err(Self::direct_cycle_error());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -2486,6 +2486,8 @@ impl ObjectHandle {
 
     /// qpdf's `insertItemAndGetNew`: return the supplied handle after the
     /// same insertion/warning/ownership path as [`Self::insert_array_item`].
+    /// A direct-cycle rejection is propagated as [`Error::Internal`], so no
+    /// handle is returned for a mutation that was not inserted.
     pub fn insert_array_item_and_get_new(
         &self,
         index: usize,
@@ -2497,9 +2499,10 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
-    /// A direct item whose descendants already reach this array is ignored to
-    /// keep recursive live-handle walkers terminating; qpdf's `push_back`
-    /// checks ownership but does not perform this cycle check.
+    /// A direct item whose descendants already reach this array returns
+    /// [`Error::Internal`] to keep recursive live-handle walkers terminating;
+    /// qpdf's `push_back` checks ownership but does not perform this cycle
+    /// check.
     /// As with [`Self::replace_key`], call
     /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
     /// mutation. The helper marks this array when it is indirect, or its
@@ -2509,7 +2512,7 @@ impl ObjectHandle {
             return Ok(());
         }
         if self.would_create_direct_cycle(&value) {
-            return Ok(());
+            return Err(Self::direct_cycle_error());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -2529,6 +2532,8 @@ impl ObjectHandle {
 
     /// qpdf's `appendItemAndGetNew`: return the supplied handle after the
     /// same append/warning/ownership path as [`Self::append_array_item`].
+    /// A direct-cycle rejection is propagated as [`Error::Internal`], so no
+    /// handle is returned for a mutation that was not appended.
     pub fn append_array_item_and_get_new(&self, value: ObjectHandle) -> Result<ObjectHandle> {
         self.append_array_item(value.clone())?;
         Ok(value)
@@ -2696,6 +2701,10 @@ impl ObjectHandle {
         let self_state = self.0.borrow().state.clone();
         let other_state = other.0.borrow().state.clone();
         Rc::ptr_eq(&self_state, &other_state)
+    }
+
+    fn direct_cycle_error() -> Error {
+        Error::Internal("attempted to create a direct object cycle".to_owned())
     }
 
     /// Return whether inserting `candidate` as a direct child would make a
@@ -11356,21 +11365,37 @@ mod mutation_tests {
     }
 
     #[test]
-    fn public_array_mutators_ignore_direct_self_aliases() {
+    fn public_array_mutators_report_direct_self_aliases() {
         let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
 
-        array
+        let set_error = array
             .set_array_item(0, array.clone())
-            .expect("direct self replacement is ignored");
-        array
+            .expect_err("direct self replacement is rejected");
+        assert!(matches!(
+            set_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+        let bulk_set_error = array
             .set_array_items(vec![array.clone()])
-            .expect("direct self replacement list is ignored");
-        array
+            .expect_err("direct self replacement list is rejected");
+        assert!(matches!(
+            bulk_set_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+        let insert_error = array
             .insert_array_item(0, array.clone())
-            .expect("direct self insertion is ignored");
-        array
+            .expect_err("direct self insertion is rejected");
+        assert!(matches!(
+            insert_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+        let append_error = array
             .append_array_item(array.clone())
-            .expect("direct self append is ignored");
+            .expect_err("direct self append is rejected");
+        assert!(matches!(
+            append_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
 
         let set_error = array
             .set_array_item(usize::MAX, array.clone())
@@ -11397,15 +11422,19 @@ mod mutation_tests {
     }
 
     #[test]
-    fn public_array_mutators_ignore_multi_hop_direct_cycles() {
+    fn public_array_mutators_report_multi_hop_direct_cycles() {
         let first = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
         let second = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
         first
             .set_array_item(0, second.clone())
             .expect("first direct array accepts second");
-        second
+        let set_error = second
             .set_array_item(0, first.clone())
-            .expect("reciprocal set is ignored");
+            .expect_err("reciprocal set is rejected");
+        assert!(matches!(
+            set_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
         assert_eq!(
             second.try_array_item(0).unwrap().unwrap().as_integer(),
             Some(2)
@@ -11416,9 +11445,13 @@ mod mutation_tests {
         first
             .insert_array_item(0, second.clone())
             .expect("first direct array accepts second");
-        second
+        let insert_error = second
             .insert_array_item(0, first.clone())
-            .expect("reciprocal insert is ignored");
+            .expect_err("reciprocal insert is rejected");
+        assert!(matches!(
+            insert_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
         assert_eq!(second.try_array_len().unwrap(), Some(1));
         assert_eq!(
             second.try_array_item(0).unwrap().unwrap().as_integer(),
@@ -11430,9 +11463,13 @@ mod mutation_tests {
         first
             .append_array_item(second.clone())
             .expect("first direct array accepts second");
-        second
+        let append_error = second
             .append_array_item(first.clone())
-            .expect("reciprocal append is ignored");
+            .expect_err("reciprocal append is rejected");
+        assert!(matches!(
+            append_error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
         assert_eq!(second.try_array_len().unwrap(), Some(1));
         assert_eq!(
             second.try_array_item(0).unwrap().unwrap().as_integer(),
@@ -11445,6 +11482,63 @@ mod mutation_tests {
         target
             .append_array_item(candidate)
             .expect("repeated direct children do not form a cycle");
+    }
+
+    #[test]
+    fn public_array_mutators_report_rejected_direct_cycles() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+        let error = array
+            .set_array_item(0, array.clone())
+            .expect_err("self set must report the rejected mutation");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(2)]);
+        let error = array
+            .set_array_items(vec![array.clone()])
+            .expect_err("self bulk-set must report the rejected mutation");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(3)]);
+        let error = array
+            .insert_array_item(0, array.clone())
+            .expect_err("self insert must report the rejected mutation");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(4)]);
+        let error = array
+            .insert_array_item_and_get_new(0, array.clone())
+            .expect_err("self insert-and-get must report the rejected mutation");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(5)]);
+        let error = array
+            .append_array_item(array.clone())
+            .expect_err("self append must report the rejected mutation");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
+
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(6)]);
+        let error = array
+            .append_array_item_and_get_new(array.clone())
+            .expect_err("self append-and-get must report the rejected mutation");
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == "attempted to create a direct object cycle"
+        ));
     }
 
     #[test]
