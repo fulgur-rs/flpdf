@@ -9133,7 +9133,7 @@ mod tests {
                 b"<< /Length /X >>" => "/Length key in stream dictionary is not an integer",
                 b"<< /Length -5 >>" => "/Length key in stream dictionary is out of range",
                 _ => unreachable!("all malformed length cases are listed"), // cov:ignore: dictionary is one of the three literals above
-            };
+            }; // cov:ignore: match terminator has no executable coverage region
 
             let mut pdf = Pdf::open_mem_owned_with_options(
                 pdf_with_bodies(&[catalog.to_vec(), body]),
