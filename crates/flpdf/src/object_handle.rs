@@ -2346,15 +2346,16 @@ impl ObjectHandle {
         if !self.prepare_array_mutation("ignoring attempt to set item")? {
             return Ok(());
         }
-        if self.is_direct_value_alias(&value) {
-            return Ok(());
-        }
 
         let in_bounds = self.with_value(
             |current| matches!(current, Some(ObjectValue::Array(items)) if index < items.len()),
         );
         if !in_bounds {
             return self.object_warning("ignoring attempt to set out of bounds array item");
+        }
+
+        if self.is_direct_value_alias(&value) {
+            return Ok(());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -2430,15 +2431,16 @@ impl ObjectHandle {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
             return Ok(());
         }
-        if self.is_direct_value_alias(&value) {
-            return Ok(());
-        }
 
         let in_bounds = self.with_value(
             |current| matches!(current, Some(ObjectValue::Array(items)) if index <= items.len()),
         );
         if !in_bounds {
             return self.object_warning("ignoring attempt to insert out of bounds array item");
+        }
+
+        if self.is_direct_value_alias(&value) {
+            return Ok(());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -11292,6 +11294,23 @@ mod mutation_tests {
         array
             .append_array_item(array.clone())
             .expect("direct self append is ignored");
+
+        let set_error = array
+            .set_array_item(usize::MAX, array.clone())
+            .expect_err("bounds warning must run before the self-alias guard");
+        assert!(matches!(
+            set_error,
+            Error::System(message)
+                if message == "ignoring attempt to set out of bounds array item"
+        ));
+        let insert_error = array
+            .insert_array_item(usize::MAX, array.clone())
+            .expect_err("bounds warning must run before the self-alias guard");
+        assert!(matches!(
+            insert_error,
+            Error::System(message)
+                if message == "ignoring attempt to insert out of bounds array item"
+        ));
 
         assert_eq!(array.try_array_len().unwrap(), Some(1));
         assert_eq!(
