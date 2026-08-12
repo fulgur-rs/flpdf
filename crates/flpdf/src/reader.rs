@@ -1923,9 +1923,7 @@ impl<R: Read + Seek> Pdf<R> {
             if handle.is_resolved() && !handle.is_missing() {
                 continue;
             }
-            let Some(object) = self.qpdf_parsed_xref_streams.get(&object_ref).cloned() else {
-                continue;
-            };
+            let object = self.qpdf_parsed_xref_streams[&object_ref].clone();
             let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
             handle.set_resolved(value);
         }
@@ -7881,6 +7879,39 @@ mod tests {
                 .contains_key(b"/Deep".as_slice()),
             "the reused dictionary must contain the replacement entries"
         );
+    }
+
+    #[test]
+    fn get_all_objects_rejects_an_overdeep_stream_dictionary_memo() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve original stream");
+
+        let mut nested = Object::Integer(7);
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            let mut dict = Dictionary::new();
+            dict.insert("Next", nested);
+            nested = Object::Dictionary(dict);
+        }
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("TooDeep", nested);
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, b"new data".to_vec())),
+        );
+
+        let error = pdf
+            .get_all_objects()
+            .expect_err("an over-deep stream dictionary must fail during reconciliation");
+        assert!(error
+            .to_string()
+            .contains("object handle lift: inline object nesting exceeds maximum"));
     }
 
     #[test]
