@@ -163,21 +163,27 @@ fn stream_uses_flatedecode<R: Read + Seek>(
     // qpdf's compare-for-test path uses `isNameAndEquals("/FlateDecode")`
     // here, so abbreviated names such as `/Fl` must stay on raw-data compare.
     Ok(resolved_filter_names_exact(stream_dict, pdf)?
+        .names
         .iter()
         .any(|name| name == b"FlateDecode"))
+}
+
+struct ResolvedFilterNames {
+    names: Vec<Vec<u8>>,
+    valid: bool,
 }
 
 fn resolved_filter_names<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
-) -> flpdf::Result<Vec<Vec<u8>>> {
+) -> flpdf::Result<ResolvedFilterNames> {
     resolved_filter_names_with_normalization(stream_dict, pdf, true)
 }
 
 fn resolved_filter_names_exact<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
-) -> flpdf::Result<Vec<Vec<u8>>> {
+) -> flpdf::Result<ResolvedFilterNames> {
     resolved_filter_names_with_normalization(stream_dict, pdf, false)
 }
 
@@ -185,19 +191,26 @@ fn resolved_filter_names_with_normalization<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
     normalize: bool,
-) -> flpdf::Result<Vec<Vec<u8>>> {
+) -> flpdf::Result<ResolvedFilterNames> {
     let filter = pdf.resolve_object_handle_to_terminal(&stream_dict.get_key(b"/Filter"))?;
     if let Some(name) = filter.as_name() {
-        return Ok(vec![if normalize {
-            normalize_filter_name(&name).to_vec()
-        } else {
-            name.to_vec()
-        }]);
+        return Ok(ResolvedFilterNames {
+            names: vec![if normalize {
+                normalize_filter_name(&name).to_vec()
+            } else {
+                name.to_vec()
+            }],
+            valid: is_known_filter_name(&name),
+        });
     }
     let Some(items) = filter.as_array() else {
-        return Ok(Vec::new());
+        return Ok(ResolvedFilterNames {
+            names: Vec::new(),
+            valid: filter.is_null(),
+        });
     };
     let mut names = Vec::with_capacity(items.len());
+    let mut valid = true;
     for item in items {
         let item = pdf.resolve_object_handle_to_terminal(&item)?;
         if let Some(name) = item.as_name() {
@@ -206,15 +219,17 @@ fn resolved_filter_names_with_normalization<R: Read + Seek>(
             } else {
                 name.to_vec()
             });
+            valid &= is_known_filter_name(&name);
         } else {
             // qpdf validates every Filter array item in its original
             // position (QPDF_Stream.cc:396-415). Keep an empty slot for an
             // invalid item so the legacy DecodeParms bridge cannot assign a
             // later filter's parameter dictionary to the wrong index.
             names.push(Vec::new());
+            valid = false;
         }
     }
-    Ok(names)
+    Ok(ResolvedFilterNames { names, valid })
 }
 
 fn normalize_filter_name(name: &[u8]) -> &[u8] {
@@ -228,6 +243,19 @@ fn normalize_filter_name(name: &[u8]) -> &[u8] {
         b"DCT" => b"DCTDecode",
         name => name,
     }
+}
+
+fn is_known_filter_name(name: &[u8]) -> bool {
+    matches!(
+        normalize_filter_name(name),
+        b"Crypt"
+            | b"FlateDecode"
+            | b"LZWDecode"
+            | b"RunLengthDecode"
+            | b"DCTDecode"
+            | b"ASCII85Decode"
+            | b"ASCIIHexDecode"
+    )
 }
 
 // Materialize exactly at the still-legacy filters::decode_stream_data
@@ -245,7 +273,10 @@ fn materialize_decode_dictionary<R: Read + Seek>(
     for (key, value) in entries {
         let value = match key.as_slice() {
             b"/Filter" => materialize_resolved_for_legacy(&value, pdf, 0)?,
-            b"/DecodeParms" => materialize_decode_params_for_legacy(&value, &filter_names, pdf)?,
+            b"/DecodeParms" if filter_names.valid => {
+                materialize_decode_params_for_legacy(&value, &filter_names.names, pdf)?
+            }
+            b"/DecodeParms" => materialize_legacy_without_resolution(&value)?,
             // `/Type` is inspected by qpdf separately for the xref-stream
             // fast path; it is not a filter decode parameter. Preserve its
             // indirect spelling here (`QPDF_Stream.cc:379-484`).
@@ -874,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_decode_boundary_preserves_filter_array_positions_for_invalid_items() {
+    fn legacy_decode_boundary_keeps_decode_params_shallow_for_invalid_filters() {
         let mut pdf = dummy_pdf();
         let second_missing = pdf.get_object_handle(ObjectRef::new(99, 0));
         let third_missing = pdf.get_object_handle(ObjectRef::new(100, 0));
@@ -895,7 +926,10 @@ mod tests {
                         ObjectHandle::integer(1),
                     )]),
                     ObjectHandle::dictionary(vec![(b"/EarlyChange".to_vec(), second_missing)]),
-                    ObjectHandle::dictionary(vec![(b"/EarlyChange".to_vec(), third_missing)]),
+                    ObjectHandle::dictionary(vec![(
+                        b"/EarlyChange".to_vec(),
+                        third_missing.clone(),
+                    )]),
                 ]),
             ),
         ]);
@@ -920,7 +954,14 @@ mod tests {
             params[2]
                 .as_dict()
                 .and_then(|dict| dict.get(b"EarlyChange")),
-            Some(&Object::Null)
+            Some(&Object::Reference(ObjectRef {
+                number: 100,
+                generation: 0
+            }))
+        );
+        assert!(
+            !third_missing.is_resolved(),
+            "an invalid Filter chain must not resolve later DecodeParms children"
         );
     }
 
