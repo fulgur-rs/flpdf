@@ -1281,30 +1281,54 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     // Convert `object` for `Pdf::set_object`'s handle-graph write-through.
-    // Identical to `Pdf::lift` except when `object` is a stream and
+    // This is intentionally broader than the ordinary legacy bounded lift:
+    // qpdf's `replaceObject` accepts the already-constructed operator and
+    // inline-image values (`QPDFObjectHandle.cc:1933-1941`) and does not apply
+    // the raw bridge's `MAX_INLINE_DEPTH` policy to programmatic values. Keep
+    // the canonical replacement on the handle graph through the parser's
+    // actual nesting boundary; only values beyond that boundary retain the
+    // legacy compatibility fallback.
+    //
+    // Identical to the ordinary bounded lift except when `object` is a stream and
     // `existing_handle`'s current (pre-overwrite) value is also a stream:
     // the new dictionary is written into the existing stream's own
     // dictionary handle in place (`ObjectHandle::replace_direct_value`),
     // preserving its already-recorded parsed offset and shared identity,
     // rather than minting a fresh dictionary handle that would start at the
     // no-offset sentinel (`stream_dictionary_parsed_offset_survives_resolve_set_object_round_trip`
-    // is the regression tripwire for getting this wrong).
+    // is the regression tripwire for getting this wrong). A stream dictionary
+    // remains an ordinary PDF dictionary: qpdf's operator and inline-image
+    // values are content-stream-only and therefore still use the legacy
+    // fallback when supplied there.
     fn lift_for_set_object(
         &mut self,
         object: &Object,
         existing_handle: &ObjectHandle,
     ) -> Result<ObjectValue> {
-        if let (Object::Stream(stream), Some(existing_dict)) =
-            (object, existing_handle.as_stream_dict())
-        {
-            return self.lift_stream_with_existing_dictionary(
-                stream,
-                existing_dict,
+        if let Object::Stream(stream) = object {
+            if let Some(existing_dict) = existing_handle.as_stream_dict() {
+                return self.lift_stream_with_existing_dictionary(
+                    stream,
+                    existing_dict,
+                    crate::object::MAX_INLINE_DEPTH,
+                    false,
+                );
+            }
+            let stream_dict = self.lift_dictionary_bounded_with_options(
+                &stream.dict,
+                0,
                 crate::object::MAX_INLINE_DEPTH,
                 false,
-            );
+            )?;
+            return Ok(ObjectValue::Stream {
+                stream_dict: self
+                    .resolver
+                    .direct_object_handle(ObjectValue::Dictionary(stream_dict)),
+                stream_data: Some(Rc::new(stream.data.clone())),
+                stream_length: 0,
+            });
         }
-        self.lift(object, 0)
+        self.lift_bounded_with_content_tokens(object, 0, crate::parser::MAX_PARSE_DEPTH)
     }
 
     fn lift_stream_with_existing_dictionary(
@@ -1910,10 +1934,10 @@ impl<R: Read + Seek> Pdf<R> {
             let Some(replacement) = self.legacy_materialized_memo.remove(&object_ref) else {
                 continue;
             };
-            // `set_object`'s ordinary lift is bounded by MAX_INLINE_DEPTH,
-            // while a value that already parsed successfully can be valid up
-            // to MAX_PARSE_DEPTH. Rebuild the canonical value at that looser
-            // bound so enumeration cannot return the stale source handle.
+            // `set_object` falls back only after the canonical replacement
+            // boundary's MAX_PARSE_DEPTH limit, while a value that already
+            // parsed successfully can be rebuilt at that same bound so
+            // enumeration cannot return the stale source handle.
             // Content-stream tokens are valid `ObjectValue` leaves even
             // though the generic legacy lift rejects them outside a content
             // stream; preserve them at every nesting level rather than
@@ -2295,14 +2319,6 @@ impl<R: Read + Seek> Pdf<R> {
         // live-looking ref would let a caller compute an "offset of
         // terminal" for an object it was just told is null.
         Ok((ObjectHandle::null(), None))
-    }
-
-    // Convert a legacy `Object` into the handle graph for callers that
-    // explicitly operate at the raw-object boundary (for example,
-    // `Pdf::set_object`). Parsed file objects are built by the canonical live
-    // resolver above; this helper is not a fallback for that path.
-    pub(crate) fn lift(&mut self, object: &Object, depth: usize) -> Result<ObjectValue> {
-        self.lift_bounded(object, depth, crate::object::MAX_INLINE_DEPTH)
     }
 
     fn lift_bounded(
@@ -5759,6 +5775,121 @@ mod tests {
                 .expect("stream remains a stream")
                 .data,
             b"canonical stream data"
+        );
+    }
+
+    #[test]
+    fn set_object_operator_replacement_survives_canonical_full_rewrite() {
+        let page_ref = ObjectRef::new(3, 0);
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.set_object(page_ref, Object::Operator(b"Do".to_vec()));
+
+        let (emitted_ref, output) = {
+            let mut writer = crate::PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+            writer.set_output_memory().expect("configure memory output");
+            writer.write().expect("write operator replacement");
+            let emitted_ref = writer
+                .get_renumbered_obj_gen(page_ref)
+                .expect("query operator mapping")
+                .expect("reachable operator replacement must be emitted");
+            (emitted_ref, writer.get_buffer().expect("take output"))
+        };
+
+        let body = String::from_utf8_lossy(&output);
+        let marker = format!(
+            "{} {} obj\nDo\nendobj",
+            emitted_ref.number, emitted_ref.generation
+        );
+        assert!(
+            body.contains(&marker),
+            "canonical writer must emit the replacement operator: {marker}\n{body}"
+        );
+    }
+
+    #[test]
+    fn set_object_inline_image_replacement_survives_canonical_full_rewrite() {
+        let page_ref = ObjectRef::new(3, 0);
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.set_object(page_ref, Object::InlineImage(b"BI /W 1 ID x EI".to_vec()));
+
+        let (emitted_ref, output) = {
+            let mut writer = crate::PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+            writer.set_output_memory().expect("configure memory output");
+            writer.write().expect("write inline-image replacement");
+            let emitted_ref = writer
+                .get_renumbered_obj_gen(page_ref)
+                .expect("query inline-image mapping")
+                .expect("reachable inline-image replacement must be emitted");
+            (emitted_ref, writer.get_buffer().expect("take output"))
+        };
+
+        let body = String::from_utf8_lossy(&output);
+        let marker = format!(
+            "{} {} obj\nBI /W 1 ID x EI\nendobj",
+            emitted_ref.number, emitted_ref.generation
+        );
+        assert!(
+            body.contains(&marker),
+            "canonical writer must emit the replacement inline image: {marker}\n{body}"
+        );
+    }
+
+    #[test]
+    fn set_object_over_depth_replacement_survives_canonical_full_rewrite() {
+        let page_ref = ObjectRef::new(3, 0);
+        let target_ref = ObjectRef::new(97, 0);
+        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let mut replacement = Object::Reference(target_ref);
+        for _ in 0..depth {
+            replacement = Object::Array(vec![replacement]);
+        }
+
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        pdf.set_object(target_ref, Object::Integer(42));
+        pdf.set_object(page_ref, replacement.clone());
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "over-depth replacements within qpdf's parser boundary stay canonical"
+        );
+
+        let (emitted_ref, emitted_target_ref, output) = {
+            let mut writer = crate::PdfWriter::new(&mut pdf);
+            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+            writer.set_output_memory().expect("configure memory output");
+            writer.write().expect("write over-depth replacement");
+            let emitted_ref = writer
+                .get_renumbered_obj_gen(page_ref)
+                .expect("query over-depth mapping")
+                .expect("reachable over-depth replacement must be emitted");
+            let emitted_target_ref = writer
+                .get_renumbered_obj_gen(target_ref)
+                .expect("query nested target mapping")
+                .expect("reference reachable through over-depth replacement must be emitted");
+            (
+                emitted_ref,
+                emitted_target_ref,
+                writer.get_buffer().expect("take output"),
+            )
+        };
+
+        let mut reopened = Pdf::open_mem_owned(output).expect("reopen over-depth output");
+        let mut leaf = reopened
+            .resolve(emitted_ref)
+            .expect("resolve over-depth replacement");
+        for _ in 0..depth {
+            leaf = match leaf {
+                Object::Array(mut items) => items.remove(0),
+                other => panic!("expected nested array, found {other:?}"), // cov:ignore: successful canonical rewrite emits the constructed array at every requested depth
+            };
+        }
+        assert_eq!(leaf, Object::Reference(emitted_target_ref));
+        assert_eq!(
+            reopened
+                .resolve(emitted_target_ref)
+                .expect("resolve nested target"),
+            Object::Integer(42)
         );
     }
 
@@ -9752,7 +9883,7 @@ mod tests {
         );
 
         let mut replacement = Object::Null;
-        for _ in 0..=crate::object::MAX_INLINE_DEPTH {
+        for _ in 0..=(crate::parser::MAX_PARSE_DEPTH + 5) {
             replacement = Object::Array(vec![replacement]);
         }
         pdf.set_object(object_ref, replacement);
@@ -9772,6 +9903,53 @@ mod tests {
                 .expect("failed replacement warning is recorded")
                 .message,
             format!("{source_description}: failed replacement warning")
+        );
+    }
+
+    #[test]
+    fn set_object_replacements_rejected_by_legacy_lift_are_canonicalized() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+
+        let operator_ref = ObjectRef::new(3, 0);
+        let operator_handle = pdf.get_object_handle(operator_ref);
+        operator_handle
+            .try_dereference()
+            .expect("resolve the source before replacing it");
+        let operator = Object::Operator(b"Do".to_vec());
+        pdf.set_object(operator_ref, operator.clone());
+
+        assert!(
+            pdf.legacy_materialized_memo.is_empty(),
+            "canonical replacements must not fall back to the legacy memo"
+        );
+        assert_eq!(
+            operator_handle
+                .materialize()
+                .expect("materialize canonical operator replacement"),
+            operator
+        );
+
+        let inline_ref = ObjectRef::new(99, 0);
+        let inline = Object::InlineImage(b"BI /W 1 ID x EI".to_vec());
+        pdf.set_object(inline_ref, inline.clone());
+        assert_eq!(
+            pdf.get_object_handle(inline_ref)
+                .materialize()
+                .expect("materialize canonical inline-image replacement"),
+            inline
+        );
+
+        let deep_ref = ObjectRef::new(98, 0);
+        let mut deep = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            deep = Object::Array(vec![deep]);
+        }
+        pdf.set_object(deep_ref, deep.clone());
+        assert_eq!(
+            pdf.get_object_handle(deep_ref)
+                .materialize()
+                .expect("materialize canonical over-depth replacement"),
+            deep
         );
     }
 

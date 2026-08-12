@@ -32,6 +32,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{Read, Seek};
 
 use crate::object::{Dictionary, Object, ObjectRef, MAX_INLINE_DEPTH};
+use crate::parser::MAX_PARSE_DEPTH;
 use crate::writer::object_streams::ObjectStreamGroup;
 use crate::Error;
 use crate::Pdf;
@@ -321,9 +322,9 @@ fn collect_canonical_children<R: Read + Seek>(
     skip_length: bool,
     found: &mut Vec<ObjectRef>,
 ) -> crate::Result<()> {
-    if depth > MAX_INLINE_DEPTH {
+    if depth > MAX_PARSE_DEPTH {
         return Err(Error::Unsupported(
-            "plain rewrite: inline object nesting exceeds MAX_INLINE_DEPTH during canonical enqueue collection"
+            "plain rewrite: inline object nesting exceeds MAX_PARSE_DEPTH during canonical enqueue collection"
                 .to_string(),
         ));
     }
@@ -1355,7 +1356,7 @@ mod tests {
         let error = collect_canonical_children(
             &mut pdf,
             &crate::ObjectHandle::integer(1),
-            MAX_INLINE_DEPTH + 1,
+            MAX_PARSE_DEPTH + 1,
             true,
             &mut found,
         )
