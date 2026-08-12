@@ -1309,30 +1309,33 @@ fn recover_xref_from_linear_scan(
     // caller (`load_xref_state_with_options`) always overwrites it via
     // `merge_recovered_qpdf_state` with the already-successfully-parsed
     // revision's own real form once this returns.
-    let (trailer, recovered_startxref, recovered_form) = if let Some(trailer) = fallback_trailer {
-        (trailer.clone(), startxref, XrefForm::Table)
-    } else {
-        match recovered.trailer {
-            Some(trailer) => (trailer, startxref, XrefForm::Table),
-            None => match recover_trailer_from_xref_stream_candidate(
-                bytes,
-                &version,
-                options,
-                &mut entries,
-                &mut parsed_xref_streams,
-                &mut repair_diagnostics,
-                &mut extra_trailer_references,
-            ) {
-                Ok((trailer, max_offset, form)) => (trailer, max_offset, form),
-                Err(candidate_error) => {
-                    return Err(Error::with_open_diagnostics(
-                        candidate_error,
-                        repair_diagnostics,
-                    ));
-                }
-            },
-        }
-    };
+    let (trailer, recovered_startxref, recovered_form, deleted_objects) =
+        if let Some(trailer) = fallback_trailer {
+            (trailer.clone(), startxref, XrefForm::Table, BTreeSet::new())
+        } else {
+            match recovered.trailer {
+                Some(trailer) => (trailer, startxref, XrefForm::Table, BTreeSet::new()),
+                None => match recover_trailer_from_xref_stream_candidate(
+                    bytes,
+                    &version,
+                    options,
+                    &mut entries,
+                    &mut parsed_xref_streams,
+                    &mut repair_diagnostics,
+                    &mut extra_trailer_references,
+                ) {
+                    Ok((trailer, max_offset, form, deleted_objects)) => {
+                        (trailer, max_offset, form, deleted_objects)
+                    }
+                    Err(candidate_error) => {
+                        return Err(Error::with_open_diagnostics(
+                            candidate_error,
+                            repair_diagnostics,
+                        ));
+                    }
+                },
+            }
+        };
 
     let mut trailer_references = collect_trailer_references(&trailer);
     trailer_references.extend(extra_trailer_references);
@@ -1351,7 +1354,7 @@ fn recover_xref_from_linear_scan(
         bootstrap_cache: empty_bootstrap_cache(),
         header_offset: 0,
         already_reconstructed: true,
-        deleted_objects: BTreeSet::new(),
+        deleted_objects,
     })
 }
 
@@ -1500,7 +1503,9 @@ const XREF_CANDIDATE_FALLBACK_SPAN: usize = 64;
 /// both key priority off the number alone). A candidate that fails to decode
 /// becomes "error decoding candidate xref stream while recovering damaged
 /// file"; no candidate at all becomes "unable to find trailer dictionary while
-/// recovering damaged file".
+/// recovering damaged file". The returned tombstone set is the candidate
+/// re-entry's object-number `deleted_objects`; matching line-scan entries are
+/// removed before the recovered table is used for `/Size` resolution.
 #[allow(clippy::too_many_arguments)]
 fn recover_trailer_from_xref_stream_candidate(
     bytes: &[u8],
@@ -1510,7 +1515,7 @@ fn recover_trailer_from_xref_stream_candidate(
     parsed_xref_streams: &mut BTreeMap<ObjectRef, Object>,
     repair_diagnostics: &mut Diagnostics,
     trailer_references: &mut BTreeSet<ObjectRef>,
-) -> Result<(Dictionary, u64, XrefForm)> {
+) -> Result<(Dictionary, u64, XrefForm, BTreeSet<u32>)> {
     let (candidate, discovery_diagnostics) =
         find_xref_stream_trailer_candidate(bytes, entries, options);
     // qpdf's candidate search resolves every type-1 entry unconditionally
@@ -1623,6 +1628,8 @@ fn recover_trailer_from_xref_stream_candidate(
         ));
     }
 
+    let deleted_objects = reentry_registration.deleted_objects.clone();
+
     // `reentry.loaded.entries` is already the live-only snapshot of
     // `reentry_registration` (free rows never get a map entry, matching
     // `XrefRegistration::insert_free_xref_entry`). Live-entry priority is
@@ -1637,6 +1644,7 @@ fn recover_trailer_from_xref_stream_candidate(
     for (object_ref, xref_entry) in reentry.loaded.entries {
         entries.entry(object_ref).or_insert(xref_entry);
     }
+    entries.retain(|object_ref, _| !deleted_objects.contains(&object_ref.number));
     parsed_xref_streams.extend(reentry.parsed_xref_streams);
     trailer_references.extend(reentry.trailer_references);
     // The candidate re-entry (and any `/Prev` chain it follows) can itself
@@ -1671,11 +1679,16 @@ fn recover_trailer_from_xref_stream_candidate(
     append_xref_size_warning_for(
         resolved_size.as_ref(),
         entries,
-        &reentry_registration.deleted_objects,
+        &deleted_objects,
         repair_diagnostics,
     );
 
-    Ok((candidate.trailer, max_offset, reentry.loaded.last_xref_form))
+    Ok((
+        candidate.trailer,
+        max_offset,
+        reentry.loaded.last_xref_form,
+        deleted_objects,
+    ))
 }
 
 /// The `/Type /XRef` candidate this file's line-scanned entries point at:
@@ -2605,11 +2618,12 @@ mod tests {
         load_xref_and_trailer_with_repair, load_xref_state_with_options,
         merge_bootstrap_cache_prefer_source, merge_previous_xref_sections,
         merge_xref_stream_from_classic_trailer, parse_xref_index, parse_xref_stream,
-        prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate, LoadedXref,
-        LoadedXrefState, RecoveryPolicy, XrefEntryLookup, XrefForm, XrefLoadOptions,
-        XrefReadContext, XrefReadContextSpec, XrefRegistration,
+        prepend_repair_diagnostics, recover_trailer_from_xref_stream_candidate,
+        recover_xref_from_linear_scan, LoadedXref, LoadedXrefState, RecoveryPolicy,
+        XrefEntryLookup, XrefForm, XrefLoadOptions, XrefReadContext, XrefReadContextSpec,
+        XrefRegistration,
     };
-    use crate::{Diagnostic, Diagnostics, Dictionary, Object, ObjectRef, XrefEntry};
+    use crate::{Diagnostic, Diagnostics, Dictionary, Error, Object, ObjectRef, XrefEntry};
     use std::collections::{BTreeMap, BTreeSet};
     use std::io::Cursor;
 
@@ -6078,16 +6092,17 @@ mod tests {
             ..XrefLoadOptions::default()
         };
 
-        let (_trailer, max_offset, form) = recover_trailer_from_xref_stream_candidate(
-            &bytes,
-            "1.5",
-            options,
-            &mut entries,
-            &mut parsed_xref_streams,
-            &mut repair_diagnostics,
-            &mut trailer_references,
-        )
-        .expect("candidate re-enters and follows its own /Prev chain");
+        let (_trailer, max_offset, form, _deleted_objects) =
+            recover_trailer_from_xref_stream_candidate(
+                &bytes,
+                "1.5",
+                options,
+                &mut entries,
+                &mut parsed_xref_streams,
+                &mut repair_diagnostics,
+                &mut trailer_references,
+            )
+            .expect("candidate re-enters and follows its own /Prev chain");
 
         assert_eq!(max_offset, candidate_offset);
         assert_eq!(form, XrefForm::Stream);
@@ -6095,6 +6110,72 @@ mod tests {
             trailer_references.contains(&ObjectRef::new(99, 0)),
             "the /Prev chain's own trailer references must be carried out; got {trailer_references:?}"
         );
+    }
+
+    #[test]
+    fn recover_trailer_from_xref_stream_candidate_filters_free_line_scan_entries() {
+        let mut bytes = b"%PDF-1.5\n".to_vec();
+        let stale_offset = bytes.len() as u64;
+        bytes.extend_from_slice(b"5 0 obj\n(obsolete)\nendobj\n");
+        let candidate_offset = bytes.len() as u64;
+        bytes.extend(xref_stream_object_bytes(
+            9,
+            "/Size 10 /Index [5 1]",
+            &[0u8, 0, 0],
+        ));
+
+        let mut entries = BTreeMap::from([
+            (
+                ObjectRef::new(5, 0),
+                XrefEntry::Uncompressed {
+                    offset: stale_offset,
+                },
+            ),
+            (
+                ObjectRef::new(9, 0),
+                XrefEntry::Uncompressed {
+                    offset: candidate_offset,
+                },
+            ),
+        ]);
+        let mut parsed_xref_streams = BTreeMap::new();
+        let mut repair_diagnostics = Diagnostics::default();
+        let mut trailer_references = BTreeSet::new();
+        let options = XrefLoadOptions {
+            allow_repair: true,
+            ..XrefLoadOptions::default()
+        };
+
+        let (_trailer, _max_offset, _form, deleted_objects) =
+            recover_trailer_from_xref_stream_candidate(
+                &bytes,
+                "1.5",
+                options,
+                &mut entries,
+                &mut parsed_xref_streams,
+                &mut repair_diagnostics,
+                &mut trailer_references,
+            )
+            .expect("candidate free row must recover");
+
+        assert!(
+            !entries.contains_key(&ObjectRef::new(5, 0)),
+            "a candidate free row must suppress the obsolete line-scan entry"
+        );
+        assert!(deleted_objects.contains(&5));
+
+        let recovered = recover_xref_from_linear_scan(
+            &bytes,
+            "1.5".to_owned(),
+            0,
+            Error::parse(0, "forced candidate recovery"),
+            None,
+            options,
+            Diagnostics::default(),
+        )
+        .expect("candidate recovery must carry its tombstone into loaded state");
+        assert!(recovered.deleted_objects.contains(&5));
+        assert!(!recovered.loaded.entries.contains_key(&ObjectRef::new(5, 0)));
     }
 
     #[test]
