@@ -8287,9 +8287,9 @@ mod tests {
     }
 
     #[test]
-    fn trailer_handle_degrades_to_null_when_nesting_exceeds_the_inline_depth_bound() {
+    fn trailer_handle_degrades_to_null_when_nesting_exceeds_the_parse_depth_bound() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
         let mut nested = Object::Integer(1);
         for _ in 0..depth {
             nested = Object::Array(vec![nested]);
@@ -8304,12 +8304,12 @@ mod tests {
     #[test]
     fn trailer_key_handle_survives_an_unrelated_sibling_entrys_deep_nesting() {
         // The whole-trailer walk `trailer_handle` performs degrades every
-        // key to null once *any* sibling entry exceeds `MAX_INLINE_DEPTH` —
+        // key to null once *any* sibling entry exceeds `MAX_PARSE_DEPTH` —
         // `trailer_key_handle` must not inherit that coupling: `/QTest`
         // itself is shallow here, only its unrelated sibling `/Deep` is not.
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         pdf.trailer.insert("QTest", Object::Boolean(true));
-        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
         let mut nested = Object::Integer(1);
         for _ in 0..depth {
             nested = Object::Array(vec![nested]);

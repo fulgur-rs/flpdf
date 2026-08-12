@@ -11,6 +11,7 @@
 //! `libqpdf/QPDFObjectHandle.cc:1575-1593` and
 //! `libqpdf/QPDF_Dictionary.cc:59-69`.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -58,6 +59,10 @@ where
     if act.as_stream_dict().is_some() {
         return compare_streams(label, &act, &exp, actual_pdf, expected_pdf);
     }
+    let mut actual_seen = Vec::new();
+    resolve_compare_children(&act, actual_pdf, &mut actual_seen, 0)?;
+    let mut expected_seen = Vec::new();
+    resolve_compare_children(&exp, expected_pdf, &mut expected_seen, 0)?;
     if act.unparse_resolved() != exp.unparse_resolved() {
         return Ok(format!("{label}: object contents differ"));
     }
@@ -103,8 +108,14 @@ where
     let decoded_act: Vec<u8>;
     let decoded_exp: Vec<u8>;
     let (act_bytes, exp_bytes): (&[u8], &[u8]) = if uncompress {
-        let act_decode_dict = materialize_decode_dictionary(&act_dict, actual_pdf)?;
-        let exp_decode_dict = materialize_decode_dictionary(&exp_dict, expected_pdf)?;
+        let mut act_decode_dict = materialize_decode_dictionary(&act_dict, actual_pdf)?;
+        let mut exp_decode_dict = materialize_decode_dictionary(&exp_dict, expected_pdf)?;
+        // The canonical stream route has already consumed decryption while
+        // producing `raw_stream_data`. qpdf's `getStreamData` likewise does
+        // not send that already-consumed Crypt stage through the codec chain
+        // (`QPDF_Stream.cc:345-374`, `QPDF_encryption.cc:1041-1153`).
+        remove_consumed_crypt_stages(&mut act_decode_dict);
+        remove_consumed_crypt_stages(&mut exp_decode_dict);
         decoded_act = flpdf::filters::decode_stream_data(&act_decode_dict, act_data.as_ref())?;
         decoded_exp = flpdf::filters::decode_stream_data(&exp_decode_dict, exp_data.as_ref())?;
         (&decoded_act, &decoded_exp)
@@ -139,21 +150,44 @@ fn stream_uses_flatedecode<R: Read + Seek>(
     stream_dict: &ObjectHandle,
     pdf: &mut Pdf<R>,
 ) -> flpdf::Result<bool> {
-    let filter = stream_dict.get_key(b"/Filter");
-    let filter = pdf.resolve_object_handle_to_terminal(&filter)?;
-    if filter.as_name().is_some_and(|name| name == b"FlateDecode") {
-        return Ok(true);
+    Ok(resolved_filter_names(stream_dict, pdf)?
+        .iter()
+        .any(|name| name == b"FlateDecode"))
+}
+
+fn resolved_filter_names<R: Read + Seek>(
+    stream_dict: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<Vec<Vec<u8>>> {
+    let filter = pdf.resolve_object_handle_to_terminal(&stream_dict.get_key(b"/Filter"))?;
+    if let Some(name) = filter.as_name() {
+        return Ok(vec![normalize_filter_name(&name).to_vec()]);
     }
     let Some(items) = filter.as_array() else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
+    let mut names = Vec::with_capacity(items.len());
     for item in items {
         let item = pdf.resolve_object_handle_to_terminal(&item)?;
-        if item.as_name().is_some_and(|name| name == b"FlateDecode") {
-            return Ok(true);
-        }
+        let Some(name) = item.as_name() else {
+            continue;
+        };
+        names.push(normalize_filter_name(&name).to_vec());
     }
-    Ok(false)
+    Ok(names)
+}
+
+fn normalize_filter_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"Fl" => b"FlateDecode",
+        b"LZW" => b"LZWDecode",
+        b"A85" => b"ASCII85Decode",
+        b"AHx" => b"ASCIIHexDecode",
+        b"RL" => b"RunLengthDecode",
+        b"CCF" => b"CCITTFaxDecode",
+        b"DCT" => b"DCTDecode",
+        name => name,
+    }
 }
 
 // Materialize exactly at the still-legacy filters::decode_stream_data
@@ -166,17 +200,203 @@ fn materialize_decode_dictionary<R: Read + Seek>(
     let entries = stream_dict
         .as_dictionary()
         .ok_or_else(|| flpdf::Error::Internal("stream dictionary is not a dictionary".into()))?;
+    let filter_names = resolved_filter_names(stream_dict, pdf)?;
     let mut legacy = Dictionary::new();
     for (key, value) in entries {
-        let value = if matches!(key.as_slice(), b"/Filter" | b"/DecodeParms" | b"/Type") {
-            materialize_resolved_for_legacy(&value, pdf, 0)?
-        } else {
-            legacyize_object(value.materialize()?)
+        let value = match key.as_slice() {
+            b"/Filter" => materialize_resolved_for_legacy(&value, pdf, 0)?,
+            b"/DecodeParms" => materialize_decode_params_for_legacy(&value, &filter_names, pdf)?,
+            // `/Type` is inspected by qpdf separately for the xref-stream
+            // fast path; it is not a filter decode parameter. Preserve its
+            // indirect spelling here (`QPDF_Stream.cc:379-484`).
+            _ => materialize_legacy_without_resolution(&value)?,
         };
         let key = key.strip_prefix(b"/").unwrap_or(key.as_slice());
         legacy.insert(key, value);
     }
     Ok(legacy)
+}
+
+fn materialize_decode_params_for_legacy<R: Read + Seek>(
+    handle: &ObjectHandle,
+    filter_names: &[Vec<u8>],
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<Object> {
+    let params = pdf.resolve_object_handle_to_terminal(handle)?;
+    if let Some(items) = params.as_array() {
+        return Ok(Object::Array(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    materialize_decode_params_item(
+                        item,
+                        filter_names.get(index).map(Vec::as_slice),
+                        pdf,
+                    )
+                })
+                .collect::<flpdf::Result<Vec<_>>>()?,
+        ));
+    }
+
+    // A scalar /DecodeParms object is replicated to every filter stage by
+    // qpdf (`QPDF_Stream.cc:425-438`). If any stage consumes dictionary
+    // entries, retain only the keys that a consuming stage reads.
+    let consuming_filter = filter_names
+        .iter()
+        .find(|name| is_decode_parameter_consumer(name));
+    materialize_decode_params_item(&params, consuming_filter.map(Vec::as_slice), pdf)
+}
+
+fn materialize_decode_params_item<R: Read + Seek>(
+    handle: &ObjectHandle,
+    filter_name: Option<&[u8]>,
+    pdf: &mut Pdf<R>,
+) -> flpdf::Result<Object> {
+    let handle = pdf.resolve_object_handle_to_terminal(handle)?;
+    if !filter_name.is_some_and(is_decode_parameter_consumer) {
+        // Non-consuming filters only inspect whether the parameter object is
+        // null. Resolve that root object, but leave all child references
+        // untouched (`SF_FlateLzwDecode.cc:29-66` versus the base filter's
+        // `setDecodeParms`).
+        return materialize_legacy_without_resolution(&handle);
+    }
+
+    let Some(entries) = handle.as_dictionary() else {
+        return materialize_legacy_without_resolution(&handle);
+    };
+    let allowed = decode_parameter_keys(filter_name.expect("consumer has a name"));
+    let mut selected = Dictionary::new();
+    for key in allowed {
+        let canonical = [b"/".as_slice(), key].concat();
+        let Some(value) = entries.get(&canonical) else {
+            continue;
+        };
+        let value = pdf.resolve_object_handle_to_terminal(value)?;
+        selected.insert(key, materialize_legacy_without_resolution(&value)?);
+    }
+    Ok(Object::Dictionary(selected))
+}
+
+fn materialize_legacy_without_resolution(handle: &ObjectHandle) -> flpdf::Result<Object> {
+    if let Some(object_ref) = handle.object_ref() {
+        if !handle.is_resolved() {
+            return Ok(Object::Reference(object_ref));
+        }
+    }
+    Ok(legacyize_object(handle.materialize()?))
+}
+
+fn is_decode_parameter_consumer(name: &[u8]) -> bool {
+    matches!(name, b"FlateDecode" | b"LZWDecode")
+}
+
+fn decode_parameter_keys(name: &[u8]) -> &'static [&'static [u8]] {
+    if name == b"LZWDecode" {
+        &[
+            b"Predictor",
+            b"Columns",
+            b"Colors",
+            b"BitsPerComponent",
+            b"EarlyChange",
+        ]
+    } else {
+        &[b"Predictor", b"Columns", b"Colors", b"BitsPerComponent"]
+    }
+}
+
+fn remove_consumed_crypt_stages(dict: &mut Dictionary) {
+    let Some(filter) = dict.get(b"Filter").cloned() else {
+        return;
+    };
+    let Some(filters) = filter_names_from_legacy_object(&filter) else {
+        return;
+    };
+    let crypt_indices: BTreeSet<usize> = filters
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| (name == b"Crypt").then_some(index))
+        .collect();
+    if crypt_indices.is_empty() {
+        return;
+    }
+
+    match filter {
+        Object::Name(_) => {
+            dict.remove("Filter");
+            dict.remove("DecodeParms");
+        }
+        Object::Array(values) => {
+            let remaining: Vec<Object> = values
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, value)| (!crypt_indices.contains(&index)).then_some(value))
+                .collect();
+            if remaining.is_empty() {
+                dict.remove("Filter");
+                dict.remove("DecodeParms");
+            } else {
+                dict.insert("Filter", Object::Array(remaining));
+                if let Some(Object::Array(params)) = dict.get("DecodeParms").cloned() {
+                    let params = params
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, value)| {
+                            (!crypt_indices.contains(&index)).then_some(value)
+                        })
+                        .collect();
+                    dict.insert("DecodeParms", Object::Array(params));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn filter_names_from_legacy_object(filter: &Object) -> Option<Vec<Vec<u8>>> {
+    match filter {
+        Object::Name(name) => Some(vec![normalize_filter_name(name).to_vec()]),
+        Object::Array(items) => Some(
+            items
+                .iter()
+                .map(|item| match item {
+                    Object::Name(name) => Some(normalize_filter_name(name).to_vec()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => None,
+    }
+}
+
+fn resolve_compare_children<R: Read + Seek>(
+    handle: &ObjectHandle,
+    pdf: &mut Pdf<R>,
+    seen: &mut Vec<ObjectHandle>,
+    depth: usize,
+) -> flpdf::Result<()> {
+    if depth > 500
+        || seen
+            .iter()
+            .any(|ancestor| ancestor.is_same_object_as(handle))
+    {
+        return Ok(());
+    }
+    seen.push(handle.clone());
+    let children = if let Some(items) = handle.as_array() {
+        items
+    } else if let Some(entries) = handle.as_dictionary() {
+        entries.into_values().collect()
+    } else {
+        seen.pop();
+        return Ok(());
+    };
+    for child in children {
+        let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
+        resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
+    }
+    seen.pop();
+    Ok(())
 }
 
 // ObjectHandle::materialize deliberately preserves an indirect child as an
@@ -396,6 +616,32 @@ mod tests {
     }
 
     #[test]
+    fn canonical_handle_compare_resolves_null_children_on_both_sides() {
+        let mut a_pdf = dummy_pdf();
+        let mut e_pdf = dummy_pdf();
+        let a_missing = a_pdf.get_object_handle(ObjectRef::new(99, 0));
+        let e_missing = e_pdf.get_object_handle(ObjectRef::new(99, 0));
+        let actual = ObjectHandle::dictionary(vec![(b"/Null".to_vec(), a_missing)]);
+        let expected = ObjectHandle::dictionary(vec![(b"/Null".to_vec(), e_missing)]);
+
+        // Simulate an earlier stream inspection that resolved only the
+        // actual-side child. qpdf's unparseResolved resolves the same child
+        // on both dictionaries before deciding whether to omit it.
+        let actual_null = actual.get_key(b"/Null");
+        assert!(a_pdf
+            .resolve_object_handle_to_terminal(&actual_null)
+            .expect("resolve actual missing child")
+            .is_null());
+
+        assert_eq!(
+            compare_objects("handle", &actual, &expected, &mut a_pdf, &mut e_pdf,)
+                .expect("null-child comparison must succeed"),
+            "",
+            "the same unresolved null child must be omitted on both sides"
+        );
+    }
+
+    #[test]
     fn canonical_handle_compare_resolves_indirect_filter_array_items() {
         let source = b"handle filter array";
         let compressed_a = zlib(source, Compression::none());
@@ -464,6 +710,95 @@ mod tests {
             .and_then(Object::as_array)
             .expect("ordinary container values are legacyized");
         assert_eq!(other[0].as_integer(), Some(7));
+    }
+
+    #[test]
+    fn legacy_decode_boundary_resolves_only_flate_parameters() {
+        let mut pdf = dummy_pdf();
+        let missing = pdf.get_object_handle(ObjectRef::new(99, 0));
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::dictionary(vec![
+                    (b"/Predictor".to_vec(), ObjectHandle::integer(1)),
+                    (b"/Unused".to_vec(), missing),
+                ]),
+            ),
+        ]);
+
+        let legacy = materialize_decode_dictionary(&stream_dict, &mut pdf)
+            .expect("only consumed Flate parameters need resolution");
+        let parms = legacy
+            .get(b"DecodeParms")
+            .and_then(Object::as_dict)
+            .expect("DecodeParms dictionary remains present");
+        assert_eq!(
+            parms.get(b"Predictor").and_then(Object::as_integer),
+            Some(1)
+        );
+        assert!(
+            parms.get(b"Unused").is_none(),
+            "an unknown Flate parameter must not resolve its indirect value"
+        );
+    }
+
+    #[test]
+    fn legacy_decode_boundary_does_not_resolve_stream_type() {
+        let mut pdf = dummy_pdf();
+        let missing = pdf.get_object_handle(ObjectRef::new(99, 0));
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::name(b"FlateDecode".to_vec()),
+            ),
+            (b"/Type".to_vec(), missing),
+        ]);
+
+        let legacy = materialize_decode_dictionary(&stream_dict, &mut pdf)
+            .expect("stream type is not consumed by the decoder");
+        assert!(matches!(
+            legacy.get(b"Type"),
+            Some(Object::Reference(ObjectRef {
+                number: 99,
+                generation: 0
+            }))
+        ));
+    }
+
+    #[test]
+    fn consumed_crypt_stages_are_removed_with_aligned_decode_params() {
+        let mut dict = Dictionary::new();
+        dict.insert(
+            "Filter",
+            Object::Array(vec![
+                Object::Name(b"Crypt".to_vec()),
+                Object::Name(b"FlateDecode".to_vec()),
+                Object::Name(b"Crypt".to_vec()),
+            ]),
+        );
+        dict.insert(
+            "DecodeParms",
+            Object::Array(vec![
+                Object::Dictionary(Dictionary::new()),
+                Object::Dictionary(Dictionary::new()),
+                Object::Dictionary(Dictionary::new()),
+            ]),
+        );
+
+        remove_consumed_crypt_stages(&mut dict);
+
+        assert_eq!(
+            dict.get("Filter"),
+            Some(&Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]))
+        );
+        assert_eq!(
+            dict.get("DecodeParms"),
+            Some(&Object::Array(vec![Object::Dictionary(Dictionary::new())]))
+        );
     }
 
     #[test]
