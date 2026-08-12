@@ -6,10 +6,13 @@
 //! `tests/fixtures/compat/attachment-two-page.pdf` to validate against a
 //! production-generated document.
 
+use flpdf::pipeline::Pipeline;
 use flpdf::{
     encode_utf16be, format_pdf_date, md5_checksum, Dictionary, EmbeddedFileStream, Error,
     FileParamDates, FileSpec, FileSpecBuilder, Object, ObjectHandle, ObjectRef, Pdf,
+    StreamDataProvider,
 };
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
@@ -607,15 +610,19 @@ fn filespec_factories_reject_exhausted_object_number_space() {
     pdf.set_object(ObjectRef::new(u32::MAX, 0), Object::Null);
     let embedded_file = pdf.get_object_handle(ObjectRef::new(6, 0));
 
-    for result in [
-        EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload").map(|_| ()),
-        FileSpec::create_file_spec(&mut pdf, b"report.txt", embedded_file).map(|_| ()),
-    ] {
-        assert!(
-            matches!(result, Err(Error::Unsupported(message)) if message == "object-number space exhausted"),
-            "factory must return an allocation error instead of wrapping object 0"
-        );
-    }
+    let embedded_error = EmbeddedFileStream::create_ef_stream(&mut pdf, b"payload")
+        .expect_err("qpdf newStream must reject the signed object-number boundary");
+    assert_eq!(
+        embedded_error.to_string(),
+        "unsupported PDF feature: max object id is too high to create new objects"
+    );
+
+    let filespec_error = FileSpec::create_file_spec(&mut pdf, b"report.txt", embedded_file)
+        .expect_err("Filespec factory must reject the exhausted allocation boundary");
+    assert!(
+        matches!(filespec_error, Error::Unsupported(message) if message == "object-number space exhausted"),
+        "Filespec factory must return an allocation error instead of wrapping object 0"
+    );
 }
 
 // ── FileSpec::uf ──────────────────────────────────────────────────────────────
@@ -1131,6 +1138,114 @@ fn qpdf_path_factories_read_payload_and_make_filespec() {
         fs.embedded_file().unwrap().unwrap().payload().unwrap(),
         b"from-path"
     );
+}
+
+struct ChunkedProvider {
+    chunks: Vec<Vec<u8>>,
+    calls: Rc<Cell<usize>>,
+}
+
+struct FailingProvider;
+
+impl StreamDataProvider for FailingProvider {
+    fn supports_retry(&self) -> bool {
+        true
+    }
+
+    fn provide_stream_data_with_retry_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+        _suppress_warnings: bool,
+        _will_retry: bool,
+    ) -> flpdf::Result<bool> {
+        pipeline.write(b"partial").map_err(Error::from)?;
+        pipeline.finish().map_err(Error::from)?;
+        Ok(false)
+    }
+}
+
+impl StreamDataProvider for ChunkedProvider {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> flpdf::Result<()> {
+        self.calls.set(self.calls.get() + 1);
+        for chunk in &self.chunks {
+            pipeline.write(chunk).map_err(Error::from)?;
+        }
+        pipeline.finish().map_err(Error::from)
+    }
+}
+
+#[test]
+fn qpdf_provider_factory_is_deferred_and_publishes_streamed_metadata() {
+    let payload = b"first\0second\nthird".to_vec();
+    let chunks = vec![
+        payload[..5].to_vec(),
+        payload[5..11].to_vec(),
+        payload[11..].to_vec(),
+    ];
+    let calls = Rc::new(Cell::new(0));
+    let provider = Rc::new(ChunkedProvider {
+        chunks,
+        calls: Rc::clone(&calls),
+    });
+    let mut pdf = Pdf::empty().expect("empty PDF");
+
+    let stream = EmbeddedFileStream::create_ef_stream_from_provider(&mut pdf, provider)
+        .expect("provider factory");
+
+    assert_eq!(calls.get(), 1, "finalization pipes the provider once");
+    let dict = stream.as_stream_dict().expect("embedded-file dictionary");
+    assert_eq!(
+        dict.get_key(b"/Type").as_name(),
+        Some(b"EmbeddedFile".to_vec())
+    );
+    let params = dict.get_key(b"/Params");
+    assert_eq!(
+        params.get_key(b"/Size").as_integer(),
+        Some(payload.len() as i64)
+    );
+    assert_eq!(
+        params.get_key(b"/CheckSum").as_string(),
+        Some(md5_checksum(&payload))
+    );
+
+    assert_eq!(
+        stream
+            .get_raw_stream_data()
+            .expect("repeat provider pipe")
+            .as_slice(),
+        payload
+    );
+    assert_eq!(calls.get(), 2, "provider remains repeatable and deferred");
+}
+
+#[test]
+fn qpdf_provider_factory_with_failed_pipe_does_not_publish_embedded_metadata() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let stream =
+        EmbeddedFileStream::create_ef_stream_from_provider(&mut pdf, Rc::new(FailingProvider))
+            .expect("qpdf warns and returns the stream after a failed provider pipe");
+
+    let dict = stream.as_stream_dict().expect("embedded-file dictionary");
+    assert_eq!(
+        dict.get_key(b"/Type").as_name(),
+        Some(b"EmbeddedFile".to_vec())
+    );
+    assert!(
+        !dict.has_key(b"/Params"),
+        "failed pipe must not publish metadata"
+    );
+    assert!(pdf.repair_diagnostics().entries().iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("unable to get stream data for new embedded file stream")
+    }));
 }
 
 #[test]

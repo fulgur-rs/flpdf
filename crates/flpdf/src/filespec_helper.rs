@@ -82,16 +82,19 @@
 
 use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
-use crate::object_handle::canonical_dictionary_key;
+use crate::object_handle::{canonical_dictionary_key, StreamDataProvider};
 use crate::pdf_string::{new_unicode_string, utf8_value};
+use crate::pipeline::count::Count;
 use crate::pipeline::md5::PlMd5;
 use crate::pipeline::{Discard, Pipeline};
 use crate::ref_chain::resolve_ref_chain;
+use crate::writer::DecodeLevel;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
+use std::rc::Rc;
 
 const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 
@@ -147,19 +150,95 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// This Rust form of qpdf's `createEFStream` returns the created
     /// `ObjectHandle`; use [`Self::new`] to obtain the borrowing helper.
     pub fn create_ef_stream(pdf: &mut Pdf<R>, data: impl AsRef<[u8]>) -> Result<ObjectHandle> {
-        let data = data.as_ref();
-        let mut params = Dictionary::new();
-        params.insert("Size", Object::Integer(data.len() as i64));
-        params.insert("CheckSum", Object::String(md5_checksum(data)));
+        let stream = pdf.new_stream()?;
+        stream.replace_stream_data(
+            Rc::new(data.as_ref().to_vec()),
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        );
+        Self::new_from_stream(pdf, stream)
+    }
 
-        let mut dict = Dictionary::new();
-        dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        dict.insert("Length", Object::Integer(data.len() as i64));
-        dict.insert("Params", Object::Dictionary(params));
+    /// Create an indirect `/EmbeddedFile` stream from a deferred qpdf-style
+    /// provider.  The provider is retained by the stream and is not invoked
+    /// until the common finalization path pipes the stream data.
+    ///
+    /// This is qpdf's provider overload from
+    /// `QPDFEFStreamObjectHelper.cc:102-107`: qpdf creates an empty stream,
+    /// installs the provider with `replaceStreamData`, and then delegates to
+    /// one `newFromStream` implementation.
+    pub fn create_ef_stream_from_provider(
+        pdf: &mut Pdf<R>,
+        provider: Rc<dyn StreamDataProvider>,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream()?;
+        stream.replace_stream_data_provider(
+            provider,
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )?;
+        Self::new_from_stream(pdf, stream)
+    }
 
-        let object_ref = next_object_ref(pdf)?;
-        pdf.set_object(object_ref, Object::Stream(Stream::new(dict, data.to_vec())));
-        Ok(pdf.get_object_handle(object_ref))
+    /// Apply qpdf's shared `newFromStream` EmbeddedFile finalization.
+    ///
+    /// `QPDFEFStreamObjectHelper.cc:131-148` sets `/Type` before piping the
+    /// decoded stream through `Pl_Count -> Pl_MD5 -> Pl_Discard`.  `/Params`
+    /// is populated only after a successful pipe; a failed provider/filter
+    /// path gets qpdf's warning and never falls back to a materialized length
+    /// or a second digest computation.
+    fn new_from_stream(pdf: &mut Pdf<R>, stream: ObjectHandle) -> Result<ObjectHandle> {
+        let stream_dict = stream.as_stream_dict().ok_or_else(|| {
+            Error::System("EmbeddedFile factory received a non-stream object".to_string())
+        })?;
+        stream_dict.replace_key(b"/Type", ObjectHandle::name(b"EmbeddedFile".to_vec()));
+        pdf.mark_object_handle_dirty(&stream)?;
+
+        let mut discard = Discard;
+        let mut md5 = PlMd5::new("EF md5", &mut discard);
+        let (success, size, checksum) = {
+            let mut count = Count::new("EF size", &mut md5);
+            let mut filtering_attempted = false;
+            let success = stream.pipe_stream_data(
+                &mut count,
+                &mut filtering_attempted,
+                0,
+                DecodeLevel::All,
+                false,
+                false,
+            )?;
+            let size = count.count();
+            drop(count);
+            let checksum = if success {
+                Some(hex::decode(md5.get_hex_digest()?).map_err(|error| {
+                    Error::Internal(format!("invalid EmbeddedFile MD5: {error}"))
+                })?)
+            } else {
+                None
+            };
+            (success, size, checksum)
+        };
+
+        if success {
+            let checksum = checksum.expect("successful EmbeddedFile pipe has a checksum");
+            stream_dict.replace_key(
+                b"/Params",
+                ObjectHandle::dictionary(vec![
+                    (
+                        b"/Size".to_vec(),
+                        ObjectHandle::integer(i64::try_from(size).map_err(|_| {
+                            Error::System("EmbeddedFile size exceeds PDF integer range".to_string())
+                        })?),
+                    ),
+                    (b"/CheckSum".to_vec(), ObjectHandle::string(checksum)),
+                ]),
+            );
+            pdf.mark_object_handle_dirty(&stream)?;
+        } else {
+            stream.warn_if_possible("unable to get stream data for new embedded file stream")?;
+        }
+
+        Ok(stream)
     }
 
     /// Create an embedded-file stream from filesystem bytes. This is the Rust
