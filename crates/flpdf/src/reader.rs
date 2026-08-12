@@ -1674,6 +1674,44 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.make_indirect_from_object_handle(handle)
     }
 
+    /// Create qpdf's owned empty stream object.
+    ///
+    /// qpdf's `QPDF::newStream()` first constructs an empty
+    /// `QPDF_Stream` with parsed offset `0` and length `0`, then registers
+    /// that same object allocation under a fresh generation-zero identity
+    /// (`include/qpdf/QPDF.hh:319-340`; `libqpdf/QPDF.cc:1912-1931`). The
+    /// stream constructor retains an empty dictionary and no source buffer
+    /// (`libqpdf/QPDF_Stream.cc:109-137`). Parsed offset `0` is intentional:
+    /// qpdf's `pipeStreamData` uses it to distinguish this no-data state from
+    /// an original source stream (`libqpdf/QPDF_Stream.cc:571-607`).
+    ///
+    /// The existing canonical promotion primitive registers this exact
+    /// `ObjectHandle` allocation; this method does not use the legacy
+    /// cloning allocator or an empty replacement buffer.
+    pub fn new_stream(&self) -> Result<ObjectHandle> {
+        let stream = self.resolver.direct_object_handle(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_length: 0,
+        });
+        stream.set_parsed_offset_if_unset(0);
+        self.make_indirect_from_object_handle(stream)
+    }
+
+    /// Create an owned stream and replace its data with the supplied buffer.
+    ///
+    /// This follows qpdf's buffer overload: the empty factory runs first and
+    /// `replaceStreamData` then installs the buffer and applies the
+    /// zero/nonzero `/Length` boundary
+    /// (`include/qpdf/QPDF.hh:319-340`; `libqpdf/QPDF.cc:1921-1931`;
+    /// `libqpdf/QPDF_Stream.cc:640-684`). The `Rc<Vec<u8>>` is retained
+    /// without copying, matching qpdf's shared buffer overload.
+    pub fn new_stream_with_data(&self, data: Rc<Vec<u8>>) -> Result<ObjectHandle> {
+        let stream = self.new_stream()?;
+        stream.replace_stream_data(data, None, None);
+        Ok(stream)
+    }
+
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
     /// raw [`Object`] materialization and writer traversal remain outside this
@@ -7681,6 +7719,148 @@ mod tests {
         assert_eq!(
             pdf.next_obj_gen().expect("next ObjGen"),
             ObjectRef::new(14, 0)
+        );
+    }
+
+    #[test]
+    fn new_stream_is_an_empty_canonical_indirect_object_with_qpdf_no_data_state() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let stream = pdf.new_stream().expect("new empty stream");
+        let stream_dict = stream.as_stream_dict().expect("stream dictionary");
+
+        assert!(stream.is_indirect());
+        assert_eq!(stream.object_ref(), Some(ObjectRef::new(4, 0)));
+        assert_eq!(stream.get_parsed_offset(), 0);
+        assert_eq!(stream.as_stream_data(), None);
+        assert_eq!(stream_dict.as_dictionary().expect("dictionary").len(), 0);
+        assert!(pdf.is_canonical_object_handle(&stream));
+
+        stream_dict.replace_key(b"/Marker", ObjectHandle::integer(7));
+        assert_eq!(
+            stream
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .get_key(b"/Marker")
+                .as_integer(),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn new_stream_rejects_raw_piping_before_data_replacement() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let stream = pdf.new_stream().expect("new empty stream");
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("qpdf's empty stream has no source bytes");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "pipeStreamData called for stream with no data"));
+    }
+
+    #[test]
+    fn new_stream_allocates_distinct_generation_zero_objects_and_honors_signed_limit() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let first = pdf.new_stream().expect("first stream");
+        let second = pdf.new_stream().expect("second stream");
+
+        assert_eq!(first.object_ref(), Some(ObjectRef::new(4, 0)));
+        assert_eq!(second.object_ref(), Some(ObjectRef::new(5, 0)));
+        assert!(!first.is_same_object_as(&second));
+
+        let at_limit = pdf.get_object_handle(ObjectRef::new(i32::MAX as u32, 0));
+        assert!(at_limit.is_indirect());
+        let error = pdf
+            .new_stream()
+            .expect_err("qpdf rejects the signed object-number boundary");
+        assert_eq!(
+            error.to_string(),
+            "unsupported PDF feature: max object id is too high to create new objects"
+        );
+    }
+
+    #[test]
+    fn new_stream_with_data_preserves_buffer_identity_and_qpdf_length_boundary() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let data = Rc::new(b"shared stream data".to_vec());
+        let stream = pdf
+            .new_stream_with_data(Rc::clone(&data))
+            .expect("new stream with data");
+
+        let stored = stream.as_stream_data().expect("replacement data");
+        assert!(Rc::ptr_eq(&stored, &data));
+        assert_eq!(
+            stream
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .get_key(b"/Length")
+                .as_integer(),
+            Some(data.len() as i64)
+        );
+
+        let empty = pdf
+            .new_stream_with_data(Rc::new(Vec::new()))
+            .expect("new empty replacement stream");
+        assert!(!empty
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .has_key(b"/Length"));
+    }
+
+    #[test]
+    fn new_stream_survives_owner_drop_as_the_same_live_stream_value() {
+        let stream = {
+            let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+            pdf.new_stream().expect("new empty stream")
+        };
+
+        assert!(stream.is_direct());
+        assert_eq!(stream.object_ref(), None);
+        assert_eq!(stream.type_code(), 14);
+        assert_eq!(stream.get_parsed_offset(), NO_PARSED_OFFSET);
+        assert_eq!(stream.as_stream_data(), None);
+    }
+
+    #[test]
+    fn reachable_new_stream_survives_a_canonical_full_rewrite() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"new stream payload".to_vec()))
+            .expect("new stream with data");
+        let stream_ref = stream.object_ref().expect("stream reference");
+        let root_ref = ObjectRef::new(1, 0);
+        let root = pdf.get_object_handle(root_ref);
+        pdf.resolve_object_handle(&root).expect("resolve root");
+        root.replace_key(b"/Extra", stream.clone());
+        pdf.mark_object_dirty(root_ref);
+
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_compress_streams(false);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let emitted_ref = writer
+            .get_renumbered_obj_gen(stream_ref)
+            .expect("query stream mapping")
+            .expect("reachable stream must be emitted");
+        let output = writer.get_buffer().expect("take output");
+
+        let mut reopened = Pdf::open_mem_owned(output).expect("reopen output");
+        let emitted_stream_ref = reopened
+            .resolve(root_ref)
+            .expect("resolve rewritten root")
+            .into_dict()
+            .and_then(|dict| dict.get("Extra").cloned())
+            .and_then(|object| object.as_ref_id())
+            .expect("rewritten root has stream reference");
+        assert_eq!(emitted_stream_ref, emitted_ref);
+        assert_eq!(
+            reopened
+                .resolve(emitted_ref)
+                .expect("resolve rewritten stream")
+                .as_stream()
+                .expect("rewritten object remains a stream")
+                .data,
+            b"new stream payload"
         );
     }
 
