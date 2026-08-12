@@ -4425,6 +4425,23 @@ fn unparse_object_walk_with_ref_map(
 ) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
+        // A resolved indirect redirect stores its reference as a scalar, but
+        // the mapping callback may re-enter mutation of this same handle.
+        // Copy the small reference token out before invoking the callback so
+        // `with_value`'s RefCell borrow cannot cross that call.
+        let reference = handle.with_value(|value| match value {
+            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
+            _ => None,
+        });
+        if let Some(object_ref) = reference {
+            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
+                out.extend_from_slice(b"null");
+            } else {
+                let mapped = map(object_ref)?;
+                out.extend_from_slice(mapped.to_string().as_bytes());
+            }
+            return Ok(());
+        }
         let container = handle.with_value(|value| match value {
             Some(value) => {
                 if let Some(container) = snapshot_unparse_container(value) {
@@ -9615,6 +9632,28 @@ mod unparse_object_tests {
             .unparse_stream_body_with_ref_map(&mut non_dictionary, false, &map)
             .unwrap();
         assert_eq!(non_dictionary, b"<< >>");
+    }
+
+    #[test]
+    fn mapped_unparse_releases_reference_value_borrow_before_mapping() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(2, 0)));
+        let reentrant_handle = handle.clone();
+        let map = move |object_ref: ObjectRef| {
+            reentrant_handle.set_resolved(ObjectValue::Integer(7));
+            Ok(ObjectRef::new(
+                object_ref.number + 10,
+                object_ref.generation,
+            ))
+        };
+
+        let mut out = Vec::new();
+        handle
+            .unparse_object_with_ref_map(&mut out, &map)
+            .expect("reference mapping may re-enter the handle");
+
+        assert_eq!(out, b"12 0 R");
+        assert_eq!(handle.as_integer(), Some(7));
     }
 
     #[test]
