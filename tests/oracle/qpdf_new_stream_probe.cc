@@ -50,6 +50,8 @@ int main()
         auto data = std::make_shared<Buffer>(std::string("abc"));
         auto with_data = pdf.newStream(data);
         require(with_data.isIndirect(), "buffer newStream did not create an indirect object");
+        require(with_data.getObjGen().getObj() == 4, "buffer newStream object number differs");
+        require(with_data.getObjGen().getGen() == 0, "buffer newStream generation differs");
         require(with_data.getDict().getKey("/Length").getIntValue() == 3, "buffer length differs");
         auto with_data_raw = with_data.getRawStreamData();
         require(with_data_raw->getSize() == 3, "buffer data size differs");
@@ -73,8 +75,16 @@ int main()
             "buffer mutation was not retained by stream");
         require(with_data.getOwningQPDF() == &pdf, "buffer newStream owner differs");
 
-        auto empty_data = pdf.newStream(std::make_shared<Buffer>());
+        auto empty_data_buffer = std::make_shared<Buffer>();
+        std::weak_ptr<Buffer> empty_data_ownership = empty_data_buffer;
+        auto empty_data = pdf.newStream(empty_data_buffer);
+        empty_data_buffer.reset();
         require(empty_data.isIndirect(), "empty buffer newStream is not indirect");
+        require(empty_data.getObjGen().getObj() == 5, "empty buffer object number differs");
+        require(empty_data.getObjGen().getGen() == 0, "empty buffer generation differs");
+        require(
+            !empty_data_ownership.expired(),
+            "empty buffer newStream did not retain the supplied allocation");
         require(empty_data.getOwningQPDF() == &pdf, "empty buffer newStream owner differs");
         require(!empty_data.getDict().hasKey("/Length"), "empty buffer retained /Length");
         require(
