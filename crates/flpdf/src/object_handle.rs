@@ -13385,6 +13385,8 @@ mod stream_provider_contract_tests {
         let provider = EmptyProvider;
         let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
 
+        assert!(!provider.supports_retry());
+
         let error = provider
             .provide_stream_data(ObjectRef::new(1, 0), &mut sink)
             .expect_err("default provider must reject missing implementation");
@@ -13405,6 +13407,64 @@ mod stream_provider_contract_tests {
     }
 
     #[test]
+    fn provider_debug_uses_qpdf_shaped_marker() {
+        let provider: Rc<dyn StreamDataProvider> = Rc::new(EmptyProvider);
+
+        assert_eq!(format!("{provider:?}"), "StreamDataProvider(..)");
+    }
+
+    fn registered_provider(value: Option<&ObjectValue>) -> Rc<dyn StreamDataProvider> {
+        match value {
+            Some(ObjectValue::Stream {
+                stream_provider: Some(provider),
+                ..
+            }) => provider.clone(),
+            _ => unreachable!("callback test stream must retain its provider"), // cov:ignore: test fixture always registers a provider-backed stream
+        }
+    }
+
+    #[test]
+    fn callback_adapters_forward_pipeline_data_and_retry_flags() {
+        let mut void_sink = crate::pipeline::buffer::Buffer::new("void callback", None);
+        let void_provider = CallbackProvider {
+            callback: |pipeline: &mut dyn Pipeline| {
+                pipeline
+                    .write(b"void callback bytes")
+                    .map_err(Error::from)?;
+                pipeline.finish().map_err(Error::from)
+            },
+        };
+        void_provider
+            .provide_stream_data(ObjectRef::new(41, 2), &mut void_sink)
+            .expect("void callback provider");
+        assert_eq!(
+            void_sink.take_buffer().expect("void callback output"),
+            b"void callback bytes"
+        );
+
+        let mut retry_sink = crate::pipeline::buffer::Buffer::new("retry callback", None);
+        let retry_provider = RetryCallbackProvider {
+            callback: |pipeline: &mut dyn Pipeline, suppress_warnings: bool, will_retry: bool| {
+                assert!(suppress_warnings);
+                assert!(!will_retry);
+                pipeline
+                    .write(b"retry callback bytes")
+                    .map_err(Error::from)?;
+                pipeline.finish().map_err(Error::from)?;
+                Ok(true)
+            },
+        };
+        assert!(retry_provider.supports_retry());
+        assert!(retry_provider
+            .provide_stream_data_with_retry(ObjectRef::new(43, 1), &mut retry_sink, true, false,)
+            .expect("retry callback provider"));
+        assert_eq!(
+            retry_sink.take_buffer().expect("retry callback output"),
+            b"retry callback bytes"
+        );
+    }
+
+    #[test]
     fn callback_adapters_are_deferred_and_retry_capability_is_retained() {
         let stream = provider_stream();
         let void_calls = Rc::new(Cell::new(0));
@@ -13420,6 +13480,12 @@ mod stream_provider_contract_tests {
             )
             .expect("void callback replacement");
         assert_eq!(void_calls.get(), 0, "callback registration must be lazy");
+        let mut void_sink = crate::pipeline::buffer::Buffer::new("void callback", None);
+        stream
+            .with_value(registered_provider)
+            .provide_stream_data(ObjectRef::new(41, 2), &mut void_sink)
+            .expect("void callback provider");
+        assert_eq!(void_calls.get(), 1, "void callback runs only when piped");
 
         let retry_calls = Rc::new(Cell::new(0));
         let retry_calls_for_callback = Rc::clone(&retry_calls);
@@ -13438,13 +13504,25 @@ mod stream_provider_contract_tests {
             0,
             "retry callback registration must be lazy"
         );
-        assert!(stream.with_value(|value| match value {
-            Some(ObjectValue::Stream {
-                stream_provider: Some(provider),
-                ..
-            }) => provider.supports_retry(),
-            _ => false,
-        }));
+        let mut retry_sink = crate::pipeline::buffer::Buffer::new("retry callback", None);
+        assert!(stream
+            .with_value(registered_provider)
+            .provide_stream_data_with_retry(ObjectRef::new(43, 1), &mut retry_sink, true, false)
+            .expect("retry callback provider"));
+        assert_eq!(retry_calls.get(), 1, "retry callback runs only when piped");
+
+        fn is_retry_provider(value: Option<&ObjectValue>) -> bool {
+            match value {
+                Some(ObjectValue::Stream {
+                    stream_provider: Some(provider),
+                    ..
+                }) => provider.supports_retry(),
+                _ => false,
+            }
+        }
+
+        assert!(stream.with_value(is_retry_provider));
+        assert!(!ObjectHandle::integer(0).with_value(is_retry_provider));
     }
 }
 
