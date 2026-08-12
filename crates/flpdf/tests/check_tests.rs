@@ -1,5 +1,6 @@
 use flpdf::{
-    check_reader, check_reader_strict, check_reader_with_options, PdfOpenOptions, Severity,
+    check_reader, check_reader_strict, check_reader_with_options, EncryptedError, Error,
+    PdfOpenOptions, Severity,
 };
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -168,6 +169,35 @@ fn check_reports_repaired_xref_warning() {
         .iter()
         .any(|entry| entry.severity == Severity::Warning
             && entry.message == "Attempting to reconstruct cross-reference table"));
+}
+
+#[test]
+fn check_preserves_encrypted_classification_after_repair_warnings() {
+    let mut input = encrypted_v1_owner_password_fixture();
+    let xref = input
+        .windows(4)
+        .position(|window| window == b"xref")
+        .expect("encrypted fixture should contain an xref keyword");
+    input[xref + 2] = b'X';
+
+    let error = check_reader_with_options(
+        Cursor::new(input),
+        PdfOpenOptions {
+            repair: true,
+            password: b"wrong".to_vec(),
+            allow_weak_crypto: true,
+            ..PdfOpenOptions::default()
+        },
+    )
+    .expect_err("authentication failure must remain a hard check error");
+    let (source, diagnostics) = error
+        .open_failure()
+        .expect("repair warnings must remain attached to the terminal error");
+    assert!(matches!(
+        source,
+        Error::Encrypted(EncryptedError::BadPassword)
+    ));
+    assert!(!diagnostics.entries().is_empty());
 }
 
 fn corrupt_xref_pdf() -> Vec<u8> {

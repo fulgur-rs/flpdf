@@ -1,14 +1,15 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::Path;
 
 use flpdf::filters::{self, DecodeLimits, StreamDecodeEvent};
-use flpdf::pages::page_content_bytes;
 use flpdf::pages::repair::prepare_for_optimization;
 use flpdf::tokenizer::{TokenType, Tokenizer};
-use flpdf::{Object, Pdf, PdfOpenOptions};
+use flpdf::{
+    DecodeLevel, Error, Object, ObjectHandle, ObjectRef, Pdf, PdfOpenOptions, Result as FlpdfResult,
+};
 
 use crate::common::test_driver_program_name_bytes;
 use crate::driver::{emit_new_diagnostics, os_str_diagnostic_bytes, write_warning};
@@ -227,7 +228,7 @@ fn process(
         .map(|prepared| prepared.pages)
         .unwrap_or_default();
     for (pageno, page_ref) in page_refs.iter().enumerate() {
-        let content = page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
+        let content = canonical_page_content_bytes(&mut pdf, *page_ref).unwrap_or_default();
         let label = format!("PAGE {}", pageno + 1);
         dump_tokens(
             &content,
@@ -249,15 +250,19 @@ fn process(
 
     let object_refs = pdf.object_refs();
     for obj_ref in object_refs {
-        // Clone only the (small) stream dictionary to classify it, rather
-        // than pdf.resolve()'s owned Object — which would deep-clone every
-        // stream's raw data just to read /Type, for every stream in the
-        // file (fonts and images included, not just the rare ObjStm).
-        let dict = match pdf.resolve_borrowed(obj_ref).map_err(|e| e.to_string())? {
-            Object::Stream(stream) => stream.dict.clone(),
-            _ => continue,
+        // Page content is already resolved through the canonical handle path
+        // above. Reusing that state is important for damaged content streams:
+        // resolving the same object through the legacy compatibility path and
+        // then through the canonical path would replay qpdf's warnings.
+        let stream_handle = pdf.get_object_handle(obj_ref);
+        if !stream_handle.is_resolved() {
+            pdf.resolve_object_handle(&stream_handle)
+                .map_err(|e| e.to_string())?;
+        }
+        let Some(stream_dict) = stream_handle.as_stream_dict() else {
+            continue;
         };
-        if !resolve_objstm_type(&mut pdf, &dict) {
+        if !resolve_objstm_type(&mut pdf, &stream_dict) {
             continue;
         }
         let Object::Stream(stream) = pdf.resolve_borrowed(obj_ref).map_err(|e| e.to_string())?
@@ -296,17 +301,87 @@ fn process(
     Ok(())
 }
 
-fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &flpdf::Dictionary) -> bool {
-    let Some(type_val) = dict.get(b"Type") else {
+/// Pipe page contents through canonical [`ObjectHandle`]s before tokenizing.
+///
+/// qpdf's `QPDFPageObjectHelper::pipeContents` resolves the page's content
+/// holders and stream framing through the same canonical object cache later
+/// walked by `getAllObjects`. Keeping that order here means a malformed page
+/// stream is not parsed once by the legacy `page_content_bytes` compatibility
+/// API and a second time while classifying object streams.
+fn canonical_page_content_bytes<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    page_ref: ObjectRef,
+) -> FlpdfResult<Vec<u8>> {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    if !page.has_key(b"/Contents") {
+        return Ok(Vec::new());
+    }
+
+    let contents = page.get_key(b"/Contents");
+    let mut streams = Vec::new();
+    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams, true)?;
+
+    let mut output = Vec::new();
+    let mut need_newline = false;
+    for stream in streams {
+        let decoded = stream.get_stream_data(DecodeLevel::Specialized)?;
+        if need_newline {
+            output.push(b'\n');
+        }
+        need_newline = decoded.last().copied().unwrap_or(0) != b'\n';
+        output.extend_from_slice(decoded.as_ref());
+    }
+    Ok(output)
+}
+
+fn collect_canonical_content_streams<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    value: &ObjectHandle,
+    page_ref: ObjectRef,
+    streams: &mut Vec<ObjectHandle>,
+    allow_array: bool,
+) -> FlpdfResult<()> {
+    let (value, _) = pdf.resolve_object_handle_to_terminal_ref(value)?;
+    if value.as_stream_dict().is_some() {
+        streams.push(value);
+        return Ok(());
+    }
+
+    if let Some(items) = value.as_array() {
+        // qpdf's arrayOrStreamToStreamArray accepts only the top-level array
+        // and ignores every array element that is not a stream
+        // (`QPDFObjectHandle.cc:1428-1469`). In particular, do not recurse
+        // into a nested array: that both diverges on self-references and
+        // fabricates content that qpdf does not pipe.
+        if !allow_array {
+            return Ok(());
+        }
+        for item in items {
+            collect_canonical_content_streams(pdf, &item, page_ref, streams, false)?;
+        }
+        return Ok(());
+    }
+
+    // A scalar /Contents value is still an invalid page-level shape, but a
+    // non-stream element inside the top-level array is qpdf's ignorable case.
+    if !allow_array {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "/Contents on page {page_ref} is not a stream or array"
+    )))
+}
+
+fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {
+    let type_handle = dict.get_key(b"/Type");
+    // qpdf's getKey()/isName() dereference through the canonical object
+    // handle. Follow the complete holder chain here as well, while keeping
+    // the decode boundary below in its existing Dictionary-shaped form.
+    let Ok((type_handle, _)) = pdf.resolve_object_handle_to_terminal_ref(&type_handle) else {
         return false;
     };
-    // /Type may be reached through a holder chain of two or more indirect
-    // references, not just one hop; resolve_ref_chain follows it to the
-    // terminal value the same way every other flpdf consumer does.
-    match flpdf::ref_chain::resolve_ref_chain(pdf, type_val) {
-        Ok((Object::Name(n), _)) => n == b"ObjStm",
-        _ => false,
-    }
+    matches!(type_handle.as_name(), Some(name) if name.as_slice() == b"ObjStm")
 }
 
 // qpdf's test_tokenizer.cc prints nothing of the kind; these diagnostics are
@@ -451,7 +526,7 @@ fn find_endstream(input: &[u8], start: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use flpdf::filters::StreamDecodeWarning;
-    use flpdf::{Dictionary, Error, ObjectRef};
+    use flpdf::{Error, ObjectHandle, ObjectRef};
 
     fn open_minimal_pdf() -> Pdf<std::io::Cursor<Vec<u8>>> {
         let bytes: &[u8] = b"%PDF-1.4\n\
@@ -465,8 +540,10 @@ mod tests {
     #[test]
     fn resolve_objstm_type_true_for_direct_name() {
         let mut pdf = open_minimal_pdf();
-        let mut dict = Dictionary::new();
-        dict.insert("Type", Object::Name(b"ObjStm".to_vec()));
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"ObjStm".to_vec()),
+        )]);
         assert!(resolve_objstm_type(&mut pdf, &dict));
     }
 
@@ -474,8 +551,10 @@ mod tests {
     fn resolve_objstm_type_true_for_single_hop_reference() {
         let mut pdf = open_minimal_pdf();
         pdf.set_object(ObjectRef::new(100, 0), Object::Name(b"ObjStm".to_vec()));
-        let mut dict = Dictionary::new();
-        dict.insert("Type", Object::Reference(ObjectRef::new(100, 0)));
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(100, 0)),
+        )]);
         assert!(resolve_objstm_type(&mut pdf, &dict));
     }
 
@@ -493,18 +572,25 @@ mod tests {
             Object::Reference(ObjectRef::new(101, 0)),
         );
         pdf.set_object(ObjectRef::new(101, 0), Object::Name(b"ObjStm".to_vec()));
-        let mut dict = Dictionary::new();
-        dict.insert("Type", Object::Reference(ObjectRef::new(100, 0)));
+        let dict = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            pdf.get_object_handle(ObjectRef::new(100, 0)),
+        )]);
         assert!(resolve_objstm_type(&mut pdf, &dict));
     }
 
     #[test]
     fn resolve_objstm_type_false_for_other_name_or_missing_type() {
         let mut pdf = open_minimal_pdf();
-        let mut other = Dictionary::new();
-        other.insert("Type", Object::Name(b"XRef".to_vec()));
+        let other = ObjectHandle::dictionary(vec![(
+            b"Type".to_vec(),
+            ObjectHandle::name(b"XRef".to_vec()),
+        )]);
         assert!(!resolve_objstm_type(&mut pdf, &other));
-        assert!(!resolve_objstm_type(&mut pdf, &Dictionary::new()));
+        assert!(!resolve_objstm_type(
+            &mut pdf,
+            &ObjectHandle::dictionary(Vec::new())
+        ));
     }
 
     #[test]

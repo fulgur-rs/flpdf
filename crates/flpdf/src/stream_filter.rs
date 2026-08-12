@@ -88,7 +88,9 @@ type FilterWarningCallback = Box<dyn FnMut(&str, i32) -> PipelineResult<()> + 's
 /// (`QPDFObjectHandle.cc:997-1009`) for every non-null object, and it is
 /// *`getKeys`* — not `setDecodeParms` — that warns
 /// `typeWarning("dictionary", "treating as empty")` (`:1005`) and hands back
-/// an empty key set.
+/// an empty key set. Live parser handles forward that warning through their
+/// document resolver; a contextless programmatic handle retains qpdf's
+/// throwing `typeWarning` branch.
 ///
 /// **Entry order is not part of this type's contract.** qpdf iterates
 /// `getKeys()`'s `std::set<std::string>`, so it sees keys sorted. The `Object`
@@ -195,6 +197,51 @@ pub(crate) fn normalize_filter_name(name: &[u8]) -> &[u8] {
     }
 }
 
+/// Return a human-readable codec label if `filter_name` is an image/binary
+/// passthrough codec that flpdf does not decode.
+///
+/// The four codecs (`DCTDecode`, `JBIG2Decode`, `JPXDecode`, `CCITTFaxDecode`)
+/// are always emitted verbatim by the writer.  Keeping this classification
+/// beside the filter registry lets the qpdf-shaped factory check use the same
+/// diagnostic that the later decode stage would have produced.
+pub(crate) fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
+    match filter_name {
+        b"DCTDecode" => Some("DCTDecode"),
+        b"JBIG2Decode" => Some("JBIG2Decode"),
+        b"JPXDecode" => Some("JPXDecode"),
+        b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
+        _ => None,
+    }
+}
+
+/// Report why a filter name has no decode factory.
+pub(crate) fn undecodable_filter_error(filter_name: &[u8]) -> Error {
+    if let Some(label) = passthrough_codec_label(filter_name) {
+        return Error::Unsupported(format!(
+            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
+        ));
+    }
+    Error::Unsupported(format!(
+        "unsupported stream filter: {}",
+        std::str::from_utf8(filter_name).unwrap_or("<binary>")
+    ))
+}
+
+/// Validate `/Filter` names at the same stage as qpdf's `filter_factories`
+/// lookup (`QPDF_Stream.cc:419-435`), before `/DecodeParms` is inspected.
+pub(crate) fn validate_filter_factories<'a, I>(names: I) -> Result<()>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    for name in names {
+        let normalized = normalize_filter_name(name);
+        if stream_filter_for(normalized).is_none() {
+            return Err(undecodable_filter_error(normalized));
+        }
+    }
+    Ok(())
+}
+
 /// `QPDF_Stream::filterable`'s `warn("stream filter type is not name or
 /// array")` (`libqpdf/QPDF_Stream.cc:413`). flpdf raises the same text as an
 /// error instead of a warning; see plan decision D3 of `flpdf-25kg.3.4`.
@@ -204,17 +251,11 @@ pub(crate) const FILTER_TYPE_ERROR: &str = "stream filter type is not name or ar
 /// inconsistent with filters")` (`libqpdf/QPDF_Stream.cc:459`), raised as an
 /// error rather than a warning just as [`FILTER_TYPE_ERROR`] is.
 ///
-/// **flpdf reaches this check on inputs qpdf does not.** qpdf validates every
-/// filter name against `filter_factories` first and returns on an unknown one
-/// (`QPDF_Stream.cc:433-435`), so `:459`'s condition is never evaluated for a
-/// stream whose `/Filter` names an unimplemented codec. Neither flpdf shape
-/// reader consults filter-name validity at all — that is
-/// `filters::prepare_decode_filters`' job, downstream of [`FilterSpec`] — so
-/// an unknown filter combined with a misaligned `/DecodeParms` reports the
-/// length error here where qpdf would report the unknown filter. Tracked as
-/// beads `flpdf-vatj` (P2); not fixed here, because Task 5's contract is that
-/// the two readers keep the same branch order. Both readers diverge from qpdf
-/// *identically*, so the legacy-vs-native equivalence gate stays valid.
+/// qpdf validates every filter name against `filter_factories` first and
+/// returns on an unknown one (`QPDF_Stream.cc:433-435`), so `:459`'s condition
+/// is never evaluated for a stream whose `/Filter` names an unimplemented
+/// codec. Both flpdf shape readers make the same factory decision before
+/// reading `/DecodeParms`, through [`validate_filter_factories`].
 pub(crate) const DECODE_PARMS_LENGTH_ERROR: &str =
     "stream /DecodeParms length is inconsistent with filters";
 
@@ -268,6 +309,8 @@ pub(crate) fn decode_filter_specs_from_object(
     if names.is_empty() {
         return Ok(Vec::new());
     }
+
+    validate_filter_factories(names.iter().copied())?;
 
     let params: Vec<Option<&Object>> = match decode_params {
         None | Some(Object::Null) => vec![None; names.len()],
@@ -352,6 +395,8 @@ pub(crate) fn decode_filter_specs_from_object_with_resolver(
     if names.is_empty() {
         return Ok(Vec::new());
     }
+
+    validate_filter_factories(names.iter().map(Vec::as_slice))?;
 
     let params: Vec<Option<Object>> = match decode_params {
         None | Some(Object::Null) => vec![None; names.len()],
@@ -469,6 +514,8 @@ pub(crate) fn decode_filter_specs_from_handle(
     if names.is_empty() {
         return Ok(Vec::new());
     }
+
+    validate_filter_factories(names.iter().map(Vec::as_slice))?;
 
     let params: Vec<DecodeParams> = if decode_params.try_is_null()? {
         absent_params(names.len())
@@ -611,11 +658,10 @@ fn replicated_decode_params(params: &ObjectHandle, names: &[Vec<u8>]) -> Result<
 /// `QPDF_Stream.cc:419-423`, ahead of the `filter_factories` lookup at `:425`,
 /// so `/Fl` reaches `SF_FlateLzwDecode` and consumes.
 ///
-/// An unknown name has no registered filter, so it lands on `false`. That is
-/// *closer* to qpdf, which fails the factory lookup and returns at
-/// `QPDF_Stream.cc:433-435` without ever reading `/DecodeParms` at `:441` —
-/// but not identical, because flpdf still resolves the `/DecodeParms` handle
-/// itself. That residue is beads `flpdf-vatj`, not this function's business.
+/// An unknown name has no registered filter, so it lands on `false`. The shape
+/// readers perform that factory lookup before `/DecodeParms` is read, matching
+/// qpdf's early return at `QPDF_Stream.cc:433-435` and leaving the later
+/// parameter-reduction code concerned only with registered filters.
 fn filter_reads_decode_params(filter_name: &[u8]) -> bool {
     // No caller's answer depends on this arm today, and no assertion can
     // witness it: `CryptStreamFilter` is registered and its
@@ -735,12 +781,12 @@ fn decode_params_from_entries(
     let crypt_stage = is_crypt_filter(filter_name);
     let retained = entries
         .iter()
-        .filter_map(|(key, value)| {
+        .filter(|(key, _)| retains_decode_param_key(legacy_dictionary_key(key), crypt_stage))
+        .map(|(key, value)| {
             let logical_key = legacy_dictionary_key(key);
-            retains_decode_param_key(logical_key, crypt_stage)
-                .then(|| (logical_key.to_vec(), param_value_without_resolving(value)))
+            Ok((logical_key.to_vec(), param_value_without_resolving(value)?))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(DecodeParams::Present(retained))
 }
 
@@ -756,7 +802,7 @@ fn decode_params_from_entries(
 /// is unchanged; only the payload is dropped.
 fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<ParamValue> {
     if let Some(int) = value.try_as_integer()? {
-        return Ok(ParamValue::Int(clamp_to_i32(int)));
+        return Ok(ParamValue::Int(clamp_handle_value_to_i32(int, value)?));
     }
     Ok(match value.try_as_name()? {
         Some(name) if keeps_name => ParamValue::Name(name),
@@ -796,10 +842,10 @@ fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<Par
 /// single [`ParamValue`]. What must not vary is `Absent` vs `Present`, and
 /// that is decided upstream by the two unconditional calls on the parameter
 /// handle itself.
-fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
+fn param_value_without_resolving(value: &ObjectHandle) -> Result<ParamValue> {
     match value.as_integer() {
-        Some(int) => ParamValue::Int(clamp_to_i32(int)),
-        None => ParamValue::Other,
+        Some(int) => Ok(ParamValue::Int(clamp_handle_value_to_i32(int, value)?)),
+        None => Ok(ParamValue::Other),
     }
 }
 
@@ -1434,20 +1480,29 @@ fn keeps_crypt_name_payload(key: &[u8], crypt_stage: bool) -> bool {
     crypt_stage && CRYPT_NAME_PAYLOAD_DECODE_PARAM_KEYS.contains(&key)
 }
 
-/// Apply `getIntValueAsInt`'s saturation (`QPDFObjectHandle.cc:531-538`), which
-/// pins a value below `INT_MIN` to `INT_MIN` and one above `INT_MAX` to
-/// `INT_MAX` rather than failing — so a `/Columns` far beyond `INT_MAX` behaves
-/// as `INT_MAX` does.
-///
-/// qpdf also emits `warnIfPossible("requested value of integer is too small;
-/// returning INT_MIN")` (and the `INT_MAX` counterpart) on those two branches;
-/// flpdf does not reproduce those diagnostics, only the value.
+/// Apply `getIntValueAsInt`'s value saturation
+/// (`QPDFObjectHandle.cc:525-543`), which pins a value below `INT_MIN` to
+/// `INT_MIN` and one above `INT_MAX` to `INT_MAX` rather than failing.
 ///
 /// This is the shape-independent half of the parity, kept separate from
 /// `clamped_int_param` so a second `/DecodeParms` shape reader clamps through
 /// this one copy instead of restating the bounds.
 fn clamp_to_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Apply qpdf's saturation and its `warnIfPossible` diagnostics to a live
+/// handle. `QPDFObjectHandle::getIntValueAsInt` calls `warnIfPossible` only
+/// after the caller has established that the value is an integer
+/// (`SF_FlateLzwDecode.cc:34-57`), so this helper deliberately does not emit a
+/// type warning for names or other non-integer values.
+fn clamp_handle_value_to_i32(value: i64, handle: &ObjectHandle) -> Result<i32> {
+    if value < i64::from(i32::MIN) {
+        handle.warn_if_possible("requested value of integer is too small; returning INT_MIN")?;
+    } else if value > i64::from(i32::MAX) {
+        handle.warn_if_possible("requested value of integer is too big; returning INT_MAX")?;
+    }
+    Ok(clamp_to_i32(value))
 }
 
 /// Read an `Object` the way qpdf reads a `/DecodeParms` value: `None` for every
@@ -2309,16 +2364,17 @@ pub(crate) mod tests {
     use super::{
         decode_filter_specs_from_handle, decode_filter_specs_from_object,
         decode_filter_specs_from_object_with_resolver, decode_flate, decode_flate_chunks,
-        decode_params_from_object, encode_flate, encode_run_length, ignore_codec_warning,
-        ignore_warning, keeps_crypt_name_payload, normalize_filter_name, stream_filter_for,
-        Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter, DecodeParams, FilterSpec,
-        FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue, Pipeline, PipelineError,
-        PipelineResult, RunLengthStreamFilter, StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX,
-        RETAINED_DECODE_PARAM_KEYS,
+        decode_params_from_handle, decode_params_from_object, encode_flate, encode_run_length,
+        ignore_codec_warning, ignore_warning, keeps_crypt_name_payload, normalize_filter_name,
+        param_value_from_handle, stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter,
+        CryptStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle,
+        OutputBuffer, ParamValue, Pipeline, PipelineError, PipelineResult, RunLengthStreamFilter,
+        StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
     };
+    use crate::object_handle::warning_emission_tests::{handle_resolving, warnings};
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::pipeline::test_support::{RecordingSink, Trace, TraceCall};
@@ -3086,6 +3142,47 @@ pub(crate) mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+    }
+
+    #[test]
+    fn unknown_filter_is_rejected_before_decode_parms_mismatch_by_each_shape_reader() {
+        let filter = Object::Array(vec![
+            Object::Name(b"BogusDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let params = Object::Array(vec![Object::Null]);
+        let expected = "unsupported PDF feature: unsupported stream filter: BogusDecode";
+
+        assert_eq!(
+            decode_filter_specs_from_object(Some(&filter), Some(&params), None)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+
+        let mut resolve = |value: &Object| value.clone();
+        assert_eq!(
+            decode_filter_specs_from_object_with_resolver(
+                Some(&filter),
+                Some(&params),
+                None,
+                &mut resolve,
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
+        );
+
+        assert_eq!(
+            decode_filter_specs_from_handle(
+                &handle_from_object(Some(&filter)),
+                &handle_from_object(Some(&params)),
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            expected
         );
     }
 
@@ -4042,7 +4139,17 @@ pub(crate) mod tests {
     fn handle_reader_matches_object_reader_for_every_filter_shape() {
         for (label, filter, parms) in shape_corpus() {
             let filter_handle = handle_from_object(filter.as_ref());
-            let parms_handle = handle_from_object(parms.as_ref());
+            // qpdf's parser stamps the document context on a direct scalar
+            // child. Keep that context for the one row whose consuming
+            // `getKeys()` call emits a recoverable type warning; all other
+            // direct rows are unchanged shape comparisons.
+            let (parms_handle, _parms_resolver) = if label == "present non-dictionary /DecodeParms"
+            {
+                let (handle, resolver) = handle_resolving(ObjectValue::Integer(1));
+                (handle, Some(resolver))
+            } else {
+                (handle_from_object(parms.as_ref()), None)
+            };
             // Every limit, because the two chain counts only show up under a
             // cap — `Some(16)` reaches the array arm's count, `Some(0)` also
             // reaches the trailing one — while every other row must be
@@ -4156,10 +4263,9 @@ pub(crate) mod tests {
         // an accepted unfiltered stream in place of a rejected document — and
         // would collapse a scalar `/DecodeParms` from `Present` to `Absent`,
         // erasing the distinction `QPDFStreamFilter::setDecodeParms`
-        // (`libqpdf/QPDFStreamFilter.cc:3-7`) rejects on. The divergence is
-        // pre-existing — `try_as_array` already answered `None` — and is
-        // pinned here so the length accessor cannot quietly adopt qpdf's
-        // treat-as-empty while looking like a pure resource change.
+        // (`libqpdf/QPDFStreamFilter.cc:3-7`) rejects on. The shape reader
+        // keeps the present scalar, and its consuming `getKeys()` call emits
+        // qpdf's recoverable type warning before returning an empty key set.
         assert_eq!(
             decode_filter_specs_from_handle(&ObjectHandle::integer(1), &ObjectHandle::null(), None)
                 .unwrap_err()
@@ -4167,9 +4273,10 @@ pub(crate) mod tests {
             "unsupported PDF feature: stream filter type is not name or array"
         );
 
+        let (decode_params, _resolver) = handle_resolving(ObjectValue::Integer(1));
         let specs = decode_filter_specs_from_handle(
             &ObjectHandle::name(b"FlateDecode".to_vec()),
-            &ObjectHandle::integer(1),
+            &decode_params,
             None,
         )
         .expect("a non-array /DecodeParms is replicated per filter, not rejected");
@@ -4981,9 +5088,12 @@ pub(crate) mod tests {
         ];
 
         for &(abbreviation, expected) in cases {
-            let filter = Object::Name(abbreviation.to_vec());
-            let specs = decode_filter_specs_from_object(Some(&filter), None, None).unwrap();
-            assert_eq!(specs[0].normalized_name(), expected);
+            assert_eq!(normalize_filter_name(abbreviation), expected);
+            if stream_filter_for(expected).is_some() {
+                let filter = Object::Name(abbreviation.to_vec());
+                let specs = decode_filter_specs_from_object(Some(&filter), None, None).unwrap();
+                assert_eq!(specs[0].normalized_name(), expected);
+            }
         }
     }
 
@@ -5729,8 +5839,10 @@ pub(crate) mod tests {
     /// The `42` row exits 3 because `getKeys` warns `typeWarning("dictionary",
     /// "treating as empty")` (`QPDFObjectHandle.cc:1005`) and hands back an
     /// empty key set; the data is still filtered, so it is an acceptance.
-    /// flpdf reproduces the empty key set, not the diagnostic — the same
-    /// present non-dictionary reduces to `Present` with no entries.
+    /// flpdf's live parser handles now emit the same warning through their
+    /// document resolver before reducing the value to `Present` with no
+    /// entries. A contextless programmatic handle retains qpdf's throwing
+    /// `typeWarning` branch.
     ///
     /// The probes used direct values throughout. A dangling indirect reference
     /// resolves to null silently and `getKeys` then drops the key, so an
@@ -6011,6 +6123,57 @@ pub(crate) mod tests {
             ]))))
         );
         assert_eq!((filter.columns, filter.colors), (i32::MAX, i32::MIN));
+    }
+
+    #[test]
+    fn handle_decode_params_warn_when_integer_values_are_saturated() {
+        let cases = [
+            (
+                i64::from(i32::MIN) - 1,
+                ParamValue::Int(i32::MIN),
+                "object 3 0: requested value of integer is too small; returning INT_MIN",
+            ),
+            (
+                i64::from(i32::MAX) + 1,
+                ParamValue::Int(i32::MAX),
+                "object 3 0: requested value of integer is too big; returning INT_MAX",
+            ),
+        ];
+
+        for (value, expected, warning) in cases {
+            let (handle, recorder) = handle_resolving(ObjectValue::Integer(value));
+
+            assert_eq!(param_value_from_handle(&handle, false).unwrap(), expected);
+            assert_eq!(warnings(&recorder), [warning]);
+        }
+    }
+
+    #[test]
+    fn snapshot_decode_params_warn_after_an_integer_was_already_resolved() {
+        let value = i64::from(i32::MAX) + 1;
+        let (child, recorder) = handle_resolving(ObjectValue::Integer(value));
+        assert_eq!(child.try_as_integer().unwrap(), Some(value));
+
+        let params = ObjectHandle::dictionary(vec![(b"/Columns".to_vec(), child)]);
+        assert_eq!(
+            decode_params_from_handle(&params, b"ASCIIHexDecode").unwrap(),
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(i32::MAX)),])
+        );
+        assert_eq!(
+            warnings(&recorder),
+            ["object 3 0: requested value of integer is too big; returning INT_MAX"]
+        );
+    }
+
+    #[test]
+    fn handle_decode_param_names_do_not_emit_integer_warnings() {
+        let (handle, recorder) = handle_resolving(ObjectValue::Name(b"Identity".to_vec()));
+
+        assert_eq!(
+            param_value_from_handle(&handle, true).unwrap(),
+            ParamValue::Name(b"Identity".to_vec())
+        );
+        assert!(warnings(&recorder).is_empty());
     }
 
     #[test]

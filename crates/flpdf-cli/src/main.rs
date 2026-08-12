@@ -2503,7 +2503,7 @@ fn run_check(
         if is_weak_crypto_advisory(diagnostic) {
             continue;
         }
-        let location = diagnostic_location(&input, diagnostic.offset);
+        let location = check_diagnostic_location(&input, diagnostic);
         match diagnostic.severity {
             Severity::Warning => {
                 let separator = if diagnostic.message.starts_with("(object ") {
@@ -5112,11 +5112,17 @@ fn probe_encryption(
         // A wrong/empty password: the document is definitely encrypted, we
         // just have not authenticated it. qpdf treats this as "encrypted,
         // password required".
-        Err(flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)) => {
-            Ok(EncryptionProbe::EncryptedAuthFailed)
-        }
+        Err(error) if is_bad_password_error(&error) => Ok(EncryptionProbe::EncryptedAuthFailed),
         Err(other) => Err(other.into()),
     }
+}
+
+fn is_bad_password_error(error: &flpdf::Error) -> bool {
+    let source = error.open_failure().map_or(error, |(source, _)| source);
+    matches!(
+        source,
+        flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
+    )
 }
 
 /// `is-encrypted FILE`: exit 0 if encrypted, exit 2 if not.
@@ -5514,6 +5520,19 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
     }
 }
 
+fn check_diagnostic_location(input: &Path, diagnostic: &flpdf::Diagnostic) -> String {
+    // Object-prefixed messages already carry qpdf's `(object N G, offset M)`
+    // context. Passing their structured offset to `diagnostic_location` would
+    // duplicate it as `file (offset M) (object N G, offset M)`. qpdf's
+    // `damagedPDF(input, offset, message)` keeps the object context in the
+    // message while the input path remains the sole outer location.
+    if diagnostic.message.starts_with("(object ") {
+        diagnostic_location(input, None)
+    } else {
+        diagnostic_location(input, diagnostic.offset)
+    }
+}
+
 /// Finish a successful operation that accumulated lazy object-recovery
 /// warnings. Any requested output has already been emitted before this is
 /// called; qpdf likewise leaves the output in place and reports exit 3.
@@ -5593,10 +5612,7 @@ fn error_with_file(input: &Path, error: Box<dyn std::error::Error>) -> Box<dyn s
 }
 
 fn actionable_password_error(error: flpdf::Error) -> Box<dyn std::error::Error> {
-    if matches!(
-        error,
-        flpdf::Error::Encrypted(flpdf::EncryptedError::BadPassword)
-    ) {
+    if is_bad_password_error(&error) {
         return "encrypted PDF: incorrect password; retry with --password or --password-file"
             .into();
     }
@@ -6058,6 +6074,47 @@ mod tests {
         assert_eq!(
             chunks.concat(),
             b"page 1: 3 0 R\n  media-box: [ 0 0 612 792 ]\n  resources: << /Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ] >>\n  contents: 7 0 R\n  rotate: 0\n"
+        );
+    }
+
+    #[test]
+    fn probe_encryption_classifies_bad_password_after_repair_warnings() {
+        let mut input =
+            include_bytes!("../../../tests/fixtures/compat/encrypted-r4-three-page.pdf").to_vec();
+        let xref = input
+            .windows(4)
+            .position(|window| window == b"xref")
+            .expect("encrypted fixture should contain an xref keyword");
+        input[xref + 2] = b'X';
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("damaged-encrypted.pdf");
+        std::fs::write(&path, input).expect("write damaged encrypted fixture");
+        let outcome = probe_encryption(
+            &path,
+            true,
+            &PasswordArgs {
+                password: Some("wrong".to_owned()),
+                ..PasswordArgs::default()
+            },
+        );
+
+        assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
+    }
+
+    #[test]
+    fn check_diagnostic_location_does_not_duplicate_object_offset() {
+        let object_warning =
+            flpdf::Diagnostic::warning("(object 5 0, offset 232): expected endobj", Some(232));
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &object_warning),
+            "input.pdf"
+        );
+
+        let ordinary_warning = flpdf::Diagnostic::warning("xref warning", Some(12));
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &ordinary_warning),
+            "input.pdf (offset 12)"
         );
     }
 

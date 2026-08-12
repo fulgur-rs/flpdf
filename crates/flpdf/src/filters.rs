@@ -10,8 +10,9 @@ use crate::stream_filter::expect_first_filter_input;
 use crate::stream_filter::{
     decode_filter_specs_from_handle, decode_filter_specs_from_object,
     decode_filter_specs_from_object_with_resolver, encode_flate, encode_run_length,
-    stream_filter_for, validate_filter_chain_count, DecodeParams, FilterDecodePhase, FilterSpec,
-    CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
+    passthrough_codec_label as stream_passthrough_codec_label, stream_filter_for,
+    undecodable_filter_error, validate_filter_chain_count, DecodeParams, FilterDecodePhase,
+    FilterSpec, CRYPT_STAGE_UNSUPPORTED, DECODE_OUTPUT_LIMIT_PREFIX,
 };
 use crate::{Dictionary, Error, Object, Result};
 
@@ -76,13 +77,7 @@ pub(crate) fn validate_filter_chain_len(filters: &[Object]) -> Result<()> {
 /// Comparison is **byte-exact** (PDF names are case-sensitive per spec).
 /// Returns `None` for any other filter name.
 pub fn passthrough_codec_label(filter_name: &[u8]) -> Option<&'static str> {
-    match filter_name {
-        b"DCTDecode" => Some("DCTDecode"),
-        b"JBIG2Decode" => Some("JBIG2Decode"),
-        b"JPXDecode" => Some("JPXDecode"),
-        b"CCITTFaxDecode" => Some("CCITTFaxDecode"),
-        _ => None,
-    }
+    stream_passthrough_codec_label(filter_name)
 }
 
 /// Decode `stream_data` by applying the stream dictionary's `/Filter` chain,
@@ -923,19 +918,6 @@ fn decode_codec_prefix(
         .expect("preflighted codec prefix pipeline is infallible")
 }
 
-/// Report why a filter name has no decode route.
-fn undecodable_filter_error(filter_name: &[u8]) -> Error {
-    if let Some(label) = passthrough_codec_label(filter_name) {
-        return Error::Unsupported(format!(
-            "passthrough codec {label}: image/binary stream data is not decoded by flpdf (preserved verbatim)"
-        ));
-    }
-    Error::Unsupported(format!(
-        "unsupported stream filter: {}",
-        std::str::from_utf8(filter_name).unwrap_or("<binary>")
-    ))
-}
-
 fn encode_stream_data_with_filters(
     filter: Option<&Object>,
     decode_params: Option<&Object>,
@@ -1026,9 +1008,11 @@ fn apply_single_filter_encode(
 mod tests {
     use super::*;
     use crate::object_handle::identity_tests::resolver_bearing_handle;
+    use crate::object_handle::warning_emission_tests::{handle_resolving, WarningRecorder};
     use crate::object_handle::ObjectValue;
     use crate::pipeline::lzw::pack_codes;
     use crate::stream_filter::{tests::handle_from_object, ParamValue};
+    use std::rc::Rc;
 
     #[test]
     fn decode_limits_default_to_unbounded_output_and_sixteen_filters() {
@@ -1134,6 +1118,45 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: stream /DecodeParms length is inconsistent with filters"
+        );
+    }
+
+    #[test]
+    fn unknown_filter_precedes_misaligned_decode_parms_on_all_decode_entry_points() {
+        let filter = Object::Array(vec![
+            Object::Name(b"BogusDecode".to_vec()),
+            Object::Name(b"FlateDecode".to_vec()),
+        ]);
+        let params = Object::Array(vec![Object::Null]);
+        let expected = "unsupported PDF feature: unsupported stream filter: BogusDecode";
+
+        let mut legacy = Dictionary::new();
+        legacy.insert("Filter", filter.clone());
+        legacy.insert("DecodeParms", params.clone());
+        assert_eq!(
+            decode_stream_data(&legacy, b"payload")
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+
+        let mut resolve = |value: &Object| value.clone();
+        assert_eq!(
+            decode_stream_data_from_xref_context(&legacy, b"payload", &mut resolve)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+
+        let native = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), handle_from_object(Some(&filter))),
+            (b"DecodeParms".to_vec(), handle_from_object(Some(&params))),
+        ]);
+        assert_eq!(
+            decode_stream_data_from_handle(&native, b"payload", DecodeLimits::default())
+                .unwrap_err()
+                .to_string(),
+            expected
         );
     }
 
@@ -3940,18 +3963,24 @@ mod tests {
                 dictionary
             }
 
-            fn native_dictionary(&self) -> ObjectHandle {
+            fn native_dictionary(&self) -> (ObjectHandle, Option<Rc<WarningRecorder>>) {
                 let mut entries = Vec::new();
                 if let Some(filter) = &self.filter {
                     entries.push((b"Filter".to_vec(), handle_from_object(Some(filter))));
                 }
+                let mut decode_params_resolver = None;
                 if let Some(decode_params) = &self.decode_params {
-                    entries.push((
-                        b"DecodeParms".to_vec(),
-                        handle_from_object(Some(decode_params)),
-                    ));
+                    let decode_params_handle =
+                        if self.label == "present non-dictionary /DecodeParms" {
+                            let (handle, resolver) = handle_resolving(ObjectValue::Integer(1));
+                            decode_params_resolver = Some(resolver);
+                            handle
+                        } else {
+                            handle_from_object(Some(decode_params))
+                        };
+                    entries.push((b"DecodeParms".to_vec(), decode_params_handle));
                 }
-                ObjectHandle::dictionary(entries)
+                (ObjectHandle::dictionary(entries), decode_params_resolver)
             }
         }
 
@@ -4209,7 +4238,7 @@ mod tests {
         fn legacy_and_native_entry_points_agree_on_every_corpus_row() {
             for row in corpus() {
                 let legacy = row.legacy_dictionary();
-                let native = row.native_dictionary();
+                let (native, _native_resolver) = row.native_dictionary();
                 for max_filter_chain in [None, Some(16), Some(0)] {
                     for max_output in [None, Some(1999), Some(2000)] {
                         let limits = DecodeLimits {
@@ -4305,6 +4334,8 @@ mod tests {
                     stream_data: stream_data.clone(),
                 };
                 let (unread_row, empty_row) = (row(&unread), row(&empty));
+                let (unread_native, _unread_resolver) = unread_row.native_dictionary();
+                let (empty_native, _empty_resolver) = empty_row.native_dictionary();
 
                 for max_filter_chain in [None, Some(16), Some(0)] {
                     for max_output in [None, Some(1), Some(2000)] {
@@ -4345,12 +4376,12 @@ mod tests {
                         );
                         assert_eq!(
                             comparable_outcome(decode_stream_data_recovering_from_handle(
-                                &unread_row.native_dictionary(),
+                                &unread_native,
                                 &unread_row.stream_data,
                                 limits,
                             )),
                             comparable_outcome(decode_stream_data_recovering_from_handle(
-                                &empty_row.native_dictionary(),
+                                &empty_native,
                                 &empty_row.stream_data,
                                 limits,
                             )),
@@ -4358,12 +4389,12 @@ mod tests {
                         );
                         assert_eq!(
                             comparable_bytes(decode_stream_data_from_handle(
-                                &unread_row.native_dictionary(),
+                                &unread_native,
                                 &unread_row.stream_data,
                                 limits,
                             )),
                             comparable_bytes(decode_stream_data_from_handle(
-                                &empty_row.native_dictionary(),
+                                &empty_native,
                                 &empty_row.stream_data,
                                 limits,
                             )),
@@ -4398,8 +4429,9 @@ mod tests {
             let outcomes: Vec<Vec<ComparableEvent>> = corpus()
                 .iter()
                 .filter_map(|row| {
+                    let (native, _native_resolver) = row.native_dictionary();
                     decode_stream_data_recovering_from_handle(
-                        &row.native_dictionary(),
+                        &native,
                         &row.stream_data,
                         DecodeLimits::default(),
                     )

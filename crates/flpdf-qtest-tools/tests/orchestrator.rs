@@ -118,6 +118,31 @@ startxref
 %%EOF
 ";
 
+fn deep_trailer_pdf(marker: i64) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.7\n".to_vec();
+    let object_1 = pdf.len();
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+    let object_2 = pdf.len();
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n");
+
+    let xref = pdf.len();
+    pdf.extend_from_slice(
+        format!("xref\n0 3\n0000000000 65535 f\n{object_1:010} 00000 n\n{object_2:010} 00000 n\n")
+            .as_bytes(),
+    );
+    let mut deep = "1".to_owned();
+    for _ in 0..300 {
+        deep = format!("[ {deep} ]");
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size 3 /Root 1 0 R /Deep {deep} /Marker {marker} >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
 // -------- tests --------
 
 #[test]
@@ -147,4 +172,14 @@ fn per_object_content_diff_labels_as_n_g_without_r() {
     // (matches qpdf's QPDFObjGen::unparse), NOT "2 0 R" (ObjectRef::Display).
     let out = compare_files(MINIMAL_PDF, MINIMAL_PDF_COUNT1, b"").expect("open + compare");
     assert_eq!(out.as_deref(), Some("2 0: object contents differ"));
+}
+
+#[test]
+fn parseable_deep_trailers_are_not_degraded_before_comparison() {
+    let actual = deep_trailer_pdf(1);
+    let expected = deep_trailer_pdf(2);
+
+    let out = compare_files(&actual, &expected, b"").expect("deep trailers should compare");
+
+    assert_eq!(out.as_deref(), Some("trailer: object contents differ"));
 }

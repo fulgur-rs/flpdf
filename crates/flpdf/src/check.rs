@@ -55,7 +55,9 @@ pub struct CheckSummary {
 ///
 /// - [`Error::Encrypted`] when the document is encrypted and cannot be opened; unlike
 ///   other input-facing open failures, this is propagated rather than downgraded to a
-///   diagnostic.
+///   diagnostic. If repair warnings were collected first, the returned value is
+///   [`Error::OpenFailure`]; inspect [`Error::open_failure`] to recover the
+///   encrypted terminal source and its diagnostics.
 /// - [`Error::System`] or [`Error::Internal`] when runtime or logic failures occur while
 ///   delivering warnings through the configured logger; these are propagated unchanged.
 /// - A failed linearization probe via [`Pdf::is_linearized`] is recorded as a
@@ -87,10 +89,11 @@ pub fn check_reader<R: Read + Seek + 'static>(reader: R) -> crate::Result<CheckR
 ///
 /// # Errors
 ///
-/// - When `options.repair` is set, behaves like [`check_reader`]: [`Error::Encrypted`],
-///   [`Error::System`], and [`Error::Internal`] are propagated from the open path, while
-///   other input-facing open failures become an error [`Diagnostic`] inside an
-///   `Ok(CheckReport)`.
+/// - When `options.repair` is set, behaves like [`check_reader`]: encrypted,
+///   system, and internal terminal sources are propagated from the open path,
+///   possibly inside [`Error::OpenFailure`] when repair diagnostics were
+///   collected; other input-facing open failures become an error [`Diagnostic`]
+///   inside an `Ok(CheckReport)`.
 /// - When `options.repair` is clear, any error from [`Pdf::open_with_options`] is
 ///   propagated unchanged (e.g. [`Error::Io`], [`Error::Parse`], [`Error::Encrypted`]).
 /// - A failed linearization probe via [`Pdf::is_linearized`] is recorded as a
@@ -179,7 +182,12 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
     let mut pdf = if allow_repair {
         match Pdf::open_with_options(reader, options) {
             Ok(pdf) => pdf,
-            Err(error @ (Error::Encrypted(_) | Error::System(_) | Error::Internal(_))) => {
+            Err(error)
+                if matches!(
+                    open_failure_source(&error),
+                    Error::Encrypted(_) | Error::System(_) | Error::Internal(_)
+                ) =>
+            {
                 return Err(error);
             }
             Err(error) => {
@@ -260,6 +268,12 @@ fn check_reader_inner_with_options<R: Read + Seek + 'static>(
         diagnostics,
         summary: Some(summary),
     })
+}
+
+fn open_failure_source(error: &Error) -> &Error {
+    error
+        .open_failure()
+        .map_or(error, |(source, _diagnostics)| source)
 }
 
 /// The generalized filters flpdf fully decodes. A decode failure on a stream

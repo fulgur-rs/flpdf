@@ -115,6 +115,43 @@ fn resolve_object_handle_resolves_the_catalog_dictionary() {
 }
 
 #[test]
+fn pdf_exposes_the_effective_qpdf_xref_table_without_free_rows() {
+    let pdf = Pdf::open_mem(std::sync::Arc::from(compressed_entry_pdf())).unwrap();
+
+    let xref = pdf.get_xref_table();
+
+    assert!(!xref
+        .values()
+        .any(|entry| matches!(entry, flpdf::XrefEntry::Free { .. })));
+    assert_eq!(
+        xref.get(&ObjectRef::new(2, 0)),
+        Some(&flpdf::XrefEntry::Compressed {
+            stream: 3,
+            index: 0,
+        })
+    );
+}
+
+#[test]
+fn get_all_objects_prepares_source_and_dangling_canonical_handles() {
+    let bytes = classic_pdf_with_bodies(
+        &[b"1 0 obj\n<< /Dangling 9 0 R >>\nendobj\n"],
+        ObjectRef::new(1, 0),
+    );
+    let mut pdf = Pdf::open_mem(std::sync::Arc::from(bytes)).unwrap();
+
+    let objects = pdf.get_all_objects().expect("get all objects");
+    let refs: Vec<_> = objects
+        .iter()
+        .map(|handle| handle.object_ref().expect("indirect object"))
+        .collect();
+
+    assert_eq!(refs, vec![ObjectRef::new(1, 0), ObjectRef::new(9, 0)]);
+    assert!(objects[0].is_resolved());
+    assert!(objects[1].is_indirect());
+}
+
+#[test]
 fn dictionary_handles_use_qpdf_slash_prefixed_decoded_keys() {
     let bytes = classic_pdf_with_bodies(
         &[
@@ -624,8 +661,10 @@ fn canonical_unterminated_dictionary_resolves_to_null_with_diagnostics() {
         .collect();
     assert!(messages
         .iter()
-        .any(|message| message == &"parse error while reading object"));
-    assert!(messages.iter().any(|message| message == &"unexpected EOF"));
+        .any(|message| message.ends_with("parse error while reading object")));
+    assert!(messages
+        .iter()
+        .any(|message| message.ends_with("unexpected EOF")));
 }
 
 #[test]
@@ -648,8 +687,10 @@ fn canonical_unterminated_array_resolves_to_null_with_diagnostics() {
         .collect();
     assert!(messages
         .iter()
-        .any(|message| message == &"parse error while reading object"));
-    assert!(messages.iter().any(|message| message == &"unexpected EOF"));
+        .any(|message| message.ends_with("parse error while reading object")));
+    assert!(messages
+        .iter()
+        .any(|message| message.ends_with("unexpected EOF")));
 }
 
 #[test]
@@ -673,11 +714,9 @@ fn canonical_nesting_past_max_parse_depth_resolves_to_null_with_warning() {
                 .expect("qpdf parser recovers excessive nesting");
 
             assert!(handle.is_null());
-            assert!(pdf
-                .repair_diagnostics()
-                .entries()
-                .iter()
-                .any(|entry| entry.message == "ignoring excessively deeply nested data structure"));
+            assert!(pdf.repair_diagnostics().entries().iter().any(|entry| entry
+                .message
+                .ends_with("ignoring excessively deeply nested data structure")));
         })
         .expect("comparison thread must start")
         .join()

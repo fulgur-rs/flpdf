@@ -1,7 +1,6 @@
 //! qpdf correspondence: QPDF's central document container, direct document-state accessors, and teardown (`include/qpdf/QPDF.hh:1438-1518`; `libqpdf/QPDF.cc:215-232,2323-2358,2647-2651`).
 
 use crate::cache::ObjectCache;
-use crate::object_handle::ObjectValue;
 use crate::reader::resolver::ResolverHandle;
 use crate::reader::EncryptionState;
 use crate::{Dictionary, Object, ObjectHandle, ObjectRef, XrefForm};
@@ -116,6 +115,12 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// [`Pdf::delete_object`] so the next resolve re-derives from the
     /// updated handle.
     pub(crate) legacy_materialized_memo: BTreeMap<ObjectRef, Object>,
+    /// Entries in [`Self::legacy_materialized_memo`] that are authoritative
+    /// caller-supplied replacements which still need to be lifted into the
+    /// canonical handle graph. Compatibility snapshots populated by
+    /// [`Pdf::resolve_borrowed`] are deliberately not included: reconciling
+    /// those must not materialize a lazy source stream just to compare it.
+    pub(crate) legacy_materialized_replacement_refs: BTreeSet<ObjectRef>,
     pub(crate) compressed_member_parents: BTreeMap<ObjectRef, CompressedMemberProvenance>,
     /// Every uncompressed object offset, sorted ascending and deduplicated. Used
     /// to bound a single object read to the start of the next object in the file
@@ -233,14 +238,12 @@ impl<R: Read + Seek> Pdf<R> {
         &self.trailer
     }
 
-    // Degrade to a null handle rather than propagating `lift`'s depth error
-    // or panicking: a trailer is always fully parsed already (by the legacy
-    // engine, whose own recursion bound — `parser::MAX_PARSE_DEPTH`, 500 — is
-    // *higher* than `lift`'s `MAX_INLINE_DEPTH`, 256), so a crafted-but
-    // -parseable trailer with literal nesting between those two bounds is
-    // reachable here even though it never occurs for a realistic document.
-    // Mirrors how `resolve`/`resolve_borrowed` already present a
-    // structurally-unusable reference as `Object::Null` rather than erroring.
+    // Degrade to a null handle rather than propagating the legacy materializer's
+    // depth error or panicking: the trailer is always fully parsed already, so
+    // the handle bridge accepts the same `parser::MAX_PARSE_DEPTH` bound as the
+    // parser itself. A value beyond that accepted bound is structurally
+    // unusable here, just as `resolve`/`resolve_borrowed` present an unusable
+    // reference as `Object::Null` rather than erroring.
     //
     // Memoized in `self.trailer_handle_memo`, the same way `handle_registry`
     // memoizes indirect handles: `self.trailer` is set once at construction
@@ -253,18 +256,19 @@ impl<R: Read + Seek> Pdf<R> {
     /// The trailer is always a direct, in-memory dictionary — it is never
     /// itself an indirect object per the PDF spec — so the returned handle is
     /// always direct. A trailer whose literal (non-indirect) nesting exceeds
-    /// the crate's inline-object-nesting bound yields a null handle instead —
-    /// note this degrades the *entire* trailer, so a caller that only cares
-    /// about one key and cannot tolerate an unrelated sibling entry's nesting
-    /// erasing it should use [`Pdf::trailer_key_handle`] instead. Repeated
-    /// calls return the same shared handle.
+    /// the parser's accepted bound yields a null handle instead — note this
+    /// degrades the *entire* trailer, so a caller that only cares about one
+    /// key and cannot tolerate an unrelated sibling entry's nesting erasing it
+    /// should use [`Pdf::trailer_key_handle`] instead. Repeated calls return
+    /// the same shared handle.
     pub fn trailer_handle(&mut self) -> ObjectHandle {
         if let Some(handle) = &self.trailer_handle_memo {
             return handle.clone();
         }
         let trailer = Object::Dictionary(self.trailer.clone());
-        let value = self.lift(&trailer, 0).unwrap_or(ObjectValue::Null);
-        let handle = ObjectHandle::from_value(value);
+        let handle = self
+            .lift_to_handle_bounded(&trailer, 0, crate::parser::MAX_PARSE_DEPTH)
+            .unwrap_or_else(|_| ObjectHandle::null());
         self.trailer_handle_memo = Some(handle.clone());
         handle
     }

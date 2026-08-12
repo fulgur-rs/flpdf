@@ -5,23 +5,9 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
-use crate::object::{Dictionary, Object, ObjectRef};
-use crate::ref_chain::terminal_ref_of_chain;
+use crate::object::ObjectRef;
+use crate::object_handle::ObjectHandle;
 use crate::{Error, Pdf, Result};
-
-/// Raw-`Object` counterpart of qpdf's null-aware dictionary `hasKey` test.
-///
-/// TODO(flpdf-25kg.3.5): delete this adapter when page-tree repair consumes
-/// resolver-backed `ObjectHandle`s and can call `ObjectHandle::try_has_key`.
-fn raw_object_key_is_visible<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    value: Option<&Object>,
-) -> Result<bool> {
-    match value {
-        Some(value) => Ok(!crate::qpdf_null::value_is_null(pdf, value)?),
-        None => Ok(false),
-    }
-}
 
 /// The effective `/Pages` root and leaf order after qpdf-compatible repair.
 ///
@@ -64,556 +50,281 @@ pub(crate) fn prepare_for_optimization_with_max_depth<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     max_depth: usize,
 ) -> Result<Option<PreparedPages>> {
-    // This function is flpdf's repair-and-enumerate counterpart to
-    // QPDF::getAllPages(). qpdf records the observation before it looks up
-    // the catalog /Pages value (QPDF_pages.cc:40-48), so missing or malformed
-    // roots still count as an attempted complete page-tree enumeration.
+    prepare_for_optimization_canonical(pdf, max_depth)
+}
+
+/// Canonical qpdf-style page-tree preparation.
+///
+/// The complete repair walk is intentionally expressed in terms of live
+/// [`ObjectHandle`]s. This is the `QPDF::getAllPages` / `getAllPagesInternal`
+/// boundary (`libqpdf/QPDF_pages.cc:39-150`): the catalog, `/Pages` root,
+/// `/Kids` array, and every leaf all retain their canonical identity while
+/// repair mutates them.
+fn prepare_for_optimization_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    max_depth: usize,
+) -> Result<Option<PreparedPages>> {
     pdf.mark_get_all_pages_called();
 
     let Some(root_ref) = pdf.root_ref() else {
         return Ok(None);
     };
-    let pages = match pdf.resolve_borrowed(root_ref)? {
-        Object::Dictionary(d) => d.get("Pages").cloned(),
-        _ => None,
-    };
-    let Some(pages) = pages else {
+    let catalog = pdf.get_object_handle(root_ref);
+    let mut pages = catalog.try_get_key(b"/Pages")?;
+    if pages.is_null() {
         return Ok(None);
-    };
+    }
 
-    let (mut pages_ref, mut direct_root) = match pages {
-        Object::Reference(pages_ref) => (pages_ref, None),
-        Object::Dictionary(pages) => (ObjectRef::new(0, 0), Some(pages)),
-        _ => return Ok(None),
-    };
-
-    // qpdf's `pushInheritedAttributesToPage` calls `getAllPages` first
-    // (QPDF_optimization.cc:138-140). `getAllPages` performs two families of
-    // page-tree repair before the push sees the tree. First (QPDF_pages.cc:50-67)
-    // it corrects a catalog whose `/Pages` points INTO the tree (e.g. at the
-    // first page) instead of at the true root, by walking `/Parent` up to the
-    // real root and rewriting the root `/Pages` — repair (6) below. Then
-    // `getAllPagesInternal` (QPDF_pages.cc:77-138) repairs the tree itself:
-    // cloning any `/Page` leaf reachable more than once in the `/Kids` tree
-    // (:119-130), overriding mistyped interior/leaf `/Type` keys (:89-92,
-    // :131-134), and defaulting a leaf's missing/invalid `/MediaBox` to
-    // letter / ANSI A `[0 0 612 792]` when no ancestor supplies a rectangle
-    // (:93-96, :104-112) — so the push below sees a well-formed tree.
-    // qpdf 11.9.0's `getAllPagesInternal` performs these repairs unconditionally
-    // (there is no xref-reconstruction gate anywhere in QPDF_pages.cc:77-138), so
-    // flpdf runs them for every input, whether or not the xref was reconstructed.
-
-    // (6) Correct a catalog whose `/Pages` points into the tree instead of at
-    // the true root, by walking `/Parent` up (QPDF_pages.cc:50-67). This runs
-    // before `repair_page_tree` so the subsequent walk (and `push_internal`
-    // below) start from the corrected root, matching qpdf's getAllPages order.
+    // qpdf corrects a catalog that points into the tree by following
+    // `/Parent` until the true root (`QPDF_pages.cc:50-67`). Track canonical
+    // handle identity so the guard covers both indirect ObjGen slots and
+    // direct dictionaries that share the same live allocation.
     let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
+    let mut seen_parent_direct: Vec<ObjectHandle> = Vec::new();
     let mut changed_pages = false;
+    let mut warned = false;
     loop {
-        let parent = if let Some(direct) = direct_root.as_ref() {
-            direct.get("Parent").cloned()
+        let repeated = if let Some(object_ref) = pages.object_ref() {
+            !seen_parent.insert(object_ref)
+        } else if seen_parent_direct
+            .iter()
+            .any(|seen| seen.is_same_object_as(&pages))
+        {
+            true
         } else {
-            if !seen_parent.insert(pages_ref) {
-                break; // Loop guard (qpdf's `seen.add`): a `/Parent` cycle.
-            }
-            match pdf.resolve_borrowed(pages_ref)? {
-                Object::Dictionary(d) => d.get("Parent").cloned(),
-                _ => None, // Not a dictionary: stop.
-            }
+            seen_parent_direct.push(pages.clone());
+            false
         };
-        let Some(parent) = parent else {
-            break;
-        };
-        if !raw_object_key_is_visible(pdf, Some(&parent))? {
+        if repeated {
             break;
         }
-        match parent {
-            Object::Reference(parent_ref) => {
-                pages_ref = parent_ref;
-                direct_root = None;
-            }
-            Object::Dictionary(parent) => {
-                direct_root = Some(parent);
-            }
-            // qpdf replaces catalog `/Pages` with any parent handle, including
-            // a scalar, then finds no dictionary tree to enumerate.
-            parent => {
-                if let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? {
-                    root_dict.insert("Pages", parent);
-                    pdf.set_object(root_ref, Object::Dictionary(root_dict));
-                }
-                return Ok(None);
-            }
+        if !pages.try_has_key(b"/Parent")? {
+            break;
         }
+        let parent = pages.try_get_key(b"/Parent")?;
+        if parent.is_null() {
+            break; // cov:ignore: qpdf-compatible try_has_key hides direct and indirect null values first
+        }
+        if !warned {
+            catalog.warn_if_possible(
+                "document page tree root (root -> /Pages) doesn't point to the root of the page tree; attempting to correct",
+            )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+            warned = true;
+        }
+        pages = parent;
         changed_pages = true;
     }
     if changed_pages {
-        let Object::Dictionary(mut root_dict) = pdf.resolve(root_ref)? else {
-            // cov:ignore-start: root_ref was resolved as a catalog dictionary before reading /Pages
-            return Ok(None);
-            // cov:ignore-end
-        };
-        let corrected = match &direct_root {
-            Some(root) => Object::Dictionary(root.clone()),
-            None => Object::Reference(pages_ref),
-        };
-        root_dict.insert("Pages", corrected);
-        pdf.set_object(root_ref, Object::Dictionary(root_dict));
+        catalog.replace_key(b"/Pages", pages.clone());
+        pdf.mark_object_handle_dirty(&catalog)?;
     }
 
-    // Compute the first free object number once and carry it through the
-    // walk, incrementing per clone. Re-deriving it with `next_object_ref`
-    // for every clone would rescan all object refs each time, making a
-    // `/Kids` array with many duplicate leaves quadratic.
-    let mut state = RepairState {
+    // qpdf's getAllPages returns an empty cache for a dictionary without
+    // `/Kids`, but a scalar `/Pages` value cannot be a page-tree root.
+    if pages.try_as_dictionary()?.is_none() {
+        return Ok(None);
+    }
+
+    let mut state = CanonicalRepairState {
         seen: BTreeSet::new(),
         visited: BTreeSet::new(),
-        next_clone: next_object_ref(pdf)?,
+        visited_direct: Vec::new(),
         pages: Vec::new(),
     };
-    let page_root = if let Some(mut direct_root) = direct_root {
-        repair_direct_page_tree(pdf, &mut direct_root, &mut state, 0, false, max_depth)?;
-        let Object::Dictionary(mut catalog) = pdf.resolve(root_ref)? else {
-            // cov:ignore-start: root_ref was resolved as a catalog dictionary before reading /Pages
-            return Ok(None);
-            // cov:ignore-end
-        };
-        catalog.insert("Pages", Object::Dictionary(direct_root));
-        pdf.set_object(root_ref, Object::Dictionary(catalog));
-        PageTreeRoot::Direct { catalog: root_ref }
-    } else {
-        repair_page_tree(pdf, pages_ref, &mut state, 0, false, max_depth)?;
-        PageTreeRoot::Indirect(pages_ref)
-    };
+    if pages.try_has_key(b"/Kids")? {
+        repair_page_tree_handle(pdf, pages.clone(), &mut state, 0, false, max_depth)?;
+    }
 
+    let root = match pages.object_ref() {
+        Some(object_ref) => PageTreeRoot::Indirect(object_ref),
+        None => PageTreeRoot::Direct { catalog: root_ref },
+    };
     Ok(Some(PreparedPages {
-        root: page_root,
+        root,
         pages: state.pages,
     }))
 }
 
-struct RepairState {
+struct CanonicalRepairState {
     seen: BTreeSet<ObjectRef>,
     visited: BTreeSet<ObjectRef>,
-    next_clone: ObjectRef,
+    visited_direct: Vec<ObjectHandle>,
     pages: Vec<ObjectRef>,
 }
 
-/// Partial mirror of qpdf 11.9.0 `getAllPagesInternal` (QPDF_pages.cc:77-138):
-/// walk the `/Kids` tree depth-first, repairing page-tree nodes in place so the
-/// subsequent inherited-attribute push sees a well-formed tree. Five repairs
-/// from `getAllPagesInternal` are applied:
+/// Canonical `QPDF::getAllPagesInternal` walk (`QPDF_pages.cc:77-138`).
 ///
-/// - **Interior `/Type`** (:89-92): a node reached as an interior node (one with
-///   `/Kids`) whose `/Type` is not `/Pages` has it overridden to `/Pages`.
-/// - **`/MediaBox` default** (:93-96, :104-112): `media_box` tracks whether this
-///   node or any ancestor already supplies a `/MediaBox` rectangle; it is set
-///   from this node's own `/MediaBox` (:93-96) and threaded into the recursion.
-///   A leaf that lacks a valid `/MediaBox` rectangle while `media_box` is false
-///   has its `/MediaBox` set to a direct letter / ANSI A array `[0 0 612 792]`.
-///   Applied to the original leaf *before* the direct-leaf and duplicate-clone
-///   decisions (qpdf order :104-112 before :113-130), so a minted object
-///   inherits the defaulted box.
-/// - **Direct leaf → indirect** (:113-118): a `/Kids` entry that is a direct
-///   (inline) `/Page` dict with no `/Kids` of its own is minted into a fresh
-///   indirect object (via the same running allocator as the clone below) and the
-///   entry is rewritten to that reference (qpdf's `makeIndirectObject`). The
-///   minted object carries NO synthesized `/Parent` (`makeIndirectObject` adds
-///   none). A direct *interior* node (a direct dict WITH `/Kids`) is out of
-///   scope: qpdf recurses into it in place (:101-102), which flpdf's
-///   reference-keyed walk cannot do, so it is left direct and untouched (no
-///   golden exists for this exotic shape).
-/// - **Duplicate leaf** (:119-130): the first occurrence of a `/Page` leaf is
-///   recorded; each later occurrence is replaced, in the parent's `/Kids` array,
-///   by a fresh shallow copy of the leaf dict (indirect sub-objects such as
-///   `/Contents` stay shared, and the original leaf's `/Parent` is kept — the
-///   clone arm never flattens).
-/// - **Leaf `/Type`** (:131-134): a leaf (no `/Kids`) whose `/Type` is not
-///   `/Page` has it overridden to `/Page`, for both a first-occurrence leaf and
-///   a freshly minted clone.
-///
-/// A well-formed tree (correct `/Type` keys, every leaf with a `/MediaBox` or an
-/// ancestor supplying one, no shared leaf) is a complete no-op — no node is
-/// rewritten and no object is minted. The walk order matches
-/// `getAllPagesInternal` (depth-first, recursing into any kid that has a `/Kids`
-/// key) so the minted clone object numbers match qpdf's. `next_clone` is the
-/// running next free object number, threaded through the walk and incremented
-/// per clone (qpdf allocates from a running maximum rather than rescanning),
-/// which keeps cloning many duplicates linear rather than quadratic.
-///
-/// Direct `/Kids` entries: a direct *leaf* is mirrored (minted to indirect, the
-/// **Direct leaf → indirect** repair above); a direct *interior* node remains
-/// out of scope (qpdf's recurse-in-place at :101-102 is not mirrored). A direct
-/// non-dictionary entry is skipped, as the inherited-attribute push does.
-fn repair_page_tree<R: Read + Seek>(
+/// The holder and every child remain live handles throughout this function.
+/// In particular, a direct child is promoted through
+/// `QPDF::makeIndirectObject`'s shared-allocation counterpart before the
+/// containing `/Kids` array is updated; no raw-object replacement is used.
+fn repair_page_tree_handle<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    node_ref: ObjectRef,
-    state: &mut RepairState,
+    node: ObjectHandle,
+    state: &mut CanonicalRepairState,
     depth: usize,
-    media_box: bool,
+    inherited_media_box: bool,
     max_depth: usize,
 ) -> Result<()> {
     if depth >= max_depth {
+        let location = node
+            .object_ref()
+            .map_or_else(|| "direct /Pages node".to_owned(), |r| r.to_string());
         return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {max_depth} at {node_ref}"
+            "page tree depth exceeds maximum of {max_depth} at {location}"
         )));
     }
-    if !state.visited.insert(node_ref) {
-        return Err(Error::Unsupported(format!(
-            "page tree cycle detected at {node_ref}"
-        )));
+    if let Some(object_ref) = node.object_ref() {
+        if !state.visited.insert(object_ref) {
+            return Err(Error::Unsupported(format!(
+                "page tree cycle detected at {object_ref}"
+            )));
+        }
+    } else if state
+        .visited_direct
+        .iter()
+        .any(|seen| seen.is_same_object_as(&node))
+    {
+        return Err(Error::Unsupported(
+            "page tree cycle detected at direct /Pages node".to_owned(),
+        ));
+    } else {
+        state.visited_direct.push(node.clone());
     }
-    let Object::Dictionary(mut dict) = pdf.resolve(node_ref)? else {
-        return Ok(()); // Non-dictionary node: nothing to walk.
+
+    node.try_dereference()?;
+    if node.try_as_dictionary()?.is_none() || !node.try_has_key(b"/Kids")? {
+        return Ok(()); // cov:ignore: callers recurse only after observing a dictionary /Kids key
+    }
+
+    if !node.try_is_dictionary_of_type(b"Pages", b"")? {
+        node.warn_if_possible("/Type key should be /Pages but is not; overriding")?;
+        replace_handle_key(pdf, &node, b"/Type", ObjectHandle::name(b"Pages".to_vec()))?;
+    }
+
+    let media_box = if inherited_media_box {
+        true
+    } else {
+        is_rectangle_handle(&node.try_get_key(b"/MediaBox")?)?
     };
-    let Some(mut kids) = dict
-        .get("Kids")
-        .and_then(Object::as_array)
-        .map(<[Object]>::to_vec)
-    else {
-        return Ok(()); // No /Kids: a leaf reached directly, or a malformed node.
-    };
-
-    // `kids` is a local copy that does not borrow `pdf`, so we can rewrite an
-    // entry in place while separately resolving/minting through `pdf`.
-    let mut changed = false;
-
-    // (2i) Override this interior node's /Type to /Pages if it is not already
-    // (QPDF_pages.cc:89-92). qpdf runs getAllPagesInternal only on /Kids-bearing
-    // nodes (getAllPages gates the root on `pages.hasKey("/Kids")`, recursion on
-    // the kid's /Kids), so reaching here — past the /Kids guard — is exactly that
-    // condition. An already-`/Pages` node is left untouched (no rewrite).
-    if !type_name_is(&dict, b"Pages") {
-        dict.insert("Type", Object::Name(b"Pages".to_vec()));
-        changed = true;
-    }
-
-    // (2m) Track whether this node or any ancestor supplies a /MediaBox rectangle
-    // (QPDF_pages.cc:93-96). Once true it stays true down the subtree, so a leaf
-    // that inherits a rectangle is not defaulted. Threaded into the recursion.
-    let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
-
-    for kid in kids.iter_mut() {
-        let kid_ref = if let Object::Reference(r) = &*kid {
-            *r
-        } else if let Object::Dictionary(d) = &mut *kid {
-            // A DIRECT (inline) /Kids entry. qpdf 11.9.0's getAllPagesInternal
-            // classifies interior-vs-leaf by `kid.hasKey("/Kids")` before any
-            // direct→indirect conversion (QPDF_pages.cc:100-118), so branch the
-            // same way here.
-            if raw_object_key_is_visible(pdf, d.get("Kids"))? {
-                // (1i) Direct *interior* node (a direct dict WITH /Kids). qpdf
-                // recurses into it in place (:101-102) and keeps the node direct;
-                // only direct leaves are materialized.
-                repair_direct_page_tree(pdf, d, state, depth + 1, media_box, max_depth)?;
-                changed = true;
-                continue;
-            }
-            // (1l) Direct *leaf* (no /Kids): mint it into a fresh indirect object
-            // and rewrite the /Kids entry to the new reference (makeIndirectObject,
-            // :113-118). Draw from the SAME running allocator the duplicate-clone
-            // arm uses so the object numbering matches qpdf. qpdf applies the
-            // /MediaBox default (:104-112) to the direct dict BEFORE
-            // makeIndirectObject (:113-118); minting first here and letting the
-            // existing leaf branch below apply the default to the now-indirect
-            // object yields the SAME object content and — since defaulting never
-            // mints — the SAME object numbers, so this reordering is byte-faithful.
-            let new_ref = state.next_clone;
-            let next_num = new_ref
-                .number
-                .checked_add(1)
-                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-            state.next_clone = ObjectRef::new(next_num, 0);
-            // Move the inline dict out of the /Kids entry WITHOUT cloning; the
-            // moved dict carries no /Parent and makeIndirectObject adds none.
-            let owned = std::mem::replace(kid, Object::Reference(new_ref));
-            pdf.set_object(new_ref, owned);
-            changed = true;
-            new_ref
-        } else {
-            continue; // Direct (non-dictionary) /Kids entry: skip, as push does.
-        };
-        // Classify the kid (interior /Pages node vs leaf) and, for a leaf,
-        // snapshot its own /MediaBox value — all in a scope that ends the
-        // immutable borrow of `pdf` before we mutate it. `leaf_media_box` is
-        // unused for an interior node (the snapshot is a small scalar/array/ref).
-        let (kids_value, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
-            Object::Dictionary(d) => (d.get("Kids").cloned(), d.get("MediaBox").cloned()),
-            _ => continue, // Reference to a non-dictionary: skip, as push does.
-        };
-        let has_kids = raw_object_key_is_visible(pdf, kids_value.as_ref())?;
-        if has_kids {
-            // Interior /Pages node: descend, threading the /MediaBox flag.
-            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box, max_depth)?;
-            continue;
-        }
-        // Leaf branch.
-        // (2b) Default a missing/invalid /MediaBox on the ORIGINAL leaf FIRST —
-        // before the duplicate-clone decision below — so a clone inherits the
-        // defaulted box (QPDF_pages.cc:104-112 precedes :119-130). An ancestor
-        // rectangle (tracked by `media_box`) suppresses the default.
-        if !media_box && !is_rectangle(pdf, leaf_media_box.as_ref())? {
-            if let Object::Dictionary(mut leaf) = pdf.resolve(kid_ref)? {
-                leaf.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                pdf.set_object(kid_ref, Object::Dictionary(leaf));
-            }
-        }
-        // (2c) Duplicate-leaf clone (QPDF_pages.cc:119-130). `leaf_ref` is the
-        // original leaf for a first occurrence, or the freshly minted clone for a
-        // duplicate; qpdf overrides the leaf /Type AFTER this clone decision
-        // (:131-134), so both flow through the (2l) override below. The clone is
-        // taken from the (possibly defaulted) original via `resolve`, so it
-        // inherits any /MediaBox default applied just above.
-        let leaf_ref = if state.seen.insert(kid_ref) {
-            kid_ref // First occurrence of this leaf.
-        } else {
-            let clone = pdf.resolve(kid_ref)?; // Owned copy of the leaf dict.
-            let new_ref = state.next_clone;
-            let next_num = new_ref
-                .number
-                .checked_add(1)
-                .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-            state.next_clone = ObjectRef::new(next_num, 0);
-            pdf.set_object(new_ref, clone);
-            state.seen.insert(new_ref);
-            *kid = Object::Reference(new_ref);
-            changed = true;
-            new_ref
-        };
-        // (2l) Override the leaf /Type to /Page if it is not already
-        // (QPDF_pages.cc:131-134). Check via a borrow so a correctly typed leaf
-        // (the common case) is never cloned or rewritten.
-        let wrong_type = matches!(
-            pdf.resolve_borrowed(leaf_ref)?,
-            Object::Dictionary(d) if !type_name_is(d, b"Page")
-        );
-        if wrong_type {
-            if let Object::Dictionary(mut leaf) = pdf.resolve(leaf_ref)? {
-                leaf.insert("Type", Object::Name(b"Page".to_vec()));
-                pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-            }
-        }
-        state.pages.push(leaf_ref);
-    }
-    if changed {
-        dict.insert("Kids", Object::Array(kids));
-        pdf.set_object(node_ref, Object::Dictionary(dict));
-    }
-    Ok(())
-}
-
-/// Allocate a fresh indirect-object reference (the new-object idiom used across
-/// the crate): one past the current highest object number.
-/// Recursively repair a direct interior `/Pages` dictionary in place.
-///
-/// qpdf treats direct intermediate nodes as ordinary handles during
-/// `getAllPagesInternal`: they stay direct, while any direct leaf beneath them
-/// is materialized. A direct dictionary has no object identity to insert into
-/// `RepairState::visited`, but a direct value cannot form a value-cycle by
-/// itself; indirect back-edges still re-enter [`repair_page_tree`] and are
-/// rejected there.
-fn repair_direct_page_tree<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    dict: &mut Dictionary,
-    state: &mut RepairState,
-    depth: usize,
-    media_box: bool,
-    max_depth: usize,
-) -> Result<()> {
-    if depth >= max_depth {
-        return Err(Error::Unsupported(format!(
-            "page tree depth exceeds maximum of {max_depth} in direct /Pages node"
-        )));
-    }
-
-    let Some(mut kids) = dict
-        .get("Kids")
-        .and_then(Object::as_array)
-        .map(<[Object]>::to_vec)
-    else {
+    let kids = node.try_get_key(b"/Kids")?;
+    let Some(kid_count) = kids.try_array_len()? else {
+        // QPDFObjectHandle::getArrayNItems warns and treats a non-array as
+        // empty (`QPDFObjectHandle.cc:758-768`).
+        kids.warn_if_possible(
+            format!(
+                "operation for array attempted on object of type {}: treating as empty",
+                kids.type_name()
+            )
+            .as_str(),
+        )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
         return Ok(());
     };
 
-    // qpdf invokes getAllPagesInternal only after `pages.hasKey("/Kids")`.
-    // A direct dictionary without /Kids is therefore left byte-for-byte intact.
-    let mut changed = false;
-    if !type_name_is(dict, b"Pages") {
-        dict.insert("Type", Object::Name(b"Pages".to_vec()));
-        changed = true;
-    }
-    let media_box = media_box || is_rectangle(pdf, dict.get("MediaBox"))?;
-
-    for kid in kids.iter_mut() {
-        let kid_ref = if let Object::Reference(reference) = &*kid {
-            *reference
-        } else if let Object::Dictionary(child) = &mut *kid {
-            if raw_object_key_is_visible(pdf, child.get("Kids"))? {
-                repair_direct_page_tree(pdf, child, state, depth + 1, media_box, max_depth)?;
-                changed = true;
-                continue;
-            }
-            let new_ref = state.next_clone;
-            state.next_clone = ObjectRef::new(
-                // cov:ignore-start: next_object_ref rejects u32::MAX before direct-leaf allocation can begin
-                new_ref.number.checked_add(1).ok_or_else(|| {
-                    Error::Unsupported("object-number space exhausted".to_string())
-                })?,
-                // cov:ignore-end
-                0,
-            );
-            let owned = std::mem::replace(kid, Object::Reference(new_ref));
-            pdf.set_object(new_ref, owned);
-            changed = true;
-            new_ref
-        } else {
+    for index in 0..kid_count {
+        let Some(mut kid) = kids.try_array_item(index)? else {
             continue;
         };
-
-        let (kids_value, leaf_media_box) = match pdf.resolve_borrowed(kid_ref)? {
-            Object::Dictionary(leaf) => (leaf.get("Kids").cloned(), leaf.get("MediaBox").cloned()),
-            _ => continue,
-        };
-        let has_kids = raw_object_key_is_visible(pdf, kids_value.as_ref())?;
-        if has_kids {
-            repair_page_tree(pdf, kid_ref, state, depth + 1, media_box, max_depth)?;
+        if kid.try_has_key(b"/Kids")? {
+            repair_page_tree_handle(pdf, kid, state, depth + 1, media_box, max_depth)?;
             continue;
         }
-        if !media_box && !is_rectangle(pdf, leaf_media_box.as_ref())? {
-            if let Object::Dictionary(mut leaf) = pdf.resolve(kid_ref)? {
-                leaf.insert(
-                    "MediaBox",
-                    Object::Array(vec![
-                        Object::Integer(0),
-                        Object::Integer(0),
-                        Object::Integer(612),
-                        Object::Integer(792),
-                    ]),
-                );
-                pdf.set_object(kid_ref, Object::Dictionary(leaf));
-            }
-        }
-        let leaf_ref = if state.seen.insert(kid_ref) {
-            kid_ref
-        } else {
-            let clone = pdf.resolve(kid_ref)?;
-            let new_ref = state.next_clone;
-            state.next_clone = ObjectRef::new(
-                // cov:ignore-start: next_object_ref rejects u32::MAX before duplicate-leaf allocation can begin
-                new_ref.number.checked_add(1).ok_or_else(|| {
-                    Error::Unsupported("object-number space exhausted".to_string())
-                })?,
-                // cov:ignore-end
-                0,
-            );
-            pdf.set_object(new_ref, clone);
-            state.seen.insert(new_ref);
-            *kid = Object::Reference(new_ref);
-            changed = true;
-            new_ref
-        };
-        let wrong_type = matches!(
-            pdf.resolve_borrowed(leaf_ref)?,
-            Object::Dictionary(leaf) if !type_name_is(leaf, b"Page")
-        );
-        if wrong_type {
-            if let Object::Dictionary(mut leaf) = pdf.resolve(leaf_ref)? {
-                leaf.insert("Type", Object::Name(b"Page".to_vec()));
-                pdf.set_object(leaf_ref, Object::Dictionary(leaf));
-            }
-        }
-        state.pages.push(leaf_ref);
-    }
 
-    if changed {
-        dict.insert("Kids", Object::Array(kids));
+        // qpdf applies the default before either direct promotion or duplicate
+        // cloning (`QPDF_pages.cc:104-130`). This order is observable because a
+        // duplicate receives the already-repaired page dictionary.
+        if !media_box && !is_rectangle_handle(&kid.try_get_key(b"/MediaBox")?)? {
+            kid.warn_if_possible(
+                format!("kid {index} (from 0) MediaBox is undefined; setting to letter / ANSI A")
+                    .as_str(),
+            )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+            replace_handle_key(
+                pdf,
+                &kid,
+                b"/MediaBox",
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            )?; // cov:ignore: canonical page owners make dirty tracking infallible here
+        }
+
+        if kid.is_direct() {
+            node.warn_if_possible(
+                format!("kid {index} (from 0) is direct; converting to indirect").as_str(),
+            )?; // cov:ignore: warning-sink failure is not injectable through the qpdf success oracle
+            kid = promote_page_handle(pdf, kid)?;
+            let promoted_ref = kid
+                .object_ref()
+                .expect("promote_page_handle returns an indirect handle");
+            state.seen.insert(promoted_ref);
+            kids.set_array_item(index, kid.clone())?;
+            pdf.mark_object_handle_dirty(&kids)?;
+        } else if let Some(object_ref) = kid.object_ref() {
+            if !state.seen.insert(object_ref) {
+                node.warn_if_possible(format!(
+                    "kid {index} (from 0) appears more than once in the pages tree; creating a new page object as a copy"
+                ).as_str())?;
+                let copied = kid.shallow_copy()?;
+                kid = promote_page_handle(pdf, copied)?;
+                let copied_ref = kid
+                    .object_ref()
+                    .expect("promote_page_handle returns an indirect handle");
+                state.seen.insert(copied_ref);
+                kids.set_array_item(index, kid.clone())?;
+                pdf.mark_object_handle_dirty(&kids)?;
+            }
+        }
+
+        if !kid.try_is_dictionary_of_type(b"Page", b"")? {
+            kid.warn_if_possible("/Type key should be /Page but is not; overriding")?;
+            replace_handle_key(pdf, &kid, b"/Type", ObjectHandle::name(b"Page".to_vec()))?;
+        }
+        let page_ref = kid
+            .object_ref()
+            .expect("every qpdf page-tree leaf is indirect after repair");
+        state.pages.push(page_ref);
     }
     Ok(())
 }
 
-fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
-    let n = pdf
-        .object_refs()
-        .iter()
-        .map(|r| r.number)
-        .max()
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
-    Ok(ObjectRef::new(n, 0))
+fn promote_page_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: ObjectHandle,
+) -> Result<ObjectHandle> {
+    let promoted = pdf.make_indirect_from_object_handle(handle)?;
+    pdf.mark_object_handle_dirty(&promoted)?;
+    Ok(promoted)
 }
 
-/// True iff `dict`'s `/Type` is a `Name` equal to `want`. Mirrors the dictionary
-/// half of qpdf's `isDictionaryOfType` (QPDFObjectHandle.cc:462-466); the caller
-/// has already established that the object is a dictionary. `/Type` is matched
-/// directly — missing, or a non-matching name, yields `false` — like the other
-/// page-tree `/Type` checks in this module.
-fn type_name_is(dict: &Dictionary, want: &[u8]) -> bool {
-    matches!(dict.get("Type"), Some(Object::Name(n)) if n.as_slice() == want)
+fn replace_handle_key<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    holder: &ObjectHandle,
+    key: &[u8],
+    value: ObjectHandle,
+) -> Result<()> {
+    holder.replace_key(key, value);
+    pdf.mark_object_handle_dirty(holder)
 }
 
-/// True iff `value` resolves to a `/MediaBox` rectangle: an `Array` of exactly
-/// four numbers (`Integer` or `Real`). Mirrors qpdf's
-/// `QPDFObjectHandle::isRectangle` (QPDFObjectHandle.cc:789-800 — an array whose
-/// size is 4 and whose first four items are numbers). Both the array value and
-/// each of its four elements are resolved through any indirect-reference chain
-/// first, matching qpdf: `getKey("/MediaBox").isRectangle()` resolves the array,
-/// and its per-item `isNumber()` dereferences an element that is itself an
-/// indirect reference to a number (e.g. `[0 0 612 5 0 R]`, kept — not defaulted —
-/// on qpdf 11.9.0). A missing key (`None`), a wrong-length array, or an element
-/// that does not resolve to a number yields `false`.
-fn is_rectangle<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<&Object>) -> Result<bool> {
-    // Resolve the /MediaBox value itself through any indirect chain (as qpdf's
-    // `getKey("/MediaBox")` does) and, if it is a four-element array, snapshot its
-    // elements. The snapshot (four small scalars/refs — never a stream) is needed
-    // to release the borrow on `pdf` before resolving each element below.
-    let items: Vec<Object> = match value {
-        None => return Ok(false),
-        Some(Object::Reference(r)) => {
-            let terminal = terminal_ref_of_chain(pdf, *r)?;
-            match pdf.resolve_borrowed(terminal)? {
-                Object::Array(items) if items.len() == 4 => items.clone(),
-                _ => return Ok(false),
-            }
-        }
-        Some(Object::Array(items)) if items.len() == 4 => items.clone(),
-        Some(_) => return Ok(false),
+fn is_rectangle_handle(value: &ObjectHandle) -> Result<bool> {
+    let Some(length) = value.try_array_len()? else {
+        return Ok(false);
     };
-    // Every element must resolve to a number. qpdf's `isRectangle()` tests each
-    // item with `isNumber()`, which dereferences an indirect reference before the
-    // type check — verified on qpdf 11.9.0: a `/MediaBox [0 0 612 5 0 R]` whose
-    // last element is an indirect number is kept, NOT overwritten with the default
-    // — so each element's indirect chain is resolved here as well.
-    for e in &items {
-        let is_num = match e {
-            Object::Integer(_) | Object::Real(_) | Object::RealLiteral { .. } => true,
-            Object::Reference(r) => {
-                let terminal = terminal_ref_of_chain(pdf, *r)?;
-                let resolved = pdf.resolve_borrowed(terminal)?;
-                // cov:ignore-start: rustfmt reflow of the `matches!` macro
-                // parks the opening `matches!(` on its own line, and llvm-cov
-                // instruments the invocation head separately from its arms;
-                // the arms record hits (DA:555+, exercised by
-                // `indirect_real_literal_mediabox_elem_is_recognized_...`)
-                // but the head line always shows zero. Same behavior in
-                // similar multi-line `matches!` sites across the crate.
-                matches!(
-                    resolved,
-                    Object::Integer(_) | Object::Real(_) | Object::RealLiteral { .. }
-                )
-                // cov:ignore-end
-            }
-            _ => false,
-        };
-        if !is_num {
+    if length != 4 {
+        return Ok(false);
+    }
+    for index in 0..length {
+        let Some(item) = value.try_array_item(index)? else {
             return Ok(false);
+        };
+        if item.try_as_integer()?.is_none() {
+            item.try_dereference()?;
+            if item.as_real().is_none() {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -622,6 +333,8 @@ fn is_rectangle<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<&Object>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{Dictionary, Object};
+    use crate::object_handle::ObjectHandle;
     use crate::Pdf;
     use std::io::Cursor;
 
@@ -630,6 +343,65 @@ mod tests {
             return Ok(());
         };
         crate::optimization::inherited_attrs::push(pdf, &prepared, true, false)
+    }
+
+    #[test]
+    fn canonical_kids_handle_observes_direct_leaf_promotion() {
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_direct_leaf_kid_no_mediabox())).expect("valid PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        let pages = catalog
+            .try_get_key(b"/Pages")
+            .expect("catalog /Pages lookup");
+        let kids = pages.try_get_key(b"/Kids").expect("pages /Kids lookup");
+
+        prepare_for_optimization(&mut pdf)
+            .expect("page preparation must succeed")
+            .expect("fixture has a page tree");
+
+        let promoted = kids
+            .try_array_item(0)
+            .expect("live /Kids lookup")
+            .expect("first /Kids entry");
+        assert_eq!(
+            promoted.object_ref(),
+            Some(ObjectRef::new(4, 0)),
+            "the retained canonical /Kids array must see qpdf-style promotion"
+        );
+        assert!(
+            catalog
+                .try_get_key(b"/Pages")
+                .expect("catalog /Pages lookup after repair")
+                .is_same_object_as(&pages),
+            "repair must preserve the canonical /Pages holder identity"
+        );
+    }
+
+    #[test]
+    fn compressed_page_tree_holders_use_the_canonical_repair_route() {
+        // The fixture stores the catalog/page tree and leaves in compressed
+        // object-stream members. qpdf resolves those holders lazily through
+        // the same QPDF object cache before QPDF_pages.cc:39-138 walks them.
+        let bytes = include_bytes!("../../../../tests/fixtures/compat/three-page-objstm.pdf");
+        let mut pdf = Pdf::open(Cursor::new(bytes.to_vec())).expect("valid ObjStm PDF");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("compressed page tree must resolve")
+            .expect("fixture has a page tree");
+        assert_eq!(
+            prepared.pages,
+            vec![
+                ObjectRef::new(4, 0),
+                ObjectRef::new(5, 0),
+                ObjectRef::new(6, 0)
+            ]
+        );
+        for object_ref in prepared.pages {
+            let page = pdf.get_object_handle(object_ref);
+            assert!(page
+                .try_is_dictionary_of_type(b"Page", b"")
+                .expect("compressed page handle must remain inspectable"));
+        }
     }
 
     /// One `/Pages` node, one `/Page` leaf, no inheritable keys anywhere.
@@ -3611,6 +3383,46 @@ mod tests {
     }
 
     #[test]
+    fn repeated_alias_of_direct_page_is_cloned_after_promotion() {
+        let mut pdf = Pdf::open(Cursor::new(pdf_with_direct_leaf_kid())).expect("valid PDF");
+        let pages = pdf.get_object_handle(ObjectRef::new(2, 0));
+        let original_kids = pages.try_get_key(b"/Kids").expect("pages /Kids lookup");
+        let direct_page = original_kids
+            .try_array_item(0)
+            .expect("direct /Kids lookup")
+            .expect("direct page");
+        assert!(direct_page.is_direct());
+
+        // Keep the same live direct handle in both slots. Promoting the first
+        // slot changes the shared handle's identity for the second slot too,
+        // so the second occurrence must enter the duplicate branch.
+        pages.replace_key(
+            b"/Kids",
+            ObjectHandle::array(vec![direct_page.clone(), direct_page]),
+        );
+        pdf.mark_object_handle_dirty(&pages)
+            .expect("mark modified /Pages");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("page preparation must succeed")
+            .expect("fixture has a page tree");
+        assert_eq!(
+            prepared.pages,
+            vec![ObjectRef::new(4, 0), ObjectRef::new(5, 0)],
+            "the repeated direct handle must produce an original and a clone"
+        );
+
+        let kids = pages
+            .try_get_key(b"/Kids")
+            .expect("repaired /Kids lookup")
+            .try_as_array()
+            .expect("repaired /Kids array")
+            .expect("repaired /Kids must be an array");
+        assert_eq!(kids[0].object_ref(), Some(ObjectRef::new(4, 0)));
+        assert_eq!(kids[1].object_ref(), Some(ObjectRef::new(5, 0)));
+    }
+
+    #[test]
     fn null_kids_is_absent_when_classifying_a_direct_leaf() {
         for (label, kids) in [
             ("direct null", Object::Null),
@@ -3866,28 +3678,19 @@ mod tests {
         pdf
     }
 
-    /// A DIRECT non-dictionary `/Kids` entry (a bare integer) is skipped: qpdf's
-    /// leaf branch would still call `makeIndirectObject` on it (its `isIndirect`
-    /// check does not require a dictionary), but flpdf's reference-keyed repair
-    /// pass mints only direct *dictionary* leaves and otherwise leaves the entry
-    /// as the inherited-attribute push does. This pins the no-panic behavior and
-    /// that the scalar entry stays direct — NOT byte parity (no golden for this
-    /// malformed shape).
+    /// A DIRECT non-dictionary `/Kids` entry (a bare integer) is promoted just
+    /// like qpdf's `makeIndirectObject` branch (`QPDF_pages.cc:113-118`): the
+    /// resulting indirect value is still a scalar, because the later `/Type`
+    /// repair is a no-op on a non-dictionary.
     #[test]
-    fn direct_non_dictionary_kid_is_skipped() {
+    fn direct_non_dictionary_kid_is_promoted_like_qpdf() {
         let bytes = pdf_with_direct_scalar_kid();
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("valid PDF");
-        let before_count = pdf.object_refs().len();
 
         let result = push_for_test(&mut pdf);
         assert!(
             result.is_ok(),
-            "a direct non-dictionary /Kids entry must be skipped, not panic or error: {result:?}"
-        );
-        assert_eq!(
-            pdf.object_refs().len(),
-            before_count,
-            "a direct non-dictionary /Kids entry must never mint an object"
+            "a direct non-dictionary /Kids entry must be promoted without error: {result:?}"
         );
 
         let pages = pdf.resolve(ObjectRef::new(2, 0)).expect("pages resolves");
@@ -3896,8 +3699,17 @@ mod tests {
         };
         assert_eq!(
             pages_dict.get("Kids"),
-            Some(&Object::Array(vec![Object::Integer(42)])),
-            "the scalar /Kids entry must stay a direct integer (not minted to a ref)"
+            Some(&Object::Array(vec![Object::Reference(ObjectRef::new(
+                3, 0
+            ))])),
+            "the scalar /Kids entry must be rewritten to its promoted object"
+        );
+        assert_eq!(
+            pdf.get_object_handle(ObjectRef::new(3, 0))
+                .materialize()
+                .expect("promoted scalar resolves"),
+            Object::Integer(42),
+            "promotion must preserve the scalar value"
         );
     }
 
@@ -4170,6 +3982,83 @@ mod tests {
             catalog_dict.get("Pages"),
             Some(&Object::Reference(ObjectRef::new(2, 0))),
             "a /Parent cycle must leave /Pages at the node where the guard broke (2 0 R)"
+        );
+    }
+
+    #[test]
+    fn direct_parent_cycle_terminates() {
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve catalog");
+        let page = pdf.get_object_handle(ObjectRef::new(4, 0));
+
+        // Direct dictionaries cannot encode this cycle in serialized PDF
+        // syntax, but canonical handles can share the same live allocations.
+        // This is the exact identity case that an ObjGen-only loop guard misses.
+        let first = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(vec![page])),
+            (b"Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let second = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Parent".to_vec(), first.clone()),
+        ]);
+        first.replace_key(b"/Parent", second.clone());
+        catalog.replace_key(b"/Pages", first.clone());
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark modified catalog");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("direct parent cycle must terminate")
+            .expect("fixture has a page tree");
+        assert_eq!(
+            prepared.root,
+            PageTreeRoot::Direct {
+                catalog: ObjectRef::new(1, 0)
+            }
+        );
+        assert_eq!(prepared.pages, vec![ObjectRef::new(4, 0)]);
+    }
+
+    #[test]
+    fn direct_kids_cycle_is_rejected_before_depth_overflow() {
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve catalog");
+        let leaf = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+            (
+                b"MediaBox".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(0),
+                    ObjectHandle::integer(612),
+                    ObjectHandle::integer(792),
+                ]),
+            ),
+        ]);
+        let first = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(vec![])),
+            (b"Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        let second = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(vec![first.clone()])),
+            (b"Count".to_vec(), ObjectHandle::integer(1)),
+        ]);
+        first.replace_key(b"/Kids", ObjectHandle::array(vec![second.clone(), leaf]));
+        catalog.replace_key(b"/Pages", first);
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark modified catalog");
+
+        let result = prepare_for_optimization_with_max_depth(&mut pdf, usize::MAX);
+        assert!(
+            matches!(result, Err(Error::Unsupported(ref message)) if message.contains("cycle")),
+            "direct /Kids cycle must be rejected before recursion can overflow: {result:?}"
         );
     }
 

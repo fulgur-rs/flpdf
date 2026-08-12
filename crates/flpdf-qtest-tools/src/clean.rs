@@ -6,10 +6,12 @@
 //! of qpdf on the same input (the trailer's `/Length` and `/ID` halves, and
 //! the encryption-dict password/permission hashes) so that a true byte-for-
 //! byte object diff can be reported for everything else.
+//!
+//! Oracle: qpdf 11.9.0 `compare-for-test/qpdf-test-compare.cc:24-43,108-131`.
 
 use std::io::{Read, Seek};
 
-use flpdf::{Dictionary, Object, Pdf};
+use flpdf::{Dictionary, Object, ObjectHandle, Pdf};
 
 /// Strip fields from the trailer that qpdf's compare-for-test tool masks
 /// before diffing.
@@ -84,10 +86,62 @@ pub fn clean_encryption<R: Read + Seek>(pdf: &mut Pdf<R>) -> flpdf::Result<()> {
     Ok(())
 }
 
+/// qpdf's handle-native `cleanTrailer(QPDFObjectHandle&)` route used by the
+/// canonical compare orchestrator. The legacy dictionary helper above remains
+/// for its focused compatibility tests; production comparison now mutates the
+/// same live handle graph that its object walk consumes.
+pub fn clean_trailer_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    trailer: &ObjectHandle,
+) -> flpdf::Result<()> {
+    trailer.remove_key(b"/Length");
+    if !trailer.has_key(b"/ID") {
+        return Ok(());
+    }
+    let id = pdf.resolve_object_handle_to_terminal(&trailer.get_key(b"/ID"))?;
+    let Some(items) = id.as_array() else {
+        return Ok(());
+    };
+    if items.len() != 2 {
+        return Ok(());
+    }
+    let both_equal = items[0].unparse() == items[1].unparse();
+    id.set_array_item(1, ObjectHandle::string(Vec::new()))?;
+    if both_equal {
+        id.set_array_item(0, ObjectHandle::string(Vec::new()))?;
+    }
+    if let Some(object_ref) = id.object_ref() {
+        pdf.mark_object_dirty(object_ref);
+    }
+    Ok(())
+}
+
+/// qpdf's handle-native `cleanEncryption(QPDF&)` route used by the canonical
+/// compare orchestrator. The `/Encrypt` child is resolved through the owning
+/// document, then its live dictionary is edited in place; the dirty mark keeps
+/// any later legacy writer/cache observer coherent without materializing the
+/// dictionary.
+pub fn clean_encryption_handle<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    trailer: &ObjectHandle,
+) -> flpdf::Result<()> {
+    let encrypt = pdf.resolve_object_handle_to_terminal(&trailer.get_key(b"/Encrypt"))?;
+    if encrypt.as_dictionary().is_none() {
+        return Ok(());
+    }
+    for key in [b"/O".as_ref(), b"/OE", b"/U", b"/UE", b"/Perms"] {
+        encrypt.remove_key(key);
+    }
+    if let Some(object_ref) = encrypt.object_ref() {
+        pdf.mark_object_dirty(object_ref);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flpdf::PdfOpenOptions;
+    use flpdf::{ObjectRef, PdfOpenOptions};
     use std::io::Cursor;
 
     // ---------- clean_trailer ----------
@@ -337,5 +391,131 @@ mod tests {
         // Sanity: trailer has no /Encrypt, so `get_ref` is None → no-op path.
         assert!(pdf.trailer().get_ref(b"Encrypt").is_none());
         clean_encryption(&mut pdf).expect("no-op when /Encrypt has no ref target");
+    }
+
+    #[test]
+    fn clean_trailer_handle_masks_length_and_id_halves() {
+        let mut pdf = Pdf::open_mem_owned(fixture_bytes("tests/fixtures/minimal.pdf"))
+            .expect("open minimal PDF");
+        let trailer = ObjectHandle::dictionary(vec![
+            (b"/Length".to_vec(), ObjectHandle::integer(42)),
+            (
+                b"/ID".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"first".to_vec()),
+                    ObjectHandle::string(b"second".to_vec()),
+                ]),
+            ),
+        ]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
+
+        assert!(!trailer.has_key(b"/Length"));
+        let items = trailer
+            .get_key(b"/ID")
+            .as_array()
+            .expect("/ID remains an array");
+        assert_eq!(items[0].as_string(), Some(b"first".to_vec()));
+        assert_eq!(items[1].as_string(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn clean_trailer_handle_masks_both_equal_id_halves() {
+        let mut pdf = Pdf::open_mem_owned(fixture_bytes("tests/fixtures/minimal.pdf"))
+            .expect("open minimal PDF");
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::string(b"same".to_vec()),
+                ObjectHandle::string(b"same".to_vec()),
+            ]),
+        )]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
+
+        let items = trailer
+            .get_key(b"/ID")
+            .as_array()
+            .expect("/ID remains an array");
+        assert_eq!(items[0].as_string(), Some(Vec::new()));
+        assert_eq!(items[1].as_string(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn clean_trailer_handle_leaves_non_array_id_unchanged() {
+        let mut pdf = Pdf::empty().expect("create an empty PDF");
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::string(b"not an array".to_vec()),
+        )]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("non-array /ID is a no-op");
+
+        assert_eq!(
+            trailer.get_key(b"/ID").as_string(),
+            Some(b"not an array".to_vec())
+        );
+    }
+
+    #[test]
+    fn clean_trailer_handle_leaves_wrong_length_id_unchanged() {
+        let mut pdf = Pdf::empty().expect("create an empty PDF");
+        let trailer = ObjectHandle::dictionary(vec![(
+            b"/ID".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::string(b"only".to_vec())]),
+        )]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("wrong-length /ID is a no-op");
+
+        let items = trailer
+            .get_key(b"/ID")
+            .as_array()
+            .expect("/ID remains an array");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].as_string(), Some(b"only".to_vec()));
+    }
+
+    #[test]
+    fn clean_trailer_handle_mutates_an_indirect_id_array_in_place() {
+        let mut pdf = Pdf::empty().expect("create an empty PDF");
+        let id_ref = ObjectRef::new(9, 0);
+        pdf.set_object(
+            id_ref,
+            Object::Array(vec![
+                Object::String(b"first".to_vec()),
+                Object::String(b"second".to_vec()),
+            ]),
+        );
+        let id = pdf.get_object_handle(id_ref);
+        let trailer = ObjectHandle::dictionary(vec![(b"/ID".to_vec(), id.clone())]);
+
+        clean_trailer_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
+
+        let cleaned_id = pdf
+            .resolve_object_handle_to_terminal(&trailer.get_key(b"/ID"))
+            .expect("resolve cleaned /ID");
+        assert_eq!(cleaned_id.object_ref(), Some(id_ref));
+        let items = cleaned_id.as_array().expect("/ID remains an array");
+        assert_eq!(items[0].as_string(), Some(b"first".to_vec()));
+        assert_eq!(items[1].as_string(), Some(Vec::new()));
+        let alias_items = id.as_array().expect("original alias remains live");
+        assert_eq!(alias_items[1].as_string(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn clean_encryption_handle_strips_hashes_from_canonical_dictionary() {
+        let mut pdf = open_v5_r6_fixture();
+        let trailer = pdf.trailer_handle();
+
+        clean_encryption_handle(&mut pdf, &trailer).expect("handle cleanup succeeds");
+
+        let encrypt = pdf
+            .resolve_object_handle_to_terminal(&trailer.get_key(b"/Encrypt"))
+            .expect("resolve /Encrypt handle");
+        for key in [b"/O".as_ref(), b"/OE", b"/U", b"/UE", b"/Perms"] {
+            assert!(!encrypt.has_key(key), "{key:?} must have been removed");
+        }
+        assert!(encrypt.has_key(b"/Filter"));
+        assert!(encrypt.has_key(b"/V"));
     }
 }

@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -123,6 +124,116 @@ fn tokenizer_emits_repair_warnings_to_stderr() {
     ));
 }
 
+#[test]
+fn tokenizer_emits_canonical_stream_recovery_warnings_once_with_qpdf_offsets() {
+    // The fixture contains malformed stream lengths in both direct and object
+    // stream objects. Resolve each canonical handle before crossing into the
+    // legacy decode boundary: qpdf emits one warning sequence per object, and
+    // its /Length warning offset is the post-obj header position.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let fixture = fixture_dir()
+        .join("compat")
+        .join("null-length-framing-matrix-objstm.pdf");
+    fs::write(
+        dir.path().join("null-length-framing-matrix-objstm.pdf"),
+        fs::read(fixture).expect("read malformed stream fixture"),
+    )
+    .expect("write malformed stream fixture into tempdir");
+
+    let output = run(&["null-length-framing-matrix-objstm.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("WARNING:"))
+        .collect();
+    assert_eq!(
+        warning_lines.len(),
+        36,
+        "unexpected warning output: {stderr}"
+    );
+    assert_eq!(
+        warning_lines.iter().collect::<HashSet<_>>().len(),
+        warning_lines.len(),
+        "canonical and legacy stream reads must not duplicate warnings: {stderr}"
+    );
+    assert!(
+        warning_lines.iter().any(|line| {
+            line.contains("(object 5 0, offset 76): stream dictionary lacks /Length key")
+        }),
+        "qpdf's post-header offset must be preserved: {stderr}"
+    );
+    assert!(
+        !warning_lines.iter().any(|line| {
+            line.contains("(object 5 0, offset 69): stream dictionary lacks /Length key")
+        }),
+        "the xref/object-start offset must not replace qpdf's readObject offset: {stderr}"
+    );
+}
+
+#[test]
+fn tokenizer_reuses_canonical_page_stream_resolution_without_replaying_warnings() {
+    let cases = [
+        (
+            "chained-indirect-contents.pdf",
+            "(object 5 0, offset 232): expected endobj",
+            None,
+        ),
+        (
+            "encrypted-recovered-eol.pdf",
+            "(object 4 0, offset 236): stream dictionary lacks /Length key",
+            Some("(object 4 0, offset 229): stream dictionary lacks /Length key"),
+        ),
+    ];
+
+    for (filename, expected_warning, obsolete_warning) in cases {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let fixture = fixture_dir().join("compat").join(filename);
+        fs::write(
+            dir.path().join(filename),
+            fs::read(&fixture).expect("read tokenizer warning fixture"),
+        )
+        .expect("write tokenizer warning fixture into tempdir");
+
+        let output = run(&[filename], dir.path());
+        assert!(
+            output.status.success(),
+            "unexpected exit status for {filename}: {:?}; stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches(expected_warning).count(),
+            1,
+            "canonical warning must be emitted once for {filename}: {stderr}"
+        );
+        if let Some(obsolete_warning) = obsolete_warning {
+            assert!(
+                !stderr.contains(obsolete_warning),
+                "legacy page-content offset must not be emitted for {filename}: {stderr}"
+            );
+        }
+        if filename == "encrypted-recovered-eol.pdf" {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("12343: word: Q"),
+                "expected the recovered page content to end with Q: {stdout}"
+            );
+            assert!(
+                !stdout.contains("12345: word:"),
+                "recovered AES framing must not be tokenized as page content: {stdout}"
+            );
+        }
+    }
+}
+
 fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offsets: Vec<u64> = vec![0];
@@ -148,6 +259,92 @@ fn build_pdf_with_page_content(content: &[u8]) -> Vec<u8> {
     stream_obj.extend_from_slice(content);
     stream_obj.extend_from_slice(b"\nendstream");
     push_obj(&mut out, &mut offsets, &stream_obj);
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+fn build_pdf_with_page_contents_array_cycle() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 1 1] >>",
+    );
+    // Object 4 resolves to an array that refers to itself. The collector must
+    // stop on the active recursion path rather than growing the call stack
+    // indefinitely while still allowing repeated non-cyclic references.
+    push_obj(&mut out, &mut offsets, b"[4 0 R]");
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
+fn build_pdf_with_nested_page_contents_array() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    let push_stream = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, content: &[u8]| {
+        let body = format!("<< /Length {} >>\nstream\n", content.len());
+        let mut stream = body.into_bytes();
+        stream.extend_from_slice(content);
+        stream.extend_from_slice(b"\nendstream");
+        push_obj(out, offsets, &stream);
+    };
+
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 1 1] >>",
+    );
+    push_obj(&mut out, &mut offsets, b"[5 0 R 6 0 R]");
+    push_obj(&mut out, &mut offsets, b"[7 0 R]");
+    push_stream(&mut out, &mut offsets, b"q\n");
+    push_stream(&mut out, &mut offsets, b"Q\n");
 
     let xref_start = out.len() as u64;
     let total = offsets.len();
@@ -229,6 +426,67 @@ fn tokenizer_repairs_page_tree_and_clones_duplicate_leaf() {
     assert!(
         stdout.contains("--- BEGIN PAGE 2 ---"),
         "expected PAGE 2 for the cloned duplicate leaf, got: {stdout}"
+    );
+}
+
+#[test]
+fn tokenizer_bounds_recursive_page_contents_collection() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("contents_cycle.pdf"),
+        build_pdf_with_page_contents_array_cycle(),
+    )
+    .expect("write contents_cycle.pdf into tempdir");
+
+    let output = run(&["contents_cycle.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "recursive /Contents must not abort tokenization: status={:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--- BEGIN PAGE 1 ---"),
+        "expected the page section even when /Contents is cyclic: {stdout}"
+    );
+    assert!(
+        !stdout.contains("word: q"),
+        "a cyclic array must not fabricate a content stream: {stdout}"
+    );
+}
+
+#[test]
+fn tokenizer_skips_nested_page_content_arrays() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("nested_contents.pdf"),
+        build_pdf_with_nested_page_contents_array(),
+    )
+    .expect("write nested_contents.pdf into tempdir");
+
+    let output = run(&["nested_contents.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "nested /Contents arrays must not abort tokenization: status={:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let page = stdout
+        .split_once("--- BEGIN PAGE 1 ---")
+        .and_then(|(_, rest)| rest.split_once("--- END PAGE 1 ---"))
+        .map(|(page, _)| page)
+        .expect("page token section");
+    assert!(
+        page.contains("word: q"),
+        "the direct stream must remain in page contents: {page}"
+    );
+    assert!(
+        !page.contains("word: Q"),
+        "a nested array element must not be recursively flattened: {page}"
     );
 }
 

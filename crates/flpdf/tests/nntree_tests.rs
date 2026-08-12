@@ -2,7 +2,221 @@ use flpdf::{
     read_name_tree, read_number_tree, Dictionary, NameTree, NumberTree, Object, ObjectRef, Pdf,
 };
 use std::collections::BTreeMap;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
+use std::process::Command;
+
+fn build_pdf(objects: &[(u32, &str)], root: u32) -> Vec<u8> {
+    let mut bytes = b"%PDF-1.7\n".to_vec();
+    let mut offsets = BTreeMap::new();
+    let max_object = objects.iter().map(|(number, _)| *number).max().unwrap_or(0);
+
+    for (number, body) in objects {
+        offsets.insert(*number, bytes.len() as u64);
+        bytes.extend_from_slice(format!("{number} 0 obj\n{body}\nendobj\n").as_bytes());
+    }
+
+    let xref_offset = bytes.len() as u64;
+    let size = max_object + 1;
+    bytes.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+    bytes.extend_from_slice(b"0000000000 65535 f \n");
+    for number in 1..=max_object {
+        match offsets.get(&number) {
+            Some(offset) => bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes()),
+            None => bytes.extend_from_slice(b"0000000000 65535 f \n"),
+        }
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size {size} /Root {root} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+            .as_bytes(),
+    );
+    bytes
+}
+
+fn qpdf_11_9_available() -> bool {
+    Command::new("qpdf")
+        .arg("--version")
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("qpdf version 11.9.0")
+        })
+        .unwrap_or(false)
+}
+
+fn canonical_name_tree_probe_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 4 0 R >> >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (
+                4,
+                "<< /Limits [(alpha) (beta)] /Names [(alpha) (A) (beta) (B)] >>",
+            ),
+        ],
+        1,
+    )
+}
+
+fn malformed_name_tree_probe_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 4 0 R >> /Outlines 5 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Kids [7 0 R] >>"),
+            (5, "<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>"),
+            (6, "<< /Title (bad) /Parent 5 0 R /Dest (m) >>"),
+            (7, "<< /Names [42 [3 0 R /Fit] (m) [3 0 R /Fit]] >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn canonical_name_tree_probe_matches_qpdf_structure_and_output_bytes() {
+    if !qpdf_11_9_available() {
+        eprintln!("qpdf 11.9.0 not available; skipping NNTree differential probe");
+        return;
+    }
+
+    let bytes = canonical_name_tree_probe_pdf();
+    let mut pdf = Pdf::open(Cursor::new(bytes.clone())).expect("open probe PDF");
+    let mut tree = NameTree::new(Object::Reference(ObjectRef::new(4, 0)), true);
+    assert_eq!(
+        tree.as_map(&mut pdf).expect("read canonical name tree"),
+        BTreeMap::from([
+            (b"alpha".to_vec(), Object::String(b"A".to_vec())),
+            (b"beta".to_vec(), Object::String(b"B".to_vec())),
+        ])
+    );
+
+    let mut input = tempfile::NamedTempFile::new().expect("create qpdf probe input");
+    input.write_all(&bytes).expect("write qpdf probe input");
+
+    let check = Command::new("qpdf")
+        .arg("--check")
+        .arg(input.path())
+        .output()
+        .expect("run qpdf --check");
+    assert!(
+        check.status.success(),
+        "qpdf --check rejected canonical name tree:\n{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    assert!(
+        check.stderr.is_empty(),
+        "canonical name tree should be warning-free in qpdf 11.9.0: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let shown = Command::new("qpdf")
+        .arg("--show-object=4")
+        .arg(input.path())
+        .output()
+        .expect("run qpdf --show-object");
+    assert!(
+        shown.status.success(),
+        "qpdf --show-object failed: {shown:?}"
+    );
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    for fragment in ["/Limits", "/Names", "(alpha)", "(beta)", "(A)", "(B)"] {
+        assert!(
+            shown.contains(fragment),
+            "qpdf structural output is missing {fragment:?}: {shown}"
+        );
+    }
+
+    let qdf = Command::new("qpdf")
+        .args(["--qdf", "--object-streams=disable"])
+        .arg(input.path())
+        .arg("-")
+        .output()
+        .expect("run qpdf --qdf");
+    assert!(qdf.status.success(), "qpdf --qdf failed: {qdf:?}");
+    for fragment in [
+        b"/Limits".as_slice(),
+        b"/Names".as_slice(),
+        b"(alpha)".as_slice(),
+    ] {
+        assert!(
+            qdf.stdout
+                .windows(fragment.len())
+                .any(|window| window == fragment),
+            "qpdf QDF output is missing byte fragment {fragment:?}"
+        );
+    }
+}
+
+#[test]
+fn canonical_name_tree_probe_matches_qpdf_warning_context() {
+    if !qpdf_11_9_available() {
+        eprintln!("qpdf 11.9.0 not available; skipping NNTree warning probe");
+        return;
+    }
+
+    let bytes = malformed_name_tree_probe_pdf();
+    let mut input = tempfile::NamedTempFile::new().expect("create malformed qpdf probe input");
+    input
+        .write_all(&bytes)
+        .expect("write malformed qpdf probe input");
+    let qpdf = Command::new("qpdf")
+        .args(["--json=2", "--json-key=outlines"])
+        .arg(input.path())
+        .output()
+        .expect("run qpdf warning probe");
+    assert_eq!(qpdf.status.code(), Some(2), "qpdf warning probe: {qpdf:?}");
+    let qpdf_stderr = String::from_utf8_lossy(&qpdf.stderr);
+    for fragment in [
+        "attempting to repair after error",
+        "item at index 0 is not the right type",
+    ] {
+        assert!(
+            qpdf_stderr.contains(fragment),
+            "qpdf warning output is missing {fragment:?}: {qpdf_stderr}"
+        );
+    }
+
+    let mut pdf = Pdf::open(Cursor::new(bytes)).expect("open malformed probe PDF");
+    let error = pdf
+        .outline()
+        .get_tree()
+        .expect_err("malformed name tree must fail through the same consumer as qpdf");
+    assert!(
+        error
+            .to_string()
+            .contains("item at index 0 is not the right type"),
+        "flpdf error diverged from qpdf warning context: {error}"
+    );
+    let diagnostics = pdf.repair_diagnostics();
+    let flpdf_warning = diagnostics
+        .entries()
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("node is missing /Limits"))
+        .map(|diagnostic| diagnostic.message.as_str())
+        .expect("flpdf must emit the qpdf repair warning");
+    assert!(
+        flpdf_warning.contains("Name/Number tree node (object 4)")
+            && flpdf_warning.contains("Name/Number tree node (object 7)"),
+        "flpdf repair warning lost qpdf object context: {flpdf_warning}"
+    );
+    for fragment in [
+        "Name/Number tree node (object 4)",
+        "Name/Number tree node (object 7)",
+        "node is missing /Limits",
+    ] {
+        assert!(
+            qpdf_stderr.contains(fragment),
+            "qpdf warning output is missing the shared context {fragment:?}: {qpdf_stderr}"
+        );
+    }
+}
 
 fn empty_pdf() -> Pdf<Cursor<Vec<u8>>> {
     let mut bytes = Vec::new();
@@ -346,7 +560,7 @@ fn number_tree_split_allocation_failure_leaves_tree_unchanged() {
 
     assert_eq!(
         error.to_string(),
-        "unsupported PDF feature: object-number space exhausted"
+        "unsupported PDF feature: max object id is too high to create new objects"
     );
     assert_eq!(
         tree.as_map(&mut pdf).expect("map after failed insert"),

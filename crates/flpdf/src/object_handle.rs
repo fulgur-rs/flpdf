@@ -1668,11 +1668,8 @@ impl ObjectHandle {
     /// owned before child resolution, so no container borrow crosses a
     /// resolver call.
     ///
-    /// A non-dictionary receiver yields an empty set. qpdf additionally
-    /// raises `typeWarning("dictionary", "treating as empty")` at `:1000`;
-    /// this accessor remains silent until its consumer migration calls
-    /// [`Self::type_warning`]. Live parser direct values now reach their
-    /// owning document; explicit and programmatic direct values do not.
+    /// A non-dictionary receiver yields an empty set after raising qpdf's
+    /// `typeWarning("dictionary", "treating as empty")` at `:1000`.
     ///
     /// # Errors
     ///
@@ -1681,6 +1678,7 @@ impl ObjectHandle {
     pub(crate) fn try_get_keys(&self) -> Result<BTreeSet<Vec<u8>>> {
         self.try_dereference()?;
         let Some(entries) = self.as_dictionary() else {
+            self.type_warning("dictionary", "treating as empty")?;
             return Ok(BTreeSet::new());
         };
         let mut result = BTreeSet::new();
@@ -1909,9 +1907,7 @@ impl ObjectHandle {
     /// yields null. qpdf additionally raises
     /// `typeWarning("dictionary", "returning null for attempted key
     /// retrieval")` at `:984`, and gives its null a child description naming
-    /// the key; this accessor remains silent until its consumer migration
-    /// calls [`Self::type_warning`]. Live parser direct values now reach
-    /// their owning document; explicit and programmatic direct values do not.
+    /// the key.
     ///
     /// `key` must be qpdf's decoded, canonical dictionary key including its
     /// leading `/` (for example, `/Type`). Lookup is exact; a slashless key is
@@ -1923,13 +1919,16 @@ impl ObjectHandle {
     #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_get_key(&self, key: &[u8]) -> Result<ObjectHandle> {
         self.try_dereference()?;
-        let child = self.with_value(|value| match value {
-            Some(ObjectValue::Dictionary(entries)) => entries.get(key).cloned(),
-            _ => None,
+        let (is_dictionary, child) = self.with_value(|value| match value {
+            Some(ObjectValue::Dictionary(entries)) => (true, entries.get(key).cloned()),
+            _ => (false, None),
         });
         if let Some(child) = child {
             Ok(child)
         } else {
+            if !is_dictionary {
+                self.type_warning("dictionary", "returning null for attempted key retrieval")?;
+            }
             let key_str = String::from_utf8_lossy(key);
             let null = ObjectHandle::null();
             let var_descr = if key_str.starts_with('/') {
@@ -2180,6 +2179,16 @@ impl ObjectHandle {
         is_null
     }
 
+    /// True if this indirect handle resolved as a missing or malformed source
+    /// object rather than as a parsed literal null. The distinction is kept
+    /// private to the canonical reader/consumer boundary because both states
+    /// intentionally present as null through the public qpdf-compatible view.
+    pub(crate) fn is_missing(&self) -> bool {
+        let state = self.0.borrow().state.clone();
+        let is_missing = matches!(&*state.borrow(), ObjectState::Missing);
+        is_missing
+    }
+
     /// The value as `i64` if this handle's value — its own if direct, or its
     /// already-resolved value if indirect — is an integer, or `None`
     /// otherwise. This never performs resolution itself: an indirect handle
@@ -2323,8 +2332,16 @@ impl ObjectHandle {
     /// a logic error for a foreign or destroyed item. `Error::Internal` is the
     /// crate's logic-error boundary. A contextless qpdf warning is likewise
     /// returned as the existing `type_warning`/`object_warning` error.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+    /// This remains public because qpdf exposes the same live mutation on
+    /// `QPDFObjectHandle`; external canonical consumers must not replace an
+    /// indirect array through its parent dictionary or materialize it into
+    /// the legacy [`crate::Object`] model.
+    ///
+    /// As with [`Self::replace_key`], this mutates the live handle graph but
+    /// cannot notify the owning [`crate::Pdf`]. After mutating a registered
+    /// indirect handle, call [`crate::Pdf::mark_object_dirty`] with its
+    /// object reference so the canonical writer observes the change.
+    pub fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to set item")? {
             return Ok(());
         }
@@ -2334,6 +2351,10 @@ impl ObjectHandle {
         );
         if !in_bounds {
             return self.object_warning("ignoring attempt to set out of bounds array item");
+        }
+
+        if self.is_direct_value_alias(&value) {
+            return Ok(());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -2356,9 +2377,13 @@ impl ObjectHandle {
     /// are then checked and attached one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
+    pub fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
+            return Ok(());
+        }
+        if items.iter().any(|item| self.is_direct_value_alias(item)) {
             return Ok(());
         }
 
@@ -2399,8 +2424,9 @@ impl ObjectHandle {
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
     /// ownership or changing the array.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
+    pub fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
             return Ok(());
         }
@@ -2410,6 +2436,10 @@ impl ObjectHandle {
         );
         if !in_bounds {
             return self.object_warning("ignoring attempt to insert out of bounds array item");
+        }
+
+        if self.is_direct_value_alias(&value) {
+            return Ok(());
         }
 
         self.check_array_item_ownership(&value)?;
@@ -2433,8 +2463,7 @@ impl ObjectHandle {
 
     /// qpdf's `insertItemAndGetNew`: return the supplied handle after the
     /// same insertion/warning/ownership path as [`Self::insert_array_item`].
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn insert_array_item_and_get_new(
+    pub fn insert_array_item_and_get_new(
         &self,
         index: usize,
         value: ObjectHandle,
@@ -2445,9 +2474,13 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
+    pub fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
+            return Ok(());
+        }
+        if self.is_direct_value_alias(&value) {
             return Ok(());
         }
 
@@ -2468,28 +2501,28 @@ impl ObjectHandle {
 
     /// qpdf's `appendItemAndGetNew`: return the supplied handle after the
     /// same append/warning/ownership path as [`Self::append_array_item`].
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn append_array_item_and_get_new(
-        &self,
-        value: ObjectHandle,
-    ) -> Result<ObjectHandle> {
+    pub fn append_array_item_and_get_new(&self, value: ObjectHandle) -> Result<ObjectHandle> {
         self.append_array_item(value.clone())?;
         Ok(value)
     }
 
     /// Erase one live array item, porting qpdf's `eraseItem`
     /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn erase_array_item(&self, index: usize) -> Result<()> {
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
+    pub fn erase_array_item(&self, index: usize) -> Result<()> {
         self.erase_array_item_and_get_old(index).map(|_| ())
     }
 
     /// Erase one live array item and return its original handle, porting
     /// qpdf's `eraseItemAndGetOld` (`libqpdf/QPDFObjectHandle.cc:948-955`).
     /// Invalid positions and non-array receivers return a fresh null after
-    /// emitting the corresponding qpdf warning.
-    #[allow(dead_code)] // consumed by flpdf-25kg.3.35's NNTree migration
-    pub(crate) fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
+    /// emitting the corresponding qpdf warning when the handle has document
+    /// warning context. A direct/contextless handle cannot route that warning
+    /// and therefore returns the existing `Error::System` boundary instead.
+    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
+    /// after mutating a registered indirect handle.
+    pub fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
         if !self.prepare_array_mutation("ignoring attempt to erase item")? {
             return Ok(ObjectHandle::null());
         }
@@ -3088,6 +3121,35 @@ impl ObjectHandle {
             will_retry,
             true,
         )
+    }
+
+    /// Return decoded stream data through the canonical source pipeline.
+    ///
+    /// This is qpdf's `QPDFObjectHandle::getStreamData`
+    /// (`libqpdf/QPDFObjectHandle.cc:1289-1292`) over the same
+    /// `QPDF_Stream::pipeStreamData` path used by page-content piping
+    /// (`libqpdf/QPDFObjectHandle.cc:1710-1722`). Unlike
+    /// [`Self::get_raw_stream_data`], this path decrypts document-backed
+    /// streams before applying their filters, so recovered stream framing is
+    /// handled at the source boundary rather than being exposed as decoded
+    /// page content.
+    pub fn get_stream_data(&self, decode_level: DecodeLevel) -> Result<Rc<Vec<u8>>> {
+        let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
+        let mut filtering_attempted = false;
+        let stream_data_succeeded = self.pipe_stream_data(
+            &mut buffer,
+            &mut filtering_attempted,
+            0,
+            decode_level,
+            false,
+            false,
+        )?; // cov:ignore: multiline call terminator has no executable coverage region
+        if !stream_data_succeeded {
+            return Err(Error::Unsupported(
+                "error getting decoded stream data".to_owned(),
+            ));
+        }
+        Ok(Rc::new(buffer.take_buffer()?))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4092,8 +4154,14 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
 fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        handle.with_value(|value| match value {
-            Some(value) => unparse_object_value(value, out),
+        // Snapshot the value before descending into children. Container
+        // values hold shared handles, and child resolution can update the
+        // same shared state; retaining with_value's RefCell borrow while
+        // walking them makes that legitimate mutation panic with
+        // "RefCell already borrowed".
+        let value = handle.with_value(|value| value.cloned());
+        match value {
+            Some(value) => unparse_object_value(&value, out),
             None => {
                 // cov:ignore-start: unreachable once `try_dereference()`
                 // above has returned `Ok` -- every `DocumentResolver::
@@ -4110,7 +4178,7 @@ fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
                 Ok(())
                 // cov:ignore-end
             }
-        })
+        }
     })
 }
 
@@ -4229,14 +4297,18 @@ fn unparse_object_walk_with_ref_map(
 ) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        handle.with_value(|value| match value {
-            Some(value) => unparse_object_value_with_ref_map(value, out, map, removed_refs),
+        // Release the shared-state borrow before resolving any child handles;
+        // a child may legitimately mutate that state while this value is
+        // being serialized.
+        let value = handle.with_value(|value| value.cloned());
+        match value {
+            Some(value) => unparse_object_value_with_ref_map(&value, out, map, removed_refs),
             None => {
                 // cov:ignore-start: successful dereference exposes Null for missing states or errors while unresolved
                 out.extend_from_slice(b"null");
                 Ok(())
             } // cov:ignore-end
-        })
+        }
     })
 }
 
@@ -6090,7 +6162,13 @@ pub(crate) mod identity_tests {
 
         let (scalar, _scalar_resolver, scalar_calls) =
             logged_resolver_bearing_handle(ObjectValue::Integer(7));
-        assert_eq!(scalar.try_get_keys().unwrap(), BTreeSet::<Vec<u8>>::new());
+        assert!(matches!(
+            scalar.try_get_keys().unwrap_err(),
+            Error::Internal(message)
+                if message == "warning raised through a resolver with no document warning sink: \
+                    object 20 0: operation for dictionary attempted on object of type integer: \
+                    treating as empty"
+        ));
         assert_eq!(*scalar_calls.borrow(), vec![ObjectRef::new(20, 0)]);
     }
 
@@ -10269,6 +10347,42 @@ mod mutation_tests {
     }
 
     #[test]
+    fn get_stream_data_maps_a_filtered_source_retry_to_an_error() {
+        let raw = b"source error".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                )]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw,
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: true,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+
+        let error = stream
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect_err("a failed filtered source must not be reported as decoded data");
+
+        assert!(matches!(
+            error,
+            Error::Unsupported(message) if message == "error getting decoded stream data"
+        ));
+        assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
     fn pipe_stream_data_resolves_filter_and_decode_parameter_values_through_the_document() {
         let (filter, _filter_resolver) = super::identity_tests::resolver_bearing_handle(
             ObjectValue::Name(b"FlateDecode".to_vec()),
@@ -11167,6 +11281,68 @@ mod mutation_tests {
             .unwrap()
             .unwrap()
             .is_same_object_as(&appended));
+    }
+
+    #[test]
+    fn public_array_mutators_ignore_direct_self_aliases() {
+        let array = ObjectHandle::array(vec![ObjectHandle::integer(1)]);
+
+        array
+            .set_array_item(0, array.clone())
+            .expect("direct self replacement is ignored");
+        array
+            .set_array_items(vec![array.clone()])
+            .expect("direct self replacement list is ignored");
+        array
+            .insert_array_item(0, array.clone())
+            .expect("direct self insertion is ignored");
+        array
+            .append_array_item(array.clone())
+            .expect("direct self append is ignored");
+
+        let set_error = array
+            .set_array_item(usize::MAX, array.clone())
+            .expect_err("bounds warning must run before the self-alias guard");
+        assert!(matches!(
+            set_error,
+            Error::System(message)
+                if message == "ignoring attempt to set out of bounds array item"
+        ));
+        let insert_error = array
+            .insert_array_item(usize::MAX, array.clone())
+            .expect_err("bounds warning must run before the self-alias guard");
+        assert!(matches!(
+            insert_error,
+            Error::System(message)
+                if message == "ignoring attempt to insert out of bounds array item"
+        ));
+
+        assert_eq!(array.try_array_len().unwrap(), Some(1));
+        assert_eq!(
+            array.try_array_item(0).unwrap().unwrap().as_integer(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn loaded_clean_array_mutation_requires_explicit_dirty_mark() {
+        let mut pdf = crate::Pdf::open_mem_owned(
+            include_bytes!("../../../tests/fixtures/minimal.pdf").to_vec(),
+        )
+        .expect("open minimal PDF");
+        let pages_ref = ObjectRef::new(2, 0);
+        let pages = pdf.get_object_handle(pages_ref);
+        pdf.resolve_object_handle(&pages)
+            .expect("resolve loaded Pages object");
+        let kids = pages.get_key(b"/Kids");
+
+        assert!(pdf.dirty_object_refs().is_empty());
+        kids.append_array_item(ObjectHandle::integer(4))
+            .expect("mutate the loaded array");
+        assert!(pdf.dirty_object_refs().is_empty());
+
+        pdf.mark_object_dirty(pages_ref);
+        assert_eq!(pdf.dirty_object_refs(), vec![pages_ref]);
     }
 
     #[test]
@@ -12341,11 +12517,11 @@ mod mutation_tests {
 }
 
 #[cfg(test)]
-mod warning_emission_tests {
+pub(crate) mod warning_emission_tests {
     use super::*;
 
     /// A document that records every warning an object emits through it.
-    struct WarningRecorder {
+    pub(crate) struct WarningRecorder {
         value: ObjectValue,
         warnings: RefCell<Vec<String>>,
     }
@@ -12368,7 +12544,7 @@ mod warning_emission_tests {
 
     /// An indirect handle that resolves to `value`, paired with the document
     /// it warns through.
-    fn handle_resolving(value: ObjectValue) -> (ObjectHandle, Rc<WarningRecorder>) {
+    pub(crate) fn handle_resolving(value: ObjectValue) -> (ObjectHandle, Rc<WarningRecorder>) {
         let recorder = Rc::new(WarningRecorder {
             value,
             warnings: RefCell::new(Vec::new()),
@@ -12381,7 +12557,7 @@ mod warning_emission_tests {
         (handle, recorder)
     }
 
-    fn warnings(recorder: &Rc<WarningRecorder>) -> Vec<String> {
+    pub(crate) fn warnings(recorder: &Rc<WarningRecorder>) -> Vec<String> {
         recorder.warnings.borrow().clone()
     }
 
@@ -12537,22 +12713,26 @@ mod warning_emission_tests {
     }
 
     #[test]
-    fn get_key_on_a_non_dictionary_returns_null_without_warning_yet() {
+    fn dictionary_accessors_warn_on_a_non_dictionary_receiver() {
         // qpdf raises `typeWarning("dictionary", "returning null for
         // attempted key retrieval")` here (`libqpdf/QPDFObjectHandle.cc:984`)
         // and its receiver always has a context, because `QPDFParser` stamps
         // the owning document on every value it creates
-        // (`libqpdf/QPDFParser.cc:416-442`). This accessor does not yet call
-        // `type_warning`, so emitting is still deferred even though live
-        // parser direct children now carry the context qpdf supplies. The
-        // consuming `/DecodeParms` read reaches exactly that future consumer;
-        // keep the silent result pinned until its separate migration lands.
+        // (`libqpdf/QPDFParser.cc:416-442`). Both accessors now call
+        // `type_warning`, while the result shapes remain qpdf's null/empty
+        // fallbacks.
         let (handle, recorder) = handle_resolving(ObjectValue::Integer(7));
 
         assert!(handle.try_get_key(b"/Type").unwrap().is_null());
         assert!(handle.try_get_keys().unwrap().is_empty());
 
-        assert!(warnings(&recorder).is_empty());
+        assert_eq!(
+            warnings(&recorder),
+            [
+                "object 3 0: operation for dictionary attempted on object of type integer: returning null for attempted key retrieval",
+                "object 3 0: operation for dictionary attempted on object of type integer: treating as empty",
+            ]
+        );
     }
 
     #[test]
@@ -13038,6 +13218,19 @@ mod warning_emission_tests {
         child
             .type_warning("dictionary", "treating as empty")
             .unwrap();
+        assert_eq!(
+            warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn dictionary_accessors_warn_through_a_direct_child_context() {
+        let (parent, recorder) = handle_resolving(ObjectValue::Array(vec![]));
+        let child = ObjectHandle::integer(10);
+        ObjectHandle::attach_child_to_parent(&child, &Rc::downgrade(&parent.0));
+
+        assert!(child.try_get_keys().unwrap().is_empty());
         assert_eq!(
             warnings(&recorder),
             ["operation for dictionary attempted on object of type integer: treating as empty"]

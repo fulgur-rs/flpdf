@@ -141,6 +141,7 @@ impl ObjectCache {
         self.entries.get(&object_ref)
     }
 
+    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
     pub(crate) fn contains_object_number(&self, number: u32) -> bool {
         self.entries
             .range(ObjectRef::new(number, 0)..=ObjectRef::new(number, u16::MAX))

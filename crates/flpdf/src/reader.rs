@@ -28,7 +28,8 @@ use crate::security::standard::{
 };
 use crate::tokenizer::Tokenizer;
 use crate::{
-    Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm,
+    Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, Stream, XrefEntry,
+    XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -439,13 +440,22 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // Stack-growth protection for this module's two recursive hubs: `lift_bounded`
 // here, and `ResolverHandle::resolve_indirect` in the `resolver` child module,
 // which reaches these as `super::READER_STACK_RED_ZONE`/
-// `super::READER_STACK_GROWTH_SIZE`. The values mirror `parser.rs`'s own
-// `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` (kept as separate local constants
-// rather than imported cross-module, matching this crate's existing per-module
-// duplication of the same two numbers in `object_handle.rs`); `resolver.rs`
-// shares *these* rather than minting a third pair because it is a child of this
-// module, not a module across the crate from it.
-const READER_STACK_RED_ZONE: usize = 32 * 1024;
+// `super::READER_STACK_GROWTH_SIZE`. The red-zone value mirrors
+// `parser.rs`'s own `STACK_RED_ZONE` (kept as a separate local constant rather
+// than imported cross-module, matching this crate's existing per-module
+// duplication in `object_handle.rs`); `resolver.rs` shares *these* rather
+// than minting a third pair because it is a child of this module, not a module
+// across the crate from it.
+// Keep this red zone larger than parser.rs's 32 KiB value: resolver frames
+// retain the post-object-stream offset and recovered-stream state, so the old
+// value let a 256 KiB caller stack exhaust before stacker could switch to its
+// growth segment.
+const READER_STACK_RED_ZONE: usize = 128 * 1024;
+// The resolver's object-attributed diagnostics and recovered-stream state add
+// enough frame state that the deep-chain regression needs an earlier growth
+// check than the original 32 KiB red zone. The callback stack remains 1 MiB;
+// stacker switches to it before the caller's bounded stack can exhaust on any
+// supported platform.
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
 impl<R: Read + Seek> Pdf<R> {
@@ -995,7 +1005,24 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     pub(crate) fn source_xref_entries(&self) -> BTreeMap<ObjectRef, XrefEntry> {
-        self.resolver.xref_entries()
+        self.resolver.source_xref_entries()
+    }
+
+    /// Return qpdf's effective source cross-reference table.
+    ///
+    /// This is the reader-owned table represented by qpdf's
+    /// `QPDF::getXRefTable` (`libqpdf/QPDF.cc:2370-2377`), not a writer
+    /// reconstruction or a table derived from resolved values. The returned
+    /// map is a snapshot because the resolver owns the table behind interior
+    /// mutability; resolution-time recovery is reflected in a subsequent
+    /// snapshot.
+    pub fn get_xref_table(&self) -> BTreeMap<ObjectRef, XrefEntry> {
+        let removed = &self.qpdf_removed_refs;
+        self.resolver
+            .xref_entries()
+            .into_iter()
+            .filter(|(object_ref, _)| !removed.contains(object_ref))
+            .collect()
     }
 
     /// Return the qpdf-logical byte offset of an indirect stream's encoded data.
@@ -1208,6 +1235,8 @@ impl<R: Read + Seek> Pdf<R> {
         // make a later resolve of this same ref keep observing the value
         // from *before* this call.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         let handle = self.get_object_handle(object_ref);
         let lifted = self.lift_for_set_object(&object, &handle);
         match lifted {
@@ -1241,6 +1270,7 @@ impl<R: Read + Seek> Pdf<R> {
                 // holds.
                 self.legacy_materialized_memo
                     .insert(object_ref, object.clone());
+                self.legacy_materialized_replacement_refs.insert(object_ref);
             }
         }
 
@@ -1266,16 +1296,36 @@ impl<R: Read + Seek> Pdf<R> {
         if let (Object::Stream(stream), Some(existing_dict)) =
             (object, existing_handle.as_stream_dict())
         {
-            let dict_value = ObjectValue::Dictionary(self.lift_dictionary(&stream.dict, 0)?);
-            existing_dict.replace_direct_value(dict_value);
-            existing_dict.clear_description();
-            return Ok(ObjectValue::Stream {
-                stream_dict: existing_dict,
-                stream_data: Some(Rc::new(stream.data.clone())),
-                stream_length: 0,
-            });
+            return self.lift_stream_with_existing_dictionary(
+                stream,
+                existing_dict,
+                crate::object::MAX_INLINE_DEPTH,
+                false,
+            );
         }
         self.lift(object, 0)
+    }
+
+    fn lift_stream_with_existing_dictionary(
+        &mut self,
+        stream: &Stream,
+        existing_dict: ObjectHandle,
+        max_depth: usize,
+        allow_content_tokens: bool,
+    ) -> Result<ObjectValue> {
+        let dict_value = ObjectValue::Dictionary(self.lift_dictionary_bounded_with_options(
+            &stream.dict,
+            0,
+            max_depth,
+            allow_content_tokens,
+        )?);
+        existing_dict.replace_direct_value(dict_value);
+        existing_dict.clear_description();
+        Ok(ObjectValue::Stream {
+            stream_dict: existing_dict,
+            stream_data: Some(Rc::new(stream.data.clone())),
+            stream_length: 0,
+        })
     }
 
     /// Remove `object_ref`, marking it deleted.
@@ -1301,6 +1351,15 @@ impl<R: Read + Seek> Pdf<R> {
             return;
         }
 
+        // qpdf erases the source xref row and canonical object-cache entry
+        // while nullifying every outstanding handle (`QPDF.cc:1996-2004`).
+        // Keep the indirect identity for this legacy public API, but remove
+        // the source row and mark the retained handle missing. The qpdf-facing
+        // object snapshot filters this compatibility slot below.
+        self.resolver
+            .remove_object_preserving_handle(object_ref)
+            .expect("canonical resolver object removal is infallible");
+
         // Invalidate the handle-graph bridge state unconditionally, before
         // the cache-state early return below: `Pdf::prepare_qpdf_json_objects`
         // can mark a ref's cache entry `Missing` (discovered as a dangling
@@ -1308,10 +1367,10 @@ impl<R: Read + Seek> Pdf<R> {
         // it has ever been created via `Pdf::get_object_handle`. If the two
         // lines below ran only past the early return, that combination
         // (cache already `Missing`, handle still `NotYetResolved`) would
-        // skip them entirely, leaving a stale-but-unresolved handle whose
-        // correctness would then depend on `Pdf::resolve_object_handle`'s
-        // fallback arm staying a wildcard forever.
+        // leave stale compatibility data behind.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         self.handle_mutated_object_refs.remove(&object_ref);
         self.get_object_handle(object_ref).set_missing();
 
@@ -1358,22 +1417,28 @@ impl<R: Read + Seek> Pdf<R> {
         self.dirty_object_refs.remove(&object_ref);
     }
 
-    /// Every object reference known from the cross-reference table, including objects
-    /// that have not yet been parsed.
+    /// Every object reference known from the cross-reference table or the
+    /// canonical handle registry, including objects that have not yet been
+    /// parsed. The registry half is needed for qpdf-shaped allocations made
+    /// from an existing [`ObjectHandle`].
     pub fn object_refs(&self) -> Vec<ObjectRef> {
-        if self.resolver.reconstructed_xref() {
-            return self
-                .cache
-                .refs_after_xref_recovery(&self.resolver.xref_entries(), false);
-        }
+        let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
+            self.cache
+                .refs_after_xref_recovery(&self.resolver.source_xref_entries(), false)
+                .into_iter()
+                .collect()
+        } else {
+            self.cache
+                .entries()
+                .iter()
+                .filter_map(|(object_ref, entry)| {
+                    (!matches!(entry, CacheEntry::Missing)).then_some(*object_ref)
+                })
+                .collect()
+        };
 
-        self.cache
-            .entries()
-            .iter()
-            .filter_map(|(object_ref, entry)| {
-                (!matches!(entry, CacheEntry::Missing)).then_some(*object_ref)
-            })
-            .collect()
+        refs.extend(self.canonical_object_refs(false));
+        refs.into_iter().collect()
     }
 
     /// Object refs that the cross-reference table marks as live.
@@ -1389,20 +1454,48 @@ impl<R: Read + Seek> Pdf<R> {
     /// is a real null indirect object (e.g. `1 0 obj null endobj`), not an
     /// absent one.
     pub fn live_object_refs(&self) -> Vec<ObjectRef> {
-        if self.resolver.reconstructed_xref() {
-            return self
-                .cache
-                .refs_after_xref_recovery(&self.resolver.xref_entries(), true);
-        }
+        let mut refs: BTreeSet<ObjectRef> = if self.resolver.reconstructed_xref() {
+            self.cache
+                .refs_after_xref_recovery(&self.resolver.source_xref_entries(), true)
+                .into_iter()
+                .collect()
+        } else {
+            self.cache
+                .entries()
+                .iter()
+                .filter_map(|(object_ref, entry)| match entry {
+                    crate::cache::CacheEntry::Deleted
+                    | crate::cache::CacheEntry::Missing
+                    | crate::cache::CacheEntry::Reserved => None,
+                    _ => Some(*object_ref),
+                })
+                .collect()
+        };
 
-        self.cache
-            .entries()
-            .iter()
-            .filter_map(|(object_ref, entry)| match entry {
-                crate::cache::CacheEntry::Deleted
-                | crate::cache::CacheEntry::Missing
-                | crate::cache::CacheEntry::Reserved => None,
-                _ => Some(*object_ref),
+        refs.extend(self.canonical_object_refs(true));
+        refs.retain(|object_ref| !self.qpdf_removed_refs.contains(object_ref));
+        refs.into_iter().collect()
+    }
+
+    fn canonical_object_refs(&self, live_only: bool) -> BTreeSet<ObjectRef> {
+        self.resolver
+            .all_object_handles()
+            .into_iter()
+            .filter_map(|handle| {
+                let object_ref = handle.object_ref()?;
+                let cache_entry = self.cache.entry(object_ref);
+                if handle.is_missing() || matches!(cache_entry, Some(CacheEntry::Missing)) {
+                    return None;
+                }
+                if live_only
+                    && (matches!(
+                        cache_entry,
+                        Some(CacheEntry::Deleted | CacheEntry::Missing | CacheEntry::Reserved)
+                    ) || (cache_entry.is_none() && !handle.is_resolved()))
+                {
+                    return None;
+                }
+                Some(object_ref)
             })
             .collect()
     }
@@ -1589,6 +1682,8 @@ impl<R: Read + Seek> Pdf<R> {
         self.recovered_stream_eols.remove(&object_ref);
         self.transformed_stream_refs.remove(&object_ref);
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         self.mark_object_handle_mutated(object_ref);
         Ok(())
     }
@@ -1673,18 +1768,23 @@ impl<R: Read + Seek> Pdf<R> {
     /// Return an unused generation-zero object reference.
     ///
     /// Both the legacy object cache and the canonical handle registry own
-    /// object numbers. A number absent from `object_refs()` may therefore
-    /// still belong to an unmaterialized [`ObjectHandle`].
+    /// object numbers. The enumeration includes both sources, and the
+    /// resolver maximum is retained here so an unmaterialized handle cannot
+    /// be skipped between the scan and allocation.
     pub(crate) fn next_available_object_ref(&self) -> Result<ObjectRef> {
-        let next_number = self
+        let max_number = self
             .object_refs()
             .iter()
             .map(|r| r.number)
             .chain(self.resolver.max_object_number())
             .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or_else(|| Error::Unsupported("object-number space exhausted".to_string()))?;
+            .unwrap_or(0);
+        if max_number >= i32::MAX as u32 {
+            return Err(Error::Unsupported(
+                "max object id is too high to create new objects".to_string(),
+            ));
+        }
+        let next_number = max_number + 1;
         Ok(ObjectRef::new(next_number, 0))
     }
 
@@ -1696,6 +1796,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `nextObjGen()` allocates above the maximum object number, so a
     /// generation-one occupant reserves the number just as generation zero
     /// does.
+    #[allow(dead_code)] // legacy test allocator; canonical consumers use next_obj_gen
     pub(crate) fn object_number_is_available(&self, number: u32) -> bool {
         !self.cache.contains_object_number(number) && !self.resolver.holds_object_number(number)
     }
@@ -1737,6 +1838,8 @@ impl<R: Read + Seek> Pdf<R> {
         // bridge. Discard any snapshot previously returned by resolve so the
         // next resolve and the writer materialize the changed live handle.
         self.legacy_materialized_memo.remove(&object_ref);
+        self.legacy_materialized_replacement_refs
+            .remove(&object_ref);
         self.handle_mutated_object_refs.insert(object_ref);
         self.dirty_object_refs.insert(object_ref);
     }
@@ -1767,39 +1870,158 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
-    // This implements the ordering/registration contract of qpdf's
-    // `getAllObjects()` (`libqpdf/QPDF.cc:1285-1294`) only. qpdf's own
-    // dangling-reference preparation additionally walks every live object's
-    // content to discover and register references that are syntactically
-    // valid but have no live xref/cache target — that step ties into
-    // xref/recovery semantics this layer does not own, and is out of scope
-    // here; full dangling-reference-preparation parity is flpdf-egzr.3.3's
-    // deliverable.
-    //
-    // qpdf's `m->xref_table` never contains free ("f"/type-0) entries in the
-    // first place (`insertFreeXrefEntry` records them in a separate
-    // `deleted_objects` set, never in `xref_table`), so `getAllObjects` never
-    // sees them. The reader's source table now follows that effective-table
-    // contract, so no Free predicate is needed at this boundary.
-    /// Every indirect object known to this document.
-    ///
-    /// The result is the union of every reference already registered in the
-    /// canonical handle cache (see [`Pdf::get_object_handle`]) and every
-    /// reference recorded in the effective source cross-reference table,
-    /// registering any of the latter that is not yet cached. Returned in
-    /// `ObjectRef` order (ascending object number, then generation); every
-    /// handle in the result is indirect ([`ObjectHandle::is_indirect`]).
-    ///
-    /// # Errors
-    ///
-    /// This method never returns an error: every candidate reference is
-    /// registered via [`Pdf::get_object_handle`], which cannot fail.
-    pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
-        let refs_to_register = self.resolver.xref_refs();
-        for object_ref in refs_to_register {
+    fn reconcile_legacy_materialized_memos(&mut self) -> Result<()> {
+        let pending: Vec<(ObjectRef, Object)> = self
+            .legacy_materialized_replacement_refs
+            .iter()
+            .filter_map(|object_ref| {
+                self.legacy_materialized_memo
+                    .get(object_ref)
+                    .cloned()
+                    .map(|object| (*object_ref, object))
+            })
+            .collect();
+
+        for (object_ref, replacement) in pending {
+            let Some(handle) = self.resolver.registered_handle(object_ref) else {
+                continue;
+            };
+            // `set_object`'s ordinary lift is bounded by MAX_INLINE_DEPTH,
+            // while a value that already parsed successfully can be valid up
+            // to MAX_PARSE_DEPTH. Rebuild the canonical value at that looser
+            // bound so enumeration cannot return the stale source handle.
+            // Content-stream tokens are valid `ObjectValue` leaves even
+            // though the generic legacy lift rejects them outside a content
+            // stream; preserve them at every nesting level rather than
+            // making enumeration fail.
+            let value = match (&replacement, handle.as_stream_dict()) {
+                (Object::Stream(stream), Some(existing_dict)) => self
+                    .lift_stream_with_existing_dictionary(
+                        stream,
+                        existing_dict,
+                        crate::parser::MAX_PARSE_DEPTH,
+                        true,
+                    )?,
+                _ => self.lift_bounded_with_content_tokens(
+                    &replacement,
+                    0,
+                    crate::parser::MAX_PARSE_DEPTH,
+                )?,
+            };
+            handle.set_resolved(value);
+            handle.clear_description();
+            handle.reset_parsed_offset();
+            self.legacy_materialized_memo.remove(&object_ref);
+            self.legacy_materialized_replacement_refs
+                .remove(&object_ref);
+        }
+        Ok(())
+    }
+
+    fn register_parsed_xref_stream_handles(&mut self) -> Result<()> {
+        let pending: Vec<ObjectRef> = self.qpdf_parsed_xref_streams.keys().copied().collect();
+        for object_ref in pending {
+            if object_ref.number == 0
+                || object_ref.generation == u16::MAX
+                || self.qpdf_removed_refs.contains(&object_ref)
+                || self.resolver.xref_entry(object_ref).is_some()
+            {
+                continue;
+            }
+            let handle = self.get_object_handle(object_ref);
+            if handle.is_resolved() && !handle.is_missing() {
+                continue;
+            }
+            let object = self.qpdf_parsed_xref_streams[&object_ref].clone();
+            let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
+            handle.set_resolved(value);
+        }
+        Ok(())
+    }
+
+    fn register_top_level_replacement_targets(&mut self) {
+        // A bare `Object::Reference` supplied to `set_object` is represented
+        // as an `ObjectValue::Reference` on the holder itself. Unlike an
+        // indirect child, that lift does not mint the target handle. Register
+        // the target before taking the cache snapshot so a dangling target is
+        // visible exactly like a reference discovered inside a parsed value.
+        let targets: BTreeSet<_> = self
+            .resolver
+            .all_object_handles()
+            .into_iter()
+            .filter_map(|handle| handle.as_reference())
+            .filter(|object_ref| {
+                object_ref.number != 0
+                    && object_ref.generation != u16::MAX
+                    && !self.qpdf_removed_refs.contains(object_ref)
+            })
+            .collect();
+        for object_ref in targets {
             self.get_object_handle(object_ref);
         }
-        Ok(self.resolver.all_object_handles())
+    }
+
+    /// Return qpdf's complete canonical object cache in `ObjectRef` order.
+    ///
+    /// `QPDF::getAllObjects` first calls `fixDanglingReferences` and then
+    /// walks `m->obj_cache` (`libqpdf/QPDF.cc:1258-1294`). The canonical
+    /// resolver performs that preparation here: every effective source-xref
+    /// object is resolved, and parser-discovered dangling references are
+    /// retained as canonical indirect handles. Free rows are not in the
+    /// effective source table, matching qpdf's `insertFreeXrefEntry` split
+    /// between `xref_table` and `deleted_objects`.
+    pub fn get_all_objects(&mut self) -> Result<Vec<ObjectHandle>> {
+        // Reconcile caller-supplied replacements before qpdf-style dangling
+        // reference preparation. Otherwise resolving the superseded source
+        // value can register references that the replacement no longer owns.
+        self.reconcile_legacy_materialized_memos()?;
+        self.register_parsed_xref_stream_handles()?;
+        self.resolver.fix_dangling_references()?;
+
+        // A trailer reference can be valid even when it has no body/xref row.
+        // qpdf's trailer parse has already observed these references; register
+        // them before taking the object-cache snapshot so `/Info 99 0 R` is not
+        // lost merely because no body object was resolved.
+        let trailer_refs: Vec<_> = self
+            .qpdf_trailer_references
+            .iter()
+            .copied()
+            .filter(|object_ref| {
+                object_ref.number != 0
+                    && object_ref.generation != u16::MAX
+                    && !self.qpdf_removed_refs.contains(object_ref)
+            })
+            .collect();
+        for object_ref in trailer_refs {
+            self.get_object_handle(object_ref);
+        }
+
+        self.reconcile_legacy_materialized_memos()?;
+        self.register_top_level_replacement_targets();
+        let removed = self.qpdf_removed_refs.clone();
+        Ok(self
+            .resolver
+            .all_object_handles()
+            .into_iter()
+            .filter(|handle| {
+                handle.object_ref().is_none_or(|object_ref| {
+                    object_ref.number != 0
+                        && object_ref.generation != u16::MAX
+                        && !removed.contains(&object_ref)
+                })
+            })
+            .collect())
+    }
+
+    /// Compatibility name for the canonical qpdf object enumeration.
+    ///
+    /// New consumers should use [`Self::get_all_objects`]. This forwarding
+    /// name remains only while the remaining consumer-cutover slices move off
+    /// the pre-qpdf naming; it has exactly the same preparation and ordering
+    /// contract.
+    ///
+    pub fn get_all_object_handles(&mut self) -> Result<Vec<ObjectHandle>> {
+        self.get_all_objects()
     }
 
     /// Resolve `handle` in place if it is an unresolved indirect handle.
@@ -2004,6 +2226,25 @@ impl<R: Read + Seek> Pdf<R> {
         depth: usize,
         max_depth: usize,
     ) -> Result<ObjectValue> {
+        self.lift_bounded_with_options(object, depth, max_depth, false)
+    }
+
+    fn lift_bounded_with_content_tokens(
+        &mut self,
+        object: &Object,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<ObjectValue> {
+        self.lift_bounded_with_options(object, depth, max_depth, true)
+    }
+
+    fn lift_bounded_with_options(
+        &mut self,
+        object: &Object,
+        depth: usize,
+        max_depth: usize,
+        allow_content_tokens: bool,
+    ) -> Result<ObjectValue> {
         if depth > max_depth {
             return Err(Error::Unsupported(format!(
                 "object handle lift: inline object nesting exceeds maximum of {max_depth}"
@@ -2037,11 +2278,23 @@ impl<R: Read + Seek> Pdf<R> {
                 Object::Array(items) => ObjectValue::Array(
                     items
                         .iter()
-                        .map(|item| self.lift_to_handle_bounded(item, depth + 1, max_depth))
+                        .map(|item| {
+                            self.lift_to_handle_bounded_with_options(
+                                item,
+                                depth + 1,
+                                max_depth,
+                                allow_content_tokens,
+                            )
+                        })
                         .collect::<Result<Vec<_>>>()?,
                 ),
                 Object::Dictionary(dict) => {
-                    ObjectValue::Dictionary(self.lift_dictionary_bounded(dict, depth, max_depth)?)
+                    ObjectValue::Dictionary(self.lift_dictionary_bounded_with_options(
+                        dict,
+                        depth,
+                        max_depth,
+                        allow_content_tokens,
+                    )?)
                 }
                 // A stream's own dictionary is lifted the same way any other
                 // nested dictionary is (see `lift_dictionary`), then wrapped in
@@ -2052,13 +2305,21 @@ impl<R: Read + Seek> Pdf<R> {
                 // pre-existing dictionary handle instead, via
                 // `Pdf::lift_for_set_object`, so an established parsed offset
                 // is not lost on a plain round trip.
-                Object::Stream(stream) => ObjectValue::Stream {
-                    stream_dict: ObjectHandle::from_value(ObjectValue::Dictionary(
-                        self.lift_dictionary_bounded(&stream.dict, depth, max_depth)?,
-                    )),
-                    stream_data: Some(Rc::new(stream.data.clone())),
-                    stream_length: 0,
-                },
+                Object::Stream(stream) => {
+                    let stream_dict = self.lift_dictionary_bounded_with_options(
+                        &stream.dict,
+                        depth,
+                        max_depth,
+                        allow_content_tokens,
+                    )?;
+                    ObjectValue::Stream {
+                        stream_dict: self
+                            .resolver
+                            .direct_object_handle(ObjectValue::Dictionary(stream_dict)),
+                        stream_data: Some(Rc::new(stream.data.clone())),
+                        stream_length: 0,
+                    }
+                }
                 // A bare top-level reference never comes from a file/ObjStm
                 // parse (`top_level_no_reference` integerizes it there,
                 // matching qpdf), but `Pdf::set_object` callers pass one
@@ -2068,16 +2329,20 @@ impl<R: Read + Seek> Pdf<R> {
                 // graph's representation for exactly that case; see its own
                 // doc.
                 Object::Reference(object_ref) => ObjectValue::Reference(*object_ref),
-                // Content-stream-only tokens; never a resolved file/ObjStm
-                // object value, and not a value any caller passes to
-                // `Pdf::set_object` in practice. `ObjectValue` has no variant to
-                // represent either losslessly, so this returns `Err` rather than
-                // silently discarding the caller-supplied value as `Null`:
-                // `Pdf::set_object` already treats a `lift` failure as "cannot be
-                // represented in the handle graph" and falls back to storing
-                // `object` directly as the authoritative
-                // `legacy_materialized_memo` value instead (see its own comment),
-                // exactly the same route the excess-depth case already takes.
+                Object::Operator(bytes) if allow_content_tokens => {
+                    ObjectValue::Operator(bytes.clone())
+                }
+                Object::InlineImage(bytes) if allow_content_tokens => {
+                    ObjectValue::InlineImage(bytes.clone())
+                }
+                // In the normal lift mode, content-stream-only tokens are not
+                // resolved file/ObjStm values and are rejected rather than
+                // silently discarded as `Null`: `Pdf::set_object` treats this
+                // failure as "cannot be represented in the handle graph" and
+                // stores the caller-supplied value in
+                // `legacy_materialized_memo`. Memo reconciliation opts into
+                // the lossless ObjectValue leaves above, including nested
+                // tokens, so enumeration can restore the authoritative value.
                 Object::Operator(_) | Object::InlineImage(_) => {
                     return Err(Error::Unsupported(
                         "object handle lift: content-stream-only token has no ObjectValue representation"
@@ -2089,30 +2354,23 @@ impl<R: Read + Seek> Pdf<R> {
         })
     }
 
-    // Shared by `lift`'s `Object::Dictionary`/`Object::Stream` arms and by
-    // `Pdf::lift_for_set_object`: lift every entry of `dict` one level
-    // deeper than `depth`, matching `lift`'s own depth bound.
-    fn lift_dictionary(
-        &mut self,
-        dict: &Dictionary,
-        depth: usize,
-    ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
-        self.lift_dictionary_bounded(dict, depth, crate::object::MAX_INLINE_DEPTH)
-    }
-
-    // Same as `lift_dictionary`, but threading a caller-chosen `max_depth`
-    // through to every entry — see `lift_bounded`.
-    fn lift_dictionary_bounded(
+    fn lift_dictionary_bounded_with_options(
         &mut self,
         dict: &Dictionary,
         depth: usize,
         max_depth: usize,
+        allow_content_tokens: bool,
     ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
         dict.iter()
             .map(|(k, v)| {
                 Ok((
                     crate::object_handle::canonical_dictionary_key_from_legacy(k),
-                    self.lift_to_handle_bounded(v, depth + 1, max_depth)?,
+                    self.lift_to_handle_bounded_with_options(
+                        v,
+                        depth + 1,
+                        max_depth,
+                        allow_content_tokens,
+                    )?,
                 ))
             })
             .collect()
@@ -2124,19 +2382,45 @@ impl<R: Read + Seek> Pdf<R> {
     // reference (via `Pdf::get_object_handle`), preserving identity with any
     // other handle already registered for the same object — it is left
     // unresolved, not eagerly followed. Any other value is lifted directly
-    // and wrapped in a fresh direct handle. `max_depth` bounds inline nesting
-    // the same way `lift_bounded` does — see its own comment.
+    // and wrapped in a fresh direct handle carrying this document's weak
+    // context. `max_depth` bounds inline nesting the same way `lift_bounded`
+    // does — see its own comment.
     pub(crate) fn lift_to_handle_bounded(
         &mut self,
         object: &Object,
         depth: usize,
         max_depth: usize,
     ) -> Result<ObjectHandle> {
+        self.lift_to_handle_bounded_with_options(object, depth, max_depth, false)
+    }
+
+    fn lift_to_handle_bounded_with_options(
+        &mut self,
+        object: &Object,
+        depth: usize,
+        max_depth: usize,
+        allow_content_tokens: bool,
+    ) -> Result<ObjectHandle> {
         match object {
             Object::Reference(object_ref) => Ok(self.get_object_handle(*object_ref)),
+            // qpdf's QPDFObjectHandle::newNull() is contextless
+            // (`libqpdf/QPDFObjectHandle.cc:1891-1894`), including null
+            // fallbacks returned by dictionary accessors. Keep a relifted
+            // legacy null on that same boundary rather than making a
+            // synthetic resolver-bearing value whose warning path would
+            // incorrectly reach this Pdf's logger.
+            Object::Null => {
+                if depth > max_depth {
+                    return Err(Error::Unsupported(format!(
+                        "object handle lift: inline object nesting exceeds maximum of {max_depth}"
+                    )));
+                }
+                Ok(ObjectHandle::null())
+            }
             direct => {
-                let value = self.lift_bounded(direct, depth, max_depth)?;
-                Ok(ObjectHandle::from_value(value))
+                let value =
+                    self.lift_bounded_with_options(direct, depth, max_depth, allow_content_tokens)?;
+                Ok(self.resolver.direct_object_handle(value))
             }
         }
     }
@@ -2470,7 +2754,13 @@ impl<R: Read + Seek> Pdf<R> {
             return;
         }
 
-        let entries = self.resolver.xref_entries();
+        let removed = &self.qpdf_removed_refs;
+        let entries = self
+            .resolver
+            .source_xref_entries()
+            .into_iter()
+            .filter(|(object_ref, _)| !removed.contains(object_ref))
+            .collect();
         self.cache.synchronize_with_xref(&entries);
         // Keep the actual `/Extends`-resolved parent for a still-identical
         // compressed xref entry, but never let a mapping survive a rebuilt
@@ -7464,6 +7754,515 @@ mod tests {
             .any(|handle| handle.object_ref() == Some(dangling_ref)));
     }
 
+    fn trailer_only_dangling_info_pdf() -> Vec<u8> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let mut offsets = BTreeMap::new();
+        for (object_ref, body) in [
+            (1, b"<< /Type /Catalog /Pages 2 0 R >>".as_slice()),
+            (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice()),
+            (
+                3,
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".as_slice(),
+            ),
+        ] {
+            offsets.insert(object_ref, bytes.len() as u64);
+            bytes.extend_from_slice(format!("{object_ref} 0 obj\n").as_bytes());
+            bytes.extend_from_slice(body);
+            bytes.extend_from_slice(b"\nendobj\n");
+        }
+        let xref_start = bytes.len() as u64;
+        bytes.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+        for object_ref in 1..=3 {
+            bytes.extend_from_slice(format!("{:010} 00000 n \n", offsets[&object_ref]).as_bytes());
+        }
+        bytes.extend_from_slice(
+            format!(
+                "trailer\n<< /Size 4 /Root 1 0 R /Info 99 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        bytes
+    }
+
+    #[test]
+    fn get_all_objects_excludes_deleted_objects_from_xref_and_canonical_snapshots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        handle
+            .try_dereference()
+            .expect("resolve object before deletion");
+        assert!(pdf.get_xref_table().contains_key(&object_ref));
+
+        pdf.delete_object(object_ref);
+
+        assert!(!pdf.get_xref_table().contains_key(&object_ref));
+        assert!(handle.is_null());
+        assert!(!pdf
+            .get_all_objects()
+            .expect("enumerate after deletion")
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(object_ref)));
+    }
+
+    #[test]
+    fn deleted_xref_tombstones_survive_reconstruction_snapshots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        pdf.delete_object(object_ref);
+
+        // Simulate reconstruction repopulating the source table from the
+        // original bytes after the public deletion has already happened.
+        pdf.resolver
+            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
+        pdf.resolver.mark_reconstructed_xref_for_test();
+
+        assert!(!pdf.get_xref_table().contains_key(&object_ref));
+        pdf.synchronize_legacy_resolution_state();
+        assert!(!pdf.live_object_refs().contains(&object_ref));
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_a_deep_memo_backed_replacement() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        let mut replacement = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement.clone());
+        assert_eq!(
+            pdf.resolve(object_ref).expect("resolve replacement"),
+            replacement
+        );
+
+        let found = pdf
+            .get_all_objects()
+            .expect("enumerate memo-backed replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement object remains enumerated");
+        assert_eq!(
+            found
+                .materialize()
+                .expect("materialize canonical replacement"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn get_all_objects_reuses_stream_dictionary_for_deep_memo_replacement() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve original stream");
+        let original_dict = handle.as_stream_dict().expect("original stream dictionary");
+        let parsed_offset = original_dict.get_parsed_offset();
+        assert!(
+            parsed_offset >= 0,
+            "source dictionary must have a parsed offset"
+        );
+
+        let mut nested = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            let mut dict = Dictionary::new();
+            dict.insert("Next", nested);
+            nested = Object::Dictionary(dict);
+        }
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("Deep", nested);
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, b"new data".to_vec())),
+        );
+
+        let found = pdf
+            .get_all_objects()
+            .expect("enumerate deep stream replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement stream remains enumerated");
+        let current_dict = found
+            .as_stream_dict()
+            .expect("replacement stream dictionary");
+        assert!(
+            current_dict.is_same_object_as(&original_dict),
+            "memo reconciliation must reuse the existing stream dictionary handle"
+        );
+        assert_eq!(
+            current_dict.get_parsed_offset(),
+            parsed_offset,
+            "reusing the dictionary must preserve its parsed offset"
+        );
+        assert!(
+            current_dict
+                .as_dictionary()
+                .expect("dictionary entries")
+                .contains_key(b"/Deep".as_slice()),
+            "the reused dictionary must contain the replacement entries"
+        );
+    }
+
+    #[test]
+    fn get_all_objects_rejects_an_overdeep_stream_dictionary_memo() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve original stream");
+
+        let mut nested = Object::Integer(7);
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            let mut dict = Dictionary::new();
+            dict.insert("Next", nested);
+            nested = Object::Dictionary(dict);
+        }
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("TooDeep", nested);
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, b"new data".to_vec())),
+        );
+
+        let error = pdf
+            .get_all_objects()
+            .expect_err("an over-deep stream dictionary must fail during reconciliation");
+        assert!(error
+            .to_string()
+            .contains("object handle lift: inline object nesting exceeds maximum"));
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_a_deep_replacement_without_reading_old_stream_data() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open(ReadFailingCursor::new(bytes)).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve the original stream handle");
+        assert!(
+            handle.as_stream_data().is_none(),
+            "source stream data must remain lazy before reconciliation"
+        );
+
+        let mut replacement = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement.clone());
+        pdf.resolver
+            .with_reader_mut(|reader| reader.fail_reads = true);
+
+        let found = pdf
+            .get_all_objects()
+            .expect("reconcile the replacement without reading the old stream")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement handle is enumerated");
+        assert_eq!(
+            found
+                .materialize()
+                .expect("materialize canonical replacement"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_memos_before_resolving_the_replaced_source() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                b"3 0 obj\n<< /Old 9 0 R >>\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let object_ref = ObjectRef::new(3, 0);
+        let mut replacement = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.set_object(object_ref, replacement);
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("enumerate the replacement without resolving the old source");
+        assert!(!objects
+            .iter()
+            .any(|handle| handle.object_ref() == Some(ObjectRef::new(9, 0))));
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_content_stream_token_memos() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let replacements = [
+            (ObjectRef::new(3, 0), Object::Operator(b"Do".to_vec())),
+            (
+                ObjectRef::new(99, 0),
+                Object::InlineImage(b"BI /W 1 ID x EI".to_vec()),
+            ),
+        ];
+        for (object_ref, object) in &replacements {
+            pdf.set_object(*object_ref, object.clone());
+        }
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("content-stream-only replacements remain enumerable");
+        for (object_ref, expected) in replacements {
+            let found = objects
+                .iter()
+                .find(|handle| handle.object_ref() == Some(object_ref))
+                .expect("replacement handle is enumerated");
+            assert_eq!(found.materialize().expect("materialize token"), expected);
+        }
+    }
+
+    #[test]
+    fn get_all_objects_reconciles_nested_content_stream_token_memos() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let mut nested_dict = Dictionary::new();
+        nested_dict.insert("Operator", Object::Operator(b"Do".to_vec()));
+        nested_dict.insert(
+            "InlineImage",
+            Object::InlineImage(b"BI /W 1 ID x EI".to_vec()),
+        );
+        let replacement = Object::Array(vec![
+            Object::Operator(b"q".to_vec()),
+            Object::Dictionary(nested_dict),
+        ]);
+        let object_ref = ObjectRef::new(98, 0);
+        pdf.set_object(object_ref, replacement.clone());
+
+        let found = pdf
+            .get_all_objects()
+            .expect("nested content-stream replacements remain enumerable")
+            .into_iter()
+            .find(|handle| handle.object_ref() == Some(object_ref))
+            .expect("nested replacement handle is enumerated");
+        assert_eq!(
+            found.materialize().expect("materialize nested replacement"),
+            replacement
+        );
+    }
+
+    #[test]
+    fn get_all_objects_excludes_the_object_zero_free_list_head() {
+        let bytes = classic_pdf_with_bodies(
+            &[
+                b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+                b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+                b"3 0 obj\n<< /Free 0 65535 R /Invalid 77 65535 R >>\nendobj\n",
+            ],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+        let invalid_generation_ref = ObjectRef::new(77, u16::MAX);
+        pdf.get_object_handle(invalid_generation_ref)
+            .set_resolved(ObjectValue::Integer(7));
+
+        let objects = pdf.get_all_objects().expect("enumerate source objects");
+        assert!(objects.iter().all(|handle| {
+            handle.object_ref().is_none_or(|object_ref| {
+                object_ref.number != 0 && object_ref.generation != u16::MAX
+            })
+        }));
+    }
+
+    #[test]
+    fn get_all_objects_registers_parsed_xref_stream_handles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let historical_ref = ObjectRef::new(99, 0);
+        let mut historical_dict = Dictionary::new();
+        historical_dict.insert("Value", Object::Integer(7));
+        let historical = Object::Dictionary(historical_dict);
+        pdf.qpdf_parsed_xref_streams
+            .insert(historical_ref, historical.clone());
+
+        let found = pdf
+            .get_all_objects()
+            .expect("enumerate retained xref-stream cache entries")
+            .into_iter()
+            .find(|handle| handle.object_ref() == Some(historical_ref))
+            .expect("historical xref-stream handle is enumerated");
+        assert_eq!(
+            found.materialize().expect("materialize historical entry"),
+            historical
+        );
+    }
+
+    #[test]
+    fn get_all_objects_skips_invalid_or_stateful_parsed_xref_stream_handles() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let historical = Object::Integer(7);
+
+        for object_ref in [ObjectRef::new(0, 0), ObjectRef::new(99, u16::MAX)] {
+            pdf.qpdf_parsed_xref_streams
+                .insert(object_ref, historical.clone());
+        }
+
+        let removed_ref = ObjectRef::new(100, 0);
+        pdf.qpdf_removed_refs.insert(removed_ref);
+        pdf.qpdf_parsed_xref_streams
+            .insert(removed_ref, historical.clone());
+
+        let xref_ref = ObjectRef::new(1, 0);
+        pdf.qpdf_parsed_xref_streams
+            .insert(xref_ref, historical.clone());
+
+        let resolved_ref = ObjectRef::new(101, 0);
+        let resolved = pdf.get_object_handle(resolved_ref);
+        resolved.set_resolved(ObjectValue::Integer(42));
+        pdf.qpdf_parsed_xref_streams
+            .insert(resolved_ref, historical.clone());
+
+        let missing_ref = ObjectRef::new(102, 0);
+        let missing = pdf.get_object_handle(missing_ref);
+        missing.set_missing();
+        pdf.qpdf_parsed_xref_streams.insert(missing_ref, historical);
+
+        pdf.get_all_objects()
+            .expect("skip invalid and restore missing parsed entries");
+
+        assert_eq!(resolved.as_integer(), Some(42));
+        assert_eq!(missing.as_integer(), Some(7));
+    }
+
+    #[test]
+    fn get_all_objects_registers_trailer_only_dangling_references() {
+        let mut pdf = Pdf::open_mem_owned(trailer_only_dangling_info_pdf()).expect("open");
+        assert!(pdf
+            .get_all_objects()
+            .expect("enumerate trailer-only reference")
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(ObjectRef::new(99, 0))));
+    }
+
+    #[test]
+    fn get_all_objects_ignores_a_stale_memo_without_a_registered_handle() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let stale_ref = ObjectRef::new(999, 0);
+        pdf.legacy_materialized_memo
+            .insert(stale_ref, Object::Integer(7));
+        pdf.legacy_materialized_replacement_refs.insert(stale_ref);
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("a stale memo must not block canonical enumeration");
+        assert!(!objects
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(stale_ref)));
+        assert!(pdf.legacy_materialized_memo.contains_key(&stale_ref));
+        assert!(pdf
+            .legacy_materialized_replacement_refs
+            .contains(&stale_ref));
+    }
+
+    #[test]
+    fn get_all_objects_propagates_an_unliftable_materialized_replacement() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(999, 0);
+        pdf.get_object_handle(object_ref);
+
+        let mut replacement = Object::Null;
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.legacy_materialized_memo.insert(object_ref, replacement);
+        pdf.legacy_materialized_replacement_refs.insert(object_ref);
+
+        let error = pdf
+            .get_all_objects()
+            .expect_err("an over-deep replacement must fail during reconciliation");
+        assert!(error
+            .to_string()
+            .contains("object handle lift: inline object nesting exceeds maximum"));
+    }
+
+    #[test]
+    fn lift_bounded_propagates_stream_dictionary_errors() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let mut dict = Dictionary::new();
+        dict.insert("Invalid", Object::Operator(b"q".to_vec()));
+        let stream = Object::Stream(Stream::new(dict, Vec::new()));
+
+        let error = pdf
+            .lift_bounded(&stream, 0, crate::object::MAX_INLINE_DEPTH)
+            .expect_err("content-only stream dictionary values must be rejected");
+        assert!(error
+            .to_string()
+            .contains("content-stream-only token has no ObjectValue representation"));
+    }
+
+    #[test]
+    fn get_all_objects_registers_a_top_level_replacement_target() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let redirect_ref = ObjectRef::new(100, 0);
+        let target_ref = ObjectRef::new(999, 0);
+        pdf.set_object(redirect_ref, Object::Reference(target_ref));
+
+        let objects = pdf
+            .get_all_objects()
+            .expect("enumerate top-level replacement target");
+        assert!(objects
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(redirect_ref)));
+        assert!(objects
+            .iter()
+            .any(|candidate| candidate.object_ref() == Some(target_ref)));
+    }
+
+    #[test]
+    fn live_object_refs_excludes_deleted_canonical_registry_slots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let deleted_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(deleted_ref);
+        assert!(!handle.is_missing());
+
+        // Keep the canonical handle registered while presenting the legacy
+        // cache state that live enumeration must filter out. `delete_object`
+        // also marks the handle missing, which exercises a different guard.
+        pdf.cache.set_deleted(deleted_ref);
+
+        assert!(pdf.object_refs().contains(&deleted_ref));
+        assert!(!pdf.live_object_refs().contains(&deleted_ref));
+
+        let placeholder_ref = ObjectRef::new(5, 1);
+        let placeholder = pdf.get_object_handle(placeholder_ref);
+        assert!(!placeholder.is_resolved());
+        assert!(pdf.object_refs().contains(&placeholder_ref));
+        assert!(!pdf.live_object_refs().contains(&placeholder_ref));
+    }
+
+    #[test]
+    fn live_object_refs_excludes_unresolved_registry_only_slots() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let placeholder_ref = ObjectRef::new(99, 0);
+        let handle = pdf.get_object_handle(placeholder_ref);
+        let allocated = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("make indirect");
+        let allocated_ref = allocated.object_ref().expect("allocated ref");
+
+        assert!(!handle.is_resolved());
+        assert!(pdf.object_refs().contains(&placeholder_ref));
+        assert!(!pdf.live_object_refs().contains(&placeholder_ref));
+        assert!(pdf.live_object_refs().contains(&allocated_ref));
+    }
+
     #[test]
     fn trailer_handle_is_direct_with_a_canonical_indirect_root_child() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
@@ -7506,9 +8305,9 @@ mod tests {
     }
 
     #[test]
-    fn trailer_handle_degrades_to_null_when_nesting_exceeds_the_inline_depth_bound() {
+    fn trailer_handle_degrades_to_null_when_nesting_exceeds_the_parse_depth_bound() {
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
         let mut nested = Object::Integer(1);
         for _ in 0..depth {
             nested = Object::Array(vec![nested]);
@@ -7523,12 +8322,12 @@ mod tests {
     #[test]
     fn trailer_key_handle_survives_an_unrelated_sibling_entrys_deep_nesting() {
         // The whole-trailer walk `trailer_handle` performs degrades every
-        // key to null once *any* sibling entry exceeds `MAX_INLINE_DEPTH` —
+        // key to null once *any* sibling entry exceeds `MAX_PARSE_DEPTH` —
         // `trailer_key_handle` must not inherit that coupling: `/QTest`
         // itself is shallow here, only its unrelated sibling `/Deep` is not.
         let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         pdf.trailer.insert("QTest", Object::Boolean(true));
-        let depth = crate::object::MAX_INLINE_DEPTH + 5;
+        let depth = crate::parser::MAX_PARSE_DEPTH + 5;
         let mut nested = Object::Integer(1);
         for _ in 0..depth {
             nested = Object::Array(vec![nested]);
@@ -7660,6 +8459,24 @@ mod tests {
         let handle = pdf.trailer_key_handle(b"QTest");
 
         assert_eq!(handle.object_ref(), Some(root_ref));
+    }
+
+    #[test]
+    fn lifted_null_handles_remain_contextless() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handle = pdf
+            .lift_to_handle_bounded(&Object::Null, 0, crate::parser::MAX_PARSE_DEPTH)
+            .expect("null is representable as a handle");
+
+        let error = handle
+            .try_get_key(b"/Missing")
+            .expect_err("a contextless null must keep the Error::System boundary");
+
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "operation for dictionary attempted on object of type null: returning null for attempted key retrieval"
+        ));
     }
 
     #[test]

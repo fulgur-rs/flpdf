@@ -156,6 +156,7 @@ impl<R: Read + Seek> Pdf<R> {
             foreign_object_maps: BTreeMap::new(),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
+            legacy_materialized_replacement_refs: BTreeSet::new(),
             compressed_member_parents: BTreeMap::new(),
             sorted_object_offsets,
             legacy_resolution_state_synced: loaded_state.already_reconstructed,
@@ -171,7 +172,16 @@ impl<R: Read + Seek> Pdf<R> {
             ever_called_get_all_pages: false,
             encryption,
         };
-        pdf.authenticate_if_encrypted(&options)?;
+        if let Err(error) = pdf.authenticate_if_encrypted(&options) {
+            // qpdf reconstructs and records warnings before
+            // `initializeEncryption` (`libqpdf/QPDF.cc:450-471`) and raises
+            // authentication errors afterward (`libqpdf/QPDF_encryption.cc:929`).
+            // Preserve that warning stream alongside the terminal
+            // password/encryption error so file-backed helpers can emit it
+            // before the final diagnostic.
+            let diagnostics = pdf.repair_diagnostics();
+            return Err(Error::with_open_diagnostics(error, diagnostics));
+        }
         Ok(pdf)
     }
 }
