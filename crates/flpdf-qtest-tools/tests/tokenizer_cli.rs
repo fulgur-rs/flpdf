@@ -178,6 +178,57 @@ fn tokenizer_emits_canonical_stream_recovery_warnings_once_with_qpdf_offsets() {
 }
 
 #[test]
+fn tokenizer_decodes_objstm_from_canonical_handle_without_replaying_container_recovery() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let fixture = fixture_dir()
+        .join("compat")
+        .join("null-length-framing-matrix-objstm.pdf");
+    let mut bytes = fs::read(fixture).expect("read ObjStm fixture");
+    let length = b"/Length 213";
+    let length_start = bytes
+        .windows(length.len())
+        .position(|window| window == length)
+        .expect("ObjStm /Length marker");
+    bytes[length_start..length_start + length.len()].fill(b' ');
+    fs::write(dir.path().join("missing-objstm-length.pdf"), bytes)
+        .expect("write malformed ObjStm fixture into tempdir");
+
+    let output = run(&["missing-objstm-length.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "unexpected exit status: {:?}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning_lines: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("WARNING:"))
+        .filter(|line| {
+            line.contains("object 20 0") && line.contains("stream dictionary lacks /Length key")
+        })
+        .collect();
+    assert_eq!(
+        warning_lines.len(),
+        1,
+        "the ObjStm container must be recovered once through its canonical handle: {stderr}"
+    );
+    let container_warnings: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.starts_with("WARNING:") && line.contains("object 20 0"))
+        .collect();
+    assert_eq!(
+        container_warnings.len(),
+        3,
+        "the canonical ObjStm recovery sequence must contain exactly three warnings: {stderr}"
+    );
+    assert!(container_warnings[0].contains("offset 840"));
+    assert!(container_warnings[1].contains("offset 916"));
+    assert!(container_warnings[2].contains("offset 916"));
+}
+
+#[test]
 fn tokenizer_reuses_canonical_page_stream_resolution_without_replaying_warnings() {
     let cases = [
         (
