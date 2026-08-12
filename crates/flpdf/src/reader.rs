@@ -28,7 +28,8 @@ use crate::security::standard::{
 };
 use crate::tokenizer::Tokenizer;
 use crate::{
-    Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, XrefEntry, XrefForm,
+    Diagnostics, Dictionary, Error, Object, ObjectHandle, ObjectRef, Result, Stream, XrefEntry,
+    XrefForm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
@@ -1286,16 +1287,36 @@ impl<R: Read + Seek> Pdf<R> {
         if let (Object::Stream(stream), Some(existing_dict)) =
             (object, existing_handle.as_stream_dict())
         {
-            let dict_value = ObjectValue::Dictionary(self.lift_dictionary(&stream.dict, 0)?);
-            existing_dict.replace_direct_value(dict_value);
-            existing_dict.clear_description();
-            return Ok(ObjectValue::Stream {
-                stream_dict: existing_dict,
-                stream_data: Some(Rc::new(stream.data.clone())),
-                stream_length: 0,
-            });
+            return self.lift_stream_with_existing_dictionary(
+                stream,
+                existing_dict,
+                crate::object::MAX_INLINE_DEPTH,
+                false,
+            );
         }
         self.lift(object, 0)
+    }
+
+    fn lift_stream_with_existing_dictionary(
+        &mut self,
+        stream: &Stream,
+        existing_dict: ObjectHandle,
+        max_depth: usize,
+        allow_content_tokens: bool,
+    ) -> Result<ObjectValue> {
+        let dict_value = ObjectValue::Dictionary(self.lift_dictionary_bounded_with_options(
+            &stream.dict,
+            0,
+            max_depth,
+            allow_content_tokens,
+        )?);
+        existing_dict.replace_direct_value(dict_value);
+        existing_dict.clear_description();
+        Ok(ObjectValue::Stream {
+            stream_dict: existing_dict,
+            stream_data: Some(Rc::new(stream.data.clone())),
+            stream_length: 0,
+        })
     }
 
     /// Remove `object_ref`, marking it deleted.
@@ -1864,11 +1885,20 @@ impl<R: Read + Seek> Pdf<R> {
             // though the generic legacy lift rejects them outside a content
             // stream; preserve them at every nesting level rather than
             // making enumeration fail.
-            let value = self.lift_bounded_with_content_tokens(
-                &replacement,
-                0,
-                crate::parser::MAX_PARSE_DEPTH,
-            )?;
+            let value = match (&replacement, handle.as_stream_dict()) {
+                (Object::Stream(stream), Some(existing_dict)) => self
+                    .lift_stream_with_existing_dictionary(
+                        stream,
+                        existing_dict,
+                        crate::parser::MAX_PARSE_DEPTH,
+                        true,
+                    )?,
+                _ => self.lift_bounded_with_content_tokens(
+                    &replacement,
+                    0,
+                    crate::parser::MAX_PARSE_DEPTH,
+                )?,
+            };
             handle.set_resolved(value);
             handle.clear_description();
             handle.reset_parsed_offset();
@@ -1880,12 +1910,8 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn register_parsed_xref_stream_handles(&mut self) -> Result<()> {
-        let pending: Vec<(ObjectRef, Object)> = self
-            .qpdf_parsed_xref_streams
-            .iter()
-            .map(|(object_ref, object)| (*object_ref, object.clone()))
-            .collect();
-        for (object_ref, object) in pending {
+        let pending: Vec<ObjectRef> = self.qpdf_parsed_xref_streams.keys().copied().collect();
+        for object_ref in pending {
             if object_ref.number == 0
                 || object_ref.generation == u16::MAX
                 || self.qpdf_removed_refs.contains(&object_ref)
@@ -1897,6 +1923,9 @@ impl<R: Read + Seek> Pdf<R> {
             if handle.is_resolved() && !handle.is_missing() {
                 continue;
             }
+            let Some(object) = self.qpdf_parsed_xref_streams.get(&object_ref).cloned() else {
+                continue;
+            };
             let value = self.lift_bounded(&object, 0, crate::parser::MAX_PARSE_DEPTH)?;
             handle.set_resolved(value);
         }
@@ -2313,28 +2342,6 @@ impl<R: Read + Seek> Pdf<R> {
             };
             Ok(value)
         })
-    }
-
-    // Shared by `lift`'s `Object::Dictionary`/`Object::Stream` arms and by
-    // `Pdf::lift_for_set_object`: lift every entry of `dict` one level
-    // deeper than `depth`, matching `lift`'s own depth bound.
-    fn lift_dictionary(
-        &mut self,
-        dict: &Dictionary,
-        depth: usize,
-    ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
-        self.lift_dictionary_bounded(dict, depth, crate::object::MAX_INLINE_DEPTH)
-    }
-
-    // Same as `lift_dictionary`, but threading a caller-chosen `max_depth`
-    // through to every entry — see `lift_bounded`.
-    fn lift_dictionary_bounded(
-        &mut self,
-        dict: &Dictionary,
-        depth: usize,
-        max_depth: usize,
-    ) -> Result<std::collections::BTreeMap<Vec<u8>, ObjectHandle>> {
-        self.lift_dictionary_bounded_with_options(dict, depth, max_depth, false)
     }
 
     fn lift_dictionary_bounded_with_options(
@@ -7815,6 +7822,64 @@ mod tests {
                 .materialize()
                 .expect("materialize canonical replacement"),
             replacement
+        );
+    }
+
+    #[test]
+    fn get_all_objects_reuses_stream_dictionary_for_deep_memo_replacement() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve original stream");
+        let original_dict = handle.as_stream_dict().expect("original stream dictionary");
+        let parsed_offset = original_dict.get_parsed_offset();
+        assert!(
+            parsed_offset >= 0,
+            "source dictionary must have a parsed offset"
+        );
+
+        let mut nested = Object::Integer(7);
+        for _ in 0..(crate::object::MAX_INLINE_DEPTH + 5) {
+            let mut dict = Dictionary::new();
+            dict.insert("Next", nested);
+            nested = Object::Dictionary(dict);
+        }
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("Deep", nested);
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, b"new data".to_vec())),
+        );
+
+        let found = pdf
+            .get_all_objects()
+            .expect("enumerate deep stream replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("replacement stream remains enumerated");
+        let current_dict = found
+            .as_stream_dict()
+            .expect("replacement stream dictionary");
+        assert!(
+            current_dict.is_same_object_as(&original_dict),
+            "memo reconciliation must reuse the existing stream dictionary handle"
+        );
+        assert_eq!(
+            current_dict.get_parsed_offset(),
+            parsed_offset,
+            "reusing the dictionary must preserve its parsed offset"
+        );
+        assert!(
+            current_dict
+                .as_dictionary()
+                .expect("dictionary entries")
+                .contains_key(b"/Deep".as_slice()),
+            "the reused dictionary must contain the replacement entries"
         );
     }
 
