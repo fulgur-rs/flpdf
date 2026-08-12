@@ -2602,7 +2602,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let mut length = match stacker::maybe_grow(
             super::READER_STACK_RED_ZONE,
             super::READER_STACK_GROWTH_SIZE,
-            || Self::stream_length(&dict),
+            || Self::stream_length(&dict, object_header_offset),
         ) {
             Ok(length) => length,
             Err(error) if self.is_recoverable_stream_error(&error) => {
@@ -2908,17 +2908,18 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// the re-entry point, and a method with no access to [`ResolverCore`]
     /// cannot be holding a borrow of it when that happens.
     ///
-    /// This helper only validates and dereferences `/Length`; it intentionally
-    /// has no input-position argument. [`Self::read_stream`] captures qpdf's
-    /// post-`obj` header position before calling this helper and passes it to
-    /// [`Self::warn_stream_failure`], which attributes recoverable `/Length`
-    /// failures to that position. A framing failure instead uses the attempted
-    /// `endstream` token's offset, while [`Self::recover_stream_length`] reports
-    /// its recovery warning at the stream-data offset.
-    fn stream_length(dict: &ObjectValue) -> Result<usize> {
+    /// This helper only validates and dereferences `/Length`; it receives
+    /// qpdf's post-`obj` header position so malformed `/Length` exceptions
+    /// retain the offset captured by `readObject`. [`Self::read_stream`] passes
+    /// that position to this helper and to [`Self::warn_stream_failure`]. A
+    /// framing failure instead uses the attempted `endstream` token's offset,
+    /// while [`Self::recover_stream_length`] reports its recovery warning at
+    /// the stream-data offset.
+    fn stream_length(dict: &ObjectValue, object_header_offset: u64) -> Result<usize> {
+        let error_offset = usize::try_from(object_header_offset).unwrap_or(usize::MAX);
         let ObjectValue::Dictionary(entries) = dict else {
             return Err(Error::parse(
-                0,
+                error_offset,
                 "stream keyword follows an object that is not a dictionary",
             ));
         };
@@ -2930,13 +2931,20 @@ impl<R: Read + Seek> ResolverHandle<R> {
         // separately (`:1373-1380`); an absent key reads as null there, so
         // both routes land on the same message here.
         match length.map(ObjectHandle::as_integer) {
-            Some(Some(value)) => usize::try_from(value)
-                .map_err(|_| Error::parse(0, "/Length key in stream dictionary is out of range")),
+            Some(Some(value)) => usize::try_from(value).map_err(|_| {
+                Error::parse(
+                    error_offset,
+                    "/Length key in stream dictionary is out of range",
+                )
+            }),
             Some(None) if length.is_some_and(|length| !length.is_null()) => Err(Error::parse(
-                0,
+                error_offset,
                 "/Length key in stream dictionary is not an integer",
             )),
-            _ => Err(Error::parse(0, "stream dictionary lacks /Length key")),
+            _ => Err(Error::parse(
+                error_offset,
+                "stream dictionary lacks /Length key",
+            )),
         }
     }
 }
@@ -9164,6 +9172,55 @@ mod tests {
                     format!("(object 2 0, offset {stream_offset}): recovered stream length: 4"),
                 ]
             );
+        }
+    }
+
+    /// With repair disabled, qpdf rethrows an unusable `/Length` exception
+    /// from `readStream`; `resolve` warns that unchanged exception and then
+    /// resolves the requested object to null. The exception still carries
+    /// `readObject`'s post-header offset (`libqpdf/QPDF.cc:1331-1399,
+    /// 1695-1749`).
+    #[test]
+    fn no_recovery_stream_length_warnings_use_qpdfs_post_header_offset() {
+        let catalog = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+        let object_start = b"%PDF-1.4\n".len() as u64 + catalog.len() as u64;
+        let header_offset = object_start + b"2 0 obj".len() as u64;
+
+        for (dictionary, expected_message) in [
+            (
+                b"<< /Type /X >>".as_slice(),
+                "stream dictionary lacks /Length key",
+            ),
+            (
+                b"<< /Length /X >>".as_slice(),
+                "/Length key in stream dictionary is not an integer",
+            ),
+            (
+                b"<< /Length -5 >>".as_slice(),
+                "/Length key in stream dictionary is out of range",
+            ),
+        ] {
+            let mut body = b"2 0 obj\n".to_vec();
+            body.extend_from_slice(dictionary);
+            body.extend_from_slice(b"\nstream\nabc\nendstream\nendobj\n");
+            let mut pdf = Pdf::open_mem_owned_with_options(
+                pdf_with_bodies(&[catalog.to_vec(), body]),
+                crate::PdfOpenOptions {
+                    repair: false,
+                    ..crate::PdfOpenOptions::default()
+                },
+            )
+            .expect("open strict malformed-length fixture");
+            let handle = pdf.get_object_handle(ObjectRef::new(2, 0));
+            handle
+                .try_dereference()
+                .expect("qpdf catches the strict malformed-length failure");
+            assert!(handle.is_null());
+
+            let diagnostics = pdf.repair_diagnostics();
+            assert_eq!(diagnostics.entries().len(), 1);
+            assert_eq!(diagnostics.entries()[0].message, expected_message);
+            assert_eq!(diagnostics.entries()[0].offset, Some(header_offset));
         }
     }
 
