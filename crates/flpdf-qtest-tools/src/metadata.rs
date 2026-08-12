@@ -404,10 +404,7 @@ mod tests {
     fn bad_password_error_uses_qpdf_path_wording() {
         let error = Error::Encrypted(EncryptedError::BadPassword);
         assert_eq!(
-            display_error(
-                Path::new("secret.pdf"),
-                &MetadataError::from(error),
-            ),
+            display_error(Path::new("secret.pdf"), &MetadataError::from(error),),
             b"secret.pdf: invalid password"
         );
     }
@@ -433,10 +430,7 @@ mod tests {
     fn read_errors_use_qpdf_file_input_wording() {
         let error = Error::Io(std::io::Error::from_raw_os_error(libc::EISDIR));
         assert_eq!(
-            display_error(
-                Path::new("directory.pdf"),
-                &MetadataError::from(error),
-            ),
+            display_error(Path::new("directory.pdf"), &MetadataError::from(error),),
             b"directory.pdf: read 1024 bytes"
         );
     }
