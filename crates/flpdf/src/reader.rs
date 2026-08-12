@@ -1207,6 +1207,7 @@ impl<R: Read + Seek> Pdf<R> {
         // object-stream entry can incorrectly retain provenance.
         self.synchronize_legacy_resolution_state();
         self.qpdf_removed_refs.remove(&object_ref);
+        self.resolver.clear_deleted_object_number(object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
@@ -1661,6 +1662,7 @@ impl<R: Read + Seek> Pdf<R> {
     ) -> Result<ObjectHandle> {
         let target = self.resolver.replace_object(object_ref, replacement)?;
         self.qpdf_removed_refs.remove(&object_ref);
+        self.resolver.clear_deleted_object_number(object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
         self.recovered_stream_eols.remove(&object_ref);
@@ -1676,6 +1678,7 @@ impl<R: Read + Seek> Pdf<R> {
     #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
     pub(crate) fn remove_object_handle(&mut self, object_ref: ObjectRef) -> Result<()> {
         self.resolver.remove_object(object_ref)?;
+        self.resolver.mark_deleted_object_number(object_ref);
         self.qpdf_removed_refs.insert(object_ref);
         self.qpdf_parsed_xref_streams.remove(&object_ref);
         self.qpdf_dangling_refs.remove(&object_ref);
@@ -7880,19 +7883,56 @@ mod tests {
 
     #[test]
     fn deleted_xref_tombstones_survive_reconstruction_snapshots() {
-        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
-        let object_ref = ObjectRef::new(3, 0);
-        pdf.delete_object(object_ref);
+        let bytes = minimal_pdf_bytes();
+        let mut pdf = Pdf::open_mem_owned(bytes.clone()).expect("open");
+        // Use an unreferenced number so this assertion isolates repaired-xref
+        // registration from ordinary child-reference discovery in the page
+        // tree of `minimal_pdf_bytes`.
+        let removed_ref = ObjectRef::new(99, 7);
+        let repaired_ref = ObjectRef::new(99, 0);
+        pdf.remove_object_handle(removed_ref)
+            .expect("remove canonical object");
 
         // Simulate reconstruction repopulating the source table from the
         // original bytes after the public deletion has already happened.
-        pdf.resolver
-            .insert_xref_entry(object_ref, XrefEntry::Uncompressed { offset: 10 });
+        let object_offset = bytes
+            .windows(b"3 0 obj".len())
+            .position(|window| window == b"3 0 obj")
+            .expect("object 3 offset") as u64;
+        pdf.resolver.insert_xref_entry(
+            repaired_ref,
+            XrefEntry::Uncompressed {
+                offset: object_offset,
+            },
+        );
         pdf.resolver.mark_reconstructed_xref_for_test();
 
-        assert!(!pdf.get_xref_table().contains_key(&object_ref));
+        assert!(!pdf.get_xref_table().contains_key(&repaired_ref));
         pdf.synchronize_legacy_resolution_state();
-        assert!(!pdf.live_object_refs().contains(&object_ref));
+        assert!(!pdf.live_object_refs().contains(&repaired_ref));
+
+        pdf.get_all_objects()
+            .expect("deleted rows must not be resolved during dangling repair");
+        assert!(
+            pdf.resolver.registered_handle(repaired_ref).is_none(),
+            "a reconstructed tombstone must not mint a replacement canonical handle"
+        );
+    }
+
+    #[test]
+    fn replacing_a_removed_object_clears_its_number_tombstone() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let removed_ref = ObjectRef::new(99, 7);
+        let replacement_ref = ObjectRef::new(99, 0);
+        pdf.remove_object_handle(removed_ref)
+            .expect("remove canonical object");
+
+        pdf.set_object(replacement_ref, Object::Integer(7));
+        pdf.resolver
+            .insert_xref_entry(replacement_ref, XrefEntry::Uncompressed { offset: 0 });
+
+        assert!(pdf.resolver.xref_entry(replacement_ref).is_some());
+        assert!(pdf.resolver.registered_handle(replacement_ref).is_some());
     }
 
     #[test]
