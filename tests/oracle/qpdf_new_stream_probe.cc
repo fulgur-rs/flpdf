@@ -103,8 +103,14 @@ int main()
             require(it != all_objects.end(), "stream was not registered");
             return *it;
         };
+        auto registered_empty = registered_handle(empty);
         auto registered_with_data = registered_handle(with_data);
         auto registered_empty_data = registered_handle(empty_data);
+        registered_empty.getDict().replaceKey(
+            "/RegisteredMarker", QPDFObjectHandle::newInteger(17));
+        require(
+            empty.getDict().getKey("/RegisteredMarker").getIntValue() == 17,
+            "registered no-data stream is disconnected from returned handle");
         registered_with_data.getDict().replaceKey(
             "/Marker", QPDFObjectHandle::newInteger(11));
         require(
