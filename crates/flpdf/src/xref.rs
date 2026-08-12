@@ -4341,7 +4341,7 @@ mod tests {
             "reconstruction must replace the stale offset for the indirect /Prev object"
         );
         assert!(
-            loaded.entries.get(&ObjectRef::new(5, 0)).is_none(),
+            !loaded.entries.contains_key(&ObjectRef::new(5, 0)),
             "reconstruction must preserve the active free row's tombstone"
         );
         assert_eq!(
