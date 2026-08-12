@@ -2409,7 +2409,14 @@ impl<R: Read + Seek> Pdf<R> {
             // legacy null on that same boundary rather than making a
             // synthetic resolver-bearing value whose warning path would
             // incorrectly reach this Pdf's logger.
-            Object::Null => Ok(ObjectHandle::null()),
+            Object::Null => {
+                if depth > max_depth {
+                    return Err(Error::Unsupported(format!(
+                        "object handle lift: inline object nesting exceeds maximum of {max_depth}"
+                    )));
+                }
+                Ok(ObjectHandle::null())
+            }
             direct => {
                 let value =
                     self.lift_bounded_with_options(direct, depth, max_depth, allow_content_tokens)?;
