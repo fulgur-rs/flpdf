@@ -2297,9 +2297,12 @@ impl ObjectHandle {
     /// through them first.
     ///
     /// This also has no path to inform the owning [`crate::Pdf`] that
-    /// `self`'s ref changed. After mutating an already-registered indirect
-    /// handle through this method, call [`crate::Pdf::mark_object_dirty`] with
-    /// the same ref so the canonical writer observes the change.
+    /// `self`'s value changed. After mutating a handle, call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with `self`. That marks the
+    /// handle itself when it is an indirect object, or its containing indirect
+    /// owner(s) when it is a direct child. For an already-registered indirect
+    /// handle, [`crate::Pdf::mark_object_dirty`] with the same ref remains the
+    /// equivalent lower-level operation.
     pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
         if value.is_direct() && value.is_null() {
             self.remove_key(key);
@@ -2338,9 +2341,12 @@ impl ObjectHandle {
     /// the legacy [`crate::Object`] model.
     ///
     /// As with [`Self::replace_key`], this mutates the live handle graph but
-    /// cannot notify the owning [`crate::Pdf`]. After mutating a registered
-    /// indirect handle, call [`crate::Pdf::mark_object_dirty`] with its
-    /// object reference so the canonical writer observes the change.
+    /// cannot notify the owning [`crate::Pdf`]. After mutating, call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle so the
+    /// canonical writer observes the change. For an indirect array this
+    /// marks its own object reference; for a direct child array it marks the
+    /// containing indirect owner(s). [`crate::Pdf::mark_object_dirty`] with
+    /// an indirect array's reference is the equivalent lower-level operation.
     pub fn set_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to set item")? {
             return Ok(());
@@ -2377,8 +2383,10 @@ impl ObjectHandle {
     /// are then checked and attached one at a time, so an ownership error at
     /// item `n` intentionally leaves the accepted prefix in place, matching
     /// qpdf's non-transactional `resize(0)` plus `push_back` loop.
-    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
-    /// after mutating a registered indirect handle.
+    /// As with [`Self::replace_key`], call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
+    /// mutation. The helper marks this array when it is indirect, or its
+    /// containing indirect owner(s) when it is a direct child.
     pub fn set_array_items(&self, items: Vec<ObjectHandle>) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to replace items")? {
             return Ok(());
@@ -2424,8 +2432,10 @@ impl ObjectHandle {
     /// `insertItem` (`libqpdf/QPDFObjectHandle.cc:895-907`). Position `size`
     /// is the append position; larger positions warn without checking item
     /// ownership or changing the array.
-    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
-    /// after mutating a registered indirect handle.
+    /// As with [`Self::replace_key`], call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
+    /// mutation. The helper marks this array when it is indirect, or its
+    /// containing indirect owner(s) when it is a direct child.
     pub fn insert_array_item(&self, index: usize, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to insert item")? {
             return Ok(());
@@ -2474,8 +2484,10 @@ impl ObjectHandle {
 
     /// Append one item to the live array, porting qpdf's `appendItem`
     /// (`libqpdf/QPDFObjectHandle.cc:916-925`, `libqpdf/QPDF_Array.cc:300-313`).
-    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
-    /// after mutating a registered indirect handle.
+    /// As with [`Self::replace_key`], call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
+    /// mutation. The helper marks this array when it is indirect, or its
+    /// containing indirect owner(s) when it is a direct child.
     pub fn append_array_item(&self, value: ObjectHandle) -> Result<()> {
         if !self.prepare_array_mutation("ignoring attempt to append item")? {
             return Ok(());
@@ -2508,8 +2520,10 @@ impl ObjectHandle {
 
     /// Erase one live array item, porting qpdf's `eraseItem`
     /// (`libqpdf/QPDFObjectHandle.cc:934-946`).
-    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
-    /// after mutating a registered indirect handle.
+    /// As with [`Self::replace_key`], call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
+    /// mutation. The helper marks this array when it is indirect, or its
+    /// containing indirect owner(s) when it is a direct child.
     pub fn erase_array_item(&self, index: usize) -> Result<()> {
         self.erase_array_item_and_get_old(index).map(|_| ())
     }
@@ -2520,8 +2534,10 @@ impl ObjectHandle {
     /// emitting the corresponding qpdf warning when the handle has document
     /// warning context. A direct/contextless handle cannot route that warning
     /// and therefore returns the existing `Error::System` boundary instead.
-    /// As with [`Self::replace_key`], call [`crate::Pdf::mark_object_dirty`]
-    /// after mutating a registered indirect handle.
+    /// As with [`Self::replace_key`], call
+    /// [`crate::Pdf::mark_object_handle_dirty`] with this handle after the
+    /// mutation. The helper marks this array when it is indirect, or its
+    /// containing indirect owner(s) when it is a direct child.
     pub fn erase_array_item_and_get_old(&self, index: usize) -> Result<ObjectHandle> {
         if !self.prepare_array_mutation("ignoring attempt to erase item")? {
             return Ok(ObjectHandle::null());
