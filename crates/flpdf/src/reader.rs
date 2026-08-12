@@ -1894,19 +1894,17 @@ impl<R: Read + Seek> Pdf<R> {
     }
 
     fn reconcile_legacy_materialized_memos(&mut self) -> Result<()> {
-        let pending: Vec<(ObjectRef, Object)> = self
+        let pending: Vec<ObjectRef> = self
             .legacy_materialized_replacement_refs
             .iter()
-            .filter_map(|object_ref| {
-                self.legacy_materialized_memo
-                    .get(object_ref)
-                    .cloned()
-                    .map(|object| (*object_ref, object))
-            })
+            .copied()
             .collect();
 
-        for (object_ref, replacement) in pending {
+        for object_ref in pending {
             let Some(handle) = self.resolver.registered_handle(object_ref) else {
+                continue;
+            };
+            let Some(replacement) = self.legacy_materialized_memo.remove(&object_ref) else {
                 continue;
             };
             // `set_object`'s ordinary lift is bounded by MAX_INLINE_DEPTH,
@@ -1917,19 +1915,35 @@ impl<R: Read + Seek> Pdf<R> {
             // though the generic legacy lift rejects them outside a content
             // stream; preserve them at every nesting level rather than
             // making enumeration fail.
-            let value = match (&replacement, handle.as_stream_dict()) {
-                (Object::Stream(stream), Some(existing_dict)) => self
-                    .lift_stream_with_existing_dictionary(
+            let value = match replacement {
+                Object::Stream(stream) => self
+                    .lift_owned_stream_bounded_with_options(
                         stream,
-                        existing_dict,
+                        handle.as_stream_dict(),
+                        0,
                         crate::parser::MAX_PARSE_DEPTH,
                         true,
-                    )?,
-                _ => self.lift_bounded_with_content_tokens(
-                    &replacement,
-                    0,
-                    crate::parser::MAX_PARSE_DEPTH,
-                )?,
+                    )
+                    .map_err(|(error, stream)| (error, Object::Stream(stream))),
+                replacement => self
+                    .lift_bounded_with_content_tokens(
+                        &replacement,
+                        0,
+                        crate::parser::MAX_PARSE_DEPTH,
+                    )
+                    .map_err(|error| (error, replacement)),
+            };
+            let value = match value {
+                Ok(value) => value,
+                Err((error, replacement)) => {
+                    // Keep the infallible legacy replacement authoritative if
+                    // canonical lifting fails. The next reconciliation call
+                    // must see the same value, without requiring a payload
+                    // clone merely to preserve this error path.
+                    self.legacy_materialized_memo
+                        .insert(object_ref, replacement);
+                    return Err(error);
+                }
             };
             handle.set_resolved(value);
             handle.clear_description();
@@ -1939,6 +1953,42 @@ impl<R: Read + Seek> Pdf<R> {
                 .remove(&object_ref);
         }
         Ok(())
+    }
+
+    fn lift_owned_stream_bounded_with_options(
+        &mut self,
+        stream: Stream,
+        existing_dict: Option<ObjectHandle>,
+        depth: usize,
+        max_depth: usize,
+        allow_content_tokens: bool,
+    ) -> std::result::Result<ObjectValue, (Error, Stream)> {
+        let dict_value = match self.lift_dictionary_bounded_with_options(
+            &stream.dict,
+            depth,
+            max_depth,
+            allow_content_tokens,
+        ) {
+            Ok(value) => value,
+            Err(error) => return Err((error, stream)),
+        };
+        let stream_dict = match existing_dict {
+            Some(existing_dict) => {
+                existing_dict.replace_direct_value(ObjectValue::Dictionary(dict_value));
+                existing_dict.clear_description();
+                existing_dict
+            }
+            None => self
+                .resolver
+                .direct_object_handle(ObjectValue::Dictionary(dict_value)),
+        };
+        Ok(ObjectValue::Stream {
+            stream_dict,
+            // Moving the Vec into Rc preserves qpdf's shared-buffer boundary
+            // without copying the legacy memo's payload.
+            stream_data: Some(Rc::new(stream.data)),
+            stream_length: 0,
+        })
     }
 
     fn register_parsed_xref_stream_handles(&mut self) -> Result<()> {
@@ -8003,6 +8053,87 @@ mod tests {
     }
 
     #[test]
+    fn get_all_objects_moves_legacy_stream_memo_payload_without_copying_it() {
+        let bytes = classic_pdf_with_bodies(
+            &[b"1 0 obj\n<< /Length 3 >>\nstream\nabc\nendstream\nendobj\n"],
+            ObjectRef::new(1, 0),
+        );
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let object_ref = ObjectRef::new(1, 0);
+        let handle = pdf.get_object_handle(object_ref);
+        pdf.resolve_object_handle(&handle)
+            .expect("resolve the original stream handle");
+
+        let mut replacement_dict = Dictionary::new();
+        // Content-stream-only tokens make the infallible legacy set_object
+        // bridge retain the replacement in its memo for later reconciliation.
+        replacement_dict.insert("Invalid", Object::Operator(b"q".to_vec()));
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, vec![0x5a; 1024 * 1024])),
+        );
+
+        let memo_payload_ptr = pdf
+            .legacy_materialized_memo
+            .get(&object_ref)
+            .and_then(Object::as_stream)
+            .expect("set_object stores a stream replacement in the legacy memo")
+            .data
+            .as_ptr();
+
+        let reconciled = pdf
+            .get_all_objects()
+            .expect("reconcile the replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("reconciled replacement handle is enumerated");
+        let canonical_payload = reconciled
+            .as_stream_data()
+            .expect("reconciled value is a stream with payload");
+
+        assert_eq!(
+            canonical_payload.as_ptr(),
+            memo_payload_ptr,
+            "reconciliation must move the memo payload into the shared canonical buffer"
+        );
+    }
+
+    #[test]
+    fn get_all_objects_moves_legacy_stream_memo_payload_into_a_new_dictionary() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open fixture");
+        let object_ref = ObjectRef::new(99, 0);
+        let mut replacement_dict = Dictionary::new();
+        replacement_dict.insert("Invalid", Object::Operator(b"q".to_vec()));
+        pdf.set_object(
+            object_ref,
+            Object::Stream(Stream::new(replacement_dict, vec![0x5a; 4096])),
+        );
+
+        let memo_payload_ptr = pdf
+            .legacy_materialized_memo
+            .get(&object_ref)
+            .and_then(Object::as_stream)
+            .expect("set_object stores a stream replacement in the legacy memo")
+            .data
+            .as_ptr();
+        let reconciled = pdf
+            .get_all_objects()
+            .expect("reconcile the replacement")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(object_ref))
+            .expect("reconciled replacement handle is enumerated");
+
+        assert_eq!(
+            reconciled
+                .as_stream_data()
+                .expect("reconciled value is a stream with payload")
+                .as_ptr(),
+            memo_payload_ptr,
+            "a replacement without an existing stream dictionary must also move its payload"
+        );
+    }
+
+    #[test]
     fn get_all_objects_reconciles_memos_before_resolving_the_replaced_source() {
         let bytes = classic_pdf_with_bodies(
             &[
@@ -8192,6 +8323,20 @@ mod tests {
         assert!(pdf
             .legacy_materialized_replacement_refs
             .contains(&stale_ref));
+    }
+
+    #[test]
+    fn get_all_objects_ignores_a_registered_replacement_without_a_memo() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(999, 0);
+        pdf.get_object_handle(object_ref);
+        pdf.legacy_materialized_replacement_refs.insert(object_ref);
+
+        pdf.get_all_objects()
+            .expect("a replacement marker without a memo is harmless");
+        assert!(pdf
+            .legacy_materialized_replacement_refs
+            .contains(&object_ref));
     }
 
     #[test]
