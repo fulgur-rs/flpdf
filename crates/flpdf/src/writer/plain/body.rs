@@ -239,7 +239,7 @@ fn canonical_stream_output(
             encode_flags,
             decode_level,
             true,
-            false,
+            true,
         )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
         let data = if !success {
             // QPDFWriter retries a failed filter pipeline against a fresh raw
@@ -360,6 +360,7 @@ mod tests {
     use super::*;
     use crate::writer::plain::plan::PlannedIndirectObject;
     use crate::{Dictionary, NewlineBeforeEndstream, ObjectRef, ObjectStreamMode, Stream};
+    use std::cell::Cell;
     use std::io::Cursor;
 
     #[test]
@@ -628,6 +629,39 @@ mod tests {
             .get_key(b"/Filter")
             .try_is_name_and_equals(b"FlateDecode")
             .unwrap());
+    }
+
+    #[test]
+    fn canonical_stream_output_marks_the_first_provider_attempt_retryable() {
+        let pdf = Pdf::empty().unwrap();
+        let stream = pdf.new_stream().unwrap();
+        let retry_seen = Rc::new(Cell::new(false));
+        let retry_seen_in_callback = Rc::clone(&retry_seen);
+
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, _suppress_warnings, will_retry| {
+                    retry_seen_in_callback.set(will_retry);
+                    pipeline
+                        .write(b"provider bytes")
+                        .map_err(crate::Error::from)?;
+                    pipeline.finish().map_err(crate::Error::from)?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .unwrap();
+
+        let options = WriterOptions {
+            compress_streams: CompressStreams::Yes,
+            ..WriterOptions::default()
+        };
+        let (_, data, refiltered) = canonical_stream_output(&stream, &options).unwrap();
+
+        assert!(retry_seen.get());
+        assert!(refiltered);
+        assert!(!data.is_empty());
     }
 
     #[test]
