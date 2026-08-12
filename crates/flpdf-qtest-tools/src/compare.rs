@@ -200,14 +200,19 @@ fn resolved_filter_names_with_normalization<R: Read + Seek>(
     let mut names = Vec::with_capacity(items.len());
     for item in items {
         let item = pdf.resolve_object_handle_to_terminal(&item)?;
-        let Some(name) = item.as_name() else {
-            continue;
-        };
-        names.push(if normalize {
-            normalize_filter_name(&name).to_vec()
+        if let Some(name) = item.as_name() {
+            names.push(if normalize {
+                normalize_filter_name(&name).to_vec()
+            } else {
+                name.to_vec()
+            });
         } else {
-            name.to_vec()
-        });
+            // qpdf validates every Filter array item in its original
+            // position (QPDF_Stream.cc:396-415). Keep an empty slot for an
+            // invalid item so the legacy DecodeParms bridge cannot assign a
+            // later filter's parameter dictionary to the wrong index.
+            names.push(Vec::new());
+        }
     }
     Ok(names)
 }
@@ -865,6 +870,57 @@ mod tests {
         assert_eq!(
             parms.get(b"EarlyChange").and_then(Object::as_integer),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn legacy_decode_boundary_preserves_filter_array_positions_for_invalid_items() {
+        let mut pdf = dummy_pdf();
+        let second_missing = pdf.get_object_handle(ObjectRef::new(99, 0));
+        let third_missing = pdf.get_object_handle(ObjectRef::new(100, 0));
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (
+                b"/Filter".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                    ObjectHandle::integer(7),
+                    ObjectHandle::name(b"LZWDecode".to_vec()),
+                ]),
+            ),
+            (
+                b"/DecodeParms".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::dictionary(vec![(
+                        b"/Predictor".to_vec(),
+                        ObjectHandle::integer(1),
+                    )]),
+                    ObjectHandle::dictionary(vec![(b"/EarlyChange".to_vec(), second_missing)]),
+                    ObjectHandle::dictionary(vec![(b"/EarlyChange".to_vec(), third_missing)]),
+                ]),
+            ),
+        ]);
+
+        let legacy = materialize_decode_dictionary(&stream_dict, &mut pdf)
+            .expect("invalid intermediate Filter item still reaches the legacy boundary");
+        let params = legacy
+            .get(b"DecodeParms")
+            .and_then(Object::as_array)
+            .expect("DecodeParms array remains positional");
+        assert_eq!(params.len(), 3);
+        assert!(matches!(
+            params[1]
+                .as_dict()
+                .and_then(|dict| dict.get(b"EarlyChange")),
+            Some(Object::Reference(ObjectRef {
+                number: 99,
+                generation: 0
+            }))
+        ));
+        assert_eq!(
+            params[2]
+                .as_dict()
+                .and_then(|dict| dict.get(b"EarlyChange")),
+            Some(&Object::Null)
         );
     }
 
