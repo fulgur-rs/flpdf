@@ -7,7 +7,7 @@ if [[ "$#" != 0 ]]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
-qpdf_source="$(${repo_root}/scripts/fetch-qpdf-source.sh --print-path)"
+qpdf_source="$("${repo_root}/scripts/fetch-qpdf-source.sh" --print-path)"
 qpdf_source="$(cd "${qpdf_source}" && pwd -P)"
 qpdf_commit="3b97c9bd266b7c32ea36d3536e22dab77412886d"
 

@@ -2,6 +2,7 @@
 #include <qpdf/QPDF.hh>
 #include <qpdf/QPDFObjectHandle.hh>
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -47,12 +48,29 @@ int main()
 
         auto data = std::make_shared<Buffer>(std::string("abc"));
         auto with_data = pdf.newStream(data);
+        require(with_data.isIndirect(), "buffer newStream did not create an indirect object");
         require(with_data.getDict().getKey("/Length").getIntValue() == 3, "buffer length differs");
         require(with_data.getRawStreamData()->getSize() == 3, "buffer data size differs");
 
         auto empty_data = pdf.newStream(std::make_shared<Buffer>());
+        require(empty_data.isIndirect(), "empty buffer newStream is not indirect");
         require(!empty_data.getDict().hasKey("/Length"), "empty buffer retained /Length");
-        require(pdf.getAllObjects().size() >= 3, "new streams were not registered");
+        require(
+            empty_data.getRawStreamData()->getSize() == 0,
+            "empty buffer stream did not retain empty data state");
+
+        auto all_objects = pdf.getAllObjects();
+        require(all_objects.size() == 5, "new streams changed the expected object count");
+        auto is_registered = [&all_objects](QPDFObjectHandle const& stream) {
+            return std::any_of(
+                all_objects.begin(),
+                all_objects.end(),
+                [&stream](QPDFObjectHandle const& object) {
+                    return object.getObjGen() == stream.getObjGen();
+                });
+        };
+        require(is_registered(with_data), "buffer stream was not registered");
+        require(is_registered(empty_data), "empty buffer stream was not registered");
 
         std::cout << "qpdf new stream probe: ok\n";
         return 0;
