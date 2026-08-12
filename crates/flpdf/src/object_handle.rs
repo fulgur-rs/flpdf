@@ -4231,34 +4231,81 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
 // qpdf's own implicit `dereference()` on `object`'s first `isXxx()` type
 // check inside `unparseObject` itself, rather than the no-hidden-I/O
 // contract [`ObjectHandle::with_value`]'s other callers rely on.
+enum UnparseContainer {
+    Array(Vec<ObjectHandle>),
+    Dictionary(Vec<(Vec<u8>, ObjectHandle)>),
+    Stream(ObjectHandle),
+}
+
+// qpdf's writer walks a live container and does not clone scalar payloads.
+// The RefCell borrow must nevertheless be released before a child is resolved,
+// since resolution can mutate the same shared state. Snapshot only the edges
+// needed for a later recursive descent; scalar/name/string bytes are emitted
+// while their borrow is still active.
+fn snapshot_unparse_container(value: &ObjectValue) -> Option<UnparseContainer> {
+    match value {
+        ObjectValue::Array(children) => Some(UnparseContainer::Array(children.clone())),
+        ObjectValue::Dictionary(entries) => Some(UnparseContainer::Dictionary(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )),
+        ObjectValue::Stream { stream_dict, .. } => {
+            Some(UnparseContainer::Stream(stream_dict.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn unparse_container(container: UnparseContainer, out: &mut Vec<u8>) -> Result<()> {
+    match container {
+        UnparseContainer::Array(children) => {
+            // QPDFWriter.cc:1334-1345: no token-boundary rule, a space is
+            // written before every element regardless of adjacency.
+            out.push(b'[');
+            for child in children {
+                out.push(b' ');
+                write_child(&child, out)?;
+            }
+            out.extend_from_slice(b" ]");
+        }
+        UnparseContainer::Dictionary(entries) => unparse_dict_entries(&entries, out)?,
+        UnparseContainer::Stream(stream_dict) => {
+            // This primitive inlines only a stream's dictionary; stream
+            // framing remains `unparse_stream_body`'s responsibility.
+            unparse_object_walk(&stream_dict, out)?;
+        }
+    }
+    Ok(())
+}
+
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        // Snapshot the value before descending into children. Container
-        // values hold shared handles, and child resolution can update the
-        // same shared state; retaining with_value's RefCell borrow while
-        // walking them makes that legitimate mutation panic with
-        // "RefCell already borrowed".
-        let value = handle.with_value(|value| value.cloned());
-        match value {
-            Some(value) => unparse_object_value(&value, out),
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    // Scalars have no child to resolve, so serialize them
+                    // while the borrow is active instead of cloning payloads.
+                    unparse_object_value(value, out).map(|()| None)
+                }
+            }
             None => {
                 // cov:ignore-start: unreachable once `try_dereference()`
-                // above has returned `Ok` -- every `DocumentResolver::
-                // resolve_indirect` implementation in this crate (the
-                // production reader's and every mock harness used by this
-                // file's own tests) leaves the slot in a terminal state on
-                // success, so `with_value` cannot still observe
-                // `NotYetResolved` here. Kept, rather than `unreachable!()`,
-                // as the same conservative null fallback `materialize_bounded`/
-                // `unparse_materialize` use for this arm -- a future
-                // `DocumentResolver` implementation that violated that
-                // invariant would degrade to `null` output instead of a panic.
+                // above has returned `Ok`; retain the conservative null
+                // fallback for a resolver that violates that invariant.
                 out.extend_from_slice(b"null");
-                Ok(())
+                Ok(None)
                 // cov:ignore-end
             }
+        })?;
+        match container {
+            Some(container) => unparse_container(container, out),
+            None => Ok(()),
         }
     })
 }
@@ -4378,19 +4425,71 @@ fn unparse_object_walk_with_ref_map(
 ) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        // Release the shared-state borrow before resolving any child handles;
-        // a child may legitimately mutate that state while this value is
-        // being serialized.
-        let value = handle.with_value(|value| value.cloned());
-        match value {
-            Some(value) => unparse_object_value_with_ref_map(&value, out, map, removed_refs),
-            None => {
-                // cov:ignore-start: successful dereference exposes Null for missing states or errors while unresolved
+        // A resolved indirect redirect stores its reference as a scalar, but
+        // the mapping callback may re-enter mutation of this same handle.
+        // Copy the small reference token out before invoking the callback so
+        // `with_value`'s RefCell borrow cannot cross that call.
+        let reference = handle.with_value(|value| match value {
+            Some(ObjectValue::Reference(object_ref)) => Some(*object_ref),
+            _ => None,
+        });
+        if let Some(object_ref) = reference {
+            if object_ref.number == 0 || removed_refs.contains(&object_ref) {
                 out.extend_from_slice(b"null");
-                Ok(())
-            } // cov:ignore-end
+            } else {
+                let mapped = map(object_ref)?;
+                out.extend_from_slice(mapped.to_string().as_bytes());
+            }
+            return Ok(());
+        }
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    // Scalar payloads are written under the borrow; only
+                    // container edges need an owned snapshot before descent.
+                    unparse_object_value_with_ref_map(value, out, map, removed_refs).map(|()| None)
+                }
+            }
+            None => {
+                // cov:ignore-start: successful dereference exposes Null for
+                // missing states or errors while unresolved.
+                out.extend_from_slice(b"null");
+                Ok(None)
+                // cov:ignore-end
+            }
+        })?;
+        match container {
+            Some(container) => unparse_container_with_ref_map(container, out, map, removed_refs),
+            None => Ok(()),
         }
     })
+}
+
+fn unparse_container_with_ref_map(
+    container: UnparseContainer,
+    out: &mut Vec<u8>,
+    map: &ObjectRefMap<'_>,
+    removed_refs: &BTreeSet<ObjectRef>,
+) -> Result<()> {
+    match container {
+        UnparseContainer::Array(children) => {
+            out.push(b'[');
+            for child in children {
+                out.push(b' ');
+                write_child_with_ref_map(&child, out, map, removed_refs)?;
+            }
+            out.extend_from_slice(b" ]");
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_with_ref_map(&entries, out, map, removed_refs)?;
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_with_ref_map(&stream_dict, out, map, removed_refs)?;
+        }
+    }
+    Ok(())
 }
 
 fn unparse_object_value_with_ref_map(
@@ -4655,18 +4754,60 @@ fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> R
 fn unparse_object_walk_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        handle.with_value(|value| match value {
-            Some(value) => unparse_object_value_qdf(value, indent, out),
+        let container = handle.with_value(|value| match value {
+            Some(value) => {
+                if let Some(container) = snapshot_unparse_container(value) {
+                    Ok(Some(container))
+                } else {
+                    // QDF changes container framing only; scalar bytes take
+                    // the same no-copy path as compact unparse.
+                    unparse_object_value_qdf(value, indent, out).map(|()| None)
+                }
+            }
             None => {
                 // cov:ignore-start: unreachable once `try_dereference()`
                 // above has returned `Ok` -- see `unparse_object_walk`'s own
                 // identical arm for why.
                 out.extend_from_slice(b"null");
-                Ok(())
+                Ok(None)
                 // cov:ignore-end
             }
-        })
+        })?;
+        match container {
+            Some(container) => unparse_container_qdf(container, indent, out),
+            None => Ok(()),
+        }
     })
+}
+
+fn unparse_container_qdf(
+    container: UnparseContainer,
+    indent: usize,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    match container {
+        UnparseContainer::Array(children) => {
+            // Object::write_pdf_qdf's Array arm: `[`, a newline, then each
+            // child at `indent + 2`, followed by the closing bracket at
+            // `indent`.
+            out.push(b'[');
+            out.push(b'\n');
+            for child in children {
+                push_spaces(out, indent + 2);
+                write_child_qdf(&child, indent + 2, out)?;
+                out.push(b'\n');
+            }
+            push_spaces(out, indent);
+            out.push(b']');
+        }
+        UnparseContainer::Dictionary(entries) => {
+            unparse_dict_entries_qdf(&entries, indent, out)?;
+        }
+        UnparseContainer::Stream(stream_dict) => {
+            unparse_object_walk_qdf(&stream_dict, indent, out)?;
+        }
+    }
+    Ok(())
 }
 
 // QDF-mode sibling of `unparse_object_value` above. Only the container arms
@@ -9036,6 +9177,32 @@ mod unparse_object_tests {
     }
 
     #[test]
+    fn unparse_object_serializes_large_scalar_payloads_without_deep_snapshotting() {
+        let string_payload = vec![b's'; 256 * 1024];
+        let mut out = Vec::new();
+        ObjectHandle::string(string_payload.clone())
+            .unparse_object(&mut out)
+            .unwrap();
+        assert_eq!(out.len(), string_payload.len() + 2);
+        assert_eq!(out.first(), Some(&b'('));
+        assert_eq!(out.last(), Some(&b')'));
+
+        let operator_payload = vec![b'o'; 256 * 1024];
+        out.clear();
+        ObjectHandle::operator(operator_payload.clone())
+            .unparse_object(&mut out)
+            .unwrap();
+        assert_eq!(out, operator_payload);
+
+        let inline_image_payload = vec![b'i'; 256 * 1024];
+        out.clear();
+        ObjectHandle::inline_image(inline_image_payload.clone())
+            .unparse_object_qdf(&mut out, 0)
+            .unwrap();
+        assert_eq!(out, inline_image_payload);
+    }
+
+    #[test]
     fn unparse_object_inlines_only_the_dictionary_of_a_direct_stream_value() {
         // A *direct* Stream ObjectValue has no qpdf counterpart (a real
         // QPDFObjectHandle's resolved value is never itself a stream
@@ -9465,6 +9632,28 @@ mod unparse_object_tests {
             .unparse_stream_body_with_ref_map(&mut non_dictionary, false, &map)
             .unwrap();
         assert_eq!(non_dictionary, b"<< >>");
+    }
+
+    #[test]
+    fn mapped_unparse_releases_reference_value_borrow_before_mapping() {
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), 0);
+        handle.set_resolved(ObjectValue::Reference(ObjectRef::new(2, 0)));
+        let reentrant_handle = handle.clone();
+        let map = move |object_ref: ObjectRef| {
+            reentrant_handle.set_resolved(ObjectValue::Integer(7));
+            Ok(ObjectRef::new(
+                object_ref.number + 10,
+                object_ref.generation,
+            ))
+        };
+
+        let mut out = Vec::new();
+        handle
+            .unparse_object_with_ref_map(&mut out, &map)
+            .expect("reference mapping may re-enter the handle");
+
+        assert_eq!(out, b"12 0 R");
+        assert_eq!(handle.as_integer(), Some(7));
     }
 
     #[test]
