@@ -446,16 +446,16 @@ const MAX_OBJECT_STREAM_CHAIN_DEPTH: usize = 100;
 // duplication in `object_handle.rs`); `resolver.rs` shares *these* rather
 // than minting a third pair because it is a child of this module, not a module
 // across the crate from it.
-const READER_STACK_RED_ZONE: usize = 32 * 1024;
-// Windows' stacker backend runs the callback on a fiber with exactly the
-// requested stack size. The resolver's object-attributed diagnostics add
-// enough frame state that the existing 4000-link regression can exhaust a
-// small fiber, even though the same growth boundary is sufficient on Unix.
-// Keep the larger fiber local to Windows; the normal thread stack is still
-// bounded by the caller's own thread configuration.
-#[cfg(windows)]
-const READER_STACK_GROWTH_SIZE: usize = 32 * 1024 * 1024;
-#[cfg(not(windows))]
+// Keep this red zone larger than parser.rs's 32 KiB value: resolver frames
+// retain the post-object-stream offset and recovered-stream state, so the old
+// value let a 256 KiB caller stack exhaust before stacker could switch to its
+// growth segment.
+const READER_STACK_RED_ZONE: usize = 128 * 1024;
+// The resolver's object-attributed diagnostics and recovered-stream state add
+// enough frame state that the deep-chain regression needs an earlier growth
+// check than the original 32 KiB red zone. The callback stack remains 1 MiB;
+// stacker switches to it before the caller's bounded stack can exhaust on any
+// supported platform.
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 
 impl<R: Read + Seek> Pdf<R> {

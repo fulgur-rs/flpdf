@@ -64,3 +64,40 @@ fn fuzz_regressions_do_not_panic() {
         dir.display()
     );
 }
+
+#[test]
+fn malformed_dictionary_does_not_reborrow_shared_state_while_writing() {
+    // Captured from the roundtrip fuzzer. The malformed page dictionary and
+    // duplicate stream object make writer-side null filtering resolve a child
+    // while the containing ObjectValue is still borrowed. This must remain a
+    // no-panic input even though the parser is expected to recover from it.
+    let input = b"%PDF-1.7\n\
+1 0 obj\n\
+<< /Type /Catalog /Pages 2 0 R >>\n\
+endobj\n\
+2 0 obj\n\
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>\n\
+endobj\n\
+5 0 obj\n\
+<< \x0fType /Page /Parent 2 0 R /MediaBox [0 0 1e3 .75] /Rotate +.5 /TrimBox [1. - .2 0 5? +.25 -1.5] /Contents 4 0 R >>\n\
+endobj\n\
+5 0 obj\n\
+<< /Length\xe1 0 >>\n\
+stream\n\n\
+endstream\n\
+endobj\n\
+xref\n\
+0 5\n\
+0000000000 65535 f\n\
+0000000009 00000 n\n\
+0000000058 00000 n\n\
+0000000115 00000 n\n\
+0000000245 00000 n\n\
+trailer\n\
+<< /Size 5 /Root 1 0 R /I\x80fo 5 0 R >>\n\
+startxref\n\
+294\n\
+%%EOF\n";
+
+    roundtrip(input);
+}

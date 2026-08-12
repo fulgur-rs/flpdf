@@ -4102,8 +4102,14 @@ fn is_removed_reference(handle: &ObjectHandle, removed_refs: &BTreeSet<ObjectRef
 fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        handle.with_value(|value| match value {
-            Some(value) => unparse_object_value(value, out),
+        // Snapshot the value before descending into children. Container
+        // values hold shared handles, and child resolution can update the
+        // same shared state; retaining with_value's RefCell borrow while
+        // walking them makes that legitimate mutation panic with
+        // "RefCell already borrowed".
+        let value = handle.with_value(|value| value.cloned());
+        match value {
+            Some(value) => unparse_object_value(&value, out),
             None => {
                 // cov:ignore-start: unreachable once `try_dereference()`
                 // above has returned `Ok` -- every `DocumentResolver::
@@ -4120,7 +4126,7 @@ fn unparse_object_walk(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
                 Ok(())
                 // cov:ignore-end
             }
-        })
+        }
     })
 }
 
@@ -4239,14 +4245,18 @@ fn unparse_object_walk_with_ref_map(
 ) -> Result<()> {
     stacker::maybe_grow(UNPARSE_STACK_RED_ZONE, UNPARSE_STACK_GROWTH_SIZE, || {
         handle.try_dereference()?;
-        handle.with_value(|value| match value {
-            Some(value) => unparse_object_value_with_ref_map(value, out, map, removed_refs),
+        // Release the shared-state borrow before resolving any child handles;
+        // a child may legitimately mutate that state while this value is
+        // being serialized.
+        let value = handle.with_value(|value| value.cloned());
+        match value {
+            Some(value) => unparse_object_value_with_ref_map(&value, out, map, removed_refs),
             None => {
                 // cov:ignore-start: successful dereference exposes Null for missing states or errors while unresolved
                 out.extend_from_slice(b"null");
                 Ok(())
             } // cov:ignore-end
-        })
+        }
     })
 }
 
