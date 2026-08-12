@@ -3113,14 +3113,15 @@ impl ObjectHandle {
     pub fn get_stream_data(&self, decode_level: DecodeLevel) -> Result<Rc<Vec<u8>>> {
         let mut buffer = crate::pipeline::buffer::Buffer::new("stream data", None);
         let mut filtering_attempted = false;
-        if !self.pipe_stream_data(
+        let stream_data_succeeded = self.pipe_stream_data(
             &mut buffer,
             &mut filtering_attempted,
             0,
             decode_level,
             false,
             false,
-        )? {
+        )?; // cov:ignore: multiline call terminator has no executable coverage region
+        if !stream_data_succeeded {
             return Err(Error::Unsupported(
                 "error getting decoded stream data".to_owned(),
             ));
@@ -10313,6 +10314,42 @@ mod mutation_tests {
             Error::Internal(message) if message == "source pipe failure"
         ));
         assert!(filtering_attempted);
+        assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
+    fn get_stream_data_maps_a_filtered_source_retry_to_an_error() {
+        let raw = b"source error".to_vec();
+        let resolver = Rc::new(SourcePipeResolver {
+            value: ObjectValue::Stream {
+                stream_dict: ObjectHandle::dictionary(vec![(
+                    b"Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                )]),
+                stream_data: None,
+                stream_length: raw.len(),
+            },
+            bytes: raw,
+            calls: RefCell::new(Vec::new()),
+            warnings: RefCell::new(Vec::new()),
+            fail_first: true,
+            fail_with_error: false,
+        });
+        let resolver_handle: Rc<dyn DocumentResolver> = resolver.clone();
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver_handle),
+        );
+        stream.set_parsed_offset_if_unset(9);
+
+        let error = stream
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect_err("a failed filtered source must not be reported as decoded data");
+
+        assert!(matches!(
+            error,
+            Error::Unsupported(message) if message == "error getting decoded stream data"
+        ));
         assert_eq!(resolver.calls.borrow().as_slice(), &[(false, false)]);
     }
 
