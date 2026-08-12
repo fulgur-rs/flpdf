@@ -82,16 +82,20 @@
 
 use crate::filters::decode_stream_data;
 use crate::object::{Dictionary, Object, Stream};
-use crate::object_handle::canonical_dictionary_key;
+use crate::object_handle::{canonical_dictionary_key, StreamDataProvider};
 use crate::pdf_string::{new_unicode_string, utf8_value};
+use crate::pipeline::count::Count;
 use crate::pipeline::md5::PlMd5;
 use crate::pipeline::{Discard, Pipeline};
 use crate::ref_chain::resolve_ref_chain;
+use crate::writer::DecodeLevel;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
+use std::rc::Rc;
 
 const NAME_KEYS: [&str; 5] = ["UF", "F", "Unix", "DOS", "Mac"];
 
@@ -147,28 +151,137 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
     /// This Rust form of qpdf's `createEFStream` returns the created
     /// `ObjectHandle`; use [`Self::new`] to obtain the borrowing helper.
     pub fn create_ef_stream(pdf: &mut Pdf<R>, data: impl AsRef<[u8]>) -> Result<ObjectHandle> {
-        let data = data.as_ref();
-        let mut params = Dictionary::new();
-        params.insert("Size", Object::Integer(data.len() as i64));
-        params.insert("CheckSum", Object::String(md5_checksum(data)));
-
-        let mut dict = Dictionary::new();
-        dict.insert("Type", Object::Name(b"EmbeddedFile".to_vec()));
-        dict.insert("Length", Object::Integer(data.len() as i64));
-        dict.insert("Params", Object::Dictionary(params));
-
-        let object_ref = next_object_ref(pdf)?;
-        pdf.set_object(object_ref, Object::Stream(Stream::new(dict, data.to_vec())));
-        Ok(pdf.get_object_handle(object_ref))
+        let stream = pdf.new_stream()?;
+        stream.replace_stream_data(
+            Rc::new(data.as_ref().to_vec()),
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        );
+        Self::new_from_stream(pdf, stream)
     }
 
-    /// Create an embedded-file stream from filesystem bytes. This is the Rust
-    /// equivalent of qpdf's provider-based `createEFStream` overload.
+    /// Create an indirect `/EmbeddedFile` stream from a deferred qpdf-style
+    /// provider.  The provider is retained by the stream and is not invoked
+    /// until the common finalization path pipes the stream data.
+    ///
+    /// This is qpdf's provider overload from
+    /// `QPDFEFStreamObjectHelper.cc:102-107`: qpdf creates an empty stream,
+    /// installs the provider with `replaceStreamData`, and then delegates to
+    /// one `newFromStream` implementation.
+    pub fn create_ef_stream_from_provider(
+        pdf: &mut Pdf<R>,
+        provider: Rc<dyn StreamDataProvider>,
+    ) -> Result<ObjectHandle> {
+        let stream = pdf.new_stream()?;
+        stream.replace_stream_data_provider(
+            provider,
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )?; // cov:ignore: Pdf::new_stream guarantees a stream handle here
+        Self::new_from_stream(pdf, stream)
+    }
+
+    /// Apply qpdf's shared `newFromStream` EmbeddedFile finalization.
+    ///
+    /// `QPDFEFStreamObjectHelper.cc:131-148` sets `/Type` before piping the
+    /// decoded stream through `Pl_Count -> Pl_MD5 -> Pl_Discard`.  `/Params`
+    /// is populated only after a successful pipe; a failed provider/filter
+    /// path gets qpdf's warning and never falls back to a materialized length
+    /// or a second digest computation.
+    fn new_from_stream(pdf: &mut Pdf<R>, stream: ObjectHandle) -> Result<ObjectHandle> {
+        let stream_dict = stream.as_stream_dict().ok_or_else(|| {
+            Error::System("EmbeddedFile factory received a non-stream object".to_string())
+        })?;
+        stream_dict.replace_key(b"/Type", ObjectHandle::name(b"EmbeddedFile".to_vec()));
+        pdf.mark_object_handle_dirty(&stream)?;
+
+        let mut discard = Discard;
+        let mut md5 = PlMd5::new("EF md5", &mut discard);
+        let (success, size, checksum) = {
+            let mut count = Count::new("EF size", &mut md5);
+            let mut filtering_attempted = false;
+            let success = stream.pipe_stream_data(
+                &mut count,
+                &mut filtering_attempted,
+                0,
+                DecodeLevel::All,
+                false,
+                false,
+            )?;
+            let size = count.count();
+            drop(count);
+            let checksum = if success {
+                Some(
+                    hex::decode(md5.get_hex_digest()?)
+                        .expect("PlMd5 always returns a hexadecimal digest"),
+                )
+            } else {
+                None
+            };
+            (success, size, checksum)
+        };
+
+        if success {
+            let checksum = checksum.expect("successful EmbeddedFile pipe has a checksum");
+            stream_dict.replace_key(
+                b"/Params",
+                ObjectHandle::dictionary(vec![
+                    (
+                        b"/Size".to_vec(),
+                        ObjectHandle::integer(
+                            i64::try_from(size).map_err(|_| {
+                                // cov:ignore-start: an in-memory stream cannot exceed PDF's signed integer range in tests
+                                Error::System(
+                                    "EmbeddedFile size exceeds PDF integer range".to_string(),
+                                )
+                                // cov:ignore-end
+                            })?, // cov:ignore: closing line of the unreachable signed-PDF-range guard
+                        ),
+                    ),
+                    (b"/CheckSum".to_vec(), ObjectHandle::string(checksum)),
+                ]),
+            );
+            pdf.mark_object_handle_dirty(&stream)?;
+        } else {
+            stream.warn_if_possible("unable to get stream data for new embedded file stream")?;
+        }
+
+        Ok(stream)
+    }
+
+    /// Create an embedded-file stream from a filesystem path.
+    ///
+    /// The path is retained by qpdf's provider-shaped callback and the file is
+    /// opened afresh for each stream pipe. This is the Rust equivalent of
+    /// qpdf's `QUtil::file_provider` overload: it does not materialize the
+    /// complete file into an intermediate `Vec<u8>`, and repeated reads use
+    /// the same provider source. This follows the path overload in
+    /// `QPDFFileSpecObjectHelper.cc:85-105` and the provider construction in
+    /// `QPDFEFStreamObjectHelper.cc:90-107`.
     pub fn create_ef_stream_from_path<P: AsRef<Path>>(
         pdf: &mut Pdf<R>,
         path: P,
     ) -> Result<ObjectHandle> {
-        Self::create_ef_stream(pdf, std::fs::read(path)?)
+        let path = path.as_ref().to_path_buf();
+        let stream = pdf.new_stream()?;
+        stream.replace_stream_data_with_callback(
+            move |pipeline| {
+                let mut file = File::open(&path)?;
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    pipeline.write(&buffer[..read]).map_err(Error::from)?;
+                }
+                pipeline.finish().map_err(Error::from)?;
+                Ok(())
+            },
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )?; // cov:ignore: Pdf::new_stream guarantees a stream handle here
+        Self::new_from_stream(pdf, stream)
     }
 
     /// Construct a wrapper for a direct or indirect `/EmbeddedFile` stream
@@ -1056,17 +1169,17 @@ impl FileSpecBuilder {
 
 // ── High-level attachment helper ──────────────────────────────────────────────
 
-/// Load a file from disk and attach it to `pdf`, compressed with FlateDecode.
+/// Attach a file from disk to `pdf` through qpdf's filesystem provider path.
 ///
-/// This is a convenience wrapper around [`FileSpecBuilder`] +
+/// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +
 /// [`crate::embedded_files::insert_embedded_file`] that:
 ///
-/// 1. Reads the file at `path` into memory.
+/// 1. Streams the file at `path` through the deferred provider factory.
 /// 2. Derives the name-tree key and `/F`/`/UF` filename from the path's
 ///    **basename** (the last component of the path).
-/// 3. Builds a `/Filespec` + `/EmbeddedFile` pair with FlateDecode compression.
-///    `/Params /Size` and `/Params /CheckSum` reflect the **raw (uncompressed)**
-///    bytes, as required by ISO 32000-1 §7.11.4.
+/// 3. Builds a `/Filespec` + `/EmbeddedFile` pair without installing a local
+///    filter. `/Params /Size` and `/Params /CheckSum` reflect the **raw** bytes,
+///    as required by ISO 32000-1 §7.11.4.
 /// 4. Inserts the pair into the catalog's `/Names /EmbeddedFiles` name tree
 ///    under the UTF-8 `key` (which may differ from the basename if the caller
 ///    wants an explicit tree key).
@@ -1082,11 +1195,10 @@ impl FileSpecBuilder {
 ///
 /// # Errors
 ///
-/// - [`Error::Io`] if the file cannot be read.
-/// - [`Error::Unsupported`] if the path has no basename, the basename is not
-///   valid UTF-8, or the basename is not ASCII (independent `/F` ASCII-fallback
-///   + `/UF` Unicode handling is not yet supported).
-/// - Any error from [`FileSpecBuilder::build`] or
+/// - [`Error::Io`] if the file cannot be opened or read.
+/// - [`Error::Unsupported`] if the path has no basename or the basename is not
+///   valid UTF-8.
+/// - Any error from [`FileSpec::create_file_spec_from_path`] or
 ///   [`crate::embedded_files::insert_embedded_file`].
 ///
 /// # Example
@@ -1130,13 +1242,19 @@ where
             ))
         })?;
 
-    // Read the raw file bytes.
-    let raw = std::fs::read(path)?;
-
-    // Build the /Filespec + /EmbeddedFile and insert into the name tree.
-    let filespec_ref = FileSpecBuilder::new(ascii_filename_fallback(basename), raw)
-        .uf_filename(basename)
-        .build(pdf)?;
+    // Build the /Filespec + /EmbeddedFile through qpdf's path-provider route.
+    // `create_file_spec` initially uses the same Unicode name for `/F` and
+    // `/UF`; replace `/F` with the independent ASCII fallback while retaining
+    // the original Unicode `/UF` value, matching FileSpecBuilder's behavior.
+    let filespec_handle = FileSpec::create_file_spec_from_path(pdf, basename.as_bytes(), path)?;
+    let filespec_ref = filespec_handle
+        .object_ref()
+        .expect("create_file_spec_from_path must create an indirect Filespec");
+    let fallback = ascii_filename_fallback(basename);
+    {
+        let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
+        filespec.set_filename(basename.as_bytes(), Some(fallback.as_slice()))?;
+    }
     crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
 
     Ok(filespec_ref)
@@ -1685,6 +1803,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF"
+        );
+    }
+
+    #[test]
+    fn embedded_file_finalizer_rejects_a_non_stream_handle() {
+        let mut pdf = open_minimal();
+        let error = EmbeddedFileStream::new_from_stream(&mut pdf, ObjectHandle::null())
+            .expect_err("the shared finalizer requires a stream handle");
+
+        assert_eq!(
+            error.to_string(),
+            "EmbeddedFile factory received a non-stream object"
         );
     }
 
