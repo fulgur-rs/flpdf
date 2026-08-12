@@ -1255,7 +1255,7 @@ fn best_effort_candidate_discovery_resolves_indirect_xref_type() {
     let candidate_offset = bytes.len() as u64;
     let entries = build_encoded_xref_stream_entries(&[(0, 0, 0), (1, candidate_offset, 0)]);
     let candidate_header = format!(
-        "1 0 obj\n<< /Type 5 0 R /Size 2 /Root 1 0 R /W [1 1 1] /Index [0 2] /Length {} >>\nstream\n",
+        "1 0 obj\n<< /Type 5 0 R /Size 2 /Root 1 0 R /W [1 4 2] /Index [0 2] /Length {} >>\nstream\n",
         entries.len()
     );
     let candidate_suffix = b"\nendstream\nendobj\n";

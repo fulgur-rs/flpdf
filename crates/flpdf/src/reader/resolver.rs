@@ -173,6 +173,12 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// still contains only live type-1/type-2 entries; this set records the
     /// lookup side effect needed for a later `resolve(og)` warning.
     default_xref_entries: BTreeSet<ObjectRef>,
+    /// qpdf `m->deleted_objects` (`QPDF.hh:1470`): object-number tombstones
+    /// that suppress later ordinary and reconstructed xref registrations.
+    /// This is separate from the Pdf-facing removed-reference set because the
+    /// repair boundary must reject a row before `fixDanglingReferences` can
+    /// mint its canonical handle.
+    deleted_object_numbers: BTreeSet<u32>,
     /// qpdf `m->attempt_recovery` (`QPDF.hh:1461`).
     ///
     /// Same on/off flag, opposite default: qpdf initialises it to `true` and
@@ -667,6 +673,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
         attempt_recovery: bool,
         already_reconstructed: bool,
+        deleted_object_numbers: BTreeSet<u32>,
         repair_diagnostics: Diagnostics,
         warning_options: ResolverWarningOptions,
         pdf_unique_id: u64,
@@ -685,6 +692,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 resolving: BTreeSet::new(),
                 resolved_object_streams: BTreeSet::new(),
                 default_xref_entries: BTreeSet::new(),
+                deleted_object_numbers,
                 attempt_recovery,
                 writer_stream_recovery: false,
                 // qpdf `m->reconstructed_xref` (`QPDF.cc:524`): set by
@@ -977,6 +985,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries.remove(&object_ref);
             core.default_xref_entries.remove(&object_ref);
+            core.deleted_object_numbers.insert(object_ref.number);
             core.fixed_dangling_refs = false;
             core.object_cache.get(&object_ref).cloned()
         };
@@ -984,6 +993,25 @@ impl<R: Read + Seek> ResolverHandle<R> {
             handle.set_missing();
         }
         Ok(())
+    }
+
+    /// Record a qpdf-style object-number tombstone for a cache-erasing
+    /// canonical removal. Unlike `remove_object_preserving_handle`, this path
+    /// has already discarded the canonical handle, so the tombstone is the
+    /// only state that prevents a later repaired xref from recreating it.
+    pub(crate) fn mark_deleted_object_number(&self, object_ref: ObjectRef) {
+        let mut core = self.core.borrow_mut();
+        core.deleted_object_numbers.insert(object_ref.number);
+        core.fixed_dangling_refs = false;
+    }
+
+    /// Clear a repair tombstone when a caller supplies a replacement for the
+    /// same object number, matching the legacy Pdf mutation contract that
+    /// removes the object from `qpdf_removed_refs`.
+    pub(crate) fn clear_deleted_object_number(&self, object_ref: ObjectRef) {
+        let mut core = self.core.borrow_mut();
+        core.deleted_object_numbers.remove(&object_ref.number);
+        core.fixed_dangling_refs = false;
     }
 
     /// Whether a canonical handle occupies `number` at any generation.
@@ -1095,11 +1123,16 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })?;
         let new_entries = crate::xref::recover_xref_entries(logical_bytes, false)?.entries;
 
+        let deleted_object_numbers = self.core.borrow().deleted_object_numbers.clone();
         {
             let mut core = self.core.borrow_mut();
             core.source_xref_entries
                 .retain(|_, entry| !matches!(entry, XrefEntry::Uncompressed { .. }));
-            core.source_xref_entries.extend(new_entries);
+            core.source_xref_entries.extend(
+                new_entries
+                    .into_iter()
+                    .filter(|(object_ref, _)| !deleted_object_numbers.contains(&object_ref.number)),
+            );
         }
 
         // Lookup object_ref in reconstructed xref table
@@ -1999,10 +2032,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// for fixtures that drive resolution of a hand-built object.
     #[cfg(test)]
     pub(crate) fn insert_xref_entry(&self, object_ref: ObjectRef, entry: XrefEntry) {
-        self.core
-            .borrow_mut()
-            .source_xref_entries
-            .insert(object_ref, entry);
+        let mut core = self.core.borrow_mut();
+        if !core.deleted_object_numbers.contains(&object_ref.number) {
+            core.source_xref_entries.insert(object_ref, entry);
+        }
     }
 
     // ---- the input source, streamed ----
@@ -3557,7 +3590,7 @@ mod tests {
     use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
     use crate::reader::{EncryptionMode, EncryptionState};
     use crate::{Diagnostics, Error, ObjectHandle, ObjectRef, Pdf, Severity, XrefEntry};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::io::Cursor;
     use std::process::Command; // cov:ignore: test-only import has no executable LLVM counter.
@@ -3712,6 +3745,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -3727,6 +3761,7 @@ mod tests {
                 BTreeMap::new(),
                 false,
                 false,
+                BTreeSet::new(),
                 Diagnostics::default(),
                 ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
                 0,
@@ -3890,6 +3925,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, "input.pdf".to_owned()),
             0,
@@ -4215,6 +4251,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -4232,6 +4269,7 @@ mod tests {
             BTreeMap::from([(object_ref, XrefEntry::Uncompressed { offset: 1 })]),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, description.to_owned()),
             0,
@@ -4252,6 +4290,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, "stream.pdf".to_owned()),
             0,
@@ -5519,6 +5558,7 @@ mod tests {
                 BTreeMap::<ObjectRef, XrefEntry>::new(),
                 false,
                 false, // already_reconstructed
+                BTreeSet::new(),
                 Diagnostics::default(),
                 ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
                 0,
@@ -5613,6 +5653,7 @@ mod tests {
             BTreeMap::<ObjectRef, XrefEntry>::new(),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -6134,6 +6175,7 @@ mod tests {
             BTreeMap::from([(ObjectRef::new(1, 0), XrefEntry::Uncompressed { offset: 0 })]),
             false,
             false, // already_reconstructed
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -6628,6 +6670,7 @@ mod tests {
             entries,
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, "input.pdf".to_owned()),
             0,
@@ -6714,6 +6757,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -6763,6 +6807,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -6813,6 +6858,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -6872,6 +6918,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -6933,6 +6980,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, String::new()),
             0,
@@ -6993,6 +7041,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, String::new()),
             0,
@@ -7043,6 +7092,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7108,6 +7158,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7154,6 +7205,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7198,6 +7250,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7253,6 +7306,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7327,6 +7381,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7391,6 +7446,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7448,6 +7504,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, String::new()),
             0,
@@ -7565,6 +7622,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7604,6 +7662,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7673,6 +7732,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(logger, false, String::new()),
             0,
@@ -7718,6 +7778,7 @@ mod tests {
             BTreeMap::from([(object_ref, XrefEntry::Free { next: 0 })]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -7773,6 +7834,7 @@ mod tests {
             ]),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -8586,6 +8648,7 @@ mod tests {
             BTreeMap::new(),
             false,
             false,
+            BTreeSet::new(),
             Diagnostics::default(),
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
@@ -10393,6 +10456,27 @@ mod tests {
         pdf
     }
 
+    fn synthetic_mismatch_discovers_loaded_tombstone_pdf() -> Vec<u8> {
+        let mut pdf = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.7\n");
+        let object_two_offset = pdf.len();
+        pdf.extend_from_slice(b"2 0 obj\ntrue\nendobj\n");
+        pdf.extend_from_slice(b"1 0 obj\n(recovered)\nendobj\n");
+        pdf.extend_from_slice(b"3 0 obj\n99\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 4\n0000000000 65535 f \n{object_two_offset:010} 00000 n \n{object_two_offset:010} 00000 n \n0000000000 00001 f \n"
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 2 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        pdf
+    }
+
     /// A recovered stream whose original xref entries both point into the
     /// first object's dictionary.  The stale second offset is intentionally
     /// between the real object boundaries so it can truncate a legacy read
@@ -10514,6 +10598,64 @@ mod tests {
             warnings.iter().any(|w| w.contains("Attempting to reconstruct cross-reference table")),
             "diagnostics must contain 'Attempting to reconstruct cross-reference table': {warnings:?}"
         );
+    }
+
+    #[test]
+    fn reconstruction_does_not_reintroduce_a_removed_unindexed_object() {
+        let options = crate::PdfOpenOptions {
+            repair: true,
+            ..Default::default()
+        };
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_discovers_unindexed_object_pdf(),
+            options,
+        )
+        .expect("open recovery fixture");
+        let removed_ref = ObjectRef::new(3, 0);
+        pdf.remove_object_handle(removed_ref)
+            .expect("remove the unindexed object before recovery");
+
+        // Resolving object 1 forces xref reconstruction. The recovery scan
+        // still sees object 3 in the bytes, but qpdf's deleted_objects set
+        // prevents that row from entering the effective xref/cache view.
+        pdf.get_object_handle(ObjectRef::new(1, 0))
+            .try_dereference()
+            .expect("the damaged header must recover object 1");
+
+        assert!(pdf.reconstructed_xref());
+        assert!(pdf.resolver.xref_entry(removed_ref).is_none());
+        assert!(pdf.resolver.registered_handle(removed_ref).is_none());
+        assert!(!pdf
+            .get_all_objects()
+            .expect("enumerate the recovered cache")
+            .iter()
+            .any(|handle| handle.object_ref() == Some(removed_ref)));
+    }
+
+    #[test]
+    fn reconstruction_preserves_loaded_free_object_tombstones() {
+        let mut pdf = Pdf::open_mem_owned_with_options(
+            synthetic_mismatch_discovers_loaded_tombstone_pdf(),
+            crate::PdfOpenOptions {
+                repair: true,
+                ..Default::default()
+            },
+        )
+        .expect("open recovery fixture");
+        let removed_ref = ObjectRef::new(3, 0);
+
+        pdf.get_object_handle(ObjectRef::new(1, 0))
+            .try_dereference()
+            .expect("the damaged header must recover object 1");
+
+        assert!(pdf.reconstructed_xref());
+        assert!(pdf.resolver.xref_entry(removed_ref).is_none());
+        assert!(pdf.resolver.registered_handle(removed_ref).is_none());
+        assert!(!pdf
+            .get_all_objects()
+            .expect("enumerate the recovered cache")
+            .iter()
+            .any(|handle| handle.object_ref() == Some(removed_ref)));
     }
 
     #[test]
