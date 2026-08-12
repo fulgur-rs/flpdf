@@ -450,11 +450,11 @@ const READER_STACK_RED_ZONE: usize = 32 * 1024;
 // Windows' stacker backend runs the callback on a fiber with exactly the
 // requested stack size. The resolver's object-attributed diagnostics add
 // enough frame state that the existing 4000-link regression can exhaust a
-// 1 MiB fiber, even though the same growth boundary is sufficient on Unix.
+// small fiber, even though the same growth boundary is sufficient on Unix.
 // Keep the larger fiber local to Windows; the normal thread stack is still
 // bounded by the caller's own thread configuration.
 #[cfg(windows)]
-const READER_STACK_GROWTH_SIZE: usize = 8 * 1024 * 1024;
+const READER_STACK_GROWTH_SIZE: usize = 32 * 1024 * 1024;
 #[cfg(not(windows))]
 const READER_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 

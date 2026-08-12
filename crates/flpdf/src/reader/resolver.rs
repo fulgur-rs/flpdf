@@ -10086,7 +10086,7 @@ mod tests {
         // `trailer_key_handle_is_null_when_the_keys_own_value_exceeds_the_parse_depth_bound`
         // builds its tree in the spawned thread.
         #[cfg(windows)]
-        let stack_size = 8 * 1024 * 1024;
+        let stack_size = 32 * 1024 * 1024;
         #[cfg(not(windows))]
         let stack_size = 256 * 1024;
         std::thread::Builder::new()
