@@ -2403,6 +2403,13 @@ impl<R: Read + Seek> Pdf<R> {
     ) -> Result<ObjectHandle> {
         match object {
             Object::Reference(object_ref) => Ok(self.get_object_handle(*object_ref)),
+            // qpdf's QPDFObjectHandle::newNull() is contextless
+            // (`libqpdf/QPDFObjectHandle.cc:1891-1894`), including null
+            // fallbacks returned by dictionary accessors. Keep a relifted
+            // legacy null on that same boundary rather than making a
+            // synthetic resolver-bearing value whose warning path would
+            // incorrectly reach this Pdf's logger.
+            Object::Null => Ok(ObjectHandle::null()),
             direct => {
                 let value =
                     self.lift_bounded_with_options(direct, depth, max_depth, allow_content_tokens)?;
@@ -8445,6 +8452,24 @@ mod tests {
         let handle = pdf.trailer_key_handle(b"QTest");
 
         assert_eq!(handle.object_ref(), Some(root_ref));
+    }
+
+    #[test]
+    fn lifted_null_handles_remain_contextless() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let handle = pdf
+            .lift_to_handle_bounded(&Object::Null, 0, crate::parser::MAX_PARSE_DEPTH)
+            .expect("null is representable as a handle");
+
+        let error = handle
+            .try_get_key(b"/Missing")
+            .expect_err("a contextless null must keep the Error::System boundary");
+
+        assert!(matches!(
+            error,
+            crate::Error::System(message)
+                if message == "operation for dictionary attempted on object of type null: returning null for attempted key retrieval"
+        ));
     }
 
     #[test]
