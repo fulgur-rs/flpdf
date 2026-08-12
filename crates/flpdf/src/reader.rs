@@ -1465,9 +1465,6 @@ impl<R: Read + Seek> Pdf<R> {
                 {
                     return None;
                 }
-                if live_only && self.cache.entry(object_ref).is_none() && !handle.is_resolved() {
-                    return None;
-                }
                 Some(object_ref)
             })
             .collect()
@@ -8037,6 +8034,7 @@ mod tests {
         let stale_ref = ObjectRef::new(999, 0);
         pdf.legacy_materialized_memo
             .insert(stale_ref, Object::Integer(7));
+        pdf.legacy_materialized_replacement_refs.insert(stale_ref);
 
         let objects = pdf
             .get_all_objects()
@@ -8045,6 +8043,45 @@ mod tests {
             .iter()
             .any(|candidate| candidate.object_ref() == Some(stale_ref)));
         assert!(pdf.legacy_materialized_memo.contains_key(&stale_ref));
+        assert!(pdf
+            .legacy_materialized_replacement_refs
+            .contains(&stale_ref));
+    }
+
+    #[test]
+    fn get_all_objects_propagates_an_unliftable_materialized_replacement() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let object_ref = ObjectRef::new(999, 0);
+        pdf.get_object_handle(object_ref);
+
+        let mut replacement = Object::Null;
+        for _ in 0..=crate::parser::MAX_PARSE_DEPTH {
+            replacement = Object::Array(vec![replacement]);
+        }
+        pdf.legacy_materialized_memo.insert(object_ref, replacement);
+        pdf.legacy_materialized_replacement_refs.insert(object_ref);
+
+        let error = pdf
+            .get_all_objects()
+            .expect_err("an over-deep replacement must fail during reconciliation");
+        assert!(error
+            .to_string()
+            .contains("object handle lift: inline object nesting exceeds maximum"));
+    }
+
+    #[test]
+    fn lift_bounded_propagates_stream_dictionary_errors() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let mut dict = Dictionary::new();
+        dict.insert("Invalid", Object::Operator(b"q".to_vec()));
+        let stream = Object::Stream(Stream::new(dict, Vec::new()));
+
+        let error = pdf
+            .lift_bounded(&stream, 0, crate::object::MAX_INLINE_DEPTH)
+            .expect_err("content-only stream dictionary values must be rejected");
+        assert!(error
+            .to_string()
+            .contains("content-stream-only token has no ObjectValue representation"));
     }
 
     #[test]
