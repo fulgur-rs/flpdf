@@ -53,6 +53,10 @@ pub(crate) struct LoadedXrefState {
     /// full reconstruction scan is not performed when an object from an
     /// already-recovered table later fails to parse.
     pub(crate) already_reconstructed: bool,
+    /// qpdf `m->deleted_objects` (`QPDF.hh:1466`): object-number tombstones
+    /// that must survive into the resolver so later reconstruction scans do
+    /// not re-register obsolete object bodies.
+    pub(crate) deleted_objects: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +770,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
         XrefReadContextSpec::ActiveSection,
     ) {
         if allow_repair {
+            loaded.deleted_objects = registration.deleted_objects.clone();
             let trigger = parse_errors.into_iter().next().unwrap_or(error);
             let recovered = recover_xref_from_linear_scan(
                 bytes,
@@ -784,6 +789,7 @@ pub(crate) fn load_xref_state_with_options<R: Read + Seek>(
     }
 
     loaded.loaded.entries = registration.snapshot();
+    loaded.deleted_objects = registration.deleted_objects.clone();
     // qpdf's post-chain `m->trailer.getKey("/Size").getIntValueAsInt()`
     // dereferences indirect `/Size` values through the completed active xref
     // table before applying the consistency warning (`QPDF.cc:689-704`).
@@ -919,6 +925,7 @@ fn parse_xref_from_start(
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: registration.deleted_objects.clone(),
         };
         merge_xref_stream_from_classic_trailer(
             bytes,
@@ -933,6 +940,7 @@ fn parse_xref_from_start(
             registration.insert_free_xref_entry(object_ref);
         }
         loaded.loaded.entries = registration.snapshot();
+        loaded.deleted_objects = registration.deleted_objects.clone();
         return Ok(loaded);
     }
 
@@ -1343,6 +1351,7 @@ fn recover_xref_from_linear_scan(
         bootstrap_cache: empty_bootstrap_cache(),
         header_offset: 0,
         already_reconstructed: true,
+        deleted_objects: BTreeSet::new(),
     })
 }
 
@@ -1372,6 +1381,9 @@ fn merge_recovered_qpdf_state(
     // the already-successfully-parsed newest revision's real one, is always
     // the correct value here, not `recovered`'s `Table` placeholder.
     recovered.loaded.last_xref_form = accumulated.loaded.last_xref_form;
+    recovered
+        .deleted_objects
+        .extend(accumulated.deleted_objects);
     recovered
         .trailer_references
         .extend(accumulated.trailer_references);
@@ -2197,6 +2209,7 @@ fn parse_xref_stream(
         bootstrap_cache,
         header_offset: 0,
         already_reconstructed: false,
+        deleted_objects: registration.deleted_objects.clone(),
     };
 
     if let Some(error) = reconstruction_trigger {
@@ -2771,6 +2784,7 @@ mod tests {
                 bootstrap_cache: empty_bootstrap_cache(),
                 header_offset: 0,
                 already_reconstructed: false,
+                deleted_objects: BTreeSet::new(),
             }
         };
 
@@ -3007,6 +3021,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
 
         merge_previous_xref_sections(
@@ -3083,6 +3098,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
 
         merge_xref_stream_from_classic_trailer(
@@ -3633,6 +3649,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
 
         let error = merge_previous_xref_sections(
@@ -3689,6 +3706,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
         let mut registration = XrefRegistration::default();
 
@@ -3742,6 +3760,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
         let mut registration = XrefRegistration::default();
 
@@ -3785,6 +3804,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
 
         let error = merge_xref_stream_from_classic_trailer(
@@ -3856,6 +3876,7 @@ mod tests {
                 bootstrap_cache: empty_bootstrap_cache(),
                 header_offset: 0,
                 already_reconstructed: false,
+                deleted_objects: BTreeSet::new(),
             }
         }
 
@@ -3936,6 +3957,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
         let mut diagnostics = Diagnostics::default();
 
@@ -3999,6 +4021,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
         let mut diagnostics = Diagnostics::default();
 
@@ -4056,6 +4079,7 @@ mod tests {
             bootstrap_cache: empty_bootstrap_cache(),
             header_offset: 0,
             already_reconstructed: false,
+            deleted_objects: BTreeSet::new(),
         };
         let mut registration = XrefRegistration::default();
         let mut diagnostics = Diagnostics::default();
