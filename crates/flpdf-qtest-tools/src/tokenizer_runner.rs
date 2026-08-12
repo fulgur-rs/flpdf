@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write;
 use std::fs;
@@ -321,8 +320,7 @@ fn canonical_page_content_bytes<R: Read + Seek>(
 
     let contents = page.get_key(b"/Contents");
     let mut streams = Vec::new();
-    let mut active_arrays = BTreeSet::new();
-    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams, &mut active_arrays)?;
+    collect_canonical_content_streams(pdf, &contents, page_ref, &mut streams, true)?;
 
     let mut output = Vec::new();
     let mut need_newline = false;
@@ -342,38 +340,37 @@ fn collect_canonical_content_streams<R: Read + Seek>(
     value: &ObjectHandle,
     page_ref: ObjectRef,
     streams: &mut Vec<ObjectHandle>,
-    active_arrays: &mut BTreeSet<ObjectRef>,
+    allow_array: bool,
 ) -> FlpdfResult<()> {
-    let (value, terminal_ref) = pdf.resolve_object_handle_to_terminal_ref(value)?;
-    let array_ref = terminal_ref.filter(|_| value.as_array().is_some());
-    if let Some(array_ref) = array_ref {
-        if !active_arrays.insert(array_ref) {
-            return Ok(());
-        }
+    let (value, _) = pdf.resolve_object_handle_to_terminal_ref(value)?;
+    if value.as_stream_dict().is_some() {
+        streams.push(value);
+        return Ok(());
     }
 
-    let result = (|| {
-        if value.as_stream_dict().is_some() {
-            streams.push(value);
+    if let Some(items) = value.as_array() {
+        // qpdf's arrayOrStreamToStreamArray accepts only the top-level array
+        // and ignores every array element that is not a stream
+        // (`QPDFObjectHandle.cc:1428-1469`). In particular, do not recurse
+        // into a nested array: that both diverges on self-references and
+        // fabricates content that qpdf does not pipe.
+        if !allow_array {
             return Ok(());
         }
-
-        if let Some(items) = value.as_array() {
-            for item in items {
-                collect_canonical_content_streams(pdf, &item, page_ref, streams, active_arrays)?;
-            }
-            return Ok(());
+        for item in items {
+            collect_canonical_content_streams(pdf, &item, page_ref, streams, false)?;
         }
-
-        Err(Error::Unsupported(format!(
-            "/Contents on page {page_ref} is not a stream or array"
-        )))
-    })();
-
-    if let Some(array_ref) = array_ref {
-        active_arrays.remove(&array_ref);
+        return Ok(());
     }
-    result
+
+    // A scalar /Contents value is still an invalid page-level shape, but a
+    // non-stream element inside the top-level array is qpdf's ignorable case.
+    if !allow_array {
+        return Ok(());
+    }
+    Err(Error::Unsupported(format!(
+        "/Contents on page {page_ref} is not a stream or array"
+    )))
 }
 
 fn resolve_objstm_type(pdf: &mut Pdf<std::io::Cursor<Vec<u8>>>, dict: &ObjectHandle) -> bool {

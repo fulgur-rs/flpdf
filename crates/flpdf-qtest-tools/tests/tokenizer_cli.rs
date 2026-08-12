@@ -312,6 +312,53 @@ fn build_pdf_with_page_contents_array_cycle() -> Vec<u8> {
     out
 }
 
+fn build_pdf_with_nested_page_contents_array() -> Vec<u8> {
+    let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
+    let mut offsets: Vec<u64> = vec![0];
+    let push_obj = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, body: &[u8]| {
+        let n = offsets.len();
+        offsets.push(out.len() as u64);
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    let push_stream = |out: &mut Vec<u8>, offsets: &mut Vec<u64>, content: &[u8]| {
+        let body = format!("<< /Length {} >>\nstream\n", content.len());
+        let mut stream = body.into_bytes();
+        stream.extend_from_slice(content);
+        stream.extend_from_slice(b"\nendstream");
+        push_obj(out, offsets, &stream);
+    };
+
+    push_obj(&mut out, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    push_obj(
+        &mut out,
+        &mut offsets,
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /MediaBox [0 0 1 1] >>",
+    );
+    push_obj(&mut out, &mut offsets, b"[5 0 R 6 0 R]");
+    push_obj(&mut out, &mut offsets, b"[7 0 R]");
+    push_stream(&mut out, &mut offsets, b"q\n");
+    push_stream(&mut out, &mut offsets, b"Q\n");
+
+    let xref_start = out.len() as u64;
+    let total = offsets.len();
+    out.extend_from_slice(format!("xref\n0 {total}\n0000000000 65535 f \n").as_bytes());
+    for offset in &offsets[1..] {
+        out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!("trailer\n<< /Size {total} /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n")
+            .as_bytes(),
+    );
+    out
+}
+
 fn build_pdf_with_duplicate_page_leaf() -> Vec<u8> {
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offsets: Vec<u64> = vec![0];
@@ -407,6 +454,39 @@ fn tokenizer_bounds_recursive_page_contents_collection() {
     assert!(
         !stdout.contains("word: q"),
         "a cyclic array must not fabricate a content stream: {stdout}"
+    );
+}
+
+#[test]
+fn tokenizer_skips_nested_page_content_arrays() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    fs::write(
+        dir.path().join("nested_contents.pdf"),
+        build_pdf_with_nested_page_contents_array(),
+    )
+    .expect("write nested_contents.pdf into tempdir");
+
+    let output = run(&["nested_contents.pdf"], dir.path());
+
+    assert!(
+        output.status.success(),
+        "nested /Contents arrays must not abort tokenization: status={:?}; stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let page = stdout
+        .split_once("--- BEGIN PAGE 1 ---")
+        .and_then(|(_, rest)| rest.split_once("--- END PAGE 1 ---"))
+        .map(|(page, _)| page)
+        .expect("page token section");
+    assert!(
+        page.contains("word: q"),
+        "the direct stream must remain in page contents: {page}"
+    );
+    assert!(
+        !page.contains("word: Q"),
+        "a nested array element must not be recursively flattened: {page}"
     );
 }
 
