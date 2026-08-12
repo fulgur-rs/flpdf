@@ -112,33 +112,40 @@ where
         return Ok(String::new());
     }
     let uncompress = stream_uses_flatedecode(&act_dict, actual_pdf)?;
-    let act_data = raw_stream_data(act)?;
-    let exp_data = raw_stream_data(exp)?;
-
-    let decoded_act: Vec<u8>;
-    let decoded_exp: Vec<u8>;
-    let (act_bytes, exp_bytes): (&[u8], &[u8]) = if uncompress {
+    if uncompress {
+        let act_data = raw_stream_data(act)?;
         let mut act_decode_dict = materialize_decode_dictionary(&act_dict, actual_pdf)?;
-        let mut exp_decode_dict = materialize_decode_dictionary(&exp_dict, expected_pdf)?;
         // The canonical stream route has already consumed decryption while
         // producing `raw_stream_data`. qpdf's `getStreamData` likewise does
         // not send that already-consumed Crypt stage through the codec chain
         // (`QPDF_Stream.cc:345-374`, `QPDF_encryption.cc:1041-1153`).
         remove_consumed_crypt_stages(&mut act_decode_dict);
+        let decoded_act = flpdf::filters::decode_stream_data(&act_decode_dict, act_data.as_ref())?;
+
+        let exp_data = raw_stream_data(exp)?;
+        let mut exp_decode_dict = materialize_decode_dictionary(&exp_dict, expected_pdf)?;
         remove_consumed_crypt_stages(&mut exp_decode_dict);
-        decoded_act = flpdf::filters::decode_stream_data(&act_decode_dict, act_data.as_ref())?;
-        decoded_exp = flpdf::filters::decode_stream_data(&exp_decode_dict, exp_data.as_ref())?;
-        (&decoded_act, &decoded_exp)
-    } else {
-        (act_data.as_ref(), exp_data.as_ref())
-    };
+        let decoded_exp = flpdf::filters::decode_stream_data(&exp_decode_dict, exp_data.as_ref())?;
+        return Ok(compare_stream_bytes(label, &decoded_act, &decoded_exp));
+    }
+
+    let act_data = raw_stream_data(act)?;
+    let exp_data = raw_stream_data(exp)?;
+    Ok(compare_stream_bytes(
+        label,
+        act_data.as_ref(),
+        exp_data.as_ref(),
+    ))
+}
+
+fn compare_stream_bytes(label: &str, act_bytes: &[u8], exp_bytes: &[u8]) -> String {
     if act_bytes.len() != exp_bytes.len() {
-        return Ok(format!("{label}: stream data size differs"));
+        return format!("{label}: stream data size differs");
     }
     if act_bytes != exp_bytes {
-        return Ok(format!("{label}: stream data differs"));
+        return format!("{label}: stream data differs");
     }
-    Ok(String::new())
+    String::new()
 }
 
 fn raw_stream_data(handle: &ObjectHandle) -> flpdf::Result<Rc<Vec<u8>>> {
@@ -1512,6 +1519,71 @@ mod tests {
         let a = handle_from_object(&mut a_pdf, &a);
         let e = handle_from_object(&mut e_pdf, &e);
         assert!(compare_objects("8 0", &a, &e, &mut a_pdf, &mut e_pdf).is_err());
+    }
+
+    #[test]
+    fn actual_decode_failure_precedes_expected_filter_resolution() {
+        let mut actual_pdf = dummy_pdf();
+        let mut actual_params = Dictionary::new();
+        actual_params.insert(b"Predictor", Object::Integer(1));
+        actual_pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(actual_params));
+        let actual = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (
+                    b"/DecodeParms".to_vec(),
+                    actual_pdf.get_object_handle(ObjectRef::new(1, 0)),
+                ),
+            ]),
+            Rc::new(b"\x00\x01\x02not zlib\xff\xff\xff".to_vec()),
+        );
+
+        let mut expected_pdf = dummy_pdf();
+        let chain_start = ObjectRef::new(11, 0);
+        let mut current = chain_start;
+        for number in 0..70 {
+            let next = ObjectRef::new(100 + number, 0);
+            expected_pdf.set_object(current, Object::Reference(next));
+            current = next;
+        }
+        expected_pdf.set_object(current, Object::Integer(1));
+        let mut expected_params = Dictionary::new();
+        expected_params.insert(b"Predictor", Object::Reference(chain_start));
+        expected_pdf.set_object(ObjectRef::new(1, 0), Object::Dictionary(expected_params));
+        let expected = ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![
+                (
+                    b"/Filter".to_vec(),
+                    ObjectHandle::name(b"FlateDecode".to_vec()),
+                ),
+                (
+                    b"/DecodeParms".to_vec(),
+                    expected_pdf.get_object_handle(ObjectRef::new(1, 0)),
+                ),
+            ]),
+            Rc::new(zlib(b"expected payload", Compression::default())),
+        );
+        let expected_before = expected_pdf.repair_diagnostics().entries().len();
+
+        assert!(
+            compare_objects(
+                "actual-first",
+                &actual,
+                &expected,
+                &mut actual_pdf,
+                &mut expected_pdf,
+            )
+            .is_err(),
+            "the actual corrupt payload must fail the comparison"
+        );
+        assert_eq!(
+            expected_pdf.repair_diagnostics().entries().len(),
+            expected_before,
+            "qpdf does not prepare the expected stream after an actual decode failure"
+        );
     }
 
     #[test]
