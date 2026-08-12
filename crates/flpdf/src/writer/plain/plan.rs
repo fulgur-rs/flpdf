@@ -895,7 +895,7 @@ mod tests {
         let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
 
         let IdPlan::Deterministic { info_suffix, .. } = plan.trailer.id else {
-            panic!("deterministic ID plan expected");
+            panic!("deterministic ID plan expected"); // cov:ignore: deterministic_id=true guarantees this plan variant
         };
         assert_eq!(info_suffix, b" live-info-replacement-768");
     }
