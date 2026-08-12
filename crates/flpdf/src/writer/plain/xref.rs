@@ -55,7 +55,8 @@ pub(crate) enum IdPlan {
 pub(crate) struct TrailerPlan {
     pub(crate) form: XrefForm,
     pub(crate) dictionary: Dictionary,
-    /// Canonical trailer entries serialized from the live ObjectHandle graph.
+    /// Canonical trailer entries from the live ObjectHandle graph. Keys remain
+    /// decoded until emission so qpdf's raw-name sort is preserved.
     /// The legacy dictionary remains for non-canonical writer routes and for
     /// writer-owned `/ID` materialization; canonical plain writes must not
     /// reconstruct their extension entries from that stale snapshot.
@@ -292,7 +293,8 @@ fn write_canonical_classic_trailer(
     bytes.extend_from_slice(b"<<");
     for (key, value) in entries {
         bytes.push(b' ');
-        bytes.extend_from_slice(&key);
+        bytes.push(b'/');
+        crate::object::write_name_escaped(bytes, key.strip_prefix(b"/").unwrap_or(&key));
         bytes.push(b' ');
         bytes.extend_from_slice(&value);
     }

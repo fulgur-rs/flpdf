@@ -423,10 +423,10 @@ fn canonical_trailer_entries(
             )?;
         }
 
-        let mut output_key = Vec::with_capacity(key.len());
-        output_key.push(b'/');
-        crate::object::write_name_escaped(&mut output_key, key.strip_prefix(b"/").unwrap_or(&key));
-        serialized.push((output_key, value_bytes));
+        // Keep qpdf's decoded key for the writer's raw-name sort. The xref
+        // emitter escapes it only after sorting, since escaping can change
+        // the bytewise order (e.g. `/ A` versus `/!A`).
+        serialized.push((key, value_bytes));
     }
     Ok(serialized)
 }
@@ -649,7 +649,7 @@ mod tests {
 
     use crate::object_handle::ObjectValue;
     use crate::writer::object_streams::ObjectStreamMode;
-    use crate::writer::plain::xref::{IdPlan, TrailerPlan};
+    use crate::writer::plain::xref::{append_xref_and_trailer, BodyLayout, IdPlan, TrailerPlan};
     use crate::writer::WriterOptions;
     use crate::{
         Dictionary, NewlineBeforeEndstream, ObjectHandle, ObjectRef, Pdf, PdfWriter, XrefForm,
@@ -874,6 +874,59 @@ mod tests {
         assert!(!text.contains("/Gone"));
         assert!(!text.contains("/Zero"));
         assert!(!text.contains("/Removed"));
+    }
+
+    #[test]
+    fn canonical_deterministic_id_uses_the_live_info_entry() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("no-stream-one-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        pdf.trailer_handle().replace_key(
+            b"/Info",
+            ObjectHandle::dictionary(vec![(
+                b"Title".to_vec(),
+                ObjectHandle::string(b"live-info-replacement-768".to_vec()),
+            )]),
+        );
+        let mut options = write_options(ObjectStreamMode::Disable);
+        options.deterministic_id = true;
+
+        let plan = PlainWritePlan::build(&mut pdf, &options).unwrap();
+
+        let IdPlan::Deterministic { info_suffix, .. } = plan.trailer.id else {
+            panic!("deterministic ID plan expected");
+        };
+        assert_eq!(info_suffix, b" live-info-replacement-768");
+    }
+
+    #[test]
+    fn canonical_trailer_sorts_decoded_names_before_escaping_them() {
+        let mut pdf = Pdf::open(std::io::BufReader::new(
+            std::fs::File::open(fixture_path("no-stream-one-page.pdf")).unwrap(),
+        ))
+        .unwrap();
+        let trailer = pdf.trailer_handle();
+        trailer.remove_key(b"/Info");
+        trailer.replace_key(b"/ A", ObjectHandle::integer(1));
+        trailer.replace_key(b"/!A", ObjectHandle::integer(2));
+
+        let plan =
+            PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
+        let mut bytes = b"BODY".to_vec();
+        let mut layout = BodyLayout::default();
+        layout
+            .uncompressed
+            .insert(plan.root.number, (plan.root.generation, 0));
+        append_xref_and_trailer(&mut bytes, &layout, &plan.trailer).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        let escaped_space = text.find("/#20A").expect("escaped space-name key");
+        let exclamation = text.find("/!A").expect("exclamation-name key");
+
+        assert!(
+            escaped_space < exclamation,
+            "decoded key order must precede PDF name escaping: {text}"
+        );
     }
 
     #[test]

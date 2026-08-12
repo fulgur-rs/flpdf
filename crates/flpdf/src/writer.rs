@@ -1854,40 +1854,28 @@ pub(crate) fn generate_id_array(source_id: Option<&Object>, static_id: bool) -> 
 /// qpdf (`QPDFWriter::generateID`) appends, for every `/Info` entry whose value
 /// is a string, `" "` followed by the string's *decoded* bytes, iterating keys
 /// in sorted order (qpdf's `getKeys()` returns names sorted). Non-string
-/// entries are skipped. `/Info`, and each value, may be an indirect reference,
-/// so both are resolved (PDF allows any value to be indirect, ISO 32000-1
-/// §7.3.10). The returned bytes are appended after `" QPDF "` to form the seed.
+/// entries are skipped. The live `/Info` handle and each value may be an
+/// indirect reference, so both are resolved (PDF allows any value to be
+/// indirect, ISO 32000-1 §7.3.10). The returned bytes are appended after
+/// `" QPDF "` to form the seed.
 pub(crate) fn deterministic_id_info_suffix<R: Read + Seek>(pdf: &mut Pdf<R>) -> Vec<u8> {
-    let info_obj = match pdf.trailer().get("Info").cloned() {
-        Some(info) => info,
-        None => return Vec::new(),
+    let trailer = pdf.trailer_handle();
+    let info = match trailer.try_get_key(b"/Info") {
+        Ok(info) => info,
+        Err(_) => return Vec::new(), // cov:ignore: defensive resolver-error fallback
     };
-    let info = match info_obj {
-        Object::Reference(reference) => match pdf.resolve(reference) {
-            Ok(resolved) => resolved,
-            // resolve yields Ok(Null) for unknown refs and only errors on
-            // I/O/parse failure, unreachable for an in-memory document.
-            Err(_) => return Vec::new(), // cov:ignore: defensive resolve-error fallback
-        },
-        other => other,
+    let dict = match info.try_as_dictionary() {
+        Ok(Some(dict)) => dict,
+        Ok(None) | Err(_) => return Vec::new(), // cov:ignore: defensive resolver-error fallback
     };
-    let Object::Dictionary(dict) = info else {
-        return Vec::new();
-    };
-    // `Dictionary::iter` already yields names in lexicographic (sorted) order,
-    // matching qpdf's `getKeys()`.
+    // `ObjectHandle::try_as_dictionary` returns qpdf's lexicographically sorted
+    // decoded names, matching `QPDFObjectHandle::getKeys()`.
     let mut suffix = Vec::new();
-    for (_key, value) in dict.iter() {
-        let resolved = match value {
-            Object::Reference(reference) => match pdf.resolve(*reference) {
-                Ok(resolved) => resolved,
-                // resolve yields Ok(Null) for unknown refs and only errors on
-                // I/O/parse failure, unreachable for an in-memory document.
-                Err(_) => continue, // cov:ignore: defensive resolve-error fallback
-            },
-            other => other.clone(),
-        };
-        if let Object::String(bytes) = resolved {
+    for (_key, value) in dict {
+        if value.try_dereference().is_err() {
+            continue; // cov:ignore: defensive resolver-error fallback
+        }
+        if let Some(bytes) = value.as_string() {
             suffix.push(b' ');
             suffix.extend_from_slice(&bytes);
         }
@@ -2912,11 +2900,11 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
     // `encrypting` was computed once at the top (the force<1.5 gate consults it);
     // encrypt / copy_encryption are never mutated, so it is still authoritative.
 
-    // Capture qpdf's deterministic-`/ID` seed inputs from the ORIGINAL trailer
-    // before the emission loop borrows `pdf`: the permanent identifier `/ID[0]`
-    // (preserved when well-formed) and the `/Info`-derived seed suffix. qpdf
-    // reads these from the source trailer (`m->pdf.getTrailer()`), not the
-    // remapped output trailer, so both are gathered here while `pdf` is free.
+    // Capture qpdf's deterministic-`/ID` seed inputs from the live source
+    // trailer before the emission loop borrows `pdf`: the permanent identifier
+    // `/ID[0]` (preserved when well-formed) and the `/Info`-derived seed suffix.
+    // qpdf reads these from `m->pdf.getTrailer()`, not the remapped output
+    // trailer, so both are gathered here while `pdf` is free.
     let (det_id_source_id0, det_id_info_suffix): (Option<Vec<u8>>, Vec<u8>) =
         if options.deterministic_id {
             let id0 = source_permanent_id(pdf.trailer());
