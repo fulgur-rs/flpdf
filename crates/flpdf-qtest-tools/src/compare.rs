@@ -464,8 +464,13 @@ fn resolve_compare_children<R: Read + Seek>(
     };
     seen.push(handle.clone());
     for child in entries.into_values() {
+        let child_is_direct = child.is_direct();
         let terminal = pdf.resolve_object_handle_to_terminal(&child)?;
-        if terminal.as_dictionary().is_some() {
+        if child_is_direct && terminal.as_dictionary().is_some() {
+            // qpdf's dictionary unparse resolves an immediate child for its
+            // null-suppression decision, but an indirect dictionary child is
+            // serialized as `N G R` and its descendants remain opaque to the
+            // compare-for-test walk. Recurse only through direct containers.
             resolve_compare_children(&terminal, pdf, seen, depth + 1)?;
         }
     }
@@ -760,6 +765,57 @@ mod tests {
             compare_objects("stream", &actual, &expected, &mut a_pdf, &mut e_pdf,)
                 .expect("stream dictionary null suppression must succeed"),
             ""
+        );
+    }
+
+    #[test]
+    fn compare_does_not_descend_into_an_indirect_dictionary_child() {
+        fn build_pdf_and_nested_handle(pdf: &mut Pdf<Cursor<Vec<u8>>>) -> ObjectHandle {
+            let nested_ref = ObjectRef::new(10, 0);
+            let chain_start = ObjectRef::new(11, 0);
+            let mut nested = Dictionary::new();
+            nested.insert(b"Bad", Object::Reference(chain_start));
+            pdf.set_object(nested_ref, Object::Dictionary(nested));
+
+            let mut current = chain_start;
+            for number in 0..70 {
+                let next = ObjectRef::new(100 + number, 0);
+                pdf.set_object(current, Object::Reference(next));
+                current = next;
+            }
+            pdf.set_object(current, Object::Integer(1));
+
+            let nested_handle = pdf.get_object_handle(nested_ref);
+            ObjectHandle::dictionary(vec![(b"/Nested".to_vec(), nested_handle)])
+        }
+
+        let mut actual_pdf = dummy_pdf();
+        let mut expected_pdf = dummy_pdf();
+        let actual = build_pdf_and_nested_handle(&mut actual_pdf);
+        let expected = build_pdf_and_nested_handle(&mut expected_pdf);
+        let actual_before = actual_pdf.repair_diagnostics().entries().len();
+        let expected_before = expected_pdf.repair_diagnostics().entries().len();
+
+        assert_eq!(
+            compare_objects(
+                "nested",
+                &actual,
+                &expected,
+                &mut actual_pdf,
+                &mut expected_pdf,
+            )
+            .expect("an indirect child dictionary is still comparable"),
+            ""
+        );
+        assert_eq!(
+            actual_pdf.repair_diagnostics().entries().len(),
+            actual_before,
+            "qpdf compares the indirect child as N G R without resolving its descendants"
+        );
+        assert_eq!(
+            expected_pdf.repair_diagnostics().entries().len(),
+            expected_before,
+            "qpdf compares the indirect child as N G R without resolving its descendants"
         );
     }
 
