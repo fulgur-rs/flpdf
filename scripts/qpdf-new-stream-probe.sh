@@ -21,7 +21,7 @@ if [[ -n "$(git -C "${qpdf_source}" status --porcelain --untracked-files=no)" ]]
   exit 1
 fi
 
-build_dir="$(mktemp -d -t flpdf-qpdf-new-stream-XXXXXXXX)"
+build_dir="$(TMPDIR=/tmp mktemp -d -t flpdf-qpdf-new-stream-XXXXXXXX)"
 build_dir="$(realpath -e -- "${build_dir}")"
 case "${build_dir}" in
   /tmp/flpdf-qpdf-new-stream-*) ;;
@@ -57,7 +57,8 @@ c++ -std=c++17 \
   -o "${probe_binary}"
 
 probe_lib_dir="$(cd "${build_dir}/libqpdf" && pwd -P)"
-loader_output="$(LD_LIBRARY_PATH="${probe_lib_dir}" ldd "${probe_binary}")"
+probe_library_path="${probe_lib_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+loader_output="$(LD_LIBRARY_PATH="${probe_library_path}" ldd "${probe_binary}")"
 resolved_libqpdf="$(awk '$1 ~ /^libqpdf\.so/ && $2 == "=>" { print $3; exit }' <<<"${loader_output}")"
 resolved_libqpdf="$(realpath -e -- "${resolved_libqpdf}")"
 case "${resolved_libqpdf}" in
@@ -68,7 +69,7 @@ case "${resolved_libqpdf}" in
     ;;
 esac
 
-LD_LIBRARY_PATH="${probe_lib_dir}" "${probe_binary}"
+LD_LIBRARY_PATH="${probe_library_path}" "${probe_binary}"
 
 actual_commit="$(git -C "${qpdf_source}" rev-parse --verify HEAD)"
 if [[ "${actual_commit}" != "${qpdf_commit}" || -n "$(git -C "${qpdf_source}" status --porcelain --untracked-files=no)" ]]; then

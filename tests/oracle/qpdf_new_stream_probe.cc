@@ -50,7 +50,14 @@ int main()
         auto with_data = pdf.newStream(data);
         require(with_data.isIndirect(), "buffer newStream did not create an indirect object");
         require(with_data.getDict().getKey("/Length").getIntValue() == 3, "buffer length differs");
-        require(with_data.getRawStreamData()->getSize() == 3, "buffer data size differs");
+        auto with_data_raw = with_data.getRawStreamData();
+        require(with_data_raw->getSize() == 3, "buffer data size differs");
+        require(
+            std::equal(
+                with_data_raw->getBuffer(),
+                with_data_raw->getBuffer() + with_data_raw->getSize(),
+                data->getBuffer()),
+            "buffer payload differs");
 
         auto empty_data = pdf.newStream(std::make_shared<Buffer>());
         require(empty_data.isIndirect(), "empty buffer newStream is not indirect");
