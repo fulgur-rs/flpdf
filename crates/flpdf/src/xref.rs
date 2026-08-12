@@ -1384,6 +1384,17 @@ fn merge_recovered_qpdf_state(
     recovered
         .deleted_objects
         .extend(accumulated.deleted_objects);
+    // qpdf `reconstruct_xref` (`QPDF.cc:516-575`) removes existing type-1
+    // entries before scanning, and `insertReconstructedXrefEntry`
+    // (`QPDF.cc:1194-1209`) refuses object numbers in `deleted_objects`.
+    // The accumulated state represents the successfully parsed xref prefix;
+    // apply its free-row tombstones to the line-scan snapshot before exposing
+    // the merged table for enumeration or bootstrap reads.
+    let deleted_objects = recovered.deleted_objects.clone();
+    recovered
+        .loaded
+        .entries
+        .retain(|object_ref, _| !deleted_objects.contains(&object_ref.number));
     recovered
         .trailer_references
         .extend(accumulated.trailer_references);
@@ -4329,12 +4340,9 @@ mod tests {
             }),
             "reconstruction must replace the stale offset for the indirect /Prev object"
         );
-        assert_eq!(
-            loaded.entries.get(&ObjectRef::new(5, 0)),
-            Some(&XrefEntry::Uncompressed {
-                offset: old_only_offset
-            }),
-            "reconstruction must retain objects omitted by the active xref section"
+        assert!(
+            loaded.entries.get(&ObjectRef::new(5, 0)).is_none(),
+            "reconstruction must preserve the active free row's tombstone"
         );
         assert_eq!(
             loaded
