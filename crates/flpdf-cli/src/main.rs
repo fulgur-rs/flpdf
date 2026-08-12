@@ -2503,7 +2503,7 @@ fn run_check(
         if is_weak_crypto_advisory(diagnostic) {
             continue;
         }
-        let location = diagnostic_location(&input, diagnostic.offset);
+        let location = check_diagnostic_location(&input, diagnostic);
         match diagnostic.severity {
             Severity::Warning => {
                 let separator = if diagnostic.message.starts_with("(object ") {
@@ -5520,6 +5520,19 @@ fn diagnostic_location(input: &Path, offset: Option<u64>) -> String {
     }
 }
 
+fn check_diagnostic_location(input: &Path, diagnostic: &flpdf::Diagnostic) -> String {
+    // Object-prefixed messages already carry qpdf's `(object N G, offset M)`
+    // context. Passing their structured offset to `diagnostic_location` would
+    // duplicate it as `file (offset M) (object N G, offset M)`. qpdf's
+    // `damagedPDF(input, offset, message)` keeps the object context in the
+    // message while the input path remains the sole outer location.
+    if diagnostic.message.starts_with("(object ") {
+        diagnostic_location(input, None)
+    } else {
+        diagnostic_location(input, diagnostic.offset)
+    }
+}
+
 /// Finish a successful operation that accumulated lazy object-recovery
 /// warnings. Any requested output has already been emitted before this is
 /// called; qpdf likewise leaves the output in place and reports exit 3.
@@ -6087,6 +6100,22 @@ mod tests {
         );
 
         assert!(matches!(outcome, Ok(EncryptionProbe::EncryptedAuthFailed)));
+    }
+
+    #[test]
+    fn check_diagnostic_location_does_not_duplicate_object_offset() {
+        let object_warning =
+            flpdf::Diagnostic::warning("(object 5 0, offset 232): expected endobj", Some(232));
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &object_warning),
+            "input.pdf"
+        );
+
+        let ordinary_warning = flpdf::Diagnostic::warning("xref warning", Some(12));
+        assert_eq!(
+            check_diagnostic_location(Path::new("input.pdf"), &ordinary_warning),
+            "input.pdf (offset 12)"
+        );
     }
 
     #[test]

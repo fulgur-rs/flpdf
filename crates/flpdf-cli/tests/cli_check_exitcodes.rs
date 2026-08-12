@@ -528,6 +528,12 @@ fn check_object_warning_uses_qpdf_space_before_object_context() {
                 "WARNING: {input}: (object 5 0, offset 232): expected endobj"
             ))
             .not(),
+        )
+        .stderr(
+            predicate::str::contains(format!(
+                "WARNING: {input} (offset 232) (object 5 0, offset 232): expected endobj"
+            ))
+            .not(),
         );
 }
 
