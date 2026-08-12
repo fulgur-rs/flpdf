@@ -753,9 +753,10 @@ fn decode_params_from_consuming_handle(
         }
         let value = params.try_get_key(&key)?;
         let keeps_name = keeps_crypt_name_payload(logical_key, crypt_stage);
+        let consumes_integer = consumes_integer_decode_param_key(logical_key, filter_name);
         retained.push((
             logical_key.to_vec(),
-            param_value_from_handle(&value, keeps_name)?,
+            param_value_from_handle(&value, keeps_name, consumes_integer)?,
         ));
     }
     Ok(DecodeParams::Present(retained))
@@ -784,10 +785,29 @@ fn decode_params_from_entries(
         .filter(|(key, _)| retains_decode_param_key(legacy_dictionary_key(key), crypt_stage))
         .map(|(key, value)| {
             let logical_key = legacy_dictionary_key(key);
-            Ok((logical_key.to_vec(), param_value_without_resolving(value)?))
+            (logical_key.to_vec(), param_value_without_resolving(value))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect();
     Ok(DecodeParams::Present(retained))
+}
+
+/// Does qpdf convert this retained key through `getIntValueAsInt`?
+///
+/// `SF_FlateLzwDecode::setDecodeParms` does so for the four geometry keys and
+/// for `/EarlyChange` only in its LZW instance
+/// (`libqpdf/SF_FlateLzwDecode.cc:34-57`). `SF_Crypt` walks every key but
+/// performs only its `/Type` and `/Name` checks
+/// (`libqpdf/QPDF_Stream.cc:33-50`), so an integer under an unknown key must
+/// not produce a saturation warning even though the key is retained.
+fn consumes_integer_decode_param_key(key: &[u8], filter_name: &[u8]) -> bool {
+    if is_crypt_filter(filter_name) {
+        return false;
+    }
+    match key {
+        b"Predictor" | b"Columns" | b"Colors" | b"BitsPerComponent" => true,
+        b"EarlyChange" => normalize_filter_name(filter_name) == b"LZWDecode",
+        _ => false,
+    }
 }
 
 /// Classify one `/DecodeParms` value, dereferencing it as qpdf's `isInteger`
@@ -799,10 +819,20 @@ fn decode_params_from_entries(
 /// which are retained for their names alone — a name reduces to
 /// [`ParamValue::Other`], which no consumer can distinguish from `Name` — see
 /// [`ParamValue`]. `try_as_name` still runs, so the dereference qpdf performs
-/// is unchanged; only the payload is dropped.
-fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<ParamValue> {
+/// is unchanged; only the payload is dropped. `consumes_integer` is the
+/// key-level qpdf boundary for `getIntValueAsInt` and its saturation warning.
+fn param_value_from_handle(
+    value: &ObjectHandle,
+    keeps_name: bool,
+    consumes_integer: bool,
+) -> Result<ParamValue> {
     if let Some(int) = value.try_as_integer()? {
-        return Ok(ParamValue::Int(clamp_handle_value_to_i32(int, value)?));
+        let int = if consumes_integer {
+            clamp_handle_value_to_i32(int, value)?
+        } else {
+            clamp_to_i32(int)
+        };
+        return Ok(ParamValue::Int(int));
     }
     Ok(match value.try_as_name()? {
         Some(name) if keeps_name => ParamValue::Name(name),
@@ -842,10 +872,10 @@ fn param_value_from_handle(value: &ObjectHandle, keeps_name: bool) -> Result<Par
 /// single [`ParamValue`]. What must not vary is `Absent` vs `Present`, and
 /// that is decided upstream by the two unconditional calls on the parameter
 /// handle itself.
-fn param_value_without_resolving(value: &ObjectHandle) -> Result<ParamValue> {
+fn param_value_without_resolving(value: &ObjectHandle) -> ParamValue {
     match value.as_integer() {
-        Some(int) => Ok(ParamValue::Int(clamp_handle_value_to_i32(int, value)?)),
-        None => Ok(ParamValue::Other),
+        Some(int) => ParamValue::Int(clamp_to_i32(int)),
+        None => ParamValue::Other,
     }
 }
 
@@ -2362,14 +2392,15 @@ pub(crate) fn encode_run_length(data: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        decode_filter_specs_from_handle, decode_filter_specs_from_object,
-        decode_filter_specs_from_object_with_resolver, decode_flate, decode_flate_chunks,
-        decode_params_from_handle, decode_params_from_object, encode_flate, encode_run_length,
-        ignore_codec_warning, ignore_warning, keeps_crypt_name_payload, normalize_filter_name,
-        param_value_from_handle, stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter,
-        CryptStreamFilter, DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle,
-        OutputBuffer, ParamValue, Pipeline, PipelineError, PipelineResult, RunLengthStreamFilter,
-        StreamFilter, DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
+        consumes_integer_decode_param_key, decode_filter_specs_from_handle,
+        decode_filter_specs_from_object, decode_filter_specs_from_object_with_resolver,
+        decode_flate, decode_flate_chunks, decode_params_from_handle, decode_params_from_object,
+        encode_flate, encode_run_length, ignore_codec_warning, ignore_warning,
+        keeps_crypt_name_payload, normalize_filter_name, param_value_from_handle,
+        stream_filter_for, Ascii85StreamFilter, AsciiHexStreamFilter, CryptStreamFilter,
+        DecodeParams, FilterSpec, FlateLzwStreamFilter, ObjectHandle, OutputBuffer, ParamValue,
+        Pipeline, PipelineError, PipelineResult, RunLengthStreamFilter, StreamFilter,
+        DECODE_OUTPUT_LIMIT_PREFIX, RETAINED_DECODE_PARAM_KEYS,
     };
     use crate::object_handle::identity_tests::{
         logged_resolver_bearing_handle, resolver_bearing_handle,
@@ -6143,26 +6174,97 @@ pub(crate) mod tests {
         for (value, expected, warning) in cases {
             let (handle, recorder) = handle_resolving(ObjectValue::Integer(value));
 
-            assert_eq!(param_value_from_handle(&handle, false).unwrap(), expected);
+            assert_eq!(
+                param_value_from_handle(&handle, false, true).unwrap(),
+                expected
+            );
             assert_eq!(warnings(&recorder), [warning]);
         }
     }
 
     #[test]
-    fn snapshot_decode_params_warn_after_an_integer_was_already_resolved() {
-        let value = i64::from(i32::MAX) + 1;
-        let (child, recorder) = handle_resolving(ObjectValue::Integer(value));
-        assert_eq!(child.try_as_integer().unwrap(), Some(value));
+    fn snapshot_decode_params_saturates_without_warning_for_non_consuming_filters() {
+        for filter_name in [
+            b"ASCIIHexDecode".as_slice(),
+            b"ASCII85Decode".as_slice(),
+            b"RunLengthDecode".as_slice(),
+        ] {
+            let value = i64::from(i32::MAX) + 1;
+            let (child, recorder) = handle_resolving(ObjectValue::Integer(value));
+            assert_eq!(child.try_as_integer().unwrap(), Some(value));
 
-        let params = ObjectHandle::dictionary(vec![(b"/Columns".to_vec(), child)]);
+            let params = ObjectHandle::dictionary(vec![(b"/Columns".to_vec(), child)]);
+            assert_eq!(
+                decode_params_from_handle(&params, filter_name).unwrap(),
+                DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(i32::MAX)),])
+            );
+            assert!(
+                warnings(&recorder).is_empty(),
+                "{filter_name:?} emitted a saturation warning"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_decode_params_saturate_integer_values() {
+        let params = ObjectHandle::dictionary(vec![(
+            b"/Columns".to_vec(),
+            ObjectHandle::integer(i64::from(i32::MIN) - 1),
+        )]);
+
         assert_eq!(
             decode_params_from_handle(&params, b"ASCIIHexDecode").unwrap(),
-            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(i32::MAX)),])
+            DecodeParams::Present(vec![(b"Columns".to_vec(), ParamValue::Int(i32::MIN)),])
         );
+    }
+
+    #[test]
+    fn consuming_decode_params_warn_only_for_integer_consuming_keys() {
+        let cases = [
+            (b"FlateDecode".as_slice(), b"Columns".as_slice(), true),
+            (b"LZWDecode".as_slice(), b"EarlyChange".as_slice(), true),
+            (b"FlateDecode".as_slice(), b"EarlyChange".as_slice(), false),
+        ];
+
+        for (filter_name, key, warns) in cases {
+            let value = i64::from(i32::MAX) + 1;
+            let (child, recorder) = handle_resolving(ObjectValue::Integer(value));
+            let params = ObjectHandle::dictionary(vec![(key.to_vec(), child)]);
+
+            assert_eq!(
+                decode_params_from_handle(&params, filter_name).unwrap(),
+                DecodeParams::Present(vec![(key.to_vec(), ParamValue::Int(i32::MAX)),])
+            );
+            if warns {
+                assert_eq!(
+                    warnings(&recorder),
+                    ["object 3 0: requested value of integer is too big; returning INT_MAX"]
+                );
+            } else {
+                assert!(warnings(&recorder).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn crypt_decode_params_do_not_warn_for_unknown_integer_keys() {
+        let value = i64::from(i32::MAX) + 1;
+        let (child, recorder) = handle_resolving(ObjectValue::Integer(value));
+        let params = ObjectHandle::dictionary(vec![(b"/Unknown".to_vec(), child)]);
+
         assert_eq!(
-            warnings(&recorder),
-            ["object 3 0: requested value of integer is too big; returning INT_MAX"]
+            decode_params_from_handle(&params, b"Crypt").unwrap(),
+            DecodeParams::Present(vec![(b"Unknown".to_vec(), ParamValue::Int(i32::MAX))])
         );
+        assert!(warnings(&recorder).is_empty());
+    }
+
+    #[test]
+    fn unrecognized_decode_param_keys_do_not_consume_integers() {
+        assert!(!consumes_integer_decode_param_key(
+            b"Unknown",
+            b"FlateDecode"
+        ));
     }
 
     #[test]
@@ -6170,7 +6272,7 @@ pub(crate) mod tests {
         let (handle, recorder) = handle_resolving(ObjectValue::Name(b"Identity".to_vec()));
 
         assert_eq!(
-            param_value_from_handle(&handle, true).unwrap(),
+            param_value_from_handle(&handle, true, false).unwrap(),
             ParamValue::Name(b"Identity".to_vec())
         );
         assert!(warnings(&recorder).is_empty());
