@@ -605,6 +605,24 @@ mod tests {
     }
 
     #[test]
+    fn from_specs_attributes_parse_failures_to_the_input() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let input = directory.path().join("malformed.pdf");
+        std::fs::write(&input, b"not a PDF").expect("write malformed fixture");
+
+        let error = CombinedPlan::from_specs(vec![InputSpec::new(
+            &input,
+            None,
+            PageRange::parse("").expect("all pages range"),
+        )])
+        .expect_err("a malformed input must fail to open");
+
+        assert!(matches!(error, Error::Unsupported(message)
+            if message.contains("input 0")
+                && message.contains("malformed.pdf")));
+    }
+
+    #[test]
     fn from_specs_preserves_encrypted_authentication_after_open_diagnostics() {
         let mut bytes = encrypted_v1_owner_password_fixture();
         let size = bytes
