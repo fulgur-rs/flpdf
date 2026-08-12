@@ -226,7 +226,7 @@ pub use name_tree_dests::{
 pub use nntree::{NameTree, NameTreeCursor, NumberTree, NumberTreeCursor};
 pub use object::{Dictionary, Object, ObjectRef, ParseObjectRefError, Stream};
 pub use object_copy::copy_objects;
-pub use object_handle::ObjectHandle;
+pub use object_handle::{ObjectHandle, StreamDataProvider};
 pub use objr_obj_annot_p::drop_objr_obj_annot_dangling_p;
 pub use outline::{OutlineId, OutlineItem, OutlineTree, OutlineTreeIter};
 pub use outline_dest_remap::{remap_outline_and_dests, remap_outline_and_dests_with_max_depth};

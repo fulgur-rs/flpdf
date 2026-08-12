@@ -2693,6 +2693,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 stream_dict: dict,
                 stream_data: None,
                 stream_length: length,
+                stream_provider: None,
             },
             i64::try_from(stream_offset).unwrap_or(i64::MAX),
         ))
@@ -6768,6 +6769,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         let member = resolver.get_object_handle(member_ref);
@@ -6869,6 +6871,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -6929,6 +6932,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -6991,6 +6995,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         assert!(matches!(
@@ -7051,6 +7056,7 @@ mod tests {
             stream_dict,
             stream_data: None,
             stream_length: stream_data.len(),
+            stream_provider: None,
         });
         stream.set_parsed_offset_if_unset(1);
 
@@ -7103,6 +7109,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -7169,6 +7176,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         let error = resolver
@@ -7261,6 +7269,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -7317,6 +7326,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -7392,6 +7402,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         let requested = resolver.get_object_handle(requested_ref);
@@ -7457,6 +7468,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -7515,6 +7527,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         assert!(matches!(
@@ -7743,6 +7756,7 @@ mod tests {
                 stream_dict,
                 stream_data: Some(Rc::new(stream_data)),
                 stream_length: 0,
+                stream_provider: None,
             });
 
         resolver
@@ -7845,6 +7859,7 @@ mod tests {
             stream_dict,
             stream_data: None,
             stream_length: ciphertext.len(),
+            stream_provider: None,
         });
         stream.set_parsed_offset_if_unset(1);
 
@@ -8280,6 +8295,7 @@ mod tests {
             stream_dict,
             stream_data: None,
             stream_length: 1_000,
+            stream_provider: None,
         });
 
         let error = stream

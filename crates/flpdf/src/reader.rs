@@ -1326,6 +1326,7 @@ impl<R: Read + Seek> Pdf<R> {
                     .direct_object_handle(ObjectValue::Dictionary(stream_dict)),
                 stream_data: Some(Rc::new(stream.data.clone())),
                 stream_length: 0,
+                stream_provider: None,
             });
         }
         self.lift_bounded_with_content_tokens(object, 0, crate::parser::MAX_PARSE_DEPTH)
@@ -1350,6 +1351,7 @@ impl<R: Read + Seek> Pdf<R> {
             stream_dict: existing_dict,
             stream_data: Some(Rc::new(stream.data.clone())),
             stream_length: 0,
+            stream_provider: None,
         })
     }
 
@@ -1693,6 +1695,7 @@ impl<R: Read + Seek> Pdf<R> {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
             stream_length: 0,
+            stream_provider: None,
         });
         stream.set_parsed_offset_if_unset(0);
         self.make_indirect_from_object_handle(stream)
@@ -2053,6 +2056,7 @@ impl<R: Read + Seek> Pdf<R> {
             // without copying the legacy memo's payload.
             stream_data: Some(Rc::new(stream.data)),
             stream_length: 0,
+            stream_provider: None,
         })
     }
 
@@ -2457,6 +2461,7 @@ impl<R: Read + Seek> Pdf<R> {
                             .direct_object_handle(ObjectValue::Dictionary(stream_dict)),
                         stream_data: Some(Rc::new(stream.data.clone())),
                         stream_length: 0,
+                        stream_provider: None,
                     }
                 }
                 // A bare top-level reference never comes from a file/ObjStm
@@ -4843,6 +4848,7 @@ mod tests {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: Some(Rc::new(Vec::new())),
             stream_length: 0,
+            stream_provider: None,
         };
 
         decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
@@ -5002,6 +5008,7 @@ mod tests {
                 b"stream payload, untouched by string decryption".to_vec(),
             )),
             stream_length: 0,
+            stream_provider: None,
         };
 
         decrypt_object_value_strings(object_ref, &mut value, &mut encryption)
@@ -5052,6 +5059,7 @@ mod tests {
             stream_dict,
             stream_data: Some(Rc::new(b"payload".to_vec())),
             stream_length: 0,
+            stream_provider: None,
         });
         let mut value = ObjectValue::Array(vec![stream_child]);
 
@@ -5159,6 +5167,7 @@ mod tests {
             )]),
             stream_data: Some(Rc::new(Vec::new())),
             stream_length: 0,
+            stream_provider: None,
         };
         decrypt_object_value_strings(object_ref, &mut accepted, &mut encryption).expect(
             "a stream dictionary entry nested exactly MAX_INLINE_DEPTH levels deep, matching \
@@ -5172,6 +5181,7 @@ mod tests {
             )]),
             stream_data: Some(Rc::new(Vec::new())),
             stream_length: 0,
+            stream_provider: None,
         };
         let err = decrypt_object_value_strings(object_ref, &mut rejected, &mut encryption)
             .expect_err("one level past the legacy decryptor's own boundary must still error");
@@ -5664,6 +5674,7 @@ mod tests {
             )]),
             stream_data: Some(Rc::new(b"old".to_vec())),
             stream_length: 3,
+            stream_provider: None,
         });
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let promoted = pdf
@@ -7122,6 +7133,7 @@ mod tests {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: Some(Rc::new(stream_data.clone())),
             stream_length: stream_data.len(),
+            stream_provider: None,
         });
 
         let legacy = Object::Stream(Stream::new(Dictionary::new(), b"legacy bytes".to_vec()));

@@ -4045,6 +4045,7 @@ mod tests {
             stream_dict: ObjectHandle::dictionary(Vec::new()),
             stream_data: None,
             stream_length: 0,
+            stream_provider: None,
         });
         let mut tree = NNTree::<NameKey>::new(Object::Null, false);
         tree.canonical_root = Some(stream);

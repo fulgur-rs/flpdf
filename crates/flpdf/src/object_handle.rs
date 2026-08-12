@@ -74,6 +74,130 @@ pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
 /// qpdf's `qpdf_ef_normalize` bit in `QPDF_Stream::pipeStreamData`.
 pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
+const STREAM_DATA_PROVIDER_DEFAULT_ERROR: &str =
+    "you must override provideStreamData -- see QPDFObjectHandle.hh";
+
+/// Deferred stream-data source corresponding to qpdf's
+/// `QPDFObjectHandle::StreamDataProvider`
+/// (`include/qpdf/QPDFObjectHandle.hh:68-127`).
+///
+/// Registration retains this trait object and does not invoke it. The source
+/// is called only when the stream is piped, and every invocation for one
+/// stream must produce the same bytes. Providers must not mutate PDF objects
+/// while producing data because qpdf may invoke them more than once during a
+/// linearized write.
+///
+/// Rust uses distinct method names for qpdf's overloaded forms. The
+/// `ObjectRef` methods delegate to the numeric identity methods by default,
+/// matching qpdf's `QPDFObjGen` overload delegation. A provider that supports
+/// the retry-aware form must return `true` from [`Self::supports_retry`].
+pub trait StreamDataProvider {
+    /// Whether the retry-aware success-returning callback should be used.
+    fn supports_retry(&self) -> bool {
+        false
+    }
+
+    /// Legacy provider form receiving the complete stream identity.
+    fn provide_stream_data(
+        &self,
+        object_ref: ObjectRef,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        self.provide_stream_data_by_id(object_ref.number, object_ref.generation, pipeline)
+    }
+
+    /// Legacy provider form receiving numeric object identity.
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        _pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        Err(Error::Internal(
+            STREAM_DATA_PROVIDER_DEFAULT_ERROR.to_owned(),
+        ))
+    }
+
+    /// Retry-aware provider form receiving the complete stream identity.
+    fn provide_stream_data_with_retry(
+        &self,
+        object_ref: ObjectRef,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        self.provide_stream_data_with_retry_by_id(
+            object_ref.number,
+            object_ref.generation,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
+    }
+
+    /// Retry-aware provider form receiving numeric object identity.
+    fn provide_stream_data_with_retry_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        _pipeline: &mut dyn Pipeline,
+        _suppress_warnings: bool,
+        _will_retry: bool,
+    ) -> Result<bool> {
+        Err(Error::Internal(
+            STREAM_DATA_PROVIDER_DEFAULT_ERROR.to_owned(),
+        ))
+    }
+}
+
+impl std::fmt::Debug for dyn StreamDataProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StreamDataProvider(..)")
+    }
+}
+
+struct CallbackProvider<F> {
+    callback: F,
+}
+
+impl<F> StreamDataProvider for CallbackProvider<F>
+where
+    F: Fn(&mut dyn Pipeline) -> Result<()> + 'static,
+{
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+    ) -> Result<()> {
+        (self.callback)(pipeline)
+    }
+}
+
+struct RetryCallbackProvider<F> {
+    callback: F,
+}
+
+impl<F> StreamDataProvider for RetryCallbackProvider<F>
+where
+    F: Fn(&mut dyn Pipeline, bool, bool) -> Result<bool> + 'static,
+{
+    fn supports_retry(&self) -> bool {
+        true
+    }
+
+    fn provide_stream_data_with_retry_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        (self.callback)(pipeline, suppress_warnings, will_retry)
+    }
+}
+
 struct StreamFilterPlan {
     filters: Vec<Box<dyn StreamFilter>>,
     specialized_compression: bool,
@@ -559,6 +683,9 @@ pub(crate) enum ObjectValue {
         stream_dict: ObjectHandle,
         /// `None` means original source bytes; `Some` is replacement data.
         stream_data: Option<Rc<Vec<u8>>>,
+        /// A deferred replacement source. This is mutually exclusive with
+        /// `stream_data`, matching qpdf's `stream_provider` slot.
+        stream_provider: Option<Rc<dyn StreamDataProvider>>,
         /// Parse-time length for the original-source branch. qpdf's
         /// `replaceFilterData` updates `/Length` but not this member
         /// (`libqpdf/QPDF_Stream.cc:668-685`).
@@ -1190,10 +1317,12 @@ impl ObjectHandle {
                 ObjectValue::Stream {
                     stream_dict,
                     stream_data,
+                    stream_provider,
                     stream_length,
                 } => ObjectValue::Stream {
                     stream_dict: shallow_copy_child(stream_dict)?,
                     stream_data: stream_data.clone(),
+                    stream_provider: stream_provider.clone(),
                     stream_length: *stream_length,
                 },
                 other => other.clone(),
@@ -2074,6 +2203,7 @@ impl ObjectHandle {
             ObjectValue::Stream {
                 stream_dict: dict,
                 stream_data: Some(data),
+                stream_provider: None,
                 stream_length: 0,
             },
             NO_PARSED_OFFSET,
@@ -3072,13 +3202,89 @@ impl ObjectHandle {
         self.with_value_mut(|v| {
             if let Some(ObjectValue::Stream {
                 stream_data: existing,
+                stream_provider,
                 ..
             }) = v
             {
                 *existing = Some(data);
+                *stream_provider = None;
             }
         });
         self.replace_filter_data(filter, decode_parms, length);
+    }
+
+    /// Replace this handle's stream source with a deferred qpdf-style
+    /// [`StreamDataProvider`]. The provider is retained without being called
+    /// or materialized. The provider source clears any replaced buffer, and a
+    /// zero length is passed to the shared filter boundary so `/Length` is
+    /// removed until the pipe path observes the provider's actual output.
+    ///
+    /// `None` filter/decode parameters preserve existing keys. An explicit
+    /// [`ObjectHandle::null`] removes them through the canonical dictionary
+    /// mutation path. A non-stream handle returns qpdf's `asStreamWithAssert`
+    /// runtime classification as [`Error::System`].
+    pub fn replace_stream_data_provider(
+        &self,
+        provider: Rc<dyn StreamDataProvider>,
+        filter: Option<ObjectHandle>,
+        decode_parms: Option<ObjectHandle>,
+    ) -> Result<()> {
+        self.try_dereference()?;
+        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {}",
+                self.type_name()
+            )));
+        }
+
+        self.with_value_mut(|value| {
+            if let Some(ObjectValue::Stream {
+                stream_data,
+                stream_provider: existing,
+                ..
+            }) = value
+            {
+                *stream_data = None;
+                *existing = Some(provider);
+            }
+        });
+        self.replace_filter_data(filter, decode_parms, 0);
+        Ok(())
+    }
+
+    /// Register a qpdf-style void callback as a deferred stream provider.
+    pub fn replace_stream_data_with_callback<F>(
+        &self,
+        callback: F,
+        filter: Option<ObjectHandle>,
+        decode_parms: Option<ObjectHandle>,
+    ) -> Result<()>
+    where
+        F: Fn(&mut dyn Pipeline) -> Result<()> + 'static,
+    {
+        self.replace_stream_data_provider(
+            Rc::new(CallbackProvider { callback }),
+            filter,
+            decode_parms,
+        )
+    }
+
+    /// Register a qpdf-style retry-aware callback as a deferred stream
+    /// provider. Its return value is consumed by the provider pipe boundary.
+    pub fn replace_stream_data_with_retry_callback<F>(
+        &self,
+        callback: F,
+        filter: Option<ObjectHandle>,
+        decode_parms: Option<ObjectHandle>,
+    ) -> Result<()>
+    where
+        F: Fn(&mut dyn Pipeline, bool, bool) -> Result<bool> + 'static,
+    {
+        self.replace_stream_data_provider(
+            Rc::new(RetryCallbackProvider { callback }),
+            filter,
+            decode_parms,
+        )
     }
 
     /// Apply the filter and length dictionary mutations shared by qpdf's
@@ -3251,6 +3457,7 @@ impl ObjectHandle {
                     stream_dict,
                     stream_data,
                     stream_length,
+                    ..
                 }) => Some((stream_dict.clone(), stream_data.clone(), *stream_length)),
                 _ => None,
             })
@@ -3508,6 +3715,7 @@ impl ObjectHandle {
                     stream_dict,
                     stream_data,
                     stream_length,
+                    ..
                 }) => Some((stream_dict.clone(), stream_data.clone(), *stream_length)),
                 _ => None,
             })
@@ -5840,6 +6048,7 @@ pub(crate) mod identity_tests {
             handle.set_resolved(ObjectValue::Stream {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: 3,
             });
             Ok(())
@@ -7006,6 +7215,7 @@ mod uniform_identity_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: stream_dict.clone(),
             stream_data: Some(stream_data.clone()),
+            stream_provider: None,
             stream_length: stream_data.len(),
         });
         let root = ObjectHandle::array(vec![array_child.clone(), stream.clone()]);
@@ -7679,6 +7889,7 @@ mod stream_payload_sharing_tests {
         stream.set_resolved(ObjectValue::Stream {
             stream_dict: length_dict(4096),
             stream_data: Some(Rc::new(vec![0x5a; 4096])),
+            stream_provider: None,
             stream_length: 4096,
         });
         let dictionary = ObjectHandle::dictionary(vec![(b"Nested".to_vec(), stream.clone())]);
@@ -8153,6 +8364,7 @@ mod materialize_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict_handle,
             stream_data: Some(Rc::new(b"Hello".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
 
@@ -8182,6 +8394,7 @@ mod materialize_tests {
             &ObjectValue::Stream {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: Some(Rc::new(Vec::new())),
+                stream_provider: None,
                 stream_length: 0,
             },
             0,
@@ -8432,6 +8645,7 @@ mod type_code_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
             stream_length: 0,
         });
         assert_eq!(stream.type_code(), 10);
@@ -8547,6 +8761,7 @@ mod unparse_tests {
                 ObjectHandle::integer(0),
             )]),
             stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
             stream_length: 0,
         });
         let inner_dict = ObjectHandle::dictionary(vec![
@@ -8606,6 +8821,7 @@ mod unparse_tests {
         handle.set_resolved(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
             stream_length: 0,
         });
         assert_eq!(handle.unparse(), b"9 0 R");
@@ -8642,6 +8858,7 @@ mod unparse_tests {
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         assert_eq!(
@@ -9215,6 +9432,7 @@ mod unparse_object_tests {
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -9239,6 +9457,7 @@ mod unparse_object_tests {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -9415,6 +9634,7 @@ mod unparse_object_tests {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -9744,6 +9964,7 @@ mod unparse_object_tests {
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -9764,6 +9985,7 @@ mod unparse_object_tests {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -10047,6 +10269,7 @@ mod unparse_object_tests {
         let handle = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -10064,6 +10287,7 @@ mod unparse_object_tests {
         let (indirect, _resolver) = resolver_bearing_handle(ObjectValue::Stream {
             stream_dict: dict,
             stream_data: Some(Rc::new(b"ab".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let mut out = Vec::new();
@@ -10537,6 +10761,7 @@ mod mutation_tests {
             value: ObjectValue::Stream {
                 stream_dict: dict,
                 stream_data: None,
+                stream_provider: None,
                 stream_length: encoded.len(),
             },
             bytes: encoded,
@@ -10580,6 +10805,7 @@ mod mutation_tests {
                     ObjectHandle::name(b"FlateDecode".to_vec()),
                 )]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw,
@@ -10626,6 +10852,7 @@ mod mutation_tests {
                     ObjectHandle::name(b"FlateDecode".to_vec()),
                 )]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw,
@@ -10701,6 +10928,7 @@ mod mutation_tests {
             value: ObjectValue::Stream {
                 stream_dict: dict,
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -10795,6 +11023,7 @@ mod mutation_tests {
                     ),
                 ]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -10847,6 +11076,7 @@ mod mutation_tests {
                     ),
                 ]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -10971,6 +11201,7 @@ mod mutation_tests {
                     ObjectHandle::name(b"FlateDecode".to_vec()),
                 )]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw,
@@ -11014,6 +11245,7 @@ mod mutation_tests {
             value: ObjectValue::Stream {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -11170,6 +11402,7 @@ mod mutation_tests {
                     ObjectHandle::integer(7),
                 )]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -11219,6 +11452,7 @@ mod mutation_tests {
                     ]),
                 )]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: raw.len(),
             },
             bytes: raw.clone(),
@@ -12155,6 +12389,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: old_dictionary.clone(),
             stream_data: None,
+            stream_provider: None,
             stream_length: 0,
         });
         owner.set_resolved(ObjectValue::Dictionary(
@@ -12166,6 +12401,7 @@ mod mutation_tests {
         stream.replace_direct_value(ObjectValue::Stream {
             stream_dict: new_dictionary.clone(),
             stream_data: None,
+            stream_provider: None,
             stream_length: 0,
         });
         assert!(old_dictionary.containing_object_refs().is_empty());
@@ -12536,6 +12772,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
             stream_data: None,
+            stream_provider: None,
             stream_length: 37,
         });
         stream.replace_stream_data(Rc::new(b"new data".to_vec()), None, None);
@@ -12557,6 +12794,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_provider: None,
             stream_length: 37,
         });
 
@@ -12571,6 +12809,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_provider: None,
             stream_length: 3,
         });
 
@@ -12585,6 +12824,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_provider: None,
             stream_length: 3,
         });
 
@@ -12627,6 +12867,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         let filter = ObjectHandle::name(b"FlateDecode".to_vec());
@@ -12650,6 +12891,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: dict.clone(),
             stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
         stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
@@ -12671,6 +12913,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: None,
+            stream_provider: None,
             stream_length: 3,
         });
         stream.set_parsed_offset_if_unset(0);
@@ -12696,6 +12939,7 @@ mod mutation_tests {
         let stream = ObjectHandle::from_value(ObjectValue::Stream {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: None,
+            stream_provider: None,
             stream_length: 3,
         });
 
@@ -12712,6 +12956,7 @@ mod mutation_tests {
             super::identity_tests::resolver_bearing_handle(ObjectValue::Stream {
                 stream_dict: ObjectHandle::dictionary(vec![]),
                 stream_data: None,
+                stream_provider: None,
                 stream_length: 3,
             });
         stream.set_parsed_offset_if_unset(9);
@@ -12839,6 +13084,7 @@ mod mutation_tests {
         indirect.set_resolved(ObjectValue::Stream {
             stream_dict: ObjectHandle::dictionary(vec![]),
             stream_data: Some(Rc::new(b"old".to_vec())),
+            stream_provider: None,
             stream_length: 0,
         });
 
@@ -12919,6 +13165,286 @@ mod mutation_tests {
             dest.get_key(b"/Font").get_key(new_name).as_integer(),
             Some(2)
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_provider_contract_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Default)]
+    struct LegacyProvider {
+        calls: Cell<usize>,
+        identities: RefCell<Vec<(u32, u16)>>,
+    }
+
+    impl StreamDataProvider for LegacyProvider {
+        fn provide_stream_data_by_id(
+            &self,
+            object_number: u32,
+            generation: u16,
+            _pipeline: &mut dyn Pipeline,
+        ) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            self.identities
+                .borrow_mut()
+                .push((object_number, generation));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RetryProvider {
+        calls: Cell<usize>,
+        flags: RefCell<Vec<(bool, bool)>>,
+    }
+
+    impl StreamDataProvider for RetryProvider {
+        fn supports_retry(&self) -> bool {
+            true
+        }
+
+        fn provide_stream_data_with_retry_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            _pipeline: &mut dyn Pipeline,
+            suppress_warnings: bool,
+            will_retry: bool,
+        ) -> Result<bool> {
+            self.calls.set(self.calls.get() + 1);
+            self.flags
+                .borrow_mut()
+                .push((suppress_warnings, will_retry));
+            Ok(true)
+        }
+    }
+
+    struct EmptyProvider;
+
+    impl StreamDataProvider for EmptyProvider {}
+
+    fn provider_stream() -> ObjectHandle {
+        ObjectHandle::stream(
+            ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
+            Rc::new(b"old".to_vec()),
+        )
+    }
+
+    #[test]
+    fn provider_registration_is_lazy_and_retains_the_provider_allocation() {
+        let stream = provider_stream();
+        let provider = Rc::new(LegacyProvider::default());
+        let ownership = Rc::downgrade(&provider);
+
+        stream
+            .replace_stream_data_provider(provider.clone(), None, None)
+            .expect("stream provider replacement");
+
+        assert_eq!(provider.calls.get(), 0, "registration must be lazy");
+        assert!(
+            stream.as_stream_data().is_none(),
+            "provider clears buffer source"
+        );
+        assert!(stream.with_value(|value| matches!(
+            value,
+            Some(ObjectValue::Stream {
+                stream_provider: Some(_),
+                ..
+            })
+        )));
+
+        drop(provider);
+        assert!(
+            ownership.upgrade().is_some(),
+            "stream must retain provider ownership"
+        );
+    }
+
+    #[test]
+    fn provider_registration_accepts_a_qpdf_owned_indirect_stream() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let object_ref = stream.object_ref().expect("new stream object identity");
+
+        stream
+            .replace_stream_data_provider(Rc::new(LegacyProvider::default()), None, None)
+            .expect("provider replacement");
+
+        assert!(stream.is_indirect());
+        assert_eq!(stream.object_ref(), Some(object_ref));
+        assert!(stream.as_stream_data().is_none());
+        assert!(stream.with_value(|value| matches!(
+            value,
+            Some(ObjectValue::Stream {
+                stream_provider: Some(_),
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn replacing_a_provider_with_a_buffer_releases_the_provider_source() {
+        let stream = provider_stream();
+        let provider = Rc::new(LegacyProvider::default());
+        let ownership = Rc::downgrade(&provider);
+
+        stream
+            .replace_stream_data_provider(provider.clone(), None, None)
+            .expect("provider replacement");
+        drop(provider);
+        assert!(ownership.upgrade().is_some());
+
+        stream.replace_stream_data(Rc::new(b"new".to_vec()), None, None);
+        assert!(
+            ownership.upgrade().is_none(),
+            "buffer replacement must clear provider ownership"
+        );
+        assert_eq!(
+            stream.as_stream_data().expect("buffer source").as_slice(),
+            b"new"
+        );
+        assert!(stream.with_value(|value| matches!(
+            value,
+            Some(ObjectValue::Stream {
+                stream_provider: None,
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn provider_replacement_uses_qpdf_filter_boundary_for_uninitialized_and_null_values() {
+        let dict = ObjectHandle::dictionary(vec![
+            (b"Filter".to_vec(), ObjectHandle::name(b"Keep".to_vec())),
+            (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
+            (b"Length".to_vec(), ObjectHandle::integer(3)),
+        ]);
+        let stream = ObjectHandle::stream(dict.clone(), Rc::new(b"old".to_vec()));
+
+        stream
+            .replace_stream_data_provider(Rc::new(LegacyProvider::default()), None, None)
+            .expect("provider replacement");
+        assert!(dict.has_key(b"/Filter"));
+        assert!(dict.has_key(b"/DecodeParms"));
+        assert!(!dict.has_key(b"/Length"));
+
+        stream
+            .replace_stream_data_provider(
+                Rc::new(LegacyProvider::default()),
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            )
+            .expect("provider replacement with explicit nulls");
+        assert!(!dict.has_key(b"/Filter"));
+        assert!(!dict.has_key(b"/DecodeParms"));
+    }
+
+    #[test]
+    fn provider_replacement_rejects_a_non_stream_with_qpdf_assertion_error() {
+        let error = ObjectHandle::integer(7)
+            .replace_stream_data_provider(Rc::new(LegacyProvider::default()), None, None)
+            .expect_err("non-stream provider replacement must fail");
+
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
+    }
+
+    #[test]
+    fn legacy_object_identity_form_delegates_to_the_numeric_form() {
+        let provider = LegacyProvider::default();
+        let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
+
+        provider
+            .provide_stream_data(ObjectRef::new(17, 4), &mut sink)
+            .expect("legacy provider");
+
+        assert_eq!(provider.calls.get(), 1);
+        assert_eq!(*provider.identities.borrow(), vec![(17, 4)]);
+    }
+
+    #[test]
+    fn retry_object_identity_form_delegates_flags_to_the_numeric_form() {
+        let provider = RetryProvider::default();
+        let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
+
+        assert!(provider
+            .provide_stream_data_with_retry(ObjectRef::new(23, 2), &mut sink, true, false,)
+            .expect("retry provider"));
+        assert!(provider.supports_retry());
+        assert_eq!(provider.calls.get(), 1);
+        assert_eq!(*provider.flags.borrow(), vec![(true, false)]);
+    }
+
+    #[test]
+    fn default_provider_methods_return_qpdf_contract_error() {
+        let provider = EmptyProvider;
+        let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
+
+        let error = provider
+            .provide_stream_data(ObjectRef::new(1, 0), &mut sink)
+            .expect_err("default provider must reject missing implementation");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "you must override provideStreamData -- see QPDFObjectHandle.hh"
+        ));
+
+        let error = provider
+            .provide_stream_data_with_retry(ObjectRef::new(1, 0), &mut sink, false, true)
+            .expect_err("default retry provider must reject missing implementation");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "you must override provideStreamData -- see QPDFObjectHandle.hh"
+        ));
+    }
+
+    #[test]
+    fn callback_adapters_are_deferred_and_retry_capability_is_retained() {
+        let stream = provider_stream();
+        let void_calls = Rc::new(Cell::new(0));
+        let void_calls_for_callback = Rc::clone(&void_calls);
+        stream
+            .replace_stream_data_with_callback(
+                move |_pipeline| {
+                    void_calls_for_callback.set(void_calls_for_callback.get() + 1);
+                    Ok(())
+                },
+                None,
+                None,
+            )
+            .expect("void callback replacement");
+        assert_eq!(void_calls.get(), 0, "callback registration must be lazy");
+
+        let retry_calls = Rc::new(Cell::new(0));
+        let retry_calls_for_callback = Rc::clone(&retry_calls);
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |_pipeline, _suppress_warnings, _will_retry| {
+                    retry_calls_for_callback.set(retry_calls_for_callback.get() + 1);
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("retry callback replacement");
+        assert_eq!(
+            retry_calls.get(),
+            0,
+            "retry callback registration must be lazy"
+        );
+        assert!(stream.with_value(|value| match value {
+            Some(ObjectValue::Stream {
+                stream_provider: Some(provider),
+                ..
+            }) => provider.supports_retry(),
+            _ => false,
+        }));
     }
 }
 
@@ -13308,6 +13834,7 @@ pub(crate) mod warning_emission_tests {
                 ObjectHandle::integer(0),
             )]),
             stream_data: None,
+            stream_provider: None,
             stream_length: 0,
         });
 
