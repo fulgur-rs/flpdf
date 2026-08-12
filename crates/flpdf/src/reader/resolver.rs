@@ -10162,7 +10162,12 @@ mod tests {
             .stack_size(stack_size)
             .spawn(|| {
                 let bytes = chained_indirect_length_pdf_bytes(4000);
-                let mut pdf = Pdf::open_mem_owned(bytes).expect("open");
+                // This test covers resolution stack growth, not the separate
+                // recursive teardown gap tracked by flpdf-97x9. On Windows,
+                // dropping the deep graph after the assertion can overflow
+                // before the spawned thread reports the result under test.
+                let mut pdf =
+                    std::mem::ManuallyDrop::new(Pdf::open_mem_owned(bytes).expect("open"));
                 let handle = pdf.get_object_handle(ObjectRef::new(1, 0));
 
                 handle
