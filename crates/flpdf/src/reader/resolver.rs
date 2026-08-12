@@ -9048,8 +9048,7 @@ mod tests {
                 b"<< /Type /X >>" => "stream dictionary lacks /Length key",
                 b"<< /Length /X >>" => "/Length key in stream dictionary is not an integer",
                 b"<< /Length -5 >>" => "/Length key in stream dictionary is out of range",
-                // cov:ignore: dictionary is one of the three literals above
-                _ => unreachable!("all malformed length cases are listed"),
+                _ => unreachable!("all malformed length cases are listed"), // cov:ignore: dictionary is one of the three literals above
             };
 
             let mut pdf = Pdf::open_mem_owned_with_options(
