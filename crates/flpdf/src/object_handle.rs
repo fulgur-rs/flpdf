@@ -54,6 +54,7 @@
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
     pipeline::{
+        count::Count,
         flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE},
         Pipeline, PipelineError, PipelineRef,
     },
@@ -3451,14 +3452,20 @@ impl ObjectHandle {
         recover_codec_errors: bool,
     ) -> Result<bool> {
         self.try_dereference()?;
-        let Some((stream_dict, stream_data, stream_length)) =
+        let Some((stream_dict, stream_data, stream_provider, stream_length)) =
             self.with_value(|value| match value {
                 Some(ObjectValue::Stream {
                     stream_dict,
                     stream_data,
+                    stream_provider,
                     stream_length,
                     ..
-                }) => Some((stream_dict.clone(), stream_data.clone(), *stream_length)),
+                }) => Some((
+                    stream_dict.clone(),
+                    stream_data.clone(),
+                    stream_provider.clone(),
+                    *stream_length,
+                )),
                 _ => None,
             })
         else {
@@ -3473,6 +3480,7 @@ impl ObjectHandle {
             return self.pipe_stream_source(
                 &stream_dict,
                 stream_data,
+                stream_provider.clone(),
                 stream_length,
                 pipeline,
                 suppress_warnings,
@@ -3485,6 +3493,7 @@ impl ObjectHandle {
             return self.pipe_stream_source(
                 &stream_dict,
                 stream_data,
+                stream_provider.clone(),
                 stream_length,
                 pipeline,
                 suppress_warnings,
@@ -3498,6 +3507,7 @@ impl ObjectHandle {
             return self.pipe_stream_source(
                 &stream_dict,
                 stream_data,
+                stream_provider.clone(),
                 stream_length,
                 pipeline,
                 suppress_warnings,
@@ -3559,6 +3569,7 @@ impl ObjectHandle {
             .pipe_stream_source(
                 &stream_dict,
                 stream_data,
+                stream_provider,
                 stream_length,
                 &mut head,
                 suppress_warnings,
@@ -3709,14 +3720,20 @@ impl ObjectHandle {
 
     fn pipe_raw_stream_data(&self, pipeline: &mut dyn crate::pipeline::Pipeline) -> Result<bool> {
         self.try_dereference()?;
-        let Some((stream_dict, stream_data, stream_length)) =
+        let Some((stream_dict, stream_data, stream_provider, stream_length)) =
             self.with_value(|value| match value {
                 Some(ObjectValue::Stream {
                     stream_dict,
                     stream_data,
+                    stream_provider,
                     stream_length,
                     ..
-                }) => Some((stream_dict.clone(), stream_data.clone(), *stream_length)),
+                }) => Some((
+                    stream_dict.clone(),
+                    stream_data.clone(),
+                    stream_provider.clone(),
+                    *stream_length,
+                )),
                 _ => None,
             })
         else {
@@ -3728,6 +3745,7 @@ impl ObjectHandle {
         self.pipe_stream_source(
             &stream_dict,
             stream_data,
+            stream_provider,
             stream_length,
             pipeline,
             false,
@@ -3741,6 +3759,7 @@ impl ObjectHandle {
         &self,
         stream_dict: &ObjectHandle,
         stream_data: Option<Rc<Vec<u8>>>,
+        stream_provider: Option<Rc<dyn StreamDataProvider>>,
         stream_length: usize,
         pipeline: &mut dyn Pipeline,
         suppress_warnings: bool,
@@ -3754,6 +3773,52 @@ impl ObjectHandle {
             pipeline
                 .finish()
                 .map_err(|error| Self::map_stream_pipeline_error(error, recover_codec_errors))?;
+            return Ok(true);
+        }
+
+        // qpdf dispatches the deferred source after replaced bytes and before
+        // the parsed-offset/original branch (`libqpdf/QPDF_Stream.cc:571-620`).
+        // Pl_Count is part of that provider boundary: it forwards every
+        // incremental write and measures the bytes that actually reached the
+        // decoder/output pipeline (`libqpdf/QPDF_Stream.cc:575-604`).
+        if let Some(provider) = stream_provider {
+            let object_ref = self.object_ref().ok_or_else(|| {
+                Error::Internal(
+                    "pipeStreamData called for provider-backed direct stream".to_owned(),
+                )
+            })?;
+            let mut count = Count::new("stream provider count", pipeline);
+            let success = if provider.supports_retry() {
+                provider.provide_stream_data_with_retry(
+                    object_ref,
+                    &mut count,
+                    suppress_warnings,
+                    will_retry,
+                )?
+            } else {
+                provider.provide_stream_data(object_ref, &mut count)?;
+                true
+            };
+            if !success {
+                return Ok(false);
+            }
+
+            let actual_length = i64::try_from(count.count()).map_err(|_| {
+                // cov:ignore-start: an in-memory provider cannot emit more than i64::MAX bytes in a test
+                Error::System("stream data provider length exceeds PDF integer range".to_owned())
+                // cov:ignore-end
+            })?; // cov:ignore: closing line of the unreachable signed-PDF-range guard
+            if stream_dict.try_has_key(b"/Length")? {
+                let desired_length = stream_dict.try_get_key(b"/Length")?.try_get_int_value()?;
+                if actual_length != desired_length {
+                    return Err(Error::System(format!(
+                        "stream data provider for {} {} provided {} bytes instead of expected {} bytes",
+                        object_ref.number, object_ref.generation, actual_length, desired_length
+                    )));
+                }
+            } else {
+                stream_dict.replace_key(b"/Length", ObjectHandle::integer(actual_length));
+            }
             return Ok(true);
         }
 
@@ -13225,6 +13290,66 @@ mod stream_provider_contract_tests {
 
     impl StreamDataProvider for EmptyProvider {}
 
+    struct PipeProvider {
+        bytes: Rc<Vec<u8>>,
+        calls: Cell<usize>,
+        identities: RefCell<Vec<(u32, u16)>>,
+    }
+
+    impl PipeProvider {
+        fn new(bytes: Rc<Vec<u8>>) -> Self {
+            Self {
+                bytes,
+                calls: Cell::new(0),
+                identities: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StreamDataProvider for PipeProvider {
+        fn provide_stream_data_by_id(
+            &self,
+            object_number: u32,
+            generation: u16,
+            pipeline: &mut dyn Pipeline,
+        ) -> Result<()> {
+            self.calls.set(self.calls.get() + 1);
+            self.identities
+                .borrow_mut()
+                .push((object_number, generation));
+            pipeline.write(&self.bytes).map_err(Error::from)?;
+            pipeline.finish().map_err(Error::from)
+        }
+    }
+
+    struct RetryPipeProvider {
+        bytes: Rc<Vec<u8>>,
+        success: bool,
+        flags: RefCell<Vec<(bool, bool)>>,
+    }
+
+    impl StreamDataProvider for RetryPipeProvider {
+        fn supports_retry(&self) -> bool {
+            true
+        }
+
+        fn provide_stream_data_with_retry_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            pipeline: &mut dyn Pipeline,
+            suppress_warnings: bool,
+            will_retry: bool,
+        ) -> Result<bool> {
+            self.flags
+                .borrow_mut()
+                .push((suppress_warnings, will_retry));
+            pipeline.write(&self.bytes).map_err(Error::from)?;
+            pipeline.finish().map_err(Error::from)?;
+            Ok(self.success)
+        }
+    }
+
     fn provider_stream() -> ObjectHandle {
         ObjectHandle::stream(
             ObjectHandle::dictionary(vec![(b"Length".to_vec(), ObjectHandle::integer(3))]),
@@ -13282,6 +13407,204 @@ mod stream_provider_contract_tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn provider_source_is_piped_lazily_and_updates_the_measured_length() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let object_ref = stream.object_ref().expect("new stream object identity");
+        let bytes = Rc::new(b"provider bytes".to_vec());
+        let provider = Rc::new(PipeProvider::new(Rc::clone(&bytes)));
+
+        stream
+            .replace_stream_data_provider(provider.clone(), None, None)
+            .expect("provider replacement");
+        assert_eq!(provider.calls.get(), 0, "provider remains lazy");
+
+        let first = stream.get_raw_stream_data().expect("first provider pipe");
+        let second = stream.get_raw_stream_data().expect("second provider pipe");
+        assert_eq!(first.as_slice(), bytes.as_slice());
+        assert_eq!(second.as_slice(), bytes.as_slice());
+        assert_eq!(provider.calls.get(), 2);
+        assert_eq!(
+            *provider.identities.borrow(),
+            vec![(object_ref.number, object_ref.generation); 2]
+        );
+        assert_eq!(
+            stream
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .get_key(b"/Length")
+                .as_integer(),
+            Some(bytes.len() as i64)
+        );
+    }
+
+    #[test]
+    fn provider_retry_result_forwards_flags_and_skips_length_update_on_failure() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let bytes = Rc::new(b"retry bytes".to_vec());
+        let provider = Rc::new(RetryPipeProvider {
+            bytes: Rc::clone(&bytes),
+            success: false,
+            flags: RefCell::new(Vec::new()),
+        });
+        stream
+            .replace_stream_data_provider(provider.clone(), None, None)
+            .expect("provider replacement");
+
+        let mut sink = crate::pipeline::buffer::Buffer::new("provider", None);
+        let mut filtering_attempted = false;
+        let success = stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::None,
+                true,
+                true,
+            )
+            .expect("retry provider result");
+
+        assert!(!success);
+        assert!(!filtering_attempted);
+        assert_eq!(sink.take_buffer().expect("provider output"), *bytes);
+        assert_eq!(*provider.flags.borrow(), vec![(true, true)]);
+        assert!(!stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .has_key(b"/Length"));
+    }
+
+    #[test]
+    fn provider_length_mismatch_uses_qpdf_system_error_text() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let object_ref = stream.object_ref().expect("new stream object identity");
+        let bytes = Rc::new(b"provider bytes".to_vec());
+        stream
+            .replace_stream_data_provider(Rc::new(PipeProvider::new(Rc::clone(&bytes))), None, None)
+            .expect("provider replacement");
+        stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .replace_key(b"/Length", ObjectHandle::integer(99));
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("provider length mismatch must fail");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == format!(
+                    "stream data provider for {} {} provided {} bytes instead of expected 99 bytes",
+                    object_ref.number,
+                    object_ref.generation,
+                    bytes.len()
+                )
+        ));
+    }
+
+    #[test]
+    fn provider_source_reuses_the_filter_pipeline() {
+        let decoded = b"decoded provider bytes";
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = Rc::new(
+            crate::filters::encode_stream_data(&filter_dict, decoded)
+                .expect("provider source encoding"),
+        );
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        stream
+            .replace_stream_data_provider(
+                Rc::new(PipeProvider::new(Rc::clone(&encoded))),
+                Some(ObjectHandle::name(b"FlateDecode".to_vec())),
+                None,
+            )
+            .expect("provider replacement");
+
+        let output = stream
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("provider filter pipeline");
+        assert_eq!(output.as_slice(), decoded);
+        assert_eq!(
+            stream
+                .as_stream_dict()
+                .expect("stream dictionary")
+                .get_key(b"/Length")
+                .as_integer(),
+            Some(encoded.len() as i64)
+        );
+    }
+
+    #[test]
+    fn provider_default_error_propagates_from_the_pipe_boundary() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        stream
+            .replace_stream_data_provider(Rc::new(EmptyProvider), None, None)
+            .expect("provider replacement");
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("provider default method must fail");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "you must override provideStreamData -- see QPDFObjectHandle.hh"
+        ));
+    }
+
+    #[test]
+    fn provider_pipe_rejects_a_direct_stream_without_object_identity() {
+        let stream = provider_stream();
+        stream
+            .replace_stream_data_provider(
+                Rc::new(PipeProvider::new(Rc::new(b"direct bytes".to_vec()))),
+                None,
+                None,
+            )
+            .expect("provider replacement");
+
+        let error = stream
+            .get_raw_stream_data()
+            .expect_err("provider requires an indirect stream identity");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == "pipeStreamData called for provider-backed direct stream"
+        ));
+    }
+
+    #[test]
+    fn callback_adapter_writes_through_the_provider_source_boundary() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = Rc::clone(&calls);
+        stream
+            .replace_stream_data_with_callback(
+                move |pipeline| {
+                    callback_calls.set(callback_calls.get() + 1);
+                    pipeline.write(b"callback bytes").map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)
+                },
+                None,
+                None,
+            )
+            .expect("callback provider replacement");
+
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("callback provider pipe")
+                .as_slice(),
+            b"callback bytes"
+        );
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
