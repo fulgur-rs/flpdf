@@ -282,6 +282,13 @@ fn process(
                 return Err(e.to_string());
             }
         };
+        let _ = emit_new_diagnostics(
+            &pdf,
+            &mut diagnostics_written,
+            &filename_diagnostic,
+            stdout,
+            stderr,
+        );
         let label = format!("OBJECT STREAM {}", obj_ref.number);
         dump_tokens(
             decoded.as_ref(),

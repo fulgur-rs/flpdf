@@ -1,7 +1,9 @@
 use assert_cmd::Command;
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::process::{Command as StdCommand, Stdio};
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -21,6 +23,29 @@ fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
         .current_dir(cwd)
         .output()
         .expect("spawn flpdf-test-tokenizer")
+}
+
+fn run_merged(args: &[&str], cwd: &std::path::Path) -> (std::process::ExitStatus, Vec<u8>) {
+    let merged = tempfile::tempfile().expect("create merged output file");
+    let stdout = merged.try_clone().expect("clone merged output file");
+    let stderr = merged.try_clone().expect("clone merged output file");
+    let status = StdCommand::new(assert_cmd::cargo_bin!("flpdf-test-tokenizer"))
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .status()
+        .expect("spawn flpdf-test-tokenizer");
+
+    let mut merged = merged;
+    merged
+        .seek(SeekFrom::Start(0))
+        .expect("rewind merged output file");
+    let mut output = Vec::new();
+    merged
+        .read_to_end(&mut output)
+        .expect("read merged output file");
+    (status, output)
 }
 
 fn assert_stderr_contains_usage(output: &std::process::Output) {
@@ -257,6 +282,38 @@ fn tokenizer_flushes_objstm_decode_warning_before_propagating_error() {
     assert!(
         warning_offset < exception_offset,
         "the object-specific warning must precede the generic exception: {stderr}"
+    );
+}
+
+#[test]
+fn tokenizer_flushes_objstm_success_warning_before_token_output() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let mut bytes = fs::read(fixture_dir().join("test_driver/stream_flate_error.pdf"))
+        .expect("read malformed filter fixture");
+    let marker = b"<< /Filter /FlateDecode /Length 3 >>";
+    let replacement = b"<< /Type /ObjStm /Filter 42 /Length 3 >>";
+    let marker_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("stream dictionary marker");
+    bytes.splice(
+        marker_start..marker_start + marker.len(),
+        replacement.iter().copied(),
+    );
+    fs::write(dir.path().join("unfilterable-objstm.pdf"), bytes)
+        .expect("write unfilterable ObjStm fixture");
+
+    let (status, output) = run_merged(&["unfilterable-objstm.pdf"], dir.path());
+
+    assert!(status.success(), "unexpected exit status: {status:?}");
+    let output = String::from_utf8_lossy(&output);
+    let warning = "stream filter type is not name or array";
+    let tokens = "--- BEGIN OBJECT STREAM 6 ---";
+    let warning_offset = output.find(warning).expect("unfilterable filter warning");
+    let token_offset = output.find(tokens).expect("ObjStm token output");
+    assert!(
+        warning_offset < token_offset,
+        "the filter warning must precede ObjStm token output: {output}"
     );
 }
 
