@@ -2573,7 +2573,15 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let stream_offset = self.tell()?;
 
         let mut recovered = false;
-        let mut length = match Self::stream_length(&dict) {
+        // `/Length` is the re-entrant call into `resolve_indirect` described
+        // above. Check the stack immediately before it, after this method's
+        // locals are live, so object-attributed recovery diagnostics cannot
+        // make a small caller stack overflow before the resolver hub grows it.
+        let mut length = match stacker::maybe_grow(
+            super::READER_STACK_RED_ZONE,
+            super::READER_STACK_GROWTH_SIZE,
+            || Self::stream_length(&dict),
+        ) {
             Ok(length) => length,
             Err(error) if self.is_recoverable_stream_error(&error) => {
                 if !self.stream_recovery_enabled() {
