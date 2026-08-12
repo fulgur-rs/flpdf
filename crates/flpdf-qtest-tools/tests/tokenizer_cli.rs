@@ -229,6 +229,38 @@ fn tokenizer_decodes_objstm_from_canonical_handle_without_replaying_container_re
 }
 
 #[test]
+fn tokenizer_flushes_objstm_decode_warning_before_propagating_error() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let mut bytes = fs::read(fixture_dir().join("test_driver/stream_flate_error.pdf"))
+        .expect("read malformed Flate fixture");
+    let marker = b"<< /Filter /FlateDecode /Length 3 >>";
+    let replacement = b"<< /Type /ObjStm /Filter /FlateDecode /Length 3 >>";
+    let marker_start = bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .expect("stream dictionary marker");
+    bytes.splice(
+        marker_start..marker_start + marker.len(),
+        replacement.iter().copied(),
+    );
+    fs::write(dir.path().join("malformed-objstm.pdf"), bytes)
+        .expect("write malformed ObjStm fixture");
+
+    let output = run(&["malformed-objstm.pdf"], dir.path());
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warning = "error decoding stream data for object 6 0";
+    let exception = "error getting decoded stream data";
+    let warning_offset = stderr.find(warning).expect("ObjStm decode warning");
+    let exception_offset = stderr.find(exception).expect("decode exception");
+    assert!(
+        warning_offset < exception_offset,
+        "the object-specific warning must precede the generic exception: {stderr}"
+    );
+}
+
+#[test]
 fn tokenizer_reuses_canonical_page_stream_resolution_without_replaying_warnings() {
     let cases = [
         (

@@ -269,9 +269,19 @@ fn process(
         // Pdf::resolve_borrowed here: a stream-length recovery on the
         // ObjStm container would otherwise run a second time through the
         // legacy source/xref route and emit a second warning sequence.
-        let decoded = stream_handle
-            .get_stream_data(DecodeLevel::Specialized)
-            .map_err(|e| e.to_string())?;
+        let decoded = match stream_handle.get_stream_data(DecodeLevel::Specialized) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                let _ = emit_new_diagnostics(
+                    &pdf,
+                    &mut diagnostics_written,
+                    &filename_diagnostic,
+                    stdout,
+                    stderr,
+                );
+                return Err(e.to_string());
+            }
+        };
         let label = format!("OBJECT STREAM {}", obj_ref.number);
         dump_tokens(
             decoded.as_ref(),
