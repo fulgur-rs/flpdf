@@ -2015,6 +2015,23 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(())
     }
 
+    fn register_trailer_references(&mut self) -> Vec<ObjectRef> {
+        let trailer_refs: Vec<_> = self
+            .qpdf_trailer_references
+            .iter()
+            .copied()
+            .filter(|object_ref| {
+                object_ref.number != 0
+                    && object_ref.generation != u16::MAX
+                    && !self.qpdf_removed_refs.contains(object_ref)
+            })
+            .collect();
+        for object_ref in &trailer_refs {
+            self.get_object_handle(*object_ref);
+        }
+        trailer_refs
+    }
+
     fn register_top_level_replacement_targets(&mut self) {
         // A bare `Object::Reference` supplied to `set_object` is represented
         // as an `ObjectValue::Reference` on the holder itself. Unlike an
@@ -2051,25 +2068,17 @@ impl<R: Read + Seek> Pdf<R> {
         // reference preparation. Otherwise resolving the superseded source
         // value can register references that the replacement no longer owns.
         self.reconcile_legacy_materialized_memos()?;
+        let trailer_refs = self.register_trailer_references();
         self.register_parsed_xref_stream_handles()?;
         self.resolver.fix_dangling_references()?;
 
-        // A trailer reference can be valid even when it has no body/xref row.
-        // qpdf's trailer parse has already observed these references; register
-        // them before taking the object-cache snapshot so `/Info 99 0 R` is not
-        // lost merely because no body object was resolved.
-        let trailer_refs: Vec<_> = self
-            .qpdf_trailer_references
-            .iter()
-            .copied()
-            .filter(|object_ref| {
-                object_ref.number != 0
-                    && object_ref.generation != u16::MAX
-                    && !self.qpdf_removed_refs.contains(object_ref)
-            })
-            .collect();
+        // qpdf's parser creates trailer-reference cache entries before
+        // fixDanglingReferences. Resolve the registered seeds after the xref
+        // pass so a trailer-only reference with no row becomes an explicit
+        // missing/null cache entry rather than escaping enumeration as
+        // NotYetResolved.
         for object_ref in trailer_refs {
-            self.get_object_handle(object_ref);
+            self.get_object_handle(object_ref).try_dereference()?;
         }
 
         self.reconcile_legacy_materialized_memos()?;
@@ -7830,7 +7839,7 @@ mod tests {
             .any(|handle| handle.object_ref() == Some(dangling_ref)));
     }
 
-    fn trailer_only_dangling_info_pdf() -> Vec<u8> {
+    fn trailer_only_dangling_info_pdf(info_ref: &str) -> Vec<u8> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
         let mut offsets = BTreeMap::new();
         for (object_ref, body) in [
@@ -7853,7 +7862,7 @@ mod tests {
         }
         bytes.extend_from_slice(
             format!(
-                "trailer\n<< /Size 4 /Root 1 0 R /Info 99 0 R >>\nstartxref\n{xref_start}\n%%EOF\n"
+                "trailer\n<< /Size 4 /Root 1 0 R /Info {info_ref} >>\nstartxref\n{xref_start}\n%%EOF\n"
             )
             .as_bytes(),
         );
@@ -8337,12 +8346,34 @@ mod tests {
 
     #[test]
     fn get_all_objects_registers_trailer_only_dangling_references() {
-        let mut pdf = Pdf::open_mem_owned(trailer_only_dangling_info_pdf()).expect("open");
-        assert!(pdf
+        let mut pdf = Pdf::open_mem_owned(trailer_only_dangling_info_pdf("99 0 R")).expect("open");
+        let info = pdf
             .get_all_objects()
             .expect("enumerate trailer-only reference")
+            .into_iter()
+            .find(|candidate| candidate.object_ref() == Some(ObjectRef::new(99, 0)))
+            .expect("trailer-only reference is represented exactly once");
+        assert!(
+            info.is_resolved(),
+            "dangling trailer references must be resolved before enumeration returns"
+        );
+        assert!(
+            info.is_null(),
+            "an absent trailer-only body resolves to null"
+        );
+    }
+
+    #[test]
+    fn get_all_objects_ignores_an_invalid_trailer_reference() {
+        let mut pdf =
+            Pdf::open_mem_owned(trailer_only_dangling_info_pdf("99 65535 R")).expect("open");
+        let objects = pdf
+            .get_all_objects()
+            .expect("invalid trailer reference must not abort enumeration");
+
+        assert!(!objects
             .iter()
-            .any(|candidate| candidate.object_ref() == Some(ObjectRef::new(99, 0))));
+            .any(|candidate| { candidate.object_ref() == Some(ObjectRef::new(99, u16::MAX)) }));
     }
 
     #[test]
