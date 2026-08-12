@@ -1121,10 +1121,8 @@ fn qpdf_path_factories_read_payload_and_make_filespec() {
     std::fs::write(file.path(), b"from-path").unwrap();
     let mut pdf = open(build_attachment_pdf("", "", b"seed"));
 
-    let ef_ref = EmbeddedFileStream::create_ef_stream_from_path(&mut pdf, file.path())
-        .unwrap()
-        .object_ref()
-        .unwrap();
+    let ef_handle = EmbeddedFileStream::create_ef_stream_from_path(&mut pdf, file.path()).unwrap();
+    let ef_ref = ef_handle.object_ref().unwrap();
     let fs_ref = FileSpec::create_file_spec_from_path(&mut pdf, "path.txt", file.path())
         .unwrap()
         .object_ref()
@@ -1132,6 +1130,16 @@ fn qpdf_path_factories_read_payload_and_make_filespec() {
     assert_eq!(
         pdf.resolve(ef_ref).unwrap().as_stream().unwrap().data,
         b"from-path"
+    );
+    assert_eq!(
+        ef_handle.get_raw_stream_data().unwrap().as_slice(),
+        b"from-path",
+        "path provider must remain readable after finalization"
+    );
+    assert_eq!(
+        ef_handle.get_raw_stream_data().unwrap().as_slice(),
+        b"from-path",
+        "path provider must be repeatable"
     );
     let mut fs = FileSpec::new(pdf.get_object_handle(fs_ref), &mut pdf).unwrap();
     assert_eq!(

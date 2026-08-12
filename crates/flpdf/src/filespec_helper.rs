@@ -92,6 +92,7 @@ use crate::writer::DecodeLevel;
 use crate::{Error, ObjectHandle, ObjectRef, Pdf, Result};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::rc::Rc;
@@ -248,13 +249,39 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         Ok(stream)
     }
 
-    /// Create an embedded-file stream from filesystem bytes. This is the Rust
-    /// equivalent of qpdf's provider-based `createEFStream` overload.
+    /// Create an embedded-file stream from a filesystem path.
+    ///
+    /// The path is retained by qpdf's provider-shaped callback and the file is
+    /// opened afresh for each stream pipe. This is the Rust equivalent of
+    /// qpdf's `QUtil::file_provider` overload: it does not materialize the
+    /// complete file into an intermediate `Vec<u8>`, and repeated reads use
+    /// the same provider source. This follows the path overload in
+    /// `QPDFFileSpecObjectHelper.cc:85-105` and the provider construction in
+    /// `QPDFEFStreamObjectHelper.cc:90-107`.
     pub fn create_ef_stream_from_path<P: AsRef<Path>>(
         pdf: &mut Pdf<R>,
         path: P,
     ) -> Result<ObjectHandle> {
-        Self::create_ef_stream(pdf, std::fs::read(path)?)
+        let path = path.as_ref().to_path_buf();
+        let stream = pdf.new_stream()?;
+        stream.replace_stream_data_with_callback(
+            move |pipeline| {
+                let mut file = File::open(&path)?;
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    pipeline.write(&buffer[..read]).map_err(Error::from)?;
+                }
+                pipeline.finish().map_err(Error::from)?;
+                Ok(())
+            },
+            Some(ObjectHandle::null()),
+            Some(ObjectHandle::null()),
+        )?; // cov:ignore: Pdf::new_stream guarantees a stream handle here
+        Self::new_from_stream(pdf, stream)
     }
 
     /// Construct a wrapper for a direct or indirect `/EmbeddedFile` stream
@@ -1142,17 +1169,17 @@ impl FileSpecBuilder {
 
 // ── High-level attachment helper ──────────────────────────────────────────────
 
-/// Load a file from disk and attach it to `pdf`, compressed with FlateDecode.
+/// Attach a file from disk to `pdf` through qpdf's filesystem provider path.
 ///
-/// This is a convenience wrapper around [`FileSpecBuilder`] +
+/// This is a convenience wrapper around [`FileSpec::create_file_spec_from_path`] +
 /// [`crate::embedded_files::insert_embedded_file`] that:
 ///
-/// 1. Reads the file at `path` into memory.
+/// 1. Streams the file at `path` through the deferred provider factory.
 /// 2. Derives the name-tree key and `/F`/`/UF` filename from the path's
 ///    **basename** (the last component of the path).
-/// 3. Builds a `/Filespec` + `/EmbeddedFile` pair with FlateDecode compression.
-///    `/Params /Size` and `/Params /CheckSum` reflect the **raw (uncompressed)**
-///    bytes, as required by ISO 32000-1 §7.11.4.
+/// 3. Builds a `/Filespec` + `/EmbeddedFile` pair without installing a local
+///    filter. `/Params /Size` and `/Params /CheckSum` reflect the **raw** bytes,
+///    as required by ISO 32000-1 §7.11.4.
 /// 4. Inserts the pair into the catalog's `/Names /EmbeddedFiles` name tree
 ///    under the UTF-8 `key` (which may differ from the basename if the caller
 ///    wants an explicit tree key).
@@ -1168,11 +1195,10 @@ impl FileSpecBuilder {
 ///
 /// # Errors
 ///
-/// - [`Error::Io`] if the file cannot be read.
-/// - [`Error::Unsupported`] if the path has no basename, the basename is not
-///   valid UTF-8, or the basename is not ASCII (independent `/F` ASCII-fallback
-///   + `/UF` Unicode handling is not yet supported).
-/// - Any error from [`FileSpecBuilder::build`] or
+/// - [`Error::Io`] if the file cannot be opened or read.
+/// - [`Error::Unsupported`] if the path has no basename or the basename is not
+///   valid UTF-8.
+/// - Any error from [`FileSpec::create_file_spec_from_path`] or
 ///   [`crate::embedded_files::insert_embedded_file`].
 ///
 /// # Example
@@ -1216,13 +1242,19 @@ where
             ))
         })?;
 
-    // Read the raw file bytes.
-    let raw = std::fs::read(path)?;
-
-    // Build the /Filespec + /EmbeddedFile and insert into the name tree.
-    let filespec_ref = FileSpecBuilder::new(ascii_filename_fallback(basename), raw)
-        .uf_filename(basename)
-        .build(pdf)?;
+    // Build the /Filespec + /EmbeddedFile through qpdf's path-provider route.
+    // `create_file_spec` initially uses the same Unicode name for `/F` and
+    // `/UF`; replace `/F` with the independent ASCII fallback while retaining
+    // the original Unicode `/UF` value, matching FileSpecBuilder's behavior.
+    let filespec_handle = FileSpec::create_file_spec_from_path(pdf, basename.as_bytes(), path)?;
+    let filespec_ref = filespec_handle
+        .object_ref()
+        .expect("create_file_spec_from_path must create an indirect Filespec");
+    let fallback = ascii_filename_fallback(basename);
+    {
+        let mut filespec = FileSpec::new(pdf.get_object_handle(filespec_ref), pdf)?;
+        filespec.set_filename(basename.as_bytes(), Some(fallback.as_slice()))?;
+    }
     crate::embedded_files::insert_embedded_file(pdf, key, filespec_ref)?;
 
     Ok(filespec_ref)
