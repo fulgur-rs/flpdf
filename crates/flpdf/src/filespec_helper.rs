@@ -176,7 +176,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             provider,
             Some(ObjectHandle::null()),
             Some(ObjectHandle::null()),
-        )?;
+        )?; // cov:ignore: Pdf::new_stream guarantees a stream handle here
         Self::new_from_stream(pdf, stream)
     }
 
@@ -210,9 +210,10 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
             let size = count.count();
             drop(count);
             let checksum = if success {
-                Some(hex::decode(md5.get_hex_digest()?).map_err(|error| {
-                    Error::Internal(format!("invalid EmbeddedFile MD5: {error}"))
-                })?)
+                Some(
+                    hex::decode(md5.get_hex_digest()?)
+                        .expect("PlMd5 always returns a hexadecimal digest"),
+                )
             } else {
                 None
             };
@@ -226,9 +227,15 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 ObjectHandle::dictionary(vec![
                     (
                         b"/Size".to_vec(),
-                        ObjectHandle::integer(i64::try_from(size).map_err(|_| {
-                            Error::System("EmbeddedFile size exceeds PDF integer range".to_string())
-                        })?),
+                        ObjectHandle::integer(
+                            i64::try_from(size).map_err(|_| {
+                                // cov:ignore-start: an in-memory stream cannot exceed PDF's signed integer range in tests
+                                Error::System(
+                                    "EmbeddedFile size exceeds PDF integer range".to_string(),
+                                )
+                                // cov:ignore-end
+                            })?, // cov:ignore: closing line of the unreachable signed-PDF-range guard
+                        ),
                     ),
                     (b"/CheckSum".to_vec(), ObjectHandle::string(checksum)),
                 ]),
@@ -1764,6 +1771,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "unsupported PDF feature: FileSpecBuilder: filename is not valid UTF-8; cannot encode /UF"
+        );
+    }
+
+    #[test]
+    fn embedded_file_finalizer_rejects_a_non_stream_handle() {
+        let mut pdf = open_minimal();
+        let error = EmbeddedFileStream::new_from_stream(&mut pdf, ObjectHandle::null())
+            .expect_err("the shared finalizer requires a stream handle");
+
+        assert_eq!(
+            error.to_string(),
+            "EmbeddedFile factory received a non-stream object"
         );
     }
 

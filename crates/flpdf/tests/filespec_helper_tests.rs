@@ -1147,6 +1147,8 @@ struct ChunkedProvider {
 
 struct FailingProvider;
 
+struct ErrorProvider;
+
 impl StreamDataProvider for FailingProvider {
     fn supports_retry(&self) -> bool {
         true
@@ -1163,6 +1165,17 @@ impl StreamDataProvider for FailingProvider {
         pipeline.write(b"partial").map_err(Error::from)?;
         pipeline.finish().map_err(Error::from)?;
         Ok(false)
+    }
+}
+
+impl StreamDataProvider for ErrorProvider {
+    fn provide_stream_data_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        _pipeline: &mut dyn Pipeline,
+    ) -> flpdf::Result<()> {
+        Err(Error::System("provider failure".to_owned()))
     }
 }
 
@@ -1246,6 +1259,16 @@ fn qpdf_provider_factory_with_failed_pipe_does_not_publish_embedded_metadata() {
             .message
             .contains("unable to get stream data for new embedded file stream")
     }));
+}
+
+#[test]
+fn qpdf_provider_factory_propagates_provider_errors() {
+    let mut pdf = Pdf::empty().expect("empty PDF");
+    let error =
+        EmbeddedFileStream::create_ef_stream_from_provider(&mut pdf, Rc::new(ErrorProvider))
+            .expect_err("provider errors must cross the qpdf stream boundary");
+
+    assert_eq!(error.to_string(), "provider failure");
 }
 
 #[test]
