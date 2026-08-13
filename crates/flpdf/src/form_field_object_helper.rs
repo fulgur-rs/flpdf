@@ -436,10 +436,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             }
         }
 
-        let on_value = self.checkbox_state(
-            annotation.as_ref().map(|(_, dictionary)| dictionary),
-            checked,
-        )?;
+        let annotation_dictionary = annotation.as_ref().map(|(_, dictionary)| dictionary);
+        let on_value = self.checkbox_state(annotation_dictionary, checked)?;
         let value = ObjectHandle::name(on_value);
         self.set_field_attribute(b"/V", value.clone())?;
         if let Some((annotation_ref, _)) = annotation {
