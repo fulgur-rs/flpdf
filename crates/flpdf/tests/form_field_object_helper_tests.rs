@@ -953,6 +953,25 @@ fn set_value_updates_checkbox_state_for_a_non_dictionary_direct_appearance() {
 }
 
 #[test]
+fn checkbox_propagates_an_unresolvable_normal_appearance_error() {
+    let bytes = doc(vec![(10, "<< /FT /Btn /AP << /N 99 0 R >> >>".into())]);
+    let mut pdf = open(bytes);
+
+    let result = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .set_value(ObjectHandle::name(b"On".to_vec()), false);
+
+    assert!(result.is_ok());
+    assert_eq!(
+        pdf.resolve(ObjectRef::new(10, 0))
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get("V"),
+        Some(&Object::Name(b"Yes".to_vec()))
+    );
+}
+
+#[test]
 fn set_value_resolves_null_parent_and_indirect_kids_for_button_widgets() {
     // qpdf's `getKey("/Parent")` returns a null object for an explicit
     // `/Parent null`, so `setRadioButtonValue` treats this as a top-level

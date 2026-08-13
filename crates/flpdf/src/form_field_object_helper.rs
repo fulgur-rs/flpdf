@@ -353,9 +353,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 if self.is_checkbox()? {
                     self.set_checkbox_value(name != b"Off")?;
                 } else if self.is_radio_button()? {
-                    if let Some(field) = self.dictionary_handle_for(self.field.clone())? {
-                        self.set_radio_button_value(field, &name)?;
-                    }
+                    self.set_radio_button_value(self.field.clone(), &name)?;
                 }
             }
             // qpdf ignores invalid button input and pushbutton values.
