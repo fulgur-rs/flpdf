@@ -1919,8 +1919,7 @@ impl<R: Read + Seek> Pdf<R> {
 
     /// qpdf's `ObjCopier::visiting` equivalent (see
     /// [`Pdf::foreign_object_visiting`]'s own doc). Used only by the
-    /// canonical `copy_foreign_object` port, never by the legacy
-    /// `copy_foreign_objects` route.
+    /// canonical `copy_foreign_object` port.
     pub(crate) fn take_foreign_object_visiting(&mut self, source_id: u64) -> BTreeSet<ObjectRef> {
         self.foreign_object_visiting
             .remove(&source_id)

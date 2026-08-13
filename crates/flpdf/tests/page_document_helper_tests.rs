@@ -302,19 +302,42 @@ fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
 }
 
 #[test]
+fn add_page_uses_qpdf_copy_foreign_object_null_key_filtering() {
+    let mut source = open(build_n_page_pdf(1));
+    let indirect_null = ObjectRef::new(10, 0);
+    source.set_object(indirect_null, Object::Null);
+    let Object::Dictionary(mut page) = source.resolve(ObjectRef::new(3, 0)).unwrap() else {
+        panic!("source page must be a dictionary");
+    };
+    page.insert("IndirectNull", Object::Reference(indirect_null));
+    source.set_object(ObjectRef::new(3, 0), Object::Dictionary(page));
+
+    let mut target = open(build_n_page_pdf(1));
+    PageDocumentHelper::new(&mut target)
+        .add_page(PageInput::foreign(&mut source, ObjectRef::new(3, 0)), false)
+        .expect("foreign page insertion should succeed");
+
+    let pages = PageDocumentHelper::new(&mut target)
+        .get_all_pages()
+        .expect("target pages");
+    let Object::Dictionary(copied_page) = target.resolve(pages[1]).unwrap() else {
+        panic!("foreign input must produce a target page dictionary");
+    };
+    assert!(
+        copied_page.get("IndirectNull").is_none(),
+        "qpdf getKeys omits a source dictionary key whose indirect value resolves to null"
+    );
+}
+
+#[test]
 fn add_page_recopies_a_page_left_as_a_nested_boundary_placeholder() {
-    // Regression test for round-3 Codex finding #3: `Pdf::copy_foreign_object`
-    // (the canonical port) and `PageDocumentHelper::add_page`'s legacy
-    // `copy_foreign_objects` route share one per-source map
-    // (`Pdf::foreign_object_maps`). If the canonical port first encounters a
-    // source page as a *nested* `/Pages`-boundary reference (not its
-    // top-level copy target), it reserves an indirect-null placeholder for
-    // that page and leaves it unfilled -- qpdf's own `reserveObjects` does
-    // the same (`libqpdf/QPDF.cc:2124-2132`). If the legacy route is later
-    // asked to copy that exact page as a real page-tree insertion, it must
-    // not treat the existing map entry as "already copied": doing so would
-    // insert the leftover null placeholder into the rebuilt page tree
-    // instead of the actual page content.
+    // Regression test for qpdf's nested `/Pages`-boundary behavior:
+    // `copyForeignObject` reserves an indirect-null placeholder when a source
+    // page is first encountered below another copied root, but a later
+    // top-level page copy must recopy that page instead of treating the
+    // placeholder as a completed object. This matches
+    // `reserveObjects` (`libqpdf/QPDF.cc:2118-2132`) and ensures page-tree
+    // insertion receives the actual page content.
     let mut source = open(build_n_page_pdf(1));
     let mut target = open(build_n_page_pdf(1));
 
@@ -408,10 +431,13 @@ fn add_page_does_not_copy_a_second_page_referenced_by_a_foreign_page() {
     let Object::Dictionary(copied_page) = target.resolve(pages[1]).unwrap() else {
         panic!("foreign input must produce a target page dictionary");
     };
+    let peer = copied_page
+        .get_ref("Peer")
+        .expect("qpdf reserves a target identity for the non-top-level Page");
     assert_eq!(
-        copied_page.get("Peer"),
-        Some(&Object::Null),
-        "qpdf copyForeignObject stops at non-top-level Page boundaries"
+        target.resolve(peer).unwrap(),
+        Object::Null,
+        "qpdf copyForeignObject leaves the non-top-level Page reservation null"
     );
 }
 

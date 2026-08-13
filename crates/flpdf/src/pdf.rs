@@ -102,10 +102,9 @@ pub struct Pdf<R: Read + Seek + 'static> {
     /// any work, throwing rather than silently treating the earlier
     /// failure's partial reservations as complete (`QPDF.cc:2066-2069`). Kept
     /// separate from [`Self::foreign_object_maps`], rather than folded into
-    /// one bundled per-source struct, so the pre-existing
-    /// `take_foreign_object_map`/`set_foreign_object_map` pair used by the
-    /// legacy `copy_foreign_objects` route is untouched by this poisoning
-    /// mechanism, which only the canonical `copy_foreign_object` port needs.
+    /// one bundled per-source struct, so map persistence and failure poisoning
+    /// remain independently tracked by the canonical `copy_foreign_object`
+    /// port.
     pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<ObjectRef>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
     /// repeated [`Pdf::trailer_handle`] calls return the same shared handle

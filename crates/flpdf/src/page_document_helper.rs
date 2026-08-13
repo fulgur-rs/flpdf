@@ -174,11 +174,17 @@ impl<'a, R: Read + Seek> PageDocumentHelper<'a, R> {
             PageInput::Existing(page) => Ok(page),
             PageInput::Foreign { source, page } => {
                 PageDocumentHelper::new(source).push_inherited_attributes_to_pages()?;
-                let closure = crate::page_closure::foreign_page_object_closure(source, page)?;
-                let copied = crate::object_copy::copy_foreign_objects(source, self.pdf, &closure)?;
-                copied.get(&page).copied().ok_or(Error::Missing(
-                    "foreign page was not present in the copied object graph",
-                ))
+                // qpdf's QPDF::insertPage calls copyForeignObject directly
+                // after materializing inherited attributes
+                // (libqpdf/QPDF.cc:2019-2097, libqpdf/QPDF_pages.cc:213-215).
+                // Keep page insertion on the canonical ObjectHandle graph
+                // route so reservation, /Pages boundaries, null-aware keys,
+                // and per-source identity reuse have one implementation.
+                let source_page = source.get_object_handle(page);
+                let copied = self.pdf.copy_foreign_object(&source_page)?;
+                copied
+                    .object_ref()
+                    .ok_or(Error::Missing("foreign page copy was not indirect"))
             }
         }
     }

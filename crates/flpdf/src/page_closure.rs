@@ -63,47 +63,6 @@ pub fn page_object_closure<R: Read + Seek>(
     Ok(visited)
 }
 
-/// Return the indirect objects qpdf copies for a foreign page.
-///
-/// This is `QPDF::copyForeignObject`'s page-input traversal: it follows the
-/// page's graph but never crosses into a `/Pages` node. The caller first
-/// materializes inherited attributes on the source page, as `QPDF::insertPage`
-/// does, so omitting `/Parent`'s `/Pages` tree cannot discard inherited page
-/// state. Reaching another `/Page` or `/Catalog` remains a boundary as in
-/// [`page_object_closure`].
-pub(crate) fn foreign_page_object_closure<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    page_ref: ObjectRef,
-) -> Result<BTreeSet<ObjectRef>> {
-    let mut visited = BTreeSet::new();
-    let mut queue = VecDeque::from([page_ref]);
-    visited.insert(page_ref);
-    let mut refs_found = Vec::new();
-
-    while let Some(current_ref) = queue.pop_front() {
-        let object = pdf.resolve_borrowed(current_ref)?;
-        collect_refs_in_object(object, 0, &mut refs_found)?;
-        for object_ref in refs_found.drain(..) {
-            if !foreign_copy_boundary(pdf, object_ref)? && visited.insert(object_ref) {
-                queue.push_back(object_ref);
-            }
-        }
-    }
-
-    Ok(visited)
-}
-
-fn foreign_copy_boundary<R: Read + Seek>(pdf: &mut Pdf<R>, object_ref: ObjectRef) -> Result<bool> {
-    Ok(matches!(
-        pdf.resolve_borrowed(object_ref)?,
-        Object::Dictionary(dict)
-            if matches!(
-                dict.get("Type").and_then(Object::as_name),
-                Some(b"Pages" | b"Page" | b"Catalog")
-            )
-    ))
-}
-
 /// Extend `visited` with the transitive closure of every [`ObjectRef`]
 /// reachable from `page_ref`, reusing whatever is already in `visited`.
 ///

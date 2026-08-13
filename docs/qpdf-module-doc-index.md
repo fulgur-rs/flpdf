@@ -57,7 +57,7 @@
 | `crates/flpdf/src/name_tree_dests.rs` | correspondence | QPDFNameTreeObjectHelper.cc destination-tree access split from the generic tree module |
 | `crates/flpdf/src/nntree.rs` | correspondence | NNTree.cc behavior implemented with Rust-specific storage, error, and ownership boundaries |
 | `crates/flpdf/src/object.rs` | correspondence | QPDFObjectHandle.cc and the QPDFObject/QPDFValue type family combined in one Rust object model |
-| `crates/flpdf/src/object_copy.rs` | correspondence | the canonical \`QPDF::copyForeignObject\` graph copy lives here; the older raw-object closure copier remains below as a compatibility route until its consumers migrate |
+| `crates/flpdf/src/object_copy.rs` | correspondence | the canonical \`QPDF::copyForeignObject\` graph copy and generic closed-set copy helpers |
 | `crates/flpdf/src/object_handle.rs` | correspondence | \`QPDFObjectHandle\`, \`QPDFObject\`, and \`QPDFValue\` identity and payload ownership, \`QPDF::newReserved\`/\`QPDF_Reserved\`, \`QPDFObjectHandle::copyStream\`/\`QPDF::copyStreamData\` stream-copy primitives, \`QPDF::setImmediateCopyFrom\`, plus \`QPDFWriter.cc\` \`unparseObject\`/\`writeTrailer\` writer-emission primitives (\`unparse_object\`/\`unparse_object_qdf\`/\`unparse_stream_body\`/\`unparse_stream_body_qdf\`/\`unparse_trailer\`) |
 | `crates/flpdf/src/objr_obj_annot_p.rs` | correspondence | QPDFJob.cc removed-page nulling plus QPDFWriter.cc null-key visibility specialized for OBJR annotations |
 | `crates/flpdf/src/optimization.rs` | correspondence | QPDF_optimization.cc optimization orchestration, inherited-page preparation, object-user maps, and compressed-object folding |
