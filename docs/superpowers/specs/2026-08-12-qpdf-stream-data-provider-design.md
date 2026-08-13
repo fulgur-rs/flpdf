@@ -15,7 +15,13 @@ pipeline を再利用し、EmbeddedFile の consumer migration は `flpdf-25kg.4
 
 ## qpdf 11.9.0 の確定事項
 
-参照する pinned source は `/home/ubuntu/.cache/flpdf/qpdf-11.9.0` である。
+参照する pinned source は、開発者固有の cache path を文書へ埋め込まず、
+`scripts/fetch-qpdf-source.sh --print-path` の解決結果を使う。シェル上では
+次のように取得する。
+
+```bash
+qpdf_source="$(scripts/fetch-qpdf-source.sh --print-path)"
+```
 
 1. `QPDFObjectHandle::StreamDataProvider` は `supports_retry` を保持し、通常形と
    retry-aware 形の `provideStreamData` を持つ。`QPDFObjGen` 形は `(objid,

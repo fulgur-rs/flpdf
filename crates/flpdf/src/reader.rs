@@ -6261,6 +6261,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_replacement_on_loaded_stream_survives_marked_full_rewrite() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let mut pdf = Pdf::open_mem_owned(pdf_with_one_stream(b"original payload"))
+            .expect("open stream fixture");
+        let stream = pdf.get_object_handle(stream_ref);
+        pdf.resolve_object_handle(&stream)
+            .expect("resolve loaded stream");
+
+        stream
+            .replace_stream_data_with_callback(
+                |pipeline| {
+                    pipeline
+                        .write(b"provider replacement")
+                        .map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)
+                },
+                None,
+                None,
+            )
+            .expect("register provider on loaded stream");
+        assert!(
+            pdf.dirty_object_refs().is_empty(),
+            "handle mutation remains explicitly dirty-marked"
+        );
+        pdf.mark_object_handle_dirty(&stream)
+            .expect("mark provider stream dirty");
+
+        let mut writer = crate::PdfWriter::new(&mut pdf);
+        writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
+        writer.set_preserve_unreferenced_objects(true);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("write provider-backed stream");
+        let output = writer.get_buffer().expect("take rewritten output");
+
+        let mut reopened = Pdf::open_mem_owned(output).expect("reopen rewritten output");
+        let rewritten_stream = reopened.get_object_handle(stream_ref);
+        reopened
+            .resolve_object_handle(&rewritten_stream)
+            .expect("resolve rewritten stream");
+        assert_eq!(
+            rewritten_stream
+                .get_stream_data(crate::writer::DecodeLevel::Generalized)
+                .expect("decode provider bytes from rewritten stream")
+                .as_slice(),
+            b"provider replacement"
+        );
+    }
+
     fn classic_pdf_with_bodies(bodies: &[&[u8]], root: ObjectRef) -> Vec<u8> {
         let mut pdf = b"%PDF-1.7\n".to_vec();
         let mut offsets = Vec::new();
