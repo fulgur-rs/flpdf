@@ -7951,6 +7951,20 @@ mod tests {
     }
 
     #[test]
+    fn reserved_object_unparse_resolved_falls_back_to_null() {
+        // `unparse_resolved` returns `Vec<u8>`, not `Result` -- unlike the
+        // writer-facing materialization family above (which rejects a
+        // reserved handle with `reserved_unparse_error()`), it has no
+        // exception channel to mirror qpdf's `QPDF_Reserved::unparse()`
+        // throw (`libqpdf/QPDF_Reserved.cc:22-26`) with, so it falls back to
+        // `null` the same way it already does for `NotYetResolved`/
+        // `Destroyed` (see `unparse_resolved`'s own doc for all three).
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        assert_eq!(reserved.unparse_resolved(), b"null");
+    }
+
+    #[test]
     fn new_stream_rejects_raw_piping_before_data_replacement() {
         let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let stream = pdf.new_stream().expect("new empty stream");

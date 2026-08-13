@@ -4056,10 +4056,12 @@ impl ObjectHandle {
     /// qpdf ordinals instead: not-yet-resolved reports `13`
     /// (`ot_unresolved`) and a destroyed (owning document dropped) handle
     /// reports `14` (`ot_destroyed`) — both real `qpdf_object_type_e`
-    /// entries, not invented here. `ot_uninitialized`/`ot_reserved` (qpdf's
-    /// two remaining entries) are construction-time-only states this port's
-    /// `ObjectHandle` never occupies, since every handle is fully
-    /// constructed at birth.
+    /// entries, not invented here. A reserved handle (see [`crate::Pdf::new_reserved`])
+    /// reports `1` (`ot_reserved`), qpdf's own ordinal for that state
+    /// (`include/qpdf/Constants.h:108-127`). `ot_uninitialized` (qpdf's one
+    /// remaining entry) is a construction-time-only state this port's
+    /// `ObjectHandle` never occupies, since every non-reserved handle is
+    /// fully constructed at birth.
     ///
     /// A resolved indirect handle whose own value is itself a bare
     /// reference (mirroring [`crate::Object::Reference`]; see
@@ -4260,7 +4262,7 @@ impl ObjectHandle {
     /// inlining fallback as any other direct container value; see
     /// `unparse_tests`' own direct-stream test for that case.
     ///
-    /// This port diverges from qpdf's own `unparseResolved()` in two
+    /// This port diverges from qpdf's own `unparseResolved()` in three
     /// internal resolution states that qpdf itself does not reach the same
     /// way:
     /// - **Not yet resolved**: qpdf silently dereferences (resolves) an
@@ -4276,6 +4278,16 @@ impl ObjectHandle {
     ///   return, no `Result`) and instead retains its null fallback rather
     ///   than panicking. [`Self::is_null`] intentionally remains false for a
     ///   destroyed handle.
+    /// - **Reserved** (see [`crate::Pdf::new_reserved`], not yet replaced with a
+    ///   real value): qpdf's `QPDF_Reserved::unparse()`
+    ///   (`libqpdf/QPDF_Reserved.cc:22-26`) throws `std::logic_error` the
+    ///   same way `QPDF_Destroyed::unparse()` does, for the same reason —
+    ///   this method has no exception channel to mirror that with and falls
+    ///   back to `null` here too. Unlike Destroyed/Not-yet-resolved, the
+    ///   writer-facing materialization family (`materialize_child`,
+    ///   `write_child`, `unparse_object_walk`) does reject a reserved handle
+    ///   with an error, since those return `Result`; this method is the one
+    ///   place in this file that cannot follow suit.
     pub fn unparse_resolved(&self) -> Vec<u8> {
         // Bridges through a null-omission-aware materialization walk
         // (`unparse_materialize`, distinct from the general `materialize`/
