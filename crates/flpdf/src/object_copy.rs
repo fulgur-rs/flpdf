@@ -346,7 +346,14 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 self.reserve_objects(item, false)?;
             }
         } else if let Some(entries) = foreign.as_dictionary() {
+            // qpdf's `QPDF_Dictionary::getKeys()` omits values for which
+            // `isNull()` is true (`libqpdf/QPDF_Dictionary.cc:118-125`).
+            // This includes indirect references that resolve to null, so
+            // those children must not be reserved before replacement either.
             for (_, item) in entries {
+                if item.try_is_null()? {
+                    continue;
+                }
                 self.reserve_objects(item, false)?;
             }
         } else if let Some(dictionary) = foreign.as_stream_dict() {
@@ -452,6 +459,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 Error::Internal("foreign stream reservation is not a stream".to_owned())
             })?;
             for (key, value) in source_dictionary.as_dictionary().unwrap_or_default() {
+                // qpdf obtains stream-dictionary keys through the same
+                // `QPDF_Dictionary::getKeys()` filter, so direct and indirect
+                // null values are not copied (`libqpdf/QPDF.cc:2200-2213`,
+                // `libqpdf/QPDF_Dictionary.cc:118-125`).
+                if value.try_is_null()? {
+                    continue;
+                }
                 let replacement = self.replace_foreign_indirect_objects(value, false)?;
                 destination_dictionary.replace_key(&key, replacement)?;
             }
@@ -490,6 +504,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 .resolver
                 .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
             for (key, value) in entries {
+                // `QPDF_Dictionary::getKeys()` excludes direct and indirect
+                // null values (`QPDF_Dictionary.cc:118-125`). Resolve the
+                // value exactly once here so the copy never reserves or
+                // reattaches a key qpdf would not visit.
+                if value.try_is_null()? {
+                    continue;
+                }
                 let replacement = self.replace_foreign_indirect_objects(value, false)?;
                 copied.replace_key(&key, replacement)?;
             }
@@ -1027,6 +1048,112 @@ mod tests {
             .any(|diagnostic| diagnostic
                 .message
                 .contains("unexpected reference to /Pages object while copying foreign object")));
+    }
+
+    #[test]
+    fn copy_foreign_object_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let target_refs_before = target.object_refs();
+        let indirect_null = source
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("indirect null");
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/IndirectNull", indirect_null)
+            .expect("attach indirect null");
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy dictionary with an indirect null entry");
+
+        assert!(!copied.has_key(b"/IndirectNull"));
+        assert_eq!(
+            target.object_refs().len(),
+            target_refs_before.len() + 1,
+            "qpdf getKeys excludes the null child before reservation"
+        );
+    }
+
+    #[test]
+    fn copy_foreign_stream_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let target_refs_before = target.object_refs();
+        let indirect_null = source
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("indirect null");
+        let stream = source.new_stream().expect("stream");
+        stream
+            .as_stream_dict()
+            .expect("stream dictionary")
+            .replace_key(b"/IndirectNull", indirect_null)
+            .expect("attach indirect null");
+
+        let copied = target
+            .copy_foreign_object(&stream)
+            .expect("copy stream with an indirect null dictionary entry");
+
+        assert!(!copied
+            .as_stream_dict()
+            .expect("copied stream dictionary")
+            .has_key(b"/IndirectNull"));
+        assert_eq!(
+            target.object_refs().len(),
+            target_refs_before.len() + 1,
+            "qpdf getKeys excludes the null stream-dictionary child before reservation"
+        );
+    }
+
+    #[test]
+    fn replace_foreign_stream_omits_indirect_null_dictionary_keys_like_qpdf_get_keys() {
+        let mut source = minimal_pdf();
+        let indirect_null = source
+            .make_indirect_object_handle(ObjectHandle::null())
+            .expect("indirect null");
+        let source_stream = source.new_stream().expect("source stream");
+        source_stream
+            .as_stream_dict()
+            .expect("source stream dictionary")
+            .replace_key(b"/IndirectNull", indirect_null.clone())
+            .expect("attach indirect null");
+        assert!(source_stream
+            .as_stream_dict()
+            .expect("source stream dictionary")
+            .has_key(b"/IndirectNull"));
+
+        let mut target = minimal_pdf();
+        let target_stream = target.new_stream().expect("target stream");
+        let target_value = target
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("target replacement");
+        let source_stream_ref = source_stream.object_ref().expect("source stream identity");
+        let source_null_ref = indirect_null.object_ref().expect("source null identity");
+        let target_stream_ref = target_stream.object_ref().expect("target stream identity");
+        let target_value_ref = target_value.object_ref().expect("target value identity");
+
+        let copied = {
+            let mut copier = ForeignObjectCopier {
+                target: &mut target,
+                source_id: source.unique_id(),
+                object_map: BTreeMap::from([
+                    (source_stream_ref, target_stream_ref),
+                    (source_null_ref, target_value_ref),
+                ]),
+                visiting: BTreeSet::new(),
+                direct_visiting: Vec::new(),
+                to_copy: Vec::new(),
+            };
+            copier
+                .replace_foreign_indirect_objects(source_stream, true)
+                .expect("replace foreign stream")
+        };
+
+        assert!(!copied
+            .as_stream_dict()
+            .expect("copied stream dictionary")
+            .has_key(b"/IndirectNull"));
     }
 
     #[test]
