@@ -8001,9 +8001,11 @@ mod tests {
     #[test]
     fn reserved_object_unparse_resolved_falls_back_to_null() {
         // `unparse_resolved` returns `Vec<u8>`, not `Result` -- unlike the
-        // writer-facing materialization family above (which rejects a
-        // reserved handle with `reserved_unparse_error()`), it has no
-        // exception channel to mirror qpdf's `QPDF_Reserved::unparse()`
+        // writer-facing top-level entry points above (which reject a
+        // reserved handle with `reserved_unparse_error()` when it is `self`,
+        // the value actually being dereferenced -- see
+        // `reserved_objects_are_rejected_by_object_writer_entrypoints`), it
+        // has no exception channel to mirror qpdf's `QPDF_Reserved::unparse()`
         // throw (`libqpdf/QPDF_Reserved.cc:22-26`) with, so it falls back to
         // `null` the same way it already does for `NotYetResolved`/
         // `Destroyed` (see `unparse_resolved`'s own doc for all three).

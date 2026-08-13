@@ -4664,11 +4664,11 @@ fn reserved_unparse_error() -> Error {
 // none (see its own doc): a reserved handle is always indirect, so it always
 // takes the reference-token branch below without ever being dereferenced
 // here, matching `unparseChild`'s own `isIndirect()`-only decision, which
-// never inspects the referenced object's resolved type either. Its own
-// unparseable body is rejected only when dereferenced directly -- `self` at
-// [`ObjectHandle::unparse_object`]'s top level, handled by
-// `unparse_object_walk`'s own `is_reserved` check -- not merely because it
-// is reachable as someone else's child through this function.
+// never inspects the referenced object's resolved type either. This
+// function's own caller family only rejects a reserved handle at
+// [`ObjectHandle::unparse_object`]'s top-level `self`, via
+// `unparse_object_walk`'s own `is_reserved` check -- never merely because
+// the handle is reachable as someone else's child through this function.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
     if let Some(object_ref) = handle.object_ref() {
