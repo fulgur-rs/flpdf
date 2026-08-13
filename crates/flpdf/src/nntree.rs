@@ -3697,6 +3697,81 @@ mod tests {
     }
 
     #[test]
+    fn handle_name_tree_lists_and_removes_live_values_without_materializing() {
+        let mut pdf = empty_pdf();
+        let first = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"first.txt".to_vec()),
+        )]);
+        let second = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"second.txt".to_vec()),
+        )]);
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    first.clone(),
+                    ObjectHandle::string(b"b".to_vec()),
+                    second.clone(),
+                ]),
+            )]))
+            .expect("allocate name-tree root");
+
+        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        let entries = tree.entries(&mut pdf).expect("enumerate live values");
+        assert!(entries
+            .get(b"a".as_slice())
+            .expect("first entry")
+            .is_same_object_as(&first));
+        assert!(entries
+            .get(b"b".as_slice())
+            .expect("second entry")
+            .is_same_object_as(&second));
+
+        let removed = tree
+            .remove(&mut pdf, b"a")
+            .expect("remove existing value")
+            .expect("existing value");
+        assert!(removed.is_same_object_as(&first));
+        assert!(tree
+            .find(&mut pdf, b"a")
+            .expect("lookup removed value")
+            .is_none());
+        assert!(tree
+            .remove(&mut pdf, b"missing")
+            .expect("remove missing value")
+            .is_none());
+        assert!(tree
+            .find(&mut pdf, b"b")
+            .expect("lookup surviving value")
+            .expect("surviving value")
+            .is_same_object_as(&second));
+    }
+
+    #[test]
+    fn handle_name_tree_entries_rejects_an_invalid_first_key() {
+        let mut pdf = empty_pdf();
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"not-a-string".to_vec()),
+                    ObjectHandle::null(),
+                ]),
+            )]))
+            .expect("allocate malformed name-tree root");
+
+        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        assert!(matches!(
+            tree.entries(&mut pdf),
+            Err(Error::Internal(message))
+                if message == "attempt made to dereference an invalid name/number tree iterator"
+        ));
+    }
+
+    #[test]
     fn direct_kid_diagnostics_do_not_blame_the_indirect_anchor() {
         let anchor = ObjectRef::new(17, 0);
         assert_eq!(NodeHandle::indirect(anchor).diagnostic_ref(), Some(anchor));
