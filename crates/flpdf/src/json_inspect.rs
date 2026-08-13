@@ -274,7 +274,7 @@ fn dict_to_json(
     let mut pairs = Vec::new();
     for (raw_key, value) in entries {
         let key_str = qpdf_dictionary_key_to_json_string(raw_key);
-        let json_val = pdf_object_to_json_bounded(value, depth + 1)?;
+        let json_val = pdf_object_to_json_bounded(value, depth + 1, false)?;
         pairs.push((key_str, json_val));
     }
     // Sort by the escaped "/Name" string so the lexicographic order is stable
@@ -688,10 +688,36 @@ const JSON_CONVERT_STACK_GROWTH_SIZE: usize = 1024 * 1024;
 /// at all), so this bounds recursion the same way
 /// [`ObjectHandle::materialize`] does rather than assuming acyclic input.
 pub fn pdf_object_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
-    pdf_object_to_json_bounded(handle, 0)
+    pdf_object_to_json_bounded(handle, 0, false)
 }
 
-fn pdf_object_to_json_bounded(handle: &ObjectHandle, depth: usize) -> Result<Json, ConvertError> {
+/// Convert an outline `/Dest` handle into the qpdf v2 JSON value form,
+/// first resolving *this* handle's own indirect identity (if any) to its
+/// value before dispatching by type — qpdf's
+/// `getJSON(json_version, /* dereference_indirect = */ true)` contract
+/// (`libqpdf/QPDFObjectHandle.cc:1614-1634`), used for outline `/Dest`
+/// (`libqpdf/QPDFJob.cc:1086`, `:1126`: `oiter.getDest().getJSON(m->json_version,
+/// true)`, contrasted with the `object` field's plain
+/// `getJSON(m->json_version)` immediately above each of those calls, at the
+/// default `dereference_indirect=false` that [`pdf_object_to_json`] itself
+/// always uses). Nested indirect children — for example the page operand of
+/// a `[3 0 R /Fit]` destination array — are still rendered as their own
+/// `"N G R"` reference strings: `dereference_indirect` never cascades past
+/// the handle it is called on directly (`libqpdf/QPDF_Array.cc:153-187`,
+/// `libqpdf/QPDF_Dictionary.cc:72-96` test each child's own
+/// `getObjGen().isIndirect()` unconditionally, ignoring the flag their
+/// parent was serialized with). Confirmed against live qpdf 11.9.0: `/Dest 8
+/// 0 R` with object 8 holding `[3 0 R /Fit]` emits `"dest": ["3 0 R",
+/// "/Fit"]`.
+fn pdf_dest_to_json(handle: &ObjectHandle) -> Result<Json, ConvertError> {
+    pdf_object_to_json_bounded(handle, 0, true)
+}
+
+fn pdf_object_to_json_bounded(
+    handle: &ObjectHandle,
+    depth: usize,
+    dereference_indirect: bool,
+) -> Result<Json, ConvertError> {
     if depth > crate::parser::MAX_PARSE_DEPTH {
         return Err(ConvertError::PdfError(format!(
             "object nesting exceeds maximum depth of {}",
@@ -707,7 +733,19 @@ fn pdf_object_to_json_bounded(handle: &ObjectHandle, depth: usize) -> Result<Jso
         JSON_CONVERT_STACK_GROWTH_SIZE,
         || {
             if let Some(object_ref) = handle.object_ref() {
-                return Ok(reference_json(object_ref));
+                // `dereference_indirect` resolves only *this* handle's own
+                // identity, one level — see `pdf_dest_to_json`'s doc for the
+                // qpdf citation. It cannot force resolution of a handle no
+                // other code path has resolved yet (design: no hidden I/O in
+                // this pure `ObjectHandle`→JSON conversion), and a Reserved
+                // sentinel (see `Pdf::new_reserved`) has no real value to
+                // dispatch on either, so both states still fall back to the
+                // reference form even when `dereference_indirect` is set —
+                // the same reference form the early return below produces
+                // unconditionally when it is not.
+                if !dereference_indirect || !handle.is_resolved() || handle.is_reserved() {
+                    return Ok(reference_json(object_ref));
+                }
             }
             // A *direct* handle can still hold a literal `ObjectValue::Reference`:
             // `Pdf::set_object(holder, Object::Reference(target))` resolves
@@ -778,7 +816,7 @@ fn pdf_object_to_json_bounded(handle: &ObjectHandle, depth: usize) -> Result<Jso
                         .expect("type_code()==8 (array) ⇒ as_array");
                     let values: Result<Vec<Json>, ConvertError> = children
                         .iter()
-                        .map(|child| pdf_object_to_json_bounded(child, depth + 1))
+                        .map(|child| pdf_object_to_json_bounded(child, depth + 1, false))
                         .collect();
                     json_array(values?)
                 }
@@ -1242,7 +1280,7 @@ fn outline_item_to_json(
     page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
 ) -> Result<Json, ConvertError> {
     let item = &tree[id];
-    let dest = pdf_object_to_json(&item.dest)?;
+    let dest = pdf_dest_to_json(&item.dest)?;
     let destpageposfrom1 = item
         .dest_page()
         .object_ref()
@@ -5273,6 +5311,58 @@ mod tests {
     }
 
     #[test]
+    fn pdf_dest_to_json_dereferences_a_resolved_indirect_array() {
+        let mut pdf = empty_pdf();
+        let dest_ref = ObjectRef::new(9, 0);
+        pdf.set_object(
+            dest_ref,
+            Object::Array(vec![
+                Object::Reference(ObjectRef::new(3, 0)),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+        pdf.resolve(dest_ref).unwrap();
+        let handle = pdf.get_object_handle(dest_ref);
+
+        let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("3 0 R".to_string()),
+                serde_json::Value::String("/Fit".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn pdf_dest_to_json_falls_back_to_the_reference_form_for_an_unresolved_handle() {
+        // `dereference_indirect` cannot force resolution (no I/O capability
+        // in this pure ObjectHandle -> JSON conversion): a dest handle no
+        // other code path has resolved yet must still render as its own
+        // "N G R" string rather than panicking on an unresolved type_code().
+        let handle = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), 0);
+        assert!(!handle.is_resolved(), "sanity: still unresolved");
+        let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
+        assert_eq!(result, serde_json::Value::String("9 0 R".to_string()));
+    }
+
+    #[test]
+    fn pdf_dest_to_json_falls_back_to_the_reference_form_for_a_reserved_handle() {
+        // Same fallback as the unresolved case above, for the other state
+        // `dereference_indirect` cannot dispatch on: a Reserved sentinel
+        // (`Pdf::new_reserved`) has no real value yet, only a reserved
+        // indirect identity of its own.
+        let pdf = empty_pdf();
+        let handle = pdf.new_reserved().unwrap();
+        assert!(handle.is_reserved(), "sanity: freshly reserved");
+        let object_ref = handle
+            .object_ref()
+            .expect("sanity: reserved handles are indirect");
+        let result = project(super::pdf_dest_to_json(&handle).unwrap()).unwrap();
+        assert_eq!(result, serde_json::Value::String(format!("{object_ref}")));
+    }
+
+    #[test]
     fn a_cycle_in_a_directly_constructed_handle_graph_errors_instead_of_overflowing_the_stack() {
         // Regression coverage: unlike the legacy Object tree, two direct
         // dictionaries can be linked to each other via replace_key with no
@@ -7829,6 +7919,56 @@ mod tests {
             ])
         );
         assert_eq!(value_for_key(&item, "destpageposfrom1"), &number(1));
+    }
+
+    /// An indirect `/Dest 8 0 R` where object 8 resolves to `[3 0 R /Fit]`.
+    /// qpdf's own `--json=2 --json-key=outlines` dereferences the `/Dest`
+    /// holder itself (`oiter.getDest().getJSON(m->json_version, true)`,
+    /// `libqpdf/QPDFJob.cc:1126`) while leaving the nested page reference as
+    /// its own `"N G R"` string — confirmed against live qpdf 11.9.0 on this
+    /// exact object shape, which emits `"dest": ["3 0 R", "/Fit"]`. Contrast
+    /// with `object`, which stays as the bare holder reference
+    /// (`oiter.getObjectHandle().getJSON(m->json_version)`, no dereference).
+    #[test]
+    fn outline_json_v2_dereferences_an_indirect_dest_but_not_its_page_child() {
+        let mut pdf = load_one_page_pdf();
+        let page_ref = crate::pages::page_refs(&mut pdf).unwrap()[0];
+        let outline_root_ref = crate::ObjectRef::new(100, 0);
+        let item_ref = crate::ObjectRef::new(101, 0);
+        let dest_array_ref = crate::ObjectRef::new(102, 0);
+
+        let mut outline_root = Dictionary::new();
+        outline_root.insert("First", Object::Reference(item_ref));
+        patch_outline_root(&mut pdf, outline_root_ref, outline_root);
+
+        let mut item = Dictionary::new();
+        item.insert("Title", Object::String(b"Indirect Dest".to_vec()));
+        item.insert("Dest", Object::Reference(dest_array_ref));
+        pdf.set_object(item_ref, Object::Dictionary(item));
+        pdf.set_object(
+            dest_array_ref,
+            Object::Array(vec![
+                Object::Reference(page_ref),
+                Object::Name(b"Fit".to_vec()),
+            ]),
+        );
+
+        let result = build_outlines_section(&mut pdf).unwrap();
+        let entries = json_array(&result);
+        let item = json_object(&entries[0]);
+
+        assert_eq!(
+            value_for_key(&item, "dest"),
+            &serde_json::Value::Array(vec![
+                serde_json::Value::String(page_ref.to_string()),
+                serde_json::Value::String("/Fit".into()),
+            ])
+        );
+        assert_eq!(value_for_key(&item, "destpageposfrom1"), &number(1));
+        assert_eq!(
+            value_for_key(&item, "object"),
+            &serde_json::Value::String(item_ref.to_string())
+        );
     }
 
     /// Helper: inject a synthetic /Outlines tree into the catalog of `pdf`.
