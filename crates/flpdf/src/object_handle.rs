@@ -2796,6 +2796,7 @@ impl ObjectHandle {
     /// Replace every item in this live array while preserving the array
     /// handle itself. Returns `false` for a non-array handle or when the
     /// replacement would create a direct value-alias cycle.
+    #[allow(dead_code)] // retained for the canonical array-mutation primitive and its tests
     pub(crate) fn replace_array_items(&self, items: Vec<ObjectHandle>) -> bool {
         if items
             .iter()
