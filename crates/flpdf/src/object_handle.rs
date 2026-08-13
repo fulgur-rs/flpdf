@@ -4284,10 +4284,23 @@ impl ObjectHandle {
     ///   same way `QPDF_Destroyed::unparse()` does, for the same reason —
     ///   this method has no exception channel to mirror that with and falls
     ///   back to `null` here too. Unlike Destroyed/Not-yet-resolved, the
-    ///   writer-facing materialization family (`materialize_child`,
-    ///   `write_child`, `unparse_object_walk`) does reject a reserved handle
-    ///   with an error, since those return `Result`; this method is the one
-    ///   place in this file that cannot follow suit.
+    ///   writer-facing top-level entry points ([`Self::materialize`],
+    ///   `unparse_object_walk` and its QDF/ref-map siblings,
+    ///   `unparse_stream_body` and its siblings, `unparse_trailer`) do
+    ///   reject a reserved handle with an error, since those return
+    ///   `Result` — but only when the reserved handle *is* the value being
+    ///   dereferenced there, mirroring where qpdf's own throw is actually
+    ///   reached (`QPDFObjectHandle::unparseResolved`,
+    ///   `QPDFObjectHandle.cc:1586-1592`, dereferencing before calling the
+    ///   resolved value's own `unparse()`). A reserved handle reached only
+    ///   as an indirect *child* of another container is never rejected:
+    ///   `materialize_child`/`write_child` and their QDF/ref-map siblings
+    ///   write its own `"N G R"` reference form like any other indirect
+    ///   child, matching `QPDFWriter::unparseChild`
+    ///   (`libqpdf/QPDFWriter.cc:1144-1156`), which checks only
+    ///   `isIndirect()` and never inspects what the reference resolves to.
+    ///   This method is the one place in this file that cannot follow
+    ///   either suit.
     pub fn unparse_resolved(&self) -> Vec<u8> {
         // Bridges through a null-omission-aware materialization walk
         // (`unparse_materialize`, distinct from the general `materialize`/
@@ -4524,11 +4537,23 @@ fn materialize_value(value: &ObjectValue, depth: usize) -> Result<Object> {
 // An array/dictionary child handle materializes to `Object::Reference`
 // without recursing into it when indirect (identity-preserving, matching
 // the parser's pre-existing `Object::Reference` semantics); a direct child
-// is materialized in place.
+// is materialized in place. Mirrors `QPDFWriter::unparseChild`
+// (`libqpdf/QPDFWriter.cc:1144-1156`), whose `child.isIndirect()` check
+// (`:1149`) is the only thing that decides reference-vs-recurse: it never
+// inspects what the referenced object resolves to, so an indirect object
+// that happens to be qpdf's reserved sentinel (`QPDF_Reserved`) is written
+// as an ordinary `"N G R"` reference like any other, never dereferenced,
+// here. This has no separate reserved check for the same reason: a reserved
+// handle is always indirect by construction
+// (`ObjectHandle::new_reserved_for_pdf` always pairs `ObjectState::Reserved`
+// with a freshly allocated `object_ref`, and every place that later clears
+// `object_ref` -- `disconnect`/`remove_from_document` -- first transitions
+// the state away from `Reserved`), so it always takes the `Some` arm below.
+// Its own unparseable body is rejected only where qpdf's own equivalent
+// throw is reached: dereferencing the reserved object directly, e.g.
+// [`ObjectHandle::materialize`]'s own `is_reserved` check, never merely
+// because it is reachable as someone else's child.
 fn materialize_child(handle: &ObjectHandle, depth: usize) -> Result<Object> {
-    if handle.is_reserved() {
-        return Err(reserved_unparse_error());
-    }
     Ok(match handle.object_ref() {
         Some(object_ref) => Object::Reference(object_ref),
         None => materialize_bounded(handle, depth)?,
@@ -4628,16 +4653,24 @@ fn reserved_unparse_error() -> Error {
 // Writes one child handle's bytes for the plain-unparse family serviced by
 // `unparse_object_walk` below: an indirect child always writes as its own
 // `"N G R"` reference form, never recursed into — the same reference-vs-
-// recurse split `unparse_materialize_child` above already applies, mirroring
-// `QPDFWriter::unparseObject`'s own `object.isIndirect()` check before
-// descending into an array element or dictionary value
-// (`QPDFWriter.cc:1330-1345`/`:1490-1527`). A direct child recurses through
-// `unparse_object_walk`.
+// recurse split `materialize_child`/`unparse_materialize_child` above already
+// apply, mirroring `QPDFWriter::unparseChild`'s own `child.isIndirect()`
+// check (`libqpdf/QPDFWriter.cc:1144-1156`, the check itself at `:1149`),
+// which `unparseObject`'s array-element and dictionary-value loops call into
+// for exactly this decision (`:1342`, `:1503`) instead of inlining it. A
+// direct child recurses through `unparse_object_walk`.
+//
+// No separate reserved check, for the same reason `materialize_child` has
+// none (see its own doc): a reserved handle is always indirect, so it always
+// takes the reference-token branch below without ever being dereferenced
+// here, matching `unparseChild`'s own `isIndirect()`-only decision, which
+// never inspects the referenced object's resolved type either. Its own
+// unparseable body is rejected only when dereferenced directly -- `self` at
+// [`ObjectHandle::unparse_object`]'s top level, handled by
+// `unparse_object_walk`'s own `is_reserved` check -- not merely because it
+// is reachable as someone else's child through this function.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn write_child(handle: &ObjectHandle, out: &mut Vec<u8>) -> Result<()> {
-    if handle.is_reserved() {
-        return Err(reserved_unparse_error());
-    }
     if let Some(object_ref) = handle.object_ref() {
         out.extend_from_slice(object_ref.to_string().as_bytes());
         return Ok(());
@@ -4860,15 +4893,19 @@ fn unparse_object_value(value: &ObjectValue, out: &mut Vec<u8>) -> Result<()> {
 
 type ObjectRefMap<'a> = dyn Fn(ObjectRef) -> Result<ObjectRef> + 'a;
 
+// Ref-map sibling of `write_child` above -- same reference-vs-recurse split
+// on `handle.object_ref()` alone, so the same reasoning applies: a reserved
+// child is always indirect and therefore always takes this `Some` branch
+// (writing its mapped reference token, or `null` if renumbering removed it,
+// per the qpdf-rewrite null-handling below) without ever being dereferenced
+// here. See `write_child`'s own doc for why no separate reserved check
+// belongs in a child-position function at all.
 fn write_child_with_ref_map(
     handle: &ObjectHandle,
     out: &mut Vec<u8>,
     map: &ObjectRefMap<'_>,
     removed_refs: &BTreeSet<ObjectRef>,
 ) -> Result<()> {
-    if handle.is_reserved() {
-        return Err(reserved_unparse_error());
-    }
     if let Some(object_ref) = handle.object_ref() {
         if object_ref.number == 0 || removed_refs.contains(&object_ref) {
             // qpdf's direct-null identity is object number zero, not an
@@ -5205,11 +5242,12 @@ fn push_spaces(out: &mut Vec<u8>, n: usize) {
 // element or dict value sits at its container's `indent + 2`; see
 // `unparse_object_value_qdf`'s own Array/Dictionary arms for where that
 // `+ 2` is actually applied before calling this).
+//
+// No separate reserved check either, for the identical reason `write_child`
+// has none: a reserved child is always indirect, so it always takes the
+// reference-token branch below without ever being dereferenced here.
 #[allow(dead_code)] // production callers land when flpdf-egzr.3.2.5 migrates writer consumers onto this API
 fn write_child_qdf(handle: &ObjectHandle, indent: usize, out: &mut Vec<u8>) -> Result<()> {
-    if handle.is_reserved() {
-        return Err(reserved_unparse_error());
-    }
     if let Some(object_ref) = handle.object_ref() {
         out.extend_from_slice(object_ref.to_string().as_bytes());
         return Ok(());

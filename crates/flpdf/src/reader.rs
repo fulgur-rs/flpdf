@@ -7862,31 +7862,52 @@ mod tests {
             expected
         );
 
+        // A reserved handle reached only as an indirect *child* of a direct
+        // container is a different case from all of the above: qpdf's own
+        // `QPDFWriter::unparseChild` (`libqpdf/QPDFWriter.cc:1144-1156`)
+        // decides reference-vs-recurse from `child.isIndirect()` alone and
+        // never inspects what the reference resolves to, so an indirect
+        // reserved child writes as an ordinary bare `"N G R"` reference,
+        // same as any other indirect child -- it is never dereferenced at
+        // this position, so its unparseable body never matters here. Only
+        // dereferencing the reserved object *itself* (the `reserved.foo()`
+        // calls above and below, where `reserved` is `self`) reaches qpdf's
+        // real throw. Codex Review on PR #789,
+        // crates/flpdf/src/object_handle.rs:4529.
+        let object_ref = reserved
+            .object_ref()
+            .expect("a reserved handle is always indirect by construction");
         let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved.clone())]);
+        out.clear();
+        containing
+            .unparse_object(&mut out)
+            .expect("an indirect reserved child must serialize as a bare reference");
         assert_eq!(
-            containing
-                .unparse_object(&mut out)
-                .expect_err("reachable reserved object must reject the writer")
-                .to_string(),
-            expected
+            out,
+            format!("<< /Reserved {object_ref} >>").into_bytes(),
+            "the reserved child appears in its own reference form, never recursed into"
         );
+
+        let materialized = containing
+            .materialize()
+            .expect("an indirect reserved child must materialize to Object::Reference");
+        let Object::Dictionary(materialized) = materialized else {
+            panic!("expected a dictionary"); // cov:ignore: unreachable in a passing run
+        };
         assert_eq!(
-            containing
-                .materialize()
-                .expect_err("materialization must reject a reserved child")
-                .to_string(),
-            expected
+            materialized.get("Reserved"),
+            Some(&Object::Reference(object_ref))
         );
 
         out.clear();
         let qdf_containing =
             ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved.clone())]);
+        qdf_containing.unparse_object_qdf(&mut out, 0).expect(
+            "an indirect reserved child must serialize as a bare reference in QDF mode too",
+        );
         assert_eq!(
-            qdf_containing
-                .unparse_object_qdf(&mut out, 0)
-                .expect_err("QDF child writer must reject reserved objects")
-                .to_string(),
-            expected
+            out,
+            format!("<<\n  /Reserved {object_ref}\n>>").into_bytes()
         );
 
         out.clear();
@@ -7948,6 +7969,33 @@ mod tests {
             error.to_string(),
             "QPDFObjectHandle: attempting to unparse a reserved object"
         );
+    }
+
+    #[test]
+    fn an_indirect_reserved_child_writes_as_a_bare_reference_through_the_ref_map_family() {
+        // `unparse_object_with_ref_map_and_removed`/`write_child_with_ref_map`
+        // are the primitives `writer/plain/body.rs`/`writer/plain/plan.rs`
+        // actually call in production, unlike the still-`#[allow(dead_code)]`
+        // `unparse_object`/`write_child` family exercised by
+        // `reserved_objects_are_rejected_by_object_writer_entrypoints` above
+        // -- so this pins the identical child-position fix against the code
+        // path real document writes use today.
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let object_ref = reserved
+            .object_ref()
+            .expect("a reserved handle is always indirect by construction");
+        let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved)]);
+
+        let mut out = Vec::new();
+        containing
+            .unparse_object_with_ref_map_and_removed(
+                &mut out,
+                &|object_ref| Ok(object_ref),
+                &BTreeSet::new(),
+            )
+            .expect("an indirect reserved child must serialize as a bare reference");
+        assert_eq!(out, format!("<< /Reserved {object_ref} >>").into_bytes());
     }
 
     #[test]
