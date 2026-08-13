@@ -242,11 +242,13 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 return Ok(());
             }
 
-            if let Some(&target_ref) = self.object_map.get(&source_ref) {
-                let mapped = self.target.get_object_handle(target_ref);
+            let target_ref;
+            if let Some(&existing_target_ref) = self.object_map.get(&source_ref) {
+                let mapped = self.target.get_object_handle(existing_target_ref);
                 if !(top && is_page && mapped.is_null()) {
                     return Ok(());
                 }
+                target_ref = existing_target_ref;
             } else {
                 let mapped = if is_stream {
                     self.target.new_stream()?
@@ -259,7 +261,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 };
                 // cov:ignore-start: every reservation branch above returns an indirect handle;
                 // this protects the canonical map invariant if a future allocator changes.
-                let target_ref = mapped.object_ref().ok_or_else(|| {
+                target_ref = mapped.object_ref().ok_or_else(|| {
                     Error::Internal("foreign copier created a direct reservation".to_owned())
                 })?;
                 // cov:ignore-end
@@ -268,6 +270,18 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 
             self.visiting.insert(source_ref);
             if !top && is_page {
+                // A nested `/Page` reservation never enters `to_copy` (qpdf's
+                // own `reserveObjects` returns without queuing it too,
+                // `QPDF.cc:2124-2132`), so `run()`'s replace loop -- the only
+                // other call site that dirty-marks a freshly reserved
+                // object -- never reaches it. Left unmarked, this indirect
+                // null placeholder is registered in the handle registry and
+                // referenced by the copied ancestor, yet never scheduled for
+                // canonical writer output: a full rewrite would emit the
+                // reference but not the placeholder object itself, leaving it
+                // dangling (see `make_indirect_from_object_handle`'s own doc
+                // on this exact failure mode).
+                self.target.mark_object_dirty(target_ref);
                 self.visiting.remove(&source_ref);
                 return Ok(());
             }
@@ -684,7 +698,7 @@ fn alloc_target_number(base: u32, offset: usize) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::object::MAX_INLINE_DEPTH;
-    use crate::ObjectHandle;
+    use crate::{ObjectHandle, ObjectStreamMode, PdfWriter};
     use std::io::Cursor;
     use std::rc::Rc;
 
@@ -1191,6 +1205,82 @@ mod tests {
             Some(b"Page".to_vec())
         );
         assert!(copied_page.get_key(b"/Parent").is_null());
+    }
+
+    #[test]
+    fn copy_foreign_object_dirty_marks_a_nested_page_null_reservation() {
+        // Regression test for round-3 Codex finding #2: a nested `/Page`
+        // reservation created while copying some other, unrelated root
+        // returns before ever entering `to_copy` (`QPDF.cc:2124-2132`
+        // mirrors this early return). Without an explicit dirty mark, that
+        // fresh indirect null placeholder -- now referenced by the copied
+        // ancestor -- would be dropped from a full rewrite, leaving the
+        // reference dangling in the written output.
+        //
+        // The holder is an *array* member, not a dictionary key: qpdf's own
+        // `QPDF_Dictionary::getKeys()` hides any key whose value currently
+        // resolves to null (`QPDF_Dictionary.cc:118-127`), so a dict-keyed
+        // reference to a still-null placeholder self-heals by disappearing
+        // from serialization entirely, regardless of dirty state. Arrays
+        // have no such elision (`QPDF_Array` keeps every position), so an
+        // array-held nested-page reference is the shape that actually
+        // exercises the dangling-reference failure the finding describes.
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let page = source.get_object_handle(ObjectRef::new(3, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Kids".to_vec(),
+                ObjectHandle::array(vec![page.clone()]),
+            )]))
+            .expect("root");
+
+        let copied_root = target
+            .copy_foreign_object(&root)
+            .expect("copy root with nested page boundary");
+        let kids = copied_root.get_key(b"/Kids");
+        let boundary_ref = kids
+            .as_array()
+            .expect("Kids is an array")
+            .first()
+            .expect("Kids has one element")
+            .object_ref()
+            .expect("nested page reservation is indirect");
+
+        assert!(
+            target.dirty_object_refs().contains(&boundary_ref),
+            "nested /Page reservation must be scheduled for writer output"
+        );
+
+        // Link the copied root into the target's reachable graph (a floating
+        // handle proves nothing about a full rewrite: the canonical writer
+        // discovers objects by walking from `/Root`, so the copied root
+        // itself must be reachable for its `/Kids` array to be discovered
+        // and put to the dangling-reference test the finding describes).
+        let catalog_ref = target.root_ref().expect("target has a root");
+        let catalog = target.get_object_handle(catalog_ref);
+        catalog.replace_key(b"/CopiedRoot", copied_root.clone());
+        target.mark_object_dirty(catalog_ref);
+
+        let mut writer = PdfWriter::new(&mut target);
+        writer.set_object_stream_mode(ObjectStreamMode::Disable);
+        writer.set_output_memory().expect("configure memory output");
+        writer.write().expect("full rewrite");
+        let written_ref = writer
+            .get_renumbered_obj_gen(boundary_ref)
+            .expect("query renumbering")
+            .expect(
+                "nested page placeholder must survive a full rewrite instead of \
+                 leaving the copied ancestor's array reference dangling",
+            );
+        let out = writer.get_buffer().expect("take full-rewrite output");
+
+        let mut reopened = Pdf::open(Cursor::new(out)).expect("reopen written output");
+        assert!(reopened.object_refs().contains(&written_ref));
+        assert!(reopened
+            .resolve(written_ref)
+            .expect("resolve written placeholder")
+            .is_null());
     }
 
     #[test]
