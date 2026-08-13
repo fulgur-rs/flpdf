@@ -77,6 +77,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use crate::nntree::HandleNameTree;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeMap;
@@ -97,272 +98,87 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
         Self { pdf }
     }
 
-    fn embedded_files_root(&mut self) -> Result<Option<Object>> {
-        // cov:ignore-start: helper methods always have a parsed catalog root
+    fn embedded_files_tree(&mut self) -> Result<Option<HandleNameTree>> {
+        // cov:ignore-start: helper methods normally receive a parsed catalog root
         let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None); // cov:ignore: helper methods always have a parsed catalog root
+            return Ok(None); // cov:ignore: helper methods normally receive a parsed catalog root
         };
         // cov:ignore-end
-        let Some(catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict() else {
-            return Ok(None);
-        };
-        let Some(names) = catalog.get("Names").cloned() else {
-            return Ok(None);
-        };
-        let (names, _) = resolve_ref_chain(self.pdf, &names)?;
-        let Some(names) = names.into_dict() else {
-            return Ok(None);
-        };
-        let Some(root) = names.get("EmbeddedFiles").cloned() else {
-            return Ok(None);
-        };
-        let (terminal, _) = resolve_ref_chain(self.pdf, &root)?;
-        if terminal.as_dict().is_some() {
-            Ok(Some(root))
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn name_tree(&mut self) -> Result<Option<crate::NameTree>> {
-        Ok(self
-            .embedded_files_root()?
-            .map(|root| crate::NameTree::new(root, true)))
-    }
-
-    /// Write a repaired direct tree root back through its `/Names` owner.
-    ///
-    /// qpdf's object handles mutate direct dictionary values in place. Rust's
-    /// `NameTree` owns an `Object` value, so a read that repairs a direct kid
-    /// must explicitly restore that value into the catalog path.
-    fn store_embedded_files_root(&mut self, root: Object) -> Result<()> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(()); // cov:ignore: name_tree already resolved /Root
-        };
-        let Some(mut catalog) = self.pdf.resolve_borrowed(catalog_ref)?.as_dict().cloned() else {
-            return Ok(()); // cov:ignore: name_tree already resolved a catalog dictionary
-        };
-        match catalog.get("Names").cloned() {
-            Some(Object::Dictionary(mut names)) => {
-                names.insert("EmbeddedFiles", root);
-                catalog.insert("Names", Object::Dictionary(names));
-                self.pdf
-                    .set_object(catalog_ref, Object::Dictionary(catalog));
-            }
-            Some(value @ Object::Reference(source_ref)) => {
-                let (terminal, terminal_ref) = resolve_ref_chain(self.pdf, &value)?;
-                let Some(mut names) = terminal.into_dict() else {
-                    return Ok(()); // cov:ignore: name_tree already resolved this names dictionary
-                };
-                names.insert("EmbeddedFiles", root);
-                self.pdf.set_object(
-                    terminal_ref.unwrap_or(source_ref),
-                    Object::Dictionary(names),
-                );
-            }
-            _ => {} // cov:ignore: name_tree established a direct or indirect /Names owner
-        }
-        Ok(())
-    }
-
-    fn store_embedded_files_root_if_changed(
-        &mut self,
-        original_root: &Object,
-        root: Object,
-    ) -> Result<()> {
-        if &root != original_root {
-            self.store_embedded_files_root(root)?;
-        }
-        Ok(())
-    }
-
-    /// Return the live direct `/EmbeddedFiles` handle when one is retained in
-    /// the catalog's canonical handle graph.
-    fn direct_embedded_files_root_handle(&mut self) -> Result<Option<(ObjectHandle, ObjectRef)>> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None); // cov:ignore: helper methods require a parsed catalog root
-        };
         let catalog = self.pdf.get_object_handle(catalog_ref);
         self.pdf.resolve_object_handle(&catalog)?;
-        let (names, terminal_ref) = self
+        if catalog.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        if !catalog.has_key(b"/Names") {
+            return Ok(None);
+        }
+        let names_seed = catalog.get_key(b"/Names");
+        let names = self.pdf.resolve_object_handle_to_terminal(&names_seed)?;
+        if names.try_as_dictionary()?.is_none() || !names.has_key(b"/EmbeddedFiles") {
+            return Ok(None);
+        }
+        let root_seed = names.get_key(b"/EmbeddedFiles");
+        let root = self.pdf.resolve_object_handle_to_terminal(&root_seed)?;
+        if root.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(HandleNameTree::new(root, self.pdf.unique_id(), true)))
+    }
+
+    fn ensure_embedded_files_tree(&mut self) -> Result<Option<HandleNameTree>> {
+        if let Some(tree) = self.embedded_files_tree()? {
+            return Ok(Some(tree));
+        }
+
+        // cov:ignore-start: qpdf always has a catalog root for this mutating helper
+        let Some(catalog_ref) = self.pdf.root_ref() else {
+            return Ok(None); // cov:ignore: qpdf always has a catalog root
+        };
+        // cov:ignore-end
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        self.pdf.resolve_object_handle(&catalog)?;
+        if catalog.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+
+        let names = if catalog.has_key(b"/Names") {
+            let candidate = catalog.get_key(b"/Names");
+            let names = self.pdf.resolve_object_handle_to_terminal(&candidate)?;
+            if names.try_as_dictionary()?.is_some() {
+                names
+            } else {
+                let names = ObjectHandle::dictionary(Vec::new());
+                catalog.replace_key(b"/Names", names.clone());
+                self.pdf.mark_object_handle_dirty(&catalog)?;
+                names
+            }
+        } else {
+            let names = ObjectHandle::dictionary(Vec::new());
+            catalog.replace_key(b"/Names", names.clone());
+            self.pdf.mark_object_handle_dirty(&catalog)?;
+            names
+        };
+
+        let root = self.new_empty_embedded_files_root(&names)?;
+
+        Ok(Some(HandleNameTree::new(root, self.pdf.unique_id(), true)))
+    }
+
+    fn new_empty_embedded_files_root(&mut self, names: &ObjectHandle) -> Result<ObjectHandle> {
+        let root = self
             .pdf
-            .resolve_object_handle_to_terminal_ref(&catalog.get_key(b"/Names"))?;
-        let names = terminal_ref
-            .map(|object_ref| self.pdf.get_object_handle(object_ref))
-            .unwrap_or(names);
-        let root = names.get_key(b"/EmbeddedFiles");
-        Ok(
-            (root.object_ref().is_none() && root.as_dictionary().is_some())
-                .then_some((root, terminal_ref.unwrap_or(catalog_ref))),
-        )
-    }
-
-    /// Copy a legacy name-tree update into a caller-retained direct root.
-    ///
-    /// qpdf mutates the shared root handle. The legacy writer still performs
-    /// its tree work on `Object`; replaying the resulting dictionary into the
-    /// original handle preserves the observable direct-handle identity.
-    fn update_direct_embedded_files_root(
-        &mut self,
-        target: &ObjectHandle,
-        owner_ref: ObjectRef,
-        updated: Object,
-    ) -> Result<()> {
-        if target.materialize()? == updated {
-            return Ok(());
-        }
-        let updated = self.pdf.lift_object_to_handle(&updated)?;
-        // cov:ignore-start: caller builds `updated` from a NameTree dictionary root
-        let Some(entries) = updated.as_dictionary() else {
-            return Ok(());
-        };
-        let Some(existing) = target.as_dictionary() else {
-            return Ok(());
-        };
-        // cov:ignore-end
-        // cov:ignore-start: NameTree updates preserve the root's /Names key
-        for key in existing.keys().filter(|key| !entries.contains_key(*key)) {
-            target.remove_key(key);
-        }
-        // cov:ignore-end
-        for (key, value) in entries {
-            let value = match existing.get(&key) {
-                Some(current) if Self::same_handle_value(current, &value)? => current.clone(),
-                Some(current) => Self::merge_updated_root_entry(&key, current, value)?,
-                None => value,
-            };
-            target.replace_key(&key, value);
-        }
-        self.pdf.mark_object_dirty(owner_ref);
-        Ok(())
-    }
-
-    fn same_handle_value(left: &ObjectHandle, right: &ObjectHandle) -> Result<bool> {
-        Ok(match (left.object_ref(), right.object_ref()) {
-            (Some(left_ref), Some(right_ref)) => left_ref == right_ref,
-            (None, None) => left.materialize()? == right.materialize()?,
-            _ => false,
-        })
-    }
-
-    fn merge_updated_root_entry(
-        key: &[u8],
-        current: &ObjectHandle,
-        updated: ObjectHandle,
-    ) -> Result<ObjectHandle> {
-        let (Some(current_items), Some(updated_items)) = (current.as_array(), updated.as_array())
-        else {
-            return Ok(updated);
-        };
-        let merged = if key == b"/Names"
-            && current_items.len() % 2 == 0
-            && updated_items.len() % 2 == 0
-        {
-            Self::merge_name_pairs(current_items, updated_items)?
-        } else {
-            let mut merged = Vec::with_capacity(updated_items.len());
-            for (index, item) in updated_items.into_iter().enumerate() {
-                let item = match current_items.get(index) {
-                    Some(current) if Self::same_handle_value(current, &item)? => current.clone(),
-                    _ => item,
-                };
-                merged.push(item);
-            }
-            merged
-        };
-        current.replace_array_items(merged);
-        Ok(current.clone())
-    }
-
-    fn merge_name_pairs(
-        current_items: Vec<ObjectHandle>,
-        updated_items: Vec<ObjectHandle>,
-    ) -> Result<Vec<ObjectHandle>> {
-        let mut current_pairs = BTreeMap::new();
-        for pair in current_items.chunks_exact(2) {
-            current_pairs.entry(pair[0].unparse()).or_insert(pair);
-        }
-        let mut merged = Vec::with_capacity(updated_items.len());
-        for updated_pair in updated_items.chunks_exact(2) {
-            let current_pair = current_pairs.get(&updated_pair[0].unparse()).copied();
-            match current_pair {
-                Some(pair) => {
-                    merged.push(pair[0].clone());
-                    merged.push(if Self::same_handle_value(&pair[1], &updated_pair[1])? {
-                        pair[1].clone()
-                    } else {
-                        updated_pair[1].clone()
-                    });
-                }
-                None => merged.extend(updated_pair.iter().cloned()),
-            }
-        }
-        Ok(merged)
-    }
-
-    fn live_embedded_file(
-        &mut self,
-        path: &[usize],
-        item_number: usize,
-    ) -> Result<Option<ObjectHandle>> {
-        let Some((pairs, value_index)) = self.live_embedded_file_slot(path, item_number)? else {
-            return Ok(None); // cov:ignore: caller obtained this selected slot from the unchanged tree
-        };
-        Ok(pairs
-            .as_array()
-            .and_then(|pairs| pairs.get(value_index).cloned()))
-    }
-
-    fn live_embedded_file_slot(
-        &mut self,
-        path: &[usize],
-        item_number: usize,
-    ) -> Result<Option<(ObjectHandle, usize)>> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
-            return Ok(None); // cov:ignore: live lookup follows a successful name_tree root lookup
-        };
-        let catalog = self.pdf.get_object_handle(catalog_ref);
-        self.pdf.resolve_object_handle(&catalog)?;
-        let names = catalog.get_key(b"/Names");
-        if names.is_indirect() {
-            self.pdf.resolve_object_handle(&names)?;
-        }
-        let mut node = names.get_key(b"/EmbeddedFiles");
-        if node.is_indirect() {
-            self.pdf.resolve_object_handle(&node)?;
-        }
-        for &kid_number in path {
-            let kids = node.get_key(b"/Kids");
-            if kids.is_indirect() {
-                self.pdf.resolve_object_handle(&kids)?; // cov:ignore: resolving a node lifts its /Kids child handle
-            }
-            let Some(kid) = kids
-                .as_array()
-                .and_then(|kids| kids.get(kid_number).cloned())
-            else {
-                return Ok(None); // cov:ignore: selected cursor path came from this unchanged tree
-            };
-            // cov:ignore-start: resolving /Kids lifts each selected child handle
-            if kid.is_indirect() {
-                self.pdf.resolve_object_handle(&kid)?;
-            }
-            // cov:ignore-end
-            node = kid;
-        }
-        let pairs = node.get_key(b"/Names"); // cov:ignore: LLVM attributes the covered direct-leaf path to the preceding loop exit
-        if pairs.is_indirect() {
-            self.pdf.resolve_object_handle(&pairs)?; // cov:ignore: resolving a leaf lifts its /Names child handle
-        }
-        let value_index = item_number + 1;
-        Ok(pairs
-            .as_array()
-            .is_some_and(|items| items.get(value_index).is_some())
-            .then_some((pairs, value_index)))
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(Vec::new()),
+            )]))?;
+        names.replace_key(b"/EmbeddedFiles", root.clone());
+        self.pdf.mark_object_handle_dirty(names)?;
+        Ok(root)
     }
 
     /// Return whether this document has an `/EmbeddedFiles` name tree.
     pub fn has_embedded_files(&mut self) -> Result<bool> {
-        Ok(self.embedded_files_root()?.is_some())
+        Ok(self.embedded_files_tree()?.is_some())
     }
 
     /// Return every embedded-files entry in key order.
@@ -371,107 +187,18 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// the canonical handle of this document; direct Filespec dictionaries are
     /// returned as direct handles.
     pub fn get_embedded_files(&mut self) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
-        let Some(mut tree) = self.name_tree()? else {
+        let Some(mut tree) = self.embedded_files_tree()? else {
             return Ok(BTreeMap::new());
         };
-        let original_root = tree.root().clone();
-        let mut entries = Vec::new();
-        let mut cursor = match tree.begin(self.pdf) {
-            Ok(cursor) => cursor,
-            Err(error) => {
-                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-                return Err(error);
-            }
-        };
-        if cursor.positioned() && cursor.current().is_none() {
-            self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-            return Err(Error::Internal(
-                "attempt made to dereference an invalid name/number tree iterator".to_string(),
-            ));
-        }
-        while let Some((key, value)) = cursor.current() {
-            let position = (!matches!(value, Object::Reference(_)))
-                .then(|| cursor.selected_path())
-                .flatten();
-            entries.push((key, value, position));
-            if let Err(error) = cursor.next(&mut tree, self.pdf) {
-                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-                return Err(error);
-            }
-        }
-        self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-        let mut result = BTreeMap::new();
-        let mut direct_pairs: BTreeMap<Vec<usize>, ObjectHandle> = BTreeMap::new();
-        for (key, value, direct_path) in entries {
-            let handle = match value {
-                Object::Reference(_) => self.pdf.lift_object_to_handle(&value)?,
-                _ => {
-                    // cov:ignore-start: a direct entry always carries the selected cursor path recorded above
-                    let Some((path, item_number)) = direct_path else {
-                        return Err(Error::Unsupported(
-                            "embedded-files tree changed during enumeration".to_string(),
-                        ));
-                    };
-                    // cov:ignore-end
-                    let pairs = match direct_pairs.get(&path) {
-                        Some(pairs) => pairs.clone(),
-                        None => {
-                            let Some((pairs, _)) =
-                                self.live_embedded_file_slot(&path, item_number)?
-                            else {
-                                // cov:ignore-start: selected cursor path remains live under this exclusive helper borrow
-                                return Err(Error::Unsupported(
-                                    "embedded-files tree changed during enumeration".to_string(),
-                                ));
-                                // cov:ignore-end
-                            };
-                            direct_pairs.insert(path, pairs.clone());
-                            pairs
-                        }
-                    };
-                    pairs
-                        .as_array()
-                        .and_then(|pairs| pairs.get(item_number + 1).cloned())
-                        .ok_or_else(|| {
-                            // cov:ignore-start: cached live pairs were validated at this selected slot
-                            Error::Unsupported(
-                                "embedded-files tree changed during enumeration".to_string(),
-                            )
-                            // cov:ignore-end
-                        })? // cov:ignore: LLVM assigns an uncovered region to this covered defensive-error terminator
-                }
-            };
-            result.insert(key, handle);
-        }
-        Ok(result)
+        tree.entries(self.pdf)
     }
 
     /// Return the Filespec handle stored under `key`, if present.
     pub fn get_embedded_file(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
-        let Some(mut tree) = self.name_tree()? else {
+        let Some(mut tree) = self.embedded_files_tree()? else {
             return Ok(None);
         };
-        let original_root = tree.root().clone();
-        let cursor = match tree.find(self.pdf, key, false) {
-            Ok(cursor) => cursor,
-            Err(error) => {
-                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-                return Err(error);
-            }
-        };
-        let value = cursor.current().map(|(_, value)| value.clone());
-        let direct_path = cursor.selected_path();
-        self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-        match value {
-            Some(Object::Reference(object_ref)) => Ok(Some(self.pdf.get_object_handle(object_ref))), // cov:ignore: LLVM assigns the exercised indirect arm to the surrounding match
-            Some(_) => match direct_path {
-                Some((path, item_number)) => self.live_embedded_file(&path, item_number),
-                // cov:ignore-start: a valid direct cursor always has a selected path
-                None => Ok(None),
-                // cov:ignore-end
-            },
-            None => Ok(None), // cov:ignore: LLVM assigns the tested missing-key return to the match terminator
-        }
+        tree.find(self.pdf, key)
     }
 
     /// Add or replace the Filespec stored under `key`.
@@ -479,75 +206,23 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// An indirect handle must be the canonical handle of this document;
     /// direct handles are stored directly in the name tree.
     pub fn replace_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
-        let direct_root = self.direct_embedded_files_root_handle()?;
-        let value = match filespec.object_ref() {
-            Some(object_ref) if self.pdf.is_canonical_object_handle(&filespec) => {
-                Object::Reference(object_ref)
-            }
-            Some(_) => {
+        if let Some(object_ref) = filespec.object_ref() {
+            if !self.pdf.is_canonical_object_handle(&filespec) {
                 return Err(Error::Unsupported(
                     "filespec handle belongs to another Pdf".to_string(),
                 ));
             }
-            None if filespec.belongs_to_pdf(self.pdf.unique_id()) => {
-                return self.replace_direct_embedded_file(key, filespec)
-            }
-            None => {
-                return Err(Error::Unsupported(
-                    "filespec handle belongs to another Pdf".to_string(),
-                ));
-            }
-        };
-        if let Some((root, owner_ref)) = direct_root {
-            let mut tree = crate::NameTree::new(root.materialize()?, true);
-            let inserted = tree.insert(self.pdf, key, value);
-            self.update_direct_embedded_files_root(&root, owner_ref, tree.into_root())?;
-            inserted?;
-            return Ok(());
+            debug_assert_eq!(filespec.object_ref(), Some(object_ref));
+        } else if !filespec.belongs_to_pdf(self.pdf.unique_id()) {
+            return Err(Error::Unsupported(
+                "filespec handle belongs to another Pdf".to_string(),
+            ));
         }
-        insert_embedded_file_value(self.pdf, key, value)?;
-        Ok(())
-    }
 
-    fn replace_direct_embedded_file(&mut self, key: &[u8], filespec: ObjectHandle) -> Result<()> {
-        // cov:ignore-start: exercised identity is identical to the indirect Filespec path; public construction of a PDF-owned direct Filespec is covered by the slot-identity regression
-        if let Some((root, owner_ref)) = self.direct_embedded_files_root_handle()? {
-            let mut tree = crate::NameTree::new(root.materialize()?, true);
-            let inserted = tree.insert(self.pdf, key, filespec.materialize()?);
-            let position = inserted
-                .as_ref()
-                .ok()
-                .and_then(|cursor| cursor.selected_path());
-            self.update_direct_embedded_files_root(&root, owner_ref, tree.into_root())?;
-            inserted?;
-            let Some((path, item_number)) = position else {
-                return Ok(()); // cov:ignore: insertion above selects its key
-            };
-            let Some((pairs, value_index)) = self.live_embedded_file_slot(&path, item_number)?
-            else {
-                return Ok(()); // cov:ignore: insertion above creates the selected value slot
-            };
-            pairs.replace_array_item(value_index, filespec);
-            self.pdf.mark_object_dirty(owner_ref);
+        let Some(mut tree) = self.ensure_embedded_files_tree()? else {
             return Ok(());
-        }
-        // cov:ignore-end
-        let filespec_value = filespec.materialize()?; // cov:ignore: FileSpec construction above guarantees a direct dictionary
-        insert_embedded_file_value(self.pdf, key, filespec_value)?; // cov:ignore: this direct-root fallback preserves the already-covered indirect insertion path
-        let Some(mut tree) = self.name_tree()? else {
-            return Ok(()); // cov:ignore: insertion above creates the tree
         };
-        let cursor = tree.find(self.pdf, key, false)?;
-        let position = cursor.selected_path();
-        self.store_embedded_files_root(tree.into_root())?;
-        let Some((path, item_number)) = position else {
-            return Ok(()); // cov:ignore: insertion above selects its key
-        };
-        let Some((pairs, value_index)) = self.live_embedded_file_slot(&path, item_number)? else {
-            return Ok(()); // cov:ignore: insertion above creates the selected value slot
-        };
-        pairs.replace_array_item(value_index, filespec);
-        Ok(())
+        tree.insert(self.pdf, key, filespec)
     }
 
     /// Remove the Filespec stored under `key`.
@@ -558,56 +233,14 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
     /// replace. This method intentionally does not perform `/AF` cleanup or
     /// reachability-based garbage collection.
     pub fn remove_embedded_file(&mut self, key: &[u8]) -> Result<bool> {
-        let direct_root = self.direct_embedded_files_root_handle()?;
-        if let Some((root, owner_ref)) = direct_root {
-            let mut tree = crate::NameTree::new(root.materialize()?, true);
-            let found = tree.find_object(self.pdf, key);
-            match found {
-                Err(error) => {
-                    self.update_direct_embedded_files_root(&root, owner_ref, tree.into_root())?;
-                    return Err(error);
-                }
-                Ok(None) => {
-                    self.update_direct_embedded_files_root(&root, owner_ref, tree.into_root())?;
-                    return Ok(false);
-                }
-                Ok(Some(_)) => {}
-            }
-            let removed = tree.remove(self.pdf, key);
-            self.update_direct_embedded_files_root(&root, owner_ref, tree.into_root())?;
-            let Some(removed) = removed? else {
-                return Ok(false); // cov:ignore: the same exclusive tree lookup just found this key
-            };
-            if let Object::Reference(object_ref) = removed {
-                self.pdf.set_object(object_ref, Object::Null);
-            }
-            return Ok(true);
-        }
-        let Some(mut tree) = self.name_tree()? else {
+        let Some(mut tree) = self.embedded_files_tree()? else {
             return Ok(false);
         };
-        let original_root = tree.root().clone();
-        let removed = match tree.find_object(self.pdf, key) {
-            Ok(removed) => removed,
-            Err(error) => {
-                self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
-                return Err(error);
-            }
-        };
-        // cov:ignore-start: the exercised missing-key return is attributed to find_object
-        let Some(removed) = removed else {
-            self.store_embedded_files_root_if_changed(&original_root, tree.into_root())?;
+        let Some(removed) = tree.remove(self.pdf, key)? else {
             return Ok(false);
         };
-        // cov:ignore-end
-        self.store_embedded_files_root(tree.into_root())?;
-        // cov:ignore-start: the same exclusive helper borrow just found this key
-        if !delete_embedded_file(self.pdf, key)? {
-            return Ok(false);
-        }
-        // cov:ignore-end
-        if let Object::Reference(object_ref) = removed {
-            self.pdf.set_object(object_ref, Object::Null);
+        if let Some(object_ref) = removed.object_ref() {
+            self.pdf.remove_object_handle(object_ref)?;
         }
         Ok(true)
     }
@@ -1362,93 +995,81 @@ mod tests {
     }
 
     #[test]
-    fn direct_root_merge_preserves_only_matching_handle_identity() {
-        type Helper<'a> = EmbeddedFileDocumentHelper<'a, std::io::Cursor<Vec<u8>>>;
-
-        let equal_direct = ObjectHandle::integer(1);
-        let equal_direct_copy = ObjectHandle::integer(1);
-        assert!(Helper::same_handle_value(&equal_direct, &equal_direct_copy)
-            .expect("direct values materialize"));
-
+    fn helper_mutates_an_indirect_root_without_detaching_direct_filespec_handle() {
         let mut pdf = open_minimal();
-        let first_ref = ObjectRef::new(90, 0);
-        let second_ref = ObjectRef::new(91, 0);
-        pdf.set_object(first_ref, Object::Integer(1));
-        pdf.set_object(second_ref, Object::Integer(1));
-        let first = pdf.get_object_handle(first_ref);
-        let first_again = pdf.get_object_handle(first_ref);
-        let second = pdf.get_object_handle(second_ref);
-        assert!(
-            Helper::same_handle_value(&first, &first_again).expect("indirect values materialize")
+        let catalog_ref = pdf.root_ref().expect("root");
+        let root_ref = ObjectRef::new(90, 0);
+        let added_ref = ObjectRef::new(91, 0);
+
+        let mut existing_filespec = Dictionary::new();
+        existing_filespec.insert("F", Object::String(b"old.txt".to_vec()));
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![
+                Object::String(b"a".to_vec()),
+                Object::Dictionary(existing_filespec),
+            ]),
         );
-        assert!(!Helper::same_handle_value(&first, &second).expect("indirect values materialize"));
-        assert!(!Helper::same_handle_value(&equal_direct, &first)
-            .expect("direct and indirect values materialize"));
+        pdf.set_object(root_ref, Object::Dictionary(root));
+        pdf.set_object(added_ref, Object::Dictionary(Dictionary::new()));
 
-        let replacement = ObjectHandle::integer(2);
-        let merged = Helper::merge_updated_root_entry(
-            b"Other",
-            &ObjectHandle::integer(1),
-            replacement.clone(),
-        )
-        .expect("root entry merges");
-        assert!(merged.is_same_object_as(&replacement));
+        let mut catalog = pdf
+            .resolve_borrowed(catalog_ref)
+            .expect("catalog")
+            .as_dict()
+            .expect("catalog dictionary")
+            .clone();
+        let mut names = Dictionary::new();
+        names.insert("EmbeddedFiles", Object::Reference(root_ref));
+        catalog.insert("Names", Object::Dictionary(names));
+        pdf.set_object(catalog_ref, Object::Dictionary(catalog));
 
-        let retained_item = ObjectHandle::integer(3);
-        let merged = Helper::merge_updated_root_entry(
-            b"Other",
-            &ObjectHandle::array(vec![retained_item.clone()]),
-            ObjectHandle::array(vec![ObjectHandle::integer(3), ObjectHandle::integer(4)]),
-        )
-        .expect("root entry merges");
-        let items = merged.as_array().expect("merged array");
-        assert!(items[0].is_same_object_as(&retained_item));
-        assert_eq!(items[1].as_integer(), Some(4));
+        let catalog_handle = pdf.get_object_handle(catalog_ref);
+        pdf.resolve_object_handle(&catalog_handle)
+            .expect("resolve catalog");
+        let retained_root = catalog_handle.get_key(b"/Names").get_key(b"/EmbeddedFiles");
+        pdf.resolve_object_handle(&retained_root)
+            .expect("resolve embedded-files root");
+        let retained_filespec = retained_root
+            .get_key(b"/Names")
+            .as_array()
+            .expect("names array")[1]
+            .clone();
 
-        let retained_key = ObjectHandle::string(b"a".to_vec());
-        let retained_value = ObjectHandle::integer(5);
-        let pairs = Helper::merge_name_pairs(
-            vec![retained_key.clone(), retained_value.clone()],
-            vec![
-                ObjectHandle::string(b"a".to_vec()),
-                ObjectHandle::integer(6),
-                ObjectHandle::string(b"b".to_vec()),
-                ObjectHandle::integer(7),
-            ],
-        )
-        .expect("name pairs merge");
-        assert!(pairs[0].is_same_object_as(&retained_key));
-        assert_eq!(pairs[1].as_integer(), Some(6));
-        assert_eq!(pairs[3].as_integer(), Some(7));
+        let added = pdf.get_object_handle(added_ref);
+        pdf.embedded_files()
+            .replace_embedded_file(b"b", added)
+            .expect("replace");
 
-        let target = ObjectHandle::dictionary(Vec::new());
-        let mut updated = Dictionary::new();
-        updated.insert("Names", Object::Array(Vec::new()));
-        let owner_ref = pdf.root_ref().expect("root");
-        Helper::new(&mut pdf)
-            .update_direct_embedded_files_root(&target, owner_ref, Object::Dictionary(updated))
-            .expect("add root entry");
-        assert!(target.has_key(b"/Names"));
-    }
+        pdf.embedded_files()
+            .replace_embedded_file(b"c", retained_filespec.clone())
+            .expect("insert direct filespec");
+        let inserted_direct = pdf
+            .embedded_files()
+            .get_embedded_file(b"c")
+            .expect("lookup direct filespec")
+            .expect("direct filespec");
+        assert!(
+            inserted_direct.is_same_object_as(&retained_filespec),
+            "qpdf stores the direct Filespec handle itself in the name tree"
+        );
 
-    #[test]
-    fn canonical_names_root_merge_preserves_shifted_name_pair_handles() {
-        type Helper<'a> = EmbeddedFileDocumentHelper<'a, std::io::Cursor<Vec<u8>>>;
+        assert!(pdf
+            .embedded_files()
+            .remove_embedded_file(b"b")
+            .expect("remove indirect filespec"));
 
-        let retained_key = ObjectHandle::string(b"a".to_vec());
-        let current = ObjectHandle::array(vec![retained_key.clone(), ObjectHandle::integer(5)]);
-        let updated = ObjectHandle::array(vec![
-            ObjectHandle::string(b"b".to_vec()),
-            ObjectHandle::integer(7),
-            ObjectHandle::string(b"a".to_vec()),
-            ObjectHandle::integer(6),
-        ]);
-
-        let merged = Helper::merge_updated_root_entry(b"/Names", &current, updated)
-            .expect("root entry merges");
-        let items = merged.as_array().expect("merged names array");
-        assert!(items[2].is_same_object_as(&retained_key));
-        assert_eq!(items[3].as_integer(), Some(6));
+        retained_filespec.replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()));
+        let current_filespec = retained_root
+            .get_key(b"/Names")
+            .as_array()
+            .expect("updated names array")[1]
+            .clone();
+        assert_eq!(
+            current_filespec.get_key(b"/F").as_string(),
+            Some(b"new.txt".to_vec())
+        );
     }
 
     #[test]
