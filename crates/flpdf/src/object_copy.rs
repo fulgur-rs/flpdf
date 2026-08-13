@@ -89,6 +89,7 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
     let object_map = target.take_foreign_object_map(source_id);
     let mut copier = ForeignObjectCopier {
         target,
+        source_id,
         object_map,
         visiting: BTreeSet::new(),
         direct_visiting: Vec::new(),
@@ -102,6 +103,21 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
 
 struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     target: &'a mut Pdf<R>,
+    /// The root's owning document identity (qpdf's `other.m->unique_id`,
+    /// `libqpdf/QPDF.cc:2060-2065`) -- `object_map`/`visiting` are keyed by
+    /// bare source `ObjectRef` numbers under the assumption that every
+    /// indirect node encountered belongs to this one document, the same
+    /// assumption qpdf's own `reserveObjects`/`replaceForeignIndirectObjects`
+    /// make. qpdf's callers cannot violate that assumption:
+    /// `QPDFObjectHandle::replaceKey`/`QPDF_Array`'s mutators all run
+    /// `checkOwnership` (`libqpdf/QPDFObjectHandle.cc:1200-1209`,
+    /// `libqpdf/QPDF_Array.cc:11-26`) and throw before a foreign-document
+    /// value can be attached anywhere reachable from a document's own graph.
+    /// [`ObjectHandle::replace_key`] does not yet perform that check (see its
+    /// own doc), so `reserve_objects` re-validates each node's owner here
+    /// instead of trusting construction-time enforcement that does not exist
+    /// yet.
+    source_id: u64,
     object_map: BTreeMap<ObjectRef, ObjectRef>,
     visiting: BTreeSet<ObjectRef>,
     direct_visiting: Vec<ObjectHandle>,
@@ -159,6 +175,28 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             return Err(Error::System(
                 "QPDF: attempting to copy a foreign reserved object".to_owned(),
             ));
+        }
+        // qpdf's `checkOwnership` (see `source_id`'s own doc) runs at
+        // construction time, before a value from a second document could
+        // ever be attached anywhere reachable from the root being copied, so
+        // `reserveObjects`/`replaceForeignIndirectObjects` never need to
+        // re-check it. `ObjectHandle::replace_key` performs no equivalent
+        // check yet, so a caller can attach an indirect handle from a
+        // *second* source `Pdf` into this graph. Without this check, that
+        // child's bare `ObjectRef` would be looked up in `object_map`/
+        // `visiting` as if it belonged to `source_id`; if the two documents
+        // happen to share an object number, the child would be silently
+        // treated as already-copied and mapped to the wrong document's
+        // object instead of being copied itself. A `None` owner is
+        // permitted, mirroring qpdf's own leniency for an ownerless value
+        // (`item_qpdf == nullptr`, `libqpdf/QPDFObjectHandle.cc:2356-2364`).
+        if let Some(owner_id) = foreign.owning_pdf_unique_id() {
+            if owner_id != self.source_id {
+                return Err(Error::System(
+                    "QPDF::copyForeign encountered an object owned by a different document"
+                        .to_owned(),
+                ));
+            }
         }
         if foreign.try_is_dictionary_of_type(b"Pages", b"")? {
             return Ok(());
@@ -799,6 +837,11 @@ mod tests {
     ) -> ForeignObjectCopier<'a, Cursor<Vec<u8>>> {
         ForeignObjectCopier {
             target,
+            // These defensive-invariant tests never exercise the ownership
+            // check (their `foreign` handles are either contextless direct
+            // scalars or already fail before reaching it), so this value is
+            // never read; `0` is a placeholder, not a real document identity.
+            source_id: 0,
             object_map: BTreeMap::new(),
             visiting: BTreeSet::new(),
             direct_visiting: Vec::new(),
@@ -934,6 +977,7 @@ mod tests {
         let error = {
             let mut copier = ForeignObjectCopier {
                 target: &mut target,
+                source_id: source.unique_id(),
                 object_map: BTreeMap::from([(source_ref, wrong_ref)]),
                 visiting: BTreeSet::new(),
                 direct_visiting: Vec::new(),
@@ -957,6 +1001,34 @@ mod tests {
             .expect_err("an indirect handle without an owning PDF must be rejected");
         assert!(matches!(error, Error::System(message)
             if message == "QPDF::copyForeign called with object with no owning PDF"));
+    }
+
+    #[test]
+    fn copy_foreign_object_rejects_a_child_owned_by_a_different_document() {
+        // `ObjectHandle::replace_key` does not yet run qpdf's
+        // `checkOwnership` (see the doc on `ForeignObjectCopier::source_id`),
+        // so this attaches an indirect handle from a *second* source `Pdf`
+        // into a graph rooted in the first. Without the reservation-time
+        // ownership check, this child's bare `ObjectRef` would be looked up
+        // in a map keyed for the root's source document; both `minimal_pdf`
+        // instances share the same object numbering (1..=3), so the
+        // collision would silently map `/Foreign` back to the *root's own*
+        // copy instead of copying the second document's distinct object.
+        let mut source = minimal_pdf();
+        let mut other_source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let foreign_child = other_source.get_object_handle(ObjectRef::new(1, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Foreign", foreign_child);
+
+        let error = target
+            .copy_foreign_object(&root)
+            .expect_err("a child owned by a different document than the root must be rejected");
+        assert!(matches!(error, Error::System(message)
+            if message == "QPDF::copyForeign encountered an object owned by a different document"));
     }
 
     #[test]
