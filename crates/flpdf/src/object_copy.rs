@@ -770,6 +770,7 @@ mod tests {
         direct.replace_key(b"/Self", direct.clone());
         let mut target = minimal_pdf();
         let mut copier = empty_copier(&mut target);
+        copier.direct_visiting.push(direct.clone());
 
         copier
             .reserve_objects(direct, true)
