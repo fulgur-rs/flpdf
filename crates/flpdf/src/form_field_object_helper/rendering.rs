@@ -269,9 +269,9 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     let stream_dict = stream
         .as_stream_dict()
         .ok_or_else(|| Error::Unsupported("new appearance stream has no dictionary".to_string()))?;
-    stream_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()));
-    stream_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()));
-    stream_dict.replace_key(b"/FormType", ObjectHandle::integer(1));
+    stream_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
+    stream_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
+    stream_dict.replace_key(b"/FormType", ObjectHandle::integer(1))?;
     stream_dict.replace_key(
         b"/BBox",
         ObjectHandle::array(vec![
@@ -280,7 +280,7 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
             ObjectHandle::real(bbox_w),
             ObjectHandle::real(bbox_h),
         ]),
-    );
+    )?;
 
     let mut resources = vec![(
         b"/ProcSet".to_vec(),
@@ -293,12 +293,12 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
         b"/Font".to_vec(),
         ObjectHandle::dictionary(vec![(resource_name, font)]),
     ));
-    stream_dict.replace_key(b"/Resources", ObjectHandle::dictionary(resources));
+    stream_dict.replace_key(b"/Resources", ObjectHandle::dictionary(resources))?;
     pdf.mark_object_handle_dirty(&stream_dict)?;
 
     let ap = if ap.is_null() {
         let ap = ObjectHandle::dictionary(Vec::new());
-        widget.replace_key(b"/AP", ap.clone());
+        widget.replace_key(b"/AP", ap.clone())?;
         pdf.mark_object_handle_dirty(&widget)?;
         ap
     } else {
@@ -311,7 +311,7 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     // the AP container did not accept the mutation, so the newly allocated
     // stream is not mistaken for an installed appearance.
     if ap.as_dictionary().is_some() {
-        ap.replace_key(b"/N", stream.clone());
+        ap.replace_key(b"/N", stream.clone())?;
         pdf.mark_object_handle_dirty(&ap)?;
     } else {
         return Ok(None);
@@ -3678,32 +3678,34 @@ mod tests {
         tx_direct_stream
             .resolve_object_handle(&tx_widget)
             .expect("resolve Tx widget");
-        tx_widget.replace_key(
-            b"/AP",
-            ObjectHandle::dictionary(vec![(
-                b"/N".to_vec(),
-                ObjectHandle::stream(
-                    ObjectHandle::dictionary(vec![
-                        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
-                        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
-                        // A valid /BBox so this repro reaches the
-                        // not-indirect guard instead of aborting earlier
-                        // at the /BBox validity check (also qpdf-modeled:
-                        // `QPDFFormFieldObjectHelper.cc:788-791`).
-                        (
-                            b"/BBox".to_vec(),
-                            ObjectHandle::array(vec![
-                                ObjectHandle::integer(0),
-                                ObjectHandle::integer(0),
-                                ObjectHandle::integer(100),
-                                ObjectHandle::integer(20),
-                            ]),
-                        ),
-                    ]),
-                    Rc::new(b"old".to_vec()),
-                ),
-            )]),
-        );
+        tx_widget
+            .replace_key(
+                b"/AP",
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::stream(
+                        ObjectHandle::dictionary(vec![
+                            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                            // A valid /BBox so this repro reaches the
+                            // not-indirect guard instead of aborting earlier
+                            // at the /BBox validity check (also qpdf-modeled:
+                            // `QPDFFormFieldObjectHelper.cc:788-791`).
+                            (
+                                b"/BBox".to_vec(),
+                                ObjectHandle::array(vec![
+                                    ObjectHandle::integer(0),
+                                    ObjectHandle::integer(0),
+                                    ObjectHandle::integer(100),
+                                    ObjectHandle::integer(20),
+                                ]),
+                            ),
+                        ]),
+                        Rc::new(b"old".to_vec()),
+                    ),
+                )]),
+            )
+            .expect("install direct-stream /AP on the Tx widget");
         let tx_result = render_text_field_canonical(
             &mut tx_direct_stream,
             ObjectRef::new(4, 0),
@@ -3726,32 +3728,34 @@ mod tests {
         ch_direct_stream
             .resolve_object_handle(&ch_widget)
             .expect("resolve Ch widget");
-        ch_widget.replace_key(
-            b"/AP",
-            ObjectHandle::dictionary(vec![(
-                b"/N".to_vec(),
-                ObjectHandle::stream(
-                    ObjectHandle::dictionary(vec![
-                        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
-                        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
-                        // A valid /BBox so this repro reaches the
-                        // not-indirect guard instead of aborting earlier
-                        // at the /BBox validity check (also qpdf-modeled:
-                        // `QPDFFormFieldObjectHelper.cc:788-791`).
-                        (
-                            b"/BBox".to_vec(),
-                            ObjectHandle::array(vec![
-                                ObjectHandle::integer(0),
-                                ObjectHandle::integer(0),
-                                ObjectHandle::integer(20),
-                                ObjectHandle::integer(20),
-                            ]),
-                        ),
-                    ]),
-                    Rc::new(b"old".to_vec()),
-                ),
-            )]),
-        );
+        ch_widget
+            .replace_key(
+                b"/AP",
+                ObjectHandle::dictionary(vec![(
+                    b"/N".to_vec(),
+                    ObjectHandle::stream(
+                        ObjectHandle::dictionary(vec![
+                            (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                            (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                            // A valid /BBox so this repro reaches the
+                            // not-indirect guard instead of aborting earlier
+                            // at the /BBox validity check (also qpdf-modeled:
+                            // `QPDFFormFieldObjectHelper.cc:788-791`).
+                            (
+                                b"/BBox".to_vec(),
+                                ObjectHandle::array(vec![
+                                    ObjectHandle::integer(0),
+                                    ObjectHandle::integer(0),
+                                    ObjectHandle::integer(20),
+                                    ObjectHandle::integer(20),
+                                ]),
+                            ),
+                        ]),
+                        Rc::new(b"old".to_vec()),
+                    ),
+                )]),
+            )
+            .expect("install direct-stream /AP on the Ch widget");
         assert!(matches!(
             render_choice_field_canonical(
                 &mut ch_direct_stream,
