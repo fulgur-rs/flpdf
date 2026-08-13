@@ -387,28 +387,37 @@ fn build_qpdf_choice_appearance_content(
     is_combo: bool,
 ) -> Vec<u8> {
     let tfh = 1.2 * font_size;
-    let max_rows = (bbox_h / tfh).max(0.0) as usize;
+    // `bbox_h` and `font_size` are attacker-controlled (`/Rect`, `/DA`): for
+    // a small font_size and/or a huge bbox_h, `bbox_h / tfh` can exceed
+    // `usize::MAX` as an f64, and `as usize` saturates rather than
+    // overflowing (Rust's documented float-to-int cast behavior since
+    // 1.45). Clamping to `options.len()` immediately — before any signed
+    // arithmetic or slicing — removes that saturation risk entirely:
+    // `options.len()` is already a natural upper bound on how many rows
+    // could ever be meaningfully selected, and for any max_rows within
+    // range the fixup loop below converges to the same window a smaller,
+    // pre-clamped max_rows would (flpdf-25kg.3.8.2.3).
+    let max_rows = ((bbox_h / tfh).max(0.0) as usize).min(options.len());
     let mut lines = vec![value.to_vec()];
     let mut highlight = false;
     let mut highlight_index = 0usize;
 
     if !is_combo && !options.is_empty() && max_rows >= 2 {
         if let Some(found_index) = options.iter().position(|option| option == value) {
-            let mut first = found_index as isize - 1;
-            let mut last = found_index as isize + max_rows as isize - 2;
-            while first < 0 {
-                first += 1;
-                last += 1;
-            }
-            while last >= options.len() as isize {
-                if first > 0 {
-                    first -= 1;
-                }
+            // All-`usize` window arithmetic (no `as isize` bit
+            // reinterpretation): `max_rows >= 2` here, so `first + max_rows
+            // - 1` cannot underflow, and the fixup loop only decrements
+            // `last` while it is still `>= options.len() >= 1`, so it can
+            // never underflow past 0 either.
+            let mut first = found_index.saturating_sub(1);
+            let mut last = first + max_rows - 1;
+            while last >= options.len() {
+                first = first.saturating_sub(1);
                 last -= 1;
             }
             highlight = true;
-            highlight_index = found_index - first as usize;
-            lines = options[first as usize..=last as usize].to_vec();
+            highlight_index = found_index - first;
+            lines = options[first..=last].to_vec();
         } else {
             highlight = true;
             lines.extend(options.iter().take(max_rows - 1).cloned());
@@ -3055,6 +3064,63 @@ mod tests {
         );
         assert!(missing.windows(b"(X)".len()).any(|window| window == b"(X)"));
         assert!(missing.windows(b"(A)".len()).any(|window| window == b"(A)"));
+    }
+
+    #[test]
+    fn qpdf_choice_builder_clamps_saturated_max_rows_to_options_len() {
+        // Regression test for flpdf-25kg.3.8.2.3. For a tiny font_size and a
+        // huge bbox_h, `bbox_h / tfh` exceeds `usize::MAX` as an f64; the raw
+        // `as usize` cast saturates to `usize::MAX`, and the subsequent
+        // `as isize` cast used to bit-reinterpret that as -1, corrupting the
+        // first/last window arithmetic and panicking on the inclusive slice
+        // `options[first..=last]` (exact repro from the bd issue).
+        let content = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"Beta",
+            &[b"Alpha".to_vec(), b"Beta".to_vec(), b"Gamma".to_vec()],
+            100.0,
+            1.0e18,
+            1.0e-10,
+            false,
+        );
+        // max_rows saturates far past options.len(), so the clamp caps the
+        // display window at the full option list -- exactly the window the
+        // original algorithm converges to for any in-range max_rows large
+        // enough to show every option.
+        for expected in [b"(Alpha)".as_slice(), b"(Beta)", b"(Gamma)"] {
+            let count = content
+                .windows(expected.len())
+                .filter(|window| *window == expected)
+                .count();
+            assert_eq!(
+                count,
+                1,
+                "expected exactly one `{}` Tj line",
+                String::from_utf8_lossy(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_choice_extreme_bbox_and_tiny_font_size_does_not_panic() {
+        // flpdf-25kg.3.8.2.3's exact end-to-end repro through the public
+        // canonical path: a crafted /Rect and /DA drive `max_rows` past
+        // `usize::MAX`, reachable from `render_choice_field_canonical`
+        // (the /Ch dispatch inside `generate_appearance_for`) with no gate
+        // upstream that would reject it first.
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Beta) \
+              /Opt [(Alpha) (Beta) (Gamma)] /Rect [0 0 100 1000000000000] \
+              /DA (/Helv 0.0000000001 Tf 0 g)>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let result =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "extreme bbox/font-size must not error");
+        assert!(
+            result.unwrap().is_some(),
+            "extreme bbox/font-size must still produce an appearance"
+        );
     }
 
     /// PDF whose `/DA` references a `/DR` resource key (`/F1`) rather than a
