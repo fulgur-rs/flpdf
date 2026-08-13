@@ -339,14 +339,20 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
     pub fn page_label_dict(style: LabelStyle, start_num: i64, prefix: &str) -> ObjectHandle {
         let result = ObjectHandle::dictionary(Vec::new());
         if let Some(name) = style.to_name() {
-            result.replace_key(b"/S", ObjectHandle::name(name.as_bytes().to_vec()));
+            result
+                .replace_key(b"/S", ObjectHandle::name(name.as_bytes().to_vec()))
+                .expect("new direct page-label dictionary is unowned");
         }
         if !prefix.is_empty() {
             let bytes = crate::pdf_string::new_unicode_string(prefix.as_bytes());
-            result.replace_key(b"/P", ObjectHandle::string(bytes));
+            result
+                .replace_key(b"/P", ObjectHandle::string(bytes))
+                .expect("new direct page-label dictionary is unowned");
         }
         if start_num != 1 {
-            result.replace_key(b"/St", ObjectHandle::integer(start_num));
+            result
+                .replace_key(b"/St", ObjectHandle::integer(start_num))
+                .expect("new direct page-label dictionary is unowned");
         }
         result
     }
@@ -444,7 +450,7 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             let default_start = new_start_idx.checked_add(1).ok_or_else(|| {
                 Error::Unsupported("page label fabricated start overflow".to_string())
             })?;
-            first_label.replace_key(b"/St", ObjectHandle::integer(default_start));
+            first_label.replace_key(b"/St", ObjectHandle::integer(default_start))?;
         }
 
         let skip_first = if let Some((last_index, last_label)) = labels.last() {
@@ -517,9 +523,9 @@ impl<'a, R: Read + Seek> PageLabelDocumentHelper<'a, R> {
             .checked_add(offset)
             .ok_or_else(|| Error::Unsupported("page label /St offset overflow".to_string()))?;
         let result = ObjectHandle::dictionary(Vec::new());
-        result.replace_key(b"/S", label.try_get_key(b"/S")?);
-        result.replace_key(b"/P", label.try_get_key(b"/P")?);
-        result.replace_key(b"/St", ObjectHandle::integer(start));
+        result.replace_key(b"/S", label.try_get_key(b"/S")?)?;
+        result.replace_key(b"/P", label.try_get_key(b"/P")?)?;
+        result.replace_key(b"/St", ObjectHandle::integer(start))?;
         Ok(Some(result))
     }
 
@@ -1308,7 +1314,7 @@ mod tests {
         let mut h = pdf.page_labels();
         let prior =
             PageLabelDocumentHelper::<Cursor<Vec<u8>>>::page_label_dict(LabelStyle::Decimal, 1, "");
-        prior.replace_key(b"/St", ObjectHandle::integer(1));
+        prior.replace_key(b"/St", ObjectHandle::integer(1)).unwrap();
         let mut labels = vec![(0, prior)];
 
         h.get_labels_for_page_range(1, 1, 1, &mut labels).unwrap();

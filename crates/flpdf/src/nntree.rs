@@ -325,9 +325,9 @@ impl LiveDictionary {
         self.handle.has_key(&key).then(|| self.handle.get_key(&key))
     }
 
-    fn insert(&self, key: &str, value: ObjectHandle) {
+    fn insert(&self, key: &str, value: ObjectHandle) -> Result<()> {
         let key = self.actual_key(key);
-        self.handle.replace_key(&key, value);
+        self.handle.replace_key(&key, value)
     }
 
     fn remove(&self, key: &str) {
@@ -1907,10 +1907,10 @@ impl<K: TreeKey> NNTree<K> {
         current.remove("Kids");
         current.remove(K::ITEMS_KEY);
         if let Some(kids) = replacement.get("Kids") {
-            current.insert("Kids", kids);
+            current.insert("Kids", kids)?;
         }
         if let Some(items) = replacement.get(K::ITEMS_KEY) {
-            current.insert(K::ITEMS_KEY, items);
+            current.insert(K::ITEMS_KEY, items)?;
         }
         current.mark_dirty(pdf)?;
         self.sync_legacy_root()
@@ -1975,7 +1975,7 @@ impl<K: TreeKey> NNTree<K> {
             root.insert(
                 "Kids",
                 ObjectHandle::array(vec![first_handle.live_handle().expect("first node handle")]),
-            );
+            )?; // cov:ignore: split allocates the replacement node in this same PDF
             root.mark_dirty(pdf)?;
 
             if is_leaf {
@@ -2114,7 +2114,7 @@ impl<K: TreeKey> NNTree<K> {
                     if unchanged {
                         false
                     } else {
-                        dictionary.insert("Limits", ObjectHandle::array(vec![first, last]));
+                        dictionary.insert("Limits", ObjectHandle::array(vec![first, last]))?;
                         dictionary.mark_dirty(pdf)?;
                         true
                     }
@@ -2236,7 +2236,7 @@ impl<K: TreeKey> NNTree<K> {
             if path_index == 0 {
                 let root = self.load_node(pdf, &parent_handle)?;
                 root.remove("Kids");
-                root.insert(K::ITEMS_KEY, ObjectHandle::array(Vec::new()));
+                root.insert(K::ITEMS_KEY, ObjectHandle::array(Vec::new()))?;
                 root.mark_dirty(pdf)?;
                 cursor.path.clear();
                 cursor.clear_position();
@@ -2889,7 +2889,7 @@ impl<K: TreeKey> NNTree<K> {
         }
         if let Some(entries) = replacement_entries {
             for (key, value) in entries {
-                target.handle.replace_key(&key, value);
+                target.handle.replace_key(&key, value)?;
             }
         }
         target.mark_dirty(pdf)?;
@@ -3576,7 +3576,7 @@ mod tests {
         let catalog_ref = ObjectRef::new(1, 0);
         let catalog = pdf.get_object_handle(catalog_ref);
         catalog.try_dereference().expect("catalog");
-        catalog.replace_key(b"/PageLabels", root.clone());
+        catalog.replace_key(b"/PageLabels", root.clone()).unwrap();
         pdf.clear_dirty(catalog_ref);
 
         let entries = HandleNumberTree::new(root.clone(), 1)
@@ -3781,13 +3781,15 @@ mod tests {
         let kid = NodeHandle::root().direct_kid(0);
 
         let changed = tree.load_node(&mut pdf, &kid).unwrap();
-        changed.insert(
-            "Names",
-            ObjectHandle::array(vec![
-                ObjectHandle::string(b"a".to_vec()),
-                ObjectHandle::integer(1),
-            ]),
-        );
+        changed
+            .insert(
+                "Names",
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    ObjectHandle::integer(1),
+                ]),
+            )
+            .unwrap();
         tree.store_node(&mut pdf, &kid, changed).unwrap();
 
         let Object::Dictionary(root) = tree.root() else {
@@ -3846,7 +3848,9 @@ mod tests {
 
         let node = tree.root_handle(&mut pdf).unwrap();
         let changed = tree.load_node(&mut pdf, &node).unwrap();
-        changed.insert("Names", ObjectHandle::array(Vec::new()));
+        changed
+            .insert("Names", ObjectHandle::array(Vec::new()))
+            .unwrap();
         tree.store_node(&mut pdf, &node, changed.clone()).unwrap();
 
         assert_eq!(

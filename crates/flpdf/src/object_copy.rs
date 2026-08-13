@@ -448,7 +448,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             })?;
             for (key, value) in source_dictionary.as_dictionary().unwrap_or_default() {
                 let replacement = self.replace_foreign_indirect_objects(value, false)?;
-                destination_dictionary.replace_key(&key, replacement);
+                destination_dictionary.replace_key(&key, replacement)?;
             }
             self.target
                 .resolver
@@ -961,15 +961,15 @@ mod tests {
         let second = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("second cycle node");
-        first.replace_key(b"/Next", second.clone());
-        second.replace_key(b"/Next", first.clone());
+        first.replace_key(b"/Next", second.clone()).unwrap();
+        second.replace_key(b"/Next", first.clone()).unwrap();
 
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/SharedA", shared.clone());
-        root.replace_key(b"/SharedB", shared.clone());
-        root.replace_key(b"/Cycle", first.clone());
+        root.replace_key(b"/SharedA", shared.clone()).unwrap();
+        root.replace_key(b"/SharedB", shared.clone()).unwrap();
+        root.replace_key(b"/Cycle", first.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1107,7 +1107,7 @@ mod tests {
         // whose two-dictionary cycle also traverses reservation before
         // reaching the replacement-phase guard under test there.
         let direct = ObjectHandle::dictionary(Vec::new());
-        direct.replace_key(b"/Self", direct.clone());
+        direct.replace_key(b"/Self", direct.clone()).unwrap();
         let mut target = minimal_pdf();
         let mut copier = empty_copier(&mut target);
         copier.direct_visiting.push(direct.clone());
@@ -1162,7 +1162,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", direct_stream);
+        root.replace_key(b"/Stream", direct_stream).unwrap();
 
         let error = target
             .copy_foreign_object(&root)
@@ -1317,12 +1317,13 @@ mod tests {
         let page = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("nested page");
-        page.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()));
-        page.replace_key(b"/Hidden", hidden.clone());
+        page.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))
+            .unwrap();
+        page.replace_key(b"/Hidden", hidden.clone()).unwrap();
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Page", page.clone());
+        root.replace_key(b"/Page", page.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1345,7 +1346,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Page", page.clone());
+        root.replace_key(b"/Page", page.clone()).unwrap();
 
         let copied_root = target
             .copy_foreign_object(&root)
@@ -1453,11 +1454,12 @@ mod tests {
         stream
             .as_stream_dict()
             .expect("source stream dictionary")
-            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()));
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .unwrap();
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", stream.clone());
+        root.replace_key(b"/Stream", stream.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1502,7 +1504,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", stream.clone());
+        root.replace_key(b"/Stream", stream.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1529,7 +1531,9 @@ mod tests {
         let immediate_root = immediate_source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("immediate root");
-        immediate_root.replace_key(b"/Stream", immediate_stream.clone());
+        immediate_root
+            .replace_key(b"/Stream", immediate_stream.clone())
+            .unwrap();
         let immediate_copy = immediate_target
             .copy_foreign_object(&immediate_root)
             .expect("immediate foreign copy");
@@ -1561,7 +1565,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", stream);
+        root.replace_key(b"/Stream", stream).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1581,7 +1585,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", source_stream.clone());
+        root.replace_key(b"/Stream", source_stream.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1606,7 +1610,7 @@ mod tests {
             let root = source
                 .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
                 .expect("root");
-            root.replace_key(b"/Stream", source_stream);
+            root.replace_key(b"/Stream", source_stream).unwrap();
             target
                 .copy_foreign_object(&root)
                 .expect("copy original stream graph")
@@ -1637,7 +1641,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Array", array);
+        root.replace_key(b"/Array", array).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
