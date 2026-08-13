@@ -153,6 +153,13 @@ fn lookup_dr_basefont_canonical<R: Read + Seek>(
 /// the document's canonical allocator; the widget and its existing `/AP`
 /// dictionary are then mutated in place, preserving every handle identity
 /// already held by the caller.
+///
+/// Returns `Ok(None)` when `/AP` is present but not a dictionary: qpdf's
+/// `replaceKey` no-ops (with a warning) on a non-dictionary receiver
+/// (`QPDFObjectHandle::replaceKey`, `QPDFObjectHandle.cc:1199-1210`), so the
+/// freshly built stream is never linked into the widget's `/AP/N`. `None`
+/// keeps that outcome visible to the caller instead of returning a stream
+/// ref the widget does not actually reference.
 fn install_normal_appearance_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -160,7 +167,7 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     bbox_w: f64,
     bbox_h: f64,
     font_resource: (Vec<u8>, Vec<u8>),
-) -> Result<ObjectRef> {
+) -> Result<Option<ObjectRef>> {
     let widget = pdf.get_object_handle(widget_ref);
     pdf.resolve_object_handle(&widget)?;
     let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
@@ -195,9 +202,12 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
                 .as_stream_dict()
                 .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
                 .transpose()?;
-            return normal.object_ref().ok_or_else(|| {
-                Error::Unsupported("normal appearance stream is not indirect".to_string())
-            });
+            return normal
+                .object_ref()
+                .ok_or_else(|| {
+                    Error::Unsupported("normal appearance stream is not indirect".to_string())
+                })
+                .map(Some);
         }
     }
 
@@ -253,20 +263,24 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
         ap
     };
 
-    // qpdf's replaceKey is a no-op for a non-dictionary /AP value. Keep the
-    // newly allocated stream live only when the AP container accepts the
-    // mutation; malformed input therefore follows qpdf's warning/no-op shape.
+    // qpdf's replaceKey is a no-op for a non-dictionary /AP value. Mirror
+    // that no-op exactly -- do not force the malformed container into a
+    // dictionary -- but report the true outcome to the caller: `None` when
+    // the AP container did not accept the mutation, so the newly allocated
+    // stream is not mistaken for an installed appearance.
     if ap.as_dictionary().is_some() {
         ap.replace_key(b"/N", stream.clone());
         pdf.mark_object_handle_dirty(&ap)?;
-    } // cov:ignore: llvm-cov attributes this closing brace as an executable branch line
+    } else {
+        return Ok(None);
+    }
 
     // cov:ignore-start: new_stream_with_data always allocates an indirect stream
     let stream_ref = stream.object_ref().ok_or_else(|| {
         Error::Unsupported("canonical appearance stream is not indirect".to_string())
     })?;
     // cov:ignore-end
-    Ok(stream_ref)
+    Ok(Some(stream_ref))
 }
 
 /// Canonical Tx appearance generation. Graph reads and writes stay on the
@@ -316,15 +330,14 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
         font_size,
         true,
     );
-    let xobj_ref = install_normal_appearance_canonical(
+    install_normal_appearance_canonical(
         pdf,
         widget_ref,
         content,
         bbox_w,
         bbox_h,
         (font_name, official_base_name(standard_font).to_vec()),
-    )?;
-    Ok(Some(xobj_ref))
+    )
 }
 
 /// Canonical Ch appearance generation. Choice values and option entries are
@@ -386,15 +399,14 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
         font_size,
         flags & 0x20000 != 0,
     );
-    let xobj_ref = install_normal_appearance_canonical(
+    install_normal_appearance_canonical(
         pdf,
         widget_ref,
         content,
         bbox_w,
         bbox_h,
         (font_name, official_base_name(standard_font).to_vec()),
-    )?;
-    Ok(Some(xobj_ref))
+    )
 }
 
 /// Substitute `/DA`'s `Tf` size operand with `resolved_font_size` when it
@@ -3396,6 +3408,43 @@ mod tests {
             Err(Error::Unsupported(message))
                 if message == "normal appearance stream is not indirect"
         ));
+    }
+
+    #[test]
+    fn canonical_tx_reports_none_when_ap_container_is_malformed() {
+        // qpdf's `AP.replaceKey("/N", AS)` no-ops (with a type warning) when
+        // `/AP` is present but not a dictionary
+        // (`QPDFObjectHandle::replaceKey`, `QPDFObjectHandle.cc:1199-1210`:
+        // `asDictionary()` returns null, so the mutation is dropped and the
+        // widget's `/AP` is left untouched). The freshly built appearance
+        // stream is therefore never linked into the widget's `/AP/N`; the
+        // canonical renderer must report that no appearance was actually
+        // installed (`None`) rather than handing back a stream ref the
+        // widget does not use.
+        let raw = build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Tx /V (Plain) /AP /Bogus \
+              /DA (/Helv 12 Tf 0 g) /Rect [10 10 200 30]>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation must not error");
+        assert!(
+            result.is_none(),
+            "malformed /AP container must not report a successfully installed appearance, got {result:?}"
+        );
+
+        // The widget's /AP must remain untouched (still the malformed
+        // Name), matching qpdf's no-op replaceKey.
+        let widget = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget else {
+            panic!("widget not a dict");
+        };
+        assert_eq!(
+            wdict.get("AP"),
+            Some(&Object::Name(b"Bogus".to_vec())),
+            "malformed /AP must be left untouched, matching qpdf's no-op replaceKey"
+        );
     }
 
     #[test]
