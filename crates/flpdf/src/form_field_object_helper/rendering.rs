@@ -414,7 +414,20 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
     // are set in two's complement, so the combo bit reads as set. Do not
     // route through `u32::try_from`, which fails (and previously defaulted
     // to zero) for any negative `/Ff`, incorrectly clearing the combo bit.
-    let flags = helper.field_flags()?.unwrap_or(0);
+    //
+    // qpdf's `getFlags()` reads `/Ff` through
+    // `QPDFObjectHandle::getIntValueAsInt` (`QPDFObjectHandle.cc:525-540`),
+    // which *saturates* an out-of-`int`-range value to `INT_MIN`/`INT_MAX`
+    // rather than passing its bit pattern through -- so it is the
+    // saturated 32-bit value, not the raw stored integer, that qpdf masks
+    // against `ff_ch_combo`. Clamp to the `i32` range before masking so an
+    // out-of-range `/Ff` (e.g. `4294967296`, which saturates to `INT_MAX`
+    // and so has the combo bit set) agrees with qpdf instead of testing a
+    // bit pattern qpdf never actually forms.
+    let flags = helper
+        .field_flags()?
+        .unwrap_or(0)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
     let value = helper.value_as_string()?;
     let options = helper.choices()?;
     drop(helper);
@@ -3406,6 +3419,51 @@ mod tests {
                 .windows(b"0.85 0.85 0.85 rg".len())
                 .any(|w| w == b"0.85 0.85 0.85 rg"),
             "negative /Ff must not draw a list-style highlight rect, got {content:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_choice_out_of_i32_range_ff_saturates_before_combo_mask() {
+        // qpdf's `getFlags()` (`QPDFFormFieldObjectHelper.cc:230-234`) reads
+        // `/Ff` through `QPDFObjectHandle::getIntValueAsInt`
+        // (`QPDFObjectHandle.cc:525-540`), which *saturates* an out-of-range
+        // `long long` to `INT_MIN`/`INT_MAX` before qpdf ever tests the
+        // combo bit (`ff_ch_combo = 1 << 17`, `Constants.h:209`) -- it is
+        // never the raw 64-bit value that gets masked. For `/Ff
+        // 4294967296` (`0x1_0000_0000`), qpdf saturates to `INT_MAX`
+        // (`0x7fff_ffff`, all of whose low 31 bits are set, so the combo
+        // bit reads as set), but `0x1_0000_0000` itself has no bits below
+        // bit 32 set, so masking the raw `i64` directly clears the combo
+        // bit and misrenders the field as a list.
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Blue) /Ff 4294967296 \
+              /Opt [(Alpha) (Blue) (Gamma)] \
+              /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let xobj_ref =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Ch generation")
+                .expect("Ch field is handled");
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve choice appearance");
+        let content = stream_handle
+            .as_stream_data()
+            .expect("choice appearance data");
+        assert!(
+            content.windows(b"(Blue)".len()).any(|w| w == b"(Blue)"),
+            "combo value must appear in Tj, got {content:?}"
+        );
+        assert!(
+            !content.windows(b"(Alpha)".len()).any(|w| w == b"(Alpha)"),
+            "out-of-i32-range /Ff must not fall back to list rendering (Alpha leaked), got {content:?}"
+        );
+        assert!(
+            !content
+                .windows(b"0.85 0.85 0.85 rg".len())
+                .any(|w| w == b"0.85 0.85 0.85 rg"),
+            "out-of-i32-range /Ff must not draw a list-style highlight rect, got {content:?}"
         );
     }
 
