@@ -1238,6 +1238,63 @@ fn non_dictionary_legacy_dests_resolve_to_null() {
     assert_eq!(outline_dest(&roots[0]), Object::Null);
 }
 
+/// Legacy named dest whose `/Dests` entry (`/held`) is an indirect reference
+/// to object 8, and object 8's *value* is later replaced in place with
+/// `Pdf::set_object(8, Object::Reference(9))` — the same reference-to-reference
+/// redirect bridge `OutlineDocumentHelper::resolve_value_handle`'s own doc
+/// describes (`Pdf::set_object` can install this state in a canonical slot;
+/// a normal indirect child parsed from a real PDF never does). The other
+/// three dest-resolution call sites in this module (`resolve_node_dest`,
+/// `goto_action_dest`, `resolve_name_tree_node_dest`) already chase this
+/// redirect to its terminal value via `resolve_value_handle`; the legacy
+/// `/Dests` dictionary lookup must reach the same object 9 array rather than
+/// exposing the still-redirected object 8 handle.
+fn named_dest_legacy_redirect_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R /Dests 6 0 R >>",
+            ),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (5, "<< /Title (L) /Parent 4 0 R /Dest /held >>"),
+            (6, "<< /held 8 0 R >>"),
+            (8, "null"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn dest_from_named_legacy_chases_a_set_object_redirect_chain() {
+    let mut pdf = Pdf::open(Cursor::new(named_dest_legacy_redirect_chain_pdf())).unwrap();
+    // Overwrite object 8's value with a further indirect reference to
+    // object 9, then give object 9 the real destination array. This is
+    // qpdf-oracle-inapplicable by construction: qpdf has no notion of an
+    // object whose own parsed value is another indirect reference (a raw
+    // "M H R" body at the top level of "N G obj ... endobj" does not parse
+    // as a reference at all — confirmed against live qpdf 11.9.0, which
+    // reads only the leading integer and warns "expected endobj" on the
+    // trailing " R"). This is purely an flpdf `Pdf::set_object` legacy-API
+    // artifact, so the oracle here is this module's own three sibling
+    // call sites, plus the pre-`ObjectHandle`-migration implementation,
+    // which called `resolve_terminal_object` on exactly this value.
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Reference(ObjectRef::new(9, 0)),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), page_dest(3));
+
+    let roots = root_items(&mut pdf);
+    assert_eq!(outline_dest(&roots[0]), page_dest(3));
+    assert_eq!(
+        outline_dest_page(&roots[0]),
+        Object::Reference(ObjectRef::new(3, 0))
+    );
+}
+
 /// Legacy /Dests with a NAME->NAME cycle: /a -> /b, /b -> /a. qpdf performs
 /// only one named lookup, so `/a` materializes as the raw alias `/b`.
 fn cyclic_named_dest_pdf() -> Vec<u8> {

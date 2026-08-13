@@ -374,7 +374,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if !dests.has_key(&key) {
             return Ok(ObjectHandle::null());
         }
-        dests.try_get_key(&key)
+        // Chase the selected entry the same way every other exit path in
+        // this file does (`resolve_node_dest`'s `candidate`,
+        // `goto_action_dest`'s `action`, `resolve_name_tree_node_dest`'s
+        // `found`): a `Pdf::set_object` legacy redirect can still sit behind
+        // this dictionary entry even after `dests` itself was chased above.
+        let value = dests.try_get_key(&key)?;
+        self.resolve_value_handle(value)
     }
 
     fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<ObjectHandle> {
