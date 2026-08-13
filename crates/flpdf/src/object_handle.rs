@@ -63,11 +63,13 @@
 // (where qpdf warns) is outside the try_array_item contract. See
 // docs/qpdf-correspondence.md.
 
+use crate::token_filter::TokenFilter;
 use crate::{
     content_normalizer::ContentNormalizerPipeline,
     pipeline::{
         count::Count,
         flate::{Flate, FlateAction, DEFAULT_OUT_BUFFER_SIZE},
+        qpdf_tokenizer::QpdfTokenizer,
         Pipeline, PipelineError, PipelineRef,
     },
     stream_filter::{
@@ -80,6 +82,9 @@ use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
+
+type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
+type StreamTokenFilterList = Rc<RefCell<Vec<StreamTokenFilter>>>;
 
 /// qpdf's `qpdf_ef_compress` bit in `QPDF_Stream::pipeStreamData`.
 pub(crate) const STREAM_ENCODE_COMPRESS: u32 = 1;
@@ -661,6 +666,11 @@ struct ObjectSlot {
     pdf_unique_ids: BTreeSet<u64>,
     containment_parents: Vec<Weak<RefCell<ObjectSlot>>>,
     description: Option<ObjectDescription>,
+    /// qpdf's `QPDF_Stream::token_filters` list. It is attached to the
+    /// canonical handle allocation rather than eagerly rewriting the source
+    /// bytes; the stream pipeline consumes it after decoding and before
+    /// normalization/encoding (`libqpdf/QPDF_Stream.cc:488-620`).
+    stream_token_filters: StreamTokenFilterList,
 }
 
 impl ObjectSlot {
@@ -1044,6 +1054,7 @@ impl ObjectHandle {
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
+            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
         })));
         handle.register_state_owner();
         handle
@@ -1073,6 +1084,7 @@ impl ObjectHandle {
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
+            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
         })));
         handle.register_state_owner();
         handle
@@ -1127,6 +1139,7 @@ impl ObjectHandle {
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
+            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
         })));
         handle.register_state_owner();
         handle
@@ -1154,6 +1167,7 @@ impl ObjectHandle {
             pdf_unique_ids: BTreeSet::new(),
             containment_parents: Vec::new(),
             description: None,
+            stream_token_filters: Rc::new(RefCell::new(Vec::new())),
         })));
         handle.register_state_owner();
         handle.with_value(|value| {
@@ -1242,7 +1256,9 @@ impl ObjectHandle {
             let state = state.borrow();
             Self::state_children(&state)
         };
+        let new_token_filters = Rc::new(RefCell::new(Vec::new()));
         for owner in self.state_owner_handles() {
+            owner.0.borrow_mut().stream_token_filters = new_token_filters.clone();
             let parent = owner.containment_parent();
             for child in &old_children {
                 Self::detach_child_from_parent(child, &parent);
@@ -1272,6 +1288,7 @@ impl ObjectHandle {
             let mut slot = self.0.borrow_mut();
             slot.state = new_state;
             slot.state_owners = Rc::new(RefCell::new(Vec::new()));
+            slot.stream_token_filters = Rc::new(RefCell::new(Vec::new()));
         }
         self.register_state_owner();
 
@@ -1305,6 +1322,7 @@ impl ObjectHandle {
             ));
         }
         let source_owners = source.0.borrow().state_owners.clone();
+        let source_token_filters = source.0.borrow().stream_token_filters.clone();
         let old_state = {
             let mut target = self.0.borrow_mut();
             let old_state = target.state.clone();
@@ -1312,6 +1330,7 @@ impl ObjectHandle {
             Self::remove_state_owner(&old_owners, &self.0);
             target.state = source_state.clone();
             target.state_owners = source_owners.clone();
+            target.stream_token_filters = source_token_filters;
             old_state
         };
         Self::register_state_owner(self);
@@ -3715,6 +3734,45 @@ impl ObjectHandle {
         })
     }
 
+    /// Whether qpdf must treat this stream's data as modified even when its
+    /// original encoded payload is still available. `QPDF_Stream::isDataModified`
+    /// is true as soon as a token filter is registered
+    /// (`libqpdf/QPDF_Stream.cc:321-324`); the writer uses that bit to avoid
+    /// copying a lone `/FlateDecode` source without running the filter
+    /// (`libqpdf/QPDFWriter.cc:1234-1315`).
+    pub(crate) fn is_data_modified(&self) -> bool {
+        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+            return false;
+        }
+        let filters = self.0.borrow().stream_token_filters.clone();
+        let modified = !filters.borrow().is_empty();
+        modified
+    }
+
+    /// Register a qpdf-style lazy token filter on this stream. The original
+    /// source bytes remain untouched; the filter is inserted into the decoded
+    /// stream pipeline only when a filtering pipe is requested.
+    pub(crate) fn add_token_filter(&self, filter: Rc<RefCell<dyn TokenFilter>>) -> Result<()> {
+        self.try_dereference()?;
+        if !self.with_value(|value| matches!(value, Some(ObjectValue::Stream { .. }))) {
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {}",
+                self.type_name()
+            )));
+        }
+        let filters = self.0.borrow().stream_token_filters.clone();
+        // A canonical object can have distinct handle slots that share one
+        // payload state (for example a dictionary child and the document's
+        // object-cache handle). qpdf's token-filter list belongs to that one
+        // stream allocation, so make every state owner observe the same list
+        // before registering the callback.
+        for owner in self.state_owner_handles() {
+            owner.0.borrow_mut().stream_token_filters = filters.clone();
+        }
+        filters.borrow_mut().push(filter);
+        Ok(())
+    }
+
     /// Pipe this stream through qpdf's filter branch.
     ///
     /// This is the `QPDFObjectHandle::pipeStreamData` entry point
@@ -3820,6 +3878,11 @@ impl ObjectHandle {
         recover_codec_errors: bool,
     ) -> Result<bool> {
         self.try_dereference()?;
+        let token_filters = {
+            let filters = self.0.borrow().stream_token_filters.clone();
+            let token_filters = filters.borrow().clone();
+            token_filters
+        };
         let Some((stream_dict, stream_data, stream_provider, stream_length)) =
             self.with_value(|value| match value {
                 Some(ObjectValue::Stream {
@@ -3843,6 +3906,12 @@ impl ObjectHandle {
         };
 
         *filtering_attempted = false;
+        // `QPDF_Stream::pipeStreamData` constructs the filtering stages only
+        // when an encode/decode policy is requested (`QPDF_Stream.cc:488-520`).
+        // `isDataModified` is consumed by `QPDFWriter::willFilterStream` to
+        // decide whether the writer must enter this pipe at all; it does not
+        // by itself turn Preserve-mode pipe calls into decoded token-filter
+        // calls.
         let filter_requested = encode_flags != 0 || !matches!(decode_level, DecodeLevel::None);
         if !filter_requested {
             return self.pipe_stream_source(
@@ -3912,6 +3981,15 @@ impl ObjectHandle {
                 }));
             }
             head = PipelineRef::Owned(Box::new(normalizer));
+        }
+
+        // qpdf's source order is decode filters -> token filters -> content
+        // normalization -> encoding. Since `head` is assembled from the
+        // sink backwards, token filters are wrapped before the decode stages
+        // in reverse registration order (`QPDF_Stream.cc:488-620`).
+        for filter in token_filters.into_iter().rev() {
+            let tokenizer = QpdfTokenizer::new_shared("stream token filter", filter, Some(head));
+            head = PipelineRef::Owned(Box::new(tokenizer));
         }
 
         for filter in plan.filters.iter_mut().rev() {
@@ -4551,6 +4629,7 @@ impl ObjectHandle {
     /// survives instead of being lost to a freshly minted handle.
     pub(crate) fn replace_direct_value(&self, value: ObjectValue) {
         if self.is_direct() {
+            self.0.borrow().stream_token_filters.borrow_mut().clear();
             self.replace_shared_state(ObjectState::Resolved(canonicalize_object_value(value)));
         }
     }
@@ -8394,6 +8473,40 @@ mod object_value_tests {
 #[cfg(test)]
 mod stream_payload_sharing_tests {
     use super::*;
+    use crate::token_filter::TokenFilterOutput;
+    use crate::tokenizer::{Token, TokenType};
+
+    struct NoopTokenFilter;
+
+    impl TokenFilter for NoopTokenFilter {
+        fn handle_token(
+            &mut self,
+            _token: &Token,
+            _output: &mut TokenFilterOutput<'_>,
+        ) -> crate::pipeline::PipelineResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn token_filter_registration_rejects_non_stream_handles() {
+        let scalar = ObjectHandle::integer(7);
+        assert!(!scalar.is_data_modified());
+
+        let mut no_op = NoopTokenFilter;
+        let token = Token::new(TokenType::Word, b"q".to_vec());
+        let mut output = TokenFilterOutput::new(None);
+        no_op.handle_token(&token, &mut output).unwrap();
+
+        let filter: Rc<RefCell<dyn TokenFilter>> = Rc::new(RefCell::new(no_op));
+        let error = scalar.add_token_filter(filter).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == "operation for stream attempted on object of type integer"
+        ));
+        assert!(!scalar.is_data_modified());
+    }
 
     // Every assertion below compares buffer identity against the buffer the
     // test itself created, never bytes: a byte-equality assertion passes for a

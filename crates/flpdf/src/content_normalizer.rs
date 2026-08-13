@@ -135,6 +135,7 @@ impl Pipeline for ContentNormalizerPipeline<'_> {
         );
         tokenizer.write(&input)?;
         tokenizer.finish()?;
+        drop(tokenizer);
         self.report_warnings()
     }
 }

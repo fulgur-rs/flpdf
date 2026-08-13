@@ -1,15 +1,21 @@
 //! qpdf correspondence: Pl_QPDFTokenizer.cc buffered token-filter pipeline.
 
 use crate::{
-    pipeline::{Pipeline, PipelineError, PipelineResult},
+    pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult},
     token_filter::{TokenFilter, TokenFilterOutput},
     tokenizer::{Token, TokenType, Tokenizer},
 };
+use std::{cell::RefCell, rc::Rc};
+
+enum TokenFilterSource<'a> {
+    Borrowed(&'a mut dyn TokenFilter),
+    Shared(Rc<RefCell<dyn TokenFilter>>),
+}
 
 pub(crate) struct QpdfTokenizer<'a> {
     identifier: String,
-    filter: &'a mut dyn TokenFilter,
-    next: Option<&'a mut dyn Pipeline>,
+    filter: TokenFilterSource<'a>,
+    next: Option<PipelineRef<'a>>,
     filter_output_attached: bool,
     data: Vec<u8>,
 }
@@ -20,40 +26,61 @@ impl<'a> QpdfTokenizer<'a> {
         filter: &'a mut dyn TokenFilter,
         next: Option<&'a mut dyn Pipeline>,
     ) -> Self {
-        let filter_output_attached = next.is_some();
         Self {
             identifier: identifier.into(),
-            filter,
+            filter: TokenFilterSource::Borrowed(filter),
+            filter_output_attached: next.is_some(),
+            next: next.map(PipelineRef::Borrowed),
+            data: Vec::new(),
+        }
+    }
+
+    /// Construct a tokenizer that owns a shared qpdf-style token filter and
+    /// the downstream pipeline chain. `addTokenFilter` stores callback objects
+    /// on the stream and may invoke them during more than one write attempt;
+    /// the shared handle therefore lives with this stage rather than behind a
+    /// temporary borrow.
+    pub(crate) fn new_shared(
+        identifier: impl Into<String>,
+        filter: Rc<RefCell<dyn TokenFilter>>,
+        next: Option<PipelineRef<'a>>,
+    ) -> Self {
+        Self {
+            identifier: identifier.into(),
+            filter: TokenFilterSource::Shared(filter),
+            filter_output_attached: next.is_some(),
             next,
-            filter_output_attached,
             data: Vec::new(),
         }
     }
 
     fn handle_token(&mut self, token: &Token) -> PipelineResult<()> {
-        if self.filter_output_attached {
-            let mut output = TokenFilterOutput::new(self.next.take());
-            let result = self.filter.handle_token(token, &mut output);
-            self.next = output.into_next();
-            result
-        } else {
-            let mut output = TokenFilterOutput::new(None);
-            self.filter.handle_token(token, &mut output)
+        let next = self.filter_output_attached.then(|| {
+            self.next.as_mut().expect("attached output has a pipeline") as &mut dyn Pipeline
+        });
+        let mut output = TokenFilterOutput::new(next);
+        match &mut self.filter {
+            TokenFilterSource::Borrowed(filter) => filter.handle_token(token, &mut output),
+            TokenFilterSource::Shared(filter) => {
+                filter.borrow_mut().handle_token(token, &mut output)
+            }
         }
     }
 
     fn handle_eof(&mut self) -> PipelineResult<()> {
+        let next = self.filter_output_attached.then(|| {
+            self.next.as_mut().expect("attached output has a pipeline") as &mut dyn Pipeline
+        });
+        let mut output = TokenFilterOutput::new(next);
+        let result = match &mut self.filter {
+            TokenFilterSource::Borrowed(filter) => filter.handle_eof(&mut output),
+            TokenFilterSource::Shared(filter) => filter.borrow_mut().handle_eof(&mut output),
+        };
+        result?;
         if self.filter_output_attached {
-            let mut output = TokenFilterOutput::new(self.next.take());
-            let result = self.filter.handle_eof(&mut output);
-            self.next = output.into_next();
-            result?;
             self.filter_output_attached = false;
-            Ok(())
-        } else {
-            let mut output = TokenFilterOutput::new(None);
-            self.filter.handle_eof(&mut output)
         }
+        Ok(())
     }
 }
 
@@ -95,7 +122,7 @@ impl Pipeline for QpdfTokenizer<'_> {
             }
         }
         self.handle_eof()?;
-        if let Some(next) = self.next.as_deref_mut() {
+        if let Some(next) = self.next.as_mut() {
             next.finish()?;
         }
         Ok(())
@@ -106,11 +133,11 @@ impl Pipeline for QpdfTokenizer<'_> {
 mod tests {
     use super::QpdfTokenizer;
     use crate::{
-        pipeline::{Pipeline, PipelineError, PipelineResult},
+        pipeline::{Pipeline, PipelineError, PipelineRef, PipelineResult},
         token_filter::{TokenFilter, TokenFilterOutput},
         tokenizer::{Token, TokenType},
     };
-    use std::{fmt::Write as _, path::Path, process::Command};
+    use std::{cell::RefCell, fmt::Write as _, path::Path, process::Command, rc::Rc};
 
     #[derive(Default)]
     struct RecordingFilter {
@@ -351,6 +378,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_filter_preserves_downstream_pipeline_and_eof() {
+        struct AppendOnEof;
+
+        impl TokenFilter for AppendOnEof {
+            fn handle_token(
+                &mut self,
+                token: &Token,
+                output: &mut TokenFilterOutput<'_>,
+            ) -> PipelineResult<()> {
+                output.write_token(token)
+            }
+
+            fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
+                output.write(b"E")
+            }
+        }
+
+        let filter = Rc::new(RefCell::new(AppendOnEof));
+        let mut sink = RecordingSink::default();
+        let mut stage = QpdfTokenizer::new_shared(
+            "shared token filter",
+            filter.clone(),
+            Some(PipelineRef::Borrowed(&mut sink)),
+        );
+        stage.write(b"q Q").unwrap();
+        stage.finish().unwrap();
+        drop(stage);
+
+        assert_eq!(sink.chunks.concat(), b"q QE");
+        assert_eq!(sink.finishes, 1);
+    }
+
+    #[test]
     fn absent_downstream_discards_filter_output_but_delivers_all_callbacks() {
         let run = run_recording(&[b"/F1 12 Tf"], false).unwrap();
         assert!(run.output.is_empty());
@@ -376,6 +436,7 @@ mod tests {
         let mut stage = QpdfTokenizer::new("token filter", &mut filter, Some(&mut sink));
         stage.write(b"q").unwrap();
         assert_eq!(stage.finish().unwrap_err().message(), "sink finish failed");
+        drop(stage);
         assert_eq!(filter.eof_calls, 1);
     }
 

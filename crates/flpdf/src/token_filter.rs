@@ -39,8 +39,4 @@ impl<'a> TokenFilterOutput<'a> {
     pub(crate) fn write_token(&mut self, token: &Token) -> PipelineResult<()> {
         self.write(&token.raw)
     }
-
-    pub(crate) fn into_next(self) -> Option<&'a mut dyn Pipeline> {
-        self.next
-    }
 }

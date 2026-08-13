@@ -28,6 +28,7 @@
 //!   These are best-effort decorations; callers that require them should
 //!   generate the appearance themselves.
 
+use std::cell::RefCell;
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
@@ -41,7 +42,10 @@ use crate::json_inspect::decode_pdf_text_string;
 use crate::object::write_literal_string;
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
+use crate::pipeline::PipelineResult;
 use crate::standard_font_metrics::StandardFont;
+use crate::token_filter::{TokenFilter, TokenFilterOutput};
+use crate::tokenizer::{Token, TokenType};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 
 #[cfg(test)]
@@ -188,6 +192,93 @@ fn lookup_dr_basefont_canonical<R: Read + Seek>(
         .and_then(|name| StandardFont::from_base_name(&name)))
 }
 
+#[derive(Clone, Copy)]
+enum AppearanceFilterState {
+    Top,
+    Bmc,
+    Emc,
+    End,
+}
+
+/// qpdf's `ValueSetter` boundary for an existing `/AP/N` stream. The
+/// generated appearance is stored as the replacement body only: the original
+/// `/Tx BMC` prefix and any post-`EMC` tokens remain owned by the source
+/// stream, exactly as `QPDFFormFieldObjectHelper.cc:524-570` does.
+struct AppearanceTokenFilter {
+    replacement_body: Vec<u8>,
+    state: AppearanceFilterState,
+    replaced: bool,
+}
+
+impl AppearanceTokenFilter {
+    fn new(content: &[u8]) -> Self {
+        const PREFIX: &[u8] = b"/Tx BMC\n";
+        const SUFFIX: &[u8] = b"EMC\n";
+        let replacement_body = content
+            .strip_prefix(PREFIX)
+            .and_then(|content| content.strip_suffix(SUFFIX))
+            .unwrap_or(content)
+            .to_vec();
+        Self {
+            replacement_body,
+            state: AppearanceFilterState::Top,
+            replaced: false,
+        }
+    }
+}
+
+impl TokenFilter for AppearanceTokenFilter {
+    fn handle_token(
+        &mut self,
+        token: &Token,
+        output: &mut TokenFilterOutput<'_>,
+    ) -> PipelineResult<()> {
+        let mut replace = false;
+        match self.state {
+            AppearanceFilterState::Top => {
+                output.write_token(token)?;
+                if token.is_word_value(b"BMC") {
+                    self.state = AppearanceFilterState::Bmc;
+                }
+            }
+            AppearanceFilterState::Bmc => {
+                if matches!(token.token_type, TokenType::Space | TokenType::Comment) {
+                    output.write_token(token)?;
+                } else {
+                    self.state = AppearanceFilterState::Emc;
+                    if token.is_word_value(b"EMC") {
+                        replace = true;
+                        self.state = AppearanceFilterState::End;
+                    }
+                }
+            }
+            AppearanceFilterState::Emc => {
+                if token.is_word_value(b"EMC") {
+                    replace = true;
+                    self.state = AppearanceFilterState::End;
+                }
+            }
+            AppearanceFilterState::End => output.write_token(token)?,
+        }
+        if replace {
+            self.replaced = true;
+            output.write(&self.replacement_body)?;
+            output.write(b"EMC")?;
+        }
+        Ok(())
+    }
+
+    fn handle_eof(&mut self, output: &mut TokenFilterOutput<'_>) -> PipelineResult<()> {
+        if !self.replaced {
+            output.write(b"/Tx BMC\n")?;
+            output.write(&self.replacement_body)?;
+            output.write(b"EMC")?;
+            self.replaced = true;
+        }
+        Ok(())
+    }
+}
+
 /// Build and install a new `/AP/N` Form XObject through canonical handles.
 ///
 /// This is the qpdf `QPDFFormFieldObjectHelper::generateTextAppearance`
@@ -214,32 +305,16 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     pdf.resolve_object_handle(&widget)?;
     let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
 
-    // qpdf keeps an existing normal appearance stream and installs a token
-    // filter on that same canonical stream (`QPDFFormFieldObjectHelper.cc:
-    // 766-860`): the filter runs lazily at write time, over the decoded
-    // original bytes, and the writer's own encode policy recompresses
-    // afterward, so /Filter always ends up matching what qpdf actually
-    // writes. flpdf has no equivalent lazy decode/token-filter/re-encode
-    // primitive yet, so this installs the freshly-built *plain* content
-    // eagerly instead. `content` is not encoded under whatever filter the
-    // existing stream's dictionary currently declares, so that declaration
-    // must be cleared (`Some(ObjectHandle::null())`, qpdf's own
-    // "pass a null object to remove those values" `replaceStreamData`
-    // contract, `include/qpdf/QPDFObjectHandle.hh:1076-1080`) rather than
-    // left untouched (`None`) -- otherwise a stale `/Filter /FlateDecode`
-    // would survive over non-Flate bytes and the writer's lone-Flate
-    // fast path (which does not check whether the data was replaced since
-    // load) would echo the mismatched bytes verbatim. Clearing it routes
-    // the stream through the writer's normal compress-policy path, which
-    // recomputes /Filter to match whatever it actually emits.
+    // qpdf keeps an existing normal appearance stream and installs a
+    // `ValueSetter` token filter on that same canonical stream
+    // (`QPDFFormFieldObjectHelper.cc:766-860`). The filter runs lazily over
+    // decoded original bytes; the writer then applies its normal encode
+    // policy. This preserves both the source payload and the source filter
+    // declaration until the canonical pipe is actually requested.
     if ap.as_dictionary().is_some() {
         let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
         if normal.as_stream_dict().is_some() {
-            normal.replace_stream_data(
-                Rc::new(content),
-                Some(ObjectHandle::null()),
-                Some(ObjectHandle::null()),
-            );
+            normal.add_token_filter(Rc::new(RefCell::new(AppearanceTokenFilter::new(&content))))?;
             normal
                 .as_stream_dict()
                 .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
@@ -2309,6 +2384,7 @@ mod tests {
     use crate::content_stream::{
         parse_content_operations, parse_content_stream_data, ParseControl, ParserCallbacks,
     };
+    use crate::pipeline::{buffer::Buffer, qpdf_tokenizer::QpdfTokenizer, Pipeline};
     use crate::writer::PdfWriter;
     use crate::Pdf;
     use std::io::Cursor;
@@ -2327,6 +2403,31 @@ mod tests {
         widget_ref: ObjectRef,
     ) -> Result<Option<ObjectRef>> {
         super::render_choice_field(pdf, widget_ref, widget_ref)
+    }
+
+    fn run_appearance_filter(source: &[u8], replacement: &[u8]) -> Vec<u8> {
+        let mut filter = AppearanceTokenFilter::new(replacement);
+        let mut sink = Buffer::new("appearance filter test", None);
+        let mut tokenizer =
+            QpdfTokenizer::new("appearance filter test", &mut filter, Some(&mut sink));
+        tokenizer.write(source).expect("tokenizer write");
+        tokenizer.finish().expect("tokenizer finish");
+        drop(tokenizer);
+        sink.take_buffer().expect("appearance filter output")
+    }
+
+    #[test]
+    fn appearance_token_filter_matches_value_setter_states() {
+        let replacement = b"/Tx BMC\nreplacement\nEMC\n";
+
+        let immediate = run_appearance_filter(b"/Tx BMC %old\n EMC q", replacement);
+        assert_eq!(immediate, b"/Tx BMC %old\n replacement\nEMC q");
+
+        let nested = run_appearance_filter(b"/Tx BMC q EMC", replacement);
+        assert_eq!(nested, b"/Tx BMC replacement\nEMC");
+
+        let at_eof = run_appearance_filter(b"q", replacement);
+        assert_eq!(at_eof, b"q/Tx BMC\nreplacement\nEMC");
     }
 
     #[derive(Default)]
@@ -2970,12 +3071,17 @@ mod tests {
         assert!(existing.is_same_object_as(&existing_again));
         pdf.resolve_object_handle(&existing_again)
             .expect("resolve existing appearance");
-        assert!(existing_again
-            .as_stream_data()
-            .expect("existing appearance data")
-            .windows(b"(text)".len())
-            .any(|window| window == b"(text)"));
-
+        assert!(
+            existing_again.is_data_modified(),
+            "reused appearance must report qpdf's data-modified state"
+        );
+        assert_eq!(
+            existing_again
+                .get_raw_stream_data()
+                .expect("original appearance data"),
+            Rc::new(b"q Q\n".to_vec()),
+            "qpdf addTokenFilter must preserve the original encoded bytes"
+        );
         // Round-trip check for flpdf-25kg.3.8.2.2's fix (clearing /Filter
         // and /DecodeParms on reuse): this fixture's existing stream never
         // had a /Filter key, so the writer's default compress policy
@@ -3104,7 +3210,7 @@ mod tests {
         );
 
         let content = stream_handle
-            .as_stream_data()
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
             .expect("reused appearance data");
         assert!(
             content.windows(b"1 6 Td".len()).any(|w| w == b"1 6 Td"),
@@ -3225,19 +3331,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_under_preserve_mode_drops_filter()
+    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_under_preserve_mode_keeps_source()
     {
-        // Under StreamDataMode::Preserve, the writer's decode/re-encode
-        // compress policy never runs (effective_stream_policy returns None,
-        // "emit the stream verbatim") -- so unlike the default
-        // CompressStreams::Yes case, nothing recomputes /Filter after this
-        // fix clears it. ObjectHandle::replace_key special-cases a direct
-        // null value as a removal (not a stored Null entry), so the cleared
-        // /Filter/DecodeParms are genuinely absent from the dictionary by
-        // the time any writer policy runs, not merely null-valued -- the
-        // Preserve-mode output must therefore have no /Filter key on this
-        // stream at all (not a stale /FlateDecode, and not a literal
-        // `/Filter null`).
+        // qpdf's preserve setting enters the writer's stream pipe because
+        // `isDataModified()` is true, but `pipeStreamData` does not construct
+        // decode/token-filter stages when both encode flags and decode level
+        // are disabled. The original encoded bytes and `/Filter` therefore
+        // remain unchanged in the output.
         let raw = build_pdf_with_existing_flate_ap();
         let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
         render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
@@ -3250,10 +3350,31 @@ mod tests {
         writer
             .write()
             .expect("write reused appearance under preserve mode");
+        let renumbered = writer
+            .get_renumbered_obj_gen(ObjectRef::new(5, 0))
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
         let output = writer.get_buffer().expect("writer buffer");
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let stream_dict = written.as_stream_dict().expect("written stream dictionary");
         assert!(
-            !output.windows(b"/Filter".len()).any(|w| w == b"/Filter"),
-            "preserve-mode output must not gain a /Filter key"
+            stream_dict.has_key(b"/Filter"),
+            "preserve mode must keep the source filter when qpdf bypasses filtering"
+        );
+        let preserved = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("read preserved appearance");
+        assert!(
+            preserved.windows(b"q Q".len()).any(|w| w == b"q Q"),
+            "preserve mode must retain the original appearance payload: {preserved:?}"
+        );
+        assert!(
+            !preserved.windows(b"(Hello)".len()).any(|w| w == b"(Hello)"),
+            "preserve mode must not apply the token filter: {preserved:?}"
         );
     }
 
