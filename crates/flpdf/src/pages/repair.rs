@@ -2,11 +2,11 @@
 //! Repairs the page tree before optimization and returns qpdf's effective page
 //! order. The normal non-linearized writer does not call this path.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Seek};
 
 use crate::object::ObjectRef;
-use crate::object_handle::ObjectHandle;
+use crate::object_handle::{ObjectHandle, ObjectHandleIdentity};
 use crate::{Error, Pdf, Result};
 
 /// The effective `/Pages` root and leaf order after qpdf-compatible repair.
@@ -80,20 +80,20 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     // handle identity so the guard covers both indirect ObjGen slots and
     // direct dictionaries that share the same live allocation.
     let mut seen_parent: BTreeSet<ObjectRef> = BTreeSet::new();
-    let mut seen_parent_direct: Vec<ObjectHandle> = Vec::new();
+    // The key hashes only the canonical slot pointer; its Rc is retained so
+    // that an allocation cannot be dropped and reused while it is tracked.
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "identity key compares only Rc pointer identity and retains the slot deliberately"
+    )]
+    let mut seen_parent_direct: HashSet<ObjectHandleIdentity> = HashSet::new();
     let mut changed_pages = false;
     let mut warned = false;
     loop {
         let repeated = if let Some(object_ref) = pages.object_ref() {
             !seen_parent.insert(object_ref)
-        } else if seen_parent_direct
-            .iter()
-            .any(|seen| seen.is_same_object_as(&pages))
-        {
-            true
         } else {
-            seen_parent_direct.push(pages.clone());
-            false
+            !seen_parent_direct.insert(pages.identity_key())
         };
         if repeated {
             break;
@@ -128,7 +128,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
     let mut state = CanonicalRepairState {
         seen: BTreeSet::new(),
         visited: BTreeSet::new(),
-        visited_direct: Vec::new(),
+        visited_direct: HashSet::new(),
         pages: Vec::new(),
     };
     if pages.try_has_key(b"/Kids")? {
@@ -148,7 +148,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
 struct CanonicalRepairState {
     seen: BTreeSet<ObjectRef>,
     visited: BTreeSet<ObjectRef>,
-    visited_direct: Vec<ObjectHandle>,
+    visited_direct: HashSet<ObjectHandleIdentity>,
     pages: Vec<ObjectRef>,
 }
 
@@ -180,16 +180,10 @@ fn repair_page_tree_handle<R: Read + Seek>(
                 "page tree cycle detected at {object_ref}"
             )));
         }
-    } else if state
-        .visited_direct
-        .iter()
-        .any(|seen| seen.is_same_object_as(&node))
-    {
+    } else if !state.visited_direct.insert(node.identity_key()) {
         return Err(Error::Unsupported(
             "page tree cycle detected at direct /Pages node".to_owned(),
         ));
-    } else {
-        state.visited_direct.push(node.clone());
     }
 
     node.try_dereference()?;
@@ -4022,6 +4016,54 @@ mod tests {
             }
         );
         assert_eq!(prepared.pages, vec![ObjectRef::new(4, 0)]);
+    }
+
+    #[test]
+    fn wide_direct_page_tree_uses_canonical_identity_lookup() {
+        const WIDTH: usize = 512;
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid base PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve catalog");
+
+        let leaf = || {
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (
+                    b"MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+            ])
+        };
+        let direct_nodes = (0..WIDTH)
+            .map(|_| {
+                ObjectHandle::dictionary(vec![
+                    (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+                    (b"Kids".to_vec(), ObjectHandle::array(vec![leaf()])),
+                    (b"Count".to_vec(), ObjectHandle::integer(1)),
+                ])
+            })
+            .collect();
+        let root = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(direct_nodes)),
+            (b"Count".to_vec(), ObjectHandle::integer(WIDTH as i64)),
+        ]);
+        catalog
+            .replace_key(b"/Pages", root)
+            .expect("install direct page tree");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog modified");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("wide direct page tree must be repairable")
+            .expect("fixture has a page tree");
+        assert_eq!(prepared.pages.len(), WIDTH);
     }
 
     #[test]

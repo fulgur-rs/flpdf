@@ -81,6 +81,7 @@ use crate::{
 use crate::{Dictionary, Error, Object, ObjectRef, Result, Stream};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
 
 type StreamTokenFilter = Rc<RefCell<dyn TokenFilter>>;
@@ -581,6 +582,30 @@ mod parse_tests {
 #[derive(Clone)]
 pub struct ObjectHandle(Rc<RefCell<ObjectSlot>>);
 
+/// Opaque canonical identity for an [`ObjectHandle`].
+///
+/// The retained slot keeps the allocation alive while a traversal set uses
+/// the key. Equality and hashing compare the slot pointer only, matching
+/// qpdf's `QPDFObjectHandle::isSameObjectAs` rather than structural value
+/// equality (`include/qpdf/QPDFObjectHandle.hh:304-309`,
+/// `libqpdf/QPDFObjectHandle.cc:224-227`).
+#[derive(Clone)]
+pub(crate) struct ObjectHandleIdentity(Rc<RefCell<ObjectSlot>>);
+
+impl PartialEq for ObjectHandleIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ObjectHandleIdentity {}
+
+impl Hash for ObjectHandleIdentity {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Rc::as_ptr(&self.0).hash(state);
+    }
+}
+
 // Hand-written rather than derived: a resolved value can hold other
 // `ObjectHandle`s sharing canonical `Rc` identities (array/dict/stream-dict
 // children — see `Pdf::drop`'s own comment on indirect cycles). A self- or
@@ -1006,6 +1031,11 @@ impl ObjectHandle {
     /// `libqpdf/QPDFObjectHandle.cc:224-227`).
     pub fn is_same_object_as(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Return a stable set key for this canonical allocation.
+    pub(crate) fn identity_key(&self) -> ObjectHandleIdentity {
+        ObjectHandleIdentity(self.0.clone())
     }
 
     #[cfg(test)]
@@ -6989,6 +7019,24 @@ pub(crate) mod identity_tests {
         assert_eq!(*resolver.calls.borrow(), vec![ObjectRef::new(7, 0)]);
         assert!(handle.ptr_eq(&clone));
         assert_eq!(handle.object_ref(), Some(ObjectRef::new(7, 0)));
+    }
+
+    #[test]
+    fn identity_key_matches_qpdf_object_sameness_without_structural_equality() {
+        let original =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(1))]);
+        let alias = original.clone();
+        let distinct =
+            ObjectHandle::dictionary(vec![(b"Value".to_vec(), ObjectHandle::integer(1))]);
+        #[allow(
+            clippy::mutable_key_type,
+            reason = "identity key compares only Rc pointer identity and retains the slot deliberately"
+        )]
+        let mut seen = std::collections::HashSet::new();
+
+        assert!(seen.insert(original.identity_key()));
+        assert!(!seen.insert(alias.identity_key()));
+        assert!(seen.insert(distinct.identity_key()));
     }
 
     #[test]
