@@ -1817,10 +1817,12 @@ impl<R: Read + Seek> Pdf<R> {
     ///
     /// Also returns [`Error::Unsupported`] for a *direct* reserved `handle`
     /// (only reachable via [`ObjectHandle::shallow_copy`] on a reserved
-    /// handle) — see [`ObjectHandle::direct_value_clone`]'s own doc for why
-    /// this crate cannot honestly answer the "already indirect?" question
-    /// with `false` here either, and why qpdf establishes no oracle for
-    /// what a successful promotion should produce.
+    /// handle). Such a handle is not indirect, so this crate cannot
+    /// honestly answer the "already indirect?" question with `false`
+    /// either: none of qpdf's own `QPDF::makeIndirectObject` call sites
+    /// ever pass it a reserved value, so qpdf establishes no oracle for
+    /// what a successful promotion should produce, and this crate's value
+    /// representation has no reserved variant to install here regardless.
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         let Some(value) = handle.direct_value_clone()? else {
             return Err(Error::Unsupported(
