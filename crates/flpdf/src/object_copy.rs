@@ -1610,6 +1610,56 @@ mod tests {
     }
 
     #[test]
+    fn copy_foreign_original_stream_reports_late_source_failures_to_destination() {
+        let mut source = pdf_with_stream(b"source bytes that will be truncated");
+        let mut target = minimal_pdf();
+        let source_stream = source.get_object_handle(ObjectRef::new(4, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Stream", source_stream.clone())
+            .expect("attach source stream to root");
+
+        let copied_stream = target
+            .copy_foreign_object(&root)
+            .expect("copy original stream graph")
+            .get_key(b"/Stream");
+        let expected_offset = u64::try_from(source_stream.get_parsed_offset())
+            .expect("source stream must retain its data offset");
+
+        source
+            .resolver
+            .with_reader_mut(|reader| reader.get_mut().clear());
+        let _ = copied_stream
+            .get_raw_stream_data()
+            .expect_err("truncated source must fail during deferred read");
+
+        let target_messages: Vec<_> = target
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+        assert!(
+            target_messages
+                .iter()
+                .any(|message| message.contains("unexpected EOF reading stream data")),
+            "destination must own deferred source warnings: {target_messages:?}"
+        );
+        assert!(target
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.offset == Some(expected_offset)
+                    && diagnostic
+                        .message
+                        .contains("unexpected EOF reading stream data")
+            }));
+        assert!(source.repair_diagnostics().entries().is_empty());
+    }
+
+    #[test]
     fn copy_foreign_object_rebuilds_direct_containers_with_destination_children() {
         let mut source = minimal_pdf();
         let mut target = minimal_pdf();
