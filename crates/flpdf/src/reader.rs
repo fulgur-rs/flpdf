@@ -7906,12 +7906,17 @@ mod tests {
             expected
         );
         out.clear();
+        let identity = |object_ref| Ok(object_ref);
+        assert_eq!(
+            identity(ObjectRef::new(99, 0)).expect("identity map"),
+            ObjectRef::new(99, 0)
+        );
         assert_eq!(
             reserved
                 .unparse_stream_body_with_ref_map_and_removed(
                     &mut out,
                     false,
-                    &|object_ref| Ok(object_ref),
+                    &identity,
                     &std::collections::BTreeSet::new(),
                 )
                 .expect_err("mapped stream-body writer must reject reserved objects")
