@@ -5,14 +5,78 @@
 //! dictionary and writes a reconstructed [`crate::Object`] back through the
 //! legacy reader cache: qpdf's helper owns the selected handle and mutates the
 //! object graph that every other handle in the document observes.
+//!
+//! Parent-chain cycle detection follows qpdf's `QPDFObjGen::set`: indirect
+//! object identities are keyed by `ObjectRef` in a `BTreeSet` (O(log n) per
+//! check), while direct handles are not inserted
+//! (`include/qpdf/QPDFObjGen.hh:105-124`). This mirrors qpdf exactly for
+//! indirect cycles, but qpdf's own guard has the same gap flpdf would
+//! otherwise inherit: a direct object's `QPDFObjGen` is always `(0, 0)`, so
+//! `QPDFObjGen::set::add` unconditionally returns `true` for it and never
+//! terminates a `/Parent` chain built entirely from direct dictionaries that
+//! reciprocally reference each other (`include/qpdf/QPDFObjGen.hh:112-120`).
+//! Such a chain cannot come from parsing real PDF bytes -- direct values are
+//! inline text, so two of them cannot mutually contain each other in a
+//! finite file -- but it is reachable in memory through the public
+//! [`ObjectHandle::replace_key`] API, whose own doc already records that
+//! gap. Unlike qpdf's C++ walk, this crate's walk must not hang the hosting
+//! process for that shape.
+//!
+//! The guard for that gap tracks direct handles by live identity
+//! (`ObjectHandle::is_same_object_as`) in a side list, checked only when the
+//! current node is direct. This is a bound on an actual repeat, not on
+//! depth: a direct `/Parent` chain has no upper bound here other than a
+//! genuine cycle, matching qpdf's own unbounded-but-for-cycles walk and the
+//! behavior of this module before the `BTreeSet` migration. Direct
+//! `/Parent` chains are rare in practice, so the linear scan this implies
+//! (O(n) per direct node, O(n^2) for a long acyclic direct-only chain) is
+//! accepted rather than adding new machinery for a shape indirect objects
+//! already avoid via the `BTreeSet`.
 
 use crate::object_handle::ObjectHandle;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::{Error, ObjectRef, Pdf, Result};
+use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 #[path = "form_field_object_helper/rendering.rs"]
 mod rendering;
+
+fn mark_field_node_seen(seen: &mut BTreeSet<ObjectRef>, current: &ObjectHandle) -> bool {
+    current
+        .object_ref()
+        .map(|object_ref| seen.insert(object_ref))
+        .unwrap_or(true)
+}
+
+/// Detect an actual repeat among **direct** `/Parent` nodes by live handle
+/// identity. Indirect nodes are ignored here (they are already turned into
+/// termination by the `ObjectRef` `seen` set); a direct node not yet seen is
+/// recorded and the walk continues. See the module doc for why direct nodes
+/// need this separate, identity-based guard.
+fn mark_direct_node_seen(direct_seen: &mut Vec<ObjectHandle>, current: &ObjectHandle) -> bool {
+    if !current.is_direct() {
+        return true;
+    }
+    if direct_seen
+        .iter()
+        .any(|handle: &ObjectHandle| handle.is_same_object_as(current))
+    {
+        return false;
+    }
+    direct_seen.push(current.clone());
+    true
+}
+
+/// The bounded error raised when [`mark_direct_node_seen`] detects an actual
+/// repeat. Real PDF bytes cannot produce this shape (see the module doc), so
+/// this is unreachable from a live qpdf parse and exists only to bound the
+/// in-memory `ObjectHandle::replace_key` gap.
+fn direct_parent_cycle_error(field_ref: ObjectRef) -> Error {
+    Error::Unsupported(format!(
+        "field tree contains a /Parent cycle of direct dictionaries at {field_ref}"
+    ))
+}
 
 /// Typed access helper for a PDF AcroForm field or widget annotation
 /// dictionary.
@@ -193,14 +257,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Return the dotted `/T` name formed by this field and its parents.
     pub fn fully_qualified_name(&mut self) -> Result<String> {
         let mut current = self.field.clone();
-        let mut seen = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut direct_seen = Vec::new();
         let mut parts = Vec::new();
 
-        while !seen
-            .iter()
-            .any(|handle: &ObjectHandle| handle.is_same_object_as(&current))
-        {
-            seen.push(current.clone());
+        while mark_field_node_seen(&mut seen, &current) {
+            if !mark_direct_node_seen(&mut direct_seen, &current) {
+                return Err(direct_parent_cycle_error(self.field_ref));
+            }
             let node = self.resolved(current.clone())?;
             if node.as_dictionary().is_none() {
                 break;
@@ -712,7 +776,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Walk field nodes by live handle identity.  qpdf's seen set is over
     /// object identity, not over a materialized reference spelling, so direct
-    /// children and indirect children follow the same cycle rule here.
+    /// children and indirect children both continue the walk the same way;
+    /// only their termination guard differs -- see the module doc for why.
     fn resolve_inherited_handle_from(
         &mut self,
         field: ObjectHandle,
@@ -720,15 +785,15 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     ) -> Result<Option<ObjectHandle>> {
         let key = crate::object_handle::canonical_dictionary_key(key);
         let mut current = field;
-        let mut seen = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut direct_seen = Vec::new();
         loop {
-            if seen
-                .iter()
-                .any(|handle: &ObjectHandle| handle.is_same_object_as(&current))
-            {
+            if !mark_field_node_seen(&mut seen, &current) {
                 return Ok(None);
             }
-            seen.push(current.clone());
+            if !mark_direct_node_seen(&mut direct_seen, &current) {
+                return Err(direct_parent_cycle_error(self.field_ref));
+            }
 
             let node = self.resolved(current)?;
             if node.as_dictionary().is_none() {
@@ -779,5 +844,52 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn resolved(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle(&handle)?;
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_field_node_seen;
+    use crate::object_handle::ObjectHandle;
+    use crate::ObjectRef;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn qpdf_seen_set_ignores_direct_handles_and_tracks_indirect_identity() {
+        let mut seen = BTreeSet::new();
+
+        assert!(mark_field_node_seen(&mut seen, &ObjectHandle::integer(1)));
+        assert!(mark_field_node_seen(&mut seen, &ObjectHandle::integer(1)));
+
+        let first = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        let same_object = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        assert!(mark_field_node_seen(&mut seen, &first));
+        assert!(!mark_field_node_seen(&mut seen, &same_object));
+    }
+
+    #[test]
+    fn direct_seen_set_ignores_indirect_handles_and_tracks_direct_identity() {
+        let mut direct_seen = Vec::new();
+
+        // Indirect handles are ignored -- the `BTreeSet` in
+        // `mark_field_node_seen` already owns their identity.
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        assert!(super::mark_direct_node_seen(&mut direct_seen, &indirect));
+        assert!(super::mark_direct_node_seen(&mut direct_seen, &indirect));
+        assert!(direct_seen.is_empty());
+
+        // A direct handle is recorded the first time and rejected on an
+        // actual repeat of the same underlying allocation.
+        let direct = ObjectHandle::dictionary(Vec::new());
+        assert!(super::mark_direct_node_seen(&mut direct_seen, &direct));
+        assert!(!super::mark_direct_node_seen(&mut direct_seen, &direct));
+
+        // A different direct handle with equal contents but distinct
+        // identity is not a repeat.
+        let other_direct = ObjectHandle::dictionary(Vec::new());
+        assert!(super::mark_direct_node_seen(
+            &mut direct_seen,
+            &other_direct
+        ));
     }
 }
