@@ -299,10 +299,13 @@ fn field_value_string() {
     let bytes = build_leaf_field_pdf("/FT /Tx /V (Hello world)");
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    match field.field_value().expect("field_value()") {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"Hello world"),
-        other => panic!("expected String, got {other:?}"),
-    }
+    assert_eq!(
+        field
+            .field_value()
+            .expect("field_value()")
+            .and_then(|value| value.as_string()),
+        Some(b"Hello world".to_vec())
+    );
 }
 
 #[test]
@@ -310,10 +313,13 @@ fn field_default_value_name() {
     let bytes = build_leaf_field_pdf("/FT /Btn /DV /Off");
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    match field.field_default_value().expect("field_default_value()") {
-        Some(Object::Name(bytes)) => assert_eq!(bytes, b"Off"),
-        other => panic!("expected Name, got {other:?}"),
-    }
+    assert_eq!(
+        field
+            .field_default_value()
+            .expect("field_default_value()")
+            .and_then(|value| value.as_name()),
+        Some(b"Off".to_vec())
+    );
 }
 
 #[test]
@@ -331,11 +337,11 @@ fn field_absent_returns_none() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
     assert_eq!(field.field_type().expect("field_type()"), None);
-    assert_eq!(field.field_value().expect("field_value()"), None);
-    assert_eq!(
-        field.field_default_value().expect("field_default_value()"),
-        None
-    );
+    assert!(field.field_value().expect("field_value()").is_none());
+    assert!(field
+        .field_default_value()
+        .expect("field_default_value()")
+        .is_none());
     assert_eq!(field.field_flags().expect("field_flags()"), None);
 }
 
@@ -364,10 +370,13 @@ fn field_value_resolves_indirect_reference() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    match field.field_value().expect("field_value()") {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"Paris"),
-        other => panic!("expected resolved String 'Paris', got {other:?}"),
-    }
+    assert_eq!(
+        field
+            .field_value()
+            .expect("field_value()")
+            .and_then(|value| value.as_string()),
+        Some(b"Paris".to_vec())
+    );
 }
 
 #[test]
@@ -388,10 +397,13 @@ fn field_default_value_resolves_indirect_reference() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    match field.field_default_value().expect("field_default_value()") {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"default text"),
-        other => panic!("expected resolved String 'default text', got {other:?}"),
-    }
+    assert_eq!(
+        field
+            .field_default_value()
+            .expect("field_default_value()")
+            .and_then(|value| value.as_string()),
+        Some(b"default text".to_vec())
+    );
 }
 
 #[test]
@@ -421,10 +433,13 @@ fn field_value_indirect_null_treated_as_absent_inherits_parent() {
     ]);
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    match child.field_value().expect("field_value()") {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"from parent"),
-        other => panic!("expected inherited String 'from parent', got {other:?}"),
-    }
+    assert_eq!(
+        child
+            .field_value()
+            .expect("field_value()")
+            .and_then(|value| value.as_string()),
+        Some(b"from parent".to_vec())
+    );
 }
 
 #[test]
@@ -451,10 +466,13 @@ fn field_default_value_indirect_null_treated_as_absent_inherits_parent() {
     ]);
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    match child.field_default_value().expect("field_default_value()") {
-        Some(Object::Name(name)) => assert_eq!(name, b"Off"),
-        other => panic!("expected inherited Name 'Off', got {other:?}"),
-    }
+    assert_eq!(
+        child
+            .field_default_value()
+            .expect("field_default_value()")
+            .and_then(|value| value.as_name()),
+        Some(b"Off".to_vec())
+    );
 }
 
 #[test]
@@ -477,10 +495,13 @@ fn field_value_resolves_indirect_name() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(4, 0), &mut pdf);
-    match field.field_value().expect("field_value()") {
-        Some(Object::Name(name)) => assert_eq!(name, b"Yes"),
-        other => panic!("expected resolved Name 'Yes', got {other:?}"),
-    }
+    assert_eq!(
+        field
+            .field_value()
+            .expect("field_value()")
+            .and_then(|value| value.as_name()),
+        Some(b"Yes".to_vec())
+    );
 }
 
 #[test]
@@ -609,10 +630,13 @@ fn field_value_inherited_from_parent() {
     let bytes = build_parent_child_field_pdf("/FT /Tx /V (from parent)", "");
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    match child.field_value().expect("field_value()") {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"from parent"),
-        other => panic!("expected String, got {other:?}"),
-    }
+    assert_eq!(
+        child
+            .field_value()
+            .expect("field_value()")
+            .and_then(|value| value.as_string()),
+        Some(b"from parent".to_vec())
+    );
 }
 
 #[test]
@@ -620,10 +644,13 @@ fn field_default_value_inherited_from_parent() {
     let bytes = build_parent_child_field_pdf("/FT /Btn /DV /Off", "");
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    match child.field_default_value().expect("field_default_value()") {
-        Some(Object::Name(name)) => assert_eq!(name, b"Off"),
-        other => panic!("expected Name, got {other:?}"),
-    }
+    assert_eq!(
+        child
+            .field_default_value()
+            .expect("field_default_value()")
+            .and_then(|value| value.as_name()),
+        Some(b"Off".to_vec())
+    );
 }
 
 #[test]
@@ -641,10 +668,13 @@ fn field_value_child_overrides_parent() {
     let bytes = build_parent_child_field_pdf("/FT /Tx /V (parent value)", "/V (child value)");
     let mut pdf = open(bytes);
     let mut child = FormFieldObjectHelper::new(ObjectRef::new(5, 0), &mut pdf);
-    match child.field_value().expect("field_value()") {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"child value"),
-        other => panic!("expected String 'child value', got {other:?}"),
-    }
+    assert_eq!(
+        child
+            .field_value()
+            .expect("field_value()")
+            .and_then(|value| value.as_string()),
+        Some(b"child value".to_vec())
+    );
 }
 
 /// When child has /FT directly, parent /FT is not consulted.

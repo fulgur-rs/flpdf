@@ -11,7 +11,7 @@
 //!   wrong value type, non-dictionary node, cycles, and long acyclic chains —
 //!   across `/FT` names, `/V` objects, and `/Ff` integers.
 
-use flpdf::{AnnotationObjectHelper, Error, FormFieldObjectHelper, Object, ObjectRef, Pdf};
+use flpdf::{AnnotationObjectHelper, Error, FormFieldObjectHelper, ObjectRef, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -155,10 +155,13 @@ fn field_value_direct_null_inherits_parent() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    match field.field_value().unwrap() {
-        Some(Object::String(bytes)) => assert_eq!(bytes, b"inherited"),
-        other => panic!("expected inherited string, got {other:?}"),
-    }
+    assert_eq!(
+        field
+            .field_value()
+            .unwrap()
+            .and_then(|value| value.as_string()),
+        Some(b"inherited".to_vec())
+    );
 }
 
 #[test]
@@ -169,7 +172,7 @@ fn field_value_parent_not_dictionary_returns_none() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_value().unwrap(), None);
+    assert!(field.field_value().unwrap().is_none());
 }
 
 #[test]
@@ -180,7 +183,7 @@ fn field_value_cycle_returns_none() {
     ]);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_value().unwrap(), None);
+    assert!(field.field_value().unwrap().is_none());
 }
 
 // ===========================================================================
@@ -262,7 +265,7 @@ fn field_value_long_acyclic_chain_returns_none() {
     let bytes = deep_field_chain(130);
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
-    assert_eq!(field.field_value().unwrap(), None);
+    assert!(field.field_value().unwrap().is_none());
 }
 
 #[test]
