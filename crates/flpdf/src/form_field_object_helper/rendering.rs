@@ -507,13 +507,18 @@ fn build_qpdf_choice_appearance_content(
     // a small font_size and/or a huge bbox_h, `bbox_h / tfh` can exceed
     // `usize::MAX` as an f64, and `as usize` saturates rather than
     // overflowing (Rust's documented float-to-int cast behavior since
-    // 1.45). Clamping to `options.len()` immediately — before any signed
-    // arithmetic or slicing — removes that saturation risk entirely:
-    // `options.len()` is already a natural upper bound on how many rows
-    // could ever be meaningfully selected, and for any max_rows within
-    // range the fixup loop below converges to the same window a smaller,
-    // pre-clamped max_rows would (flpdf-25kg.3.8.2.3).
-    let max_rows = ((bbox_h / tfh).max(0.0) as usize).min(options.len());
+    // 1.45). Clamping immediately — before any signed arithmetic or
+    // slicing — removes that saturation risk entirely. The bound is
+    // `options.len() + 1`, not `options.len()`: the *found* branch below
+    // replaces `lines` outright with a slice of `options` (needs at most
+    // `options.len()` rows, and the fixup loop converges to the same
+    // window for any max_rows at or above that), but the *not-found*
+    // branch keeps the unmatched value as its own row and appends up to
+    // `max_rows - 1` options on top, so it needs room for the value plus
+    // every option -- `options.len() + 1` rows -- when the bounding box is
+    // tall enough to hold them (flpdf-25kg.3.8.2.3's clamp under-served
+    // this branch by exactly one row).
+    let max_rows = ((bbox_h / tfh).max(0.0) as usize).min(options.len().saturating_add(1));
     let mut lines = vec![value.to_vec()];
     let mut highlight = false;
     let mut highlight_index = 0usize;
@@ -3579,6 +3584,71 @@ mod tests {
             result.unwrap().is_some(),
             "extreme bbox/font-size must still produce an appearance"
         );
+    }
+
+    #[test]
+    fn qpdf_choice_builder_reserves_room_for_unmatched_value_row() {
+        // Regression: the `.min(options.len())` clamp added for
+        // flpdf-25kg.3.8.2.3 protects the *found* branch (which replaces
+        // `lines` with a slice of `options`, needing at most
+        // `options.len()` rows) but starves the *not-found* branch, which
+        // needs `options.len() + 1` rows -- `lines` already holds the
+        // unmatched value, and `options.iter().take(max_rows - 1)` then
+        // appends up to `max_rows - 1` more. With `max_rows` capped to
+        // `options.len()`, `take(max_rows - 1)` drops the last option even
+        // when the bounding box is tall enough to show every option plus
+        // the unmatched value.
+        let content = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"NotFound",
+            &[b"Alpha".to_vec(), b"Beta".to_vec(), b"Gamma".to_vec()],
+            100.0,
+            48.0, // 4 rows of 12pt fit: the value plus all 3 options.
+            10.0,
+            false,
+        );
+        for (expected, label) in [
+            (b"(NotFound)".as_slice(), "NotFound"),
+            (b"(Alpha)", "Alpha"),
+            (b"(Beta)", "Beta"),
+            (b"(Gamma)", "Gamma"),
+        ] {
+            assert!(
+                content
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "expected `{label}` Tj line in content, got {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_choice_builder_reserves_room_for_sole_unmatched_option() {
+        // Same regression, degenerate single-option case: before the fix,
+        // clamping `max_rows` to `options.len() == 1` fails the `max_rows
+        // >= 2` gate entirely, so the sole option is never shown at all --
+        // even though the box has room for both the unmatched value and
+        // the option.
+        let content = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"NotFound",
+            &[b"OnlyOption".to_vec()],
+            100.0,
+            24.0, // 2 rows of 12pt fit: the value plus the sole option.
+            10.0,
+            false,
+        );
+        for (expected, label) in [
+            (b"(NotFound)".as_slice(), "NotFound"),
+            (b"(OnlyOption)", "OnlyOption"),
+        ] {
+            assert!(
+                content
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "expected `{label}` Tj line in content, got {content:?}"
+            );
+        }
     }
 
     // ── substitute_da_tf_operand: direct-function-level (flpdf-25kg.3.8.2.1) ─
