@@ -243,9 +243,11 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&ap)?;
     } // cov:ignore: llvm-cov attributes this closing brace as an executable branch line
 
+    // cov:ignore-start: new_stream_with_data always allocates an indirect stream
     let stream_ref = stream.object_ref().ok_or_else(|| {
         Error::Unsupported("canonical appearance stream is not indirect".to_string())
     })?;
+    // cov:ignore-end
     Ok(stream_ref)
 }
 
