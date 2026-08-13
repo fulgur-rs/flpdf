@@ -831,6 +831,17 @@ mod tests {
 
     #[test]
     fn foreign_copier_stops_reservation_on_a_direct_identity_cycle() {
+        // NOTE: `direct.replace_key(b"/Self", direct.clone())` is a no-op —
+        // `ObjectHandle::is_direct_value_alias` silently rejects a direct
+        // handle aliasing itself, so `direct` never actually gains a "/Self"
+        // key. This test pre-seeds `direct_visiting` below to exercise the
+        // guard mechanically in isolation; it does not prove a naturally
+        // constructed cycle reaches it. That organic coverage — a genuine
+        // multi-hop direct cycle flowing through `reserve_objects` via the
+        // public `copy_foreign_object` entry point — comes from
+        // `copy_foreign_object_rejects_a_direct_identity_cycle_during_replacement`,
+        // whose two-dictionary cycle also traverses reservation before
+        // reaching the replacement-phase guard under test there.
         let direct = ObjectHandle::dictionary(Vec::new());
         direct.replace_key(b"/Self", direct.clone());
         let mut target = minimal_pdf();
