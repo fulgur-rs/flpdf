@@ -1,5 +1,4 @@
-//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy
-//! lives here.
+//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy lives here.
 //! Cross-document deep object copier (identity-preserving reservation + cycle handling).
 //!
 //! [`copy_objects`] copies a pre-closed set of source [`ObjectRef`]s into a
