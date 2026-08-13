@@ -2284,12 +2284,23 @@ pub(crate) fn encrypt_stream_payload_with_iv(
 ///   preserve/decode/re-encode decision. The reader records it only while an
 ///   `endstream` scan remains authoritative.
 /// * `CompressStreams::Yes` on an already-lone-`/FlateDecode` source (and no
-///   `/F` external-data entry, no `--recompress-flate`, and no content
-///   normalization) is **preserved verbatim** — qpdf does not decode +
-///   re-encode it — with `/Length` normalized to the raw data length.
+///   `/F` external-data entry, no `--recompress-flate`, no content
+///   normalization, and `is_data_modified` false) is **preserved verbatim**
+///   — qpdf does not decode + re-encode it — with `/Length` normalized to the
+///   raw data length.
 /// * any other `Yes`/`No` policy decodes and re-encodes via
 ///   [`apply_stream_compress_policy`].
 /// * preserve mode (`None`) passes the dict + raw bytes through unchanged.
+///
+/// `is_data_modified` mirrors `QPDFObjectHandle::isDataModified()`
+/// (`QPDF_Stream.cc:321-324`), which `QPDFWriter::willFilterStream`
+/// consults before the lone-`/FlateDecode` exemption
+/// (`QPDFWriter.cc:1234-1245`): a stream carrying a registered token filter
+/// is never eligible for the verbatim shortcut, even though this
+/// materialized-`Object` caller has no token-filter machinery of its own and
+/// so always decodes + re-encodes the **already-materialized** bytes rather
+/// than running the filter. Callers that never observe token-filtered
+/// streams (`write_pclm`) may pass `false` unconditionally.
 ///
 /// The returned bool feeds [`write_reencoded_object`], which only appends a
 /// regenerated `/Filter` (qpdf's re-filtered key order) when the source was NOT
@@ -2297,6 +2308,7 @@ pub(crate) fn encrypt_stream_payload_with_iv(
 pub(crate) fn reencode_stream_for_compress(
     mut stream: crate::Stream,
     options: &WriterOptions,
+    is_data_modified: bool,
     qpdf_plain_empty_refilter: bool,
     recovered_stream_eol: Option<&[u8]>,
     normalize_content: bool,
@@ -2351,8 +2363,14 @@ pub(crate) fn reencode_stream_for_compress(
         // preserving them verbatim would keep a stale external reference. Such
         // streams fall through to the re-encode arm, which embeds the decoded
         // data and strips `/F` / `/FFilter` / `/FDecodeParms`.
+        //
+        // `!is_data_modified` mirrors `willFilterStream`'s own exemption guard
+        // (`QPDFWriter.cc:1234-1245`): a token-filtered stream is never
+        // eligible for the verbatim shortcut, so it falls through to the
+        // re-encode arm below like any other non-lone-Flate source.
         Some(CompressStreams::Yes)
             if source_filter_is_lone_flate
+                && !is_data_modified
                 && !options.recompress_flate
                 && !stream_normalization
                 && !is_metadata_stream
@@ -2623,9 +2641,14 @@ fn write_pclm<R: Read + Seek, W: Write>(
                 bytes.extend_from_slice(format!("{} 0 obj\n", output.number).as_bytes());
                 match object {
                     Object::Stream(stream) => {
+                        // PCLm image-strip pages never carry a registered
+                        // token filter (AcroForm appearance regeneration is
+                        // the only producer), so `is_data_modified` is always
+                        // false here.
                         let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
                             stream,
                             options,
+                            false,
                             true,
                             pdf.recovered_stream_eol(source),
                             false,
@@ -3462,9 +3485,20 @@ fn emit_canonical_pdf_inner<R: Read + Seek, W: Write>(
             // excluded modes and the plain pipeline cannot drift on qpdf's
             // re-filter rules. The resulting raw buffer is consumed directly
             // by the writer pipeline below; encryption does not mutate it.
+            //
+            // `is_data_modified` is hardcoded false here: this fallback path
+            // (QDF / encrypted / content-normalized / non-default
+            // object-stream-mode writes -- see `write_plain::eligible`) only
+            // has the already-materialized `object`, with no canonical
+            // handle to query `is_data_modified()` from. A token-filtered
+            // lone-Flate stream written through this branch keeps today's
+            // verbatim-preserve shortcut instead of qpdf's forced re-encode;
+            // tracked as a follow-up, parallel to the linearized-writer fix
+            // this parameter exists for.
             let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
                 stream,
                 options,
+                false,
                 qpdf_null_visibility,
                 pdf.recovered_stream_eol(*old_ref),
                 options.content_normalization && contents_seq.contains_key(old_ref),
@@ -4352,8 +4386,18 @@ fn normalize_direct_content_values(object: &mut Object, options: &WriterOptions)
 fn normalize_direct_content_value(value: &mut Object, options: &WriterOptions) {
     match value {
         Object::Stream(stream) => {
-            let (normalized, _) =
-                reencode_stream_for_compress(stream.clone(), options, false, None, true, false);
+            // A direct (non-indirect) stream value has no canonical handle
+            // of its own to register a token filter against, so
+            // `is_data_modified` is always false here.
+            let (normalized, _) = reencode_stream_for_compress(
+                stream.clone(),
+                options,
+                false,
+                false,
+                None,
+                true,
+                false,
+            );
             let Object::Stream(normalized) = normalized else {
                 unreachable!("stream compression always returns a stream") // cov:ignore: stream normalization always returns a stream object
             };

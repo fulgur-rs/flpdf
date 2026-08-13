@@ -52,10 +52,23 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                     )?; // cov:ignore: validated source placements have already passed the reference-map invariant
                     match object {
                         Object::Stream(stream) => {
+                            // `is_data_modified` is hardcoded false here:
+                            // this `!plan.canonical` branch (Preserve mode
+                            // with a source that already has ObjStm
+                            // containers, or Generate mode) only has the
+                            // already-materialized `object`, with no
+                            // canonical handle to query `is_data_modified()`
+                            // from. A token-filtered lone-Flate stream
+                            // written through this branch keeps today's
+                            // verbatim-preserve shortcut instead of qpdf's
+                            // forced re-encode; tracked as a follow-up,
+                            // parallel to the linearized-writer fix this
+                            // parameter exists for.
                             let (reencoded, source_filter_is_lone_flate) =
                                 reencode_stream_for_compress(
                                     stream,
                                     options,
+                                    false,
                                     true,
                                     pdf.recovered_stream_eol(*source),
                                     false,
@@ -215,44 +228,50 @@ fn canonical_stream_output(
     };
     let preserve_lone_flate = matches!(policy, Some(CompressStreams::Yes))
         && source_has_lone_flate
+        && !handle.is_data_modified()
         && !options.recompress_flate
         && !options.content_normalization
         && !stream_dict.try_has_key(b"/F")?;
     let source_for_pipe = handle.clone();
 
-    let (data, filtering_attempted) = if policy.is_none() || preserve_lone_flate {
-        (
-            source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
-            false,
-        )
-    } else {
-        let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
-        let mut filtering_attempted = false;
-        let encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
-            crate::object_handle::STREAM_ENCODE_COMPRESS
+    // QPDFWriter::willFilterStream starts with `isDataModified()` before it
+    // considers the user compression policy (`QPDFWriter.cc:1234-1245`). A
+    // token-filtered stream must therefore take the pipe path even under
+    // Preserve mode; only an unmodified stream may be emitted verbatim.
+    let (data, filtering_attempted) =
+        if !handle.is_data_modified() && (policy.is_none() || preserve_lone_flate) {
+            (
+                source_for_pipe.get_raw_stream_data()?.as_ref().clone(),
+                false,
+            )
         } else {
-            0
+            let mut buffer = crate::pipeline::buffer::Buffer::new("canonical writer stream", None);
+            let mut filtering_attempted = false;
+            let encode_flags = if matches!(policy, Some(CompressStreams::Yes)) {
+                crate::object_handle::STREAM_ENCODE_COMPRESS
+            } else {
+                0
+            };
+            let success = source_for_pipe.pipe_stream_data(
+                &mut buffer,
+                &mut filtering_attempted,
+                encode_flags,
+                decode_level,
+                true,
+                true,
+            )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
+            let data = if !success {
+                // QPDFWriter retries a failed filter pipeline against a fresh raw
+                // source (QPDFWriter.cc:1287-1314). The first pipeline may have
+                // consumed or partially filled its destination, so do not emit
+                // that buffer when filtering fails.
+                filtering_attempted = false;
+                source_for_pipe.get_raw_stream_data()?.as_ref().clone()
+            } else {
+                buffer.take_buffer()?.to_vec()
+            };
+            (data, filtering_attempted)
         };
-        let success = source_for_pipe.pipe_stream_data(
-            &mut buffer,
-            &mut filtering_attempted,
-            encode_flags,
-            decode_level,
-            true,
-            true,
-        )?; // cov:ignore: filter-pipeline failures are covered at the pipeline boundary, not by this validated emitter
-        let data = if !success {
-            // QPDFWriter retries a failed filter pipeline against a fresh raw
-            // source (QPDFWriter.cc:1287-1314). The first pipeline may have
-            // consumed or partially filled its destination, so do not emit
-            // that buffer when filtering fails.
-            filtering_attempted = false;
-            source_for_pipe.get_raw_stream_data()?.as_ref().clone()
-        } else {
-            buffer.take_buffer()?.to_vec()
-        };
-        (data, filtering_attempted)
-    };
 
     let mut entries = stream_dict.try_as_dictionary()?.unwrap_or_default();
     entries.remove(b"/Length".as_slice());

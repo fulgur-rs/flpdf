@@ -586,6 +586,21 @@ fn append_object(
     Ok(offset)
 }
 
+/// Query `r`'s canonical-handle `is_data_modified()` bit
+/// (`QPDF_Stream::isDataModified`, `QPDF_Stream.cc:321-324`) for
+/// [`append_body_object`]'s stream-compression-policy decision.
+///
+/// `ObjectHandle::is_data_modified` reports `false` for an unresolved
+/// handle, so this resolves `r` through the canonical handle explicitly
+/// rather than relying on a caller's separate `pdf.resolve(r)` (the
+/// legacy-`Object` resolver `append_body_object`'s callers already use,
+/// which does not touch the canonical handle as a side effect).
+fn stream_is_data_modified<R: Read + Seek>(pdf: &mut Pdf<R>, r: ObjectRef) -> Result<bool> {
+    let handle = pdf.get_object_handle(r);
+    pdf.resolve_object_handle(&handle)?;
+    Ok(handle.is_data_modified())
+}
+
 /// Append a renumbered body object, routing `Object::Stream` payloads through
 /// the same [`CompressStreams`] re-encoding the flat full-rewrite path applies
 /// so a linearized file's body content streams are byte-identical to qpdf's
@@ -624,6 +639,22 @@ fn append_object(
 /// `--cleartext-metadata` exemption below. `new_ref` must not be substituted
 /// here: `metadata_ref` is populated before renumbering, so comparing against
 /// the renumbered ref would never match.
+///
+/// `is_data_modified` is `original_ref`'s canonical-handle
+/// `is_data_modified()` bit (see [`stream_is_data_modified`]), queried by the
+/// caller before `object` was materialized. It defeats
+/// [`crate::writer::reencode_stream_for_compress`]'s lone-`/FlateDecode`
+/// verbatim shortcut, mirroring `QPDFWriter::willFilterStream`
+/// (`QPDFWriter.cc:1234-1245`): qpdf never takes that shortcut for a stream
+/// carrying a registered token filter, even though — because
+/// `QPDF_Stream::pipeStreamData` runs that filter a second time during
+/// `QPDF::optimize`'s linearization pre-pass and the filter's qpdf-ported
+/// state (`AppearanceTokenFilter`) does not reset between pipes — the
+/// content the *real* write pass re-encodes is whatever the exhausted
+/// filter passes through unchanged, not the fresh replacement. This
+/// function does not run the token filter at all (`object` is already
+/// materialized from the pre-filter source), which reproduces that same
+/// observed qpdf output byte-for-byte without modeling the double pipe.
 #[allow(clippy::too_many_arguments)]
 fn append_body_object(
     bytes: &mut Vec<u8>,
@@ -634,14 +665,22 @@ fn append_body_object(
     recovered_stream_eol: Option<&[u8]>,
     encrypt_ctx: Option<&crate::writer::EncryptionContext>,
     encrypted_string_emitter: Option<&mut EncryptedStringEmitter>,
+    is_data_modified: bool,
 ) -> Result<usize> {
     let Object::Stream(stream) = object else {
         return append_object(bytes, new_ref, object, encrypted_string_emitter);
     };
 
     let policy = effective_stream_policy(options);
-    let (reencoded, source_filter_is_lone_flate) =
-        reencode_stream_for_compress(stream, options, true, recovered_stream_eol, false, false);
+    let (reencoded, source_filter_is_lone_flate) = reencode_stream_for_compress(
+        stream,
+        options,
+        is_data_modified,
+        true,
+        recovered_stream_eol,
+        false,
+        false,
+    );
 
     // `apply_stream_compress_policy` always returns `Object::Stream` (every arm
     // constructs one), so this destructuring never fails.
@@ -2111,6 +2150,7 @@ fn do_write_pass<R: Read + Seek>(
         );
         let object = pdf.resolve(catalog_orig)?;
         let recovered_eol = pdf.recovered_stream_eol(catalog_orig);
+        let is_data_modified = stream_is_data_modified(pdf, catalog_orig)?;
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let appended = append_body_object(
@@ -2122,6 +2162,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
+            is_data_modified,
         );
         let offset = appended?;
         xref_offsets.insert(catalog_new_ref.number, offset);
@@ -2150,6 +2191,7 @@ fn do_write_pass<R: Read + Seek>(
         // cov:ignore-end
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let appended = append_body_object(
@@ -2161,6 +2203,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
+            is_data_modified,
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
@@ -2258,6 +2301,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let appended = append_body_object(
@@ -2269,6 +2313,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
+            is_data_modified,
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
@@ -2300,6 +2345,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let appended = append_body_object(
@@ -2311,6 +2357,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
+            is_data_modified,
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
@@ -2358,6 +2405,7 @@ fn do_write_pass<R: Read + Seek>(
         };
         let object = pdf.resolve(*original_ref)?;
         let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+        let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
         let renumbered =
             renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
         let appended = append_body_object(
@@ -2369,6 +2417,7 @@ fn do_write_pass<R: Read + Seek>(
             recovered_eol,
             encrypt_ctx,
             encrypted_string_emitter.as_deref_mut(),
+            is_data_modified,
         );
         let offset = appended?;
         xref_offsets.insert(new_ref.number, offset);
@@ -2434,6 +2483,7 @@ fn do_write_pass<R: Read + Seek>(
                     .expect("part4 plain object renumber entry checked above");
                 let object = pdf.resolve(*original_ref)?;
                 let recovered_eol = pdf.recovered_stream_eol(*original_ref);
+                let is_data_modified = stream_is_data_modified(pdf, *original_ref)?;
                 let renumbered =
                     renumber_object_with_removed(pdf, &object, 0, renumber, &plan.removed_refs)?;
                 let appended = append_body_object(
@@ -2445,6 +2495,7 @@ fn do_write_pass<R: Read + Seek>(
                     recovered_eol,
                     encrypt_ctx,
                     encrypted_string_emitter.as_deref_mut(),
+                    is_data_modified,
                 );
                 let offset = appended?;
                 xref_offsets.insert(new_ref.number, offset);
@@ -8734,6 +8785,7 @@ mod tests {
             None,
             Some(&context),
             Some(&mut emitter),
+            false,
         )
         .expect("linearized encrypted body stream");
 
