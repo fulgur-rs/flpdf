@@ -1450,6 +1450,22 @@ impl ObjectHandle {
     /// Propagates [`Self::shallow_copy`]'s stream rejection when the stream
     /// dictionary being privatized itself holds a *direct* stream, the same
     /// case `QPDF_Dictionary::copy` throws on.
+    ///
+    /// Also returns [`Error::Unsupported`] for a *direct* reserved handle
+    /// (only constructible via [`Self::shallow_copy`] on a reserved handle,
+    /// `QPDF_Reserved::copy`, `libqpdf/QPDF_Reserved.cc:14-19`, which never
+    /// throws). The early `object_ref.is_some()` check above already
+    /// confirms directness before this state match runs, so a reserved
+    /// value here cannot honestly join the arm below that means "already
+    /// indirect" for the caller — but this crate's [`ObjectValue`] also has
+    /// no reserved variant to clone into `Some`, since qpdf represents
+    /// `QPDF_Reserved` as its own `QPDFValue` subclass rather than a
+    /// data-carrying value. None of qpdf's own `QPDF::makeIndirectObject`
+    /// call sites (`QPDF_pages.cc`, `NNTree.cc`,
+    /// `QPDFAcroFormDocumentHelper.cc`, …) ever pass a reserved handle, so
+    /// there is no qpdf throw text to mirror for a successful promotion
+    /// here; this is rejected explicitly instead of silently misreporting
+    /// the already-indirect case.
     pub(crate) fn direct_value_clone(&self) -> Result<Option<ObjectValue>> {
         let slot = self.0.borrow();
         if slot.object_ref.is_some() {
@@ -1471,10 +1487,8 @@ impl ObjectHandle {
                 },
                 other => other.clone(),
             })),
-            ObjectState::NotYetResolved
-            | ObjectState::Missing
-            | ObjectState::Reserved
-            | ObjectState::Destroyed => Ok(None),
+            ObjectState::Reserved => Err(reserved_clone_error()),
+            ObjectState::NotYetResolved | ObjectState::Missing | ObjectState::Destroyed => Ok(None),
         }
     }
 
@@ -4725,6 +4739,20 @@ fn unparse_materialize_child(handle: &ObjectHandle) -> Object {
 
 fn reserved_unparse_error() -> Error {
     Error::System("QPDFObjectHandle: attempting to unparse a reserved object".to_owned())
+}
+
+// Unlike `reserved_unparse_error` above, no qpdf throw text exists to mirror
+// here: `QPDF::makeIndirectObject` is never called with a reserved handle
+// anywhere in qpdf's own source (see `ObjectHandle::direct_value_clone`'s
+// own doc for the call-site survey), and `QPDF_Reserved::copy` itself never
+// throws either (`libqpdf/QPDF_Reserved.cc:14-19`). `Error::Unsupported`
+// matches the sibling "already indirect" rejection
+// `Pdf::make_indirect_object_handle` (`reader.rs`) raises for the case this
+// one must not be confused with.
+fn reserved_clone_error() -> Error {
+    Error::Unsupported(
+        "cannot clone a reserved ObjectHandle's value for indirect promotion".to_owned(),
+    )
 }
 
 // Writes one child handle's bytes for the plain-unparse family serviced by
@@ -8290,6 +8318,31 @@ mod stream_payload_sharing_tests {
             matches!(error, Error::System(ref message)
                 if message == "stream objects cannot be cloned"),
             "{error:?}"
+        );
+    }
+
+    // `direct_value_clone`'s early `slot.object_ref.is_some()` check already
+    // confirms this handle is direct before this match ever runs, so its
+    // `Reserved` arm can only be reached by a *direct* reserved handle --
+    // only constructible via `ObjectHandle::shallow_copy` on a reserved
+    // handle (`QPDF_Reserved::copy`, `libqpdf/QPDF_Reserved.cc:14-19`, never
+    // null, never a throw). Codex Review round 5 on PR #789, databaseId
+    // 3773627592: this used to fall into the same `Ok(None)` bucket as a
+    // genuinely indirect handle, so `Pdf::make_indirect_object_handle`
+    // reported "cannot make an already-indirect ObjectHandle indirect" for
+    // a handle its own `is_direct()` would confirm is not indirect.
+    #[test]
+    fn direct_value_clone_rejects_a_direct_reserved_handle_instead_of_reporting_already_indirect() {
+        let handle = ObjectHandle::new_reserved_direct();
+        assert!(handle.is_direct());
+
+        let error = handle
+            .direct_value_clone()
+            .expect_err("a direct reserved handle has no ObjectValue to clone");
+
+        assert!(
+            !error.to_string().contains("already-indirect"),
+            "the handle is direct, not indirect: {error}"
         );
     }
 

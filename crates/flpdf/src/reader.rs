@@ -1814,6 +1814,13 @@ impl<R: Read + Seek> Pdf<R> {
     /// an uninitialized QPDFObjectHandle indirect")` — this crate has no
     /// "uninitialized handle" state to reject separately, since every
     /// `ObjectHandle` is always validly constructed).
+    ///
+    /// Also returns [`Error::Unsupported`] for a *direct* reserved `handle`
+    /// (only reachable via [`ObjectHandle::shallow_copy`] on a reserved
+    /// handle) — see [`ObjectHandle::direct_value_clone`]'s own doc for why
+    /// this crate cannot honestly answer the "already indirect?" question
+    /// with `false` here either, and why qpdf establishes no oracle for
+    /// what a successful promotion should produce.
     pub fn make_indirect_object_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         let Some(value) = handle.direct_value_clone()? else {
             return Err(Error::Unsupported(
@@ -5653,6 +5660,50 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let already_indirect = pdf.get_object_handle(ObjectRef::new(1, 0));
         assert!(pdf.make_indirect_object_handle(already_indirect).is_err());
+    }
+
+    #[test]
+    fn make_indirect_object_handle_rejects_a_direct_reserved_handle_without_misreporting_already_indirect(
+    ) {
+        // Codex Review round 5 on PR #789, databaseId 3773627592,
+        // object_handle.rs:1476 (ObjectHandle::direct_value_clone). A
+        // *direct* reserved handle -- only constructible via
+        // `ObjectHandle::shallow_copy` on a reserved handle
+        // (`QPDF_Reserved::copy`, never null, never a throw:
+        // `libqpdf/QPDF_Reserved.cc:14-19`) -- used to fall into the same
+        // `Ok(None)` bucket `direct_value_clone` returns for a genuinely
+        // indirect handle, so this method reported "cannot make an
+        // already-indirect ObjectHandle indirect" for a handle
+        // `slot.object_ref.is_some()` had already confirmed was direct just
+        // a few lines above.
+        //
+        // qpdf's own `QPDF::makeIndirectObject` never receives a reserved
+        // value from any of its own call sites (`QPDF_pages.cc`,
+        // `NNTree.cc`, `QPDFAcroFormDocumentHelper.cc`, etc. always pass a
+        // dictionary, page, or resource dictionary), so there is no qpdf
+        // throw text to mirror for a *successful* promotion here, and this
+        // crate's `ObjectValue` has no reserved variant this clone-based
+        // allocator could install via `set_resolved` either way. This is
+        // rejected explicitly instead, the same way a direct reserved child
+        // is rejected during materialize rather than silently substituted
+        // with something else (flpdf-25kg.3.16.1.2, commit 60a63829).
+        let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let direct_copy = reserved
+            .shallow_copy()
+            .expect("QPDF_Reserved::copy never throws");
+        assert!(
+            direct_copy.is_direct(),
+            "shallow_copy never carries an object number of its own"
+        );
+
+        let error = pdf
+            .make_indirect_object_handle(direct_copy)
+            .expect_err("a direct reserved handle's value cannot be cloned");
+        assert!(
+            !error.to_string().contains("already-indirect"),
+            "the handle is direct; reporting it as already indirect would be false: {error}"
+        );
     }
 
     #[test]
