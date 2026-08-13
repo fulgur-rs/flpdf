@@ -4025,6 +4025,60 @@ mod tests {
     }
 
     #[test]
+    fn wide_direct_page_tree_uses_canonical_identity_lookup() {
+        const WIDTH: usize = 512;
+        let mut pdf =
+            Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid base PDF");
+        let catalog = pdf.get_object_handle(ObjectRef::new(1, 0));
+        catalog.try_dereference().expect("resolve catalog");
+
+        let leaf = || {
+            ObjectHandle::dictionary(vec![
+                (b"Type".to_vec(), ObjectHandle::name(b"Page".to_vec())),
+                (
+                    b"MediaBox".to_vec(),
+                    ObjectHandle::array(vec![
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(0),
+                        ObjectHandle::integer(612),
+                        ObjectHandle::integer(792),
+                    ]),
+                ),
+            ])
+        };
+        let direct_nodes = (0..WIDTH)
+            .map(|_| {
+                ObjectHandle::dictionary(vec![
+                    (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+                    (
+                        b"Kids".to_vec(),
+                        ObjectHandle::array(vec![leaf()]),
+                    ),
+                    (b"Count".to_vec(), ObjectHandle::integer(1)),
+                ])
+            })
+            .collect();
+        let root = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
+            (b"Kids".to_vec(), ObjectHandle::array(direct_nodes)),
+            (
+                b"Count".to_vec(),
+                ObjectHandle::integer(WIDTH as i64),
+            ),
+        ]);
+        catalog
+            .replace_key(b"/Pages", root)
+            .expect("install direct page tree");
+        pdf.mark_object_handle_dirty(&catalog)
+            .expect("mark catalog modified");
+
+        let prepared = prepare_for_optimization(&mut pdf)
+            .expect("wide direct page tree must be repairable")
+            .expect("fixture has a page tree");
+        assert_eq!(prepared.pages.len(), WIDTH);
+    }
+
+    #[test]
     fn direct_kids_cycle_is_rejected_before_depth_overflow() {
         let mut pdf =
             Pdf::open(Cursor::new(pdf_with_root_pages_parent_cycle())).expect("valid PDF");
