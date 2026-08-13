@@ -272,15 +272,13 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     stream_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()))?;
     stream_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()))?;
     stream_dict.replace_key(b"/FormType", ObjectHandle::integer(1))?;
-    stream_dict.replace_key(
-        b"/BBox",
-        ObjectHandle::array(vec![
-            ObjectHandle::real(0.0),
-            ObjectHandle::real(0.0),
-            ObjectHandle::real(bbox_w),
-            ObjectHandle::real(bbox_h),
-        ]),
-    )?;
+    let bbox = ObjectHandle::array(vec![
+        ObjectHandle::real(0.0),
+        ObjectHandle::real(0.0),
+        ObjectHandle::real(bbox_w),
+        ObjectHandle::real(bbox_h),
+    ]);
+    stream_dict.replace_key(b"/BBox", bbox)?;
 
     let mut resources = vec![(
         b"/ProcSet".to_vec(),
