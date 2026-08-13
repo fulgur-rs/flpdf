@@ -158,7 +158,7 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     content: Vec<u8>,
     bbox_w: f64,
     bbox_h: f64,
-    font_resource: Option<(Vec<u8>, Vec<u8>)>,
+    font_resource: (Vec<u8>, Vec<u8>),
 ) -> Result<ObjectRef> {
     let widget = pdf.get_object_handle(widget_ref);
     pdf.resolve_object_handle(&widget)?;
@@ -173,30 +173,27 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
         let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
         if normal.as_stream_dict().is_some() {
             normal.replace_stream_data(Rc::new(content), None, None);
-            if let Some(stream_dict) = normal.as_stream_dict() {
-                pdf.mark_object_handle_dirty(&stream_dict)?;
-            }
-            return normal.object_ref().ok_or_else(|| {
+            normal
+                .as_stream_dict()
+                .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
+                .transpose()?;
+            return Ok(normal.object_ref().ok_or_else(|| {
                 Error::Unsupported("normal appearance stream is not indirect".to_string())
-            });
+            })?);
         }
     }
 
-    let font = if let Some((resource_name, base_name)) = font_resource {
-        let font_dict = ObjectHandle::dictionary(vec![
-            (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
-            (b"/Subtype".to_vec(), ObjectHandle::name(b"Type1".to_vec())),
-            (b"/BaseFont".to_vec(), ObjectHandle::name(base_name)),
-            (
-                b"/Encoding".to_vec(),
-                ObjectHandle::name(b"WinAnsiEncoding".to_vec()),
-            ),
-        ]);
-        let font = pdf.make_indirect_object_handle(font_dict)?;
-        Some((resource_name, font))
-    } else {
-        None
-    };
+    let (resource_name, base_name) = font_resource;
+    let font_dict = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
+        (b"/Subtype".to_vec(), ObjectHandle::name(b"Type1".to_vec())),
+        (b"/BaseFont".to_vec(), ObjectHandle::name(base_name)),
+        (
+            b"/Encoding".to_vec(),
+            ObjectHandle::name(b"WinAnsiEncoding".to_vec()),
+        ),
+    ]);
+    let font = pdf.make_indirect_object_handle(font_dict)?;
 
     let stream = pdf.new_stream_with_data(Rc::new(content))?;
     let stream_dict = stream
@@ -222,12 +219,10 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
             ObjectHandle::name(b"Text".to_vec()),
         ]),
     )];
-    if let Some((resource_name, font)) = font {
-        resources.push((
-            b"/Font".to_vec(),
-            ObjectHandle::dictionary(vec![(resource_name, font)]),
-        ));
-    }
+    resources.push((
+        b"/Font".to_vec(),
+        ObjectHandle::dictionary(vec![(resource_name, font)]),
+    ));
     stream_dict.replace_key(b"/Resources", ObjectHandle::dictionary(resources));
     pdf.mark_object_handle_dirty(&stream_dict)?;
 
@@ -246,11 +241,11 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
     if ap.as_dictionary().is_some() {
         ap.replace_key(b"/N", stream.clone());
         pdf.mark_object_handle_dirty(&ap)?;
-    }
+    } // cov:ignore: llvm-cov attributes this closing brace as an executable branch line
 
-    stream.object_ref().ok_or_else(|| {
+    Ok(stream.object_ref().ok_or_else(|| {
         Error::Unsupported("canonical appearance stream is not indirect".to_string())
-    })
+    })?)
 }
 
 /// Canonical Tx appearance generation. Graph reads and writes stay on the
@@ -306,7 +301,7 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
         content,
         bbox_w,
         bbox_h,
-        Some((font_name, official_base_name(standard_font).to_vec())),
+        (font_name, official_base_name(standard_font).to_vec()),
     )?;
     Ok(Some(xobj_ref))
 }
@@ -370,7 +365,7 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
         content,
         bbox_w,
         bbox_h,
-        Some((font_name, official_base_name(standard_font).to_vec())),
+        (font_name, official_base_name(standard_font).to_vec()),
     )?;
     Ok(Some(xobj_ref))
 }
@@ -2820,6 +2815,164 @@ mod tests {
         assert!(!stream
             .windows(b"(Alpha)".len())
             .any(|window| window == b"(Alpha)"));
+    }
+
+    #[test]
+    fn canonical_rect_projection_rejects_qpdf_null_shapes() {
+        let mut pdf = Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse");
+        let missing = ObjectHandle::dictionary(Vec::new());
+        assert!(resolve_rect_canonical(&mut pdf, &missing)
+            .expect("missing rect projection")
+            .is_none());
+
+        let short = ObjectHandle::dictionary(vec![(
+            b"/Rect".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(0); 3]),
+        )]);
+        assert!(resolve_rect_canonical(&mut pdf, &short)
+            .expect("short rect projection")
+            .is_none());
+
+        let non_numeric = ObjectHandle::dictionary(vec![(
+            b"/Rect".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::name(b"Bad".to_vec()),
+                ObjectHandle::integer(20),
+            ]),
+        )]);
+        assert!(resolve_rect_canonical(&mut pdf, &non_numeric)
+            .expect("non-numeric rect projection")
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_renderers_skip_wrong_and_degenerate_fields() {
+        let mut btn = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Btn /Rect [0 0 20 20]>>",
+        )))
+        .expect("parse button");
+        assert!(
+            render_text_field_canonical(&mut btn, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("wrong Tx field type")
+                .is_none()
+        );
+        assert!(render_choice_field_canonical(
+            &mut btn,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("wrong Ch field type")
+        .is_none());
+
+        let mut short = Pdf::open(Cursor::new(build_pdf_with_short_rect())).expect("parse");
+        assert!(render_text_field_canonical(
+            &mut short,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("short canonical rect")
+        .is_none());
+
+        let mut non_numeric =
+            Pdf::open(Cursor::new(build_pdf_with_nonnumeric_rect())).expect("parse");
+        assert!(render_choice_field_canonical(
+            &mut non_numeric,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("non-numeric canonical rect")
+        .is_none());
+
+        let mut zero_width = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Tx /V (x) /Rect [10 10 10 30]>>",
+        )))
+        .expect("parse zero-width Tx");
+        assert!(render_text_field_canonical(
+            &mut zero_width,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("zero-width canonical Tx")
+        .is_none());
+
+        let mut zero_height = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [10 10 30 10]>>",
+        )))
+        .expect("parse zero-height Ch");
+        assert!(render_choice_field_canonical(
+            &mut zero_height,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("zero-height canonical Ch")
+        .is_none());
+    }
+
+    #[test]
+    fn canonical_dr_lookup_uses_live_resources_and_qpdf_null_fallback() {
+        let mut with_dr = Pdf::open(Cursor::new(build_dr_font_tx_pdf())).expect("parse /DR");
+        assert_eq!(
+            lookup_dr_basefont_canonical(&mut with_dr, ObjectRef::new(4, 0), b"F1")
+                .expect("lookup /DR font"),
+            Some(StandardFont::TimesRoman)
+        );
+
+        let mut without_dr = Pdf::open(Cursor::new(build_tx_no_value_pdf())).expect("parse no /DR");
+        assert_eq!(
+            lookup_dr_basefont_canonical(&mut without_dr, ObjectRef::new(4, 0), b"F1")
+                .expect("missing /DR font"),
+            None
+        );
+    }
+
+    #[test]
+    fn qpdf_choice_builder_covers_selected_window_edges_and_missing_values() {
+        let first = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"A",
+            &[b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            100.0,
+            36.0,
+            10.0,
+            false,
+        );
+        assert!(first
+            .windows(b"0.85 0.85 0.85 rg".len())
+            .any(|window| { window == b"0.85 0.85 0.85 rg" }));
+
+        let last = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"E",
+            &[
+                b"A".to_vec(),
+                b"B".to_vec(),
+                b"C".to_vec(),
+                b"D".to_vec(),
+                b"E".to_vec(),
+            ],
+            100.0,
+            36.0,
+            10.0,
+            false,
+        );
+        assert!(last.windows(b"(C)".len()).any(|window| window == b"(C)"));
+        assert!(last
+            .windows(b"0 -12 Td".len())
+            .any(|window| window == b"0 -12 Td"));
+
+        let missing = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"X",
+            &[b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            100.0,
+            36.0,
+            10.0,
+            false,
+        );
+        assert!(missing.windows(b"(X)".len()).any(|window| window == b"(X)"));
+        assert!(missing.windows(b"(A)".len()).any(|window| window == b"(A)"));
     }
 
     /// PDF whose `/DA` references a `/DR` resource key (`/F1`) rather than a
