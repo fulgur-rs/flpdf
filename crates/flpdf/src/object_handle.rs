@@ -37,6 +37,17 @@
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
 //! (`libqpdf/qpdf/QPDFValue.hh`).
+//!
+//! qpdf stores a stream's deferred source as a
+//! `std::shared_ptr<QPDFObjectHandle::StreamDataProvider>` in
+//! `QPDF_Stream` (`include/qpdf/QPDFObjectHandle.hh:68-127`,
+//! `libqpdf/QPDF_Stream.cc:575-604,640-660`). [`ObjectValue::Stream`] uses
+//! `Rc<dyn StreamDataProvider>` as an internal container substitution: it
+//! preserves provider ownership, exclusive buffer/provider source state,
+//! lazy invocation, repeated-call behavior, and the source pipeline order.
+//! The `Rc` choice is an internal Rust ownership detail; qpdf's observable
+//! callback, identity, retry, error, and `/Length` contracts remain the
+//! authority.
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
@@ -78,6 +89,8 @@ pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
 const STREAM_DATA_PROVIDER_DEFAULT_ERROR: &str =
     "you must override provideStreamData -- see QPDFObjectHandle.hh";
+const STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR: &str =
+    "stream data provider requires an indirect stream";
 const FOREIGN_OBJECT_OWNERSHIP_ERROR: &str =
     "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.";
 
@@ -3521,7 +3534,17 @@ impl ObjectHandle {
     /// `None` filter/decode parameters preserve existing keys. An explicit
     /// [`ObjectHandle::null`] removes them through the canonical dictionary
     /// mutation path. A non-stream handle returns qpdf's `asStreamWithAssert`
-    /// runtime classification as [`Error::System`].
+    /// runtime classification as [`Error::System`]. Provider registration is
+    /// restricted to indirect streams because the provider callback requires
+    /// the stream's stable `ObjectRef`; a direct stream is rejected here at
+    /// registration time rather than being accepted and failing later at the
+    /// pipe boundary.
+    ///
+    /// This mutates the live stream and dictionary in place. As with
+    /// [`Self::replace_stream_data`] and [`Self::replace_key`], callers that
+    /// mutate a document-owned handle must call
+    /// [`crate::Pdf::mark_object_handle_dirty`] (or the corresponding
+    /// [`crate::Pdf::mark_object_dirty`]) before writing the document.
     pub fn replace_stream_data_provider(
         &self,
         provider: Rc<dyn StreamDataProvider>,
@@ -3535,7 +3558,11 @@ impl ObjectHandle {
                 self.type_name()
             )));
         }
-
+        if self.object_ref().is_none() {
+            return Err(Error::System(
+                STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR.to_owned(),
+            ));
+        }
         self.with_value_mut(|value| {
             if let Some(ObjectValue::Stream {
                 stream_data,
@@ -13988,6 +14015,56 @@ mod stream_provider_contract_tests {
         }
     }
 
+    struct RetryOnlyProvider;
+
+    impl StreamDataProvider for RetryOnlyProvider {
+        fn provide_stream_data_with_retry_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            _pipeline: &mut dyn Pipeline,
+            _suppress_warnings: bool,
+            _will_retry: bool,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct LegacyOnlyProviderWithRetryFlag;
+
+    impl StreamDataProvider for LegacyOnlyProviderWithRetryFlag {
+        fn supports_retry(&self) -> bool {
+            true
+        }
+
+        fn provide_stream_data_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            _pipeline: &mut dyn Pipeline,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingCallbackPipeline {
+        failure: &'static str,
+    }
+
+    impl Pipeline for FailingCallbackPipeline {
+        fn identifier(&self) -> &str {
+            "failing callback pipeline"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            Err(PipelineError::runtime(self.failure))
+        }
+
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            Err(PipelineError::runtime(self.failure))
+        }
+    }
+
     struct EmptyProvider;
 
     impl StreamDataProvider for EmptyProvider {}
@@ -14061,7 +14138,8 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn provider_registration_is_lazy_and_retains_the_provider_allocation() {
-        let stream = provider_stream();
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
         let provider = Rc::new(LegacyProvider::default());
         let ownership = Rc::downgrade(&provider);
 
@@ -14233,6 +14311,11 @@ mod stream_provider_contract_tests {
             .get_stream_data(crate::writer::DecodeLevel::Generalized)
             .expect("provider filter pipeline");
         assert_eq!(output.as_slice(), decoded);
+        assert_ne!(
+            encoded.len(),
+            decoded.len(),
+            "the fixture must distinguish encoded provider bytes from decoded output"
+        );
         assert_eq!(
             stream
                 .as_stream_dict()
@@ -14264,21 +14347,58 @@ mod stream_provider_contract_tests {
     #[test]
     fn provider_pipe_rejects_a_direct_stream_without_object_identity() {
         let stream = provider_stream();
-        stream
+        let error = stream
             .replace_stream_data_provider(
                 Rc::new(PipeProvider::new(Rc::new(b"direct bytes".to_vec()))),
                 None,
                 None,
             )
-            .expect("provider replacement");
+            .expect_err("provider registration requires an indirect stream identity");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR
+        ));
+    }
 
-        let error = stream
+    #[test]
+    fn supports_retry_does_not_fallback_between_callback_families() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+
+        let mut retry_only_pipeline = crate::pipeline::buffer::Buffer::new("retry-only", None);
+        RetryOnlyProvider
+            .provide_stream_data_with_retry_by_id(47, 0, &mut retry_only_pipeline, false, false)
+            .expect("retry-only override");
+
+        let normal_family_stream = pdf.new_stream().expect("normal-family stream");
+        normal_family_stream
+            .replace_stream_data_provider(Rc::new(RetryOnlyProvider), None, None)
+            .expect("normal-family provider replacement");
+        let error = normal_family_stream
             .get_raw_stream_data()
-            .expect_err("provider requires an indirect stream identity");
+            .expect_err("normal family must not call retry-only override");
         assert!(matches!(
             error,
             Error::Internal(message)
-                if message == "pipeStreamData called for provider-backed direct stream"
+                if message == STREAM_DATA_PROVIDER_DEFAULT_ERROR
+        ));
+
+        let mut legacy_only_pipeline = crate::pipeline::buffer::Buffer::new("legacy-only", None);
+        LegacyOnlyProviderWithRetryFlag
+            .provide_stream_data_by_id(47, 0, &mut legacy_only_pipeline)
+            .expect("legacy-only override");
+
+        let retry_family_stream = pdf.new_stream().expect("retry-family stream");
+        retry_family_stream
+            .replace_stream_data_provider(Rc::new(LegacyOnlyProviderWithRetryFlag), None, None)
+            .expect("retry-family provider replacement");
+        let error = retry_family_stream
+            .get_raw_stream_data()
+            .expect_err("retry family must not call normal-only override");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == STREAM_DATA_PROVIDER_DEFAULT_ERROR
         ));
     }
 
@@ -14311,8 +14431,123 @@ mod stream_provider_contract_tests {
     }
 
     #[test]
+    fn callback_adapters_propagate_errors_and_preserve_repeated_invocation() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = Rc::clone(&calls);
+        stream
+            .replace_stream_data_with_callback(
+                move |_pipeline| {
+                    callback_calls.set(callback_calls.get() + 1);
+                    Err(Error::System("callback failure".to_owned()))
+                },
+                None,
+                None,
+            )
+            .expect("callback provider replacement");
+
+        for _ in 0..2 {
+            let error = stream
+                .get_raw_stream_data()
+                .expect_err("callback error must cross the provider boundary");
+            assert!(matches!(
+                error,
+                Error::System(message) if message == "callback failure"
+            ));
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "callback must remain reusable after an error"
+        );
+    }
+
+    #[test]
+    fn callback_adapters_propagate_pipeline_write_and_finish_errors() {
+        let mut write_pipeline = FailingCallbackPipeline {
+            failure: "callback write failure",
+        };
+        assert_eq!(write_pipeline.identifier(), "failing callback pipeline");
+        let write_provider = CallbackProvider {
+            callback: |pipeline: &mut dyn Pipeline| {
+                pipeline.write(b"write failure").map_err(Error::from)
+            },
+        };
+        assert!(matches!(
+            write_provider
+                .provide_stream_data(ObjectRef::new(47, 0), &mut write_pipeline)
+                .expect_err("callback write failure must propagate"),
+            Error::System(message) if message == "callback write failure"
+        ));
+
+        let mut finish_pipeline = FailingCallbackPipeline {
+            failure: "callback finish failure",
+        };
+        let finish_provider = CallbackProvider {
+            callback: |pipeline: &mut dyn Pipeline| pipeline.finish().map_err(Error::from),
+        };
+        assert!(matches!(
+            finish_provider
+                .provide_stream_data(ObjectRef::new(47, 0), &mut finish_pipeline)
+                .expect_err("callback finish failure must propagate"),
+            Error::System(message) if message == "callback finish failure"
+        ));
+    }
+
+    #[test]
+    fn retry_callback_adapter_forwards_both_flag_combinations() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let flags = Rc::new(RefCell::new(Vec::new()));
+        let callback_flags = Rc::clone(&flags);
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    callback_flags
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline
+                        .write(b"retry callback bytes")
+                        .map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("retry callback provider replacement");
+
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("default retry callback pipe")
+                .as_slice(),
+            b"retry callback bytes"
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("retry callback", None);
+        let mut filtering_attempted = false;
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::None,
+                true,
+                true,
+            )
+            .expect("explicit retry callback pipe"));
+        assert_eq!(
+            sink.take_buffer().expect("retry callback output"),
+            b"retry callback bytes"
+        );
+        assert_eq!(*flags.borrow(), vec![(false, false), (true, true)]);
+    }
+
+    #[test]
     fn replacing_a_provider_with_a_buffer_releases_the_provider_source() {
-        let stream = provider_stream();
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
         let provider = Rc::new(LegacyProvider::default());
         let ownership = Rc::downgrade(&provider);
 
@@ -14342,12 +14577,15 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn provider_replacement_uses_qpdf_filter_boundary_for_uninitialized_and_null_values() {
-        let dict = ObjectHandle::dictionary(vec![
-            (b"Filter".to_vec(), ObjectHandle::name(b"Keep".to_vec())),
-            (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
-            (b"Length".to_vec(), ObjectHandle::integer(3)),
-        ]);
-        let stream = ObjectHandle::stream(dict.clone(), Rc::new(b"old".to_vec()));
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"old".to_vec()))
+            .expect("owned stream");
+        let dict = stream.as_stream_dict().expect("stream dictionary");
+        dict.replace_key(b"/Filter", ObjectHandle::name(b"Keep".to_vec()))
+            .expect("filter key");
+        dict.replace_key(b"/DecodeParms", ObjectHandle::dictionary(vec![]))
+            .expect("decode parms key");
 
         stream
             .replace_stream_data_provider(Rc::new(LegacyProvider::default()), None, None)
@@ -14492,7 +14730,8 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn callback_adapters_are_deferred_and_retry_capability_is_retained() {
-        let stream = provider_stream();
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
         let void_calls = Rc::new(Cell::new(0));
         let void_calls_for_callback = Rc::clone(&void_calls);
         stream
