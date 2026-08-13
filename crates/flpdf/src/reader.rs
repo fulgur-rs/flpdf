@@ -7832,6 +7832,39 @@ mod tests {
     }
 
     #[test]
+    fn shallow_copy_on_a_reserved_handle_produces_a_fresh_direct_reserved_sentinel() {
+        // `QPDF_Reserved::copy(bool shallow)` ignores its `shallow` argument
+        // and always returns `create()` -- a brand-new `QPDF_Reserved`
+        // instance (`libqpdf/QPDF_Reserved.cc:14-19`), never null and never a
+        // throw. `QPDFObjectHandle::shallowCopy` (`libqpdf/QPDFObjectHandle.cc
+        // :2073-2079`) wraps that result the same way it wraps any other
+        // type's `copy()`: a *direct* handle with no object number of its own
+        // and no owning `QPDF*`, independent from the source. Codex Review on
+        // PR #789, crates/flpdf/src/object_handle.rs:4158 (databaseId
+        // 3773163232).
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+
+        let copy = reserved
+            .shallow_copy()
+            .expect("QPDF_Reserved::copy never throws");
+
+        assert!(
+            copy.is_reserved(),
+            "shallow_copy on Reserved must stay Reserved, not fall back to null"
+        );
+        assert_eq!(copy.type_code(), 1, "qpdf ot_reserved");
+        assert!(
+            copy.is_direct(),
+            "a shallow copy has no object number of its own, matching every other value arm"
+        );
+        assert!(
+            !copy.is_same_object_as(&reserved),
+            "qpdf's copy() always mints a new object, never shares the source's identity"
+        );
+    }
+
+    #[test]
     fn reserved_objects_are_rejected_by_object_writer_entrypoints() {
         let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
