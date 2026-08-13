@@ -3443,7 +3443,7 @@ mod tests {
         // Name), matching qpdf's no-op replaceKey.
         let widget = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
         let Object::Dictionary(wdict) = widget else {
-            panic!("widget not a dict");
+            panic!("widget not a dict"); // cov:ignore: unreachable -- build_btn_pdf_obj4's obj-4 body is always a dictionary
         };
         assert_eq!(
             wdict.get("AP"),
