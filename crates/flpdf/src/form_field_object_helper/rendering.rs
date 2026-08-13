@@ -167,13 +167,30 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
 
     // qpdf keeps an existing normal appearance stream and installs a token
     // filter on that same canonical stream (`QPDFFormFieldObjectHelper.cc:
-    // 766-860`). Replacing only its data is the equivalent live-handle
-    // operation here; the stream's object identity and existing dictionary
-    // remain intact.
+    // 766-860`): the filter runs lazily at write time, over the decoded
+    // original bytes, and the writer's own encode policy recompresses
+    // afterward, so /Filter always ends up matching what qpdf actually
+    // writes. flpdf has no equivalent lazy decode/token-filter/re-encode
+    // primitive yet, so this installs the freshly-built *plain* content
+    // eagerly instead. `content` is not encoded under whatever filter the
+    // existing stream's dictionary currently declares, so that declaration
+    // must be cleared (`Some(ObjectHandle::null())`, qpdf's own
+    // "pass a null object to remove those values" `replaceStreamData`
+    // contract, `include/qpdf/QPDFObjectHandle.hh:1076-1080`) rather than
+    // left untouched (`None`) -- otherwise a stale `/Filter /FlateDecode`
+    // would survive over non-Flate bytes and the writer's lone-Flate
+    // fast path (which does not check whether the data was replaced since
+    // load) would echo the mismatched bytes verbatim. Clearing it routes
+    // the stream through the writer's normal compress-policy path, which
+    // recomputes /Filter to match whatever it actually emits.
     if ap.as_dictionary().is_some() {
         let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
         if normal.as_stream_dict().is_some() {
-            normal.replace_stream_data(Rc::new(content), None, None);
+            normal.replace_stream_data(
+                Rc::new(content),
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            );
             normal
                 .as_stream_dict()
                 .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
@@ -2882,6 +2899,144 @@ mod tests {
             .expect("existing appearance data")
             .windows(b"(text)".len())
             .any(|window| window == b"(text)"));
+
+        // Round-trip check for flpdf-25kg.3.8.2.2's fix (clearing /Filter
+        // and /DecodeParms on reuse): this fixture's existing stream never
+        // had a /Filter key, so the writer's default compress policy
+        // already recomputes a fresh, correct /Filter regardless of what
+        // this fix passes for filter/decode_parms -- confirming the fix is
+        // byte-behavior-neutral for the common (no pre-existing filter)
+        // case, matching the companion flate-compressed-source regression
+        // test below for the case this fix actually changes.
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("write reused appearance");
+        let renumbered = writer
+            .get_renumbered_obj_gen(result)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse output");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let decoded = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("written appearance must decode via its declared filter");
+        assert!(
+            decoded.windows(b"(text)".len()).any(|w| w == b"(text)"),
+            "decoded appearance is missing the field value: {:?}",
+            String::from_utf8_lossy(&decoded)
+        );
+    }
+
+    /// PDF whose widget's existing `/AP/N` (obj 5) is a genuinely
+    /// Flate-compressed stream (`/Filter /FlateDecode` over real zlib
+    /// bytes), mirroring flpdf-25kg.3.8.2.2's empirical repro fixture.
+    fn build_pdf_with_existing_flate_ap() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"q Q").expect("zlib encode");
+        let compressed = encoder.finish().expect("zlib finish");
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with an existing /AP/N (obj 5) that will be reused.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Hello) /Rect [10 10 200 30] /AP <</N 5 0 R>>>>\nendobj\n",
+        );
+        // Existing appearance stream, genuinely Flate-compressed.
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+                  /BBox [0 0 190 20] /Filter /FlateDecode /Length {}>>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_writes_decodable_output() {
+        // Regression test for flpdf-25kg.3.8.2.2. The existing /AP/N stream
+        // declares /Filter /FlateDecode over genuinely zlib-compressed
+        // bytes; installing freshly-built plain content into it must not
+        // leave that stale filter declaration on the written output --
+        // before the fix, the writer's lone-Flate fast path echoed the
+        // mismatched (plain) bytes verbatim under a /FlateDecode
+        // declaration, producing a stream that fails to decode.
+        let raw = build_pdf_with_existing_flate_ap();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            xobj_ref,
+            ObjectRef::new(5, 0),
+            "existing appearance was not reused"
+        );
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("write reused appearance");
+        let renumbered = writer
+            .get_renumbered_obj_gen(xobj_ref)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        // Parse -> resolve -> decode via the declared filter -> recover the
+        // appearance content, per the bd issue's prescribed round-trip
+        // check (not just "it doesn't error").
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let decoded = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("appearance stream must decode via its declared filter");
+        assert!(
+            decoded.windows(b"(Hello)".len()).any(|w| w == b"(Hello)"),
+            "decoded appearance is missing the field value: {:?}",
+            String::from_utf8_lossy(&decoded)
+        );
     }
 
     // ── canonical Tf-operand substitution (flpdf-25kg.3.8.2.1) ───────────────
