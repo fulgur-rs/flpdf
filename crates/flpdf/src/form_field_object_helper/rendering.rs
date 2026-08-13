@@ -243,9 +243,10 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
         pdf.mark_object_handle_dirty(&ap)?;
     } // cov:ignore: llvm-cov attributes this closing brace as an executable branch line
 
-    Ok(stream.object_ref().ok_or_else(|| {
+    let stream_ref = stream.object_ref().ok_or_else(|| {
         Error::Unsupported("canonical appearance stream is not indirect".to_string())
-    })?)
+    })?;
+    Ok(stream_ref)
 }
 
 /// Canonical Tx appearance generation. Graph reads and writes stay on the
@@ -2875,8 +2876,10 @@ mod tests {
         .expect("short canonical rect")
         .is_none());
 
-        let mut non_numeric =
-            Pdf::open(Cursor::new(build_pdf_with_nonnumeric_rect())).expect("parse");
+        let mut non_numeric = Pdf::open(Cursor::new(build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [100 700 /Bad 720]>>",
+        )))
+        .expect("parse");
         assert!(render_choice_field_canonical(
             &mut non_numeric,
             ObjectRef::new(4, 0),
@@ -2908,6 +2911,70 @@ mod tests {
         )
         .expect("zero-height canonical Ch")
         .is_none());
+
+        let mut tx_direct_stream =
+            Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse direct Tx appearance");
+        let tx_widget = tx_direct_stream.get_object_handle(ObjectRef::new(4, 0));
+        tx_direct_stream
+            .resolve_object_handle(&tx_widget)
+            .expect("resolve Tx widget");
+        tx_widget.replace_key(
+            b"/AP",
+            ObjectHandle::dictionary(vec![(
+                b"/N".to_vec(),
+                ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![
+                        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                    ]),
+                    Rc::new(b"old".to_vec()),
+                ),
+            )]),
+        );
+        let tx_result = render_text_field_canonical(
+            &mut tx_direct_stream,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0),
+        );
+        assert!(
+            matches!(
+                &tx_result,
+                Err(Error::Unsupported(message))
+                    if message == "normal appearance stream is not indirect"
+            ),
+            "unexpected direct Tx appearance result: {tx_result:?}"
+        );
+
+        let mut ch_direct_stream = Pdf::open(Cursor::new(build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [0 0 100 20]>>",
+        )))
+        .expect("parse direct Ch appearance");
+        let ch_widget = ch_direct_stream.get_object_handle(ObjectRef::new(4, 0));
+        ch_direct_stream
+            .resolve_object_handle(&ch_widget)
+            .expect("resolve Ch widget");
+        ch_widget.replace_key(
+            b"/AP",
+            ObjectHandle::dictionary(vec![(
+                b"/N".to_vec(),
+                ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![
+                        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                    ]),
+                    Rc::new(b"old".to_vec()),
+                ),
+            )]),
+        );
+        assert!(matches!(
+            render_choice_field_canonical(
+                &mut ch_direct_stream,
+                ObjectRef::new(4, 0),
+                ObjectRef::new(4, 0)
+            ),
+            Err(Error::Unsupported(message))
+                if message == "normal appearance stream is not indirect"
+        ));
     }
 
     #[test]
@@ -2925,6 +2992,19 @@ mod tests {
                 .expect("missing /DR font"),
             None
         );
+
+        let raw = String::from_utf8(build_dr_font_tx_pdf())
+            .expect("UTF-8 fixture")
+            .replace("/FT /Tx", "/FT /Ch")
+            .into_bytes();
+        let mut choice = Pdf::open(Cursor::new(raw)).expect("parse choice /DR");
+        assert!(render_choice_field_canonical(
+            &mut choice,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("choice /DR appearance")
+        .is_some());
     }
 
     #[test]
