@@ -5,14 +5,26 @@
 //! dictionary and writes a reconstructed [`crate::Object`] back through the
 //! legacy reader cache: qpdf's helper owns the selected handle and mutates the
 //! object graph that every other handle in the document observes.
+//!
+//! Parent-chain cycle detection follows qpdf's `QPDFObjGen::set`: indirect
+//! object identities are keyed by `ObjectRef` in a `BTreeSet`, while direct
+//! handles are not inserted (`include/qpdf/QPDFObjGen.hh:105-124`).
 
 use crate::object_handle::ObjectHandle;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
 use crate::{Error, ObjectRef, Pdf, Result};
+use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 #[path = "form_field_object_helper/rendering.rs"]
 mod rendering;
+
+fn mark_field_node_seen(seen: &mut BTreeSet<ObjectRef>, current: &ObjectHandle) -> bool {
+    current
+        .object_ref()
+        .map(|object_ref| seen.insert(object_ref))
+        .unwrap_or(true)
+}
 
 /// Typed access helper for a PDF AcroForm field or widget annotation
 /// dictionary.
@@ -193,14 +205,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Return the dotted `/T` name formed by this field and its parents.
     pub fn fully_qualified_name(&mut self) -> Result<String> {
         let mut current = self.field.clone();
-        let mut seen = Vec::new();
+        let mut seen = BTreeSet::new();
         let mut parts = Vec::new();
 
-        while !seen
-            .iter()
-            .any(|handle: &ObjectHandle| handle.is_same_object_as(&current))
-        {
-            seen.push(current.clone());
+        while mark_field_node_seen(&mut seen, &current) {
             let node = self.resolved(current.clone())?;
             if node.as_dictionary().is_none() {
                 break;
@@ -720,15 +728,11 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     ) -> Result<Option<ObjectHandle>> {
         let key = crate::object_handle::canonical_dictionary_key(key);
         let mut current = field;
-        let mut seen = Vec::new();
+        let mut seen = BTreeSet::new();
         loop {
-            if seen
-                .iter()
-                .any(|handle: &ObjectHandle| handle.is_same_object_as(&current))
-            {
+            if !mark_field_node_seen(&mut seen, &current) {
                 return Ok(None);
             }
-            seen.push(current.clone());
 
             let node = self.resolved(current)?;
             if node.as_dictionary().is_none() {
@@ -779,5 +783,26 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     fn resolved(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle(&handle)?;
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_field_node_seen;
+    use crate::object_handle::ObjectHandle;
+    use crate::ObjectRef;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn qpdf_seen_set_ignores_direct_handles_and_tracks_indirect_identity() {
+        let mut seen = BTreeSet::new();
+
+        assert!(mark_field_node_seen(&mut seen, &ObjectHandle::integer(1)));
+        assert!(mark_field_node_seen(&mut seen, &ObjectHandle::integer(1)));
+
+        let first = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        let same_object = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        assert!(mark_field_node_seen(&mut seen, &first));
+        assert!(!mark_field_node_seen(&mut seen, &same_object));
     }
 }

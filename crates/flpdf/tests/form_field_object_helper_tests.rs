@@ -148,6 +148,36 @@ fn qualifies_names_from_the_parent_chain() {
 }
 
 #[test]
+fn qualifies_names_through_direct_parent_handles() {
+    let bytes = doc(vec![(
+        10,
+        "<< /T (child) /Parent << /T (parent) /Parent << /T (top) >> >> >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert_eq!(field.fully_qualified_name().unwrap(), "top.parent.child");
+}
+
+#[test]
+fn inherits_values_through_direct_parent_handles() {
+    let bytes = doc(vec![(
+        10,
+        "<< /Parent << /Parent << /V (top) >> /V (parent) >> >>".into(),
+    )]);
+    let mut pdf = open(bytes);
+    let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
+
+    assert_eq!(
+        field
+            .field_value()
+            .unwrap()
+            .and_then(|value| value.as_string()),
+        Some(b"parent".to_vec())
+    );
+}
+
+#[test]
 fn decodes_pdf_text_strings_in_field_names() {
     // qpdf's getUTF8Value() decodes PDFDocEncoding and UTF-16BE before
     // assembling the public field-name strings.
