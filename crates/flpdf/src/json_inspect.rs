@@ -800,75 +800,6 @@ fn pdf_object_to_json_bounded(handle: &ObjectHandle, depth: usize) -> Result<Jso
     )
 }
 
-/// Lift a legacy `Object` value one-off through [`Pdf::lift_object_to_handle`]
-/// and run it through [`pdf_object_to_json`] — shared by callers that still
-/// hold a plain `Object` with no live handle of their own (outline items,
-/// AcroForm inherited field values) rather than an already-migrated
-/// `ObjectHandle`.
-fn lift_and_convert_to_json<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    object: &Object,
-) -> Result<Json, ConvertError> {
-    // Content-stream-only tokens have no `ObjectValue` representation
-    // (`Pdf::lift_object_to_handle` errors on them — `Pdf::set_object`
-    // itself falls back to its legacy materialized memo for the same
-    // reason), but `pdf_object_to_json` maps both straight to `null`
-    // regardless, at any nesting depth (an Operator/InlineImage nested
-    // inside an Array/Dictionary/Stream used to convert to `null` in place,
-    // not fail the whole container). Strip them to `Object::Null` before
-    // lifting so every caller of this bridge keeps that behavior instead of
-    // surfacing a conversion error for a value that used to convert
-    // cleanly — only when the tree actually contains one, so the common
-    // case (no content-only tokens anywhere) pays no extra clone.
-    let sanitized;
-    let object = if contains_content_only_token(object) {
-        sanitized = strip_content_only_tokens(object);
-        &sanitized
-    } else {
-        object
-    };
-    pdf_object_to_json(
-        &pdf.lift_object_to_handle(object)
-            .map_err(ConvertError::from)?,
-    )
-}
-
-fn contains_content_only_token(object: &Object) -> bool {
-    match object {
-        Object::Operator(_) | Object::InlineImage(_) => true,
-        Object::Array(items) => items.iter().any(contains_content_only_token),
-        Object::Dictionary(dict) => dict.iter().any(|(_, v)| contains_content_only_token(v)),
-        Object::Stream(stream) => stream
-            .dict
-            .iter()
-            .any(|(_, v)| contains_content_only_token(v)),
-        _ => false,
-    }
-}
-
-fn strip_content_only_tokens(object: &Object) -> Object {
-    match object {
-        Object::Operator(_) | Object::InlineImage(_) => Object::Null,
-        Object::Array(items) => {
-            Object::Array(items.iter().map(strip_content_only_tokens).collect())
-        }
-        Object::Dictionary(dict) => Object::Dictionary(strip_content_only_tokens_dict(dict)),
-        Object::Stream(stream) => Object::Stream(Stream::new(
-            strip_content_only_tokens_dict(&stream.dict),
-            stream.data.clone(),
-        )),
-        other => other.clone(),
-    }
-}
-
-fn strip_content_only_tokens_dict(dict: &Dictionary) -> Dictionary {
-    let mut stripped = Dictionary::new();
-    for (key, value) in dict.iter() {
-        stripped.insert(key, strip_content_only_tokens(value));
-    }
-    stripped
-}
-
 // ── StreamDataMode ────────────────────────────────────────────────────────────
 
 /// Controls how stream payloads are emitted in the qpdf JSON v2 output.
@@ -1304,34 +1235,27 @@ pub fn build_pagelabels_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json
 
 // ── build_outlines_section ────────────────────────────────────────────────────
 
-/// Project one materialized outline item into qpdf's JSON v2 shape.
-fn outline_item_to_json<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
+/// Project one live outline item into qpdf's JSON v2 shape.
+fn outline_item_to_json(
     tree: &crate::OutlineTree,
     id: crate::OutlineId,
     page_numbers: &std::collections::BTreeMap<crate::ObjectRef, i64>,
 ) -> Result<Json, ConvertError> {
     let item = &tree[id];
-    // `item.dest`/`item.object` are materialized `Object` copies with no live
-    // handle of their own (flpdf-2mkd tracks moving `OutlineTree` itself to
-    // `ObjectHandle`); lift each one-off via the canonical bridge so
-    // `pdf_object_to_json` never needs a legacy-type entry point.
-    let dest = lift_and_convert_to_json(pdf, &item.dest)?;
-    let destpageposfrom1 = match item.dest_page() {
-        Object::Reference(reference) => page_numbers
-            .get(&reference)
-            .copied()
-            .map(Json::make_int)
-            .unwrap_or_else(Json::make_null),
-        _ => Json::make_null(),
-    };
+    let dest = pdf_object_to_json(&item.dest)?;
+    let destpageposfrom1 = item
+        .dest_page()
+        .object_ref()
+        .and_then(|reference| page_numbers.get(&reference).copied())
+        .map(Json::make_int)
+        .unwrap_or_else(Json::make_null);
     let mut kids = Vec::with_capacity(item.kids.len());
     for kid in item.kids.iter().copied() {
-        kids.push(outline_item_to_json(pdf, tree, kid, page_numbers)?);
+        kids.push(outline_item_to_json(tree, kid, page_numbers)?);
     }
     let object = match item.source_ref {
         Some(reference) => Json::make_string(reference.to_string()),
-        None => lift_and_convert_to_json(pdf, &item.object)?,
+        None => pdf_object_to_json(&item.object)?,
     };
 
     json_dictionary([
@@ -1366,7 +1290,7 @@ pub fn build_outlines_section<R: Read + Seek>(pdf: &mut Pdf<R>) -> Result<Json, 
     let tree = pdf.outline().get_tree()?;
     let mut entries = Vec::with_capacity(tree.roots().len());
     for id in tree.roots().to_vec() {
-        entries.push(outline_item_to_json(pdf, &tree, id, &page_numbers)?);
+        entries.push(outline_item_to_json(&tree, id, &page_numbers)?);
     }
     json_array(entries)
 }
@@ -4184,12 +4108,9 @@ mod tests {
 
     #[test]
     fn qpdf_projection_maps_content_only_tokens_to_null_without_lifting() {
-        // Object::Operator/InlineImage have no ObjectValue representation
-        // (Pdf::lift_object_to_handle errors on them), so
-        // lift_and_convert_to_json (reached via qpdf_pdf_object_to_json's
-        // fallback arm) special-cases both to null directly rather than
-        // routing through the lift bridge — pin that both variants still
-        // convert cleanly instead of surfacing a conversion error.
+        // Object::Operator/InlineImage have no ObjectValue representation;
+        // qpdf_object_projection maps both to null directly, matching the
+        // legacy JSON projection without routing through a handle lift.
         let mut pdf = empty_pdf();
         for object in [
             Object::Operator(b"cm".to_vec()),
@@ -4200,88 +4121,6 @@ mod tests {
                 serde_json::Value::Null
             );
         }
-    }
-
-    #[test]
-    fn lift_and_convert_to_json_maps_content_only_tokens_to_null_instead_of_erroring() {
-        // Regression coverage for the bridge itself, not just its
-        // qpdf_pdf_object_to_json caller: outline_item_to_json and
-        // walk_acroform_fields both reach this helper directly with a
-        // caller-supplied Object (e.g. one injected via Pdf::set_object, the
-        // same fallback Pdf::set_object itself takes when a lift fails).
-        // Before this migration, pdf_object_to_json(&Object::Operator(..))
-        // returned null with no error; this pins that lift_and_convert_to_json
-        // still does, rather than surfacing Pdf::lift_object_to_handle's
-        // Unsupported error for a value that used to convert cleanly.
-        let mut pdf = empty_pdf();
-        for object in [
-            Object::Operator(b"cm".to_vec()),
-            Object::InlineImage(b"\x00EI\xff".to_vec()),
-        ] {
-            let json = super::lift_and_convert_to_json(&mut pdf, &object).unwrap();
-            assert!(project(json).unwrap().is_null());
-        }
-    }
-
-    #[test]
-    fn lift_and_convert_to_json_maps_a_nested_content_only_token_to_null_in_place() {
-        // Regression coverage: the root-only check above is not enough — a
-        // content-only token nested inside an Array/Dictionary/Stream used
-        // to convert to `null` in place under the legacy pdf_object_to_json
-        // (its Array/Dictionary arms simply recursed), so lift_and_convert_to_json
-        // must strip these at every depth, not just when the whole value is
-        // one directly.
-        let mut pdf = empty_pdf();
-        let nested = Object::Array(vec![
-            Object::Integer(1),
-            Object::Dictionary({
-                let mut dict = Dictionary::new();
-                dict.insert("Op", Object::Operator(b"cm".to_vec()));
-                dict.insert("Img", Object::InlineImage(b"\x00EI\xff".to_vec()));
-                dict
-            }),
-            Object::Stream(Stream::new(
-                {
-                    let mut dict = Dictionary::new();
-                    dict.insert("Op", Object::Operator(b"cm".to_vec()));
-                    dict
-                },
-                vec![],
-            )),
-        ]);
-        let json = super::lift_and_convert_to_json(&mut pdf, &nested).unwrap();
-        assert_eq!(
-            project(json).unwrap(),
-            serde_json::json!([
-                1,
-                {"/Img": null, "/Op": null},
-                {"stream": {"dict": {"/Op": null}}},
-            ])
-        );
-    }
-
-    #[test]
-    fn lift_and_convert_to_json_detects_a_content_only_token_reachable_only_through_a_stream_dict()
-    {
-        // contains_content_only_token's Array/Dictionary arms use `.any()`,
-        // which short-circuits on the first hit — the combined test above
-        // never actually evaluates its Stream arm, because an earlier array
-        // element already satisfies `.any()`. Exercise it directly so a
-        // Stream dict is the *only* thing that could trigger detection.
-        let mut pdf = empty_pdf();
-        let stream_only = Object::Stream(Stream::new(
-            {
-                let mut dict = Dictionary::new();
-                dict.insert("Op", Object::Operator(b"cm".to_vec()));
-                dict
-            },
-            vec![],
-        ));
-        let json = super::lift_and_convert_to_json(&mut pdf, &stream_only).unwrap();
-        assert_eq!(
-            project(json).unwrap(),
-            serde_json::json!({"stream": {"dict": {"/Op": null}}})
-        );
     }
 
     #[test]

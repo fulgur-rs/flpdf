@@ -44,40 +44,20 @@
 //! let _ = pdf.outline().get_root_with_max_depth(10);
 //! ```
 
+use crate::nntree::HandleNameTree;
 use crate::outline::{OutlineId, OutlineItem, OutlineTree};
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result};
+use crate::{ObjectHandle, ObjectRef, Pdf, Result};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek};
 
 const QPDF_MAX_EXPANDED_OUTLINE_DEPTH: usize = 50;
 
-#[derive(Clone)]
-enum OutlineCursor {
-    Direct(Object),
-    Indirect(ObjectRef),
-}
-
-impl OutlineCursor {
-    fn from_object(object: Object) -> Option<Self> {
-        match object {
-            Object::Null => None,
-            Object::Reference(reference) => Some(Self::Indirect(reference)),
-            direct => Some(Self::Direct(direct)),
-        }
-    }
-
-    fn source_ref(&self) -> Option<ObjectRef> {
-        match self {
-            Self::Direct(_) => None,
-            Self::Indirect(reference) => Some(*reference),
-        }
-    }
-}
-
-fn object_key(object: &Object, key: &str) -> Object {
-    match object {
-        Object::Dictionary(dict) => dict.get(key).cloned().unwrap_or(Object::Null),
-        _ => Object::Null,
+fn object_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>> {
+    let value = object.try_get_key(key)?;
+    if value.try_is_null()? {
+        Ok(None)
+    } else {
+        Ok(Some(value))
     }
 }
 
@@ -102,36 +82,55 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(outlines) = self.catalog_outlines()? else {
             return Ok(false);
         };
-        let Some(cursor) = OutlineCursor::from_object(outlines) else {
+        self.pdf.resolve_object_handle(&outlines)?;
+        if outlines.try_as_dictionary()?.is_none() {
             return Ok(false);
-        };
-        let Object::Dictionary(dict) = self.resolve_cursor(&cursor)? else {
-            return Ok(false);
-        };
-        let Some(first) = dict.get("First").cloned() else {
-            return Ok(false);
-        };
-        let Some(first_cursor) = OutlineCursor::from_object(first) else {
-            return Ok(false);
-        };
-        Ok(!matches!(self.resolve_cursor(&first_cursor)?, Object::Null))
-    }
-
-    fn resolve_cursor(&mut self, cursor: &OutlineCursor) -> Result<Object> {
-        match cursor {
-            OutlineCursor::Direct(object) => Ok(object.clone()),
-            OutlineCursor::Indirect(reference) => self.pdf.resolve(*reference),
         }
+        if !outlines.has_key(b"/First") {
+            return Ok(false);
+        }
+        Ok(!outlines.try_get_key(b"/First")?.try_is_null()?)
     }
 
-    fn catalog_outlines(&mut self) -> Result<Option<Object>> {
+    fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
+        self.pdf.resolve_object_handle(handle)
+    }
+
+    /// Follow the temporary bare-reference redirect that `Pdf::set_object`
+    /// can install in a canonical slot. Parsed qpdf objects never contain
+    /// this state: a normal indirect child resolves in one hop and is
+    /// returned unchanged. Keeping this compatibility chase handle-native
+    /// lets the outline consumer preserve live identity without reopening the
+    /// raw `Object` route while the legacy replacement bridge is removed.
+    fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
+        self.pdf.resolve_object_handle_to_terminal(&handle)
+    }
+
+    fn catalog_handle(&mut self) -> Result<Option<ObjectHandle>> {
         let Some(catalog_ref) = self.pdf.root_ref() else {
             return Ok(None);
         };
-        let Object::Dictionary(catalog) = self.pdf.resolve(catalog_ref)? else {
+        let catalog = self.pdf.get_object_handle(catalog_ref);
+        self.resolve_handle(&catalog)?;
+        if catalog.try_as_dictionary()?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(catalog))
+    }
+
+    fn catalog_outlines(&mut self) -> Result<Option<ObjectHandle>> {
+        let Some(catalog) = self.catalog_handle()? else {
             return Ok(None);
         };
-        Ok(catalog.get("Outlines").cloned())
+        if !catalog.has_key(b"/Outlines") {
+            return Ok(None);
+        }
+        let outlines = catalog.try_get_key(b"/Outlines")?;
+        if outlines.try_is_null()? {
+            Ok(None)
+        } else {
+            Ok(Some(outlines))
+        }
     }
 
     /// Materialize the qpdf-compatible outline arena.
@@ -144,23 +143,23 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(outlines) = self.catalog_outlines()? else {
             return Ok(tree);
         };
-        let Some(outlines_cursor) = OutlineCursor::from_object(outlines) else {
+        self.resolve_handle(&outlines)?;
+        if outlines.try_as_dictionary()?.is_none() {
             return Ok(tree);
-        };
-        let Object::Dictionary(outlines) = self.resolve_cursor(&outlines_cursor)? else {
+        }
+        if !outlines.has_key(b"/First") {
             return Ok(tree);
-        };
-        let Some(first) = outlines.get("First").cloned() else {
+        }
+        let first = outlines.try_get_key(b"/First")?;
+        if first.try_is_null()? {
             return Ok(tree);
-        };
-        let Some(mut cursor) = OutlineCursor::from_object(first) else {
-            return Ok(tree);
-        };
+        }
+        let mut cursor = first;
 
         let mut top_level_seen = BTreeSet::new();
         let mut constructor_seen = BTreeSet::new();
         loop {
-            if let Some(reference) = cursor.source_ref() {
+            if let Some(reference) = cursor.object_ref() {
                 if !top_level_seen.insert(reference) {
                     break;
                 }
@@ -170,8 +169,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 break;
             };
             tree.roots.push(id);
-            let Some(next) = OutlineCursor::from_object(object_key(&tree[id].object, "Next"))
-            else {
+            let Some(next) = object_key(&tree[id].object, b"/Next")? else {
                 break;
             };
             cursor = next;
@@ -184,7 +182,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// one native call frame per outline level.
     fn build_item(
         &mut self,
-        cursor: OutlineCursor,
+        cursor: ObjectHandle,
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
         constructor_seen: &mut BTreeSet<ObjectRef>,
@@ -200,13 +198,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
 
         struct Frame {
             owner: OutlineId,
-            next: Option<OutlineCursor>,
+            next: Option<ObjectHandle>,
             depth: usize,
             siblings_seen: BTreeSet<ObjectRef>,
         }
 
         let mut frames = Vec::new();
-        let first = OutlineCursor::from_object(object_key(&tree[root].object, "First"));
+        let first = object_key(&tree[root].object, b"/First")?;
         if first.is_some() {
             frames.push(Frame {
                 owner: root,
@@ -226,7 +224,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 let frame = frames
                     .last_mut()
                     .expect("outline construction frame exists");
-                if let Some(reference) = cursor.source_ref() {
+                if let Some(reference) = cursor.object_ref() {
                     if !frame.siblings_seen.insert(reference) {
                         frame.next = None;
                         continue;
@@ -252,10 +250,10 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             frames
                 .last_mut()
                 .expect("outline construction frame exists")
-                .next = OutlineCursor::from_object(object_key(&tree[child].object, "Next"));
+                .next = object_key(&tree[child].object, b"/Next")?;
 
             if expand_child {
-                let first = OutlineCursor::from_object(object_key(&tree[child].object, "First"));
+                let first = object_key(&tree[child].object, b"/First")?;
                 if first.is_some() {
                     frames.push(Frame {
                         owner: child,
@@ -272,33 +270,46 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
 
     fn materialize_item(
         &mut self,
-        cursor: OutlineCursor,
+        cursor: ObjectHandle,
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
     ) -> Result<Option<OutlineId>> {
-        let source_ref = cursor.source_ref();
-        let object = self.resolve_cursor(&cursor)?;
-        if matches!(object, Object::Null) {
+        let source_ref = cursor.object_ref();
+        self.resolve_handle(&cursor)?;
+        if cursor.try_is_null()? {
             return Ok(None);
         }
-        let (title_src, count_src, dest_src, action_src) = match &object {
-            Object::Dictionary(dict) => (
-                dict.get("Title").cloned(),
-                dict.get("Count").cloned(),
-                dict.get("Dest").cloned(),
-                dict.get("A").cloned(),
-            ),
-            _ => (None, None, None, None),
+        let (title_src, count_src, dest_src, action_src) = if cursor.try_as_dictionary()?.is_some()
+        {
+            (
+                cursor
+                    .has_key(b"/Title")
+                    .then(|| cursor.try_get_key(b"/Title")),
+                cursor
+                    .has_key(b"/Count")
+                    .then(|| cursor.try_get_key(b"/Count")),
+                cursor
+                    .has_key(b"/Dest")
+                    .then(|| cursor.try_get_key(b"/Dest")),
+                cursor.has_key(b"/A").then(|| cursor.try_get_key(b"/A")),
+            )
+        } else {
+            (None, None, None, None)
         };
+        let title_src = title_src.transpose()?;
+        let count_src = count_src.transpose()?;
+        let dest_src = dest_src.transpose()?;
+        let action_src = action_src.transpose()?;
         let title = resolve_title(self.pdf, title_src)?;
         let count = resolve_count(self.pdf, count_src)?;
-        let dest = self.resolve_node_dest(dest_src.as_ref(), action_src.as_ref())?;
+        let dest = self.resolve_node_dest(dest_src, action_src)?;
+        self.resolve_handle(&dest)?;
         let id = OutlineId(tree.items.len());
         tree.items.push(OutlineItem {
             source_ref,
             parent,
             kids: Vec::new(),
-            object,
+            object: cursor,
             title,
             count,
             dest,
@@ -310,122 +321,94 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// Resolve a node's destination from `/Dest`, else a `/A` GoTo action's `/D`.
     fn resolve_node_dest(
         &mut self,
-        dest: Option<&Object>,
-        action: Option<&Object>,
-    ) -> Result<Object> {
-        let candidate = if let Some(dest) = dest {
-            Some(dest.clone())
+        dest: Option<ObjectHandle>,
+        action: Option<ObjectHandle>,
+    ) -> Result<ObjectHandle> {
+        let Some(candidate) = (if let Some(dest) = dest {
+            Some(dest)
         } else {
             self.goto_action_dest(action)?
+        }) else {
+            return Ok(ObjectHandle::null());
         };
-        match candidate {
-            Some(value) => self.resolve_node_dest_value(value),
-            None => Ok(Object::Null),
+
+        let candidate = self.resolve_value_handle(candidate)?;
+        if let Some(name) = candidate.try_as_name()? {
+            return self.resolve_legacy_node_dest(&name);
         }
+        if let Some(bytes) = candidate.as_string() {
+            return self.resolve_name_tree_node_dest(&bytes);
+        }
+        Ok(candidate)
     }
 
-    fn goto_action_dest(&mut self, action: Option<&Object>) -> Result<Option<Object>> {
+    fn goto_action_dest(&mut self, action: Option<ObjectHandle>) -> Result<Option<ObjectHandle>> {
         let Some(action) = action else {
             return Ok(None);
         };
-        let Object::Dictionary(dict) = resolve_terminal_object(self.pdf, action.clone())? else {
-            return Ok(None);
-        };
-        let Some(subtype) = dict.get("S").cloned() else {
-            return Ok(None);
-        };
-        let subtype = resolve_terminal_object(self.pdf, subtype)?;
-        if !matches!(subtype, Object::Name(ref name) if name == b"GoTo") {
+        let action = self.resolve_value_handle(action)?;
+        if action.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
-        Ok(dict.get("D").cloned())
-    }
-
-    fn resolve_node_dest_value(&mut self, value: Object) -> Result<Object> {
-        match resolve_terminal_object(self.pdf, value)? {
-            Object::Name(name) => self.resolve_legacy_node_dest(&name),
-            Object::String(bytes) => self.resolve_name_tree_node_dest(&bytes),
-            other => Ok(other),
+        let subtype = action.try_get_key(b"/S")?;
+        if !subtype.try_is_name_and_equals(b"GoTo")? {
+            return Ok(None);
         }
+        if !action.has_key(b"/D") {
+            return Ok(None);
+        }
+        Ok(Some(action.try_get_key(b"/D")?))
     }
 
-    fn resolve_legacy_node_dest(&mut self, name: &[u8]) -> Result<Object> {
-        let Some(Object::Dictionary(dests)) = self.catalog_value_terminal("Dests")? else {
-            return Ok(Object::Null);
+    fn resolve_legacy_node_dest(&mut self, name: &[u8]) -> Result<ObjectHandle> {
+        let Some(dests) = self.catalog_value_handle(b"/Dests")? else {
+            return Ok(ObjectHandle::null());
         };
-        match dests.get(name).cloned() {
-            Some(value) => resolve_terminal_object(self.pdf, value),
-            None => Ok(Object::Null),
+        let dests = self.resolve_value_handle(dests)?;
+        if dests.try_as_dictionary()?.is_none() {
+            return Ok(ObjectHandle::null());
         }
+        let mut key = Vec::with_capacity(name.len() + 1);
+        key.push(b'/');
+        key.extend_from_slice(name);
+        if !dests.has_key(&key) {
+            return Ok(ObjectHandle::null());
+        }
+        dests.try_get_key(&key)
     }
 
-    fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<Object> {
+    fn resolve_name_tree_node_dest(&mut self, bytes: &[u8]) -> Result<ObjectHandle> {
         let lookup =
             crate::pdf_string::normalized_utf8_value(&crate::pdf_string::utf8_value(bytes));
-        let Some(Object::Dictionary(mut names)) = self.catalog_value_terminal("Names")? else {
-            return Ok(Object::Null);
+        let Some(names) = self.catalog_value_handle(b"/Names")? else {
+            return Ok(ObjectHandle::null());
         };
-        let Some(dests_root) = names.remove("Dests") else {
-            return Ok(Object::Null);
-        };
-        match &dests_root {
-            Object::Dictionary(_) => {}
-            Object::Reference(_) => {
-                if !matches!(
-                    crate::ref_chain::resolve_ref_chain(self.pdf, &dests_root)?.0,
-                    Object::Dictionary(_)
-                ) {
-                    return Ok(Object::Null);
-                }
-            }
-            _ => return Ok(Object::Null),
+        let names = self.resolve_value_handle(names)?;
+        if names.try_as_dictionary()?.is_none() || !names.has_key(b"/Dests") {
+            return Ok(ObjectHandle::null());
         }
 
-        let original_root = dests_root.clone();
-        let mut tree = crate::NameTree::new(dests_root, true);
-        let found = tree.find_object(self.pdf, lookup.as_slice());
-        if tree.root() != &original_root {
-            if let Object::Dictionary(repaired_root) = tree.into_root() {
-                write_back_direct_dests_root(self.pdf, repaired_root)?;
-            }
+        let root = names.try_get_key(b"/Dests")?;
+        let root = self.resolve_value_handle(root)?;
+        if root.try_as_dictionary()?.is_none() {
+            return Ok(ObjectHandle::null());
         }
-
-        match found? {
-            Some(value) => resolve_terminal_object(self.pdf, value),
-            None => Ok(Object::Null),
-        }
+        let mut tree = HandleNameTree::new(root, self.pdf.unique_id(), true);
+        let found = tree.find(self.pdf, lookup.as_slice())?;
+        found
+            .map(|value| self.resolve_value_handle(value))
+            .transpose()
+            .map(|value| value.unwrap_or_else(ObjectHandle::null))
     }
 
-    /// Like [`Self::catalog_value`] but follows the full indirect reference
-    /// chain to its terminal object. Used by the raw named-destination lookup
-    /// so a `/Dests` or `/Names` dictionary behind multiple holders resolves.
-    fn catalog_value_terminal(&mut self, key: &str) -> Result<Option<Object>> {
-        Ok(match self.catalog_value(key)? {
-            Some(value @ Object::Reference(_)) => {
-                Some(crate::ref_chain::resolve_ref_chain(self.pdf, &value)?.0)
-            }
-            other => other,
-        })
-    }
-
-    /// Resolve a catalog key's value to an owned object, following one level of
-    /// indirection. Returns the value whether the catalog stores it as an
-    /// indirect reference or as a direct (inline) object — so an inline
-    /// `/Names`/`/Dests` dictionary is handled as well as the reference form.
-    fn catalog_value(&mut self, key: &str) -> Result<Option<Object>> {
-        let Some(catalog_ref) = self.pdf.root_ref() else {
+    fn catalog_value_handle(&mut self, key: &[u8]) -> Result<Option<ObjectHandle>> {
+        let Some(catalog) = self.catalog_handle()? else {
             return Ok(None);
         };
-        let Object::Dictionary(catalog) = self.pdf.resolve_borrowed(catalog_ref)? else {
+        if !catalog.has_key(key) {
             return Ok(None);
-        };
-        let Some(value) = catalog.get(key).cloned() else {
-            return Ok(None);
-        };
-        match value {
-            Object::Reference(r) => Ok(Some(self.pdf.resolve(r)?)),
-            other => Ok(Some(other)),
         }
+        Ok(Some(catalog.try_get_key(key)?))
     }
 }
 impl<R: Read + Seek> Pdf<R> {
@@ -435,141 +418,42 @@ impl<R: Read + Seek> Pdf<R> {
     }
 }
 
-fn resolve_terminal_object<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Object> {
-    match value {
-        value @ Object::Reference(_) => Ok(crate::ref_chain::resolve_ref_chain(pdf, &value)?.0),
-        other => Ok(other),
-    }
-}
-
-fn write_back_direct_dests_root<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    repaired_root: Dictionary,
-) -> Result<()> {
-    let catalog_ref = pdf.root_ref().ok_or(Error::Missing("/Root"))?;
-    let Object::Dictionary(mut catalog) = pdf.resolve(catalog_ref)? else {
-        return Ok(()); // cov:ignore: resolve_name_tree_node_dest just resolved the catalog dictionary
-    };
-    let Some(names_value) = catalog.get("Names").cloned() else {
-        return Ok(()); // cov:ignore: resolve_name_tree_node_dest just established catalog /Names
-    };
-
-    match names_value {
-        Object::Dictionary(mut names) => {
-            names.insert("Dests", Object::Dictionary(repaired_root));
-            catalog.insert("Names", Object::Dictionary(names));
-            pdf.set_object(catalog_ref, Object::Dictionary(catalog));
-        }
-        value @ Object::Reference(_) => {
-            let (terminal, terminal_ref) = crate::ref_chain::resolve_ref_chain(pdf, &value)?;
-            let Some(mut names) = terminal.into_dict() else {
-                return Ok(()); // cov:ignore: caller established /Names reference terminal as a dictionary
-            };
-            let Some(terminal_ref) = terminal_ref else {
-                return Ok(()); // cov:ignore: caller established /Names reference has an indirect terminal
-            };
-            names.insert("Dests", Object::Dictionary(repaired_root));
-            pdf.set_object(terminal_ref, Object::Dictionary(names));
-        }
-        _ => {} // cov:ignore: caller established catalog /Names as a dictionary or reference
-    }
-    Ok(())
-}
-
 /// Decode an outline `/Title`, resolving one level of indirection (review rule 2).
-fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<String> {
+fn resolve_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<ObjectHandle>) -> Result<String> {
     let Some(value) = value else {
         return Ok(String::new());
     };
-    let resolved = resolve_scalar(pdf, value)?;
-    qpdf_title(pdf, resolved)
+    pdf.resolve_object_handle(&value)?;
+    qpdf_title(&value)
 }
 
-fn qpdf_title<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<String> {
-    match value {
-        Object::String(bytes) => {
-            Ok(String::from_utf8_lossy(&crate::pdf_string::utf8_value(&bytes)).into_owned())
-        }
-        other => {
-            pdf.push_warning(format!(
-                "operation for string attempted on object of type {}: returning empty string",
-                qpdf_object_type_name(&other)
-            ))?;
-            Ok(String::new())
-        }
+fn qpdf_title(value: &ObjectHandle) -> Result<String> {
+    if let Some(bytes) = value.as_string() {
+        Ok(String::from_utf8_lossy(&crate::pdf_string::utf8_value(&bytes)).into_owned())
+    } else {
+        value.type_warning("string", "returning empty string")?;
+        Ok(String::new())
     }
 }
 
 /// Read an outline `/Count`, resolving one level of indirection (review rule 2/3).
-fn resolve_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<Object>) -> Result<i32> {
+fn resolve_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Option<ObjectHandle>) -> Result<i32> {
     let Some(value) = value else {
         return Ok(0);
     };
-    let resolved = resolve_scalar(pdf, value)?;
-    qpdf_count(pdf, resolved)
+    pdf.resolve_object_handle(&value)?;
+    qpdf_count(&value)
 }
 
-fn qpdf_count<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<i32> {
-    let Object::Integer(value) = value else {
-        pdf.push_warning(format!(
-            "operation for integer attempted on object of type {}: returning 0",
-            qpdf_object_type_name(&value)
-        ))?;
-        return Ok(0);
-    };
-    if value < i64::from(i32::MIN) {
-        pdf.push_warning("requested value of integer is too small; returning INT_MIN")?;
-        Ok(i32::MIN)
-    } else if value > i64::from(i32::MAX) {
-        pdf.push_warning("requested value of integer is too big; returning INT_MAX")?;
-        Ok(i32::MAX)
-    } else {
-        Ok(value as i32)
-    }
-}
-
-fn resolve_scalar<R: Read + Seek>(pdf: &mut Pdf<R>, value: Object) -> Result<Object> {
-    match value {
-        Object::Reference(r) => pdf.resolve(r),
-        other => Ok(other),
-    }
-}
-
-fn qpdf_object_type_name(value: &Object) -> &'static str {
-    match value {
-        Object::Null => "null",
-        Object::Boolean(_) => "boolean",
-        Object::Integer(_) => "integer",
-        Object::Real(_) | Object::RealLiteral { .. } => "real",
-        Object::Name(_) => "name",
-        Object::String(_) => "string",
-        Object::Operator(_) => "operator",
-        Object::InlineImage(_) => "inline-image",
-        Object::Array(_) => "array",
-        Object::Dictionary(_) => "dictionary",
-        Object::Stream(_) => "stream",
-        Object::Reference(_) => "reference",
-    }
+fn qpdf_count(value: &ObjectHandle) -> Result<i32> {
+    value.try_get_int_value_as_int()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{qpdf_count, qpdf_object_type_name, qpdf_title};
+    use super::{qpdf_count, qpdf_title};
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
-    use crate::Object;
-
-    #[test]
-    fn qpdf_object_type_name_labels_content_only_values() {
-        assert_eq!(
-            qpdf_object_type_name(&Object::Operator(b"q".to_vec())),
-            "operator"
-        );
-        assert_eq!(
-            qpdf_object_type_name(&Object::InlineImage(b"data".to_vec())),
-            "inline-image"
-        );
-    }
 
     #[test]
     fn scalar_warning_sink_failures_propagate() {
@@ -580,9 +464,15 @@ mod tests {
             pdf.set_logger(logger);
 
             let result = if title {
-                qpdf_title(&mut pdf, Object::Integer(42)).map(|_| ())
+                let value = pdf
+                    .lift_object_to_handle(&crate::Object::Integer(42))
+                    .unwrap();
+                qpdf_title(&value).map(|_| ())
             } else {
-                qpdf_count(&mut pdf, Object::String(b"wrong".to_vec())).map(|_| ())
+                let value = pdf
+                    .lift_object_to_handle(&crate::Object::String(b"wrong".to_vec()))
+                    .unwrap();
+                qpdf_count(&value).map(|_| ())
             };
             assert!(matches!(
                 result,

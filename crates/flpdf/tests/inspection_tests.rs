@@ -32,7 +32,9 @@ fn outline_tree_returns_titles_in_pre_order() {
     assert_eq!(depth, 1);
     assert_eq!(item.title, "Chapter One");
     assert_eq!(item.source_ref, Some(ObjectRef::new(10, 0)));
-    assert_eq!(tree.get(id), Some(item));
+    assert!(tree
+        .get(id)
+        .is_some_and(|candidate| std::ptr::eq(candidate, item)));
 }
 
 #[test]
