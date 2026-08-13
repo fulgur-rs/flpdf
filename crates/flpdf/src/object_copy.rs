@@ -13,8 +13,11 @@
 //! boundary, destination reservations, and deferred stream source dispatch
 //! (`libqpdf/QPDF.cc:2019-2272`). qpdf's `ot_reserved` value is an internal
 //! construction sentinel, not a user-visible object value; this port keeps
-//! the equivalent reservation as a destination-owned indirect null slot and
-//! replaces that slot in place before returning it.
+//! the equivalent reservation as a destination-owned `new_reserved()` slot and
+//! replaces that slot in place before returning it. The one intentional qpdf
+//! exception is a Page boundary, whose reservation is an indirect null so the
+//! boundary is returned without copying its descendants. A foreign reserved
+//! sentinel is rejected during reservation with qpdf's exact error contract.
 //!
 //! # Boundary semantics
 //!
@@ -129,6 +132,11 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
 
     fn reserve_objects(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
         foreign.try_dereference()?;
+        if foreign.is_reserved() {
+            return Err(Error::System(
+                "QPDF: attempting to copy a foreign reserved object".to_owned(),
+            ));
+        }
         if foreign.try_is_dictionary_of_type(b"Pages", b"")? {
             return Ok(());
         }
@@ -148,9 +156,20 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             } else {
                 let mapped = if is_stream {
                     self.target.new_stream()?
-                } else {
+                } else if is_page {
+                    // qpdf deliberately uses an indirect null for Page
+                    // boundaries (including a top-level Page), while ordinary
+                    // non-stream objects use QPDF_Reserved
+                    // (`QPDF.cc:2124-2132`). A nested Page is returned as this
+                    // null boundary without traversing into its children.
                     self.target
                         .make_indirect_from_object_handle(ObjectHandle::null())?
+                } else {
+                    // qpdf allocates QPDF_Reserved here, not a serialized null:
+                    // `reserveObjects` uses `newReserved`, then `replaceReserved`
+                    // assigns the copied direct value into the same identity
+                    // (`libqpdf/QPDF.cc:2032-2045,2071-2087`).
+                    self.target.new_reserved()?
                 };
                 let target_ref = mapped.object_ref().ok_or_else(|| {
                     Error::Internal("foreign copier created a direct reservation".to_owned())
@@ -677,6 +696,23 @@ mod tests {
             .any(|diagnostic| diagnostic
                 .message
                 .contains("unexpected reference to /Pages object while copying foreign object")));
+    }
+
+    #[test]
+    fn copy_foreign_object_rejects_a_foreign_reserved_object_before_reservation() {
+        let source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let reserved = source
+            .new_reserved()
+            .expect("source reserved construction sentinel");
+        let target_refs_before = target.object_refs();
+
+        let error = target
+            .copy_foreign_object(&reserved)
+            .expect_err("qpdf rejects a foreign reserved object during reservation");
+        assert!(matches!(error, Error::System(message)
+            if message == "QPDF: attempting to copy a foreign reserved object"));
+        assert_eq!(target.object_refs(), target_refs_before);
     }
 
     #[test]
