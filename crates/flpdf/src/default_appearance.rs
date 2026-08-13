@@ -46,13 +46,21 @@ pub struct DefaultAppearance {
     /// are malformed.  The caller should substitute a default font.
     pub font_name: Option<Vec<u8>>,
 
-    /// Font size in points.  `0.0` when the `Tf` size operand is zero (PDF
-    /// convention for "auto-size"); check [`auto_size`](Self::auto_size)
-    /// instead of comparing this field to `0.0` directly.
+    /// The `Tf` operator's raw size operand, in points.  This is the literal
+    /// parsed value even when it falls outside the accepted range described
+    /// under [`auto_size`](Self::auto_size) (for example `0.0`, a negative
+    /// value, or `1000.0`); check `auto_size` before using this field, since
+    /// an out-of-range value is not a usable point size.
     pub font_size: f64,
 
-    /// `true` when `font_size == 0.0`, indicating that the viewer should
-    /// choose the size automatically to fit the field bounds.
+    /// `true` when the field's size should be chosen automatically instead
+    /// of using [`font_size`](Self::font_size) directly.
+    ///
+    /// This holds whenever `font_size` falls outside the open interval
+    /// `(1.0, 1000.0)` — not just `font_size == 0.0` — matching qpdf's
+    /// accepted range for an explicit `Tf` operand.  `0.0`, a negative
+    /// value, exactly `1.0`, exactly `1000.0`, and anything above `1000.0`
+    /// are all auto-size.
     pub auto_size: bool,
 
     /// Text colour.  Defaults to [`TextColor::Gray`]`(0.0)` (black).
@@ -104,7 +112,13 @@ pub fn parse_default_appearance(da: &[u8]) -> DefaultAppearance {
                     if let (Some(name), Some(size)) = (name.as_name(), obj_as_f64(size)) {
                         font_name = Some(name.to_vec());
                         font_size = size;
-                        auto_size = size == 0.0;
+                        // qpdf's TfFinder only accepts an explicit Tf
+                        // operand within the open interval (1.0, 1000.0)
+                        // (`QPDFFormFieldObjectHelper.cc:704-710`); a value
+                        // at or outside those bounds (0, a negative size,
+                        // 1000, or larger) is auto-size, not just an
+                        // operand of exactly 0.0.
+                        auto_size = !(size > 1.0 && size < 1000.0);
                     }
                 }
             }
@@ -304,5 +318,55 @@ mod tests {
 
         let cmyk = parse_default_appearance(b"9 9 0.1 0.2 0.3 0.4 k");
         assert_eq!(cmyk.color, TextColor::Cmyk(0.1, 0.2, 0.3, 0.4));
+    }
+
+    // ── Tf acceptance range (qpdf TfFinder::handleToken, (1.0, 1000.0) ──────
+    // exclusive) — flpdf-25kg.3.8.2.1 scope item 2.
+
+    #[test]
+    fn tf_boundary_exactly_one_is_auto_size() {
+        // qpdf's acceptance test is `last_num > 1.0`, so exactly 1.0 is
+        // rejected (auto-size), not accepted.
+        let da = parse_default_appearance(b"/Helv 1 Tf");
+        assert!(approx_eq(da.font_size, 1.0));
+        assert!(da.auto_size, "exactly 1.0 must be treated as auto-size");
+    }
+
+    #[test]
+    fn tf_boundary_exactly_1000_is_auto_size() {
+        // qpdf's acceptance test is `last_num < 1000.0`, so exactly 1000.0
+        // is rejected (auto-size), not accepted.
+        let da = parse_default_appearance(b"/Helv 1000 Tf");
+        assert!(approx_eq(da.font_size, 1000.0));
+        assert!(da.auto_size, "exactly 1000.0 must be treated as auto-size");
+    }
+
+    #[test]
+    fn tf_just_inside_accepted_range_is_not_auto_size() {
+        let low = parse_default_appearance(b"/Helv 1.001 Tf");
+        assert!(!low.auto_size);
+        assert!(approx_eq(low.font_size, 1.001));
+
+        let high = parse_default_appearance(b"/Helv 999.999 Tf");
+        assert!(!high.auto_size);
+        assert!(approx_eq(high.font_size, 999.999));
+    }
+
+    #[test]
+    fn tf_negative_operand_is_auto_size() {
+        // qpdf treats a negative Tf operand as out of range too (only
+        // `last_num > 1.0` is accepted), unlike flpdf's previous
+        // `font_size == 0.0`-only check, which would have left a negative
+        // size unmodified.
+        let da = parse_default_appearance(b"/Helv -5 Tf");
+        assert!(approx_eq(da.font_size, -5.0));
+        assert!(da.auto_size, "a negative Tf operand must be auto-size");
+    }
+
+    #[test]
+    fn tf_operand_beyond_1000_is_auto_size() {
+        let da = parse_default_appearance(b"/Helv 1200 Tf");
+        assert!(approx_eq(da.font_size, 1200.0));
+        assert!(da.auto_size, "an operand >= 1000.0 must be auto-size");
     }
 }

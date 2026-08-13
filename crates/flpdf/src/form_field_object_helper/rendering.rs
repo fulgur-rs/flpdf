@@ -2,10 +2,10 @@
 //! Appearance-stream generators for AcroForm widgets.
 //!
 //! This module builds the `/AP/N` (normal-appearance) Form XObject for
-//! AcroForm widget annotations.  Both **Tx (text field)** and **Btn
-//! (checkbox / radio / pushbutton)** appearance streams are implemented.
-//! Shared helpers are exported as `pub(crate)` for use by future field-type
-//! renderers (Ch list fields, etc.).
+//! AcroForm **Tx** and **Ch** widgets. Button appearance generation is not
+//! part of the production path: qpdf's
+//! `QPDFFormFieldObjectHelper::generateAppearance` dispatches only `/Tx` and
+//! `/Ch` (`QPDFFormFieldObjectHelper.cc:472-478`).
 //!
 //! # Observable-equivalence policy
 //!
@@ -29,15 +29,25 @@
 //!   generate the appearance themselves.
 
 use std::io::{Read, Seek};
+use std::rc::Rc;
 
-use crate::default_appearance::{parse_default_appearance, TextColor};
+use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
+use crate::default_appearance::parse_default_appearance;
+#[cfg(test)]
+use crate::default_appearance::TextColor;
 use crate::form_field_object_helper::FormFieldObjectHelper;
+#[cfg(test)]
 use crate::json_inspect::decode_pdf_text_string;
 use crate::object::write_literal_string;
+use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
-use crate::ref_chain::resolve_ref_chain;
 use crate::standard_font_metrics::StandardFont;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Error, Object, ObjectRef, Pdf, Result};
+
+#[cfg(test)]
+use crate::ref_chain::resolve_ref_chain;
+#[cfg(test)]
+use crate::{Dictionary, Stream};
 
 // ── Public-crate helpers ─────────────────────────────────────────────────────
 
@@ -45,6 +55,7 @@ use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
 ///
 /// Produces one of `g`, `rg`, or `k` (ISO 32000-1 §8.6.8) with all numeric
 /// values formatted by [`fmt_f64`].
+#[cfg(test)]
 pub(crate) fn color_ops(color: &TextColor, out: &mut Vec<u8>) {
     match color {
         TextColor::Gray(g) => {
@@ -72,6 +83,558 @@ pub(crate) fn color_ops(color: &TextColor, out: &mut Vec<u8>) {
     }
 }
 
+/// Resolve one canonical handle hop without materializing a legacy `Object`.
+fn resolve_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: ObjectHandle,
+) -> Result<ObjectHandle> {
+    pdf.resolve_object_handle(&handle)?;
+    Ok(handle)
+}
+
+/// Read a rectangle-shaped array (`/Rect`, `/BBox`, …) at `key` through a
+/// live handle.
+fn resolve_rectangle_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    handle: &ObjectHandle,
+    key: &[u8],
+) -> Result<Option<PageBox>> {
+    let rect = resolve_canonical(pdf, handle.get_key(key))?;
+    let Some(items) = rect.as_array() else {
+        return Ok(None);
+    };
+    if items.len() != 4 {
+        return Ok(None);
+    }
+
+    let mut values = [0.0; 4];
+    for (index, item) in items.into_iter().enumerate() {
+        let item = resolve_canonical(pdf, item)?;
+        let Some(value) = item
+            .as_real()
+            .or_else(|| item.as_integer().map(|n| n as f64))
+        else {
+            return Ok(None);
+        };
+        values[index] = value;
+    }
+    Ok(Some(PageBox::new(
+        values[0], values[1], values[2], values[3],
+    )))
+}
+
+/// Read a widget rectangle through the live annotation handle.
+fn resolve_rect_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget: &ObjectHandle,
+) -> Result<Option<PageBox>> {
+    resolve_rectangle_canonical(pdf, widget, b"/Rect")
+}
+
+/// Resolve the bounding box used to size a widget's `/AP/N` appearance
+/// content.
+///
+/// qpdf's `QPDFFormFieldObjectHelper::generateTextAppearance` only derives
+/// the box from the widget's `/Rect` when creating a fresh `/AP/N` stream.
+/// When `/AP/N` is *already* a stream, it lays out content against that
+/// stream's own `/BBox` instead -- never against the current `/Rect` -- and
+/// leaves `/BBox` itself completely untouched
+/// (`libqpdf/QPDFFormFieldObjectHelper.cc:766-793`). If that existing
+/// `/BBox` is not a valid four-number rectangle, qpdf warns and aborts
+/// appearance generation entirely rather than falling back to `/Rect`
+/// (`QPDFFormFieldObjectHelper.cc:788-791`).
+///
+/// Verified against a real `qpdf 11.9.0 --generate-appearances` run: a
+/// widget with an existing `/AP/N` `/BBox [0 0 190 20]` and an enlarged
+/// `/Rect [10 10 400 130]` is rewritten with `/BBox` still `[0 0 190 20]`,
+/// and the appearance content's `Td` offsets are computed from that
+/// unchanged 190×20 box.
+fn resolve_appearance_bbox_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget: &ObjectHandle,
+) -> Result<Option<PageBox>> {
+    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
+    if ap.as_dictionary().is_some() {
+        let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
+        if let Some(stream_dict) = normal.as_stream_dict() {
+            return resolve_rectangle_canonical(pdf, &stream_dict, b"/BBox");
+        }
+    }
+    resolve_rect_canonical(pdf, widget)
+}
+
+/// Resolve the standard-14 font named by a field's document-level `/DR`.
+fn lookup_dr_basefont_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    resource_name: &[u8],
+) -> Result<Option<StandardFont>> {
+    let resources = FormFieldObjectHelper::new(field_ref, pdf).default_resources()?;
+    let Some(resources) = resources else {
+        return Ok(None);
+    };
+    let resources = resolve_canonical(pdf, resources)?;
+    let font_dict = resolve_canonical(pdf, resources.get_key(b"/Font"))?;
+    let resource_key = {
+        let mut key = Vec::with_capacity(resource_name.len() + 1);
+        key.push(b'/');
+        key.extend_from_slice(resource_name);
+        key
+    };
+    let font = resolve_canonical(pdf, font_dict.get_key(&resource_key))?;
+    let base_font = resolve_canonical(pdf, font.get_key(b"/BaseFont"))?;
+    Ok(base_font
+        .as_name()
+        .and_then(|name| StandardFont::from_base_name(&name)))
+}
+
+/// Build and install a new `/AP/N` Form XObject through canonical handles.
+///
+/// This is the qpdf `QPDFFormFieldObjectHelper::generateTextAppearance`
+/// allocation boundary. New streams and font dictionaries are registered by
+/// the document's canonical allocator; the widget and its existing `/AP`
+/// dictionary are then mutated in place, preserving every handle identity
+/// already held by the caller.
+///
+/// Returns `Ok(None)` when `/AP` is present but not a dictionary: qpdf's
+/// `replaceKey` no-ops (with a warning) on a non-dictionary receiver
+/// (`QPDFObjectHandle::replaceKey`, `QPDFObjectHandle.cc:1199-1210`), so the
+/// freshly built stream is never linked into the widget's `/AP/N`. `None`
+/// keeps that outcome visible to the caller instead of returning a stream
+/// ref the widget does not actually reference.
+fn install_normal_appearance_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget_ref: ObjectRef,
+    content: Vec<u8>,
+    bbox_w: f64,
+    bbox_h: f64,
+    font_resource: (Vec<u8>, Vec<u8>),
+) -> Result<Option<ObjectRef>> {
+    let widget = pdf.get_object_handle(widget_ref);
+    pdf.resolve_object_handle(&widget)?;
+    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
+
+    // qpdf keeps an existing normal appearance stream and installs a token
+    // filter on that same canonical stream (`QPDFFormFieldObjectHelper.cc:
+    // 766-860`): the filter runs lazily at write time, over the decoded
+    // original bytes, and the writer's own encode policy recompresses
+    // afterward, so /Filter always ends up matching what qpdf actually
+    // writes. flpdf has no equivalent lazy decode/token-filter/re-encode
+    // primitive yet, so this installs the freshly-built *plain* content
+    // eagerly instead. `content` is not encoded under whatever filter the
+    // existing stream's dictionary currently declares, so that declaration
+    // must be cleared (`Some(ObjectHandle::null())`, qpdf's own
+    // "pass a null object to remove those values" `replaceStreamData`
+    // contract, `include/qpdf/QPDFObjectHandle.hh:1076-1080`) rather than
+    // left untouched (`None`) -- otherwise a stale `/Filter /FlateDecode`
+    // would survive over non-Flate bytes and the writer's lone-Flate
+    // fast path (which does not check whether the data was replaced since
+    // load) would echo the mismatched bytes verbatim. Clearing it routes
+    // the stream through the writer's normal compress-policy path, which
+    // recomputes /Filter to match whatever it actually emits.
+    if ap.as_dictionary().is_some() {
+        let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
+        if normal.as_stream_dict().is_some() {
+            normal.replace_stream_data(
+                Rc::new(content),
+                Some(ObjectHandle::null()),
+                Some(ObjectHandle::null()),
+            );
+            normal
+                .as_stream_dict()
+                .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
+                .transpose()?;
+            return normal
+                .object_ref()
+                .ok_or_else(|| {
+                    Error::Unsupported("normal appearance stream is not indirect".to_string())
+                })
+                .map(Some);
+        }
+    }
+
+    let (resource_name, base_name) = font_resource;
+    let font_dict = ObjectHandle::dictionary(vec![
+        (b"/Type".to_vec(), ObjectHandle::name(b"Font".to_vec())),
+        (b"/Subtype".to_vec(), ObjectHandle::name(b"Type1".to_vec())),
+        (b"/BaseFont".to_vec(), ObjectHandle::name(base_name)),
+        (
+            b"/Encoding".to_vec(),
+            ObjectHandle::name(b"WinAnsiEncoding".to_vec()),
+        ),
+    ]);
+    let font = pdf.make_indirect_object_handle(font_dict)?;
+
+    let stream = pdf.new_stream_with_data(Rc::new(content))?;
+    let stream_dict = stream
+        .as_stream_dict()
+        .ok_or_else(|| Error::Unsupported("new appearance stream has no dictionary".to_string()))?;
+    stream_dict.replace_key(b"/Type", ObjectHandle::name(b"XObject".to_vec()));
+    stream_dict.replace_key(b"/Subtype", ObjectHandle::name(b"Form".to_vec()));
+    stream_dict.replace_key(b"/FormType", ObjectHandle::integer(1));
+    stream_dict.replace_key(
+        b"/BBox",
+        ObjectHandle::array(vec![
+            ObjectHandle::real(0.0),
+            ObjectHandle::real(0.0),
+            ObjectHandle::real(bbox_w),
+            ObjectHandle::real(bbox_h),
+        ]),
+    );
+
+    let mut resources = vec![(
+        b"/ProcSet".to_vec(),
+        ObjectHandle::array(vec![
+            ObjectHandle::name(b"PDF".to_vec()),
+            ObjectHandle::name(b"Text".to_vec()),
+        ]),
+    )];
+    resources.push((
+        b"/Font".to_vec(),
+        ObjectHandle::dictionary(vec![(resource_name, font)]),
+    ));
+    stream_dict.replace_key(b"/Resources", ObjectHandle::dictionary(resources));
+    pdf.mark_object_handle_dirty(&stream_dict)?;
+
+    let ap = if ap.is_null() {
+        let ap = ObjectHandle::dictionary(Vec::new());
+        widget.replace_key(b"/AP", ap.clone());
+        pdf.mark_object_handle_dirty(&widget)?;
+        ap
+    } else {
+        ap
+    };
+
+    // qpdf's replaceKey is a no-op for a non-dictionary /AP value. Mirror
+    // that no-op exactly -- do not force the malformed container into a
+    // dictionary -- but report the true outcome to the caller: `None` when
+    // the AP container did not accept the mutation, so the newly allocated
+    // stream is not mistaken for an installed appearance.
+    if ap.as_dictionary().is_some() {
+        ap.replace_key(b"/N", stream.clone());
+        pdf.mark_object_handle_dirty(&ap)?;
+    } else {
+        return Ok(None);
+    }
+
+    // cov:ignore-start: new_stream_with_data always allocates an indirect stream
+    let stream_ref = stream.object_ref().ok_or_else(|| {
+        Error::Unsupported("canonical appearance stream is not indirect".to_string())
+    })?;
+    // cov:ignore-end
+    Ok(Some(stream_ref))
+}
+
+/// Canonical Tx appearance generation. Graph reads and writes stay on the
+/// field/widget handles; only the appearance content itself is a byte buffer.
+pub(crate) fn render_text_field_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
+    if field_type.as_deref() != Some(b"/Tx") {
+        return Ok(None);
+    }
+
+    let value = FormFieldObjectHelper::new(field_ref, pdf).value_as_string()?;
+    let widget = pdf.get_object_handle(widget_ref);
+    pdf.resolve_object_handle(&widget)?;
+    let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
+        return Ok(None);
+    };
+    let bbox_w = (rect.urx - rect.llx).abs();
+    let bbox_h = (rect.ury - rect.lly).abs();
+    if !bbox_w.is_finite() || !bbox_h.is_finite() || bbox_w < 1.0 || bbox_h < 1.0 {
+        return Ok(None);
+    }
+
+    let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+    let default_appearance = helper.default_appearance()?;
+    let da = parse_default_appearance(default_appearance.as_bytes());
+    drop(helper);
+
+    let font_name = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
+    let standard_font = if let Some(font) = StandardFont::from_base_name(&font_name) {
+        font
+    } else {
+        lookup_dr_basefont_canonical(pdf, field_ref, &font_name)?.unwrap_or(StandardFont::Helvetica)
+    };
+    // qpdf's ValueSetter ignores quadding and uses 11pt when the /DA Tf
+    // operand is absent or auto-sized (`QPDFFormFieldObjectHelper.cc:797-860`).
+    let font_size = if da.auto_size { 11.0 } else { da.font_size };
+    let content = build_qpdf_choice_appearance_content(
+        default_appearance.as_bytes(),
+        &to_winansi_bytes(&value),
+        &[],
+        bbox_w,
+        bbox_h,
+        font_size,
+        true,
+    );
+    install_normal_appearance_canonical(
+        pdf,
+        widget_ref,
+        content,
+        bbox_w,
+        bbox_h,
+        (font_name, official_base_name(standard_font).to_vec()),
+    )
+}
+
+/// Canonical Ch appearance generation. Choice values and option entries are
+/// projected from live handles before the existing pure content builder runs.
+pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    field_ref: ObjectRef,
+    widget_ref: ObjectRef,
+) -> Result<Option<ObjectRef>> {
+    let field_type = FormFieldObjectHelper::new(field_ref, pdf).field_type()?;
+    if field_type.as_deref() != Some(b"/Ch") {
+        return Ok(None);
+    }
+
+    let widget = pdf.get_object_handle(widget_ref);
+    pdf.resolve_object_handle(&widget)?;
+    let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
+        return Ok(None);
+    };
+    let bbox_w = (rect.urx - rect.llx).abs();
+    let bbox_h = (rect.ury - rect.lly).abs();
+    if !bbox_w.is_finite() || !bbox_h.is_finite() || bbox_w < 1.0 || bbox_h < 1.0 {
+        return Ok(None);
+    }
+
+    let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
+    let default_appearance = helper.default_appearance()?;
+    let da = parse_default_appearance(default_appearance.as_bytes());
+    // qpdf's `getFlags()` returns a signed C++ `int` and tests the combo
+    // bit directly on that signed value (`getFlags() & ff_ch_combo`,
+    // `QPDFFormFieldObjectHelper.cc:231-234,800`): for `/Ff -1`, all bits
+    // are set in two's complement, so the combo bit reads as set. Do not
+    // route through `u32::try_from`, which fails (and previously defaulted
+    // to zero) for any negative `/Ff`, incorrectly clearing the combo bit.
+    //
+    // qpdf's `getFlags()` reads `/Ff` through
+    // `QPDFObjectHandle::getIntValueAsInt` (`QPDFObjectHandle.cc:525-540`),
+    // which *saturates* an out-of-`int`-range value to `INT_MIN`/`INT_MAX`
+    // rather than passing its bit pattern through -- so it is the
+    // saturated 32-bit value, not the raw stored integer, that qpdf masks
+    // against `ff_ch_combo`. Clamp to the `i32` range before masking so an
+    // out-of-range `/Ff` (e.g. `4294967296`, which saturates to `INT_MAX`
+    // and so has the combo bit set) agrees with qpdf instead of testing a
+    // bit pattern qpdf never actually forms.
+    let flags = helper
+        .field_flags()?
+        .unwrap_or(0)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX));
+    let value = helper.value_as_string()?;
+    let options = helper.choices()?;
+    drop(helper);
+
+    let font_name = da.font_name.clone().unwrap_or_else(|| b"Helv".to_vec());
+    let standard_font = if let Some(font) = StandardFont::from_base_name(&font_name) {
+        font
+    } else {
+        lookup_dr_basefont_canonical(pdf, field_ref, &font_name)?.unwrap_or(StandardFont::Helvetica)
+    };
+    // qpdf's ValueSetter starts from the Tf operand in /DA. A missing or
+    // auto-sized Tf uses its source default of 11pt; it does not invent a
+    // field-height-dependent size here.
+    let font_size = if da.auto_size { 11.0 } else { da.font_size };
+    let content = build_qpdf_choice_appearance_content(
+        default_appearance.as_bytes(),
+        &to_winansi_bytes(&value),
+        &options
+            .iter()
+            .map(|option| to_winansi_bytes(option))
+            .collect::<Vec<_>>(),
+        bbox_w,
+        bbox_h,
+        font_size,
+        flags & 0x20000 != 0,
+    );
+    install_normal_appearance_canonical(
+        pdf,
+        widget_ref,
+        content,
+        bbox_w,
+        bbox_h,
+        (font_name, official_base_name(standard_font).to_vec()),
+    )
+}
+
+/// Substitute `/DA`'s `Tf` size operand with `resolved_font_size` when it
+/// differs from the parsed literal by more than qpdf's `0.001` tolerance,
+/// mirroring `TfFinder::getDA()` (`QPDFFormFieldObjectHelper.cc:729-746`).
+///
+/// Returns `default_appearance` unchanged when no `<name> <size> Tf` pattern
+/// is present at all: qpdf's `tf_idx` never matches a token index when
+/// `/DA` has no `Tf` operator (`tf_idx` stays `-1`,
+/// `QPDFFormFieldObjectHelper.cc:689-716`), so `getDA()` performs no
+/// substitution there and no `Tf` operator is invented either.
+///
+/// Unlike qpdf's raw last-number/last-name tracking (which persists across
+/// unrelated operators), this locates the candidate operand using the same
+/// `<name> <size> Tf` operand-stack pattern as [`parse_default_appearance`]
+/// (operands clear at every operator boundary), so the two functions always
+/// agree on which `Tf` occurrence is authoritative. This is within the
+/// module's documented observable-equivalence policy for `/DA` text, not
+/// byte-identical reproduction of qpdf's own token-level bookkeeping.
+fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) -> Vec<u8> {
+    struct TfOperandFinder {
+        operands: Vec<(Object, usize, usize)>,
+        tf_size_span: Option<(usize, usize, f64)>,
+    }
+
+    impl ParserCallbacks for TfOperandFinder {
+        fn handle_object(
+            &mut self,
+            object: Object,
+            offset: usize,
+            length: usize,
+        ) -> Result<ParseControl> {
+            match object {
+                Object::Operator(operator) => {
+                    if operator == b"Tf" {
+                        if let [.., name, size] = self.operands.as_slice() {
+                            if let (Some(_), Some(value)) = (
+                                name.0.as_name(),
+                                size.0
+                                    .as_real()
+                                    .or_else(|| size.0.as_integer().map(|n| n as f64)),
+                            ) {
+                                self.tf_size_span = Some((size.1, size.2, value));
+                            }
+                        }
+                    }
+                    self.operands.clear();
+                }
+                Object::InlineImage(_) => {}
+                operand => self.operands.push((operand, offset, length)),
+            }
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut finder = TfOperandFinder {
+        operands: Vec::new(),
+        tf_size_span: None,
+    };
+    // Best-effort, matching parse_default_appearance's own "skip malformed,
+    // last wins" recovery: a parse error partway through still leaves
+    // whatever valid Tf occurrence was already found in place.
+    let _ = parse_content_stream_data(default_appearance, &mut finder);
+
+    let Some((offset, length, raw_value)) = finder.tf_size_span else {
+        return default_appearance.to_vec();
+    };
+    if (raw_value - resolved_font_size).abs() <= 0.001 {
+        return default_appearance.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(default_appearance.len());
+    out.extend_from_slice(&default_appearance[..offset]);
+    out.extend_from_slice(fmt_f64(resolved_font_size).as_bytes());
+    out.extend_from_slice(&default_appearance[offset + length..]);
+    out
+}
+
+/// Reproduce qpdf 11.9.0's `ValueSetter::writeAppearance` layout. In
+/// particular, `/I` and `/TI` are intentionally not consulted: the qpdf
+/// implementation reads only `/V` and (for non-combo fields) `/Opt` before
+/// selecting the visible rows (`QPDFFormFieldObjectHelper.cc:797-860`).
+fn build_qpdf_choice_appearance_content(
+    default_appearance: &[u8],
+    value: &[u8],
+    options: &[Vec<u8>],
+    bbox_w: f64,
+    bbox_h: f64,
+    font_size: f64,
+    is_combo: bool,
+) -> Vec<u8> {
+    let tfh = 1.2 * font_size;
+    // `bbox_h` and `font_size` are attacker-controlled (`/Rect`, `/DA`): for
+    // a small font_size and/or a huge bbox_h, `bbox_h / tfh` can exceed
+    // `usize::MAX` as an f64, and `as usize` saturates rather than
+    // overflowing (Rust's documented float-to-int cast behavior since
+    // 1.45). Clamping immediately — before any signed arithmetic or
+    // slicing — removes that saturation risk entirely. The bound is
+    // `options.len() + 1`, not `options.len()`: the *found* branch below
+    // replaces `lines` outright with a slice of `options` (needs at most
+    // `options.len()` rows, and the fixup loop converges to the same
+    // window for any max_rows at or above that), but the *not-found*
+    // branch keeps the unmatched value as its own row and appends up to
+    // `max_rows - 1` options on top, so it needs room for the value plus
+    // every option -- `options.len() + 1` rows -- when the bounding box is
+    // tall enough to hold them (flpdf-25kg.3.8.2.3's clamp under-served
+    // this branch by exactly one row).
+    let max_rows = ((bbox_h / tfh).max(0.0) as usize).min(options.len().saturating_add(1));
+    let mut lines = vec![value.to_vec()];
+    let mut highlight = false;
+    let mut highlight_index = 0usize;
+
+    if !is_combo && !options.is_empty() && max_rows >= 2 {
+        if let Some(found_index) = options.iter().position(|option| option == value) {
+            // All-`usize` window arithmetic (no `as isize` bit
+            // reinterpretation): `max_rows >= 2` here, so `first + max_rows
+            // - 1` cannot underflow, and the fixup loop only decrements
+            // `last` while it is still `>= options.len() >= 1`, so it can
+            // never underflow past 0 either.
+            let mut first = found_index.saturating_sub(1);
+            let mut last = first + max_rows - 1;
+            while last >= options.len() {
+                first = first.saturating_sub(1);
+                last -= 1;
+            }
+            highlight = true;
+            highlight_index = found_index - first;
+            lines = options[first..=last].to_vec();
+        } else {
+            highlight = true;
+            lines.extend(options.iter().take(max_rows - 1).cloned());
+        }
+    }
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"/Tx BMC\n");
+    let line_count = lines.len() as f64;
+    let mut y = bbox_h - ((bbox_h - (line_count * tfh)) / 2.0);
+    if highlight {
+        out.extend_from_slice(b"q\n0.85 0.85 0.85 rg\n");
+        out.extend_from_slice(b"0 ");
+        out.extend_from_slice(fmt_f64(y - tfh * (highlight_index as f64 + 1.0)).as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(fmt_f64(bbox_w).as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(fmt_f64(tfh).as_bytes());
+        out.extend_from_slice(b" re f\nQ\n");
+    }
+    y -= font_size;
+    out.extend_from_slice(b"q\nBT\n");
+    out.extend_from_slice(&substitute_da_tf_operand(default_appearance, font_size));
+    out.push(b'\n');
+    for (index, line) in lines.iter().enumerate() {
+        if index == 0 {
+            out.extend_from_slice(b"1 ");
+            out.extend_from_slice(fmt_f64(y).as_bytes());
+            out.extend_from_slice(b" Td\n");
+        } else {
+            out.extend_from_slice(b"0 ");
+            out.extend_from_slice(fmt_f64(-tfh).as_bytes());
+            out.extend_from_slice(b" Td\n");
+        }
+        write_literal_string(&mut out, line);
+        out.extend_from_slice(b" Tj\n");
+    }
+    out.extend_from_slice(b"ET\nQ\nEMC\n");
+    out
+}
+
 /// Build and install a new `/AP/N` Form XObject on the widget at `widget_ref`.
 ///
 /// Writes two objects: the XObject stream itself (uncompressed) and optionally
@@ -88,6 +651,7 @@ pub(crate) fn color_ops(color: &TextColor, out: &mut Vec<u8>) {
 /// - `obj_ref`: the pre-allocated [`ObjectRef`] for the font dictionary object.
 ///
 /// Returns the [`ObjectRef`] of the newly-created Form XObject.
+#[cfg(test)]
 pub(crate) fn install_normal_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -176,6 +740,7 @@ pub(crate) fn install_normal_appearance<R: Read + Seek>(
 ///
 /// All string data has already been decoded from PDF text-string encoding and
 /// re-encoded to WinAnsi bytes.  All measurements are in user-space units.
+#[cfg(test)]
 pub(crate) struct TextAppearanceParams {
     /// WinAnsi-encoded text to render.
     pub text_bytes: Vec<u8>,
@@ -215,6 +780,7 @@ pub(crate) struct TextAppearanceParams {
 ///
 /// This function is pure (no `Pdf` access) and is tested independently from
 /// object allocation.
+#[cfg(test)]
 pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -260,6 +826,7 @@ pub(crate) fn build_text_appearance_content(p: &TextAppearanceParams) -> Vec<u8>
 ///
 /// This is an internal renderer. Public callers use
 /// [`crate::FormFieldObjectHelper::generate_appearance_for`] instead.
+#[cfg(test)]
 pub(crate) fn render_text_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -422,6 +989,7 @@ pub(crate) fn render_text_field<R: Read + Seek>(
 ///
 /// This internal renderer is not a public form-field entry point.
 #[allow(dead_code)] // qpdf's public helper intentionally dispatches only /Tx and /Ch.
+#[cfg(test)]
 pub(crate) fn render_button_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -480,6 +1048,7 @@ pub(crate) fn render_button_field<R: Read + Seek>(
 }
 
 /// Pushbutton appearance: render `/MK/CA` caption centred in the bbox.
+#[cfg(test)]
 fn generate_pushbutton_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -532,6 +1101,7 @@ fn generate_pushbutton_appearance<R: Read + Seek>(
 
 /// Checkbox / radio appearance: build on + off XObjects and install as
 /// `/AP` << `/N` << `/<on>` `/<off>` >> `/D` << ... >> >>.
+#[cfg(test)]
 fn generate_checkbox_radio_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -665,6 +1235,7 @@ fn generate_checkbox_radio_appearance<R: Read + Seek>(
 /// current max with no reservation.
 ///
 /// Returns the `ObjectRef` of the on-state XObject.
+#[cfg(test)]
 fn install_state_appearances<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -868,6 +1439,7 @@ fn to_winansi_bytes(s: &str) -> Vec<u8> {
 }
 
 /// Allocate the next available object reference.
+#[cfg(test)]
 fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
     let n = pdf
         .object_refs()
@@ -881,6 +1453,7 @@ fn next_object_ref<R: Read + Seek>(pdf: &Pdf<R>) -> Result<ObjectRef> {
 }
 
 /// Read an inheritable name through the form-field helper boundary.
+#[cfg(test)]
 fn field_name<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
@@ -891,6 +1464,7 @@ fn field_name<R: Read + Seek>(
 }
 
 /// Read an inheritable object through the form-field helper boundary.
+#[cfg(test)]
 fn field_object<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
@@ -903,6 +1477,7 @@ fn field_object<R: Read + Seek>(
 }
 
 /// Read an inheritable integer through the form-field helper boundary.
+#[cfg(test)]
 fn field_integer<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
@@ -920,6 +1495,7 @@ fn field_integer<R: Read + Seek>(
 }
 
 /// Obtain `/DA` from the form-field helper.
+#[cfg(test)]
 fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Option<Vec<u8>>> {
     let appearance = FormFieldObjectHelper::new(start, pdf).default_appearance()?;
     Ok((!appearance.is_empty()).then_some(appearance.into_bytes()))
@@ -927,6 +1503,7 @@ fn resolve_da<R: Read + Seek>(pdf: &mut Pdf<R>, start: ObjectRef) -> Result<Opti
 
 /// Resolve a (possibly indirect) dictionary-valued entry to an owned
 /// [`Dictionary`], returning `None` for absent/null/non-dict values.
+#[cfg(test)]
 fn resolve_to_dict<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     value: Option<Object>,
@@ -945,6 +1522,7 @@ fn resolve_to_dict<R: Read + Seek>(
 
 /// Resolve a `/DA` font resource name using the document-level `/AcroForm/DR`
 /// supplied by the form-field helper.
+#[cfg(test)]
 fn lookup_dr_basefont<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     start: ObjectRef,
@@ -982,6 +1560,7 @@ fn lookup_dr_basefont<R: Read + Seek>(
 }
 
 /// Extract the `/Rect` of the widget as a [`PageBox`].
+#[cfg(test)]
 fn resolve_rect<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     widget_ref: ObjectRef,
@@ -1029,6 +1608,7 @@ fn resolve_rect<R: Read + Seek>(
 }
 
 /// Render a single-line text appearance (no word-wrap, one `Td Tj` pair).
+#[cfg(test)]
 fn render_singleline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
     let x = compute_x_offset(p, &p.text_bytes);
     // Vertical baseline: midpoint + 20% of font size for typical descender.
@@ -1048,6 +1628,7 @@ fn render_singleline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
 /// `Td` is a *relative* move on the text line matrix.  Each subsequent `Td`
 /// is expressed as a delta `(x_curr − x_prev, −leading)` rather than an
 /// absolute coordinate so that x offsets do not accumulate across lines.
+#[cfg(test)]
 fn render_multiline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
     let leading = p.font_size * 1.15;
     // Top baseline — allow small top margin.
@@ -1085,6 +1666,7 @@ fn render_multiline(p: &TextAppearanceParams, out: &mut Vec<u8>) {
 
 /// Compute the horizontal starting offset for a text run with the given
 /// quadding setting.
+#[cfg(test)]
 fn compute_x_offset(p: &TextAppearanceParams, text: &[u8]) -> f64 {
     match p.quadding {
         1 => {
@@ -1109,6 +1691,7 @@ fn compute_x_offset(p: &TextAppearanceParams, text: &[u8]) -> f64 {
 ///
 /// Splits on space bytes only.  Returns at least one element (may overflow
 /// if a single word exceeds `max_width`).
+#[cfg(test)]
 fn word_wrap(
     text: &[u8],
     font_size: f64,
@@ -1169,6 +1752,7 @@ fn word_wrap(
 
 /// Split `text` into hard lines on `\r\n`, `\r`, or `\n`, preserving empty
 /// segments (so blank lines entered by the user are kept).
+#[cfg(test)]
 fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut line: Vec<u8> = Vec::new();
@@ -1224,6 +1808,7 @@ fn split_hard_lines(text: &[u8]) -> Vec<Vec<u8>> {
 ///
 /// This is an internal renderer. Public callers use
 /// [`crate::FormFieldObjectHelper::generate_appearance_for`] instead.
+#[cfg(test)]
 pub(crate) fn render_choice_field<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -1294,6 +1879,7 @@ pub(crate) fn render_choice_field<R: Read + Seek>(
 }
 
 /// Resolved font information for Ch appearance rendering.
+#[cfg(test)]
 struct ChFontInfo {
     /// Name used in the Tf operator and `/Resources/Font` key (from /DA).
     resource_name: Vec<u8>,
@@ -1304,6 +1890,7 @@ struct ChFontInfo {
 }
 
 /// Parameters for rendering a combo-box appearance.
+#[cfg(test)]
 struct ComboAppearanceParams<'a> {
     widget_ref: ObjectRef,
     bbox_w: f64,
@@ -1314,6 +1901,7 @@ struct ComboAppearanceParams<'a> {
 }
 
 /// Render a Combo-box appearance: the selected `/V` value as a single-line text.
+#[cfg(test)]
 fn generate_combo_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -1382,6 +1970,7 @@ fn generate_combo_appearance<R: Read + Seek>(
 /// contain an `[export, display]` pair matching `value`.  All /Opt elements
 /// and their sub-elements are resolved through indirect references
 /// (review-pattern #2).
+#[cfg(test)]
 fn resolve_combo_display<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -1433,6 +2022,7 @@ fn resolve_combo_display<R: Read + Seek>(
 }
 
 /// Resolve an /Opt value (possibly indirect) to a `Vec<Object>` array.
+#[cfg(test)]
 fn resolve_opt_array<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     opt_val: Option<Object>,
@@ -1451,6 +2041,7 @@ fn resolve_opt_array<R: Read + Seek>(
 }
 
 /// Resolve a single /Opt element (possibly indirect) to a String byte vec.
+#[cfg(test)]
 fn resolve_string_elem<R: Read + Seek>(pdf: &mut Pdf<R>, val: Option<Object>) -> Option<Vec<u8>> {
     match val? {
         Object::String(s) => Some(s),
@@ -1463,6 +2054,7 @@ fn resolve_string_elem<R: Read + Seek>(pdf: &mut Pdf<R>, val: Option<Object>) ->
 }
 
 /// Render a List-box appearance: each option as a row, selected rows highlighted.
+#[cfg(test)]
 fn generate_list_appearance<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     field_ref: ObjectRef,
@@ -2317,6 +2909,1156 @@ mod tests {
             matches!(xobj2, Object::Stream(_)),
             "re-parsed xobj is not a stream"
         );
+    }
+
+    #[test]
+    fn canonical_tx_preserves_live_widget_and_appearance_identity() {
+        let mut pdf = Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse");
+        let widget = pdf.get_object_handle(ObjectRef::new(4, 0));
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+
+        let widget_again = pdf.get_object_handle(ObjectRef::new(4, 0));
+        assert!(widget.is_same_object_as(&widget_again));
+        pdf.resolve_object_handle(&widget_again)
+            .expect("resolve widget");
+        let ap = resolve_canonical(&mut pdf, widget_again.get_key(b"/AP")).expect("resolve AP");
+        let normal =
+            resolve_canonical(&mut pdf, ap.get_key(b"/N")).expect("resolve normal appearance");
+        assert_eq!(normal.object_ref(), Some(xobj_ref));
+        assert!(normal.is_same_object_as(&pdf.get_object_handle(xobj_ref)));
+        assert_eq!(
+            normal
+                .as_stream_dict()
+                .unwrap()
+                .get_key(b"/Subtype")
+                .as_name(),
+            Some(b"Form".to_vec())
+        );
+        assert!(normal
+            .as_stream_data()
+            .expect("appearance data")
+            .windows(b"(Hello World)".len())
+            .any(|window| window == b"(Hello World)"));
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("write canonical appearance");
+        let renumbered = writer
+            .get_renumbered_obj_gen(xobj_ref)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse output");
+        assert!(reparsed.resolve(renumbered).is_ok());
+    }
+
+    #[test]
+    fn canonical_tx_reuses_an_existing_normal_appearance_stream() {
+        let mut pdf = Pdf::open(Cursor::new(build_pdf_with_existing_ap())).expect("parse");
+        let existing = pdf.get_object_handle(ObjectRef::new(5, 0));
+        let result =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            result,
+            ObjectRef::new(5, 0),
+            "existing appearance was not reused"
+        );
+        let existing_again = pdf.get_object_handle(ObjectRef::new(5, 0));
+        assert!(existing.is_same_object_as(&existing_again));
+        pdf.resolve_object_handle(&existing_again)
+            .expect("resolve existing appearance");
+        assert!(existing_again
+            .as_stream_data()
+            .expect("existing appearance data")
+            .windows(b"(text)".len())
+            .any(|window| window == b"(text)"));
+
+        // Round-trip check for flpdf-25kg.3.8.2.2's fix (clearing /Filter
+        // and /DecodeParms on reuse): this fixture's existing stream never
+        // had a /Filter key, so the writer's default compress policy
+        // already recomputes a fresh, correct /Filter regardless of what
+        // this fix passes for filter/decode_parms -- confirming the fix is
+        // byte-behavior-neutral for the common (no pre-existing filter)
+        // case, matching the companion flate-compressed-source regression
+        // test below for the case this fix actually changes.
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("write reused appearance");
+        let renumbered = writer
+            .get_renumbered_obj_gen(result)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse output");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let decoded = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("written appearance must decode via its declared filter");
+        assert!(
+            decoded.windows(b"(text)".len()).any(|w| w == b"(text)"),
+            "decoded appearance is missing the field value: {decoded:?}"
+        );
+    }
+
+    /// PDF whose widget's existing `/AP/N` (obj 5) has a `/BBox [0 0 190
+    /// 20]` that predates the widget's current, enlarged `/Rect [10 10 400
+    /// 130]` -- a caller regenerating the appearance after resizing the
+    /// widget without first clearing `/AP`.
+    fn build_pdf_with_existing_ap_and_enlarged_rect() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 10 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget's /Rect has grown well past the existing appearance's /BBox.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (text) /Rect [10 10 400 130] /AP <</N 5 0 R>>>>\nendobj\n",
+        );
+        // Existing appearance stream: /BBox from the widget's earlier,
+        // smaller /Rect (unchanged by this fixture's regeneration call).
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+              /BBox [0 0 190 20] /Length 4>>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_sizes_reused_appearance_from_existing_bbox_not_enlarged_rect() {
+        // qpdf's `generateTextAppearance` sizes a reused appearance stream's
+        // content against *that stream's own* `/BBox`, never the widget's
+        // current `/Rect`, and never rewrites `/BBox` on this path either
+        // (`libqpdf/QPDFFormFieldObjectHelper.cc:766-793`). Verified against
+        // a real `qpdf 11.9.0 --generate-appearances` run on this exact
+        // shape (existing `/BBox [0 0 190 20]`, `/Rect` enlarged to `[10 10
+        // 400 130]`): the output keeps `/BBox [0 0 190 20]` and computes its
+        // `Td` offset (`1 5.2 Td` there, `/Helv 12 Tf`; `1 6 Td` here with
+        // this fixture's `/Helv 10 Tf`) from that unchanged 190x20 box, not
+        // from the enlarged `/Rect`.
+        let raw = build_pdf_with_existing_ap_and_enlarged_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            xobj_ref,
+            ObjectRef::new(5, 0),
+            "existing appearance was not reused"
+        );
+
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve reused appearance");
+        let stream_dict = stream_handle
+            .as_stream_dict()
+            .expect("reused stream has a dictionary");
+        let bbox = stream_dict.get_key(b"/BBox");
+        pdf.resolve_object_handle(&bbox).expect("resolve /BBox");
+        let items = bbox.as_array().expect("/BBox is an array");
+        let values: Vec<f64> = items
+            .into_iter()
+            .map(|item| {
+                pdf.resolve_object_handle(&item)
+                    .expect("resolve /BBox item");
+                item.as_real()
+                    .or_else(|| item.as_integer().map(|n| n as f64))
+                    .expect("/BBox item is numeric")
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![0.0, 0.0, 190.0, 20.0],
+            "/BBox must stay untouched on reuse, matching qpdf"
+        );
+
+        let content = stream_handle
+            .as_stream_data()
+            .expect("reused appearance data");
+        assert!(
+            content.windows(b"1 6 Td".len()).any(|w| w == b"1 6 Td"),
+            "content must be positioned against the existing 190x20 /BBox, \
+             not the widget's enlarged /Rect: {content:?}"
+        );
+        assert!(
+            !content.windows(b"1 56 Td".len()).any(|w| w == b"1 56 Td"),
+            "content must not be sized against the enlarged /Rect: {content:?}"
+        );
+    }
+
+    /// PDF whose widget's existing `/AP/N` (obj 5) is a genuinely
+    /// Flate-compressed stream (`/Filter /FlateDecode` over real zlib
+    /// bytes), mirroring flpdf-25kg.3.8.2.2's empirical repro fixture.
+    fn build_pdf_with_existing_flate_ap() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"q Q").expect("zlib encode");
+        let compressed = encoder.finish().expect("zlib finish");
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with an existing /AP/N (obj 5) that will be reused.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Hello) /Rect [10 10 200 30] /AP <</N 5 0 R>>>>\nendobj\n",
+        );
+        // Existing appearance stream, genuinely Flate-compressed.
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+                  /BBox [0 0 190 20] /Filter /FlateDecode /Length {}>>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_writes_decodable_output() {
+        // Regression test for flpdf-25kg.3.8.2.2. The existing /AP/N stream
+        // declares /Filter /FlateDecode over genuinely zlib-compressed
+        // bytes; installing freshly-built plain content into it must not
+        // leave that stale filter declaration on the written output --
+        // before the fix, the writer's lone-Flate fast path echoed the
+        // mismatched (plain) bytes verbatim under a /FlateDecode
+        // declaration, producing a stream that fails to decode.
+        let raw = build_pdf_with_existing_flate_ap();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            xobj_ref,
+            ObjectRef::new(5, 0),
+            "existing appearance was not reused"
+        );
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.write().expect("write reused appearance");
+        let renumbered = writer
+            .get_renumbered_obj_gen(xobj_ref)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        // Parse -> resolve -> decode via the declared filter -> recover the
+        // appearance content, per the bd issue's prescribed round-trip
+        // check (not just "it doesn't error").
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let decoded = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("appearance stream must decode via its declared filter");
+        assert!(
+            decoded.windows(b"(Hello)".len()).any(|w| w == b"(Hello)"),
+            "decoded appearance is missing the field value: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_under_preserve_mode_drops_filter()
+    {
+        // Under StreamDataMode::Preserve, the writer's decode/re-encode
+        // compress policy never runs (effective_stream_policy returns None,
+        // "emit the stream verbatim") -- so unlike the default
+        // CompressStreams::Yes case, nothing recomputes /Filter after this
+        // fix clears it. ObjectHandle::replace_key special-cases a direct
+        // null value as a removal (not a stored Null entry), so the cleared
+        // /Filter/DecodeParms are genuinely absent from the dictionary by
+        // the time any writer policy runs, not merely null-valued -- the
+        // Preserve-mode output must therefore have no /Filter key on this
+        // stream at all (not a stale /FlateDecode, and not a literal
+        // `/Filter null`).
+        let raw = build_pdf_with_existing_flate_ap();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+            .expect("canonical Tx generation")
+            .expect("Tx field is handled");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_stream_data_mode(crate::writer::StreamDataMode::Preserve);
+        writer
+            .write()
+            .expect("write reused appearance under preserve mode");
+        let output = writer.get_buffer().expect("writer buffer");
+        assert!(
+            !output.windows(b"/Filter".len()).any(|w| w == b"/Filter"),
+            "preserve-mode output must not gain a /Filter key"
+        );
+    }
+
+    // ── canonical Tf-operand substitution (flpdf-25kg.3.8.2.1) ───────────────
+
+    #[test]
+    fn canonical_tx_substitutes_out_of_range_da_tf_operand_in_emitted_content() {
+        // Empirical repro from the bd issue: /DA "/Helv 0 Tf 0 g" resolves
+        // font_size to 11pt (auto-size) for layout, but the emitted content
+        // stream previously kept the raw "0" Tf operand verbatim, making the
+        // text invisible in any spec-compliant viewer despite the layout
+        // math assuming 11pt.
+        let raw = build_pdf_autosize_tx();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let stream = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream).expect("resolve xobj");
+        let content = stream.as_stream_data().expect("appearance data");
+        assert!(
+            content
+                .windows(b"/Helv 11 Tf".len())
+                .any(|w| w == b"/Helv 11 Tf"),
+            "resolved 11pt Tf operand missing from {content:?}"
+        );
+        assert!(
+            !content
+                .windows(b"/Helv 0 Tf".len())
+                .any(|w| w == b"/Helv 0 Tf"),
+            "stale unsubstituted 0 Tf operand still present in {content:?}"
+        );
+    }
+
+    /// PDF whose `/DA` names a resource font via an octal-escaped raw byte
+    /// 0x80 (`/F\200`), matching a `/DR/Font` key written with the
+    /// equivalent name-escape (`/F#80`) so both decode to the identical raw
+    /// byte 0x80 at the PDF-syntax level.
+    fn build_pdf_da_octal_escape_font_name() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <</Font <</F#80 5 0 R>>>> \
+              /DA (/F\\200 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Hi) /Rect [100 700 300 720]>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Times-Roman>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_da_octal_escaped_font_name_misses_dr_like_qpdf() {
+        // NOT a bug: qpdf's own `getDefaultAppearance()` decodes `/DA`
+        // through `QPDFObjectHandle::getUTF8Value` -- the same
+        // PDFDocEncoding "text string" transform flpdf's
+        // `FormFieldObjectHelper::default_appearance` applies
+        // (`libqpdf/QPDFFormFieldObjectHelper.cc:196-210`,
+        // `libqpdf/QPDF_String.cc:161-172`
+        // (`getUTF8Val` -> `pdf_doc_to_utf8` for the non-UTF16/non-explicit-
+        // UTF8 case), `libqpdf/QUtil.cc` `pdf_doc_to_unicode[0x80-127] ==
+        // 0x2022` BULLET). A raw byte 0x80 inside a `/DA` resource name
+        // (`/F\200`, an octal *string* escape) is therefore re-encoded to
+        // the 3-byte UTF-8 sequence for U+2022 before qpdf's `TfFinder`
+        // ever tokenizes it, so the extracted font name never matches a
+        // `/DR/Font` key written with the equivalent *name* escape
+        // (`/F#80`, decoding to the same single raw byte 0x80) -- qpdf
+        // itself falls back to its default font/encoder here. Confirmed
+        // against a real `qpdf 11.9.0 --generate-appearances` run on this
+        // exact fixture shape: the regenerated appearance's `/Resources`
+        // gains no `/Font` entry at all, and its content stream literally
+        // contains `/F\xe2\x80\xa2` (UTF-8 bullet) in the `Tf` operator.
+        // flpdf must reproduce this qpdf-inherited miss, not "fix" it by
+        // reading `/DA` as raw bytes -- doing so would make flpdf diverge
+        // from real qpdf output for this exact shape.
+        let raw = build_pdf_da_octal_escape_font_name();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let stream = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream).expect("resolve xobj");
+
+        let content = stream.as_stream_data().expect("appearance data");
+        assert!(
+            content
+                .windows("/F\u{2022} 12 Tf".len())
+                .any(|w| w == "/F\u{2022} 12 Tf".as_bytes()),
+            "content must literally carry the PDFDocEncoding-corrupted \
+             (bullet) font name, matching qpdf's own getUTF8Value() \
+             transform verbatim: {content:?}"
+        );
+
+        let stream_dict = stream.as_stream_dict().expect("stream dict");
+        let resources = stream_dict.get_key(b"/Resources");
+        pdf.resolve_object_handle(&resources)
+            .expect("resolve resources");
+        let font_dict = resources.get_key(b"/Font");
+        pdf.resolve_object_handle(&font_dict)
+            .expect("resolve font dict");
+        let fonts = font_dict.as_dictionary().expect("font dict is a map");
+        assert_eq!(fonts.len(), 1, "exactly one synthesized font entry");
+        let (_, font) = fonts.into_iter().next().expect("one font entry");
+        pdf.resolve_object_handle(&font).expect("resolve font");
+        let base_font = font.get_key(b"/BaseFont");
+        pdf.resolve_object_handle(&base_font)
+            .expect("resolve BaseFont");
+        assert_eq!(
+            base_font.as_name(),
+            Some(b"Helvetica".to_vec()),
+            "the /DR font (Times-Roman) must NOT be matched -- the \
+             corrupted name misses it just like qpdf, so flpdf falls back \
+             to its Helvetica default"
+        );
+    }
+
+    /// PDF whose `/DA` has no `Tf` token at all (only a colour operator).
+    fn build_pdf_da_without_tf_token() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Plain) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_with_no_tf_token_in_da_does_not_invent_one() {
+        // NOTES correction on flpdf-25kg.3.8.2.1: qpdf never invents a Tf
+        // operator when /DA has none -- it only uses the resolved 11pt
+        // default for layout math. The emitted content must copy the DA's
+        // "0 g" through unchanged, with no Tf operator anywhere.
+        let raw = build_pdf_da_without_tf_token();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let stream = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream).expect("resolve xobj");
+        let content = stream.as_stream_data().expect("appearance data");
+        assert!(
+            content.windows(b"0 g".len()).any(|w| w == b"0 g"),
+            "original DA color operator missing from {content:?}"
+        );
+        assert!(
+            !content.windows(2).any(|w| w == b"Tf"),
+            "no Tf operator must be invented when /DA has none, found one in {content:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_choice_uses_qpdf_value_and_choices_boundary() {
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Beta) \
+              /Opt [(Alpha) (Beta) (Gamma)] /I [0] /TI 2 \
+              /Rect [0 0 100 20] /DA (/Helv 10 Tf 0 g)>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let xobj_ref =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Ch generation")
+                .expect("Ch field is handled");
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve choice appearance");
+        let stream = stream_handle
+            .as_stream_data()
+            .expect("choice appearance data");
+        assert!(stream
+            .windows(b"(Beta)".len())
+            .any(|window| window == b"(Beta)"));
+        assert!(!stream
+            .windows(b"(Alpha)".len())
+            .any(|window| window == b"(Alpha)"));
+    }
+
+    #[test]
+    fn canonical_choice_negative_ff_preserves_combo_bit() {
+        // qpdf's `getFlags()` returns a signed C++ `int`
+        // (`QPDFObjectHandle::getIntValueAsInt`, `QPDFObjectHandle.cc:525-540`,
+        // which saturates to `INT_MIN`/`INT_MAX` but never zeroes a negative
+        // value) and the combo-bit test `getFlags() & ff_ch_combo`
+        // (`QPDFFormFieldObjectHelper.cc:231-234,800`, `ff_ch_combo = 1 <<
+        // 17` in `Constants.h:209`) operates directly on that signed value:
+        // `-1 & 0x20000 != 0`, so a field with `/Ff -1` is a combo. A
+        // `u32::try_from` that defaults a failed (negative) conversion to
+        // zero clears the combo bit instead, misrendering the field as a
+        // list.
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Blue) /Ff -1 \
+              /Opt [(Alpha) (Blue) (Gamma)] \
+              /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let xobj_ref =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Ch generation")
+                .expect("Ch field is handled");
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve choice appearance");
+        let content = stream_handle
+            .as_stream_data()
+            .expect("choice appearance data");
+        assert!(
+            content.windows(b"(Blue)".len()).any(|w| w == b"(Blue)"),
+            "combo value must appear in Tj, got {content:?}"
+        );
+        assert!(
+            !content.windows(b"(Alpha)".len()).any(|w| w == b"(Alpha)"),
+            "negative /Ff must not fall back to list rendering (Alpha leaked), got {content:?}"
+        );
+        assert!(
+            !content
+                .windows(b"0.85 0.85 0.85 rg".len())
+                .any(|w| w == b"0.85 0.85 0.85 rg"),
+            "negative /Ff must not draw a list-style highlight rect, got {content:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_choice_out_of_i32_range_ff_saturates_before_combo_mask() {
+        // qpdf's `getFlags()` (`QPDFFormFieldObjectHelper.cc:230-234`) reads
+        // `/Ff` through `QPDFObjectHandle::getIntValueAsInt`
+        // (`QPDFObjectHandle.cc:525-540`), which *saturates* an out-of-range
+        // `long long` to `INT_MIN`/`INT_MAX` before qpdf ever tests the
+        // combo bit (`ff_ch_combo = 1 << 17`, `Constants.h:209`) -- it is
+        // never the raw 64-bit value that gets masked. For `/Ff
+        // 4294967296` (`0x1_0000_0000`), qpdf saturates to `INT_MAX`
+        // (`0x7fff_ffff`, all of whose low 31 bits are set, so the combo
+        // bit reads as set), but `0x1_0000_0000` itself has no bits below
+        // bit 32 set, so masking the raw `i64` directly clears the combo
+        // bit and misrenders the field as a list.
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Blue) /Ff 4294967296 \
+              /Opt [(Alpha) (Blue) (Gamma)] \
+              /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let xobj_ref =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Ch generation")
+                .expect("Ch field is handled");
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve choice appearance");
+        let content = stream_handle
+            .as_stream_data()
+            .expect("choice appearance data");
+        assert!(
+            content.windows(b"(Blue)".len()).any(|w| w == b"(Blue)"),
+            "combo value must appear in Tj, got {content:?}"
+        );
+        assert!(
+            !content.windows(b"(Alpha)".len()).any(|w| w == b"(Alpha)"),
+            "out-of-i32-range /Ff must not fall back to list rendering (Alpha leaked), got {content:?}"
+        );
+        assert!(
+            !content
+                .windows(b"0.85 0.85 0.85 rg".len())
+                .any(|w| w == b"0.85 0.85 0.85 rg"),
+            "out-of-i32-range /Ff must not draw a list-style highlight rect, got {content:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_rect_projection_rejects_qpdf_null_shapes() {
+        let mut pdf = Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse");
+        let missing = ObjectHandle::dictionary(Vec::new());
+        assert!(resolve_rect_canonical(&mut pdf, &missing)
+            .expect("missing rect projection")
+            .is_none());
+
+        let short = ObjectHandle::dictionary(vec![(
+            b"/Rect".to_vec(),
+            ObjectHandle::array(vec![ObjectHandle::integer(0); 3]),
+        )]);
+        assert!(resolve_rect_canonical(&mut pdf, &short)
+            .expect("short rect projection")
+            .is_none());
+
+        let non_numeric = ObjectHandle::dictionary(vec![(
+            b"/Rect".to_vec(),
+            ObjectHandle::array(vec![
+                ObjectHandle::integer(0),
+                ObjectHandle::integer(0),
+                ObjectHandle::name(b"Bad".to_vec()),
+                ObjectHandle::integer(20),
+            ]),
+        )]);
+        assert!(resolve_rect_canonical(&mut pdf, &non_numeric)
+            .expect("non-numeric rect projection")
+            .is_none());
+    }
+
+    #[test]
+    fn canonical_renderers_skip_wrong_and_degenerate_fields() {
+        let mut btn = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Btn /Rect [0 0 20 20]>>",
+        )))
+        .expect("parse button");
+        assert!(
+            render_text_field_canonical(&mut btn, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("wrong Tx field type")
+                .is_none()
+        );
+        assert!(render_choice_field_canonical(
+            &mut btn,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("wrong Ch field type")
+        .is_none());
+
+        let mut short = Pdf::open(Cursor::new(build_pdf_with_short_rect())).expect("parse");
+        assert!(render_text_field_canonical(
+            &mut short,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("short canonical rect")
+        .is_none());
+
+        let mut non_numeric = Pdf::open(Cursor::new(build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [100 700 /Bad 720]>>",
+        )))
+        .expect("parse");
+        assert!(render_choice_field_canonical(
+            &mut non_numeric,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("non-numeric canonical rect")
+        .is_none());
+
+        let mut zero_width = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Tx /V (x) /Rect [10 10 10 30]>>",
+        )))
+        .expect("parse zero-width Tx");
+        assert!(render_text_field_canonical(
+            &mut zero_width,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("zero-width canonical Tx")
+        .is_none());
+
+        let mut zero_height = Pdf::open(Cursor::new(build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [10 10 30 10]>>",
+        )))
+        .expect("parse zero-height Ch");
+        assert!(render_choice_field_canonical(
+            &mut zero_height,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("zero-height canonical Ch")
+        .is_none());
+
+        let mut tx_direct_stream =
+            Pdf::open(Cursor::new(build_minimal_tx_pdf())).expect("parse direct Tx appearance");
+        let tx_widget = tx_direct_stream.get_object_handle(ObjectRef::new(4, 0));
+        tx_direct_stream
+            .resolve_object_handle(&tx_widget)
+            .expect("resolve Tx widget");
+        tx_widget.replace_key(
+            b"/AP",
+            ObjectHandle::dictionary(vec![(
+                b"/N".to_vec(),
+                ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![
+                        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                        // A valid /BBox so this repro reaches the
+                        // not-indirect guard instead of aborting earlier
+                        // at the /BBox validity check (also qpdf-modeled:
+                        // `QPDFFormFieldObjectHelper.cc:788-791`).
+                        (
+                            b"/BBox".to_vec(),
+                            ObjectHandle::array(vec![
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(100),
+                                ObjectHandle::integer(20),
+                            ]),
+                        ),
+                    ]),
+                    Rc::new(b"old".to_vec()),
+                ),
+            )]),
+        );
+        let tx_result = render_text_field_canonical(
+            &mut tx_direct_stream,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0),
+        );
+        assert!(
+            matches!(
+                &tx_result,
+                Err(Error::Unsupported(message))
+                    if message == "normal appearance stream is not indirect"
+            ),
+            "unexpected direct Tx appearance result: {tx_result:?}"
+        );
+
+        let mut ch_direct_stream = Pdf::open(Cursor::new(build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (x) /Rect [0 0 100 20]>>",
+        )))
+        .expect("parse direct Ch appearance");
+        let ch_widget = ch_direct_stream.get_object_handle(ObjectRef::new(4, 0));
+        ch_direct_stream
+            .resolve_object_handle(&ch_widget)
+            .expect("resolve Ch widget");
+        ch_widget.replace_key(
+            b"/AP",
+            ObjectHandle::dictionary(vec![(
+                b"/N".to_vec(),
+                ObjectHandle::stream(
+                    ObjectHandle::dictionary(vec![
+                        (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
+                        (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                        // A valid /BBox so this repro reaches the
+                        // not-indirect guard instead of aborting earlier
+                        // at the /BBox validity check (also qpdf-modeled:
+                        // `QPDFFormFieldObjectHelper.cc:788-791`).
+                        (
+                            b"/BBox".to_vec(),
+                            ObjectHandle::array(vec![
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(20),
+                                ObjectHandle::integer(20),
+                            ]),
+                        ),
+                    ]),
+                    Rc::new(b"old".to_vec()),
+                ),
+            )]),
+        );
+        assert!(matches!(
+            render_choice_field_canonical(
+                &mut ch_direct_stream,
+                ObjectRef::new(4, 0),
+                ObjectRef::new(4, 0)
+            ),
+            Err(Error::Unsupported(message))
+                if message == "normal appearance stream is not indirect"
+        ));
+    }
+
+    #[test]
+    fn canonical_tx_reports_none_when_ap_container_is_malformed() {
+        // qpdf's `AP.replaceKey("/N", AS)` no-ops (with a type warning) when
+        // `/AP` is present but not a dictionary
+        // (`QPDFObjectHandle::replaceKey`, `QPDFObjectHandle.cc:1199-1210`:
+        // `asDictionary()` returns null, so the mutation is dropped and the
+        // widget's `/AP` is left untouched). The freshly built appearance
+        // stream is therefore never linked into the widget's `/AP/N`; the
+        // canonical renderer must report that no appearance was actually
+        // installed (`None`) rather than handing back a stream ref the
+        // widget does not use.
+        let raw = build_btn_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Tx /V (Plain) /AP /Bogus \
+              /DA (/Helv 12 Tf 0 g) /Rect [10 10 200 30]>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let result =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation must not error");
+        assert!(
+            result.is_none(),
+            "malformed /AP container must not report a successfully installed appearance, got {result:?}"
+        );
+
+        // The widget's /AP must remain untouched (still the malformed
+        // Name), matching qpdf's no-op replaceKey.
+        let widget = pdf.resolve(ObjectRef::new(4, 0)).expect("resolve widget");
+        let Object::Dictionary(wdict) = widget else {
+            panic!("widget not a dict"); // cov:ignore: unreachable -- build_btn_pdf_obj4's obj-4 body is always a dictionary
+        };
+        assert_eq!(
+            wdict.get("AP"),
+            Some(&Object::Name(b"Bogus".to_vec())),
+            "malformed /AP must be left untouched, matching qpdf's no-op replaceKey"
+        );
+    }
+
+    #[test]
+    fn canonical_dr_lookup_uses_live_resources_and_qpdf_null_fallback() {
+        let mut with_dr = Pdf::open(Cursor::new(build_dr_font_tx_pdf())).expect("parse /DR");
+        assert_eq!(
+            lookup_dr_basefont_canonical(&mut with_dr, ObjectRef::new(4, 0), b"F1")
+                .expect("lookup /DR font"),
+            Some(StandardFont::TimesRoman)
+        );
+
+        let mut without_dr = Pdf::open(Cursor::new(build_tx_no_value_pdf())).expect("parse no /DR");
+        assert_eq!(
+            lookup_dr_basefont_canonical(&mut without_dr, ObjectRef::new(4, 0), b"F1")
+                .expect("missing /DR font"),
+            None
+        );
+
+        let raw = String::from_utf8(build_dr_font_tx_pdf())
+            .expect("UTF-8 fixture")
+            .replace("/FT /Tx", "/FT /Ch")
+            .into_bytes();
+        let mut choice = Pdf::open(Cursor::new(raw)).expect("parse choice /DR");
+        assert!(render_choice_field_canonical(
+            &mut choice,
+            ObjectRef::new(4, 0),
+            ObjectRef::new(4, 0)
+        )
+        .expect("choice /DR appearance")
+        .is_some());
+    }
+
+    #[test]
+    fn qpdf_choice_builder_covers_selected_window_edges_and_missing_values() {
+        let first = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"A",
+            &[b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            100.0,
+            36.0,
+            10.0,
+            false,
+        );
+        assert!(first
+            .windows(b"0.85 0.85 0.85 rg".len())
+            .any(|window| { window == b"0.85 0.85 0.85 rg" }));
+
+        let last = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"E",
+            &[
+                b"A".to_vec(),
+                b"B".to_vec(),
+                b"C".to_vec(),
+                b"D".to_vec(),
+                b"E".to_vec(),
+            ],
+            100.0,
+            36.0,
+            10.0,
+            false,
+        );
+        assert!(last.windows(b"(C)".len()).any(|window| window == b"(C)"));
+        assert!(last
+            .windows(b"0 -12 Td".len())
+            .any(|window| window == b"0 -12 Td"));
+
+        let missing = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"X",
+            &[b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            100.0,
+            36.0,
+            10.0,
+            false,
+        );
+        assert!(missing.windows(b"(X)".len()).any(|window| window == b"(X)"));
+        assert!(missing.windows(b"(A)".len()).any(|window| window == b"(A)"));
+    }
+
+    #[test]
+    fn qpdf_choice_builder_clamps_saturated_max_rows_to_options_len() {
+        // Regression test for flpdf-25kg.3.8.2.3. For a tiny font_size and a
+        // huge bbox_h, `bbox_h / tfh` exceeds `usize::MAX` as an f64; the raw
+        // `as usize` cast saturates to `usize::MAX`, and the subsequent
+        // `as isize` cast used to bit-reinterpret that as -1, corrupting the
+        // first/last window arithmetic and panicking on the inclusive slice
+        // `options[first..=last]` (exact repro from the bd issue).
+        let content = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"Beta",
+            &[b"Alpha".to_vec(), b"Beta".to_vec(), b"Gamma".to_vec()],
+            100.0,
+            1.0e18,
+            1.0e-10,
+            false,
+        );
+        // max_rows saturates far past options.len(), so the clamp caps the
+        // display window at the full option list -- exactly the window the
+        // original algorithm converges to for any in-range max_rows large
+        // enough to show every option.
+        for (expected, label) in [
+            (b"(Alpha)".as_slice(), "Alpha"),
+            (b"(Beta)", "Beta"),
+            (b"(Gamma)", "Gamma"),
+        ] {
+            let count = content
+                .windows(expected.len())
+                .filter(|window| *window == expected)
+                .count();
+            assert_eq!(count, 1, "expected exactly one `{label}` Tj line");
+        }
+    }
+
+    #[test]
+    fn canonical_choice_extreme_bbox_and_tiny_font_size_does_not_panic() {
+        // flpdf-25kg.3.8.2.3's exact end-to-end repro through the public
+        // canonical path: a crafted /Rect and /DA drive `max_rows` past
+        // `usize::MAX`, reachable from `render_choice_field_canonical`
+        // (the /Ch dispatch inside `generate_appearance_for`) with no gate
+        // upstream that would reject it first.
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Beta) \
+              /Opt [(Alpha) (Beta) (Gamma)] /Rect [0 0 100 1000000000000] \
+              /DA (/Helv 0.0000000001 Tf 0 g)>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let result =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0));
+        assert!(result.is_ok(), "extreme bbox/font-size must not error");
+        assert!(
+            result.unwrap().is_some(),
+            "extreme bbox/font-size must still produce an appearance"
+        );
+    }
+
+    #[test]
+    fn qpdf_choice_builder_reserves_room_for_unmatched_value_row() {
+        // Regression: the `.min(options.len())` clamp added for
+        // flpdf-25kg.3.8.2.3 protects the *found* branch (which replaces
+        // `lines` with a slice of `options`, needing at most
+        // `options.len()` rows) but starves the *not-found* branch, which
+        // needs `options.len() + 1` rows -- `lines` already holds the
+        // unmatched value, and `options.iter().take(max_rows - 1)` then
+        // appends up to `max_rows - 1` more. With `max_rows` capped to
+        // `options.len()`, `take(max_rows - 1)` drops the last option even
+        // when the bounding box is tall enough to show every option plus
+        // the unmatched value.
+        let content = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"NotFound",
+            &[b"Alpha".to_vec(), b"Beta".to_vec(), b"Gamma".to_vec()],
+            100.0,
+            48.0, // 4 rows of 12pt fit: the value plus all 3 options.
+            10.0,
+            false,
+        );
+        for (expected, label) in [
+            (b"(NotFound)".as_slice(), "NotFound"),
+            (b"(Alpha)", "Alpha"),
+            (b"(Beta)", "Beta"),
+            (b"(Gamma)", "Gamma"),
+        ] {
+            assert!(
+                content
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "expected `{label}` Tj line in content, got {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qpdf_choice_builder_reserves_room_for_sole_unmatched_option() {
+        // Same regression, degenerate single-option case: before the fix,
+        // clamping `max_rows` to `options.len() == 1` fails the `max_rows
+        // >= 2` gate entirely, so the sole option is never shown at all --
+        // even though the box has room for both the unmatched value and
+        // the option.
+        let content = build_qpdf_choice_appearance_content(
+            b"/Helv 10 Tf 0 g",
+            b"NotFound",
+            &[b"OnlyOption".to_vec()],
+            100.0,
+            24.0, // 2 rows of 12pt fit: the value plus the sole option.
+            10.0,
+            false,
+        );
+        for (expected, label) in [
+            (b"(NotFound)".as_slice(), "NotFound"),
+            (b"(OnlyOption)", "OnlyOption"),
+        ] {
+            assert!(
+                content
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "expected `{label}` Tj line in content, got {content:?}"
+            );
+        }
+    }
+
+    // ── substitute_da_tf_operand: direct-function-level (flpdf-25kg.3.8.2.1) ─
+
+    #[test]
+    fn substitute_da_tf_operand_replaces_out_of_range_operand() {
+        // The bd issue's exact repro: /Helv 0 Tf 0 g resolves to 11pt
+        // (auto-size), but the raw "0" Tf operand was previously copied
+        // through unmodified.
+        let out = substitute_da_tf_operand(b"/Helv 0 Tf 0 g", 11.0);
+        assert_eq!(out, b"/Helv 11 Tf 0 g");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_leaves_in_range_operand_untouched() {
+        // When the resolved font_size matches the DA's own operand (delta
+        // within qpdf's 0.001 tolerance), no substitution occurs and the
+        // bytes are unchanged -- not just numerically equal.
+        let out = substitute_da_tf_operand(b"/Helv 12 Tf 0 g", 12.0);
+        assert_eq!(out, b"/Helv 12 Tf 0 g");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_no_tf_token_returns_unchanged() {
+        // NOTES correction on flpdf-25kg.3.8.2.1: qpdf's tf_idx never
+        // matches when /DA has no Tf token at all, so getDA() performs no
+        // substitution and no Tf operator is invented either.
+        let out = substitute_da_tf_operand(b"0 g", 11.0);
+        assert_eq!(out, b"0 g");
+        assert!(!out.windows(2).any(|w| w == b"Tf"));
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_tf_with_no_preceding_number_returns_unchanged() {
+        // A malformed "Tf" with nothing numeric before it: qpdf's tf_idx is
+        // only set from a preceding number token, so this must not invent a
+        // substitution out of thin air either.
+        let out = substitute_da_tf_operand(b"Tf 0 g", 11.0);
+        assert_eq!(out, b"Tf 0 g");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_multi_tf_only_substitutes_the_last_occurrence() {
+        // qpdf's TfFinder overwrites tf_idx on every Tf token it sees, so
+        // only the *last* Tf's operand is a substitution candidate -- the
+        // first Tf's "12" must stay untouched even though it precedes the
+        // out-of-range "0" that does get substituted. This is the case that
+        // would catch a span-finder that disagrees with
+        // parse_default_appearance's own "last Tf wins" resolution.
+        let out = substitute_da_tf_operand(b"/Helv 12 Tf /Cour 0 Tf", 11.0);
+        assert_eq!(out, b"/Helv 12 Tf /Cour 11 Tf");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_skips_inline_image_payload_without_confusing_operands() {
+        // A pathological /DA containing an inline-image sequence must not
+        // corrupt the Tf-operand scan: the image payload is a distinct
+        // token kind (Object::InlineImage) carrying no operand semantics,
+        // and the operators around it (BI/ID/EI) must not be mistaken for
+        // Tf or leave stale operands behind.
+        let out = substitute_da_tf_operand(b"BI /CS /RGB ID payload EI /Helv 0 Tf 0 g", 11.0);
+        assert_eq!(out, b"BI /CS /RGB ID payload EI /Helv 11 Tf 0 g");
     }
 
     /// PDF whose `/DA` references a `/DR` resource key (`/F1`) rather than a
@@ -3463,7 +5205,7 @@ mod tests {
         let off5 = pdf.len() as u64;
         pdf.extend_from_slice(
             b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
-              /BBox [0 0 190 20]>>\nstream\nq Q\nendstream\nendobj\n",
+              /BBox [0 0 190 20] /Length 4>>\nstream\nq Q\nendstream\nendobj\n",
         );
         let xref_start = pdf.len() as u64;
         let xref = format!(
