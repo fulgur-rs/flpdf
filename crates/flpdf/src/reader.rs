@@ -1694,6 +1694,17 @@ impl<R: Read + Seek> Pdf<R> {
         self.resolver.new_stream_handle()
     }
 
+    /// Create qpdf's document-owned reserved construction sentinel.
+    ///
+    /// A reserved object is an indirect identity with no serializable PDF
+    /// value. It exists to make circular construction possible and must be
+    /// replaced before writing, matching `QPDF::newReserved` and
+    /// `QPDF_Reserved::unparse`
+    /// (`libqpdf/QPDF.cc:1900-1903`; `libqpdf/QPDF_Reserved.cc:20-27`).
+    pub fn new_reserved(&self) -> Result<ObjectHandle> {
+        self.resolver.new_reserved_handle()
+    }
+
     /// Create an owned stream and replace its data with the supplied buffer.
     ///
     /// This follows qpdf's buffer overload: the empty factory runs first and
@@ -7776,6 +7787,104 @@ mod tests {
                 .get_key(b"/Marker")
                 .as_integer(),
             Some(7)
+        );
+    }
+
+    #[test]
+    fn new_reserved_is_a_distinct_qpdf_internal_sentinel() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let first = pdf.new_reserved().expect("first reserved object");
+        let second = pdf.new_reserved().expect("second reserved object");
+
+        pdf.resolve_object_handle(&first)
+            .expect("reserved handles do not enter the source resolver");
+        assert!(first.is_indirect());
+        assert_eq!(first.object_ref(), Some(ObjectRef::new(4, 0)));
+        assert!(first.is_reserved());
+        assert!(first.is_resolved());
+        assert!(!first.is_null());
+        assert_eq!(first.type_code(), 1, "qpdf ot_reserved");
+        assert_eq!(first.type_name(), "reserved");
+        assert!(!first.is_same_object_as(&second));
+        assert!(pdf.is_canonical_object_handle(&first));
+
+        let error = first
+            .materialize()
+            .expect_err("qpdf reserved objects cannot be materialized");
+        assert_eq!(
+            error.to_string(),
+            "QPDFObjectHandle: attempting to unparse a reserved object"
+        );
+    }
+
+    #[test]
+    fn dropping_the_owner_turns_a_reserved_handle_into_destroyed() {
+        let reserved = {
+            let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+            pdf.new_reserved().expect("reserved object")
+        };
+
+        assert!(!reserved.is_reserved());
+        assert_eq!(reserved.type_code(), 14, "qpdf ot_destroyed");
+        assert_eq!(reserved.type_name(), "destroyed");
+        assert!(!reserved.is_null());
+    }
+
+    #[test]
+    fn reserved_objects_are_rejected_by_object_writer_entrypoints() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let expected = "QPDFObjectHandle: attempting to unparse a reserved object";
+
+        let mut out = Vec::new();
+        assert_eq!(
+            reserved
+                .unparse_object(&mut out)
+                .expect_err("plain writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+        out.clear();
+        assert_eq!(
+            reserved
+                .unparse_object_qdf(&mut out, 0)
+                .expect_err("QDF writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+        out.clear();
+        assert_eq!(
+            reserved
+                .unparse_object_with_ref_map(&mut out, &|object_ref| Ok(object_ref))
+                .expect_err("mapped writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+
+        let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved)]);
+        assert_eq!(
+            containing
+                .unparse_object(&mut out)
+                .expect_err("reachable reserved object must reject the writer")
+                .to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn full_writer_rejects_a_reachable_reserved_object() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let root = pdf.get_object_handle(ObjectRef::new(1, 0));
+        pdf.resolve_object_handle(&root).expect("resolve catalog");
+        assert!(root.as_dictionary().is_some(), "catalog dictionary");
+        root.replace_key(b"/Reserved", reserved);
+
+        let error = crate::writer::write_qpdf_to_memory(&mut pdf, |_| {})
+            .expect_err("full writer must reject a reachable reserved object");
+        assert_eq!(
+            error.to_string(),
+            "QPDFObjectHandle: attempting to unparse a reserved object"
         );
     }
 

@@ -734,6 +734,29 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.make_indirect_from_object_handle(stream)
     }
 
+    /// Create qpdf's reserved construction sentinel and register its
+    /// document-owned identity in the canonical object cache.
+    ///
+    /// `QPDF::newReserved` delegates to `makeIndirectFromQPDFObject`, which
+    /// allocates `nextObjGen`, stores a `QPDF_Reserved` payload in `obj_cache`,
+    /// and returns the same indirect identity
+    /// (`libqpdf/QPDF.cc:1882-1888,1900-1903`; `QPDF_Reserved.cc:1-27`).
+    pub(crate) fn new_reserved_handle(&self) -> Result<ObjectHandle> {
+        let object_ref = self.next_obj_gen()?;
+        let resolver: Weak<dyn DocumentResolver> = self.self_weak.clone();
+        let reserved = ObjectHandle::new_reserved_for_pdf(object_ref, self.pdf_unique_id, resolver);
+        let previous = self
+            .core
+            .borrow_mut()
+            .object_cache
+            .insert(object_ref, reserved.clone());
+        debug_assert!(
+            previous.is_none(),
+            "next_obj_gen must return a fresh ObjGen"
+        );
+        Ok(reserved)
+    }
+
     /// Set qpdf's source-side immediate-copy flag.
     pub(crate) fn set_immediate_copy_from(&self, value: bool) {
         self.immediate_copy_from.set(value);
