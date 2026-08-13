@@ -1,4 +1,4 @@
-//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy lives here; the older raw-object closure copier remains below as a compatibility route until its consumers migrate.
+//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy lives here.
 //! Cross-document deep object copier (identity-preserving reservation + cycle handling).
 //!
 //! [`copy_objects`] copies a pre-closed set of source [`ObjectRef`]s into a
@@ -629,91 +629,6 @@ pub fn copy_objects<RS: Read + Seek, RT: Read + Seek>(
     Ok(map)
 }
 
-/// Copy foreign objects while retaining qpdf's per-source object identity map.
-///
-/// `QPDF::copyForeignObject` stores its map on the destination `QPDF`, keyed
-/// by the source document's unique identity. Page insertion uses this variant;
-/// the public [`copy_objects`] helper intentionally remains a fresh-copy API.
-pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
-    source: &mut Pdf<RS>,
-    target: &mut Pdf<RT>,
-    refs: &BTreeSet<ObjectRef>,
-) -> Result<BTreeMap<ObjectRef, ObjectRef>> {
-    let source_id = source.unique_id();
-    let mut map = target.take_foreign_object_map(source_id);
-    let copied = (|| {
-        let mut to_copy = Vec::new();
-        let mut base = None;
-        // Counts only fresh allocations from the `Vacant` arm below. The
-        // `Occupied` arm can also push onto `to_copy` (re-queuing a stale
-        // null reservation for copying, without allocating a new target
-        // number for it), so `to_copy.len()` no longer tracks 1:1 with the
-        // number of numbers allocated from `base`; a dedicated counter keeps
-        // each freshly allocated target number offset by the count of
-        // allocations that actually happened, not by the unrelated count of
-        // entries queued for the resolve/rewrite pass below.
-        let mut allocated = 0usize;
-
-        for &source_ref in refs {
-            match map.entry(source_ref) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let base = match base {
-                        Some(base) => base,
-                        None => {
-                            let first = target.next_available_object_ref()?.number;
-                            base = Some(first);
-                            first
-                        }
-                    };
-                    let target_ref = ObjectRef::new(alloc_target_number(base, allocated)?, 0);
-                    allocated += 1;
-                    // Reserve before resolving any source object so cycles can be
-                    // rewritten through the complete map, as qpdf does.
-                    target.set_object(target_ref, Object::Null);
-                    entry.insert(target_ref);
-                    to_copy.push(source_ref);
-                }
-                std::collections::btree_map::Entry::Occupied(entry) => {
-                    // This per-source map (`Pdf::foreign_object_maps`) is also
-                    // shared with the canonical `copy_foreign_object` port. When
-                    // that port discovers a `/Page` nested below some other
-                    // copied root, it reserves an indirect-null placeholder for
-                    // it without ever filling it in -- qpdf's own
-                    // `reserveObjects` does the same, returning without queuing
-                    // it for replacement (`libqpdf/QPDF.cc:2124-2132`). If that
-                    // same page is later requested here as an actual
-                    // page-tree insertion target, an already-occupied entry
-                    // must not be treated as "already copied": qpdf's own
-                    // `reserveObjects` recopies through the identical
-                    // condition when `copyForeignObject` runs with the page as
-                    // its top-level object, as `insertPage` does
-                    // (`top && isPageObject() && object_map[...].isNull()`,
-                    // `QPDF.cc:2118-2122`). Detect the same condition here --
-                    // the existing target is still an unfulfilled null
-                    // reservation -- and (re)populate it instead of leaving
-                    // the rebuilt page tree pointing at a leftover placeholder.
-                    if target.get_object_handle(*entry.get()).is_null() {
-                        to_copy.push(source_ref);
-                    }
-                }
-            }
-        }
-
-        for source_ref in to_copy {
-            let mut object = source.resolve(source_ref)?;
-            rewrite_refs(&mut object, 0, &map)?;
-            target.set_object(map[&source_ref], object);
-        }
-
-        Ok(refs
-            .iter()
-            .map(|source_ref| (*source_ref, map[source_ref]))
-            .collect())
-    })();
-    target.set_foreign_object_map(source_id, map);
-    copied
-}
-
 /// Deep-rewrite every [`Object::Reference`] in `obj` *in place*: refs present in
 /// `map` are remapped, refs outside `map` become [`Object::Null`].  Stream byte
 /// payloads are left untouched (never cloned); scalars are unchanged.
@@ -892,85 +807,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn foreign_copy_restores_existing_map_after_rewrite_failure() {
-        let mut source = minimal_pdf();
-        let mut target = minimal_pdf();
-        let source_id = source.unique_id();
-        copy_foreign_objects(
-            &mut source,
-            &mut target,
-            &BTreeSet::from([ObjectRef::new(3, 0)]),
-        )
-        .unwrap();
-
-        source.set_object(ObjectRef::new(4, 0), nested_arrays(MAX_INLINE_DEPTH + 5));
-        assert!(copy_foreign_objects(
-            &mut source,
-            &mut target,
-            &BTreeSet::from([ObjectRef::new(4, 0)]),
-        )
-        .is_err());
-
-        assert!(target
-            .take_foreign_object_map(source_id)
-            .contains_key(&ObjectRef::new(3, 0)));
-    }
-
-    #[test]
-    fn copy_foreign_objects_recopies_its_own_null_reservation_after_a_failed_call() {
-        // The `Entry::Occupied` re-queue added for round-3 Codex finding #3
-        // (the canonical port sharing this map with a stale nested-page
-        // placeholder) is not limited to that origin: `copy_foreign_objects`
-        // reserves its own null placeholder (`target.set_object(target_ref,
-        // Object::Null)`, above) before resolving/rewriting the source
-        // object, so a failure in that resolve/rewrite step -- exactly the
-        // scenario `foreign_copy_restores_existing_map_after_rewrite_failure`
-        // already constructs -- leaves this route's own reservation
-        // unfulfilled too. Confirm a later successful call reuses that same
-        // target identity and fills in the real content, rather than
-        // permanently returning the leftover null (the same class of bug,
-        // just triggered by this route's own failure instead of a shared
-        // map with the canonical port) or allocating a second target number
-        // for the same source object.
-        let mut source = minimal_pdf();
-        let mut target = minimal_pdf();
-        let source_id = source.unique_id();
-
-        source.set_object(ObjectRef::new(3, 0), nested_arrays(MAX_INLINE_DEPTH + 5));
-        assert!(copy_foreign_objects(
-            &mut source,
-            &mut target,
-            &BTreeSet::from([ObjectRef::new(3, 0)]),
-        )
-        .is_err());
-        let map_after_failure = target.take_foreign_object_map(source_id);
-        let reserved_ref = *map_after_failure
-            .get(&ObjectRef::new(3, 0))
-            .expect("the failed call still reserves a target identity");
-        target.set_foreign_object_map(source_id, map_after_failure);
-        assert!(target.resolve(reserved_ref).unwrap().is_null());
-
-        source.set_object(ObjectRef::new(3, 0), Object::Integer(777));
-        let copied = copy_foreign_objects(
-            &mut source,
-            &mut target,
-            &BTreeSet::from([ObjectRef::new(3, 0)]),
-        )
-        .expect("a retry after fixing the source object must succeed");
-
-        assert_eq!(
-            copied[&ObjectRef::new(3, 0)],
-            reserved_ref,
-            "retry must reuse the identity reserved by the failed call, not allocate a new one"
-        );
-        assert_eq!(
-            target.resolve(reserved_ref).unwrap(),
-            Object::Integer(777),
-            "retry must fill the reservation with the real content"
-        );
     }
 
     #[test]
