@@ -6193,9 +6193,11 @@ mod tests {
 
         clear_need_appearances_after_generation(&mut pdf).unwrap();
 
-        let Object::Dictionary(acroform) = pdf.resolve(ObjectRef::new(100, 0)).unwrap() else {
-            panic!("AcroForm must remain a dictionary");
-        };
+        let acroform = pdf
+            .resolve(ObjectRef::new(100, 0))
+            .unwrap()
+            .into_dict()
+            .expect("AcroForm must remain a dictionary");
         assert!(acroform.get("NeedAppearances").is_none());
     }
 

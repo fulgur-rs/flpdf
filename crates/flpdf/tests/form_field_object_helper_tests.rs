@@ -440,6 +440,12 @@ fn checked_requires_checkbox_and_an_on_name_value() {
         let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
         assert_eq!(field.is_checked().unwrap(), expected);
     }
+
+    let bytes = doc(vec![(10, "<< /FT /Btn /Ff 0 >>".into())]);
+    let mut pdf = open(bytes);
+    assert!(!FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+        .is_checked()
+        .unwrap());
 }
 
 #[test]
@@ -518,6 +524,35 @@ fn exposes_remaining_qpdf_read_and_traversal_accessors() {
     let mut pdf = open(bytes);
     let mut field = FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf);
     assert!(field.is_null().unwrap());
+}
+
+#[test]
+fn top_level_field_stops_when_a_parent_chain_returns_to_a_seen_handle() {
+    let bytes = doc(vec![
+        (10, "<< /Parent 11 0 R >>".into()),
+        (11, "<< /Parent 10 0 R >>".into()),
+    ]);
+    let mut pdf = open(bytes);
+
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .top_level_field()
+            .unwrap(),
+        (ObjectRef::new(10, 0), true)
+    );
+}
+
+#[test]
+fn parent_returns_none_for_a_null_parent() {
+    let bytes = doc(vec![(10, "<< /Parent null >>".into())]);
+    let mut pdf = open(bytes);
+
+    assert_eq!(
+        FormFieldObjectHelper::new(ObjectRef::new(10, 0), &mut pdf)
+            .parent()
+            .unwrap(),
+        None
+    );
 }
 
 #[test]

@@ -353,7 +353,9 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
                 if self.is_checkbox()? {
                     self.set_checkbox_value(name != b"Off")?;
                 } else if self.is_radio_button()? {
-                    self.set_radio_button_value(self.field.clone(), &name)?;
+                    if let Some(field) = self.dictionary_handle_for(self.field.clone())? {
+                        self.set_radio_button_value(field, &name)?;
+                    }
                 }
             }
             // qpdf ignores invalid button input and pushbutton values.
@@ -492,10 +494,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     }
 
     fn set_radio_button_value(&mut self, field: ObjectHandle, value: &[u8]) -> Result<()> {
-        let field = self.dictionary_handle_for(field)?;
-        let Some(field) = field else {
-            return Ok(());
-        };
+        let field = self.resolved(field)?;
 
         let parent = self.resolved(field.get_key(b"/Parent"))?;
         if !parent.is_null() {
@@ -514,15 +513,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         }
 
         self.set_direct_attribute(&field, b"/V", ObjectHandle::name(value.to_vec()))?;
-        self.update_radio_kids(kids, value)
-    }
-
-    fn update_radio_kids(&mut self, kids: ObjectHandle, value: &[u8]) -> Result<()> {
-        let kids = self.resolved(kids)?;
         let Some(items) = kids.as_array() else {
             return Ok(());
         };
-        for kid in items {
+        self.update_radio_kids(items, value)
+    }
+
+    fn update_radio_kids(&mut self, kids: Vec<ObjectHandle>, value: &[u8]) -> Result<()> {
+        for kid in kids {
             self.update_radio_kid(kid, value)?;
         }
         Ok(())
@@ -542,18 +540,14 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         }
 
         let grandkids = self.resolved(kid.get_key(b"/Kids"))?;
-        if grandkids.as_array().is_some() {
-            self.update_first_radio_widget(grandkids, value)?;
+        if let Some(items) = grandkids.as_array() {
+            self.update_first_radio_widget(items, value)?;
         }
         Ok(())
     }
 
-    fn update_first_radio_widget(&mut self, kids: ObjectHandle, value: &[u8]) -> Result<bool> {
-        let kids = self.resolved(kids)?;
-        let Some(items) = kids.as_array() else {
-            return Ok(false);
-        };
-        for widget in items {
+    fn update_first_radio_widget(&mut self, kids: Vec<ObjectHandle>, value: &[u8]) -> Result<bool> {
+        for widget in kids {
             if self.update_radio_widget(widget, value)? {
                 return Ok(true);
             }
@@ -584,9 +578,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         &mut self,
         start: ObjectHandle,
     ) -> Result<Option<(ObjectRef, ObjectHandle)>> {
-        let Some(field) = self.dictionary_handle_for(start)? else {
-            return Ok(None);
-        };
+        let field = self.resolved(start)?;
         if self.has_non_null_appearance(&field)? {
             return Ok(field.object_ref().map(|reference| (reference, field)));
         }
@@ -622,9 +614,6 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     fn normal_appearance_names(&mut self, dictionary: &ObjectHandle) -> Result<Vec<Vec<u8>>> {
         let appearance = self.resolved(dictionary.get_key(b"/AP"))?;
-        if appearance.is_null() {
-            return Ok(Vec::new());
-        }
         let normal = self.resolved(appearance.get_key(b"/N"))?;
         let Some(entries) = normal.as_dictionary() else {
             return Ok(Vec::new());
