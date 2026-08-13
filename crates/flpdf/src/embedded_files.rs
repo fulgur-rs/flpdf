@@ -159,17 +159,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
             names
         };
 
-        let root = if names.has_key(b"/EmbeddedFiles") {
-            let candidate = names.get_key(b"/EmbeddedFiles");
-            let root = self.pdf.resolve_object_handle_to_terminal(&candidate)?;
-            if root.try_as_dictionary()?.is_some() {
-                root
-            } else {
-                self.new_empty_embedded_files_root(&names)?
-            }
-        } else {
-            self.new_empty_embedded_files_root(&names)?
-        };
+        let root = self.new_empty_embedded_files_root(&names)?;
 
         Ok(Some(HandleNameTree::new(root, self.pdf.unique_id(), true)))
     }
