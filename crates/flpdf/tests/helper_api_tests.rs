@@ -645,13 +645,13 @@ fn page_remove_matches_manual_kids_rewrite() {
 /// resulting graphs are structurally identical ⇒ byte-identity.
 #[test]
 fn acroform_set_field_value_matches_manual_v_insert() {
-    use flpdf::{Object, ObjectRef};
+    use flpdf::{Object, ObjectHandle, ObjectRef};
     let f1_ref = ObjectRef::new(4, 0); // the `name` text field
     roundtrip_eq(
         acroform_smoke_pdf,
         |pdf| {
             pdf.acroform()
-                .set_field_value(f1_ref, Object::String(b"Bob".to_vec()))
+                .set_field_value(f1_ref, ObjectHandle::string(b"Bob".to_vec()))
                 .unwrap();
         },
         |pdf| {

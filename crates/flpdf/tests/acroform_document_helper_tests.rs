@@ -613,18 +613,27 @@ fn field_value_get_set_uses_live_document() {
     {
         let mut acroform = AcroFormDocumentHelper::new(&mut pdf);
         assert_eq!(
-            acroform.field_value(ObjectRef::new(6, 0)).unwrap(),
-            Some(Object::String(b"before".to_vec()))
+            acroform
+                .field_value(ObjectRef::new(6, 0))
+                .unwrap()
+                .and_then(|value| value.as_string()),
+            Some(b"before".to_vec())
         );
         acroform
-            .set_field_value(ObjectRef::new(6, 0), Object::String(b"after".to_vec()))
+            .set_field_value(
+                ObjectRef::new(6, 0),
+                flpdf::ObjectHandle::string(b"after".to_vec()),
+            )
             .unwrap();
     }
 
     let mut acroform = pdf.acroform();
     assert_eq!(
-        acroform.field_value(ObjectRef::new(6, 0)).unwrap(),
-        Some(Object::String(b"after".to_vec()))
+        acroform
+            .field_value(ObjectRef::new(6, 0))
+            .unwrap()
+            .and_then(|value| value.as_string()),
+        Some(b"after".to_vec())
     );
 }
 
@@ -917,7 +926,10 @@ fn copy_fields_from_appends_copied_fields_to_target_acroform() {
     );
 
     let value = target.acroform().field_value(fields[1]).unwrap();
-    assert_eq!(value, Some(Object::String(b"before".to_vec())));
+    assert_eq!(
+        value.and_then(|value| value.as_string()),
+        Some(b"before".to_vec())
+    );
 }
 
 #[test]

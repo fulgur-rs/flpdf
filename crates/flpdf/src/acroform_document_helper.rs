@@ -8,6 +8,7 @@
 
 use crate::form_field_object_helper::FormFieldObjectHelper;
 use crate::object::MAX_INLINE_DEPTH;
+use crate::object_handle::ObjectHandle;
 use crate::ref_chain::resolve_ref_chain;
 use crate::{
     copy_objects, json_inspect::decode_pdf_text_string, Dictionary, Error, Object, ObjectRef, Pdf,
@@ -155,7 +156,7 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// - [`Error::Unsupported`] when a field-tree node is not a dictionary, or
     ///   when the field-tree depth limit is exceeded.
     /// - Any error from [`Pdf::resolve`].
-    pub fn field_value(&mut self, field_ref: ObjectRef) -> Result<Option<Object>> {
+    pub fn field_value(&mut self, field_ref: ObjectRef) -> Result<Option<ObjectHandle>> {
         FormFieldObjectHelper::new(field_ref, self.pdf).field_value()
     }
 
@@ -169,11 +170,8 @@ impl<'a, R: Read + Seek> AcroFormDocumentHelper<'a, R> {
     /// - [`Error::Unsupported`] when `field_ref` does not resolve to a
     ///   dictionary.
     /// - Any error from [`Pdf::resolve`].
-    pub fn set_field_value(&mut self, field_ref: ObjectRef, value: Object) -> Result<()> {
-        let mut dict = self.resolve_field_dict(field_ref)?;
-        dict.insert("V", value);
-        self.pdf.set_object(field_ref, Object::Dictionary(dict));
-        Ok(())
+    pub fn set_field_value(&mut self, field_ref: ObjectRef, value: ObjectHandle) -> Result<()> {
+        FormFieldObjectHelper::new(field_ref, self.pdf).set_field_attribute(b"V", value)
     }
 
     /// Set `/AcroForm/DA`, creating `/AcroForm` if needed.

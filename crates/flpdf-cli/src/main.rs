@@ -27,7 +27,7 @@ use flpdf::{
     pages::coalesce_page_contents,
     parse_pdf_version, AnnotationObjectHelper, CompressStreams, CopyEncryptionSource, Dictionary,
     EncryptMethod, EncryptParams, FormFieldObjectHelper, NewlineBeforeEndstream, Object,
-    ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
+    ObjectHandle, ObjectKeyAlg, ObjectRef, ObjectStreamMode, PageDocumentHelper, PasswordMode, Pdf,
     PdfOpenOptions, PdfVersion, PdfWriter, PermissionsConfig, PrintPermission, QPDFLogger,
     RemoveUnreferencedResources, Severity, Stream, StreamDataMode,
 };
@@ -3424,7 +3424,7 @@ fn generate_missing_appearances<R: Read + Seek>(pdf: &mut Pdf<R>) -> CliResult<(
             == Some(b"/Btn");
         if is_button {
             let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
-            let value = helper.value()?.unwrap_or(Object::Null);
+            let value = helper.value()?.unwrap_or_else(ObjectHandle::null);
             helper.set_value(value, false)?;
             continue;
         }
@@ -6176,7 +6176,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_need_appearances_removes_a_chained_true_value() {
+    fn clear_need_appearances_removes_an_indirect_true_value() {
         let mut pdf = Pdf::open_mem_owned(
             include_bytes!("../../../tests/fixtures/compat/one-page.pdf").to_vec(),
         )
@@ -6188,21 +6188,13 @@ mod tests {
 
         let mut acroform = Dictionary::new();
         acroform.insert("NeedAppearances", Object::Reference(ObjectRef::new(102, 0)));
-        pdf.set_object(
-            ObjectRef::new(100, 0),
-            Object::Reference(ObjectRef::new(101, 0)),
-        );
-        pdf.set_object(ObjectRef::new(101, 0), Object::Dictionary(acroform));
-        pdf.set_object(
-            ObjectRef::new(102, 0),
-            Object::Reference(ObjectRef::new(103, 0)),
-        );
-        pdf.set_object(ObjectRef::new(103, 0), Object::Boolean(true));
+        pdf.set_object(ObjectRef::new(100, 0), Object::Dictionary(acroform));
+        pdf.set_object(ObjectRef::new(102, 0), Object::Boolean(true));
 
         clear_need_appearances_after_generation(&mut pdf).unwrap();
 
-        let Object::Dictionary(acroform) = pdf.resolve(ObjectRef::new(101, 0)).unwrap() else {
-            panic!("terminal AcroForm must remain a dictionary");
+        let Object::Dictionary(acroform) = pdf.resolve(ObjectRef::new(100, 0)).unwrap() else {
+            panic!("AcroForm must remain a dictionary");
         };
         assert!(acroform.get("NeedAppearances").is_none());
     }

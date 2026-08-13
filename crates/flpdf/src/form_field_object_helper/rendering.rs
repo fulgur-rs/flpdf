@@ -896,7 +896,10 @@ fn field_object<R: Read + Seek>(
     start: ObjectRef,
     key: &[u8],
 ) -> Result<Option<Object>> {
-    FormFieldObjectHelper::new(start, pdf).inheritable_value(key)
+    FormFieldObjectHelper::new(start, pdf)
+        .inheritable_value(key)?
+        .map(|value| value.materialize())
+        .transpose()
 }
 
 /// Read an inheritable integer through the form-field helper boundary.
@@ -907,7 +910,10 @@ fn field_integer<R: Read + Seek>(
 ) -> Result<Option<i64>> {
     Ok(
         match FormFieldObjectHelper::new(start, pdf).inheritable_value(key)? {
-            Some(Object::Integer(value)) => Some(value),
+            Some(value) => {
+                pdf.resolve_object_handle(&value)?;
+                value.as_integer()
+            }
             _ => None,
         },
     )
@@ -944,7 +950,10 @@ fn lookup_dr_basefont<R: Read + Seek>(
     start: ObjectRef,
     resource_name: &[u8],
 ) -> Result<Option<StandardFont>> {
-    let resources = FormFieldObjectHelper::new(start, pdf).default_resources()?;
+    let resources = FormFieldObjectHelper::new(start, pdf)
+        .default_resources()?
+        .map(|value| value.materialize())
+        .transpose()?;
     let Some(dr) = resolve_to_dict(pdf, resources)? else {
         return Ok(None);
     };
@@ -7138,16 +7147,15 @@ mod tests {
         );
     }
 
-    /// Tx PDF whose catalog `/AcroForm` is a two-hop holder chain `1→6→7`. The
-    /// terminal AcroForm dict carries a red `/DA` (`1 0 0 rg`). Only a correct
-    /// chain-follow reaches that DA; a single-hop resolve sees the second-hop
-    /// `Reference`, finds no AcroForm DA, and emits the default black `0 g`.
-    fn build_acroform_holder_chain_pdf() -> Vec<u8> {
+    /// Tx PDF whose catalog `/AcroForm` is an indirect canonical dictionary.
+    /// The AcroForm dict carries a red `/DA` (`1 0 0 rg`), which must be
+    /// reached through the live catalog handle.
+    fn build_acroform_indirect_pdf() -> Vec<u8> {
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len() as u64;
         pdf.extend_from_slice(
-            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm 6 0 R>>\nendobj\n",
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm 7 0 R>>\nendobj\n",
         );
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
@@ -7163,8 +7171,9 @@ mod tests {
               /V (Hi) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
         );
         let off5 = pdf.len() as u64;
-        // First hop of the /AcroForm chain.
-        pdf.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+        // Keep the unused object slot valid; the catalog points directly to
+        // the canonical AcroForm object below.
+        pdf.extend_from_slice(b"6 0 obj\nnull\nendobj\n");
         let off6 = pdf.len() as u64;
         // Terminal /AcroForm dict with a red DA.
         pdf.extend_from_slice(
@@ -7189,15 +7198,11 @@ mod tests {
         pdf
     }
 
-    /// Site 2: the catalog `/AcroForm` dict reached through a 2-hop holder chain
-    /// must yield its `/DA`, so the red colour operator appears in the stream.
+    /// Site 2: the catalog's live `/AcroForm` handle must yield its `/DA`, so
+    /// the red colour operator appears in the stream.
     #[test]
-    fn acroform_holder_chain_resolves_default_da() {
-        let mut pdf = Pdf::open(Cursor::new(build_acroform_holder_chain_pdf())).expect("parse");
-        pdf.set_object(
-            ObjectRef::new(6, 0),
-            Object::Reference(ObjectRef::new(7, 0)),
-        );
+    fn acroform_indirect_handle_resolves_default_da() {
+        let mut pdf = Pdf::open(Cursor::new(build_acroform_indirect_pdf())).expect("parse");
         let xobj_ref = render_text_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
@@ -7210,18 +7215,16 @@ mod tests {
         );
     }
 
-    /// Tx PDF whose AcroForm `/DR` is a two-hop holder chain `1→6→7`. The DA is
-    /// inline (`/F1 12 Tf`) so the AcroForm dict itself is direct — only the
-    /// `/DR` lookup exercises the chain. The terminal `/DR` maps `/F1` to a
-    /// Times-Roman font; a single-hop `into_dict()` on the second-hop
-    /// `Reference` yields `None`, so the font falls back to Helvetica.
-    fn build_dr_holder_chain_pdf() -> Vec<u8> {
+    /// Tx PDF whose AcroForm `/DR` is an indirect canonical dictionary. The DA
+    /// is inline (`/F1 12 Tf`) so only the `/DR` lookup exercises the indirect
+    /// handle. The resource dictionary maps `/F1` to a Times-Roman font.
+    fn build_dr_indirect_pdf() -> Vec<u8> {
         let mut pdf: Vec<u8> = Vec::new();
         pdf.extend_from_slice(b"%PDF-1.4\n");
         let off1 = pdf.len() as u64;
         pdf.extend_from_slice(
             b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
-              <</Fields [4 0 R] /DR 6 0 R /DA (/F1 12 Tf 0 g)>>>>\nendobj\n",
+              <</Fields [4 0 R] /DR 7 0 R /DA (/F1 12 Tf 0 g)>>>>\nendobj\n",
         );
         let off2 = pdf.len() as u64;
         pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
@@ -7236,8 +7239,9 @@ mod tests {
               /V (Hi) /Rect [100 700 300 720] /P 3 0 R>>\nendobj\n",
         );
         let off5 = pdf.len() as u64;
-        // First hop of the /DR chain.
-        pdf.extend_from_slice(b"6 0 obj\n7 0 R\nendobj\n");
+        // Keep the unused object slot valid; the AcroForm points directly to
+        // the canonical resource dictionary below.
+        pdf.extend_from_slice(b"6 0 obj\nnull\nendobj\n");
         let off6 = pdf.len() as u64;
         // Terminal /DR dict mapping /F1 to a Times-Roman font (obj 8).
         pdf.extend_from_slice(b"7 0 obj\n<</Font <</F1 8 0 R>>>>\nendobj\n");
@@ -7265,15 +7269,11 @@ mod tests {
         pdf
     }
 
-    /// Site 3 (`resolve_to_dict`): the `/DR` dict reached through a 2-hop holder
-    /// chain must be followed so `/F1` resolves to its Times-Roman `/BaseFont`.
+    /// Site 3 (`resolve_to_dict`): the canonical `/DR` dict must be followed
+    /// so `/F1` resolves to its Times-Roman `/BaseFont`.
     #[test]
-    fn dr_holder_chain_resolves_font_basefont() {
-        let mut pdf = Pdf::open(Cursor::new(build_dr_holder_chain_pdf())).expect("parse");
-        pdf.set_object(
-            ObjectRef::new(6, 0),
-            Object::Reference(ObjectRef::new(7, 0)),
-        );
+    fn dr_indirect_handle_resolves_font_basefont() {
+        let mut pdf = Pdf::open(Cursor::new(build_dr_indirect_pdf())).expect("parse");
         let xobj_ref = render_text_field(&mut pdf, ObjectRef::new(4, 0))
             .expect("generate")
             .expect("Tx field handled");
