@@ -1410,6 +1410,11 @@ fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
     let mut non_dict_catalog = open(build_single_level_pdf());
     let catalog_ref = non_dict_catalog.root_ref().expect("root");
     non_dict_catalog.set_object(catalog_ref, Object::Integer(7));
+    let filespec = make_filespec(&mut non_dict_catalog, b"ignored.txt");
+    non_dict_catalog
+        .embedded_files()
+        .replace_embedded_file(b"ignored", filespec)
+        .expect("non-dictionary catalog is a qpdf no-op");
     assert!(!non_dict_catalog
         .embedded_files()
         .has_embedded_files()
@@ -1437,6 +1442,47 @@ fn helper_treats_missing_or_malformed_catalog_paths_as_absent() {
         .embedded_files()
         .has_embedded_files()
         .expect("non-dict embedded files"));
+}
+
+#[test]
+fn helper_replace_rebuilds_non_dictionary_names_and_embedded_files_paths() {
+    let mut non_dict_names = open(build_non_dict_names_pdf());
+    let names_filespec = make_filespec(&mut non_dict_names, b"names.txt");
+    non_dict_names
+        .embedded_files()
+        .replace_embedded_file(b"names", names_filespec.clone())
+        .expect("non-dictionary /Names terminal is rebuilt");
+    assert!(non_dict_names
+        .embedded_files()
+        .get_embedded_file(b"names")
+        .expect("rebuilt /Names lookup")
+        .expect("rebuilt /Names entry")
+        .is_same_object_as(&names_filespec));
+
+    let mut non_dict_embedded_files = open(build_no_embedded_files_pdf());
+    let catalog_ref = non_dict_embedded_files.root_ref().expect("root");
+    let mut catalog = non_dict_embedded_files
+        .resolve_borrowed(catalog_ref)
+        .expect("catalog")
+        .as_dict()
+        .expect("catalog dictionary")
+        .clone();
+    let mut names = Dictionary::new();
+    names.insert("EmbeddedFiles", Object::Integer(7));
+    catalog.insert("Names", Object::Dictionary(names));
+    non_dict_embedded_files.set_object(catalog_ref, Object::Dictionary(catalog));
+
+    let embedded_filespec = make_filespec(&mut non_dict_embedded_files, b"embedded.txt");
+    non_dict_embedded_files
+        .embedded_files()
+        .replace_embedded_file(b"embedded", embedded_filespec.clone())
+        .expect("non-dictionary /EmbeddedFiles terminal is rebuilt");
+    assert!(non_dict_embedded_files
+        .embedded_files()
+        .get_embedded_file(b"embedded")
+        .expect("rebuilt /EmbeddedFiles lookup")
+        .expect("rebuilt /EmbeddedFiles entry")
+        .is_same_object_as(&embedded_filespec));
 }
 
 #[test]
