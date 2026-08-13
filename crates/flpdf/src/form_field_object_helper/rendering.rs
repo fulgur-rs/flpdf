@@ -353,7 +353,13 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
     let mut helper = FormFieldObjectHelper::new(field_ref, pdf);
     let default_appearance = helper.default_appearance()?;
     let da = parse_default_appearance(default_appearance.as_bytes());
-    let flags = u32::try_from(helper.field_flags()?.unwrap_or(0)).unwrap_or(0);
+    // qpdf's `getFlags()` returns a signed C++ `int` and tests the combo
+    // bit directly on that signed value (`getFlags() & ff_ch_combo`,
+    // `QPDFFormFieldObjectHelper.cc:231-234,800`): for `/Ff -1`, all bits
+    // are set in two's complement, so the combo bit reads as set. Do not
+    // route through `u32::try_from`, which fails (and previously defaulted
+    // to zero) for any negative `/Ff`, incorrectly clearing the combo bit.
+    let flags = helper.field_flags()?.unwrap_or(0);
     let value = helper.value_as_string()?;
     let options = helper.choices()?;
     drop(helper);
@@ -3187,6 +3193,50 @@ mod tests {
         assert!(!stream
             .windows(b"(Alpha)".len())
             .any(|window| window == b"(Alpha)"));
+    }
+
+    #[test]
+    fn canonical_choice_negative_ff_preserves_combo_bit() {
+        // qpdf's `getFlags()` returns a signed C++ `int`
+        // (`QPDFObjectHandle::getIntValueAsInt`, `QPDFObjectHandle.cc:525-540`,
+        // which saturates to `INT_MIN`/`INT_MAX` but never zeroes a negative
+        // value) and the combo-bit test `getFlags() & ff_ch_combo`
+        // (`QPDFFormFieldObjectHelper.cc:231-234,800`, `ff_ch_combo = 1 <<
+        // 17` in `Constants.h:209`) operates directly on that signed value:
+        // `-1 & 0x20000 != 0`, so a field with `/Ff -1` is a combo. A
+        // `u32::try_from` that defaults a failed (negative) conversion to
+        // zero clears the combo bit instead, misrendering the field as a
+        // list.
+        let raw = build_ch_pdf_obj4(
+            "<</Type /Annot /Subtype /Widget /FT /Ch /V (Blue) /Ff -1 \
+              /Opt [(Alpha) (Blue) (Gamma)] \
+              /DA (/Helv 10 Tf 0 g) /Rect [100 600 300 700]>>",
+        );
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse choice");
+        let xobj_ref =
+            render_choice_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Ch generation")
+                .expect("Ch field is handled");
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve choice appearance");
+        let content = stream_handle
+            .as_stream_data()
+            .expect("choice appearance data");
+        assert!(
+            content.windows(b"(Blue)".len()).any(|w| w == b"(Blue)"),
+            "combo value must appear in Tj, got {content:?}"
+        );
+        assert!(
+            !content.windows(b"(Alpha)".len()).any(|w| w == b"(Alpha)"),
+            "negative /Ff must not fall back to list rendering (Alpha leaked), got {content:?}"
+        );
+        assert!(
+            !content
+                .windows(b"0.85 0.85 0.85 rg".len())
+                .any(|w| w == b"0.85 0.85 0.85 rg"),
+            "negative /Ff must not draw a list-style highlight rect, got {content:?}"
+        );
     }
 
     #[test]
