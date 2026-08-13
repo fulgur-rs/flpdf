@@ -7967,6 +7967,29 @@ mod tests {
     }
 
     #[test]
+    fn resolver_copy_stream_data_rejects_non_stream_contract_inputs() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("make non-stream source");
+        pdf.set_immediate_copy_from(true);
+
+        let destination = ObjectHandle::integer(2);
+        assert!(matches!(
+            pdf.resolver.copy_stream_data(&destination, &source),
+            Err(Error::System(message))
+                if message == "operation for stream attempted on object of type integer"
+        ));
+
+        let destination = pdf.new_stream().expect("new destination stream");
+        assert!(matches!(
+            pdf.resolver.copy_stream_data(&destination, &source),
+            Err(Error::System(message))
+                if message == "operation for stream attempted on object of type integer"
+        ));
+    }
+
+    #[test]
     fn new_stream_survives_owner_drop_as_the_same_live_stream_value() {
         let stream = {
             let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
