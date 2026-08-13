@@ -1402,6 +1402,11 @@ impl<K: TreeKey> NNTree<K> {
             {
                 return Ok(root.clone());
             }
+            if !self.legacy_projection {
+                return Err(Error::Unsupported(
+                    "name/number tree root belongs to a different Pdf".to_string(),
+                ));
+            }
             // Private unit tests and the old wrapper can still replace the
             // raw root directly. Treat that as an external root replacement
             // and relift it once; all production mutations synchronize the
@@ -4012,6 +4017,47 @@ mod tests {
                 .current()
                 .map(|(key, value)| (*key, value.clone())),
             Some((2, Object::String(b"two".to_vec())))
+        );
+    }
+
+    #[test]
+    fn handle_tree_rejects_a_foreign_pdf_without_discarding_its_root() {
+        let root_ref = ObjectRef::new(80, 0);
+        let mut pdf_one = empty_pdf();
+        let mut root = Dictionary::new();
+        root.insert(
+            "Names",
+            Object::Array(vec![Object::String(b"one".to_vec()), Object::Integer(1)]),
+        );
+        pdf_one.set_object(root_ref, Object::Dictionary(root));
+
+        let root_handle = pdf_one.get_object_handle(root_ref);
+        let pdf_one_id = pdf_one.unique_id();
+        let mut tree = HandleNameTree::new(root_handle.clone(), pdf_one_id, false);
+        assert_eq!(
+            tree.find(&mut pdf_one, b"one")
+                .unwrap()
+                .and_then(|value| value.as_integer()),
+            Some(1)
+        );
+
+        let mut pdf_two = empty_pdf();
+        let error = tree
+            .find(&mut pdf_two, b"one")
+            .expect_err("a handle-native tree must reject a foreign Pdf");
+        assert!(error.to_string().contains("different Pdf"));
+        assert_eq!(tree.inner.canonical_root_pdf_id, Some(pdf_one_id));
+        assert!(tree
+            .inner
+            .canonical_root
+            .as_ref()
+            .is_some_and(|root| root.is_same_object_as(&root_handle)));
+
+        assert_eq!(
+            tree.find(&mut pdf_one, b"one")
+                .unwrap()
+                .and_then(|value| value.as_integer()),
+            Some(1)
         );
     }
 
