@@ -95,7 +95,7 @@ use crate::pipeline::rc4::PlRc4;
 use crate::pipeline::Pipeline;
 use crate::tokenizer::{Token, TokenType, Tokenizer};
 use crate::{Diagnostic, Diagnostics, Error, ObjectHandle, ObjectRef, Result, XrefEntry};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::rc::{Rc, Weak};
@@ -585,6 +585,9 @@ pub(crate) struct ResolverHandle<R: Read + Seek + 'static> {
     /// safe-Rust stand-in and this field is the only way to obtain one from
     /// `&self`.
     self_weak: Weak<ResolverHandle<R>>,
+    /// qpdf's source-side `setImmediateCopyFrom` flag. It is read by the
+    /// destination stream-copy boundary before a lazy source is registered.
+    immediate_copy_from: Cell<bool>,
     /// The owning document's [`crate::Pdf`] identity, stamped onto every
     /// handle this minted — `ObjectHandle`'s `pdf_unique_id`, whose own doc
     /// traces it to qpdf's `QPDF::getUniqueId`
@@ -711,8 +714,88 @@ impl<R: Read + Seek> ResolverHandle<R> {
             }),
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
+            immediate_copy_from: Cell::new(false),
             pdf_unique_id,
         })
+    }
+
+    /// Create qpdf's owned empty stream object at the resolver boundary.
+    /// `QPDF::newStream` registers the freshly created stream under a new
+    /// generation-zero identity; keeping the allocation and registration here
+    /// lets `ObjectHandle::copy_stream` use the same path as `Pdf::new_stream`.
+    pub(crate) fn new_stream_handle(&self) -> Result<ObjectHandle> {
+        let stream = self.direct_object_handle(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_length: 0,
+            stream_provider: None,
+        });
+        stream.set_parsed_offset_if_unset(0);
+        self.make_indirect_from_object_handle(stream)
+    }
+
+    /// Set qpdf's source-side immediate-copy flag.
+    pub(crate) fn set_immediate_copy_from(&self, value: bool) {
+        self.immediate_copy_from.set(value);
+    }
+
+    fn immediate_copy_from(&self) -> bool {
+        self.immediate_copy_from.get()
+    }
+
+    /// qpdf's `QPDF::copyStreamData` (`libqpdf/QPDF.cc:2216-2272`). Existing
+    /// buffers are shared directly; provider/original sources remain lazy and
+    /// are dispatched through one retry-aware provider owned by the copied
+    /// destination stream. The source-side immediate flag is checked through
+    /// the source handle's resolver, matching qpdf's source-QPDF contract.
+    pub(crate) fn copy_stream_data(
+        &self,
+        destination: &ObjectHandle,
+        source: &ObjectHandle,
+    ) -> Result<()> {
+        source.try_dereference()?;
+        destination.try_dereference()?;
+        let destination_dict = destination.as_stream_dict().ok_or_else(|| {
+            Error::System(format!(
+                "operation for stream attempted on object of type {}",
+                destination.type_name()
+            ))
+        })?;
+
+        let filter = stream_copy_dictionary_value(&destination_dict, b"/Filter");
+        let decode_parms = stream_copy_dictionary_value(&destination_dict, b"/DecodeParms");
+        let mut source_data = source.as_stream_data();
+        let source_immediate_copy = source
+            .context()
+            .map(|resolver| resolver.immediate_copy_from())
+            .unwrap_or(false);
+
+        if source_data.is_none() && source_immediate_copy {
+            let source_dict = source.as_stream_dict().ok_or_else(|| {
+                Error::System(format!(
+                    "operation for stream attempted on object of type {}",
+                    source.type_name()
+                ))
+            })?;
+            let raw_data = source.get_raw_stream_data()?;
+            source.replace_stream_data(
+                raw_data,
+                stream_copy_dictionary_value(&source_dict, b"/Filter"),
+                stream_copy_dictionary_value(&source_dict, b"/DecodeParms"),
+            );
+            source_data = source.as_stream_data();
+        }
+
+        if let Some(data) = source_data {
+            destination.replace_stream_data(data, filter, decode_parms);
+            return Ok(());
+        }
+
+        destination.replace_stream_data_provider(
+            crate::object_handle::copied_stream_data_provider(source.clone()),
+            filter,
+            decode_parms,
+        )
     }
 
     /// The canonical handle for `object_ref`, minting and registering one on
@@ -3217,6 +3300,10 @@ fn read_live_header_integer(token: Token) -> Result<i64> {
         .ok_or_else(|| Error::parse(token.start, "invalid integer"))
 }
 
+fn stream_copy_dictionary_value(dictionary: &ObjectHandle, key: &[u8]) -> Option<ObjectHandle> {
+    dictionary.has_key(key).then(|| dictionary.get_key(key))
+}
+
 /// Lets the parser mint a canonical handle for a nested `N G R` through the
 /// resolver's own registry.
 ///
@@ -3250,6 +3337,18 @@ impl<R: Read + Seek> crate::parser::HandleResolver for ChildHandles<'_, R> {
 }
 
 impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
+    fn new_stream(&self) -> Result<ObjectHandle> {
+        self.new_stream_handle()
+    }
+
+    fn copy_stream_data(&self, destination: &ObjectHandle, source: &ObjectHandle) -> Result<()> {
+        ResolverHandle::copy_stream_data(self, destination, source)
+    }
+
+    fn immediate_copy_from(&self) -> bool {
+        self.immediate_copy_from()
+    }
+
     fn warn(&self, message: String) -> Result<()> {
         self.push_object_warning(message)
     }
