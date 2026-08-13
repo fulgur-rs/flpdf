@@ -60,6 +60,14 @@ use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
+// Stack-safety constants for `ForeignObjectCopier`'s two recursion hubs
+// (`reserve_objects`, `replace_foreign_indirect_objects`), mirroring
+// `parser.rs`'s own `STACK_RED_ZONE`/`STACK_GROWTH_SIZE` values (kept as
+// separate local constants rather than imported cross-module, matching that
+// file's own precedent, since this pair's scope is limited to this file).
+const OBJECT_COPY_STACK_RED_ZONE: usize = 32 * 1024;
+const OBJECT_COPY_STACK_GROWTH_SIZE: usize = 1024 * 1024;
+
 /// Copy one canonical foreign object into `target`, retaining qpdf's
 /// per-source object identity map on the destination document.
 ///
@@ -169,7 +177,32 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         Ok(self.target.get_object_handle(target_ref))
     }
 
+    // `reserve_objects` is the sole recursion hub for reservation: every
+    // nested descent, including a chain of *separate* indirect objects
+    // (`A -> B -> C -> ...`, each a distinct object number, not nested
+    // containers within one object) recurses only through it via
+    // `reserve_children`. A parsed document's own container-nesting limit
+    // (`MAX_PARSE_DEPTH`, `parser.rs`) bounds direct nesting *within* one
+    // object, but does not bound this kind of chain: each hop is a fresh,
+    // independently-parsed indirect object, so a document with a
+    // sufficiently long reference chain can drive this recursion arbitrarily
+    // deep with no qpdf-parity depth limit to stop it (qpdf's own
+    // `reserveObjects`, `libqpdf/QPDF.cc:2101-2151`, has no bound here
+    // either). Wrapping this hub in `stacker::maybe_grow` -- the same
+    // Rust-implementation-safety mechanism already used for `parser.rs`'s
+    // `object`, `reader.rs`'s live-object resolution, and
+    // `object_handle.rs`'s unparse family -- keeps a sufficiently long
+    // (but non-cyclic; `visiting` already bounds cycles) chain from
+    // exhausting the caller's stack and aborting the process.
     fn reserve_objects(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
+        stacker::maybe_grow(
+            OBJECT_COPY_STACK_RED_ZONE,
+            OBJECT_COPY_STACK_GROWTH_SIZE,
+            || self.reserve_objects_inner(foreign, top),
+        )
+    }
+
+    fn reserve_objects_inner(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
         foreign.try_dereference()?;
         if foreign.is_reserved() {
             return Err(Error::System(
@@ -272,7 +305,27 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         Ok(())
     }
 
+    // The sole recursion hub for replacement, mirroring `reserve_objects`'s
+    // own hub/wrap split above and for the identical reason: `top=false`
+    // only short-circuits an *indirect* child through a plain map lookup
+    // (no recursion), but a genuinely direct value -- an array, dictionary,
+    // or stream dictionary entry with no object identity of its own --
+    // still recurses back through this function via `replace_foreign_value`,
+    // and a long run of such direct nesting has the same unbounded-stack
+    // exposure `reserve_objects`'s own doc explains.
     fn replace_foreign_indirect_objects(
+        &mut self,
+        foreign: ObjectHandle,
+        top: bool,
+    ) -> Result<ObjectHandle> {
+        stacker::maybe_grow(
+            OBJECT_COPY_STACK_RED_ZONE,
+            OBJECT_COPY_STACK_GROWTH_SIZE,
+            || self.replace_foreign_indirect_objects_inner(foreign, top),
+        )
+    }
+
+    fn replace_foreign_indirect_objects_inner(
         &mut self,
         foreign: ObjectHandle,
         top: bool,
@@ -1395,5 +1448,55 @@ mod tests {
         assert!(copied.is_indirect());
         assert_eq!(copied.as_integer(), Some(123));
         assert!(!copied.is_same_object_as(&scalar));
+    }
+
+    #[test]
+    fn copy_foreign_object_survives_a_long_indirect_reference_chain_on_a_small_stack() {
+        // A valid (non-cyclic) chain of *separate* indirect objects
+        // (A -> B -> C -> ... -> N) keeps every hop on `reserve_objects`'s
+        // call stack; `visiting` only bounds cycles, and no parsed-container
+        // nesting limit bounds a chain across distinct object numbers (see
+        // `reserve_objects`'s own doc). Run the copy on a deliberately small
+        // stack: without `stacker::maybe_grow`, this depth reliably aborts
+        // the process with a stack overflow instead of returning a `Result`.
+        const CHAIN_DEPTH: usize = 2_000;
+
+        let outcome = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut source = minimal_pdf();
+                let mut leaf = source
+                    .make_indirect_object_handle(ObjectHandle::integer(0))
+                    .expect("leaf");
+                for _ in 0..CHAIN_DEPTH {
+                    let node = source
+                        .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+                        .expect("chain node");
+                    node.replace_key(b"/Next", leaf.clone());
+                    leaf = node;
+                }
+                let mut target = minimal_pdf();
+                let copied = target
+                    .copy_foreign_object(&leaf)
+                    .expect("a long acyclic chain must not overflow the caller stack");
+                let is_indirect = copied.is_indirect();
+                // Drop glue for this N-deep `Rc` chain recurses just as
+                // deeply and is not `stacker`-protected anywhere in this
+                // crate (see `live_file_parser_accepts_qpdfs_500_container_
+                // limit_on_a_small_stack`'s own `ManuallyDrop` note for the
+                // identical concern with the parser's own tree). Leak
+                // everything reachable from this frame rather than letting
+                // it drop on this deliberately small stack.
+                std::mem::forget(source);
+                std::mem::forget(target);
+                std::mem::forget(leaf);
+                std::mem::forget(copied);
+                is_indirect
+            })
+            .expect("spawn small-stack copier thread")
+            .join()
+            .expect("copy_foreign_object must not overflow the caller stack");
+
+        assert!(outcome);
     }
 }
