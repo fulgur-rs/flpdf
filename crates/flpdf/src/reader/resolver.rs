@@ -85,7 +85,7 @@
 //! document warning.
 
 use super::{interpret_cf_from_handle, EncryptionMode, EncryptionState};
-use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, NO_PARSED_OFFSET};
 use crate::parser::{
     parse_live_file_object_with_decrypter, parse_qpdf_direct_object_handle_with_diagnostics,
     LiveInput, LiveTokenSource, StringDecrypter,
@@ -607,6 +607,44 @@ struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
     resolver: &'resolver ResolverHandle<R>,
 }
 
+/// qpdf's `ForeignStreamData`/`CopiedStreamDataProvider` split for an
+/// original file-backed stream (`libqpdf/QPDF.cc:2265-2273`). The source
+/// resolver is retained, but the source object handle is not: this lets the
+/// destination continue reading the source input after the source `Pdf` has
+/// run its object-cache teardown.
+struct OriginalStreamDataProvider<R: Read + Seek + 'static> {
+    resolver: Rc<ResolverHandle<R>>,
+    object_ref: ObjectRef,
+    parsed_offset: i64,
+    stream_length: usize,
+    destination_dict: ObjectHandle,
+}
+
+impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider<R> {
+    fn supports_retry(&self) -> bool {
+        true
+    }
+
+    fn provide_stream_data_with_retry_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        self.resolver.pipe_stream_data(
+            self.object_ref,
+            self.parsed_offset,
+            self.stream_length,
+            &self.destination_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
+    }
+}
+
 impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R> {
     fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()> {
         let warn_unknown_string = {
@@ -814,11 +852,45 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Ok(());
         }
 
-        destination.replace_stream_data_provider(
-            crate::object_handle::copied_stream_data_provider(source.clone()),
-            filter,
-            decode_parms,
-        )
+        let provider = if source.has_stream_data_provider() {
+            // qpdf's provider-backed source retains the foreign stream/QPDF
+            // because the provider itself is the source of the bytes.
+            crate::object_handle::copied_stream_data_provider(source.clone())
+        } else {
+            // qpdf's original-file source captures the input and stream
+            // metadata instead, so the source QPDF/handle may be destroyed.
+            let source_resolver = source.context().ok_or_else(|| {
+                Error::Internal(
+                    "original foreign stream has no owning document resolver".to_owned(),
+                )
+            })?;
+            source_resolver.original_stream_data_provider(source, &destination_dict)?
+        };
+
+        destination.replace_stream_data_provider(provider, filter, decode_parms)
+    }
+
+    pub(crate) fn original_stream_data_provider(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        let object_ref = source.object_ref().ok_or_else(|| {
+            Error::Internal("original foreign stream has no object reference".to_owned())
+        })?;
+        let stream_length = source.stream_source_length().ok_or_else(|| {
+            Error::Internal("original foreign stream has no stream length".to_owned())
+        })?;
+        let resolver = self.self_weak.upgrade().ok_or_else(|| {
+            Error::Internal("original foreign stream resolver is no longer live".to_owned())
+        })?;
+        Ok(Rc::new(OriginalStreamDataProvider {
+            resolver,
+            object_ref,
+            parsed_offset: source.get_parsed_offset(),
+            stream_length,
+            destination_dict: destination_dict.clone(),
+        }))
     }
 
     /// The canonical handle for `object_ref`, minting and registering one on
@@ -3366,6 +3438,14 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
 
     fn copy_stream_data(&self, destination: &ObjectHandle, source: &ObjectHandle) -> Result<()> {
         ResolverHandle::copy_stream_data(self, destination, source)
+    }
+
+    fn original_stream_data_provider(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        ResolverHandle::original_stream_data_provider(self, source, destination_dict)
     }
 
     fn immediate_copy_from(&self) -> bool {

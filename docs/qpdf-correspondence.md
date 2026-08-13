@@ -431,6 +431,16 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
 
+なお、`object_copy.rs` の `copy_objects` / `page_closure.rs` は旧来の
+pre-closed raw `Object` 経路であり、canonical parity の責務ではない。
+qpdf 11.9.0 の `QPDF::copyForeignObject`（`QPDF.cc:2019-2272`）に対応する
+正本は `object_copy::copy_foreign_object` で、`reserveObjects` / 完全な
+`ObjectHandle` graph replacement / `/Pages` 境界 / per-source map reuse を
+ここで担う。stream の Buffer/provider/original-source 選択は
+`reader/resolver.rs` の resolver-owned boundary に委譲し、qpdf の
+`ot_reserved` は外部に露出しない内部 reservation sentinel として
+destination-owned indirect null slot で表現する。
+
 ---
 
 ## 検証可能性（safety net）

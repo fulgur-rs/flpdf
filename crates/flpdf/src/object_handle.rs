@@ -278,6 +278,21 @@ pub(crate) trait DocumentResolver {
         ))
     }
 
+    /// Create qpdf's lazy provider for an original file-backed foreign
+    /// stream. Unlike a provider-backed source, this provider must not retain
+    /// the source `ObjectHandle`: qpdf captures the source input and stream
+    /// metadata so the source `QPDF` may be destroyed after the copy.
+    fn original_stream_data_provider(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        let _ = (source, destination_dict);
+        Err(Error::Internal(
+            "original stream data provider requested from a resolver without a document".to_owned(),
+        ))
+    }
+
     /// Whether this resolver is a qpdf source configured for immediate stream
     /// copying (`QPDF::setImmediateCopyFrom`).
     fn immediate_copy_from(&self) -> bool {
@@ -906,6 +921,14 @@ impl ObjectHandle {
     /// direct one.
     pub fn object_ref(&self) -> Option<ObjectRef> {
         self.0.borrow().object_ref
+    }
+
+    /// The owning document identity carried by this canonical handle, if it
+    /// was minted by a [`crate::Pdf`]. This is qpdf's source-QPDF identity
+    /// key used by `QPDF::copyForeignObject`'s per-source `ObjCopier` map
+    /// (`libqpdf/QPDF.cc:2065`).
+    pub(crate) fn owning_pdf_unique_id(&self) -> Option<u64> {
+        self.0.borrow().active_pdf_unique_id
     }
 
     /// True if `self` and `other` share the same underlying storage — the
@@ -3498,6 +3521,31 @@ impl ObjectHandle {
     pub fn as_stream_data(&self) -> Option<Rc<Vec<u8>>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Stream { stream_data, .. }) => stream_data.clone(),
+            _ => None,
+        })
+    }
+
+    /// Whether this stream currently uses a deferred provider source rather
+    /// than replacement bytes or its parsed original source. This is kept at
+    /// the canonical stream boundary so qpdf's foreign-copy path can preserve
+    /// the different source-lifetime contracts of provider and file-backed
+    /// streams.
+    pub(crate) fn has_stream_data_provider(&self) -> bool {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream {
+                stream_provider, ..
+            }) => stream_provider.is_some(),
+            _ => false,
+        })
+    }
+
+    /// The parsed source length retained by an original stream, when this
+    /// handle currently contains a stream. qpdf stores this alongside the
+    /// source offset in `QPDF_Stream`; the foreign-copy provider captures it
+    /// without retaining the source `ObjectHandle` itself.
+    pub(crate) fn stream_source_length(&self) -> Option<usize> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
             _ => None,
         })
     }

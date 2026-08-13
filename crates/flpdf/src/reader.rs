@@ -1719,6 +1719,20 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(stream)
     }
 
+    /// Copy one indirect object and its canonical foreign object graph into
+    /// this document. This is qpdf's `QPDF::copyForeignObject`
+    /// (`libqpdf/QPDF.cc:2019-2097`): indirect identities are reserved before
+    /// recursive replacement, shared children and cycles reuse one
+    /// destination handle, `/Pages` is a boundary, and stream payloads use
+    /// the destination resolver's shared buffer/provider boundary.
+    ///
+    /// The destination retains the source-to-destination map, so copying the
+    /// same source handle again returns the same destination identity. The
+    /// source handle must be indirect and belong to a different live `Pdf`.
+    pub fn copy_foreign_object(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
+        crate::object_copy::copy_foreign_object(self, foreign)
+    }
+
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
     /// raw [`Object`] materialization and writer traversal remain outside this

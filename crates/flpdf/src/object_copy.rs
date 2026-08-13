@@ -1,5 +1,5 @@
-//! qpdf correspondence: QPDF.cc copyForeignObject responsibility split into copy and closure modules.
-//! Cross-document deep object copier (renumber + cycle handling).
+//! qpdf correspondence: the canonical `QPDF::copyForeignObject` graph copy lives here; the older raw-object closure copier remains below as a compatibility route until its consumers migrate.
+//! Cross-document deep object copier (identity-preserving reservation + cycle handling).
 //!
 //! [`copy_objects`] copies a pre-closed set of source [`ObjectRef`]s into a
 //! target [`Pdf`], assigning fresh object numbers and returning the
@@ -7,6 +7,14 @@
 //! extract and multi-document merge: callers first compute the curated object
 //! set (e.g. via [`page_object_closure`](crate::page_closure::page_object_closure))
 //! and hand it to the copier.
+//!
+//! [`copy_foreign_object`] is the qpdf-shaped `ObjectHandle` route. It owns
+//! the live foreign graph traversal, per-source identity map, `/Pages`
+//! boundary, destination reservations, and deferred stream source dispatch
+//! (`libqpdf/QPDF.cc:2019-2272`). qpdf's `ot_reserved` value is an internal
+//! construction sentinel, not a user-visible object value; this port keeps
+//! the equivalent reservation as a destination-owned indirect null slot and
+//! replaces that slot in place before returning it.
 //!
 //! # Boundary semantics
 //!
@@ -30,9 +38,235 @@
 //! independent, non-shared target copies.
 
 use crate::object::{Dictionary, MAX_INLINE_DEPTH};
+use crate::object_handle::{ObjectHandle, ObjectValue};
 use crate::{Error, Object, ObjectRef, Pdf, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
+
+/// Copy one canonical foreign object into `target`, retaining qpdf's
+/// per-source object identity map on the destination document.
+///
+/// This is intentionally separate from [`copy_objects`]. The latter accepts a
+/// legacy, pre-closed `ObjectRef` set and rewrites raw [`Object`] values. This
+/// function follows the live `ObjectHandle` graph instead, matching qpdf's
+/// `QPDF::reserveObjects` and `QPDF::replaceForeignIndirectObjects`
+/// (`libqpdf/QPDF.cc:2101-2210`).
+pub(crate) fn copy_foreign_object<R: Read + Seek>(
+    target: &mut Pdf<R>,
+    foreign: &ObjectHandle,
+) -> Result<ObjectHandle> {
+    if !foreign.is_indirect() {
+        return Err(Error::System(
+            "QPDF::copyForeign called with direct object handle".to_owned(),
+        ));
+    }
+    let source_id = foreign.owning_pdf_unique_id().ok_or_else(|| {
+        Error::System("QPDF::copyForeign called with object with no owning PDF".to_owned())
+    })?;
+    if source_id == target.unique_id() {
+        return Err(Error::System(
+            "QPDF::copyForeign called with object from this QPDF".to_owned(),
+        ));
+    }
+
+    let object_map = target.take_foreign_object_map(source_id);
+    let mut copier = ForeignObjectCopier {
+        target,
+        object_map,
+        visiting: BTreeSet::new(),
+        direct_visiting: Vec::new(),
+        to_copy: Vec::new(),
+    };
+    let result = copier.run(foreign);
+    let object_map = copier.object_map;
+    copier.target.set_foreign_object_map(source_id, object_map);
+    result
+}
+
+struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
+    target: &'a mut Pdf<R>,
+    object_map: BTreeMap<ObjectRef, ObjectRef>,
+    visiting: BTreeSet<ObjectRef>,
+    direct_visiting: Vec<ObjectHandle>,
+    to_copy: Vec<ObjectHandle>,
+}
+
+impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
+    fn run(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
+        self.reserve_objects(foreign.clone(), true)?;
+        if !self.visiting.is_empty() {
+            return Err(Error::Internal(
+                "foreign object copier retained a visiting object".to_owned(),
+            ));
+        }
+
+        for source in std::mem::take(&mut self.to_copy) {
+            let source_ref = source.object_ref().ok_or_else(|| {
+                Error::Internal("foreign copier queued a direct object".to_owned())
+            })?;
+            let replacement = self.replace_foreign_indirect_objects(source.clone(), true)?;
+            if source.as_stream_dict().is_none() {
+                self.target
+                    .resolver
+                    .replace_object(self.object_map[&source_ref], replacement)?;
+                self.target.mark_object_dirty(self.object_map[&source_ref]);
+            }
+        }
+
+        let Some(source_ref) = foreign.object_ref() else {
+            return Err(Error::System(
+                "QPDF::copyForeign called with direct object handle".to_owned(),
+            ));
+        };
+        let Some(&target_ref) = self.object_map.get(&source_ref) else {
+            self.target.resolver.push_warning(
+                "unexpected reference to /Pages object while copying foreign object; replacing with null",
+            )?;
+            return Ok(ObjectHandle::null());
+        };
+        Ok(self.target.get_object_handle(target_ref))
+    }
+
+    fn reserve_objects(&mut self, foreign: ObjectHandle, top: bool) -> Result<()> {
+        foreign.try_dereference()?;
+        if foreign.try_is_dictionary_of_type(b"Pages", b"")? {
+            return Ok(());
+        }
+
+        if let Some(source_ref) = foreign.object_ref() {
+            let is_page = foreign.try_is_dictionary_of_type(b"Page", b"")?;
+            let is_stream = foreign.as_stream_dict().is_some();
+            if self.visiting.contains(&source_ref) {
+                return Ok(());
+            }
+
+            if let Some(&target_ref) = self.object_map.get(&source_ref) {
+                let mapped = self.target.get_object_handle(target_ref);
+                if !(top && is_page && mapped.is_null()) {
+                    return Ok(());
+                }
+            } else {
+                let mapped = if is_stream {
+                    self.target.new_stream()?
+                } else {
+                    self.target
+                        .make_indirect_from_object_handle(ObjectHandle::null())?
+                };
+                let target_ref = mapped.object_ref().ok_or_else(|| {
+                    Error::Internal("foreign copier created a direct reservation".to_owned())
+                })?;
+                self.object_map.insert(source_ref, target_ref);
+            }
+
+            self.visiting.insert(source_ref);
+            if !top && is_page {
+                self.visiting.remove(&source_ref);
+                return Ok(());
+            }
+            self.to_copy.push(foreign.clone());
+            self.reserve_children(&foreign)?;
+            self.visiting.remove(&source_ref);
+            return Ok(());
+        }
+
+        if self
+            .direct_visiting
+            .iter()
+            .any(|active| active.is_same_object_as(&foreign))
+        {
+            return Ok(());
+        }
+        self.direct_visiting.push(foreign.clone());
+        let result = self.reserve_children(&foreign);
+        self.direct_visiting.pop();
+        result
+    }
+
+    fn reserve_children(&mut self, foreign: &ObjectHandle) -> Result<()> {
+        if let Some(items) = foreign.as_array() {
+            for item in items {
+                self.reserve_objects(item, false)?;
+            }
+        } else if let Some(entries) = foreign.as_dictionary() {
+            for (_, item) in entries {
+                self.reserve_objects(item, false)?;
+            }
+        } else if let Some(dictionary) = foreign.as_stream_dict() {
+            self.reserve_objects(dictionary, false)?;
+        }
+        Ok(())
+    }
+
+    fn replace_foreign_indirect_objects(
+        &mut self,
+        foreign: ObjectHandle,
+        top: bool,
+    ) -> Result<ObjectHandle> {
+        foreign.try_dereference()?;
+        if !top {
+            if let Some(source_ref) = foreign.object_ref() {
+                return Ok(self
+                    .object_map
+                    .get(&source_ref)
+                    .map(|target_ref| self.target.get_object_handle(*target_ref))
+                    .unwrap_or_else(ObjectHandle::null));
+            }
+        }
+
+        if let Some(source_dictionary) = foreign.as_stream_dict() {
+            if !foreign.is_indirect() {
+                return Err(Error::System(
+                    "QPDF::copyForeign encountered a direct stream object".to_owned(),
+                ));
+            }
+            let source_ref = foreign.object_ref().ok_or_else(|| {
+                Error::Internal("foreign stream has no object reference".to_owned())
+            })?;
+            let target_ref = self.object_map[&source_ref];
+            let destination = self.target.get_object_handle(target_ref);
+            let destination_dictionary = destination.as_stream_dict().ok_or_else(|| {
+                Error::Internal("foreign stream reservation is not a stream".to_owned())
+            })?;
+            for (key, value) in source_dictionary.as_dictionary().unwrap_or_default() {
+                let replacement = self.replace_foreign_indirect_objects(value, false)?;
+                destination_dictionary.replace_key(&key, replacement);
+            }
+            self.target
+                .resolver
+                .copy_stream_data(&destination, &foreign)?;
+            self.target.mark_object_dirty(target_ref);
+            return Ok(destination);
+        }
+
+        if let Some(items) = foreign.as_array() {
+            let mut copied = Vec::with_capacity(items.len());
+            for item in items {
+                copied.push(self.replace_foreign_indirect_objects(item, false)?);
+            }
+            return Ok(self
+                .target
+                .resolver
+                .direct_object_handle(ObjectValue::Array(copied)));
+        }
+
+        if let Some(entries) = foreign.as_dictionary() {
+            let mut copied = BTreeMap::new();
+            for (key, value) in entries {
+                copied.insert(key, self.replace_foreign_indirect_objects(value, false)?);
+            }
+            return Ok(self
+                .target
+                .resolver
+                .direct_object_handle(ObjectValue::Dictionary(copied)));
+        }
+
+        let direct = foreign.shallow_copy()?;
+        let value = direct.direct_value_clone()?.ok_or_else(|| {
+            Error::Internal("foreign scalar copy did not produce a direct value".to_owned())
+        })?;
+        Ok(self.target.resolver.direct_object_handle(value))
+    }
+}
 
 /// Copy the pre-closed object set `refs` from `source` into `target`, assigning
 /// fresh target object numbers, and return the source→target renumber map.
@@ -239,7 +473,9 @@ fn alloc_target_number(base: u32, offset: usize) -> Result<u32> {
 mod tests {
     use super::*;
     use crate::object::MAX_INLINE_DEPTH;
+    use crate::ObjectHandle;
     use std::io::Cursor;
+    use std::rc::Rc;
 
     fn minimal_pdf() -> Pdf<Cursor<Vec<u8>>> {
         let mut bytes = b"%PDF-1.4\n".to_vec();
@@ -255,6 +491,32 @@ mod tests {
         bytes.extend_from_slice(
             format!(
                 "xref\n0 4\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        Pdf::open(Cursor::new(bytes)).unwrap()
+    }
+
+    fn pdf_with_stream(data: &[u8]) -> Pdf<Cursor<Vec<u8>>> {
+        let mut bytes = b"%PDF-1.4\n".to_vec();
+        let off1 = bytes.len();
+        bytes.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = bytes.len();
+        bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = bytes.len();
+        bytes.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let off4 = bytes.len();
+        bytes.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", data.len()).as_bytes(),
+        );
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!(
+                "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{off4:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
             )
             .as_bytes(),
         );
@@ -338,5 +600,381 @@ mod tests {
         assert!(target
             .take_foreign_object_map(source_id)
             .contains_key(&ObjectRef::new(3, 0)));
+    }
+
+    #[test]
+    fn copy_foreign_object_preserves_shared_children_and_cycles() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let shared = source
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("shared child");
+        let first = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("first cycle node");
+        let second = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("second cycle node");
+        first.replace_key(b"/Next", second.clone());
+        second.replace_key(b"/Next", first.clone());
+
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/SharedA", shared.clone());
+        root.replace_key(b"/SharedB", shared.clone());
+        root.replace_key(b"/Cycle", first.clone());
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy foreign object");
+        let copied_again = target
+            .copy_foreign_object(&root)
+            .expect("reuse foreign object map");
+
+        assert!(copied.is_same_object_as(&copied_again));
+        let copied_shared_a = copied.get_key(b"/SharedA");
+        let copied_shared_b = copied.get_key(b"/SharedB");
+        assert!(copied_shared_a.is_same_object_as(&copied_shared_b));
+        assert_ne!(copied_shared_a.object_ref(), shared.object_ref());
+
+        let copied_first = copied.get_key(b"/Cycle");
+        let copied_second = copied_first.get_key(b"/Next");
+        assert_eq!(
+            copied_second.get_key(b"/Next").object_ref(),
+            copied_first.object_ref()
+        );
+    }
+
+    #[test]
+    fn copy_foreign_object_matches_qpdf_input_classification_and_pages_boundary() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let direct_error = target
+            .copy_foreign_object(&ObjectHandle::integer(1))
+            .expect_err("direct input must be rejected");
+        assert!(matches!(direct_error, Error::System(message)
+            if message == "QPDF::copyForeign called with direct object handle"));
+
+        let owned = target.get_object_handle(ObjectRef::new(3, 0));
+        let owned_error = target
+            .copy_foreign_object(&owned)
+            .expect_err("destination-owned input must be rejected");
+        assert!(matches!(owned_error, Error::System(message)
+            if message == "QPDF::copyForeign called with object from this QPDF"));
+
+        let pages = source.get_object_handle(ObjectRef::new(2, 0));
+        let copied_pages = target
+            .copy_foreign_object(&pages)
+            .expect("Pages boundary is a warning/null result");
+        assert!(copied_pages.is_null());
+        assert!(target
+            .repair_diagnostics()
+            .entries()
+            .iter()
+            .any(|diagnostic| diagnostic
+                .message
+                .contains("unexpected reference to /Pages object while copying foreign object")));
+    }
+
+    #[test]
+    fn copy_foreign_object_rejects_an_unowned_indirect_handle() {
+        let mut target = minimal_pdf();
+        let unowned = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+
+        let error = target
+            .copy_foreign_object(&unowned)
+            .expect_err("an indirect handle without an owning PDF must be rejected");
+        assert!(matches!(error, Error::System(message)
+            if message == "QPDF::copyForeign called with object with no owning PDF"));
+    }
+
+    #[test]
+    fn copy_foreign_object_stops_at_nested_page_boundaries() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let hidden = source
+            .make_indirect_object_handle(ObjectHandle::integer(99))
+            .expect("hidden page child");
+        let page = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("nested page");
+        page.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()));
+        page.replace_key(b"/Hidden", hidden.clone());
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Page", page.clone());
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy root with nested page");
+        let copied_page = copied.get_key(b"/Page");
+        assert!(copied_page.is_null());
+        assert!(copied_page.object_ref().is_some());
+        assert!(!target
+            .object_refs()
+            .iter()
+            .any(|object_ref| *object_ref != ObjectRef::new(1, 0)
+                && target.get_object_handle(*object_ref).as_integer() == Some(99)));
+    }
+
+    #[test]
+    fn copy_foreign_object_recopies_a_nested_page_when_it_becomes_top_level() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let page = source.get_object_handle(ObjectRef::new(3, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Page", page.clone());
+
+        let copied_root = target
+            .copy_foreign_object(&root)
+            .expect("copy root with nested page boundary");
+        let boundary_page = copied_root.get_key(b"/Page");
+        assert!(boundary_page.is_null());
+        assert!(boundary_page.is_indirect());
+
+        let copied_page = target
+            .copy_foreign_object(&page)
+            .expect("copy page as a top-level object");
+        assert!(copied_page.is_same_object_as(&boundary_page));
+        assert!(!copied_page.is_null());
+        assert_eq!(
+            copied_page.get_key(b"/Type").as_name(),
+            Some(b"Page".to_vec())
+        );
+        assert!(copied_page.get_key(b"/Parent").is_null());
+    }
+
+    #[test]
+    fn copy_foreign_object_shares_stream_buffers_without_copying_the_graph() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let data = Rc::new(b"foreign stream bytes".to_vec());
+        let stream = source
+            .new_stream_with_data(Rc::clone(&data))
+            .expect("source stream");
+        stream
+            .as_stream_dict()
+            .expect("source stream dictionary")
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Stream", stream.clone());
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy stream graph");
+        let copied_stream = copied.get_key(b"/Stream");
+        assert!(copied_stream.is_indirect());
+        assert!(Rc::ptr_eq(
+            &copied_stream.as_stream_data().expect("copied buffer"),
+            &data
+        ));
+        assert_eq!(
+            copied_stream
+                .as_stream_dict()
+                .expect("copied stream dictionary")
+                .get_key(b"/Filter")
+                .as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+    }
+
+    #[test]
+    fn copy_foreign_object_defers_provider_streams_and_supports_immediate_copy() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let calls = Rc::new(std::cell::RefCell::new(0usize));
+        let calls_for_provider = Rc::clone(&calls);
+        let stream = source.new_stream().expect("source stream");
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, _suppress_warnings, _will_retry| {
+                    *calls_for_provider.borrow_mut() += 1;
+                    pipeline
+                        .write(b"deferred foreign bytes")
+                        .map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("source provider");
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Stream", stream.clone());
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy provider graph");
+        let copied_stream = copied.get_key(b"/Stream");
+        assert!(copied_stream.as_stream_data().is_none());
+        assert_eq!(*calls.borrow(), 0);
+        assert_eq!(
+            copied_stream
+                .get_raw_stream_data()
+                .expect("deferred stream bytes")
+                .as_ref(),
+            b"deferred foreign bytes"
+        );
+        assert_eq!(*calls.borrow(), 1);
+
+        let mut immediate_source = minimal_pdf();
+        let mut immediate_target = minimal_pdf();
+        let immediate_stream = immediate_source.new_stream().expect("immediate stream");
+        immediate_stream
+            .replace_stream_data_with_callback(|_pipeline| Ok(()), None, None)
+            .expect("immediate provider");
+        immediate_source.set_immediate_copy_from(true);
+        let immediate_root = immediate_source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("immediate root");
+        immediate_root.replace_key(b"/Stream", immediate_stream.clone());
+        let immediate_copy = immediate_target
+            .copy_foreign_object(&immediate_root)
+            .expect("immediate foreign copy");
+        assert!(Rc::ptr_eq(
+            &immediate_stream
+                .as_stream_data()
+                .expect("materialized immediate source"),
+            &immediate_copy
+                .get_key(b"/Stream")
+                .as_stream_data()
+                .expect("shared immediate buffer")
+        ));
+    }
+
+    #[test]
+    fn copy_foreign_object_preserves_provider_failures_until_destination_read() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let stream = source.new_stream().expect("source stream");
+        stream
+            .replace_stream_data_with_retry_callback(
+                |_pipeline, _suppress, _retry| {
+                    Err(Error::System("foreign provider failed".to_owned()))
+                },
+                None,
+                None,
+            )
+            .expect("source provider");
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Stream", stream);
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("provider failure must stay deferred");
+        let error = copied
+            .get_key(b"/Stream")
+            .get_raw_stream_data()
+            .expect_err("destination read must propagate the foreign provider error");
+        assert!(matches!(error, Error::System(message) if message == "foreign provider failed"));
+    }
+
+    #[test]
+    fn copy_foreign_object_keeps_original_file_streams_lazy() {
+        let mut source = pdf_with_stream(b"original foreign bytes");
+        let mut target = minimal_pdf();
+        let source_stream = source.get_object_handle(ObjectRef::new(4, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Stream", source_stream.clone());
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy original stream graph");
+        let copied_stream = copied.get_key(b"/Stream");
+        assert!(copied_stream.as_stream_data().is_none());
+        assert_eq!(
+            copied_stream
+                .get_raw_stream_data()
+                .expect("original stream bytes")
+                .as_ref(),
+            b"original foreign bytes"
+        );
+    }
+
+    #[test]
+    fn copy_foreign_object_original_file_streams_are_not_bound_to_the_source_pdf() {
+        let mut target = minimal_pdf();
+        let copied_stream = {
+            let mut source = pdf_with_stream(b"source lifetime bytes");
+            let source_stream = source.get_object_handle(ObjectRef::new(4, 0));
+            let root = source
+                .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+                .expect("root");
+            root.replace_key(b"/Stream", source_stream);
+            target
+                .copy_foreign_object(&root)
+                .expect("copy original stream graph")
+                .get_key(b"/Stream")
+        };
+
+        assert_eq!(
+            copied_stream
+                .get_raw_stream_data()
+                .expect("original source stream remains readable after source Pdf drop")
+                .as_ref(),
+            b"source lifetime bytes"
+        );
+    }
+
+    #[test]
+    fn copy_foreign_object_rebuilds_direct_containers_with_destination_children() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let shared = source
+            .make_indirect_object_handle(ObjectHandle::integer(11))
+            .expect("shared child");
+        let nested = ObjectHandle::dictionary(vec![
+            (b"/Name".to_vec(), ObjectHandle::name(b"Nested".to_vec())),
+            (b"/Shared".to_vec(), shared.clone()),
+        ]);
+        let array = ObjectHandle::array(vec![nested.clone(), shared.clone()]);
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Array", array);
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy direct containers");
+        let copied_array = copied.get_key(b"/Array");
+        let copied_items = copied_array.as_array().expect("copied array");
+        let copied_nested = copied_items[0].clone();
+        let copied_shared_from_dict = copied_nested.get_key(b"/Shared");
+        let copied_shared_from_array = copied_items[1].clone();
+        assert!(copied_shared_from_dict.is_same_object_as(&copied_shared_from_array));
+        assert_eq!(
+            copied_nested.get_key(b"/Name").as_name(),
+            Some(b"Nested".to_vec())
+        );
+        assert_ne!(copied_shared_from_array.object_ref(), shared.object_ref());
+    }
+
+    #[test]
+    fn copy_foreign_object_copies_top_level_scalar_as_a_destination_handle() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let scalar = source
+            .make_indirect_object_handle(ObjectHandle::integer(123))
+            .expect("scalar");
+
+        let copied = target.copy_foreign_object(&scalar).expect("copy scalar");
+        assert!(copied.is_indirect());
+        assert_eq!(copied.as_integer(), Some(123));
+        assert!(!copied.is_same_object_as(&scalar));
     }
 }
