@@ -6220,6 +6220,22 @@ pub(crate) mod identity_tests {
         }
     }
 
+    struct NonStreamDestinationResolver;
+
+    impl DocumentResolver for NonStreamDestinationResolver {
+        fn resolve_indirect(
+            &self,
+            object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            NoStreamSourceResolver.resolve_indirect(object_ref, handle)
+        }
+
+        fn new_stream(&self) -> crate::Result<ObjectHandle> {
+            Ok(ObjectHandle::integer(1))
+        }
+    }
+
     /// An unresolved indirect handle whose resolver installs `value`.
     ///
     /// `pub(crate)` so `stream_filter.rs`'s handle-shape reader tests can
@@ -6279,6 +6295,20 @@ pub(crate) mod identity_tests {
                 if message == "stream data copy requested from a resolver without a document"
         ));
         assert!(!resolver.immediate_copy_from());
+    }
+
+    #[test]
+    fn copy_stream_rejects_a_non_stream_created_by_its_resolver() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(NonStreamDestinationResolver);
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver),
+        );
+        let error = stream
+            .copy_stream()
+            .expect_err("resolver returned a non-stream destination");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "copyStream created a non-stream destination"));
     }
 
     /// [`resolver_bearing_handle`] plus the resolver's [`ResolutionLog`].
