@@ -7807,6 +7807,7 @@ mod tests {
         assert_eq!(first.type_name(), "reserved");
         assert!(!first.is_same_object_as(&second));
         assert!(pdf.is_canonical_object_handle(&first));
+        assert!(format!("{first:?}").contains("state: \"Reserved\""));
 
         let error = first
             .materialize()
@@ -7861,11 +7862,67 @@ mod tests {
             expected
         );
 
-        let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved)]);
+        let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved.clone())]);
         assert_eq!(
             containing
                 .unparse_object(&mut out)
                 .expect_err("reachable reserved object must reject the writer")
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            containing
+                .materialize()
+                .expect_err("materialization must reject a reserved child")
+                .to_string(),
+            expected
+        );
+
+        out.clear();
+        let qdf_containing =
+            ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), reserved.clone())]);
+        assert_eq!(
+            qdf_containing
+                .unparse_object_qdf(&mut out, 0)
+                .expect_err("QDF child writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+
+        out.clear();
+        assert_eq!(
+            reserved
+                .unparse_stream_body(&mut out, false)
+                .expect_err("stream-body writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+        out.clear();
+        assert_eq!(
+            reserved
+                .unparse_stream_body_qdf(&mut out, 0)
+                .expect_err("QDF stream-body writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+        out.clear();
+        assert_eq!(
+            reserved
+                .unparse_stream_body_with_ref_map_and_removed(
+                    &mut out,
+                    false,
+                    &|object_ref| Ok(object_ref),
+                    &std::collections::BTreeSet::new(),
+                )
+                .expect_err("mapped stream-body writer must reject reserved objects")
+                .to_string(),
+            expected
+        );
+        out.clear();
+        assert_eq!(
+            reserved
+                .unparse_trailer(&mut out, false, None)
+                .expect_err("trailer writer must reject reserved objects")
                 .to_string(),
             expected
         );
