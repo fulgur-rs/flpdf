@@ -333,7 +333,6 @@ fn counts_match_qpdf_get_int_value_as_int() {
 #[test]
 fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
     let cases = [
-        ("null", "null"),
         ("true", "boolean"),
         ("42", "integer"),
         ("1.5", "real"),
@@ -432,6 +431,27 @@ fn present_wrong_type_scalar_warnings_use_qpdf_object_type_names() {
         assert_eq!(warnings.len(), 1, "{key}");
         assert!(warnings[0].ends_with(expected), "{key}: {warnings:?}");
     }
+}
+
+/// A literal `null` `/Title` or `/Count` is indistinguishable from a missing
+/// key: `QPDF_Dictionary::hasKey` (`libqpdf/QPDF_Dictionary.cc:97-100`)
+/// treats a null-valued entry as absent, so
+/// `QPDFOutlineObjectHelper::getTitle`/`getCount`
+/// (`libqpdf/QPDFOutlineObjectHelper.cc:79-86,94-100`), both gated on
+/// `hasKey`, never reach the type-checked accessor and never warn. Confirmed
+/// against qpdf 11.9.0: `qpdf --json --json-key=outlines` on a `/Title null`
+/// outline exits 0 with empty stderr and `"title": ""`.
+#[test]
+fn present_null_scalar_is_treated_as_a_missing_key_like_qpdf_haskey() {
+    let mut pdf = Pdf::open(Cursor::new(single_outline_with_title("null"))).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].title, "");
+    assert!(warning_messages(&pdf).is_empty());
+
+    let mut pdf = Pdf::open(Cursor::new(single_outline_with_count("null"))).unwrap();
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree[tree.roots()[0]].count, 0);
+    assert!(warning_messages(&pdf).is_empty());
 }
 
 #[test]

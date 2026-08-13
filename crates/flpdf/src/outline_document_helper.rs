@@ -86,7 +86,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if outlines.try_as_dictionary()?.is_none() {
             return Ok(false);
         }
-        if !outlines.has_key(b"/First") {
+        if !outlines.try_has_key(b"/First")? {
             return Ok(false);
         }
         Ok(!outlines.try_get_key(b"/First")?.try_is_null()?)
@@ -122,15 +122,10 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(catalog) = self.catalog_handle()? else {
             return Ok(None);
         };
-        if !catalog.has_key(b"/Outlines") {
+        if !catalog.try_has_key(b"/Outlines")? {
             return Ok(None);
         }
-        let outlines = catalog.try_get_key(b"/Outlines")?;
-        if outlines.try_is_null()? {
-            Ok(None)
-        } else {
-            Ok(Some(outlines))
-        }
+        Ok(Some(catalog.try_get_key(b"/Outlines")?))
     }
 
     /// Materialize the qpdf-compatible outline arena.
@@ -147,7 +142,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if outlines.try_as_dictionary()?.is_none() {
             return Ok(tree);
         }
-        if !outlines.has_key(b"/First") {
+        if !outlines.try_has_key(b"/First")? {
             return Ok(tree);
         }
         let first = outlines.try_get_key(b"/First")?;
@@ -283,15 +278,17 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         {
             (
                 cursor
-                    .has_key(b"/Title")
+                    .try_has_key(b"/Title")?
                     .then(|| cursor.try_get_key(b"/Title")),
                 cursor
-                    .has_key(b"/Count")
+                    .try_has_key(b"/Count")?
                     .then(|| cursor.try_get_key(b"/Count")),
                 cursor
-                    .has_key(b"/Dest")
+                    .try_has_key(b"/Dest")?
                     .then(|| cursor.try_get_key(b"/Dest")),
-                cursor.has_key(b"/A").then(|| cursor.try_get_key(b"/A")),
+                cursor
+                    .try_has_key(b"/A")?
+                    .then(|| cursor.try_get_key(b"/A")),
             )
         } else {
             (None, None, None, None)
@@ -354,7 +351,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if !subtype.try_is_name_and_equals(b"GoTo")? {
             return Ok(None);
         }
-        if !action.has_key(b"/D") {
+        if !action.try_has_key(b"/D")? {
             return Ok(None);
         }
         Ok(Some(action.try_get_key(b"/D")?))
@@ -371,7 +368,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let mut key = Vec::with_capacity(name.len() + 1);
         key.push(b'/');
         key.extend_from_slice(name);
-        if !dests.has_key(&key) {
+        if !dests.try_has_key(&key)? {
             return Ok(ObjectHandle::null());
         }
         // Chase the selected entry the same way every other exit path in
@@ -390,7 +387,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             return Ok(ObjectHandle::null());
         };
         let names = self.resolve_value_handle(names)?;
-        if names.try_as_dictionary()?.is_none() || !names.has_key(b"/Dests") {
+        if names.try_as_dictionary()?.is_none() || !names.try_has_key(b"/Dests")? {
             return Ok(ObjectHandle::null());
         }
 
@@ -411,7 +408,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let Some(catalog) = self.catalog_handle()? else {
             return Ok(None);
         };
-        if !catalog.has_key(key) {
+        if !catalog.try_has_key(key)? {
             return Ok(None);
         }
         Ok(Some(catalog.try_get_key(key)?))
