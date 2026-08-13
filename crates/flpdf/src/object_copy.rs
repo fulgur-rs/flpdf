@@ -589,21 +589,47 @@ pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
         let mut base = None;
 
         for &source_ref in refs {
-            if let std::collections::btree_map::Entry::Vacant(entry) = map.entry(source_ref) {
-                let base = match base {
-                    Some(base) => base,
-                    None => {
-                        let first = target.next_available_object_ref()?.number;
-                        base = Some(first);
-                        first
+            match map.entry(source_ref) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let base = match base {
+                        Some(base) => base,
+                        None => {
+                            let first = target.next_available_object_ref()?.number;
+                            base = Some(first);
+                            first
+                        }
+                    };
+                    let target_ref =
+                        ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
+                    // Reserve before resolving any source object so cycles can be
+                    // rewritten through the complete map, as qpdf does.
+                    target.set_object(target_ref, Object::Null);
+                    entry.insert(target_ref);
+                    to_copy.push(source_ref);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    // This per-source map (`Pdf::foreign_object_maps`) is also
+                    // shared with the canonical `copy_foreign_object` port. When
+                    // that port discovers a `/Page` nested below some other
+                    // copied root, it reserves an indirect-null placeholder for
+                    // it without ever filling it in -- qpdf's own
+                    // `reserveObjects` does the same, returning without queuing
+                    // it for replacement (`libqpdf/QPDF.cc:2124-2132`). If that
+                    // same page is later requested here as an actual
+                    // page-tree insertion target, an already-occupied entry
+                    // must not be treated as "already copied": qpdf's own
+                    // `reserveObjects` recopies through the identical
+                    // condition when `copyForeignObject` runs with the page as
+                    // its top-level object, as `insertPage` does
+                    // (`top && isPageObject() && object_map[...].isNull()`,
+                    // `QPDF.cc:2118-2122`). Detect the same condition here --
+                    // the existing target is still an unfulfilled null
+                    // reservation -- and (re)populate it instead of leaving
+                    // the rebuilt page tree pointing at a leftover placeholder.
+                    if target.get_object_handle(*entry.get()).is_null() {
+                        to_copy.push(source_ref);
                     }
-                };
-                let target_ref = ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
-                // Reserve before resolving any source object so cycles can be
-                // rewritten through the complete map, as qpdf does.
-                target.set_object(target_ref, Object::Null);
-                entry.insert(target_ref);
-                to_copy.push(source_ref);
+                }
             }
         }
 

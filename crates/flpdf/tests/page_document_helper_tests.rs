@@ -302,6 +302,56 @@ fn add_page_copies_a_foreign_page_after_materializing_source_inheritance() {
 }
 
 #[test]
+fn add_page_recopies_a_page_left_as_a_nested_boundary_placeholder() {
+    // Regression test for round-3 Codex finding #3: `Pdf::copy_foreign_object`
+    // (the canonical port) and `PageDocumentHelper::add_page`'s legacy
+    // `copy_foreign_objects` route share one per-source map
+    // (`Pdf::foreign_object_maps`). If the canonical port first encounters a
+    // source page as a *nested* `/Pages`-boundary reference (not its
+    // top-level copy target), it reserves an indirect-null placeholder for
+    // that page and leaves it unfilled -- qpdf's own `reserveObjects` does
+    // the same (`libqpdf/QPDF.cc:2124-2132`). If the legacy route is later
+    // asked to copy that exact page as a real page-tree insertion, it must
+    // not treat the existing map entry as "already copied": doing so would
+    // insert the leftover null placeholder into the rebuilt page tree
+    // instead of the actual page content.
+    let mut source = open(build_n_page_pdf(1));
+    let mut target = open(build_n_page_pdf(1));
+
+    // Seed the shared map: copy some unrelated array holder that nests the
+    // source's page as a non-top-level reference, exactly as a caller could
+    // do before ever calling `add_page` for the same page.
+    let page_handle = source.get_object_handle(ObjectRef::new(3, 0));
+    let holder = source
+        .make_indirect_object_handle(ObjectHandle::array(vec![page_handle]))
+        .expect("holder array referencing the source page");
+    target
+        .copy_foreign_object(&holder)
+        .expect("seed a nested-page null placeholder in the shared foreign object map");
+
+    PageDocumentHelper::new(&mut target)
+        .add_page(PageInput::foreign(&mut source, ObjectRef::new(3, 0)), false)
+        .expect("copy the same page as a real page-tree insertion");
+
+    let pages = PageDocumentHelper::new(&mut target)
+        .get_all_pages()
+        .unwrap();
+    assert_eq!(pages.len(), 2);
+    let Object::Dictionary(copied_page) = target.resolve(pages[1]).unwrap() else {
+        panic!(
+            "foreign input must produce a real target page dictionary, not the \
+             leftover null placeholder left by the canonical port's nested-page \
+             boundary reservation"
+        );
+    };
+    assert_eq!(
+        copied_page.get("Type").and_then(Object::as_name),
+        Some(b"Page".as_slice()),
+        "the rebuilt page tree must hold the actual copied page content"
+    );
+}
+
+#[test]
 fn add_page_reuses_foreign_resources_from_the_same_source() {
     let mut source = open(build_n_page_pdf(2));
     let mut resources = Dictionary::new();
