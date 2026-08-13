@@ -385,8 +385,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
     /// Generate a normal appearance for `widget_ref` from this field's value.
     pub fn generate_appearance_for(&mut self, widget_ref: ObjectRef) -> Result<Option<ObjectRef>> {
         match self.field_type()?.as_deref() {
-            Some(b"/Tx") => rendering::render_text_field(self.pdf, self.field_ref, widget_ref),
-            Some(b"/Ch") => rendering::render_choice_field(self.pdf, self.field_ref, widget_ref),
+            Some(b"/Tx") => {
+                rendering::render_text_field_canonical(self.pdf, self.field_ref, widget_ref)
+            }
+            Some(b"/Ch") => {
+                rendering::render_choice_field_canonical(self.pdf, self.field_ref, widget_ref)
+            }
             _ => Ok(None),
         }
     }
