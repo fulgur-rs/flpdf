@@ -8,7 +8,7 @@
 //! set (e.g. via [`page_object_closure`](crate::page_closure::page_object_closure))
 //! and hand it to the copier.
 //!
-//! [`copy_foreign_object`] is the qpdf-shaped `ObjectHandle` route. It owns
+//! `copy_foreign_object` is the qpdf-shaped `ObjectHandle` route. It owns
 //! the live foreign graph traversal, per-source identity map, `/Pages`
 //! boundary, destination reservations, and deferred stream source dispatch
 //! (`libqpdf/QPDF.cc:2019-2272`). qpdf's `ot_reserved` value is an internal
