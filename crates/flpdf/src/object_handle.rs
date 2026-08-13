@@ -6992,6 +6992,24 @@ pub(crate) mod identity_tests {
     }
 
     #[test]
+    fn identity_key_matches_qpdf_object_sameness_without_structural_equality() {
+        let original = ObjectHandle::dictionary(vec![(
+            b"Value".to_vec(),
+            ObjectHandle::integer(1),
+        )]);
+        let alias = original.clone();
+        let distinct = ObjectHandle::dictionary(vec![(
+            b"Value".to_vec(),
+            ObjectHandle::integer(1),
+        )]);
+        let mut seen = std::collections::HashSet::new();
+
+        assert!(seen.insert(original.identity_key()));
+        assert!(!seen.insert(alias.identity_key()));
+        assert!(seen.insert(distinct.identity_key()));
+    }
+
+    #[test]
     fn try_dereference_reports_a_dropped_document_without_reconnecting() {
         let resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
         let handle = ObjectHandle::new_indirect_with_resolver(
