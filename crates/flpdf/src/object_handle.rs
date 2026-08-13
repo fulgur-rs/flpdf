@@ -308,6 +308,42 @@ pub(crate) trait DocumentResolver {
         ))
     }
 
+    /// The destination-aware form used by qpdf's foreign-stream dispatch.
+    /// Test-only resolver implementations can keep the default behavior;
+    /// document-backed resolvers override it to route deferred warnings to
+    /// the destination document.
+    fn original_stream_data_provider_for_destination(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+        destination_resolver: Weak<dyn DocumentResolver>,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        let _ = destination_resolver;
+        self.original_stream_data_provider(source, destination_dict)
+    }
+
+    /// Deliver a warning raised while a destination stream is reading a
+    /// foreign source. qpdf's `pipeForeignStreamData` passes the destination
+    /// `QPDF` as `qpdf_for_warning` (`libqpdf/QPDF.cc:2565-2585`), even though
+    /// the bytes, `last_offset`, and location text (the exception's filename)
+    /// all belong to the captured source input: the static `pipeStreamData`
+    /// builds its `QPDFExc` from the explicit `file` argument, not from
+    /// `qpdf_for_warning` (`libqpdf/QPDF.cc:2477-2530`;
+    /// `libqpdf/QPDF_encryption.cc:1122-1128`). `description_override` carries
+    /// that captured source description when set; `self`'s own description is
+    /// used only for the ordinary (non-foreign) caller, which passes `None`.
+    fn warn_stream_data(
+        &self,
+        _offset: u64,
+        description_override: Option<&str>,
+        message: String,
+    ) -> Result<()> {
+        let _ = (description_override, message);
+        Err(Error::Internal(
+            "stream data warning requested from a resolver without a document".to_owned(),
+        ))
+    }
+
     /// Whether this resolver is a qpdf source configured for immediate stream
     /// copying (`QPDF::setImmediateCopyFrom`).
     fn immediate_copy_from(&self) -> bool {
@@ -6725,6 +6761,28 @@ pub(crate) mod identity_tests {
         assert!(!ObjectHandle::integer(1).has_stream_data_provider());
         assert_eq!(ObjectHandle::integer(1).stream_source_length(), None);
         assert!(!resolver.immediate_copy_from());
+    }
+
+    #[test]
+    fn stream_copy_destination_defaults_delegate_and_warning_defaults_fail() {
+        let resolver = NoStreamSourceResolver;
+        let destination: Rc<dyn DocumentResolver> = Rc::new(NoStreamSourceResolver);
+        let destination_resolver = Rc::downgrade(&destination);
+
+        assert!(matches!(
+            resolver.original_stream_data_provider_for_destination(
+                &ObjectHandle::null(),
+                &ObjectHandle::null(),
+                destination_resolver,
+            ),
+            Err(Error::Internal(message))
+                if message == "original stream data provider requested from a resolver without a document"
+        ));
+        assert!(matches!(
+            resolver.warn_stream_data(17, None, "late warning".to_owned()),
+            Err(Error::Internal(message))
+                if message == "stream data warning requested from a resolver without a document"
+        ));
     }
 
     #[test]

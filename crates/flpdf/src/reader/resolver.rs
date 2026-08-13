@@ -117,21 +117,118 @@ use std::rc::{Rc, Weak};
 /// (`StringDecrypter`, `libqpdf/QPDF.cc:1337-1339`) but streams only at pipe
 /// time (`decryptStream`, `QPDF.cc:2491`); wiring the string decrypter in is
 /// still flpdf-25kg.3.5 AC2. See [`ResolverCore::encryption_parameters`].
+///
+/// The shared input source corresponding to qpdf's `m->file`.
+///
+/// `QPDF::ForeignStreamData` retains the same `InputSource` shared pointer as
+/// the source document, rather than retaining the source `QPDF` object
+/// (`libqpdf/QPDF.cc:2265-2273`). Keeping the reader, header wrapper, and
+/// `last_offset` in one `Rc` gives the Rust port the same ownership boundary:
+/// a deferred foreign-stream provider can outlive its source resolver while
+/// still using the source input and its logical offset coordinates.
+struct StreamInput<R: Read + Seek + 'static> {
+    reader: Rc<RefCell<R>>,
+    header_offset: usize,
+    last_offset: Cell<u64>,
+}
+
+impl<R: Read + Seek + 'static> StreamInput<R> {
+    fn new(reader: R, header_offset: usize) -> Self {
+        Self {
+            reader: Rc::new(RefCell::new(reader)),
+            header_offset,
+            last_offset: Cell::new(0),
+        }
+    }
+
+    fn seek(&self, offset: u64) -> Result<()> {
+        let physical = (self.header_offset as u64).saturating_add(offset);
+        self.reader.borrow_mut().seek(SeekFrom::Start(physical))?;
+        Ok(())
+    }
+
+    fn tell(&self) -> Result<u64> {
+        Ok(self
+            .reader
+            .borrow_mut()
+            .stream_position()?
+            .saturating_sub(self.header_offset as u64))
+    }
+
+    fn source_length(&self) -> Result<u64> {
+        let mut reader = self.reader.borrow_mut();
+        let position = reader.stream_position()?;
+        let end = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(position))?;
+        Ok(end.saturating_sub(self.header_offset as u64))
+    }
+
+    fn seek_relative(&self, delta: u64) -> Result<()> {
+        const MAX_OFFSET: u64 = i64::MAX as u64;
+
+        let mut reader = self.reader.borrow_mut();
+        let position = reader.stream_position()?;
+        if delta > MAX_OFFSET.saturating_sub(position) {
+            return Err(Error::parse(
+                position as usize,
+                format!("adding {delta} to {position} would cause an integer overflow"),
+            ));
+        }
+        reader.seek(SeekFrom::Current(delta as i64))?;
+        Ok(())
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        self.last_offset
+            .set(self.tell().unwrap_or(self.last_offset.get()));
+        let mut reader = self.reader.borrow_mut();
+        let mut filled = 0;
+        while filled < buf.len() {
+            match reader.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(filled)
+    }
+
+    fn rewind_underlying_source(&self) -> Result<()> {
+        self.reader.borrow_mut().seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    fn read_underlying_bytes(&self) -> Result<Vec<u8>> {
+        let pos = self.tell()?;
+        self.rewind_underlying_source()?;
+        let mut bytes = Vec::new();
+        self.reader.borrow_mut().read_to_end(&mut bytes)?;
+        self.seek(pos)?;
+        Ok(bytes)
+    }
+
+    fn last_offset(&self) -> u64 {
+        self.last_offset.get()
+    }
+}
+
 pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// qpdf `m->file` (`QPDF.hh:1456`).
-    reader: R,
+    input: Rc<StreamInput<R>>,
     /// Also qpdf `m->file`: when repair finds a valid header after leading
     /// material, qpdf does not keep the offset beside the input source, it
     /// *wraps* the source so the shift is invisible to every later read —
     /// `m->file = std::shared_ptr<InputSource>(new OffsetInputSource(m->file,
-    /// global_offset))` (`libqpdf/QPDF.cc:406`). Keeping the shift beside
-    /// `reader` and applying it in [`Self::seek`] and [`Self::tell`] puts it
-    /// under the same single owner, without a second input-source type.
+    /// global_offset))` (`libqpdf/QPDF.cc:406`). Keeping the shift in
+    /// [`StreamInput`] beside the reader and applying it in
+    /// [`Self::seek`] and [`Self::tell`] puts it under the same single owner,
+    /// without a second input-source type.
     ///
     /// It is *not* equivalent, and the difference is what
-    /// [`Self::rewind_underlying_source`] exists for: wrapping makes the shift
-    /// unskippable, so raw-input snapshots reach the bytes before it through
-    /// the wrapper's `proxied` member rather than through `m->file`.
+    /// [`StreamInput::rewind_underlying_source`] exists for: wrapping makes
+    /// the shift unskippable, so raw-input snapshots reach the bytes before it
+    /// through the wrapper's `proxied` member rather than through `m->file`.
     header_offset: usize,
     /// qpdf `m->xref_table` (`QPDF.hh:1465`).
     source_xref_entries: BTreeMap<ObjectRef, XrefEntry>,
@@ -261,17 +358,6 @@ pub(crate) struct ResolverCore<R: Read + Seek + 'static> {
     /// `Option` serves both; see the field-mapping table in this issue's
     /// design (`bd show flpdf-25kg.3.11`) for the disclosed collapse.
     encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
-    /// qpdf `InputSource::last_offset` (`include/qpdf/InputSource.hh:88`),
-    /// which `getLastOffset()` reports and which every warning raised from a
-    /// failed pipe is attributed to (`libqpdf/QPDF.cc:2513,2525`).
-    ///
-    /// Only a *read* updates it: both input sources set it to the position
-    /// they are about to read from, before the read can fail
-    /// (`BufferInputSource.cc:128`, `FileInputSource.cc:118-119`), and
-    /// **`seek` never touches it**. Reporting the requested seek target
-    /// instead would attribute a rejected seek to a byte the reader never
-    /// reached.
-    last_offset: u64,
 }
 
 pub(crate) struct ResolverWarningOptions {
@@ -376,9 +462,7 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// `m->file` (`libqpdf/QPDF.cc:406`): every caller above this line works
     /// in qpdf-logical coordinates and never sees the physical position.
     fn seek(&mut self, offset: u64) -> Result<()> {
-        let physical = (self.header_offset as u64).saturating_add(offset);
-        self.reader.seek(SeekFrom::Start(physical))?;
-        Ok(())
+        self.input.seek(offset)
     }
 
     /// The input source's current qpdf-logical position.
@@ -388,17 +472,11 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// (`libqpdf/QPDF.cc:1367-1384`) — not a value recomputed from an
     /// argument, which is precisely why the restore is load-bearing.
     fn tell(&mut self) -> Result<u64> {
-        Ok(self
-            .reader
-            .stream_position()?
-            .saturating_sub(self.header_offset as u64))
+        self.input.tell()
     }
 
     fn source_length(&mut self) -> Result<u64> {
-        let position = self.reader.stream_position()?;
-        let end = self.reader.seek(SeekFrom::End(0))?;
-        self.reader.seek(SeekFrom::Start(position))?;
-        Ok(end.saturating_sub(self.header_offset as u64))
+        self.input.source_length()
     }
 
     /// Advance the input by `delta` bytes from wherever it currently is,
@@ -434,19 +512,7 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// Collapsing this into "expected endstream" would file the case on the
     /// wrong fork for whichever slice ports recovery.
     fn seek_relative(&mut self, delta: u64) -> Result<()> {
-        // qpdf `std::numeric_limits<qpdf_offset_t>::max()`.
-        const MAX_OFFSET: u64 = i64::MAX as u64;
-
-        let position = self.reader.stream_position()?;
-        if delta > MAX_OFFSET.saturating_sub(position) {
-            return Err(Error::parse(
-                position as usize,
-                format!("adding {delta} to {position} would cause an integer overflow"),
-            ));
-        }
-        // Exact: the check above bounds `delta` by `i64::MAX`.
-        self.reader.seek(SeekFrom::Current(delta as i64))?;
-        Ok(())
+        self.input.seek_relative(delta)
     }
 
     /// Fill `buf` from the current position, returning how many bytes were
@@ -459,52 +525,13 @@ impl<R: Read + Seek> ResolverCore<R> {
     /// loop here is what makes a short `Read::read` — legal for any `R` —
     /// indistinguishable from that contract.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // Both of qpdf's input sources record where the read starts before it
-        // can fail, so a failing read is still attributed to the byte it
-        // reached for.
-        self.last_offset = self.tell().unwrap_or(self.last_offset);
-        let mut filled = 0;
-        while filled < buf.len() {
-            match self.reader.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(read) => filled += read,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(filled)
-    }
-
-    /// Position the *unwrapped* input source at its own offset zero, before
-    /// the header shift.
-    ///
-    /// **The one method here with no `m->file` counterpart, and it is
-    /// deliberately a primitive rather than a helper.** qpdf's wrapped source
-    /// cannot express this: `OffsetInputSource::rewind` is
-    /// `seek(0, SEEK_SET)` (`libqpdf/OffsetInputSource.cc:55-59`), which lands
-    /// on *logical* zero, and every other method adds `global_offset` too. But
-    /// the unwrapped source is not hidden from qpdf either — the wrapper holds
-    /// it as `std::shared_ptr<InputSource> proxied`
-    /// (`libqpdf/qpdf/OffsetInputSource.hh:24`). This is flpdf reaching that
-    /// same member; `header_offset` is what stands in for the wrapper, so the
-    /// member has to become a method.
-    ///
-    /// qpdf never reads `proxied` directly. flpdf needs the equivalent source
-    /// boundary for raw-input snapshots used by JSON inspection and repair.
-    fn rewind_underlying_source(&mut self) -> Result<()> {
-        self.reader.seek(SeekFrom::Start(0))?;
-        Ok(())
+        self.input.read(buf)
     }
 
     /// Read all physical bytes of the input source from position 0, restoring the
     /// logical position afterwards.
     fn read_underlying_bytes(&mut self) -> Result<Vec<u8>> {
-        let pos = self.tell()?;
-        self.rewind_underlying_source()?;
-        let mut bytes = Vec::new();
-        self.reader.read_to_end(&mut bytes)?;
-        self.seek(pos)?;
-        Ok(bytes)
+        self.input.read_underlying_bytes()
     }
 }
 
@@ -613,17 +640,39 @@ struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
     resolver: &'resolver ResolverHandle<R>,
 }
 
-/// qpdf's `ForeignStreamData`/`CopiedStreamDataProvider` split for an
-/// original file-backed stream (`libqpdf/QPDF.cc:2265-2273`). The source
-/// resolver is retained, but the source object handle is not: this lets the
-/// destination continue reading the source input after the source `Pdf` has
-/// run its object-cache teardown.
-struct OriginalStreamDataProvider<R: Read + Seek + 'static> {
-    resolver: Rc<ResolverHandle<R>>,
+/// qpdf's `ForeignStreamData` (`include/qpdf/QPDF.hh:925-943`), captured at
+/// `QPDF::copyStreamData` time (`libqpdf/QPDF.cc:2265-2273`). The source input
+/// and encryption cell are shared independently from the source resolver;
+/// only the destination warning sink is retained weakly for the later
+/// `pipeForeignStreamData` call.
+///
+/// `description` mirrors qpdf's `foreign->file` carrying its own name
+/// (`InputSource::getName`): `pipeForeignStreamData` throws its damaged-PDF
+/// exceptions via `damagedPDF(file, ...)`, which bakes the *source*
+/// `InputSource`'s name into the exception before the destination `QPDF`
+/// ever sees it (`libqpdf/QPDF.cc:2477-2530,2565-2585`;
+/// `libqpdf/QPDF_encryption.cc:1122-1128`). Captured once here rather than
+/// read from `input` at pipe time because `StreamInput` (flpdf's
+/// `InputSource` stand-in) does not itself carry a name — flpdf keeps that
+/// string on the resolver instead.
+struct ForeignStreamData<R: Read + Seek + 'static> {
+    input: Rc<StreamInput<R>>,
+    encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
     object_ref: ObjectRef,
     parsed_offset: i64,
     stream_length: usize,
-    destination_dict: ObjectHandle,
+    local_dict: ObjectHandle,
+    recovered_stream_eol_length: usize,
+    description: String,
+}
+
+/// qpdf's `CopiedStreamDataProvider` (`libqpdf/QPDF.cc:126-163`) dispatches
+/// captured foreign data through the destination `QPDF`. A weak erased
+/// resolver keeps that ownership direction without making the provider keep a
+/// destination resolver cycle alive.
+struct OriginalStreamDataProvider<R: Read + Seek + 'static> {
+    foreign_data: Rc<ForeignStreamData<R>>,
+    destination_resolver: Weak<dyn DocumentResolver>,
 }
 
 impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider<R> {
@@ -639,11 +688,19 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
         suppress_warnings: bool,
         will_retry: bool,
     ) -> Result<bool> {
-        self.resolver.pipe_stream_data(
-            self.object_ref,
-            self.parsed_offset,
-            self.stream_length,
-            &self.destination_dict,
+        let destination = self.destination_resolver.upgrade().ok_or_else(|| {
+            Error::Internal("foreign stream destination resolver is no longer live".to_owned())
+        })?;
+        pipe_stream_data_from_input(
+            &self.foreign_data.input,
+            &self.foreign_data.encryption_parameters,
+            self.foreign_data.recovered_stream_eol_length,
+            destination.as_ref(),
+            Some(self.foreign_data.description.as_str()),
+            self.foreign_data.object_ref,
+            self.foreign_data.parsed_offset,
+            self.foreign_data.stream_length,
+            &self.foreign_data.local_dict,
             pipeline,
             suppress_warnings,
             will_retry,
@@ -732,7 +789,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         } = warning_options;
         Rc::new_cyclic(|self_weak| Self {
             core: RefCell::new(ResolverCore {
-                reader,
+                input: Rc::new(StreamInput::new(reader, header_offset)),
                 header_offset,
                 source_xref_entries,
                 object_cache: BTreeMap::new(),
@@ -754,7 +811,6 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 suppress_warnings,
                 description,
                 encryption_parameters: Rc::new(RefCell::new(None)),
-                last_offset: 0,
             }),
             recovered_stream_eols: RefCell::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
@@ -870,7 +926,12 @@ impl<R: Read + Seek> ResolverHandle<R> {
                     "original foreign stream has no owning document resolver".to_owned(),
                 )
             })?;
-            source_resolver.original_stream_data_provider(source, &destination_dict)?
+            let destination_resolver = self.document_resolver_weak()?;
+            source_resolver.original_stream_data_provider_for_destination(
+                source,
+                &destination_dict,
+                destination_resolver,
+            )?
         };
 
         destination.replace_stream_data_provider(provider, filter, decode_parms)
@@ -881,26 +942,51 @@ impl<R: Read + Seek> ResolverHandle<R> {
         source: &ObjectHandle,
         destination_dict: &ObjectHandle,
     ) -> Result<Rc<dyn StreamDataProvider>> {
+        let destination_resolver = self.document_resolver_weak()?;
+        self.original_stream_data_provider_for_destination(
+            source,
+            destination_dict,
+            destination_resolver,
+        )
+    }
+
+    pub(crate) fn original_stream_data_provider_for_destination(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+        destination_resolver: Weak<dyn DocumentResolver>,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
         let object_ref = source.object_ref().ok_or_else(|| {
             Error::Internal("original foreign stream has no object reference".to_owned())
         })?;
         let stream_length = source.stream_source_length().ok_or_else(|| {
             Error::Internal("original foreign stream has no stream length".to_owned())
         })?;
-        // cov:ignore-start: ResolverHandle::new_shared always installs a live
-        // self_weak; only an invalid manually-constructed resolver could reach
-        // this branch.
-        let resolver = self.self_weak.upgrade().ok_or_else(|| {
-            Error::Internal("original foreign stream resolver is no longer live".to_owned())
-        })?;
-        // cov:ignore-end
+        let input = self.stream_input();
+        let encryption_parameters = self.encryption_parameters();
+        let description = self.core.borrow().description.clone();
         Ok(Rc::new(OriginalStreamDataProvider {
-            resolver,
-            object_ref,
-            parsed_offset: source.get_parsed_offset(),
-            stream_length,
-            destination_dict: destination_dict.clone(),
+            foreign_data: Rc::new(ForeignStreamData {
+                input,
+                encryption_parameters,
+                object_ref,
+                parsed_offset: source.get_parsed_offset(),
+                stream_length,
+                local_dict: destination_dict.clone(),
+                recovered_stream_eol_length: self.recovered_stream_eol_len(object_ref),
+                description,
+            }),
+            destination_resolver,
         }))
+    }
+
+    fn document_resolver_weak(&self) -> Result<Weak<dyn DocumentResolver>> {
+        let strong = self
+            .self_weak
+            .upgrade()
+            .ok_or_else(|| Error::Internal("document resolver is no longer live".to_owned()))?;
+        let erased: Rc<dyn DocumentResolver> = strong;
+        Ok(Rc::downgrade(&erased))
     }
 
     /// The canonical handle for `object_ref`, minting and registering one on
@@ -1370,7 +1456,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// expression, so it composes with a nested resolution — but it must not
     /// be called while a borrow of the core is already held.
     pub(crate) fn push_warning(&self, message: impl Into<String>) -> Result<()> {
-        self.push_warning_with_offset(None, message)
+        self.push_warning_with_offset(None, None, message)
     }
 
     /// [`Self::push_warning`] with the offset qpdf attributes the warning to.
@@ -1380,16 +1466,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// (`include/qpdf/QPDF.hh:1044-1050`) — where flpdf keeps it in
     /// [`Diagnostic::offset`] beside the text.
     ///
-    /// Same borrow discipline as [`Self::push_warning`].
-    /// qpdf `InputSource::getLastOffset` (`include/qpdf/InputSource.hh:55`).
-    ///
-    /// Borrow discipline: taken and dropped inside this expression.
-    fn last_offset(&self) -> u64 {
-        self.core.borrow().last_offset
-    }
-
     pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) -> Result<()> {
-        self.push_warning_with_offset(Some(offset), message)
+        self.push_warning_with_offset(Some(offset), None, message)
     }
 
     /// Emit a warning raised while parsing a canonical ObjStm member.
@@ -1440,13 +1518,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    /// `description_override` is `Some` only for a foreign stream's deferred
+    /// read: qpdf's `pipeForeignStreamData` builds its `QPDFExc` from the
+    /// captured source `InputSource`'s name, and `QPDF::warn(QPDFExc const&)`
+    /// pushes that exception into the destination's own warning list without
+    /// rewriting its filename (`libqpdf/QPDF.cc:488-494,2498-2500,2565-2585`).
+    /// `self` (the destination) still owns collection into
+    /// [`Diagnostic`]/`repair_diagnostics` and routing through its own
+    /// logger/`suppress_warnings`; only the location text substitutes the
+    /// source's description for `self`'s own.
     fn push_warning_with_offset(
         &self,
         offset: Option<u64>,
+        description_override: Option<&str>,
         message: impl Into<String>,
     ) -> Result<()> {
         let message = message.into();
-        let (logger, suppress_warnings, description) = {
+        let (logger, suppress_warnings, own_description) = {
             let mut core = self.core.borrow_mut();
             core.repair_diagnostics
                 .push(Diagnostic::warning(message.clone(), offset));
@@ -1456,7 +1544,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 core.description.clone(),
             )
         };
-        route_warning(&logger, suppress_warnings, &description, offset, &message)
+        let description = description_override.unwrap_or(&own_description);
+        route_warning(&logger, suppress_warnings, description, offset, &message)
     }
 
     /// [`Self::push_warning`] for a warning an object raised about itself.
@@ -1580,6 +1669,10 @@ impl<R: Read + Seek> ResolverHandle<R> {
         &self,
     ) -> Rc<RefCell<Option<crate::reader::EncryptionState>>> {
         self.core.borrow().encryption_parameters.clone()
+    }
+
+    fn stream_input(&self) -> Rc<StreamInput<R>> {
+        self.core.borrow().input.clone()
     }
 
     /// This document's cross-reference entry for `object_ref`, if the source
@@ -1996,284 +2089,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
         suppress_warnings: bool,
         will_retry: bool,
     ) -> Result<bool> {
-        // qpdf only calls `decryptStream` for encrypted input
-        // (`QPDF.cc:2487-2492`). Snapshot the shared state before inspecting
-        // the dictionary: an ObjectHandle operation can lazily re-enter this
-        // resolver, so the encryption-cell borrow must not span it.
+        let input = self.stream_input();
         let encryption_parameters = self.encryption_parameters();
-        let encryption_snapshot = encryption_parameters.borrow().as_ref().cloned();
-        let Some(encryption_snapshot) = encryption_snapshot else {
-            return self.pipe_stream_data_to_pipeline(
-                object_ref,
-                offset,
-                length,
-                pipeline,
-                suppress_warnings,
-                will_retry,
-            );
-        };
-
-        // `decryptStream` rejects cross-reference streams before looking at
-        // encryption version or crypt filters (`QPDF_encryption.cc:1055-1061`).
-        let inspection = inspect_stream_encryption(&encryption_snapshot, stream_dict)?;
-        if inspection.is_xref {
-            return self.pipe_stream_data_to_pipeline(
-                object_ref,
-                offset,
-                length,
-                pipeline,
-                suppress_warnings,
-                will_retry,
-            );
-        }
-
-        // `decryptStream` constructs the stage before `pipeStreamData` enters
-        // its read/write `try` (`QPDF.cc:2487-2494`). Derive and copy the key
-        // while holding the short encryption-cell borrow, then release it
-        // before touching the source or the downstream pipeline.
-        let decryption = {
-            let mut encryption = encryption_parameters.borrow_mut();
-            match encryption.as_mut() {
-                None => None,
-                Some(encryption) => {
-                    let (use_aes, warn_unknown) = encryption.stream_method(inspection.method);
-                    let stage = match use_aes {
-                        None => StreamDecryption::None,
-                        Some(false) => StreamDecryption::Rc4(
-                            encryption.key_for_object(object_ref, false).to_vec(),
-                        ),
-                        Some(true) => StreamDecryption::Aes(
-                            encryption.key_for_object(object_ref, true).to_vec(),
-                        ),
-                    };
-                    Some((stage, warn_unknown))
-                }
-            }
-        };
-        let Some((decryption, warn_unknown)) = decryption else {
-            return self.pipe_stream_data_to_pipeline(
-                object_ref,
-                offset,
-                length,
-                pipeline,
-                suppress_warnings,
-                will_retry,
-            );
-        };
-        if warn_unknown {
-            self.warn_unknown_stream_filter(inspection.method_source)?;
-        }
-
-        match decryption {
-            StreamDecryption::None => self.pipe_stream_data_to_pipeline(
-                object_ref,
-                offset,
-                length,
-                pipeline,
-                suppress_warnings,
-                will_retry,
-            ),
-            StreamDecryption::Rc4(key) => {
-                let length = length.saturating_sub(self.recovered_stream_eol_len(object_ref));
-                let mut decrypt = PlRc4::new("RC4 stream decryption", pipeline, &key)?;
-                self.pipe_stream_data_to_pipeline(
-                    object_ref,
-                    offset,
-                    length,
-                    &mut decrypt,
-                    suppress_warnings,
-                    will_retry,
-                )
-            }
-            StreamDecryption::Aes(key) => {
-                let length = length.saturating_sub(self.recovered_stream_eol_len(object_ref));
-                let mut decrypt = PlAesPdf::new_decrypt("AES stream decryption", pipeline, &key)?;
-                self.pipe_stream_data_to_pipeline(
-                    object_ref,
-                    offset,
-                    length,
-                    &mut decrypt,
-                    suppress_warnings,
-                    will_retry,
-                )
-            }
-        }
-    }
-
-    /// qpdf's unknown-stream-filter warning from `decryptStream`'s default
-    /// arm (`libqpdf/QPDF_encryption.cc:1121-1129`). It happens before the
-    /// source read, so `getLastOffset()` is sampled here rather than in the
-    /// pipe-time catch path below.
-    fn warn_unknown_stream_filter(&self, method_source: &str) -> Result<()> {
-        self.push_warning_at(
-            self.last_offset(),
-            format!(
-                "unknown encryption filter for streams (check {method_source}); \
-                 streams may be decrypted improperly"
-            ),
-        )
-    }
-
-    /// qpdf's `pipeStreamData` read/write `try`, catches, and shared finish
-    /// tail (`libqpdf/QPDF.cc:2494-2538`). `pipeline` is either the caller's
-    /// sink or a decryption stage prepended by [`Self::pipe_stream_data`].
-    #[allow(clippy::too_many_arguments)]
-    fn pipe_stream_data_to_pipeline(
-        &self,
-        object_ref: ObjectRef,
-        offset: i64,
-        length: usize,
-        pipeline: &mut dyn Pipeline,
-        suppress_warnings: bool,
-        will_retry: bool,
-    ) -> Result<bool> {
-        // qpdf's shape is one `try` whose every escape lands in a `catch`,
-        // followed by a tail common to all of them (`libqpdf/QPDF.cc:2494-2538`).
-        // `attempted_finish` is what the tail consults, and it is set
-        // immediately before `finish()` so that the tail finishes exactly the
-        // pipelines that never got the call.
-        let mut attempted_finish = false;
-        let Some(failure) =
-            self.attempt_pipe_stream_data(offset, length, pipeline, &mut attempted_finish)
-        else {
-            return Ok(true);
-        };
-
-        self.finish_pipe_failure_with_attempt(
+        let recovered_stream_eol_length = self.recovered_stream_eol_len(object_ref);
+        pipe_stream_data_from_input(
+            &input,
+            &encryption_parameters,
+            recovered_stream_eol_length,
+            self,
+            None,
             object_ref,
+            offset,
+            length,
+            stream_dict,
             pipeline,
             suppress_warnings,
             will_retry,
-            failure,
-            attempted_finish,
         )
-    }
-
-    /// qpdf's `catch` arms and common finish tail (`QPDF.cc:2505-2538`).
-    #[allow(clippy::too_many_arguments)]
-    fn finish_pipe_failure_with_attempt(
-        &self,
-        object_ref: ObjectRef,
-        pipeline: &mut dyn Pipeline,
-        suppress_warnings: bool,
-        will_retry: bool,
-        failure: PipeFailure,
-        attempted_finish: bool,
-    ) -> Result<bool> {
-        if !suppress_warnings {
-            match failure {
-                // qpdf `:2498-2500` throws `damagedPDF(file, "", offset +
-                // read, ...)`, which its `catch (QPDFExc&)` arm reports
-                // (`:2505-2509`). The position is where the read stopped, not
-                // where it began.
-                PipeFailure::ShortRead { at } => {
-                    self.push_warning_at(at, "unexpected EOF reading stream data")?;
-                }
-                // qpdf `:2510-2530`.
-                PipeFailure::Decoding { at, ref detail } => {
-                    let og = format!("{} {}", object_ref.number, object_ref.generation);
-                    self.push_warning_at(
-                        at,
-                        format!("error decoding stream data for object {og}: {detail}"),
-                    )?;
-                    if will_retry {
-                        self.push_warning_at(
-                            at,
-                            "stream will be re-processed without filtering to avoid data loss",
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // qpdf `:2531-2537`, reached from either arm. Its own failure is
-        // swallowed.
-        if !attempted_finish {
-            let _ = pipeline.finish();
-        }
-        Ok(false)
-    }
-
-    /// qpdf's `try` block (`libqpdf/QPDF.cc:2495-2504`). `None` is its
-    /// `return true`; anything else is what it would have thrown.
-    fn attempt_pipe_stream_data(
-        &self,
-        offset: i64,
-        length: usize,
-        pipeline: &mut dyn Pipeline,
-        attempted_finish: &mut bool,
-    ) -> Option<PipeFailure> {
-        let start = match u64::try_from(offset) {
-            Ok(start) => start,
-            // qpdf's input source throws `std::logic_error("INTERNAL ERROR:
-            // BufferInputSource offset < 0")` here
-            // (`libqpdf/BufferInputSource.cc:119-121`).
-            Err(_) => {
-                return Some(PipeFailure::Decoding {
-                    at: self.last_offset(),
-                    detail: format!("stream offset {offset} is negative"),
-                })
-            }
-        };
-
-        // qpdf `:2496-2497`: the seek comes *before* the allocation, so an
-        // offset the source rejects is diagnosed without first trusting the
-        // declared length for a buffer.
-        if let Err(error) = self.seek(start) {
-            // `getLastOffset()` is where the last *read* happened; a seek
-            // never sets it, so a rejected seek is not attributed to the byte
-            // it was asked for.
-            return Some(PipeFailure::Decoding {
-                at: self.last_offset(),
-                detail: error.to_string(),
-            });
-        }
-
-        // qpdf `:2497` allocates with `make_unique<char[]>`, whose
-        // `std::bad_alloc` its own `catch (std::exception&)` arm reports
-        // (`:2510-2520`). An infallible `vec![0u8; length]` would abort the
-        // process instead, so a hostile declared length has to go through a
-        // fallible reservation.
-        let mut buf: Vec<u8> = Vec::new();
-        if let Err(error) = buf.try_reserve_exact(length) {
-            return Some(PipeFailure::Decoding {
-                at: self.last_offset(),
-                detail: format!("cannot allocate {length} bytes of stream data: {error}"),
-            });
-        }
-        buf.resize(length, 0);
-
-        // qpdf `:2498-2500`.
-        match self.read(&mut buf) {
-            Ok(read) if read == length => {}
-            Ok(read) => {
-                return Some(PipeFailure::ShortRead {
-                    at: start.saturating_add(read as u64),
-                })
-            }
-            Err(error) => {
-                return Some(PipeFailure::Decoding {
-                    at: self.last_offset(),
-                    detail: error.to_string(),
-                })
-            }
-        }
-
-        // qpdf `:2501-2504`.
-        if let Err(error) = pipeline.write(&buf) {
-            return Some(PipeFailure::Decoding {
-                at: self.last_offset(),
-                detail: error.to_string(),
-            });
-        }
-        *attempted_finish = true;
-        if let Err(error) = pipeline.finish() {
-            return Some(PipeFailure::Decoding {
-                at: self.last_offset(),
-                detail: error.to_string(),
-            });
-        }
-        None
     }
 
     /// Test-only mutable access to the input source itself, for fixtures that
@@ -2284,7 +2116,9 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// flips a field on a fault-injecting cursor.
     #[cfg(test)]
     pub(crate) fn with_reader_mut<T>(&self, f: impl FnOnce(&mut R) -> T) -> T {
-        f(&mut self.core.borrow_mut().reader)
+        let reader = self.core.borrow().input.reader.clone();
+        let mut guard = reader.borrow_mut();
+        f(&mut *guard)
     }
 
     /// Test-only: install a cross-reference entry the source did not declare,
@@ -3248,6 +3082,271 @@ const INPUT_CHUNK: usize = 4096;
 /// What qpdf's `pipeStreamData` `try` block would have thrown
 /// (`libqpdf/QPDF.cc:2495-2504`), carrying the position each exception is
 /// attributed to. The two variants are qpdf's two `catch` arms.
+/// Shared qpdf-shaped implementation for original and foreign source data.
+/// The source input/encryption owners and destination warning sink are
+/// deliberately separate, matching `QPDF::pipeForeignStreamData`'s call into
+/// static `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2585`).
+///
+/// `description_override` is qpdf's explicit `file` argument to `damagedPDF`
+/// and to the unknown-encryption-filter `QPDFExc` constructor
+/// (`libqpdf/QPDF.cc:2498-2500,2517-2529`; `libqpdf/QPDF_encryption.cc:
+/// 1122-1128`): both build the exception's filename from the *source*
+/// `InputSource`, never from `qpdf_for_warning`. `None` here reproduces
+/// qpdf's non-foreign overload, where `file` and `qpdf_for_warning` are the
+/// same `QPDF` (`libqpdf/QPDF.cc:2541-2552`) and `warning_sink`'s own
+/// description is already correct.
+#[allow(clippy::too_many_arguments)]
+fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
+    input: &StreamInput<R>,
+    encryption_parameters: &Rc<RefCell<Option<crate::reader::EncryptionState>>>,
+    recovered_stream_eol_length: usize,
+    warning_sink: &dyn DocumentResolver,
+    description_override: Option<&str>,
+    object_ref: ObjectRef,
+    offset: i64,
+    length: usize,
+    stream_dict: &ObjectHandle,
+    pipeline: &mut dyn Pipeline,
+    suppress_warnings: bool,
+    will_retry: bool,
+) -> Result<bool> {
+    let encryption_snapshot = encryption_parameters.borrow().as_ref().cloned();
+    let Some(encryption_snapshot) = encryption_snapshot else {
+        return pipe_stream_data_to_pipeline_for_input(
+            input,
+            warning_sink,
+            description_override,
+            object_ref,
+            offset,
+            length,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        );
+    };
+
+    let inspection = inspect_stream_encryption(&encryption_snapshot, stream_dict)?;
+    if inspection.is_xref {
+        return pipe_stream_data_to_pipeline_for_input(
+            input,
+            warning_sink,
+            description_override,
+            object_ref,
+            offset,
+            length,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        );
+    }
+
+    let decryption = {
+        let mut encryption = encryption_parameters.borrow_mut();
+        match encryption.as_mut() {
+            None => None,
+            Some(encryption) => {
+                let (use_aes, warn_unknown) = encryption.stream_method(inspection.method);
+                let stage = match use_aes {
+                    None => StreamDecryption::None,
+                    Some(false) => {
+                        StreamDecryption::Rc4(encryption.key_for_object(object_ref, false).to_vec())
+                    }
+                    Some(true) => {
+                        StreamDecryption::Aes(encryption.key_for_object(object_ref, true).to_vec())
+                    }
+                };
+                Some((stage, warn_unknown))
+            }
+        }
+    };
+    let Some((decryption, warn_unknown)) = decryption else {
+        return pipe_stream_data_to_pipeline_for_input(
+            input,
+            warning_sink,
+            description_override,
+            object_ref,
+            offset,
+            length,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        );
+    };
+    if warn_unknown {
+        warning_sink.warn_stream_data(
+            input.last_offset(),
+            description_override,
+            format!(
+                "unknown encryption filter for streams (check {}); \
+                 streams may be decrypted improperly",
+                inspection.method_source
+            ),
+        )?;
+    }
+
+    match decryption {
+        StreamDecryption::None => pipe_stream_data_to_pipeline_for_input(
+            input,
+            warning_sink,
+            description_override,
+            object_ref,
+            offset,
+            length,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        ),
+        StreamDecryption::Rc4(key) => {
+            let length = length.saturating_sub(recovered_stream_eol_length);
+            let mut decrypt = PlRc4::new("RC4 stream decryption", pipeline, &key)?;
+            pipe_stream_data_to_pipeline_for_input(
+                input,
+                warning_sink,
+                description_override,
+                object_ref,
+                offset,
+                length,
+                &mut decrypt,
+                suppress_warnings,
+                will_retry,
+            )
+        }
+        StreamDecryption::Aes(key) => {
+            let length = length.saturating_sub(recovered_stream_eol_length);
+            let mut decrypt = PlAesPdf::new_decrypt("AES stream decryption", pipeline, &key)?;
+            pipe_stream_data_to_pipeline_for_input(
+                input,
+                warning_sink,
+                description_override,
+                object_ref,
+                offset,
+                length,
+                &mut decrypt,
+                suppress_warnings,
+                will_retry,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
+    input: &StreamInput<R>,
+    warning_sink: &dyn DocumentResolver,
+    description_override: Option<&str>,
+    object_ref: ObjectRef,
+    offset: i64,
+    length: usize,
+    pipeline: &mut dyn Pipeline,
+    suppress_warnings: bool,
+    will_retry: bool,
+) -> Result<bool> {
+    let mut attempted_finish = false;
+    let Some(failure) =
+        attempt_pipe_stream_data_for_input(input, offset, length, pipeline, &mut attempted_finish)
+    else {
+        return Ok(true);
+    };
+
+    // `description_override` is fixed for the whole call (it names the
+    // source input this piping reads from, not the failure), so it is
+    // captured once here rather than threaded as a fourth positional
+    // argument to every `warn_stream_data` call below.
+    let warn =
+        |at: u64, message: String| warning_sink.warn_stream_data(at, description_override, message);
+
+    if !suppress_warnings {
+        match failure {
+            PipeFailure::ShortRead { at } => {
+                warn(at, "unexpected EOF reading stream data".to_owned())?;
+            }
+            PipeFailure::Decoding { at, ref detail } => {
+                let og = format!("{} {}", object_ref.number, object_ref.generation);
+                warn(
+                    at,
+                    format!("error decoding stream data for object {og}: {detail}"),
+                )?;
+                if will_retry {
+                    warn(
+                        at,
+                        "stream will be re-processed without filtering to avoid data loss"
+                            .to_owned(),
+                    )?;
+                }
+            }
+        }
+    }
+
+    if !attempted_finish {
+        let _ = pipeline.finish();
+    }
+    Ok(false)
+}
+
+fn attempt_pipe_stream_data_for_input<R: Read + Seek + 'static>(
+    input: &StreamInput<R>,
+    offset: i64,
+    length: usize,
+    pipeline: &mut dyn Pipeline,
+    attempted_finish: &mut bool,
+) -> Option<PipeFailure> {
+    let start = match u64::try_from(offset) {
+        Ok(start) => start,
+        Err(_) => {
+            return Some(PipeFailure::Decoding {
+                at: input.last_offset(),
+                detail: format!("stream offset {offset} is negative"),
+            })
+        }
+    };
+
+    if let Err(error) = input.seek(start) {
+        return Some(PipeFailure::Decoding {
+            at: input.last_offset(),
+            detail: error.to_string(),
+        });
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    if let Err(error) = buf.try_reserve_exact(length) {
+        return Some(PipeFailure::Decoding {
+            at: input.last_offset(),
+            detail: format!("cannot allocate {length} bytes of stream data: {error}"),
+        });
+    }
+    buf.resize(length, 0);
+
+    match input.read(&mut buf) {
+        Ok(read) if read == length => {}
+        Ok(read) => {
+            return Some(PipeFailure::ShortRead {
+                at: start.saturating_add(read as u64),
+            })
+        }
+        Err(error) => {
+            return Some(PipeFailure::Decoding {
+                at: input.last_offset(),
+                detail: error.to_string(),
+            })
+        }
+    }
+
+    if let Err(error) = pipeline.write(&buf) {
+        return Some(PipeFailure::Decoding {
+            at: input.last_offset(),
+            detail: error.to_string(),
+        });
+    }
+    *attempted_finish = true;
+    if let Err(error) = pipeline.finish() {
+        return Some(PipeFailure::Decoding {
+            at: input.last_offset(),
+            detail: error.to_string(),
+        });
+    }
+    None
+}
+
 enum PipeFailure {
     /// `damagedPDF(file, "", offset + read, "unexpected EOF reading stream
     /// data")` (`:2498-2500`), caught as a `QPDFExc` (`:2505-2509`).
@@ -3529,12 +3628,35 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         ResolverHandle::original_stream_data_provider(self, source, destination_dict)
     }
 
+    fn original_stream_data_provider_for_destination(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+        destination_resolver: Weak<dyn DocumentResolver>,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        ResolverHandle::original_stream_data_provider_for_destination(
+            self,
+            source,
+            destination_dict,
+            destination_resolver,
+        )
+    }
+
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from()
     }
 
     fn warn(&self, message: String) -> Result<()> {
         self.push_object_warning(message)
+    }
+
+    fn warn_stream_data(
+        &self,
+        offset: u64,
+        description_override: Option<&str>,
+        message: String,
+    ) -> Result<()> {
+        self.push_warning_with_offset(Some(offset), description_override, message)
     }
 
     fn pipe_stream_data(
@@ -3867,6 +3989,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
 
 #[cfg(test)]
 mod tests {
+    use super::pipe_stream_data_from_input;
     use super::ObjectStreamResolutionError;
     use super::ResolveMark;
     use super::ResolverHandle;
@@ -4076,6 +4199,116 @@ mod tests {
             .expect_err("an unresolved non-stream handle has no source stream length");
         assert!(matches!(error, Error::Internal(message)
             if message == "original foreign stream has no stream length"));
+    }
+
+    #[test]
+    fn foreign_original_stream_provider_reports_a_dropped_destination() {
+        let source = bare_resolver();
+        let source_stream = source.new_stream_handle().expect("source stream");
+        let destination = bare_resolver();
+        let destination_erased: Rc<dyn DocumentResolver> = destination.clone();
+        let destination_resolver = Rc::downgrade(&destination_erased);
+        drop(destination_erased);
+        drop(destination);
+
+        let provider = source
+            .original_stream_data_provider_for_destination(
+                &source_stream,
+                &ObjectHandle::dictionary(Vec::new()),
+                destination_resolver,
+            )
+            .expect("foreign source metadata");
+        let mut sink = crate::pipeline::buffer::Buffer::new("foreign stream", None);
+        let error = provider
+            .provide_stream_data_with_retry_by_id(0, 0, &mut sink, false, false)
+            .expect_err("destination lifetime must be checked at pipe time");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "foreign stream destination resolver is no longer live"));
+    }
+
+    /// qpdf's `pipeForeignStreamData` builds the damaged-PDF exception from
+    /// the captured source `InputSource` (`foreign->file`), not from the
+    /// destination `QPDF`: `pipeStreamData`'s static overload throws
+    /// `damagedPDF(file, "", offset, message)`, which bakes `file->getName()`
+    /// in as the exception's filename before `qpdf_for_warning.warn(e)` ever
+    /// runs (`libqpdf/QPDF.cc:2477-2585`). `QPDF::warn(QPDFExc const&)` just
+    /// pushes that already-built exception into the destination's warning
+    /// list and logs it — it never reconstructs the filename from its own
+    /// `m->file` (`libqpdf/QPDF.cc:488-494`). So a stream copied from a named
+    /// source into a differently named destination must still report the
+    /// source's name when its deferred read fails, even though the failure
+    /// is collected and logged through the destination.
+    #[test]
+    fn foreign_deferred_read_failure_reports_the_source_description() {
+        let source_bytes = b"%PDF-1.4\nshort".to_vec();
+        let parsed_offset = 9i64;
+        let available = source_bytes.len() - 9;
+        let declared_length = available + 100;
+
+        let source = ResolverHandle::new_shared(
+            Cursor::new(source_bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false, // already_reconstructed
+            BTreeSet::new(),
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, "source.pdf".to_owned()),
+            0,
+        );
+        let source_stream = source.direct_object_handle(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_length: declared_length,
+            stream_provider: None,
+        });
+        source_stream.set_parsed_offset_if_unset(parsed_offset);
+        let source_stream = source
+            .make_indirect_from_object_handle(source_stream)
+            .expect("source stream registers under a fresh identity");
+
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let destination = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false, // already_reconstructed
+            BTreeSet::new(),
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, "destination.pdf".to_owned()),
+            0,
+        );
+        let destination_erased: Rc<dyn DocumentResolver> = destination.clone();
+        let destination_resolver = Rc::downgrade(&destination_erased);
+
+        let provider = source
+            .original_stream_data_provider_for_destination(
+                &source_stream,
+                &ObjectHandle::dictionary(Vec::new()),
+                destination_resolver,
+            )
+            .expect("original foreign source metadata");
+
+        let mut sink = crate::pipeline::buffer::Buffer::new("foreign stream", None);
+        let ok = provider
+            .provide_stream_data_with_retry_by_id(0, 0, &mut sink, false, false)
+            .expect("decryptStream preparation");
+        assert!(!ok, "a truncated foreign read fails");
+
+        let logged = String::from_utf8(output.lock().unwrap().clone()).expect("utf8 log");
+        assert!(
+            logged.contains("source.pdf"),
+            "warning must name the source document: {logged}"
+        );
+        assert!(
+            !logged.contains("destination.pdf"),
+            "warning must not attribute the source's location to the destination: {logged}"
+        );
     }
 
     #[test]
@@ -4726,6 +4959,27 @@ mod tests {
         }
     }
 
+    struct FailingStreamWarningResolver;
+
+    impl DocumentResolver for FailingStreamWarningResolver {
+        fn resolve_indirect(
+            &self,
+            _object_ref: ObjectRef,
+            _handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn warn_stream_data(
+            &self,
+            _offset: u64,
+            _description_override: Option<&str>,
+            _message: String,
+        ) -> crate::Result<()> {
+            Err(Error::Internal("stream warning sink failed".to_owned()))
+        }
+    }
+
     /// `QPDF::pipeStreamData` seeks to the parsed offset, reads exactly
     /// `length` bytes, writes them to the pipeline and finishes it
     /// (`libqpdf/QPDF.cc:2496-2504`). It reads the declared length and nothing
@@ -5206,6 +5460,42 @@ mod tests {
                 .cf_stream,
             EncryptionMode::Aes128
         );
+    }
+
+    #[test]
+    fn unknown_stream_filter_warning_delivery_failure_propagates() {
+        let resolver = resolver_over(Vec::new());
+        *resolver.encryption_parameters().borrow_mut() =
+            Some(v4_encryption(EncryptionMode::Unknown));
+        let input = resolver.stream_input();
+        let encryption_parameters = resolver.encryption_parameters();
+        let dict = crate::ObjectHandle::dictionary(vec![]);
+        let warning_sink = FailingStreamWarningResolver;
+        let mut sink = crate::pipeline::buffer::Buffer::new("stream data", None);
+        warning_sink
+            .resolve_indirect(
+                ObjectRef::new(4, 0),
+                &ObjectHandle::new_indirect_unresolved(ObjectRef::new(4, 0), 0),
+            )
+            .expect("the warning sink resolver is otherwise a no-op");
+
+        let error = pipe_stream_data_from_input(
+            &input,
+            &encryption_parameters,
+            0,
+            &warning_sink,
+            None,
+            ObjectRef::new(4, 0),
+            0,
+            0,
+            &dict,
+            &mut sink,
+            false,
+            false,
+        )
+        .expect_err("warning sink failure must propagate");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "stream warning sink failed"));
     }
 
     /// A bare `/Crypt` only overrides `/StmF` when its dictionary has qpdf's
