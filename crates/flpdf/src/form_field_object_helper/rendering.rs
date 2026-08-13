@@ -3291,6 +3291,117 @@ mod tests {
         );
     }
 
+    /// PDF whose `/DA` names a resource font via an octal-escaped raw byte
+    /// 0x80 (`/F\200`), matching a `/DR/Font` key written with the
+    /// equivalent name-escape (`/F#80`) so both decode to the identical raw
+    /// byte 0x80 at the PDF-syntax level.
+    fn build_pdf_da_octal_escape_font_name() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <</Font <</F#80 5 0 R>>>> \
+              /DA (/F\\200 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Hi) /Rect [100 700 300 720]>>\nendobj\n",
+        );
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /Font /Subtype /Type1 /BaseFont /Times-Roman>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_da_octal_escaped_font_name_misses_dr_like_qpdf() {
+        // NOT a bug: qpdf's own `getDefaultAppearance()` decodes `/DA`
+        // through `QPDFObjectHandle::getUTF8Value` -- the same
+        // PDFDocEncoding "text string" transform flpdf's
+        // `FormFieldObjectHelper::default_appearance` applies
+        // (`libqpdf/QPDFFormFieldObjectHelper.cc:196-210`,
+        // `libqpdf/QPDF_String.cc:161-172`
+        // (`getUTF8Val` -> `pdf_doc_to_utf8` for the non-UTF16/non-explicit-
+        // UTF8 case), `libqpdf/QUtil.cc` `pdf_doc_to_unicode[0x80-127] ==
+        // 0x2022` BULLET). A raw byte 0x80 inside a `/DA` resource name
+        // (`/F\200`, an octal *string* escape) is therefore re-encoded to
+        // the 3-byte UTF-8 sequence for U+2022 before qpdf's `TfFinder`
+        // ever tokenizes it, so the extracted font name never matches a
+        // `/DR/Font` key written with the equivalent *name* escape
+        // (`/F#80`, decoding to the same single raw byte 0x80) -- qpdf
+        // itself falls back to its default font/encoder here. Confirmed
+        // against a real `qpdf 11.9.0 --generate-appearances` run on this
+        // exact fixture shape: the regenerated appearance's `/Resources`
+        // gains no `/Font` entry at all, and its content stream literally
+        // contains `/F\xe2\x80\xa2` (UTF-8 bullet) in the `Tf` operator.
+        // flpdf must reproduce this qpdf-inherited miss, not "fix" it by
+        // reading `/DA` as raw bytes -- doing so would make flpdf diverge
+        // from real qpdf output for this exact shape.
+        let raw = build_pdf_da_octal_escape_font_name();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let stream = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream).expect("resolve xobj");
+
+        let content = stream.as_stream_data().expect("appearance data");
+        assert!(
+            content
+                .windows("/F\u{2022} 12 Tf".len())
+                .any(|w| w == "/F\u{2022} 12 Tf".as_bytes()),
+            "content must literally carry the PDFDocEncoding-corrupted \
+             (bullet) font name, matching qpdf's own getUTF8Value() \
+             transform verbatim: {content:?}"
+        );
+
+        let stream_dict = stream.as_stream_dict().expect("stream dict");
+        let resources = stream_dict.get_key(b"/Resources");
+        pdf.resolve_object_handle(&resources)
+            .expect("resolve resources");
+        let font_dict = resources.get_key(b"/Font");
+        pdf.resolve_object_handle(&font_dict)
+            .expect("resolve font dict");
+        let fonts = font_dict.as_dictionary().expect("font dict is a map");
+        assert_eq!(fonts.len(), 1, "exactly one synthesized font entry");
+        let (_, font) = fonts.into_iter().next().expect("one font entry");
+        pdf.resolve_object_handle(&font).expect("resolve font");
+        let base_font = font.get_key(b"/BaseFont");
+        pdf.resolve_object_handle(&base_font)
+            .expect("resolve BaseFont");
+        assert_eq!(
+            base_font.as_name(),
+            Some(b"Helvetica".to_vec()),
+            "the /DR font (Times-Roman) must NOT be matched -- the \
+             corrupted name misses it just like qpdf, so flpdf falls back \
+             to its Helvetica default"
+        );
+    }
+
     /// PDF whose `/DA` has no `Tf` token at all (only a colour operator).
     fn build_pdf_da_without_tf_token() -> Vec<u8> {
         let mut pdf: Vec<u8> = Vec::new();
