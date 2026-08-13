@@ -160,8 +160,12 @@ fn deep_outline_round_trip_through_write_pdf() {
     loop {
         let item = &tree[id];
         assert_eq!(item.title, format!("L{depth}"));
+        let dest_page = item.dest_page();
         assert_eq!(
-            item.dest_page(),
+            dest_page
+                .object_ref()
+                .map(Object::Reference)
+                .unwrap_or_else(|| dest_page.materialize().unwrap()),
             Object::Reference(mapped_page),
             "level {depth} must keep its /Dest after the round trip"
         );

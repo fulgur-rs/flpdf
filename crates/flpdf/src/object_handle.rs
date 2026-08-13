@@ -2359,7 +2359,6 @@ impl ObjectHandle {
     /// `/Type`). Lookup is exact; a slashless key is not an alias. A present
     /// value that resolves to null is treated as absent, matching
     /// `QPDF_Dictionary::hasKey`.
-    #[allow(dead_code)] // promoted with complete resolver wiring in flpdf-25kg.3.5
     pub(crate) fn try_has_key(&self, key: &[u8]) -> Result<bool> {
         self.try_dereference()?;
         let child = self.with_value(|value| match value {

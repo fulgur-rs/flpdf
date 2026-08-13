@@ -6,7 +6,7 @@
 //! use flpdf::outline::{outline_items, outline_items_with_max_depth};
 //! ```
 
-use crate::{Object, ObjectRef};
+use crate::{ObjectHandle, ObjectRef};
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Index;
 use std::sync::OnceLock;
@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 pub struct OutlineId(pub(crate) usize);
 
 /// One materialized outline item.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct OutlineItem {
     /// Indirect source identity, or `None` for a direct outline value.
     pub source_ref: Option<ObjectRef>,
@@ -24,23 +24,23 @@ pub struct OutlineItem {
     pub parent: Option<OutlineId>,
     /// Child items in raw `/First` then `/Next` order.
     pub kids: Vec<OutlineId>,
-    /// Raw object obtained by resolving this outline cursor exactly once.
-    pub object: Object,
+    /// Live qpdf object handle obtained by resolving this outline cursor exactly once.
+    pub object: ObjectHandle,
     /// Decoded `/Title`, or an empty string when unavailable.
     pub title: String,
     /// Raw `/Count` converted to qpdf's signed 32-bit accessor shape.
     pub count: i32,
-    /// qpdf-compatible resolved destination, or [`Object::Null`].
-    pub dest: Object,
+    /// Live qpdf-compatible resolved destination, or a direct null handle.
+    pub dest: ObjectHandle,
 }
 
 impl OutlineItem {
     /// Mirror qpdf `getDestPage()` without resolving the page operand.
-    pub fn dest_page(&self) -> Object {
-        match &self.dest {
-            Object::Array(items) if !items.is_empty() => items[0].clone(),
-            _ => Object::Null,
-        }
+    pub fn dest_page(&self) -> ObjectHandle {
+        self.dest
+            .as_array()
+            .and_then(|items| items.into_iter().next())
+            .unwrap_or_else(ObjectHandle::null)
     }
 }
 
@@ -66,10 +66,7 @@ impl OutlineTree {
     }
 
     fn page_key(item: &OutlineItem) -> Option<ObjectRef> {
-        match item.dest_page() {
-            Object::Reference(reference) => Self::normalize_page_key(Some(reference)),
-            _ => None,
-        }
+        Self::normalize_page_key(item.dest_page().object_ref())
     }
 
     fn by_page(&self) -> &BTreeMap<Option<ObjectRef>, Vec<OutlineId>> {
@@ -88,6 +85,17 @@ impl OutlineTree {
     ///
     /// `None` represents qpdf's `QPDFObjGen(0, 0)` bucket and therefore also
     /// contains destinations whose page operand is not an indirect reference.
+    ///
+    /// The page-to-outline mapping is computed once and cached for the
+    /// lifetime of this tree, matching qpdf's own
+    /// `QPDFOutlineDocumentHelper::getOutlinesForPage`/`initializeByPage`
+    /// contract (`libqpdf/QPDFOutlineDocumentHelper.cc:35-59`), which lazily
+    /// builds `m->by_page` on first use and never invalidates it. A
+    /// destination mutated through a live [`ObjectHandle`] after this method
+    /// has already been called is not reflected in later results — qpdf has
+    /// the identical hazard for the same reason (its outline destinations
+    /// are live, mutable `QPDFObjectHandle` values too), so this is qpdf
+    /// parity rather than an flpdf-only limitation.
     pub fn outlines_for_page(
         &self,
         page: Option<ObjectRef>,

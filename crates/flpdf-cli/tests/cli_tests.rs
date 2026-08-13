@@ -1277,7 +1277,7 @@ fn show_outline_warns_and_prints_empty_when_outline_resolution_fails() {
     cmd.args(["--show-outline", fixture.path().to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Warning:"))
+        .stderr(predicate::str::contains("WARNING:"))
         .stdout(predicate::str::contains("Outline:\n  <empty>"));
 }
 
