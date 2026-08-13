@@ -325,9 +325,20 @@ pub(crate) trait DocumentResolver {
     /// Deliver a warning raised while a destination stream is reading a
     /// foreign source. qpdf's `pipeForeignStreamData` passes the destination
     /// `QPDF` as `qpdf_for_warning` (`libqpdf/QPDF.cc:2565-2585`), even though
-    /// the bytes and `last_offset` belong to the captured source input.
-    fn warn_stream_data(&self, _offset: u64, message: String) -> Result<()> {
-        let _ = message;
+    /// the bytes, `last_offset`, and location text (the exception's filename)
+    /// all belong to the captured source input: the static `pipeStreamData`
+    /// builds its `QPDFExc` from the explicit `file` argument, not from
+    /// `qpdf_for_warning` (`libqpdf/QPDF.cc:2477-2530`;
+    /// `libqpdf/QPDF_encryption.cc:1122-1128`). `description_override` carries
+    /// that captured source description when set; `self`'s own description is
+    /// used only for the ordinary (non-foreign) caller, which passes `None`.
+    fn warn_stream_data(
+        &self,
+        _offset: u64,
+        description_override: Option<&str>,
+        message: String,
+    ) -> Result<()> {
+        let _ = (description_override, message);
         Err(Error::Internal(
             "stream data warning requested from a resolver without a document".to_owned(),
         ))
@@ -6768,7 +6779,7 @@ pub(crate) mod identity_tests {
                 if message == "original stream data provider requested from a resolver without a document"
         ));
         assert!(matches!(
-            resolver.warn_stream_data(17, "late warning".to_owned()),
+            resolver.warn_stream_data(17, None, "late warning".to_owned()),
             Err(Error::Internal(message))
                 if message == "stream data warning requested from a resolver without a document"
         ));

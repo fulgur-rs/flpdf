@@ -645,6 +645,16 @@ struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
 /// and encryption cell are shared independently from the source resolver;
 /// only the destination warning sink is retained weakly for the later
 /// `pipeForeignStreamData` call.
+///
+/// `description` mirrors qpdf's `foreign->file` carrying its own name
+/// (`InputSource::getName`): `pipeForeignStreamData` throws its damaged-PDF
+/// exceptions via `damagedPDF(file, ...)`, which bakes the *source*
+/// `InputSource`'s name into the exception before the destination `QPDF`
+/// ever sees it (`libqpdf/QPDF.cc:2477-2530,2565-2585`;
+/// `libqpdf/QPDF_encryption.cc:1122-1128`). Captured once here rather than
+/// read from `input` at pipe time because `StreamInput` (flpdf's
+/// `InputSource` stand-in) does not itself carry a name — flpdf keeps that
+/// string on the resolver instead.
 struct ForeignStreamData<R: Read + Seek + 'static> {
     input: Rc<StreamInput<R>>,
     encryption_parameters: Rc<RefCell<Option<crate::reader::EncryptionState>>>,
@@ -653,6 +663,7 @@ struct ForeignStreamData<R: Read + Seek + 'static> {
     stream_length: usize,
     local_dict: ObjectHandle,
     recovered_stream_eol_length: usize,
+    description: String,
 }
 
 /// qpdf's `CopiedStreamDataProvider` (`libqpdf/QPDF.cc:126-163`) dispatches
@@ -685,6 +696,7 @@ impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider
             &self.foreign_data.encryption_parameters,
             self.foreign_data.recovered_stream_eol_length,
             destination.as_ref(),
+            Some(self.foreign_data.description.as_str()),
             self.foreign_data.object_ref,
             self.foreign_data.parsed_offset,
             self.foreign_data.stream_length,
@@ -952,6 +964,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
         })?;
         let input = self.stream_input();
         let encryption_parameters = self.encryption_parameters();
+        let description = self.core.borrow().description.clone();
         Ok(Rc::new(OriginalStreamDataProvider {
             foreign_data: Rc::new(ForeignStreamData {
                 input,
@@ -961,6 +974,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 stream_length,
                 local_dict: destination_dict.clone(),
                 recovered_stream_eol_length: self.recovered_stream_eol_len(object_ref),
+                description,
             }),
             destination_resolver,
         }))
@@ -1442,7 +1456,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// expression, so it composes with a nested resolution — but it must not
     /// be called while a borrow of the core is already held.
     pub(crate) fn push_warning(&self, message: impl Into<String>) -> Result<()> {
-        self.push_warning_with_offset(None, message)
+        self.push_warning_with_offset(None, None, message)
     }
 
     /// [`Self::push_warning`] with the offset qpdf attributes the warning to.
@@ -1453,7 +1467,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
     /// [`Diagnostic::offset`] beside the text.
     ///
     pub(crate) fn push_warning_at(&self, offset: u64, message: impl Into<String>) -> Result<()> {
-        self.push_warning_with_offset(Some(offset), message)
+        self.push_warning_with_offset(Some(offset), None, message)
     }
 
     /// Emit a warning raised while parsing a canonical ObjStm member.
@@ -1504,13 +1518,23 @@ impl<R: Read + Seek> ResolverHandle<R> {
         )
     }
 
+    /// `description_override` is `Some` only for a foreign stream's deferred
+    /// read: qpdf's `pipeForeignStreamData` builds its `QPDFExc` from the
+    /// captured source `InputSource`'s name, and `QPDF::warn(QPDFExc const&)`
+    /// pushes that exception into the destination's own warning list without
+    /// rewriting its filename (`libqpdf/QPDF.cc:488-494,2498-2500,2565-2585`).
+    /// `self` (the destination) still owns collection into
+    /// [`Diagnostic`]/`repair_diagnostics` and routing through its own
+    /// logger/`suppress_warnings`; only the location text substitutes the
+    /// source's description for `self`'s own.
     fn push_warning_with_offset(
         &self,
         offset: Option<u64>,
+        description_override: Option<&str>,
         message: impl Into<String>,
     ) -> Result<()> {
         let message = message.into();
-        let (logger, suppress_warnings, description) = {
+        let (logger, suppress_warnings, own_description) = {
             let mut core = self.core.borrow_mut();
             core.repair_diagnostics
                 .push(Diagnostic::warning(message.clone(), offset));
@@ -1520,7 +1544,8 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 core.description.clone(),
             )
         };
-        route_warning(&logger, suppress_warnings, &description, offset, &message)
+        let description = description_override.unwrap_or(&own_description);
+        route_warning(&logger, suppress_warnings, description, offset, &message)
     }
 
     /// [`Self::push_warning`] for a warning an object raised about itself.
@@ -2072,6 +2097,7 @@ impl<R: Read + Seek> ResolverHandle<R> {
             &encryption_parameters,
             recovered_stream_eol_length,
             self,
+            None,
             object_ref,
             offset,
             length,
@@ -3060,12 +3086,22 @@ const INPUT_CHUNK: usize = 4096;
 /// The source input/encryption owners and destination warning sink are
 /// deliberately separate, matching `QPDF::pipeForeignStreamData`'s call into
 /// static `QPDF::pipeStreamData` (`libqpdf/QPDF.cc:2477-2585`).
+///
+/// `description_override` is qpdf's explicit `file` argument to `damagedPDF`
+/// and to the unknown-encryption-filter `QPDFExc` constructor
+/// (`libqpdf/QPDF.cc:2498-2500,2517-2529`; `libqpdf/QPDF_encryption.cc:
+/// 1122-1128`): both build the exception's filename from the *source*
+/// `InputSource`, never from `qpdf_for_warning`. `None` here reproduces
+/// qpdf's non-foreign overload, where `file` and `qpdf_for_warning` are the
+/// same `QPDF` (`libqpdf/QPDF.cc:2541-2552`) and `warning_sink`'s own
+/// description is already correct.
 #[allow(clippy::too_many_arguments)]
 fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
     encryption_parameters: &Rc<RefCell<Option<crate::reader::EncryptionState>>>,
     recovered_stream_eol_length: usize,
     warning_sink: &dyn DocumentResolver,
+    description_override: Option<&str>,
     object_ref: ObjectRef,
     offset: i64,
     length: usize,
@@ -3079,6 +3115,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         return pipe_stream_data_to_pipeline_for_input(
             input,
             warning_sink,
+            description_override,
             object_ref,
             offset,
             length,
@@ -3093,6 +3130,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         return pipe_stream_data_to_pipeline_for_input(
             input,
             warning_sink,
+            description_override,
             object_ref,
             offset,
             length,
@@ -3125,6 +3163,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         return pipe_stream_data_to_pipeline_for_input(
             input,
             warning_sink,
+            description_override,
             object_ref,
             offset,
             length,
@@ -3136,6 +3175,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
     if warn_unknown {
         warning_sink.warn_stream_data(
             input.last_offset(),
+            description_override,
             format!(
                 "unknown encryption filter for streams (check {}); \
                  streams may be decrypted improperly",
@@ -3148,6 +3188,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
         StreamDecryption::None => pipe_stream_data_to_pipeline_for_input(
             input,
             warning_sink,
+            description_override,
             object_ref,
             offset,
             length,
@@ -3161,6 +3202,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             pipe_stream_data_to_pipeline_for_input(
                 input,
                 warning_sink,
+                description_override,
                 object_ref,
                 offset,
                 length,
@@ -3175,6 +3217,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
             pipe_stream_data_to_pipeline_for_input(
                 input,
                 warning_sink,
+                description_override,
                 object_ref,
                 offset,
                 length,
@@ -3190,6 +3233,7 @@ fn pipe_stream_data_from_input<R: Read + Seek + 'static>(
 fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
     input: &StreamInput<R>,
     warning_sink: &dyn DocumentResolver,
+    description_override: Option<&str>,
     object_ref: ObjectRef,
     offset: i64,
     length: usize,
@@ -3204,20 +3248,26 @@ fn pipe_stream_data_to_pipeline_for_input<R: Read + Seek + 'static>(
         return Ok(true);
     };
 
+    // `description_override` is fixed for the whole call (it names the
+    // source input this piping reads from, not the failure), so it is
+    // captured once here rather than threaded as a fourth positional
+    // argument to every `warn_stream_data` call below.
+    let warn =
+        |at: u64, message: String| warning_sink.warn_stream_data(at, description_override, message);
+
     if !suppress_warnings {
         match failure {
             PipeFailure::ShortRead { at } => {
-                warning_sink
-                    .warn_stream_data(at, "unexpected EOF reading stream data".to_owned())?;
+                warn(at, "unexpected EOF reading stream data".to_owned())?;
             }
             PipeFailure::Decoding { at, ref detail } => {
                 let og = format!("{} {}", object_ref.number, object_ref.generation);
-                warning_sink.warn_stream_data(
+                warn(
                     at,
                     format!("error decoding stream data for object {og}: {detail}"),
                 )?;
                 if will_retry {
-                    warning_sink.warn_stream_data(
+                    warn(
                         at,
                         "stream will be re-processed without filtering to avoid data loss"
                             .to_owned(),
@@ -3600,8 +3650,13 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         self.push_object_warning(message)
     }
 
-    fn warn_stream_data(&self, offset: u64, message: String) -> Result<()> {
-        self.push_warning_at(offset, message)
+    fn warn_stream_data(
+        &self,
+        offset: u64,
+        description_override: Option<&str>,
+        message: String,
+    ) -> Result<()> {
+        self.push_warning_with_offset(Some(offset), description_override, message)
     }
 
     fn pipe_stream_data(
@@ -4169,6 +4224,91 @@ mod tests {
             .expect_err("destination lifetime must be checked at pipe time");
         assert!(matches!(error, Error::Internal(message)
             if message == "foreign stream destination resolver is no longer live"));
+    }
+
+    /// qpdf's `pipeForeignStreamData` builds the damaged-PDF exception from
+    /// the captured source `InputSource` (`foreign->file`), not from the
+    /// destination `QPDF`: `pipeStreamData`'s static overload throws
+    /// `damagedPDF(file, "", offset, message)`, which bakes `file->getName()`
+    /// in as the exception's filename before `qpdf_for_warning.warn(e)` ever
+    /// runs (`libqpdf/QPDF.cc:2477-2585`). `QPDF::warn(QPDFExc const&)` just
+    /// pushes that already-built exception into the destination's warning
+    /// list and logs it — it never reconstructs the filename from its own
+    /// `m->file` (`libqpdf/QPDF.cc:488-494`). So a stream copied from a named
+    /// source into a differently named destination must still report the
+    /// source's name when its deferred read fails, even though the failure
+    /// is collected and logged through the destination.
+    #[test]
+    fn foreign_deferred_read_failure_reports_the_source_description() {
+        let source_bytes = b"%PDF-1.4\nshort".to_vec();
+        let parsed_offset = 9i64;
+        let available = source_bytes.len() - 9;
+        let declared_length = available + 100;
+
+        let source = ResolverHandle::new_shared(
+            Cursor::new(source_bytes),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false, // already_reconstructed
+            BTreeSet::new(),
+            Diagnostics::default(),
+            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, "source.pdf".to_owned()),
+            0,
+        );
+        let source_stream = source.direct_object_handle(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_length: declared_length,
+            stream_provider: None,
+        });
+        source_stream.set_parsed_offset_if_unset(parsed_offset);
+        let source_stream = source
+            .make_indirect_from_object_handle(source_stream)
+            .expect("source stream registers under a fresh identity");
+
+        let logger = crate::QPDFLogger::create();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        logger.set_warn(Some(crate::pipeline::PipelineHandle::new(
+            WarningRecordingSink(std::sync::Arc::clone(&output)),
+        )));
+        let destination = ResolverHandle::new_shared(
+            Cursor::new(Vec::new()),
+            0,
+            BTreeMap::<ObjectRef, XrefEntry>::new(),
+            false,
+            false, // already_reconstructed
+            BTreeSet::new(),
+            Diagnostics::default(),
+            ResolverWarningOptions::new(logger, false, "destination.pdf".to_owned()),
+            0,
+        );
+        let destination_erased: Rc<dyn DocumentResolver> = destination.clone();
+        let destination_resolver = Rc::downgrade(&destination_erased);
+
+        let provider = source
+            .original_stream_data_provider_for_destination(
+                &source_stream,
+                &ObjectHandle::dictionary(Vec::new()),
+                destination_resolver,
+            )
+            .expect("original foreign source metadata");
+
+        let mut sink = crate::pipeline::buffer::Buffer::new("foreign stream", None);
+        let ok = provider
+            .provide_stream_data_with_retry_by_id(0, 0, &mut sink, false, false)
+            .expect("decryptStream preparation");
+        assert!(!ok, "a truncated foreign read fails");
+
+        let logged = String::from_utf8(output.lock().unwrap().clone()).expect("utf8 log");
+        assert!(
+            logged.contains("source.pdf"),
+            "warning must name the source document: {logged}"
+        );
+        assert!(
+            !logged.contains("destination.pdf"),
+            "warning must not attribute the source's location to the destination: {logged}"
+        );
     }
 
     #[test]
@@ -4830,7 +4970,12 @@ mod tests {
             Ok(())
         }
 
-        fn warn_stream_data(&self, _offset: u64, _message: String) -> crate::Result<()> {
+        fn warn_stream_data(
+            &self,
+            _offset: u64,
+            _description_override: Option<&str>,
+            _message: String,
+        ) -> crate::Result<()> {
             Err(Error::Internal("stream warning sink failed".to_owned()))
         }
     }
@@ -5339,6 +5484,7 @@ mod tests {
             &encryption_parameters,
             0,
             &warning_sink,
+            None,
             ObjectRef::new(4, 0),
             0,
             0,
