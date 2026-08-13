@@ -31,6 +31,7 @@
 use std::io::{Read, Seek};
 use std::rc::Rc;
 
+use crate::content_stream::{parse_content_stream_data, ParseControl, ParserCallbacks};
 use crate::default_appearance::parse_default_appearance;
 #[cfg(test)]
 use crate::default_appearance::TextColor;
@@ -41,12 +42,12 @@ use crate::object::write_literal_string;
 use crate::object_handle::ObjectHandle;
 use crate::page_object_helper::PageBox;
 use crate::standard_font_metrics::StandardFont;
-use crate::{Error, ObjectRef, Pdf, Result};
+use crate::{Error, Object, ObjectRef, Pdf, Result};
 
 #[cfg(test)]
 use crate::ref_chain::resolve_ref_chain;
 #[cfg(test)]
-use crate::{Dictionary, Object, Stream};
+use crate::{Dictionary, Stream};
 
 // ── Public-crate helpers ─────────────────────────────────────────────────────
 
@@ -373,6 +374,86 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
     Ok(Some(xobj_ref))
 }
 
+/// Substitute `/DA`'s `Tf` size operand with `resolved_font_size` when it
+/// differs from the parsed literal by more than qpdf's `0.001` tolerance,
+/// mirroring `TfFinder::getDA()` (`QPDFFormFieldObjectHelper.cc:729-746`).
+///
+/// Returns `default_appearance` unchanged when no `<name> <size> Tf` pattern
+/// is present at all: qpdf's `tf_idx` never matches a token index when
+/// `/DA` has no `Tf` operator (`tf_idx` stays `-1`,
+/// `QPDFFormFieldObjectHelper.cc:689-716`), so `getDA()` performs no
+/// substitution there and no `Tf` operator is invented either.
+///
+/// Unlike qpdf's raw last-number/last-name tracking (which persists across
+/// unrelated operators), this locates the candidate operand using the same
+/// `<name> <size> Tf` operand-stack pattern as [`parse_default_appearance`]
+/// (operands clear at every operator boundary), so the two functions always
+/// agree on which `Tf` occurrence is authoritative. This is within the
+/// module's documented observable-equivalence policy for `/DA` text, not
+/// byte-identical reproduction of qpdf's own token-level bookkeeping.
+fn substitute_da_tf_operand(default_appearance: &[u8], resolved_font_size: f64) -> Vec<u8> {
+    struct TfOperandFinder {
+        operands: Vec<(Object, usize, usize)>,
+        tf_size_span: Option<(usize, usize, f64)>,
+    }
+
+    impl ParserCallbacks for TfOperandFinder {
+        fn handle_object(
+            &mut self,
+            object: Object,
+            offset: usize,
+            length: usize,
+        ) -> Result<ParseControl> {
+            match object {
+                Object::Operator(operator) => {
+                    if operator == b"Tf" {
+                        if let [.., name, size] = self.operands.as_slice() {
+                            if let (Some(_), Some(value)) = (
+                                name.0.as_name(),
+                                size.0
+                                    .as_real()
+                                    .or_else(|| size.0.as_integer().map(|n| n as f64)),
+                            ) {
+                                self.tf_size_span = Some((size.1, size.2, value));
+                            }
+                        }
+                    }
+                    self.operands.clear();
+                }
+                Object::InlineImage(_) => {}
+                operand => self.operands.push((operand, offset, length)),
+            }
+            Ok(ParseControl::Continue)
+        }
+
+        fn handle_eof(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut finder = TfOperandFinder {
+        operands: Vec::new(),
+        tf_size_span: None,
+    };
+    // Best-effort, matching parse_default_appearance's own "skip malformed,
+    // last wins" recovery: a parse error partway through still leaves
+    // whatever valid Tf occurrence was already found in place.
+    let _ = parse_content_stream_data(default_appearance, &mut finder);
+
+    let Some((offset, length, raw_value)) = finder.tf_size_span else {
+        return default_appearance.to_vec();
+    };
+    if (raw_value - resolved_font_size).abs() <= 0.001 {
+        return default_appearance.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(default_appearance.len());
+    out.extend_from_slice(&default_appearance[..offset]);
+    out.extend_from_slice(fmt_f64(resolved_font_size).as_bytes());
+    out.extend_from_slice(&default_appearance[offset + length..]);
+    out
+}
+
 /// Reproduce qpdf 11.9.0's `ValueSetter::writeAppearance` layout. In
 /// particular, `/I` and `/TI` are intentionally not consulted: the qpdf
 /// implementation reads only `/V` and (for non-combo fields) `/Opt` before
@@ -440,7 +521,7 @@ fn build_qpdf_choice_appearance_content(
     }
     y -= font_size;
     out.extend_from_slice(b"q\nBT\n");
-    out.extend_from_slice(default_appearance);
+    out.extend_from_slice(&substitute_da_tf_operand(default_appearance, font_size));
     out.push(b'\n');
     for (index, line) in lines.iter().enumerate() {
         if index == 0 {
@@ -2803,6 +2884,103 @@ mod tests {
             .any(|window| window == b"(text)"));
     }
 
+    // ── canonical Tf-operand substitution (flpdf-25kg.3.8.2.1) ───────────────
+
+    #[test]
+    fn canonical_tx_substitutes_out_of_range_da_tf_operand_in_emitted_content() {
+        // Empirical repro from the bd issue: /DA "/Helv 0 Tf 0 g" resolves
+        // font_size to 11pt (auto-size) for layout, but the emitted content
+        // stream previously kept the raw "0" Tf operand verbatim, making the
+        // text invisible in any spec-compliant viewer despite the layout
+        // math assuming 11pt.
+        let raw = build_pdf_autosize_tx();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let stream = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream).expect("resolve xobj");
+        let content = stream.as_stream_data().expect("appearance data");
+        assert!(
+            content
+                .windows(b"/Helv 11 Tf".len())
+                .any(|w| w == b"/Helv 11 Tf"),
+            "resolved 11pt Tf operand missing from {:?}",
+            String::from_utf8_lossy(&content)
+        );
+        assert!(
+            !content
+                .windows(b"/Helv 0 Tf".len())
+                .any(|w| w == b"/Helv 0 Tf"),
+            "stale unsubstituted 0 Tf operand still present in {:?}",
+            String::from_utf8_lossy(&content)
+        );
+    }
+
+    /// PDF whose `/DA` has no `Tf` token at all (only a colour operator).
+    fn build_pdf_da_without_tf_token() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Plain) /Rect [10 10 200 30]>>\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 5 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_with_no_tf_token_in_da_does_not_invent_one() {
+        // NOTES correction on flpdf-25kg.3.8.2.1: qpdf never invents a Tf
+        // operator when /DA has none -- it only uses the resolved 11pt
+        // default for layout math. The emitted content must copy the DA's
+        // "0 g" through unchanged, with no Tf operator anywhere.
+        let raw = build_pdf_da_without_tf_token();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        let stream = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream).expect("resolve xobj");
+        let content = stream.as_stream_data().expect("appearance data");
+        assert!(
+            content.windows(b"0 g".len()).any(|w| w == b"0 g"),
+            "original DA color operator missing from {:?}",
+            String::from_utf8_lossy(&content)
+        );
+        assert!(
+            !content.windows(2).any(|w| w == b"Tf"),
+            "no Tf operator must be invented when /DA has none, found one in {:?}",
+            String::from_utf8_lossy(&content)
+        );
+    }
+
     #[test]
     fn canonical_choice_uses_qpdf_value_and_choices_boundary() {
         let raw = build_ch_pdf_obj4(
@@ -3121,6 +3299,57 @@ mod tests {
             result.unwrap().is_some(),
             "extreme bbox/font-size must still produce an appearance"
         );
+    }
+
+    // ── substitute_da_tf_operand: direct-function-level (flpdf-25kg.3.8.2.1) ─
+
+    #[test]
+    fn substitute_da_tf_operand_replaces_out_of_range_operand() {
+        // The bd issue's exact repro: /Helv 0 Tf 0 g resolves to 11pt
+        // (auto-size), but the raw "0" Tf operand was previously copied
+        // through unmodified.
+        let out = substitute_da_tf_operand(b"/Helv 0 Tf 0 g", 11.0);
+        assert_eq!(out, b"/Helv 11 Tf 0 g");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_leaves_in_range_operand_untouched() {
+        // When the resolved font_size matches the DA's own operand (delta
+        // within qpdf's 0.001 tolerance), no substitution occurs and the
+        // bytes are unchanged -- not just numerically equal.
+        let out = substitute_da_tf_operand(b"/Helv 12 Tf 0 g", 12.0);
+        assert_eq!(out, b"/Helv 12 Tf 0 g");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_no_tf_token_returns_unchanged() {
+        // NOTES correction on flpdf-25kg.3.8.2.1: qpdf's tf_idx never
+        // matches when /DA has no Tf token at all, so getDA() performs no
+        // substitution and no Tf operator is invented either.
+        let out = substitute_da_tf_operand(b"0 g", 11.0);
+        assert_eq!(out, b"0 g");
+        assert!(!out.windows(2).any(|w| w == b"Tf"));
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_tf_with_no_preceding_number_returns_unchanged() {
+        // A malformed "Tf" with nothing numeric before it: qpdf's tf_idx is
+        // only set from a preceding number token, so this must not invent a
+        // substitution out of thin air either.
+        let out = substitute_da_tf_operand(b"Tf 0 g", 11.0);
+        assert_eq!(out, b"Tf 0 g");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_multi_tf_only_substitutes_the_last_occurrence() {
+        // qpdf's TfFinder overwrites tf_idx on every Tf token it sees, so
+        // only the *last* Tf's operand is a substitution candidate -- the
+        // first Tf's "12" must stay untouched even though it precedes the
+        // out-of-range "0" that does get substituted. This is the case that
+        // would catch a span-finder that disagrees with
+        // parse_default_appearance's own "last Tf wins" resolution.
+        let out = substitute_da_tf_operand(b"/Helv 12 Tf /Cour 0 Tf", 11.0);
+        assert_eq!(out, b"/Helv 12 Tf /Cour 11 Tf");
     }
 
     /// PDF whose `/DA` references a `/DR` resource key (`/F1`) rather than a
