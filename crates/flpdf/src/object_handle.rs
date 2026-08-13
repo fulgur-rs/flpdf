@@ -1780,26 +1780,44 @@ impl ObjectHandle {
                         // production consumers land with flpdf-25kg.3.6
     pub(crate) fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
         let slot = self.0.borrow();
-        slot.resolver
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .or_else(|| {
-                if let Some(ObjectDescription::Child(child)) = &slot.description {
-                    child
-                        .parent
-                        .upgrade()
-                        .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                slot.containment_parents.iter().find_map(|parent| {
-                    parent
-                        .upgrade()
-                        .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
-                })
-            })
+        if let Some(resolver) = slot.resolver.as_ref().and_then(Weak::upgrade) {
+            return Some(resolver);
+        }
+
+        if let Some(ObjectDescription::Child(child)) = &slot.description {
+            let resolver = child
+                .parent
+                .upgrade()
+                .and_then(|parent| parent.borrow().resolver.as_ref().and_then(Weak::upgrade));
+            if let Some(resolver) = resolver {
+                return Some(resolver);
+            }
+        }
+
+        // qpdf's literal `QPDFObjectHandle::newNull()` carries neither a
+        // QPDF* nor a resolver, even when it is nested below a document-owned
+        // array, dictionary, or stream dictionary
+        // (`libqpdf/QPDF_Null.cc:12-15`, `QPDFParser.cc:397-410`). Do not lend
+        // it the parent's context through our containment back-links: a
+        // dictionary accessor on that null must take qpdf's contextless
+        // exception path. A dictionary-missing-key null is different: qpdf's
+        // `setChildDescription` copies the parent QPDF* onto it
+        // (`libqpdf/QPDFObject_private.hh:79-91`), so the Child description
+        // branch above intentionally preserves that context-aware warning.
+        // Non-null direct children still use the parent fallback below, and
+        // indirect nulls retain their own resolver above.
+        if matches!(
+            &*slot.state.borrow(),
+            ObjectState::Resolved(ObjectValue::Null)
+        ) {
+            return None;
+        }
+
+        slot.containment_parents.iter().find_map(|parent| {
+            parent
+                .upgrade()
+                .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
+        })
     }
 
     #[allow(dead_code)]
@@ -15496,6 +15514,78 @@ pub(crate) mod warning_emission_tests {
             .unwrap();
         assert_eq!(
             warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn nested_lifted_nulls_keep_qpdfs_contextless_dictionary_contract() {
+        fn assert_contextless_dictionary_access(handle: ObjectHandle) {
+            let error = handle
+                .try_get_keys()
+                .expect_err("qpdf newNull has no owning document context");
+            assert!(matches!(
+                error,
+                crate::Error::System(ref message)
+                    if message
+                        == "operation for dictionary attempted on object of type null: treating as empty"
+            ));
+        }
+
+        let (array, array_recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::null()]));
+        let array_null = array
+            .try_array_item(0)
+            .unwrap()
+            .expect("array contains the lifted null");
+        assert_contextless_dictionary_access(array_null);
+        assert!(warnings(&array_recorder).is_empty());
+
+        let (dictionary, dictionary_recorder) = handle_resolving(ObjectValue::Dictionary(
+            [(b"/Null".to_vec(), ObjectHandle::null())]
+                .into_iter()
+                .collect(),
+        ));
+        let dictionary_null = dictionary.try_get_key(b"/Null").unwrap();
+        assert_contextless_dictionary_access(dictionary_null);
+        assert!(warnings(&dictionary_recorder).is_empty());
+
+        let contextless_dictionary = ObjectHandle::dictionary(vec![]);
+        let missing_key_null = contextless_dictionary.try_get_key(b"/Missing").unwrap();
+        let error = missing_key_null
+            .try_get_keys()
+            .expect_err("qpdf missing-key null has no context without a document");
+        assert!(matches!(
+            error,
+            crate::Error::System(ref message)
+                if message
+                    == " -> dictionary key /Missing: operation for dictionary attempted on object of type null: treating as empty"
+        ));
+
+        let (stream, stream_recorder) = handle_resolving(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![(b"/Null".to_vec(), ObjectHandle::null())]),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
+            stream_length: 0,
+        });
+        stream.try_dereference().unwrap();
+        let stream_null = stream
+            .as_stream_dict()
+            .expect("stream has a dictionary")
+            .try_get_key(b"/Null")
+            .unwrap();
+        assert_contextless_dictionary_access(stream_null);
+        assert!(warnings(&stream_recorder).is_empty());
+
+        let (non_null, non_null_recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::integer(7)]));
+        let non_null_child = non_null
+            .try_array_item(0)
+            .unwrap()
+            .expect("array contains the integer");
+        assert!(non_null_child.try_get_keys().unwrap().is_empty());
+        assert_eq!(
+            warnings(&non_null_recorder),
             ["operation for dictionary attempted on object of type integer: treating as empty"]
         );
     }
