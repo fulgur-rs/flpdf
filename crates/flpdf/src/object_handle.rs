@@ -6457,6 +6457,13 @@ pub(crate) mod identity_tests {
             Err(Error::Internal(message))
                 if message == "stream data copy requested from a resolver without a document"
         ));
+        assert!(matches!(
+            resolver.original_stream_data_provider(&ObjectHandle::null(), &ObjectHandle::null()),
+            Err(Error::Internal(message))
+                if message == "original stream data provider requested from a resolver without a document"
+        ));
+        assert!(!ObjectHandle::integer(1).has_stream_data_provider());
+        assert_eq!(ObjectHandle::integer(1).stream_source_length(), None);
         assert!(!resolver.immediate_copy_from());
     }
 

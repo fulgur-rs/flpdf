@@ -881,9 +881,13 @@ impl<R: Read + Seek> ResolverHandle<R> {
         let stream_length = source.stream_source_length().ok_or_else(|| {
             Error::Internal("original foreign stream has no stream length".to_owned())
         })?;
+        // cov:ignore-start: ResolverHandle::new_shared always installs a live
+        // self_weak; only an invalid manually-constructed resolver could reach
+        // this branch.
         let resolver = self.self_weak.upgrade().ok_or_else(|| {
             Error::Internal("original foreign stream resolver is no longer live".to_owned())
         })?;
+        // cov:ignore-end
         Ok(Rc::new(OriginalStreamDataProvider {
             resolver,
             object_ref,
@@ -3953,6 +3957,48 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         )
+    }
+
+    #[test]
+    fn foreign_copy_stream_requires_an_owning_source_resolver() {
+        let resolver = bare_resolver();
+        let destination = resolver.new_stream_handle().expect("destination stream");
+        let source = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_provider: None,
+            stream_length: 0,
+        });
+
+        let error = resolver
+            .copy_stream_data(&destination, &source)
+            .expect_err("an original stream without a document cannot be copied lazily");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "original foreign stream has no owning document resolver"));
+    }
+
+    #[test]
+    fn foreign_original_stream_provider_reports_invalid_source_shapes() {
+        let resolver = bare_resolver();
+        let destination_dict = ObjectHandle::dictionary(Vec::new());
+        let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: destination_dict.clone(),
+            stream_data: None,
+            stream_provider: None,
+            stream_length: 0,
+        });
+        let error = resolver
+            .original_stream_data_provider(&direct_stream, &destination_dict)
+            .expect_err("a direct stream has no source object identity");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "original foreign stream has no object reference"));
+
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let error = resolver
+            .original_stream_data_provider(&unresolved, &destination_dict)
+            .expect_err("an unresolved non-stream handle has no source stream length");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "original foreign stream has no stream length"));
     }
 
     #[test]

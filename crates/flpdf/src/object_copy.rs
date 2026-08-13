@@ -13,11 +13,12 @@
 //! boundary, destination reservations, and deferred stream source dispatch
 //! (`libqpdf/QPDF.cc:2019-2272`). qpdf's `ot_reserved` value is an internal
 //! construction sentinel, not a user-visible object value; this port keeps
-//! the equivalent reservation as a destination-owned `new_reserved()` slot and
-//! replaces that slot in place before returning it. The one intentional qpdf
-//! exception is a Page boundary, whose reservation is an indirect null so the
-//! boundary is returned without copying its descendants. A foreign reserved
-//! sentinel is rejected during reservation with qpdf's exact error contract.
+//! the equivalent reservation as a destination-owned indirect null slot and
+//! replaces that slot in place before returning it. qpdf's
+//! `reserveObjects` uses `newIndirectNull()` for every non-stream indirect
+//! object, including Page boundaries; a nested Page is simply not traversed.
+//! A foreign reserved sentinel is rejected during reservation with qpdf's
+//! exact error contract.
 //!
 //! # Boundary semantics
 //!
@@ -156,24 +157,19 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             } else {
                 let mapped = if is_stream {
                     self.target.new_stream()?
-                } else if is_page {
-                    // qpdf deliberately uses an indirect null for Page
-                    // boundaries (including a top-level Page), while ordinary
-                    // non-stream objects use QPDF_Reserved
-                    // (`QPDF.cc:2124-2132`). A nested Page is returned as this
-                    // null boundary without traversing into its children.
+                } else {
+                    // qpdf's reserveObjects uses newIndirectNull for all
+                    // non-stream objects. The null is replaced in place after
+                    // graph traversal (`QPDF.cc:2124-2132,2185-2189`).
                     self.target
                         .make_indirect_from_object_handle(ObjectHandle::null())?
-                } else {
-                    // qpdf allocates QPDF_Reserved here, not a serialized null:
-                    // `reserveObjects` uses `newReserved`, then `replaceReserved`
-                    // assigns the copied direct value into the same identity
-                    // (`libqpdf/QPDF.cc:2032-2045,2071-2087`).
-                    self.target.new_reserved()?
                 };
+                // cov:ignore-start: every reservation branch above returns an indirect handle;
+                // this protects the canonical map invariant if a future allocator changes.
                 let target_ref = mapped.object_ref().ok_or_else(|| {
                     Error::Internal("foreign copier created a direct reservation".to_owned())
                 })?;
+                // cov:ignore-end
                 self.object_map.insert(source_ref, target_ref);
             }
 
@@ -238,9 +234,12 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                     "QPDF::copyForeign encountered a direct stream object".to_owned(),
                 ));
             }
+            // cov:ignore-start: an indirect stream always carries its object identity;
+            // direct streams are rejected by the preceding branch.
             let source_ref = foreign.object_ref().ok_or_else(|| {
                 Error::Internal("foreign stream has no object reference".to_owned())
             })?;
+            // cov:ignore-end
             let target_ref = self.object_map[&source_ref];
             let destination = self.target.get_object_handle(target_ref);
             let destination_dictionary = destination.as_stream_dict().ok_or_else(|| {
@@ -280,9 +279,12 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         }
 
         let direct = foreign.shallow_copy()?;
+        // cov:ignore-start: shallow_copy always returns a direct value, so this
+        // is an invariant guard for a future ObjectHandle state.
         let value = direct.direct_value_clone()?.ok_or_else(|| {
             Error::Internal("foreign scalar copy did not produce a direct value".to_owned())
         })?;
+        // cov:ignore-end
         Ok(self.target.resolver.direct_object_handle(value))
     }
 }
@@ -713,6 +715,113 @@ mod tests {
         assert!(matches!(error, Error::System(message)
             if message == "QPDF: attempting to copy a foreign reserved object"));
         assert_eq!(target.object_refs(), target_refs_before);
+    }
+
+    fn empty_copier<'a>(
+        target: &'a mut Pdf<Cursor<Vec<u8>>>,
+    ) -> ForeignObjectCopier<'a, Cursor<Vec<u8>>> {
+        ForeignObjectCopier {
+            target,
+            object_map: BTreeMap::new(),
+            visiting: BTreeSet::new(),
+            direct_visiting: Vec::new(),
+            to_copy: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn foreign_copier_defensive_invariants_are_reported() {
+        let error = {
+            let mut target = minimal_pdf();
+            let mut copier = empty_copier(&mut target);
+            copier.visiting.insert(ObjectRef::new(900, 0));
+            copier
+                .run(&ObjectHandle::integer(1))
+                .expect_err("a stale visiting set must be rejected")
+        };
+        assert!(matches!(error, Error::Internal(message)
+            if message == "foreign object copier retained a visiting object"));
+
+        let error = {
+            let mut target = minimal_pdf();
+            let mut copier = empty_copier(&mut target);
+            copier.to_copy.push(ObjectHandle::integer(1));
+            copier
+                .run(&ObjectHandle::integer(2))
+                .expect_err("a direct queued object must be rejected")
+        };
+        assert!(matches!(error, Error::Internal(message)
+            if message == "foreign copier queued a direct object"));
+
+        let error = {
+            let mut target = minimal_pdf();
+            let mut copier = empty_copier(&mut target);
+            copier
+                .run(&ObjectHandle::integer(3))
+                .expect_err("a direct copier root must be rejected")
+        };
+        assert!(matches!(error, Error::System(message)
+            if message == "QPDF::copyForeign called with direct object handle"));
+    }
+
+    #[test]
+    fn foreign_copier_stops_reservation_on_a_direct_identity_cycle() {
+        let direct = ObjectHandle::dictionary(Vec::new());
+        direct.replace_key(b"/Self", direct.clone());
+        let mut target = minimal_pdf();
+        let mut copier = empty_copier(&mut target);
+
+        copier
+            .reserve_objects(direct, true)
+            .expect("direct identity cycles are bounded during reservation");
+    }
+
+    #[test]
+    fn copy_foreign_object_rejects_a_direct_stream_child() {
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"direct stream".to_vec()),
+        );
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Stream", direct_stream);
+
+        let error = target
+            .copy_foreign_object(&root)
+            .expect_err("a direct stream has no qpdf foreign-copy route");
+        assert!(matches!(error, Error::System(message)
+            if message == "QPDF::copyForeign encountered a direct stream object"));
+    }
+
+    #[test]
+    fn foreign_copier_rejects_a_non_stream_destination_reservation() {
+        let source = minimal_pdf();
+        let source_stream = source.new_stream().expect("source stream");
+        let source_ref = source_stream.object_ref().expect("source stream identity");
+        let mut target = minimal_pdf();
+        let wrong_destination = target
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("wrong destination");
+        let wrong_ref = wrong_destination
+            .object_ref()
+            .expect("wrong destination identity");
+        let error = {
+            let mut copier = ForeignObjectCopier {
+                target: &mut target,
+                object_map: BTreeMap::from([(source_ref, wrong_ref)]),
+                visiting: BTreeSet::new(),
+                direct_visiting: Vec::new(),
+                to_copy: Vec::new(),
+            };
+            copier
+                .replace_foreign_indirect_objects(source_stream, true)
+                .expect_err("a stream must map to a stream destination")
+        };
+        assert!(matches!(error, Error::Internal(message)
+            if message == "foreign stream reservation is not a stream"));
     }
 
     #[test]
