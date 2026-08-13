@@ -357,6 +357,7 @@ pub(crate) struct NNTreeCursor<K: TreeKey> {
     item_number: Option<usize>,
     raw: Option<(Object, Object)>,
     current: Option<(K::Key, Object)>,
+    current_handle: Option<(K::Key, ObjectHandle)>,
     /// qpdf's iterator retains `QPDFObjectHandle`s owned by one `QPDF`
     /// (`QPDFObjectHandle.hh:852-872`, `NNTree.cc:30-73`). Keep the same
     /// document boundary when the Rust API receives a cursor and a `Pdf`
@@ -373,6 +374,7 @@ impl<K: TreeKey> NNTreeCursor<K> {
             item_number: None,
             raw: None,
             current: None,
+            current_handle: None,
             pdf_id: None,
             marker: PhantomData,
         }
@@ -414,6 +416,14 @@ impl<K: TreeKey> NNTreeCursor<K> {
         self.current.clone()
     }
 
+    fn cloned_current_handle(&self) -> Option<(K::Key, ObjectHandle)> {
+        self.current_handle.clone()
+    }
+
+    fn current_key(&self) -> Option<&K::Key> {
+        self.current_handle.as_ref().map(|(key, _value)| key)
+    }
+
     #[allow(dead_code)]
     fn cloned_raw_current(&self) -> Option<(Object, Object)> {
         self.raw.clone()
@@ -424,6 +434,7 @@ impl<K: TreeKey> NNTreeCursor<K> {
         self.item_number = None;
         self.raw = None;
         self.current = None;
+        self.current_handle = None;
     }
 
     fn same_position(&self, other: &Self) -> bool {
@@ -455,6 +466,7 @@ impl<K: TreeKey> Clone for NNTreeCursor<K> {
             item_number: self.item_number,
             raw: self.raw.clone(),
             current: self.current.clone(),
+            current_handle: self.current_handle.clone(),
             pdf_id: self.pdf_id,
             marker: PhantomData,
         }
@@ -468,6 +480,7 @@ pub(crate) struct NNTree<K: TreeKey> {
     legacy_root_snapshot: Object,
     canonical_root: Option<ObjectHandle>,
     canonical_root_pdf_id: Option<u64>,
+    legacy_projection: bool,
     auto_repair: bool,
     split_threshold: usize,
     max_depth: Option<usize>,
@@ -1183,6 +1196,74 @@ impl NumberTree {
     }
 }
 
+/// Handle-native name-tree facade for qpdf-shaped consumers.
+///
+/// Unlike [`NameTree`], this facade has no raw [`Object`] projection. The
+/// root, cursor values, insertions, and removals all remain live
+/// [`ObjectHandle`]s, so a direct child keeps its qpdf identity through tree
+/// repair and mutation. The shared [`NNTree`] implementation still owns the
+/// traversal, split, limits, and auto-repair rules.
+pub(crate) struct HandleNameTree {
+    inner: NNTree<NameKey>,
+}
+
+#[allow(dead_code)] // the facade is consumed by the next stacked consumer layer
+impl HandleNameTree {
+    pub(crate) fn new(root: ObjectHandle, pdf_id: u64, auto_repair: bool) -> Self {
+        Self {
+            inner: NNTree::from_handle(root, pdf_id, auto_repair),
+        }
+    }
+
+    pub(crate) fn find<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+    ) -> Result<Option<ObjectHandle>> {
+        let cursor = self.inner.find(pdf, &key.as_ref().to_vec(), false)?;
+        Ok(cursor.cloned_current_handle().map(|(_, value)| value))
+    }
+
+    pub(crate) fn insert<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+        value: ObjectHandle,
+    ) -> Result<()> {
+        self.inner
+            .insert_handle(pdf, key.as_ref().to_vec(), value)
+            .map(|_| ())
+    }
+
+    #[allow(dead_code)] // consumed by the EmbeddedFileDocumentHelper cutover above this layer
+    pub(crate) fn remove<R: Read + Seek, K: AsRef<[u8]>>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K,
+    ) -> Result<Option<ObjectHandle>> {
+        self.inner.remove_handle(pdf, &key.as_ref().to_vec())
+    }
+
+    #[allow(dead_code)] // consumed by the EmbeddedFileDocumentHelper cutover above this layer
+    pub(crate) fn entries<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+    ) -> Result<BTreeMap<Vec<u8>, ObjectHandle>> {
+        let mut result = BTreeMap::new();
+        let mut cursor = self.inner.begin(pdf)?;
+        if cursor.positioned() && cursor.cloned_current_handle().is_none() {
+            return Err(Error::Internal(
+                "attempt made to dereference an invalid name/number tree iterator".to_string(),
+            ));
+        }
+        while let Some((key, value)) = cursor.cloned_current_handle() {
+            result.insert(key, value);
+            self.inner.next(pdf, &mut cursor)?;
+        }
+        Ok(result)
+    }
+}
+
 /// Cursor over a [`NumberTree`].
 pub struct NumberTreeCursor {
     inner: NNTreeCursor<NumberKey>,
@@ -1304,11 +1385,21 @@ impl<K: TreeKey> NNTree<K> {
             root,
             canonical_root: None,
             canonical_root_pdf_id: None,
+            legacy_projection: true,
             auto_repair,
             split_threshold: DEFAULT_SPLIT_THRESHOLD,
             max_depth: None,
             marker: PhantomData,
         }
+    }
+
+    #[allow(dead_code)] // consumed by HandleNameTree in the next stacked layer
+    fn from_handle(root: ObjectHandle, pdf_id: u64, auto_repair: bool) -> Self {
+        let mut tree = Self::new(Object::Null, auto_repair);
+        tree.canonical_root = Some(root);
+        tree.canonical_root_pdf_id = Some(pdf_id);
+        tree.legacy_projection = false;
+        tree
     }
 
     pub(crate) fn root(&self) -> &Object {
@@ -1322,7 +1413,8 @@ impl<K: TreeKey> NNTree<K> {
     fn ensure_canonical_root<R: Read + Seek>(&mut self, pdf: &mut Pdf<R>) -> Result<ObjectHandle> {
         let pdf_id = pdf.unique_id();
         if let Some(root) = &self.canonical_root {
-            if self.canonical_root_pdf_id == Some(pdf_id) && self.root == self.legacy_root_snapshot
+            if self.canonical_root_pdf_id == Some(pdf_id)
+                && (!self.legacy_projection || self.root == self.legacy_root_snapshot)
             {
                 return Ok(root.clone());
             }
@@ -1344,6 +1436,9 @@ impl<K: TreeKey> NNTree<K> {
     }
 
     fn sync_legacy_root(&mut self) -> Result<()> {
+        if !self.legacy_projection {
+            return Ok(());
+        }
         let Some(root) = &self.canonical_root else {
             return Ok(());
         };
@@ -1468,6 +1563,18 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree in the next stacked layer
+    fn insert_handle<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: K::Key,
+        value: ObjectHandle,
+    ) -> Result<NNTreeCursor<K>> {
+        let mut allocator = ObjectAllocator::default();
+        let result = self.insert_with_allocator(pdf, &mut allocator, key, value);
+        self.finish_mutation(result)
+    }
+
     fn insert_with_allocator<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1492,8 +1599,8 @@ impl<K: TreeKey> NNTree<K> {
         }
 
         let is_exact = cursor
-            .current()
-            .is_some_and(|(current_key, _)| K::compare(&key, current_key) == Ordering::Equal);
+            .current_key()
+            .is_some_and(|current_key| K::compare(&key, current_key) == Ordering::Equal);
         if is_exact {
             let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
             let item_number = cursor.item_number.expect("valid cursor has an item");
@@ -1588,6 +1695,20 @@ impl<K: TreeKey> NNTree<K> {
         Ok(Some(value))
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree::remove in the next stack layer
+    fn remove_handle<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        key: &K::Key,
+    ) -> Result<Option<ObjectHandle>> {
+        let mut cursor = self.find(pdf, key, false)?;
+        let Some((_, value)) = cursor.cloned_current_handle() else {
+            return Ok(None);
+        };
+        self.remove_at_handle(pdf, &mut cursor)?;
+        Ok(Some(value))
+    }
+
     pub(crate) fn remove_at<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1598,12 +1719,32 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree::remove in the next stack layer
+    fn remove_at_handle<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+    ) -> Result<Option<ObjectHandle>> {
+        cursor.ensure_pdf(pdf)?;
+        let result = self.remove_at_inner_handles(pdf, cursor);
+        self.finish_mutation(result)
+    }
+
     fn remove_at_inner<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
         cursor: &mut NNTreeCursor<K>,
     ) -> Result<Option<Object>> {
-        let Some((_, removed_value)) = cursor.cloned_current() else {
+        self.remove_at_inner_handles(pdf, cursor)?
+            .map_or(Ok(None), |value| materialize_cursor_value(&value).map(Some))
+    }
+
+    fn remove_at_inner_handles<R: Read + Seek>(
+        &mut self,
+        pdf: &mut Pdf<R>,
+        cursor: &mut NNTreeCursor<K>,
+    ) -> Result<Option<ObjectHandle>> {
+        let Some((_, removed_value)) = cursor.cloned_current_handle() else {
             return Ok(None);
         };
         let leaf = cursor.leaf.clone().expect("valid cursor has a leaf");
@@ -1644,6 +1785,7 @@ impl<K: TreeKey> NNTree<K> {
             cursor.item_number = None;
             cursor.raw = None;
             cursor.current = None;
+            cursor.current_handle = None;
             self.reset_limits(pdf, cursor, leaf, None)?;
             self.sync_legacy_root()?;
             return Ok(Some(removed_value));
@@ -1695,6 +1837,7 @@ impl<K: TreeKey> NNTree<K> {
         let mut replacement = NNTree::<K>::new(Object::Dictionary(Dictionary::new()), false);
         replacement.canonical_root = Some(replacement_root);
         replacement.canonical_root_pdf_id = Some(pdf.unique_id());
+        replacement.legacy_projection = self.legacy_projection;
 
         let mut allocator = ObjectAllocator::default();
         let mut cursor = self.begin(pdf)?;
@@ -2124,7 +2267,7 @@ impl<K: TreeKey> NNTree<K> {
         if !first.positioned() {
             return Ok(self.end());
         }
-        if let Some((first_key, _)) = first.current() {
+        if let Some(first_key) = first.current_key() {
             if K::compare(key, first_key) == Ordering::Less {
                 return Ok(self.end());
             }
@@ -2328,6 +2471,7 @@ impl<K: TreeKey> NNTree<K> {
         let original_item_number = cursor.item_number;
         let original_raw = cursor.raw.clone();
         let original_current = cursor.current.clone();
+        let original_current_handle = cursor.current_handle.clone();
         let mut seen: HashSet<NodeIdentity> = cursor
             .path
             .iter()
@@ -2402,6 +2546,7 @@ impl<K: TreeKey> NNTree<K> {
                 cursor.item_number = None;
                 cursor.raw = None;
                 cursor.current = None;
+                cursor.current_handle = None;
                 return Ok(true);
             }
 
@@ -2421,6 +2566,7 @@ impl<K: TreeKey> NNTree<K> {
         cursor.item_number = original_item_number;
         cursor.raw = original_raw;
         cursor.current = original_current;
+        cursor.current_handle = original_current_handle;
         Ok(false)
     }
 
@@ -2460,10 +2606,11 @@ impl<K: TreeKey> NNTree<K> {
                     self.warn(pdf, &leaf, "items array doesn't have enough elements")?;
                     cursor.raw = None;
                     cursor.current = None;
+                    cursor.current_handle = None;
                     continue;
                 }
                 self.update_current(pdf, cursor, true)?;
-                if cursor.current.is_some() {
+                if cursor.current_handle.is_some() {
                     return Ok(());
                 }
                 self.warn(pdf, &leaf, format!("item {candidate} has the wrong type"))?;
@@ -2504,7 +2651,7 @@ impl<K: TreeKey> NNTree<K> {
                     cursor.path[last_index].kid_number = kid_number;
                     let kid = self.prepare_kid(pdf, &parent, kid_number, kid_object)?;
                     if self.descend(pdf, cursor, kid, !backward, false)? {
-                        if cursor.current.is_none() {
+                        if cursor.current_handle.is_none() {
                             let item_number = cursor
                                 .item_number
                                 .expect("descended non-empty leaf has an item number");
@@ -2527,7 +2674,7 @@ impl<K: TreeKey> NNTree<K> {
             if !descended {
                 return Ok(());
             }
-            if cursor.current.is_some() {
+            if cursor.current_handle.is_some() {
                 return Ok(());
             }
         }
@@ -2539,8 +2686,9 @@ impl<K: TreeKey> NNTree<K> {
         cursor: &mut NNTreeCursor<K>,
         allow_invalid: bool,
     ) -> Result<()> {
-        cursor.current = None;
         cursor.raw = None;
+        cursor.current = None;
+        cursor.current_handle = None;
         let (Some(leaf), Some(item_number)) = (&cursor.leaf, cursor.item_number) else {
             return Ok(());
         };
@@ -2559,10 +2707,12 @@ impl<K: TreeKey> NNTree<K> {
         }
         let raw_key = items.values[item_number].clone();
         let raw_value = items.values[item_number + 1].clone();
-        cursor.raw = Some((
-            materialize_cursor_value(&raw_key)?,
-            materialize_cursor_value(&raw_value)?,
-        ));
+        if self.legacy_projection {
+            cursor.raw = Some((
+                materialize_cursor_value(&raw_key)?,
+                materialize_cursor_value(&raw_value)?,
+            ));
+        }
         let Some(key) = resolved_key::<K, _>(pdf, &raw_key)? else {
             if allow_invalid {
                 return Ok(());
@@ -2572,7 +2722,10 @@ impl<K: TreeKey> NNTree<K> {
                 format!("item at index {item_number} is not the right type"),
             ));
         };
-        cursor.current = Some((key, materialize_cursor_value(&raw_value)?));
+        cursor.current_handle = Some((key.clone(), raw_value.clone()));
+        if self.legacy_projection {
+            cursor.current = Some((key, materialize_cursor_value(&raw_value)?));
+        }
         Ok(())
     }
 
@@ -3511,6 +3664,111 @@ mod tests {
             normalized_utf8_value(&[0xf8, 0x88, 0x80, 0x80, 0x80]),
             "�".as_bytes()
         );
+    }
+
+    #[test]
+    fn handle_name_tree_keeps_live_direct_values_when_inserting() {
+        let mut pdf = empty_pdf();
+        let retained = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"old.txt".to_vec()),
+        )]);
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![ObjectHandle::string(b"a".to_vec()), retained.clone()]),
+            )]))
+            .expect("allocate name-tree root");
+
+        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        assert!(tree
+            .find(&mut pdf, b"a")
+            .expect("find existing value")
+            .expect("existing value")
+            .is_same_object_as(&retained));
+
+        tree.insert(&mut pdf, b"b", retained.clone())
+            .expect("insert direct value");
+        let inserted = tree
+            .find(&mut pdf, b"b")
+            .expect("find inserted value")
+            .expect("inserted value");
+        assert!(inserted.is_same_object_as(&retained));
+    }
+
+    #[test]
+    fn handle_name_tree_lists_and_removes_live_values_without_materializing() {
+        let mut pdf = empty_pdf();
+        let first = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"first.txt".to_vec()),
+        )]);
+        let second = ObjectHandle::dictionary(vec![(
+            b"/F".to_vec(),
+            ObjectHandle::string(b"second.txt".to_vec()),
+        )]);
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::string(b"a".to_vec()),
+                    first.clone(),
+                    ObjectHandle::string(b"b".to_vec()),
+                    second.clone(),
+                ]),
+            )]))
+            .expect("allocate name-tree root");
+
+        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        let entries = tree.entries(&mut pdf).expect("enumerate live values");
+        assert!(entries
+            .get(b"a".as_slice())
+            .expect("first entry")
+            .is_same_object_as(&first));
+        assert!(entries
+            .get(b"b".as_slice())
+            .expect("second entry")
+            .is_same_object_as(&second));
+
+        let removed = tree
+            .remove(&mut pdf, b"a")
+            .expect("remove existing value")
+            .expect("existing value");
+        assert!(removed.is_same_object_as(&first));
+        assert!(tree
+            .find(&mut pdf, b"a")
+            .expect("lookup removed value")
+            .is_none());
+        assert!(tree
+            .remove(&mut pdf, b"missing")
+            .expect("remove missing value")
+            .is_none());
+        assert!(tree
+            .find(&mut pdf, b"b")
+            .expect("lookup surviving value")
+            .expect("surviving value")
+            .is_same_object_as(&second));
+    }
+
+    #[test]
+    fn handle_name_tree_entries_rejects_an_invalid_first_key() {
+        let mut pdf = empty_pdf();
+        let root = pdf
+            .make_indirect_from_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Names".to_vec(),
+                ObjectHandle::array(vec![
+                    ObjectHandle::name(b"not-a-string".to_vec()),
+                    ObjectHandle::null(),
+                ]),
+            )]))
+            .expect("allocate malformed name-tree root");
+
+        let mut tree = HandleNameTree::new(root, pdf.unique_id(), true);
+        assert!(matches!(
+            tree.entries(&mut pdf),
+            Err(Error::Internal(message))
+                if message == "attempt made to dereference an invalid name/number tree iterator"
+        ));
     }
 
     #[test]
@@ -4701,6 +4959,7 @@ mod tests {
             item_number: Some(0),
             raw: None,
             current: None,
+            current_handle: None,
             pdf_id: None,
             marker: PhantomData,
         };
@@ -4720,6 +4979,7 @@ mod tests {
             item_number: Some(0),
             raw: None,
             current: None,
+            current_handle: None,
             pdf_id: None,
             marker: PhantomData,
         };
@@ -4841,6 +5101,7 @@ mod tests {
                 item_number: Some(item_number),
                 raw: None,
                 current: Some((1, Object::Integer(1))),
+                current_handle: Some((1, ObjectHandle::integer(1))),
                 pdf_id: None,
                 marker: PhantomData,
             }
@@ -4877,6 +5138,7 @@ mod tests {
                 item_number: None,
                 raw: None,
                 current: None,
+                current_handle: None,
                 pdf_id: None,
                 marker: PhantomData,
             }
