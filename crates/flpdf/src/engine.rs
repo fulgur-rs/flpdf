@@ -155,6 +155,7 @@ impl<R: Read + Seek> Pdf<R> {
             last_xref_form: loaded.last_xref_form,
             cache,
             foreign_object_maps: BTreeMap::new(),
+            foreign_object_visiting: BTreeMap::new(),
             trailer_handle_memo: None,
             legacy_materialized_memo: BTreeMap::new(),
             legacy_materialized_replacement_refs: BTreeSet::new(),

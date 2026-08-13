@@ -1719,6 +1719,20 @@ impl<R: Read + Seek> Pdf<R> {
         Ok(stream)
     }
 
+    /// Copy one indirect object and its canonical foreign object graph into
+    /// this document. This is qpdf's `QPDF::copyForeignObject`
+    /// (`libqpdf/QPDF.cc:2019-2097`): indirect identities are reserved before
+    /// recursive replacement, shared children and cycles reuse one
+    /// destination handle, `/Pages` is a boundary, and stream payloads use
+    /// the destination resolver's shared buffer/provider boundary.
+    ///
+    /// The destination retains the source-to-destination map, so copying the
+    /// same source handle again returns the same destination identity. The
+    /// source handle must be indirect and belong to a different live `Pdf`.
+    pub fn copy_foreign_object(&mut self, foreign: &ObjectHandle) -> Result<ObjectHandle> {
+        crate::object_copy::copy_foreign_object(self, foreign)
+    }
+
     /// Replace a canonical object value while retaining the target
     /// [`ObjectHandle`] identity. This is the qpdf-shaped mutation boundary;
     /// raw [`Object`] materialization and writer traversal remain outside this
@@ -1901,6 +1915,24 @@ impl<R: Read + Seek> Pdf<R> {
         map: BTreeMap<ObjectRef, ObjectRef>,
     ) {
         self.foreign_object_maps.insert(source_id, map);
+    }
+
+    /// qpdf's `ObjCopier::visiting` equivalent (see
+    /// [`Pdf::foreign_object_visiting`]'s own doc). Used only by the
+    /// canonical `copy_foreign_object` port, never by the legacy
+    /// `copy_foreign_objects` route.
+    pub(crate) fn take_foreign_object_visiting(&mut self, source_id: u64) -> BTreeSet<ObjectRef> {
+        self.foreign_object_visiting
+            .remove(&source_id)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_foreign_object_visiting(
+        &mut self,
+        source_id: u64,
+        visiting: BTreeSet<ObjectRef>,
+    ) {
+        self.foreign_object_visiting.insert(source_id, visiting);
     }
 
     /// Mark `object_ref` dirty so canonical writer preparation and other live

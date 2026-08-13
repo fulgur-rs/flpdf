@@ -431,6 +431,48 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
 
+なお、`object_copy.rs` の `copy_objects` / `page_closure.rs` は旧来の
+pre-closed raw `Object` 経路であり、canonical parity の責務ではない。
+qpdf 11.9.0 の `QPDF::copyForeignObject`（`QPDF.cc:2019-2272`）に対応する
+正本は `object_copy::copy_foreign_object` で、`reserveObjects` / 完全な
+`ObjectHandle` graph replacement / `/Pages` 境界 / per-source map reuse を
+ここで担う。stream の Buffer/provider/original-source 選択は
+`reader/resolver.rs` の resolver-owned boundary に委譲し、qpdf の
+`ot_reserved` は外部に露出しない内部 reservation sentinel として
+destination-owned indirect null slot で表現する。
+
+⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
+相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を
+`direct_visiting`（`ForeignObjectCopier` フィールド）で bound する。qpdf の該当
+2 関数（`QPDF.cc:2101-2213`）はいずれも direct cycle 用の visited set を持たない。
+実際にパースされた PDF はこの形を表現できない（直接値は自分自身を参照するための
+アドレス可能な identity を持たない）ため、qpdf 側にこの bound の対応物は無い。
+公開 `ObjectHandle::replace_key` API 経由でのみ構築可能な入力への防御であり、
+出力バイトには影響しない。
+
+⚪ `reserve_objects`（`ForeignObjectCopier`）は各ノードの `owning_pdf_unique_id`
+を root の `source_id` と照合し、不一致なら拒否する。qpdf では
+`QPDFObjectHandle::replaceKey`/`QPDF_Array` の各ミューテータが挿入時に
+`checkOwnership`（`QPDFObjectHandle.cc:1200-1209`、`QPDF_Array.cc:11-26`）を
+呼ぶため、別ドキュメント所有のオブジェクトがそもそも一つのグラフに混在し得ず、
+`reserveObjects`/`replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）自身に
+対応するチェックは無い。flpdf の `ObjectHandle::replace_key` はまだ
+`checkOwnership` を実装していない（同メソッドの doc に明記）ため、この bound は
+その未実装ギャップを `object_copy.rs` 側で暫定的に埋めるもので、公開
+`ObjectHandle::replace_key` API 経由でのみ構築可能な入力への防御であり、実パース
+された PDF の出力バイトには影響しない。`replace_key` 自体への `checkOwnership`
+移植は flpdf-25kg.3.16.7 で追跡する。
+
+⚪ `reserve_objects` と `replace_foreign_indirect_objects` の両方を
+`stacker::maybe_grow`（`OBJECT_COPY_STACK_RED_ZONE`/`OBJECT_COPY_STACK_GROWTH_SIZE`）
+で包む。個別の indirect object から成る非循環チェーン（A → B → C → …、各々が
+別オブジェクト番号）はパーサの container-nesting 上限（`MAX_PARSE_DEPTH`）で
+bound されないため、十分に長い参照チェーンを持つ実在の PDF がこの再帰で
+コールスタックを枯渇させ得る。qpdf の `reserveObjects`/
+`replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）にもこの経路の深さ制限は
+無いため、qpdf parity の欠落ではなく flpdf 実装固有の Rust スタック安全性対応
+であり、出力バイトには影響しない。
+
 ---
 
 ## 検証可能性（safety net）
