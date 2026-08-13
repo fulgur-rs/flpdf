@@ -70,8 +70,9 @@ fn object_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>>
 /// that reciprocally reference each other, but it is reachable in memory
 /// through the public [`ObjectHandle::replace_key`] API. Unlike that helper
 /// (which raises an error), this returns a bool like the existing `ObjectRef`
-/// seen-set checks in `get_tree`/`build_item`'s sibling walks, so a cycle
-/// here silently stops the walk the same way a repeated indirect reference
+/// seen-set checks in [`OutlineDocumentHelper::chase_and_mark_seen`] (used by
+/// both `get_tree`'s and `build_item`'s sibling walks), so a cycle here
+/// silently stops the walk the same way a repeated indirect reference
 /// already does — matching qpdf's own `QPDFObjGen::set`-guarded constructor
 /// loop, which also just stops (`libqpdf/QPDFOutlineDocumentHelper.cc:16-21`).
 fn mark_direct_sibling_seen(direct_seen: &mut Vec<ObjectHandle>, current: &ObjectHandle) -> bool {
@@ -116,7 +117,17 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if !outlines.try_has_key(b"/First")? {
             return Ok(false);
         }
-        Ok(!outlines.try_get_key(b"/First")?.try_is_null()?)
+        // Chase the same `Pdf::set_object` + `shallow_copy` redirect every
+        // other exit path in this file already chases via
+        // `resolve_value_handle` before inspecting the resolved value:
+        // `try_is_null` dereferences only the receiver itself, so a direct
+        // reference-valued `/First` whose terminal target is null would
+        // otherwise report non-null here while `get_tree` (which chases
+        // inside `materialize_item`) terminal-chases the same cursor and
+        // produces zero roots — the two would disagree on the same document.
+        let first = outlines.try_get_key(b"/First")?;
+        let first = self.resolve_value_handle(first)?;
+        Ok(!first.try_is_null()?)
     }
 
     fn resolve_handle(&mut self, handle: &ObjectHandle) -> Result<()> {
@@ -131,6 +142,40 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     /// raw `Object` route while the legacy replacement bridge is removed.
     fn resolve_value_handle(&mut self, handle: ObjectHandle) -> Result<ObjectHandle> {
         self.pdf.resolve_object_handle_to_terminal(&handle)
+    }
+
+    /// Chase `cursor` to its terminal target (see [`Self::resolve_value_handle`])
+    /// and record that terminal's identity in the appropriate "already
+    /// visited" set — `seen` when the terminal is indirect, `direct_seen`
+    /// (via [`mark_direct_sibling_seen`]) when it is direct — **before** any
+    /// further work runs on `cursor`. This mirrors qpdf's own ordering: its
+    /// outline constructor records `QPDFObjGen::set` identity as the first
+    /// act per node (`libqpdf/QPDFOutlineDocumentHelper.cc:16-21`), before
+    /// anything else touches that node. Chasing only inside
+    /// [`Self::materialize_item`] (downstream of the identity check) let a
+    /// direct reference-valued cursor's *wrapper* identity be recorded
+    /// instead of its resolved target's, so a self-referential `/Next` chain
+    /// hidden behind such a wrapper was visited and appended twice before
+    /// the seen-set caught it — one full extra iteration late.
+    ///
+    /// Returns `Ok(None)` once `cursor`'s terminal target has already been
+    /// seen and the walk must stop there, else `Ok(Some(chased_cursor))` for
+    /// the caller to materialize.
+    fn chase_and_mark_seen(
+        &mut self,
+        cursor: ObjectHandle,
+        seen: &mut BTreeSet<ObjectRef>,
+        direct_seen: &mut Vec<ObjectHandle>,
+    ) -> Result<Option<ObjectHandle>> {
+        let cursor = self.resolve_value_handle(cursor)?;
+        if let Some(reference) = cursor.object_ref() {
+            if !seen.insert(reference) {
+                return Ok(None);
+            }
+        } else if !mark_direct_sibling_seen(direct_seen, &cursor) {
+            return Ok(None);
+        }
+        Ok(Some(cursor))
     }
 
     fn catalog_handle(&mut self) -> Result<Option<ObjectHandle>> {
@@ -173,6 +218,16 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             return Ok(tree);
         }
         let first = outlines.try_get_key(b"/First")?;
+        // Chased for the same reason as `has_outlines`'s own `/First` read
+        // (see its doc): a direct reference-valued `first` whose terminal
+        // target is null would otherwise pass this check unrecognized. The
+        // loop below already produces the correct (empty) result for that
+        // shape on its own — `materialize_item` chases and detects the
+        // null, so `build_item` returns `None` and the loop breaks before
+        // pushing a root — but chasing here too keeps this early-return
+        // consistent with `has_outlines`'s check on the same value instead
+        // of relying on that fallback.
+        let first = self.resolve_value_handle(first)?;
         if first.try_is_null()? {
             return Ok(tree);
         }
@@ -182,15 +237,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let mut top_level_direct_seen = Vec::new();
         let mut constructor_seen = BTreeSet::new();
         loop {
-            if let Some(reference) = cursor.object_ref() {
-                if !top_level_seen.insert(reference) {
-                    break;
-                }
-            } else if !mark_direct_sibling_seen(&mut top_level_direct_seen, &cursor) {
+            let Some(chased) =
+                self.chase_and_mark_seen(cursor, &mut top_level_seen, &mut top_level_direct_seen)?
+            else {
                 break;
-            }
+            };
 
-            let Some(id) = self.build_item(cursor, None, &mut tree, &mut constructor_seen)? else {
+            let Some(id) = self.build_item(chased, None, &mut tree, &mut constructor_seen)? else {
                 break;
             };
             tree.roots.push(id);
@@ -247,20 +300,25 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 frames.pop();
                 continue;
             };
-            let (owner, child_depth) = {
+            let (owner, child_depth, chased) = {
                 let frame = frames
                     .last_mut()
                     .expect("outline construction frame exists");
-                if let Some(reference) = cursor.object_ref() {
-                    if !frame.siblings_seen.insert(reference) {
-                        frame.next = None;
-                        continue;
-                    }
-                } else if !mark_direct_sibling_seen(&mut frame.direct_siblings_seen, &cursor) {
-                    frame.next = None;
-                    continue;
-                }
-                (frame.owner, frame.depth)
+                let owner = frame.owner;
+                let child_depth = frame.depth;
+                let chased = self.chase_and_mark_seen(
+                    cursor,
+                    &mut frame.siblings_seen,
+                    &mut frame.direct_siblings_seen,
+                )?;
+                (owner, child_depth, chased)
+            };
+            let Some(cursor) = chased else {
+                frames
+                    .last_mut()
+                    .expect("outline construction frame exists")
+                    .next = None;
+                continue;
             };
             let Some(child) = self.materialize_item(cursor, Some(owner), tree)? else {
                 continue;
@@ -310,10 +368,17 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         // `Pdf::set_object`-redirected holder, then set as `/First`/`/Next`
         // through the public `ObjectHandle::replace_key` API) to its real
         // target, the same way every other exit path in this file already
-        // chases this shape via `resolve_value_handle`. `object_ref()` is
-        // captured AFTER chasing so cycle detection (`source_ref`, used by
-        // `build_item`'s `constructor_seen`) keys off the terminal identity,
-        // not the pre-chase holder.
+        // chases this shape via `resolve_value_handle`. Both callers
+        // (`get_tree`'s loop and `build_item`'s frame loop) already chase
+        // `cursor` through `chase_and_mark_seen` before calling here, so
+        // this re-chase is normally a redundant no-op —
+        // `resolve_object_handle_to_terminal` returns an already-terminal
+        // handle unchanged — kept so this function's own `source_ref`
+        // capture stays correct standalone, independent of caller
+        // discipline. `object_ref()` is captured AFTER chasing so cycle
+        // detection (`source_ref`, used by `build_item`'s
+        // `constructor_seen`) keys off the terminal identity, not the
+        // pre-chase holder.
         let cursor = self.resolve_value_handle(cursor)?;
         let source_ref = cursor.object_ref();
         if cursor.try_is_null()? {

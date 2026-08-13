@@ -4292,3 +4292,173 @@ fn direct_child_sibling_next_cycle_terminates_the_frame_walk() {
     assert_eq!(tree[parent_item.kids[0]].title, "A");
     assert_eq!(tree[parent_item.kids[1]].title, "B");
 }
+
+// -----------------------------------------------------------------------
+// PR #796 codex round-3 findings: the round-2 fix taught `materialize_item`
+// to chase a direct reference-valued cursor, but `get_tree`'s top-level
+// `/Next` walk, `build_item`'s per-frame sibling walk, and `has_outlines`
+// all inspect a cursor's identity/nullness *before* `materialize_item` ever
+// runs, so none of them saw the chased target. qpdf-oracle-inapplicable by
+// construction, same as the round-2 findings above: these shapes need
+// `Pdf::set_object` + `ObjectHandle::shallow_copy` to construct a direct
+// handle whose own value is a bare reference, and qpdf's own
+// `QPDF::replaceObject` (`libqpdf/QPDF.cc:1980-1991`) throws
+// `std::logic_error` given an indirect handle, so qpdf's object graph can
+// never hold this state at all — there is no qpdf byte output to compare
+// against, only qpdf's *architectural* precedent that identity is recorded
+// before further per-node work runs (`QPDFObjGen::set`-guarded constructor,
+// `libqpdf/QPDFOutlineDocumentHelper.cc:16-21`).
+// -----------------------------------------------------------------------
+
+/// Same direct reference-valued `/First` shape as
+/// `direct_reference_valued_first_pdf`, but the chased target's own `/Next`
+/// points back at itself (an ordinary indirect self-loop, reachable from
+/// real PDF bytes on its own). Before recording identity *after* chasing,
+/// `get_tree`'s first iteration takes the direct-cursor branch on the
+/// un-chased wrapper (recording only the wrapper's own identity, since a
+/// direct handle's `object_ref()` is always `None`) and only discovers the
+/// target's real `ObjectRef` two iterations later, once the raw `/Next`
+/// reference itself becomes the cursor — one full extra iteration after the
+/// target was already materialized once.
+fn direct_reference_valued_first_self_loop_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 1 >>"),
+            (8, "<< /Title (Target) /Parent 4 0 R /Next 8 0 R >>"),
+            (9, "null"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn direct_reference_valued_cursor_self_loop_is_recorded_before_a_second_visit() {
+    let mut pdf = Pdf::open(Cursor::new(direct_reference_valued_first_self_loop_pdf())).unwrap();
+
+    // Same construction as `direct_reference_valued_cursor_is_chased_to_its_target`:
+    // redirect a spare holder (obj 9) to the real outline item (obj 8), then
+    // shallow_copy its resolved handle to obtain a DIRECT handle whose value
+    // is still `ObjectValue::Reference(8, 0)`.
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
+    let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
+    pdf.resolve_object_handle(&holder).unwrap();
+    let direct_reference = holder.shallow_copy().unwrap();
+    assert!(direct_reference.object_ref().is_none());
+    assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
+
+    let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&outlines).unwrap();
+    outlines.replace_key(b"/First", direct_reference).unwrap();
+
+    // Object 8 must be visited exactly once, not twice: the self-loop is a
+    // repeat of the SAME node, not two distinct siblings.
+    let roots = root_items(&mut pdf);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].title, "Target");
+}
+
+/// Same reciprocal-cycle shape as
+/// `direct_reference_valued_cursor_self_loop_is_recorded_before_a_second_visit`,
+/// but one level down: a parent item's `/First` is the direct
+/// reference-valued wrapper, and the resolved child's own `/Next` is an
+/// ordinary indirect self-loop back to that child — exercising
+/// `build_item`'s per-frame `siblings_seen`/`direct_siblings_seen`, not
+/// `get_tree`'s top-level ones.
+fn direct_reference_valued_first_child_self_loop_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Parent) /Parent 4 0 R /First 8 0 R /Last 8 0 R /Count 1 >>",
+            ),
+            (8, "<< /Title (Child) /Parent 5 0 R /Next 8 0 R >>"),
+            (9, "null"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn direct_reference_valued_child_cursor_self_loop_is_recorded_before_a_second_visit() {
+    let mut pdf = Pdf::open(Cursor::new(
+        direct_reference_valued_first_child_self_loop_pdf(),
+    ))
+    .unwrap();
+
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
+    let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
+    pdf.resolve_object_handle(&holder).unwrap();
+    let direct_reference = holder.shallow_copy().unwrap();
+    assert!(direct_reference.object_ref().is_none());
+    assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
+
+    let parent = pdf.get_object_handle(ObjectRef::new(5, 0));
+    pdf.resolve_object_handle(&parent).unwrap();
+    parent.replace_key(b"/First", direct_reference).unwrap();
+
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    let parent_item = &tree[tree.roots()[0]];
+    assert_eq!(parent_item.title, "Parent");
+    // Object 8 must appear exactly once among the parent's kids.
+    assert_eq!(parent_item.kids.len(), 1);
+    assert_eq!(tree[parent_item.kids[0]].title, "Child");
+}
+
+/// A direct reference-valued `/First` (same construction as
+/// `direct_reference_valued_first_pdf`) whose terminal target is null
+/// (obj 8, `null`). `has_outlines` read `/First`'s raw value and called
+/// `try_is_null` on the un-chased wrapper directly; `try_is_null` only
+/// dereferences its own receiver and never follows a bare-reference-valued
+/// result, so it saw `ObjectValue::Reference(8, 0)` — not
+/// `ObjectValue::Null` — and reported non-null. `get_tree`, which chases
+/// the same shape inside `materialize_item` before checking, correctly
+/// reports zero roots for this exact document.
+fn direct_reference_valued_first_to_null_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines >>"),
+            (8, "null"),
+            (9, "null"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn has_outlines_agrees_with_get_tree_for_a_direct_reference_valued_first_targeting_null() {
+    let mut pdf = Pdf::open(Cursor::new(direct_reference_valued_first_to_null_pdf())).unwrap();
+
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
+    let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
+    pdf.resolve_object_handle(&holder).unwrap();
+    let direct_reference = holder.shallow_copy().unwrap();
+    assert!(direct_reference.object_ref().is_none());
+    assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
+
+    let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&outlines).unwrap();
+    outlines.replace_key(b"/First", direct_reference).unwrap();
+
+    assert!(!pdf.outline().has_outlines().unwrap());
+    assert!(pdf.outline().get_tree().unwrap().roots().is_empty());
+}
