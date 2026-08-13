@@ -134,7 +134,9 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
     let object_map = copier.object_map;
     let visiting = copier.visiting;
     copier.target.set_foreign_object_map(source_id, object_map);
-    copier.target.set_foreign_object_visiting(source_id, visiting);
+    copier
+        .target
+        .set_foreign_object_visiting(source_id, visiting);
     result
 }
 
@@ -628,8 +630,7 @@ pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
                             first
                         }
                     };
-                    let target_ref =
-                        ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
+                    let target_ref = ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
                     // Reserve before resolving any source object so cycles can be
                     // rewritten through the complete map, as qpdf does.
                     target.set_object(target_ref, Object::Null);
