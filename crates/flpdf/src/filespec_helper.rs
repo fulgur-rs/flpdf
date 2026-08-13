@@ -192,7 +192,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
         let stream_dict = stream.as_stream_dict().ok_or_else(|| {
             Error::System("EmbeddedFile factory received a non-stream object".to_string())
         })?;
-        stream_dict.replace_key(b"/Type", ObjectHandle::name(b"EmbeddedFile".to_vec()));
+        stream_dict.replace_key(b"/Type", ObjectHandle::name(b"EmbeddedFile".to_vec()))?;
         pdf.mark_object_handle_dirty(&stream)?;
 
         let mut discard = Discard;
@@ -240,7 +240,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                     ),
                     (b"/CheckSum".to_vec(), ObjectHandle::string(checksum)),
                 ]),
-            );
+            )?; // cov:ignore: factory-created stream and parameter values share this PDF
             pdf.mark_object_handle_dirty(&stream)?;
         } else {
             stream.warn_if_possible("unable to get stream data for new embedded file stream")?;
@@ -506,7 +506,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 }
             }
             let key = canonical_dictionary_key(key.as_bytes());
-            target.replace_key(&key, ObjectHandle::string(value));
+            target.replace_key(&key, ObjectHandle::string(value))?;
             return Ok(());
         }
 
@@ -524,7 +524,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 canonical_dictionary_key(key.as_bytes()),
                 ObjectHandle::string(value),
             )]),
-        );
+        )?; // cov:ignore: the factory-created parameter value is always unowned
         Ok(())
     }
 
@@ -553,7 +553,7 @@ impl<'a, R: Read + Seek> EmbeddedFileStream<'a, R> {
                 pdf.mark_object_handle_dirty(&stream_dict)?;
             }
         }
-        stream_dict.replace_key(b"/Subtype", ObjectHandle::name(value.as_ref().to_vec()));
+        stream_dict.replace_key(b"/Subtype", ObjectHandle::name(value.as_ref().to_vec()))?;
         Ok(self)
     }
 }
@@ -690,7 +690,7 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         dict.replace_key(
             b"/Desc",
             ObjectHandle::string(new_unicode_string(description.as_ref())),
-        );
+        )?; // cov:ignore: FileSpec::new validates the receiver's document ownership
         Ok(self)
     }
 
@@ -709,14 +709,14 @@ impl<'a, R: Read + Seek> FileSpec<'a, R> {
         };
         self.pdf.mark_object_handle_dirty(&dict)?;
         let unicode_name = new_unicode_string(unicode_name.as_ref());
-        dict.replace_key(b"/UF", ObjectHandle::string(unicode_name.clone()));
+        dict.replace_key(b"/UF", ObjectHandle::string(unicode_name.clone()))?;
         let compatibility_name = compatibility_name
             .map(ToOwned::to_owned)
             .filter(|name| !name.is_empty());
         dict.replace_key(
             b"/F",
             ObjectHandle::string(compatibility_name.unwrap_or(unicode_name)),
-        );
+        )?; // cov:ignore: FileSpec::new validates the receiver's document ownership
         Ok(self)
     }
 

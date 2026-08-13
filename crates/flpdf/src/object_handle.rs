@@ -37,6 +37,17 @@
 //! `QPDFObjectHandle` (`include/qpdf/QPDFObjectHandle.hh`) shares a canonical `QPDFObject`
 //! (`libqpdf/qpdf/QPDFObject.hh`), which owns the `QPDFValue` payload
 //! (`libqpdf/qpdf/QPDFValue.hh`).
+//!
+//! qpdf stores a stream's deferred source as a
+//! `std::shared_ptr<QPDFObjectHandle::StreamDataProvider>` in
+//! `QPDF_Stream` (`include/qpdf/QPDFObjectHandle.hh:68-127`,
+//! `libqpdf/QPDF_Stream.cc:575-604,640-660`). [`ObjectValue::Stream`] uses
+//! `Rc<dyn StreamDataProvider>` as an internal container substitution: it
+//! preserves provider ownership, exclusive buffer/provider source state,
+//! lazy invocation, repeated-call behavior, and the source pipeline order.
+//! The `Rc` choice is an internal Rust ownership detail; qpdf's observable
+//! callback, identity, retry, error, and `/Length` contracts remain the
+//! authority.
 
 // Deviation: shared handle identity uses Rc<RefCell<..>> in place of qpdf's
 // std::shared_ptr<QPDFObject>; ObjectValue is the QPDFValue payload. This is
@@ -78,6 +89,10 @@ pub(crate) const STREAM_ENCODE_NORMALIZE: u32 = 2;
 
 const STREAM_DATA_PROVIDER_DEFAULT_ERROR: &str =
     "you must override provideStreamData -- see QPDFObjectHandle.hh";
+const STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR: &str =
+    "stream data provider requires an indirect stream";
+const FOREIGN_OBJECT_OWNERSHIP_ERROR: &str =
+    "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.";
 
 /// Deferred stream-data source corresponding to qpdf's
 /// `QPDFObjectHandle::StreamDataProvider`
@@ -275,6 +290,21 @@ pub(crate) trait DocumentResolver {
         let _ = (destination, source);
         Err(Error::Internal(
             "stream data copy requested from a resolver without a document".to_owned(),
+        ))
+    }
+
+    /// Create qpdf's lazy provider for an original file-backed foreign
+    /// stream. Unlike a provider-backed source, this provider must not retain
+    /// the source `ObjectHandle`: qpdf captures the source input and stream
+    /// metadata so the source `QPDF` may be destroyed after the copy.
+    fn original_stream_data_provider(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        let _ = (source, destination_dict);
+        Err(Error::Internal(
+            "original stream data provider requested from a resolver without a document".to_owned(),
         ))
     }
 
@@ -911,6 +941,14 @@ impl ObjectHandle {
     /// direct one.
     pub fn object_ref(&self) -> Option<ObjectRef> {
         self.0.borrow().object_ref
+    }
+
+    /// The owning document identity carried by this canonical handle, if it
+    /// was minted by a [`crate::Pdf`]. This is qpdf's source-QPDF identity
+    /// key used by `QPDF::copyForeignObject`'s per-source `ObjCopier` map
+    /// (`libqpdf/QPDF.cc:2065`).
+    pub(crate) fn owning_pdf_unique_id(&self) -> Option<u64> {
+        self.0.borrow().active_pdf_unique_id
     }
 
     /// True if `self` and `other` share the same underlying storage — the
@@ -1552,11 +1590,23 @@ impl ObjectHandle {
         }
     }
 
-    /// qpdf's `checkOwnership` rejects a value that is already attached to a
-    /// different document, including an indirect child nested below an
-    /// otherwise direct replacement value. A direct value with no recorded
-    /// document identity is unowned and can be inserted into one document.
-    #[allow(dead_code)] // consumer cutover is flpdf-25kg.3.6.3
+    /// True if every indirect descendant reachable through `self`'s direct
+    /// value graph (stopping at each indirect boundary) belongs to
+    /// `pdf_unique_id`, or carries no recorded document identity at all.
+    ///
+    /// Unlike qpdf's own `checkOwnership`
+    /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`, `QPDF_Array.cc:10-26`),
+    /// which is a shallow, O(1) comparison of only the top-level handle's
+    /// own owning document, this walks the complete direct-value
+    /// descendant graph. It exists for [`Self::check_array_item_ownership`]
+    /// as a flpdf-specific defense against a foreign indirect object nested
+    /// several direct hops below an array item -- a shape qpdf's own
+    /// shallow check does not catch either (see
+    /// `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_container`
+    /// for the equivalent dictionary-key case, which flpdf accepts to match
+    /// qpdf exactly). [`Self::check_key_value_ownership`] (`replace_key`'s
+    /// ownership boundary) intentionally does not call this: qpdf's real
+    /// `checkOwnership` never does either.
     pub(crate) fn belongs_exclusively_to_pdf(&self, pdf_unique_id: u64) -> bool {
         let mut pending = vec![self.clone()];
         let mut visited = BTreeSet::new();
@@ -1730,26 +1780,44 @@ impl ObjectHandle {
                         // production consumers land with flpdf-25kg.3.6
     pub(crate) fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
         let slot = self.0.borrow();
-        slot.resolver
-            .as_ref()
-            .and_then(Weak::upgrade)
-            .or_else(|| {
-                if let Some(ObjectDescription::Child(child)) = &slot.description {
-                    child
-                        .parent
-                        .upgrade()
-                        .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                slot.containment_parents.iter().find_map(|parent| {
-                    parent
-                        .upgrade()
-                        .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
-                })
-            })
+        if let Some(resolver) = slot.resolver.as_ref().and_then(Weak::upgrade) {
+            return Some(resolver);
+        }
+
+        if let Some(ObjectDescription::Child(child)) = &slot.description {
+            let resolver = child
+                .parent
+                .upgrade()
+                .and_then(|parent| parent.borrow().resolver.as_ref().and_then(Weak::upgrade));
+            if let Some(resolver) = resolver {
+                return Some(resolver);
+            }
+        }
+
+        // qpdf's literal `QPDFObjectHandle::newNull()` carries neither a
+        // QPDF* nor a resolver, even when it is nested below a document-owned
+        // array, dictionary, or stream dictionary
+        // (`libqpdf/QPDF_Null.cc:12-15`, `QPDFParser.cc:397-410`). Do not lend
+        // it the parent's context through our containment back-links: a
+        // dictionary accessor on that null must take qpdf's contextless
+        // exception path. A dictionary-missing-key null is different: qpdf's
+        // `setChildDescription` copies the parent QPDF* onto it
+        // (`libqpdf/QPDFObject_private.hh:79-91`), so the Child description
+        // branch above intentionally preserves that context-aware warning.
+        // Non-null direct children still use the parent fallback below, and
+        // indirect nulls retain their own resolver above.
+        if matches!(
+            &*slot.state.borrow(),
+            ObjectState::Resolved(ObjectValue::Null)
+        ) {
+            return None;
+        }
+
+        slot.containment_parents.iter().find_map(|parent| {
+            parent
+                .upgrade()
+                .and_then(|p| p.borrow().resolver.as_ref().and_then(Weak::upgrade))
+        })
     }
 
     #[allow(dead_code)]
@@ -2559,9 +2627,18 @@ impl ObjectHandle {
     /// observes — mirrors `QPDFObjectHandle::replaceKey`
     /// (`libqpdf/QPDFObjectHandle.cc:1199-1209`) and
     /// `QPDF_Dictionary::replaceKey`
-    /// (`libqpdf/QPDF_Dictionary.cc:135-153`). A direct null removes the
-    /// key, while an indirect null or dangling indirect reference is
-    /// retained as the dictionary value. A no-op on a
+    /// (`libqpdf/QPDF_Dictionary.cc:135-153`). Ownership is checked with
+    /// qpdf's own shallow `checkOwnership` comparison
+    /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`) before insertion — only
+    /// `self`'s and `value`'s own owning document, never a walk into
+    /// `value`'s descendants — and a value indirectly owned by a different
+    /// document returns qpdf's `checkOwnership` logic error as
+    /// [`Error::Internal`]. A direct value (including a direct null) is
+    /// always unowned for this check, matching qpdf: `checkOwnership` never
+    /// associates ownership with a direct value through containment. A
+    /// direct null removes the key, while an indirect
+    /// null or dangling indirect reference is retained as the dictionary
+    /// value. A no-op on a
     /// non-dictionary handle or an unresolved/missing/destroyed indirect
     /// handle, matching qpdf's own `typeWarning`-and-ignore contract rather
     /// than panicking. Also a no-op if `value` is a direct handle sharing
@@ -2570,10 +2647,8 @@ impl ObjectHandle {
     /// walkers (`shallow_copy`, `materialize`, `Debug`) guard against, since
     /// they only stop recursion at an indirect-handle boundary. This does
     /// not detect a multi-hop reciprocal cycle built from two or more
-    /// `replace_key` calls across distinct direct dictionaries. Unlike
-    /// qpdf's `replaceKey`, this does not check that `value` belongs to the
-    /// same document (`checkOwnership`) — no caller in this crate crosses
-    /// document boundaries this way today. Never performs resolution
+    /// `replace_key` calls across distinct direct dictionaries. Never performs
+    /// resolution
     /// itself. `key` must be qpdf's decoded, canonical dictionary key including
     /// its leading `/`; this API does not normalize slashless input.
     ///
@@ -2594,7 +2669,22 @@ impl ObjectHandle {
     /// owner(s) when it is a direct child. For an already-registered indirect
     /// handle, [`crate::Pdf::mark_object_dirty`] with the same ref remains the
     /// equivalent lower-level operation.
-    pub fn replace_key(&self, key: &[u8], value: ObjectHandle) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`] when the value belongs to a different
+    /// document than the dictionary receiver, matching qpdf's
+    /// `checkOwnership` failure boundary.
+    pub fn replace_key(&self, key: &[u8], value: ObjectHandle) -> Result<()> {
+        if !self.with_value(|current| matches!(current, Some(ObjectValue::Dictionary(_)))) {
+            return Ok(());
+        }
+        self.check_key_value_ownership(&value)?;
+        self.replace_key_unchecked(key, value);
+        Ok(())
+    }
+
+    fn replace_key_unchecked(&self, key: &[u8], value: ObjectHandle) {
         if value.is_direct() && value.is_null() {
             self.remove_key(key);
             return;
@@ -2896,7 +2986,6 @@ impl ObjectHandle {
     /// a direct value can retain one or more propagated owner ids through live
     /// containment. A direct value with no owner id is qpdf's unowned array
     /// case and is accepted by the upstream check.
-    #[allow(dead_code)] // consumed by the array mutator family above
     fn check_array_item_ownership(&self, item: &ObjectHandle) -> Result<()> {
         let item_is_destroyed = {
             let slot = item.0.borrow();
@@ -2921,9 +3010,34 @@ impl ObjectHandle {
             .iter()
             .any(|pdf_unique_id| !item.belongs_exclusively_to_pdf(*pdf_unique_id))
         {
-            return Err(Error::Internal(
-                "Attempting to add an object from a different QPDF. Use QPDF::copyForeignObject to add objects from another file.".to_owned(),
-            ));
+            return Err(Error::Internal(FOREIGN_OBJECT_OWNERSHIP_ERROR.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Port `QPDFObjectHandle::checkOwnership` (`libqpdf/QPDFObjectHandle.cc:
+    /// 2355-2365`) exactly: qpdf compares only `this->getOwningQPDF()` and
+    /// `item.getOwningQPDF()`, two O(1) reads of each handle's *own* owning
+    /// document -- never a walk into either handle's descendants. A value's
+    /// `getOwningQPDF()` in qpdf is `nullptr` unless the value itself is
+    /// indirect (set once by `setObjGen`); mere containment inside another
+    /// document's object graph does not confer ownership. This deliberately
+    /// does not consult [`Self::belongs_exclusively_to_pdf`] or the
+    /// `pdf_unique_ids` live-containment set that field reads from: that
+    /// bookkeeping tracks *current* containment for dirty-marking
+    /// ([`Self::containing_object_refs_for_pdf`]) and keeps a value's prior
+    /// document id after it is no longer reachable there, which is not
+    /// qpdf's ownership semantics and would reject a direct value (a null
+    /// or any other scalar) that merely passed through a different
+    /// document's object graph at some earlier point, even though qpdf
+    /// itself never associates ownership with a direct value that way.
+    fn check_key_value_ownership(&self, value: &ObjectHandle) -> Result<()> {
+        if let (Some(self_pdf_unique_id), Some(value_pdf_unique_id)) =
+            (self.owning_pdf_unique_id(), value.owning_pdf_unique_id())
+        {
+            if self_pdf_unique_id != value_pdf_unique_id {
+                return Err(Error::Internal(FOREIGN_OBJECT_OWNERSHIP_ERROR.to_owned()));
+            }
         }
         Ok(())
     }
@@ -3280,7 +3394,7 @@ impl ObjectHandle {
             } else {
                 value.shallow_copy()?
             };
-            destination_dict.replace_key(&key, value);
+            destination_dict.replace_key_unchecked(&key, value);
         }
 
         resolver.copy_stream_data(&result, self)?;
@@ -3361,14 +3475,14 @@ impl ObjectHandle {
         };
         for (rtype, other_val) in other_entries {
             if !self.has_key(&rtype) {
-                self.replace_key(&rtype, other_val.shallow_copy()?);
+                self.replace_key(&rtype, other_val.shallow_copy()?)?;
                 continue;
             }
             let mut this_val = self.get_key(&rtype);
             if this_val.as_dictionary().is_some() && other_val.as_dictionary().is_some() {
                 if this_val.is_indirect() {
                     let privatized = this_val.shallow_copy()?;
-                    self.replace_key(&rtype, privatized.clone());
+                    self.replace_key(&rtype, privatized.clone())?;
                     this_val = privatized;
                 }
                 merge_resource_subdict(&this_val, &other_val, &rtype, conflicts.as_deref_mut())?;
@@ -3389,12 +3503,12 @@ impl ObjectHandle {
     /// `QPDF_Stream::replaceStreamData`/`replaceFilterData`,
     /// `libqpdf/QPDF_Stream.cc:637-649,669-685`). `filter`/`decode_parms`
     /// are `Some` exactly where qpdf's own overload checks
-    /// `QPDFObjectHandle::isInitialized()`: `Some` installs the key via
-    /// [`Self::replace_key`], `None` leaves it untouched rather than
-    /// removing it. A zero byte length removes `/Length`; a nonzero length
-    /// installs the exact integer, matching qpdf's shared
-    /// `QPDF_Stream::replaceFilterData` boundary for buffer and provider
-    /// replacement. A no-op if this handle's value is not a stream.
+    /// `QPDFObjectHandle::isInitialized()`: `Some` installs the key through
+    /// qpdf's stream-internal dictionary replacement path, `None` leaves it
+    /// untouched rather than removing it. A zero byte length removes
+    /// `/Length`; a nonzero length installs the exact integer, matching qpdf's
+    /// shared `QPDF_Stream::replaceFilterData` boundary for buffer and
+    /// provider replacement. A no-op if this handle's value is not a stream.
     ///
     /// `data` is installed as given, not copied — qpdf's own
     /// `std::shared_ptr<Buffer>` overload is documented against its
@@ -3406,8 +3520,8 @@ impl ObjectHandle {
     /// See [`Self::replace_key`]'s doc comment for the same
     /// `resolve`/`resolve_borrowed` staleness caveat and the
     /// [`crate::Pdf::mark_object_dirty`] requirement — both apply here too,
-    /// since this method installs `/Filter`/`/DecodeParms`/`/Length` via
-    /// `replace_key` and mutates the stream data in place.
+    /// since this method mutates the stream data in place and updates its
+    /// dictionary through qpdf's lower-level stream-internal path.
     pub fn replace_stream_data(
         &self,
         data: Rc<Vec<u8>>,
@@ -3438,7 +3552,17 @@ impl ObjectHandle {
     /// `None` filter/decode parameters preserve existing keys. An explicit
     /// [`ObjectHandle::null`] removes them through the canonical dictionary
     /// mutation path. A non-stream handle returns qpdf's `asStreamWithAssert`
-    /// runtime classification as [`Error::System`].
+    /// runtime classification as [`Error::System`]. Provider registration is
+    /// restricted to indirect streams because the provider callback requires
+    /// the stream's stable `ObjectRef`; a direct stream is rejected here at
+    /// registration time rather than being accepted and failing later at the
+    /// pipe boundary.
+    ///
+    /// This mutates the live stream and dictionary in place. As with
+    /// [`Self::replace_stream_data`] and [`Self::replace_key`], callers that
+    /// mutate a document-owned handle must call
+    /// [`crate::Pdf::mark_object_handle_dirty`] (or the corresponding
+    /// [`crate::Pdf::mark_object_dirty`]) before writing the document.
     pub fn replace_stream_data_provider(
         &self,
         provider: Rc<dyn StreamDataProvider>,
@@ -3452,7 +3576,11 @@ impl ObjectHandle {
                 self.type_name()
             )));
         }
-
+        if self.object_ref().is_none() {
+            return Err(Error::System(
+                STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR.to_owned(),
+            ));
+        }
         self.with_value_mut(|value| {
             if let Some(ObjectValue::Stream {
                 stream_data,
@@ -3516,15 +3644,15 @@ impl ObjectHandle {
             return;
         };
         if let Some(filter) = filter {
-            dict.replace_key(b"/Filter", filter);
+            dict.replace_key_unchecked(b"/Filter", filter);
         }
         if let Some(decode_parms) = decode_parms {
-            dict.replace_key(b"/DecodeParms", decode_parms);
+            dict.replace_key_unchecked(b"/DecodeParms", decode_parms);
         }
         if length == 0 {
             dict.remove_key(b"/Length");
         } else {
-            dict.replace_key(
+            dict.replace_key_unchecked(
                 b"/Length",
                 ObjectHandle::integer(i64::try_from(length).unwrap_or(i64::MAX)),
             );
@@ -3558,6 +3686,31 @@ impl ObjectHandle {
     pub fn as_stream_data(&self) -> Option<Rc<Vec<u8>>> {
         self.with_value(|value| match value {
             Some(ObjectValue::Stream { stream_data, .. }) => stream_data.clone(),
+            _ => None,
+        })
+    }
+
+    /// Whether this stream currently uses a deferred provider source rather
+    /// than replacement bytes or its parsed original source. This is kept at
+    /// the canonical stream boundary so qpdf's foreign-copy path can preserve
+    /// the different source-lifetime contracts of provider and file-backed
+    /// streams.
+    pub(crate) fn has_stream_data_provider(&self) -> bool {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream {
+                stream_provider, ..
+            }) => stream_provider.is_some(),
+            _ => false,
+        })
+    }
+
+    /// The parsed source length retained by an original stream, when this
+    /// handle currently contains a stream. qpdf stores this alongside the
+    /// source offset in `QPDF_Stream`; the foreign-copy provider captures it
+    /// without retaining the source `ObjectHandle` itself.
+    pub(crate) fn stream_source_length(&self) -> Option<usize> {
+        self.with_value(|value| match value {
+            Some(ObjectValue::Stream { stream_length, .. }) => Some(*stream_length),
             _ => None,
         })
     }
@@ -4032,7 +4185,7 @@ impl ObjectHandle {
                     )));
                 }
             } else {
-                stream_dict.replace_key(b"/Length", ObjectHandle::integer(actual_length));
+                stream_dict.replace_key_unchecked(b"/Length", ObjectHandle::integer(actual_length));
             }
             return Ok(true);
         }
@@ -6211,7 +6364,7 @@ fn merge_resource_subdict(
             } else {
                 rval.shallow_copy()?
             };
-            this_val.replace_key(&key, installed);
+            this_val.replace_key(&key, installed)?;
             continue;
         }
         let Some(conflicts_map) = conflicts.as_deref_mut() else {
@@ -6237,7 +6390,7 @@ fn merge_resource_subdict(
                 .entry(rtype.to_vec())
                 .or_default()
                 .insert(key, new_key.clone());
-            this_val.replace_key(&new_key, rval);
+            this_val.replace_key(&new_key, rval)?;
         }
     }
     Ok(())
@@ -6564,6 +6717,13 @@ pub(crate) mod identity_tests {
             Err(Error::Internal(message))
                 if message == "stream data copy requested from a resolver without a document"
         ));
+        assert!(matches!(
+            resolver.original_stream_data_provider(&ObjectHandle::null(), &ObjectHandle::null()),
+            Err(Error::Internal(message))
+                if message == "original stream data provider requested from a resolver without a document"
+        ));
+        assert!(!ObjectHandle::integer(1).has_stream_data_provider());
+        assert_eq!(ObjectHandle::integer(1).stream_source_length(), None);
         assert!(!resolver.immediate_copy_from());
     }
 
@@ -6811,8 +6971,8 @@ pub(crate) mod identity_tests {
     fn exclusive_pdf_ownership_walk_handles_cycles_and_indirect_mismatch() {
         let first = ObjectHandle::dictionary(vec![]);
         let second = ObjectHandle::dictionary(vec![]);
-        first.replace_key(b"/Second", second.clone());
-        second.replace_key(b"/First", first.clone());
+        first.replace_key(b"/Second", second.clone()).unwrap();
+        second.replace_key(b"/First", first.clone()).unwrap();
         assert!(first.belongs_exclusively_to_pdf(4242));
 
         let foreign_resolver: Rc<dyn DocumentResolver> = Rc::new(RecordingResolver::default());
@@ -6875,7 +7035,9 @@ pub(crate) mod identity_tests {
         assert!(target.is_direct());
         assert!(target.is_null());
         assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(7));
-        replacement.replace_key(b"/Value", ObjectHandle::integer(9));
+        replacement
+            .replace_key(b"/Value", ObjectHandle::integer(9))
+            .unwrap();
         assert_eq!(replacement.get_key(b"/Value").as_integer(), Some(9));
     }
 
@@ -6923,7 +7085,7 @@ pub(crate) mod identity_tests {
             [(b"Parent".to_vec(), parent.clone())].into_iter().collect(),
         ));
         let child = ObjectHandle::dictionary(vec![]);
-        parent.replace_key(b"/Child", child.clone());
+        parent.replace_key(b"/Child", child.clone()).unwrap();
 
         parent.remove_key(b"/Child");
 
@@ -6943,8 +7105,8 @@ pub(crate) mod identity_tests {
         );
         let first = ObjectHandle::dictionary(vec![]);
         let second = ObjectHandle::dictionary(vec![]);
-        first.replace_key(b"/Second", second.clone());
-        second.replace_key(b"/First", first.clone());
+        first.replace_key(b"/Second", second.clone()).unwrap();
+        second.replace_key(b"/First", first.clone()).unwrap();
 
         owner.set_resolved(ObjectValue::Dictionary(
             [(b"First".to_vec(), first.clone())].into_iter().collect(),
@@ -7658,7 +7820,9 @@ mod uniform_identity_tests {
             self.calls.borrow_mut().push(object_ref);
             assert_eq!(handle.object_ref(), Some(object_ref));
             handle.set_resolved(ObjectValue::Dictionary(Default::default()));
-            handle.replace_key(b"/Resolved", ObjectHandle::boolean(true));
+            handle
+                .replace_key(b"/Resolved", ObjectHandle::boolean(true))
+                .unwrap();
             Ok(())
         }
     }
@@ -7681,9 +7845,13 @@ mod uniform_identity_tests {
         assert_eq!(promoted.object_ref(), Some(ObjectRef::new(17, 2)));
         assert_eq!(outstanding_clone.get_parsed_offset(), 37);
 
-        original.replace_key(b"/Value", ObjectHandle::integer(2));
+        original
+            .replace_key(b"/Value", ObjectHandle::integer(2))
+            .unwrap();
         assert_eq!(promoted.get_key(b"/Value").as_integer(), Some(2));
-        promoted.replace_key(b"/Value", ObjectHandle::integer(3));
+        promoted
+            .replace_key(b"/Value", ObjectHandle::integer(3))
+            .unwrap();
         assert_eq!(outstanding_clone.get_key(b"/Value").as_integer(), Some(3));
     }
 
@@ -7779,7 +7947,9 @@ mod uniform_identity_tests {
 
         assert!(child.containing_object_refs_for_pdf(81).is_empty());
         let grandchild = ObjectHandle::integer(1);
-        child.replace_key(b"/Grandchild", grandchild.clone());
+        child
+            .replace_key(b"/Grandchild", grandchild.clone())
+            .unwrap();
         assert_eq!(
             grandchild.containing_object_refs_for_pdf(81),
             vec![ObjectRef::new(43, 0)]
@@ -8290,7 +8460,9 @@ mod stream_payload_sharing_tests {
         assert!(Rc::ptr_eq(&payload_of(&copy), &shared));
         let copy_dict = copy.as_stream_dict().expect("copied stream dict");
         assert!(!copy_dict.is_same_object_as(&source_dict));
-        copy_dict.replace_key(b"/Length", ObjectHandle::integer(7));
+        copy_dict
+            .replace_key(b"/Length", ObjectHandle::integer(7))
+            .unwrap();
         assert_eq!(
             source_dict.get_key(b"/Length").as_integer(),
             Some(4096),
@@ -12106,14 +12278,14 @@ mod mutation_tests {
     fn replace_key_mutates_the_live_dictionary_in_place() {
         let dict = ObjectHandle::dictionary(vec![]);
         let clone = dict.clone();
-        dict.replace_key(b"/A", ObjectHandle::integer(9));
+        dict.replace_key(b"/A", ObjectHandle::integer(9)).unwrap();
         assert_eq!(clone.get_key(b"/A").as_integer(), Some(9));
     }
 
     #[test]
     fn replace_key_overwrites_an_existing_key() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
-        dict.replace_key(b"/A", ObjectHandle::integer(2));
+        dict.replace_key(b"/A", ObjectHandle::integer(2)).unwrap();
         assert_eq!(dict.get_key(b"/A").as_integer(), Some(2));
     }
 
@@ -12127,7 +12299,7 @@ mod mutation_tests {
             [(b"Nested".to_vec(), dict.clone())].into_iter().collect(),
         ));
 
-        dict.replace_key(b"/A", ObjectHandle::null());
+        dict.replace_key(b"/A", ObjectHandle::null()).unwrap();
 
         assert!(!dict.has_key(b"/A"));
         assert!(child.containing_object_refs().is_empty());
@@ -12137,7 +12309,7 @@ mod mutation_tests {
     fn replace_key_with_direct_null_keeps_a_missing_key_absent() {
         let dict = ObjectHandle::dictionary(vec![]);
 
-        dict.replace_key(b"/Missing", ObjectHandle::null());
+        dict.replace_key(b"/Missing", ObjectHandle::null()).unwrap();
 
         assert!(!dict.has_key(b"/Missing"));
     }
@@ -12151,7 +12323,7 @@ mod mutation_tests {
                 .collect(),
         ));
 
-        dict.replace_key(b"/A", ObjectHandle::null());
+        dict.replace_key(b"/A", ObjectHandle::null()).unwrap();
 
         assert!(!dict.has_key(b"/A"));
     }
@@ -12160,7 +12332,7 @@ mod mutation_tests {
     fn replace_key_with_direct_null_on_a_non_dictionary_is_a_no_op() {
         let scalar = ObjectHandle::integer(1);
 
-        scalar.replace_key(b"/A", ObjectHandle::null());
+        scalar.replace_key(b"/A", ObjectHandle::null()).unwrap();
 
         assert_eq!(scalar.as_integer(), Some(1));
     }
@@ -12171,7 +12343,7 @@ mod mutation_tests {
         indirect_null.set_resolved(ObjectValue::Null);
         let dict = ObjectHandle::dictionary(vec![]);
 
-        dict.replace_key(b"/Null", indirect_null.clone());
+        dict.replace_key(b"/Null", indirect_null.clone()).unwrap();
 
         let retained = dict.get_key(b"/Null");
         assert!(dict.has_key(b"/Null"));
@@ -12186,7 +12358,7 @@ mod mutation_tests {
         dangling.set_missing();
         let dict = ObjectHandle::dictionary(vec![]);
 
-        dict.replace_key(b"/Dangling", dangling.clone());
+        dict.replace_key(b"/Dangling", dangling.clone()).unwrap();
 
         let retained = dict.get_key(b"/Dangling");
         assert!(dict.has_key(b"/Dangling"));
@@ -12198,7 +12370,7 @@ mod mutation_tests {
     #[test]
     fn replace_key_on_a_non_dictionary_handle_is_a_no_op() {
         let scalar = ObjectHandle::integer(1);
-        scalar.replace_key(b"/A", ObjectHandle::integer(2));
+        scalar.replace_key(b"/A", ObjectHandle::integer(2)).unwrap();
         assert_eq!(scalar.as_integer(), Some(1));
     }
 
@@ -12209,7 +12381,9 @@ mod mutation_tests {
         let retained = replacement.clone();
 
         assert!(array.replace_array_item(0, replacement));
-        retained.replace_key(b"/K", ObjectHandle::integer(9));
+        retained
+            .replace_key(b"/K", ObjectHandle::integer(9))
+            .unwrap();
         let inserted = array.as_array().expect("array")[0].clone();
         assert_eq!(inserted.get_key(b"/K").as_integer(), Some(9));
 
@@ -12590,6 +12764,127 @@ mod mutation_tests {
     }
 
     #[test]
+    fn replace_key_rejects_foreign_ownership_without_mutating_the_dictionary() {
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let destination =
+            ObjectHandle::dictionary(vec![(b"/Existing".to_vec(), ObjectHandle::integer(1))]);
+        destination.promote_to_indirect(ObjectRef::new(40, 0), 4242, Rc::downgrade(&resolver));
+        let foreign = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(41, 0),
+            NO_PARSED_OFFSET,
+            4243,
+            Rc::downgrade(&resolver),
+        );
+
+        let error = destination
+            .replace_key(b"/Foreign", foreign)
+            .expect_err("replaceKey must reject a value owned by another QPDF");
+
+        assert!(matches!(
+            error,
+            Error::Internal(message) if message == FOREIGN_OBJECT_OWNERSHIP_ERROR
+        ));
+        assert!(!destination.has_key(b"/Foreign"));
+        assert_eq!(destination.get_key(b"/Existing").as_integer(), Some(1));
+    }
+
+    #[test]
+    fn replace_key_accepts_a_foreign_descendant_nested_in_a_direct_container() {
+        // `QPDFObjectHandle::checkOwnership` (`libqpdf/QPDFObjectHandle.cc:
+        // 2355-2365`) compares only `this->getOwningQPDF()` and
+        // `item.getOwningQPDF()` -- both O(1) reads of the *top-level*
+        // handle's own owning-document pointer -- and never walks `item`'s
+        // descendants. `QPDF_Array::checkOwnership` (`QPDF_Array.cc:10-26`)
+        // is the same shape. A direct value's own `getOwningQPDF()` is
+        // `nullptr` regardless of what it contains (ownership is a property
+        // of an *indirect* `QPDFObject`, set once by `setObjGen`, never by
+        // mere containment), so real qpdf's `replaceKey` accepts a direct
+        // container that nests a foreign indirect object several levels
+        // down -- silently embedding an out-of-context object reference,
+        // per qpdf's own `copyForeignObject` guidance for the caller to
+        // avoid this. This is a known qpdf footgun, not a guard qpdf
+        // implements; flpdf's `replace_key` must match qpdf's actual
+        // (shallow) `checkOwnership`, not invent a deeper one.
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let destination = ObjectHandle::dictionary(vec![]);
+        destination.promote_to_indirect(ObjectRef::new(42, 0), 4242, Rc::downgrade(&resolver));
+        let foreign = ObjectHandle::new_indirect_for_pdf_with_resolver(
+            ObjectRef::new(43, 0),
+            NO_PARSED_OFFSET,
+            4243,
+            Rc::downgrade(&resolver),
+        );
+        let direct_container = ObjectHandle::dictionary(vec![(b"/Foreign".to_vec(), foreign)]);
+
+        destination
+            .replace_key(b"/Container", direct_container)
+            .expect("checkOwnership does not inspect a direct value's descendants");
+
+        assert!(destination.has_key(b"/Container"));
+        assert!(destination
+            .get_key(b"/Container")
+            .get_key(b"/Foreign")
+            .is_indirect());
+    }
+
+    #[test]
+    fn replace_key_removes_the_key_for_a_direct_null_previously_contained_by_another_document() {
+        // Regression test for a chatgpt-codex-connector finding on PR #791
+        // (databaseId 3773208253): a direct null handle that was earlier a
+        // descendant of a PDF-A indirect object picks up PDF A's id in its
+        // `pdf_unique_ids` live-containment bookkeeping (`promote_to_indirect`
+        // -> `associate_pdf_identity`). That bookkeeping tracks *current*
+        // containment for dirty-marking, not qpdf's notion of ownership
+        // (`getOwningQPDF()`, set only by `setObjGen`/indirect promotion --
+        // see `replace_key_accepts_a_foreign_descendant_nested_in_a_direct_
+        // container` above), and never clears when the null value is no
+        // longer reachable from PDF A. Using it to drive the ownership check
+        // wrongly rejects this direct null when it is later passed to
+        // `replace_key` on a PDF-B dictionary, even though a direct value is
+        // always unowned in qpdf and `QPDF_Dictionary::replaceKey`'s
+        // null-removes-key branch (`QPDF_Dictionary.cc:135-146`) would run
+        // unconditionally after qpdf's own (shallow, `object_ref`-only)
+        // `checkOwnership` passes.
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let stale_null = ObjectHandle::null();
+        let pdf_a_container = ObjectHandle::dictionary(vec![(b"/X".to_vec(), stale_null.clone())]);
+        pdf_a_container.promote_to_indirect(ObjectRef::new(60, 0), 4242, Rc::downgrade(&resolver));
+
+        let destination =
+            ObjectHandle::dictionary(vec![(b"/K".to_vec(), ObjectHandle::integer(1))]);
+        destination.promote_to_indirect(ObjectRef::new(61, 0), 4243, Rc::downgrade(&resolver));
+
+        destination
+            .replace_key(b"/K", stale_null)
+            .expect("a direct null is always unowned in qpdf, regardless of prior containment");
+
+        assert!(!destination.has_key(b"/K"));
+    }
+
+    #[test]
+    fn replace_key_accepts_a_direct_scalar_previously_contained_by_another_document() {
+        // Companion to the null regression above: the fix must not be a
+        // null-specific exemption. qpdf's `checkOwnership` never associates
+        // ownership with a direct value through containment, for any type,
+        // so a direct (non-null) scalar with the same stale `pdf_unique_ids`
+        // history must be accepted and inserted, not rejected.
+        let (_, resolver) = super::identity_tests::resolver_bearing_handle(ObjectValue::Null);
+        let stale_integer = ObjectHandle::integer(7);
+        let pdf_a_container =
+            ObjectHandle::dictionary(vec![(b"/Y".to_vec(), stale_integer.clone())]);
+        pdf_a_container.promote_to_indirect(ObjectRef::new(62, 0), 4242, Rc::downgrade(&resolver));
+
+        let destination = ObjectHandle::dictionary(vec![]);
+        destination.promote_to_indirect(ObjectRef::new(63, 0), 4243, Rc::downgrade(&resolver));
+
+        destination
+            .replace_key(b"/Int", stale_integer)
+            .expect("a direct scalar is always unowned in qpdf, regardless of prior containment");
+
+        assert_eq!(destination.get_key(b"/Int").as_integer(), Some(7));
+    }
+
+    #[test]
     fn canonical_array_mutators_resolve_a_lazy_holder_and_update_every_alias() {
         let child = ObjectHandle::integer(1);
         let (array, _resolver) =
@@ -12634,7 +12929,7 @@ mod mutation_tests {
     fn replace_key_rejects_inserting_a_direct_dictionary_into_itself() {
         let dict = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let self_clone = dict.clone();
-        dict.replace_key(b"/Self", self_clone);
+        dict.replace_key(b"/Self", self_clone).unwrap();
         assert!(dict.get_key(b"/Self").is_null());
         // The rest of the dictionary is untouched by the rejected insert.
         assert_eq!(dict.get_key(b"/A").as_integer(), Some(1));
@@ -12648,7 +12943,7 @@ mod mutation_tests {
             .share_value_state_with(&replacement)
             .expect("share replacement payload");
 
-        target.replace_key(b"/Self", replacement.clone());
+        target.replace_key(b"/Self", replacement.clone()).unwrap();
 
         assert!(!target.has_key(b"Self"));
     }
@@ -12685,7 +12980,7 @@ mod mutation_tests {
         // insert rather than being rejected as a no-op.
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(7, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
-        indirect.replace_key(b"/Self", indirect.clone());
+        indirect.replace_key(b"/Self", indirect.clone()).unwrap();
         assert!(indirect.get_key(b"/Self").is_indirect());
     }
 
@@ -12841,7 +13136,9 @@ mod mutation_tests {
             [(b"Nested".to_vec(), nested.clone())].into_iter().collect(),
         ));
 
-        owner.replace_key(b"/Nested", ObjectHandle::dictionary(vec![]));
+        owner
+            .replace_key(b"/Nested", ObjectHandle::dictionary(vec![]))
+            .unwrap();
 
         assert!(nested.containing_object_refs().is_empty());
         assert!(leaf.containing_object_refs().is_empty());
@@ -12957,8 +13254,8 @@ mod mutation_tests {
         let owner = ObjectHandle::new_indirect_unresolved(owner_ref, -1);
         let first = ObjectHandle::dictionary(vec![]);
         let second = ObjectHandle::dictionary(vec![]);
-        first.replace_key(b"/Second", second.clone());
-        second.replace_key(b"/First", first.clone());
+        first.replace_key(b"/Second", second.clone()).unwrap();
+        second.replace_key(b"/First", first.clone()).unwrap();
         owner.set_resolved(ObjectValue::Dictionary(
             [(b"First".to_vec(), first.clone())].into_iter().collect(),
         ));
@@ -12978,7 +13275,7 @@ mod mutation_tests {
     fn shallow_copy_mutation_does_not_affect_the_source() {
         let original = ObjectHandle::dictionary(vec![(b"A".to_vec(), ObjectHandle::integer(1))]);
         let copy = original.shallow_copy().expect("dictionary copy");
-        copy.replace_key(b"/A", ObjectHandle::integer(2));
+        copy.replace_key(b"/A", ObjectHandle::integer(2)).unwrap();
         assert_eq!(original.get_key(b"/A").as_integer(), Some(1));
         assert_eq!(copy.get_key(b"/A").as_integer(), Some(2));
     }
@@ -12996,7 +13293,8 @@ mod mutation_tests {
         )]);
         let copy = original.shallow_copy().expect("dictionary copy");
         copy.get_key(b"/A")
-            .replace_key(b"/Inner", ObjectHandle::integer(2));
+            .replace_key(b"/Inner", ObjectHandle::integer(2))
+            .unwrap();
         assert_eq!(
             original.get_key(b"/A").get_key(b"/Inner").as_integer(),
             Some(1)
@@ -13488,7 +13786,9 @@ mod mutation_tests {
     fn replace_key_and_remove_key_mutate_a_resolved_indirect_handle() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
         indirect.set_resolved(ObjectValue::Dictionary(Default::default()));
-        indirect.replace_key(b"/A", ObjectHandle::integer(1));
+        indirect
+            .replace_key(b"/A", ObjectHandle::integer(1))
+            .unwrap();
         assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
         indirect.remove_key(b"/A");
         assert!(indirect.get_key(b"/A").is_null());
@@ -13549,7 +13849,7 @@ mod mutation_tests {
         ])));
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(9, 0), -1);
 
-        direct.replace_key(b"/Indirect", indirect.clone());
+        direct.replace_key(b"/Indirect", indirect.clone()).unwrap();
 
         assert!(direct.get_key(b"/Indirect").is_same_object_as(&indirect));
         assert!(indirect.containing_object_refs().is_empty());
@@ -13558,7 +13858,9 @@ mod mutation_tests {
     #[test]
     fn replace_key_and_remove_key_are_no_ops_on_an_unresolved_indirect_handle() {
         let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(1, 0), -1);
-        indirect.replace_key(b"/A", ObjectHandle::integer(1)); // must not panic
+        indirect
+            .replace_key(b"/A", ObjectHandle::integer(1))
+            .unwrap(); // must not panic
         indirect.remove_key(b"/A"); // must not panic
         assert!(indirect.get_key(b"/A").is_null());
     }
@@ -13731,6 +14033,56 @@ mod stream_provider_contract_tests {
         }
     }
 
+    struct RetryOnlyProvider;
+
+    impl StreamDataProvider for RetryOnlyProvider {
+        fn provide_stream_data_with_retry_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            _pipeline: &mut dyn Pipeline,
+            _suppress_warnings: bool,
+            _will_retry: bool,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    struct LegacyOnlyProviderWithRetryFlag;
+
+    impl StreamDataProvider for LegacyOnlyProviderWithRetryFlag {
+        fn supports_retry(&self) -> bool {
+            true
+        }
+
+        fn provide_stream_data_by_id(
+            &self,
+            _object_number: u32,
+            _generation: u16,
+            _pipeline: &mut dyn Pipeline,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FailingCallbackPipeline {
+        failure: &'static str,
+    }
+
+    impl Pipeline for FailingCallbackPipeline {
+        fn identifier(&self) -> &str {
+            "failing callback pipeline"
+        }
+
+        fn write(&mut self, _data: &[u8]) -> crate::pipeline::PipelineResult<()> {
+            Err(PipelineError::runtime(self.failure))
+        }
+
+        fn finish(&mut self) -> crate::pipeline::PipelineResult<()> {
+            Err(PipelineError::runtime(self.failure))
+        }
+    }
+
     struct EmptyProvider;
 
     impl StreamDataProvider for EmptyProvider {}
@@ -13804,7 +14156,8 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn provider_registration_is_lazy_and_retains_the_provider_allocation() {
-        let stream = provider_stream();
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
         let provider = Rc::new(LegacyProvider::default());
         let ownership = Rc::downgrade(&provider);
 
@@ -13935,7 +14288,8 @@ mod stream_provider_contract_tests {
         stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .replace_key(b"/Length", ObjectHandle::integer(99));
+            .replace_key(b"/Length", ObjectHandle::integer(99))
+            .unwrap();
 
         let error = stream
             .get_raw_stream_data()
@@ -13975,6 +14329,11 @@ mod stream_provider_contract_tests {
             .get_stream_data(crate::writer::DecodeLevel::Generalized)
             .expect("provider filter pipeline");
         assert_eq!(output.as_slice(), decoded);
+        assert_ne!(
+            encoded.len(),
+            decoded.len(),
+            "the fixture must distinguish encoded provider bytes from decoded output"
+        );
         assert_eq!(
             stream
                 .as_stream_dict()
@@ -14006,21 +14365,58 @@ mod stream_provider_contract_tests {
     #[test]
     fn provider_pipe_rejects_a_direct_stream_without_object_identity() {
         let stream = provider_stream();
-        stream
+        let error = stream
             .replace_stream_data_provider(
                 Rc::new(PipeProvider::new(Rc::new(b"direct bytes".to_vec()))),
                 None,
                 None,
             )
-            .expect("provider replacement");
+            .expect_err("provider registration requires an indirect stream identity");
+        assert!(matches!(
+            error,
+            Error::System(message)
+                if message == STREAM_DATA_PROVIDER_REQUIRES_INDIRECT_ERROR
+        ));
+    }
 
-        let error = stream
+    #[test]
+    fn supports_retry_does_not_fallback_between_callback_families() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+
+        let mut retry_only_pipeline = crate::pipeline::buffer::Buffer::new("retry-only", None);
+        RetryOnlyProvider
+            .provide_stream_data_with_retry_by_id(47, 0, &mut retry_only_pipeline, false, false)
+            .expect("retry-only override");
+
+        let normal_family_stream = pdf.new_stream().expect("normal-family stream");
+        normal_family_stream
+            .replace_stream_data_provider(Rc::new(RetryOnlyProvider), None, None)
+            .expect("normal-family provider replacement");
+        let error = normal_family_stream
             .get_raw_stream_data()
-            .expect_err("provider requires an indirect stream identity");
+            .expect_err("normal family must not call retry-only override");
         assert!(matches!(
             error,
             Error::Internal(message)
-                if message == "pipeStreamData called for provider-backed direct stream"
+                if message == STREAM_DATA_PROVIDER_DEFAULT_ERROR
+        ));
+
+        let mut legacy_only_pipeline = crate::pipeline::buffer::Buffer::new("legacy-only", None);
+        LegacyOnlyProviderWithRetryFlag
+            .provide_stream_data_by_id(47, 0, &mut legacy_only_pipeline)
+            .expect("legacy-only override");
+
+        let retry_family_stream = pdf.new_stream().expect("retry-family stream");
+        retry_family_stream
+            .replace_stream_data_provider(Rc::new(LegacyOnlyProviderWithRetryFlag), None, None)
+            .expect("retry-family provider replacement");
+        let error = retry_family_stream
+            .get_raw_stream_data()
+            .expect_err("retry family must not call normal-only override");
+        assert!(matches!(
+            error,
+            Error::Internal(message)
+                if message == STREAM_DATA_PROVIDER_DEFAULT_ERROR
         ));
     }
 
@@ -14053,8 +14449,123 @@ mod stream_provider_contract_tests {
     }
 
     #[test]
+    fn callback_adapters_propagate_errors_and_preserve_repeated_invocation() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let calls = Rc::new(Cell::new(0));
+        let callback_calls = Rc::clone(&calls);
+        stream
+            .replace_stream_data_with_callback(
+                move |_pipeline| {
+                    callback_calls.set(callback_calls.get() + 1);
+                    Err(Error::System("callback failure".to_owned()))
+                },
+                None,
+                None,
+            )
+            .expect("callback provider replacement");
+
+        for _ in 0..2 {
+            let error = stream
+                .get_raw_stream_data()
+                .expect_err("callback error must cross the provider boundary");
+            assert!(matches!(
+                error,
+                Error::System(message) if message == "callback failure"
+            ));
+        }
+        assert_eq!(
+            calls.get(),
+            2,
+            "callback must remain reusable after an error"
+        );
+    }
+
+    #[test]
+    fn callback_adapters_propagate_pipeline_write_and_finish_errors() {
+        let mut write_pipeline = FailingCallbackPipeline {
+            failure: "callback write failure",
+        };
+        assert_eq!(write_pipeline.identifier(), "failing callback pipeline");
+        let write_provider = CallbackProvider {
+            callback: |pipeline: &mut dyn Pipeline| {
+                pipeline.write(b"write failure").map_err(Error::from)
+            },
+        };
+        assert!(matches!(
+            write_provider
+                .provide_stream_data(ObjectRef::new(47, 0), &mut write_pipeline)
+                .expect_err("callback write failure must propagate"),
+            Error::System(message) if message == "callback write failure"
+        ));
+
+        let mut finish_pipeline = FailingCallbackPipeline {
+            failure: "callback finish failure",
+        };
+        let finish_provider = CallbackProvider {
+            callback: |pipeline: &mut dyn Pipeline| pipeline.finish().map_err(Error::from),
+        };
+        assert!(matches!(
+            finish_provider
+                .provide_stream_data(ObjectRef::new(47, 0), &mut finish_pipeline)
+                .expect_err("callback finish failure must propagate"),
+            Error::System(message) if message == "callback finish failure"
+        ));
+    }
+
+    #[test]
+    fn retry_callback_adapter_forwards_both_flag_combinations() {
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
+        let flags = Rc::new(RefCell::new(Vec::new()));
+        let callback_flags = Rc::clone(&flags);
+        stream
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    callback_flags
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline
+                        .write(b"retry callback bytes")
+                        .map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("retry callback provider replacement");
+
+        assert_eq!(
+            stream
+                .get_raw_stream_data()
+                .expect("default retry callback pipe")
+                .as_slice(),
+            b"retry callback bytes"
+        );
+        let mut sink = crate::pipeline::buffer::Buffer::new("retry callback", None);
+        let mut filtering_attempted = false;
+        assert!(stream
+            .pipe_stream_data(
+                &mut sink,
+                &mut filtering_attempted,
+                0,
+                crate::writer::DecodeLevel::None,
+                true,
+                true,
+            )
+            .expect("explicit retry callback pipe"));
+        assert_eq!(
+            sink.take_buffer().expect("retry callback output"),
+            b"retry callback bytes"
+        );
+        assert_eq!(*flags.borrow(), vec![(false, false), (true, true)]);
+    }
+
+    #[test]
     fn replacing_a_provider_with_a_buffer_releases_the_provider_source() {
-        let stream = provider_stream();
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
         let provider = Rc::new(LegacyProvider::default());
         let ownership = Rc::downgrade(&provider);
 
@@ -14084,12 +14595,15 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn provider_replacement_uses_qpdf_filter_boundary_for_uninitialized_and_null_values() {
-        let dict = ObjectHandle::dictionary(vec![
-            (b"Filter".to_vec(), ObjectHandle::name(b"Keep".to_vec())),
-            (b"DecodeParms".to_vec(), ObjectHandle::dictionary(vec![])),
-            (b"Length".to_vec(), ObjectHandle::integer(3)),
-        ]);
-        let stream = ObjectHandle::stream(dict.clone(), Rc::new(b"old".to_vec()));
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf
+            .new_stream_with_data(Rc::new(b"old".to_vec()))
+            .expect("owned stream");
+        let dict = stream.as_stream_dict().expect("stream dictionary");
+        dict.replace_key(b"/Filter", ObjectHandle::name(b"Keep".to_vec()))
+            .expect("filter key");
+        dict.replace_key(b"/DecodeParms", ObjectHandle::dictionary(vec![]))
+            .expect("decode parms key");
 
         stream
             .replace_stream_data_provider(Rc::new(LegacyProvider::default()), None, None)
@@ -14234,7 +14748,8 @@ mod stream_provider_contract_tests {
 
     #[test]
     fn callback_adapters_are_deferred_and_retry_capability_is_retained() {
-        let stream = provider_stream();
+        let pdf = crate::Pdf::empty().expect("empty PDF");
+        let stream = pdf.new_stream().expect("owned empty stream");
         let void_calls = Rc::new(Cell::new(0));
         let void_calls_for_callback = Rc::clone(&void_calls);
         stream
@@ -14999,6 +15514,78 @@ pub(crate) mod warning_emission_tests {
             .unwrap();
         assert_eq!(
             warnings(&recorder),
+            ["operation for dictionary attempted on object of type integer: treating as empty"]
+        );
+    }
+
+    #[test]
+    fn nested_lifted_nulls_keep_qpdfs_contextless_dictionary_contract() {
+        fn assert_contextless_dictionary_access(handle: ObjectHandle) {
+            let error = handle
+                .try_get_keys()
+                .expect_err("qpdf newNull has no owning document context");
+            assert!(matches!(
+                error,
+                crate::Error::System(ref message)
+                    if message
+                        == "operation for dictionary attempted on object of type null: treating as empty"
+            ));
+        }
+
+        let (array, array_recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::null()]));
+        let array_null = array
+            .try_array_item(0)
+            .unwrap()
+            .expect("array contains the lifted null");
+        assert_contextless_dictionary_access(array_null);
+        assert!(warnings(&array_recorder).is_empty());
+
+        let (dictionary, dictionary_recorder) = handle_resolving(ObjectValue::Dictionary(
+            [(b"/Null".to_vec(), ObjectHandle::null())]
+                .into_iter()
+                .collect(),
+        ));
+        let dictionary_null = dictionary.try_get_key(b"/Null").unwrap();
+        assert_contextless_dictionary_access(dictionary_null);
+        assert!(warnings(&dictionary_recorder).is_empty());
+
+        let contextless_dictionary = ObjectHandle::dictionary(vec![]);
+        let missing_key_null = contextless_dictionary.try_get_key(b"/Missing").unwrap();
+        let error = missing_key_null
+            .try_get_keys()
+            .expect_err("qpdf missing-key null has no context without a document");
+        assert!(matches!(
+            error,
+            crate::Error::System(ref message)
+                if message
+                    == " -> dictionary key /Missing: operation for dictionary attempted on object of type null: treating as empty"
+        ));
+
+        let (stream, stream_recorder) = handle_resolving(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(vec![(b"/Null".to_vec(), ObjectHandle::null())]),
+            stream_data: Some(Rc::new(Vec::new())),
+            stream_provider: None,
+            stream_length: 0,
+        });
+        stream.try_dereference().unwrap();
+        let stream_null = stream
+            .as_stream_dict()
+            .expect("stream has a dictionary")
+            .try_get_key(b"/Null")
+            .unwrap();
+        assert_contextless_dictionary_access(stream_null);
+        assert!(warnings(&stream_recorder).is_empty());
+
+        let (non_null, non_null_recorder) =
+            handle_resolving(ObjectValue::Array(vec![ObjectHandle::integer(7)]));
+        let non_null_child = non_null
+            .try_array_item(0)
+            .unwrap()
+            .expect("array contains the integer");
+        assert!(non_null_child.try_get_keys().unwrap().is_empty());
+        assert_eq!(
+            warnings(&non_null_recorder),
             ["operation for dictionary attempted on object of type integer: treating as empty"]
         );
     }

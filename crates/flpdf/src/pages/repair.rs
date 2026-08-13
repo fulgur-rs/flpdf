@@ -115,7 +115,7 @@ fn prepare_for_optimization_canonical<R: Read + Seek>(
         changed_pages = true;
     }
     if changed_pages {
-        catalog.replace_key(b"/Pages", pages.clone());
+        catalog.replace_key(b"/Pages", pages.clone())?;
         pdf.mark_object_handle_dirty(&catalog)?;
     }
 
@@ -305,7 +305,7 @@ fn replace_handle_key<R: Read + Seek>(
     key: &[u8],
     value: ObjectHandle,
 ) -> Result<()> {
-    holder.replace_key(key, value);
+    holder.replace_key(key, value)?;
     pdf.mark_object_handle_dirty(holder)
 }
 
@@ -3396,10 +3396,12 @@ mod tests {
         // Keep the same live direct handle in both slots. Promoting the first
         // slot changes the shared handle's identity for the second slot too,
         // so the second occurrence must enter the duplicate branch.
-        pages.replace_key(
-            b"/Kids",
-            ObjectHandle::array(vec![direct_page.clone(), direct_page]),
-        );
+        pages
+            .replace_key(
+                b"/Kids",
+                ObjectHandle::array(vec![direct_page.clone(), direct_page]),
+            )
+            .expect("page-tree fixture values are unowned");
         pdf.mark_object_handle_dirty(&pages)
             .expect("mark modified /Pages");
 
@@ -4005,8 +4007,8 @@ mod tests {
             (b"Type".to_vec(), ObjectHandle::name(b"Pages".to_vec())),
             (b"Parent".to_vec(), first.clone()),
         ]);
-        first.replace_key(b"/Parent", second.clone());
-        catalog.replace_key(b"/Pages", first.clone());
+        first.replace_key(b"/Parent", second.clone()).unwrap();
+        catalog.replace_key(b"/Pages", first.clone()).unwrap();
         pdf.mark_object_handle_dirty(&catalog)
             .expect("mark modified catalog");
 
@@ -4050,8 +4052,10 @@ mod tests {
             (b"Kids".to_vec(), ObjectHandle::array(vec![first.clone()])),
             (b"Count".to_vec(), ObjectHandle::integer(1)),
         ]);
-        first.replace_key(b"/Kids", ObjectHandle::array(vec![second.clone(), leaf]));
-        catalog.replace_key(b"/Pages", first);
+        first
+            .replace_key(b"/Kids", ObjectHandle::array(vec![second.clone(), leaf]))
+            .unwrap();
+        catalog.replace_key(b"/Pages", first).unwrap();
         pdf.mark_object_handle_dirty(&catalog)
             .expect("mark modified catalog");
 

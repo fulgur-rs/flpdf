@@ -127,8 +127,9 @@ resolution, and provenance stay in `flpdf`.
 | qpdf | 行 | flpdf | 状態 |
 |---|---|---|---|
 | `QPDFObjectHandle.cc` | 2601 | `object.rs`(1301) + `object_handle.rs`(shared handle identity・parsed offset・遅延解決・live direct containment・`QPDF::newReserved`/`QPDF_Reserved`・`copyStream`/`StreamDataProvider` source dispatch) + `qpdf_null.rs`(9-37: `reference_is_null` / `value_is_null` = `isNull` の間接参照解決) + `overlay_annotations.rs`(1685-1737: `merge_resources_shallow` = `mergeResources`) + `overlay_appearance_stream.rs`（段階的 conflict merge の再現） | 🔀 アクセサが各所に散在（`flpdf-mfir`）。object identity / 遅延解決は `object_handle.rs` へ移行中（`flpdf-egzr.3.1`）。qpdf の array/dictionary/stream が保持する現在の forward child を正本とし、incremental dirty lookup 用に各 forward edge と一対一の immediate weak reverse edge を派生記録する。削除・置換後の旧 child は旧 root を返さない。`try_get_keys` は `QPDFObjectHandle::getKeys` → `QPDF_Dictionary::getKeys`（`QPDFObjectHandle.cc:997-1009`; `QPDF_Dictionary.cc:117-127`）に対応し、holder と全 child を lazy resolve して null value のキーを除外した `BTreeSet` を返す。child resolve 前に辞書 snapshot の borrow は終了し、resolver error は伝播する。`stream_filter.rs` の consuming stage は retained-key reduction 前に `try_get_keys` を使用する。`shallow_copy` は `QPDFObjectHandle::shallowCopy`（`QPDFObjectHandle.cc:2072-2079`）に対応し、stream は `QPDF_Stream::copy`（`QPDF_Stream.cc:140-145`）が `shallow` 引数を無視して無条件に `std::runtime_error` を投げるのに合わせて `Error::System` で拒否する。`QPDF_Dictionary::copy`/`QPDF_Array::copy` が direct な子に `shallowCopy` を掛けるため、コンテナに入れ子の direct stream も同じ拒否に到達する。qpdf の `QPDFObjectHandle::copyStream`（`QPDFObjectHandle.cc:2136-2151`）と `QPDF::copyStreamData`（`QPDF.cc:2216-2272`）を `ObjectHandle::copy_stream` と resolver-owned stream-copy boundary として実装済み（`flpdf-a8mk`）。Buffer は `Rc<Vec<u8>>` 共有、provider/original source は retry-aware provider で遅延 dispatch、`set_immediate_copy_from` は qpdf の source-side `setImmediateCopyFrom` に対応する。`QPDFObjectHandle::isReserved`/`QPDF::newReserved` は `ObjectState::Reserved` と `Pdf::new_reserved` に対応し、`ot_reserved` は null/missing/destroyed と区別して、materialize と全 ObjectHandle writer entrypoint で `QPDFObjectHandle: attempting to unparse a reserved object` を返す。 |
+| `QPDFObjectHandle::StreamDataProvider` / `QPDF_Stream` | `QPDFObjectHandle.hh:68-127`; `QPDFObjectHandle.cc:48-90,1365-1428`; `QPDF_Stream.cc:571-620,640-660` | `object_handle.rs` の `StreamDataProvider`、`ObjectValue::Stream.stream_provider`、`replace_stream_data_provider`、callback adapter、`pipe_stream_source` | ✅ qpdf の provider ownership、通常/retry family の選択、identity forwarding、遅延・反復 invocation、`Pl_Count` による encoded-byte length 検証、buffer/provider の排他を canonical route で保持する。qpdf の `std::shared_ptr` container は `Rc<dyn StreamDataProvider>` に置換するが、これは内部所有表現だけの差であり、callback/error/finish/`/Length` の観測契約は変えない。登録 API は stable `ObjectRef` を必要とするため indirect stream に限定し、direct stream は登録時に `Error::System` で拒否する。既存 document-owned stream の provider/dictionary 置換は live graph mutation なので、writer 前に `Pdf::mark_object_handle_dirty` を要求する | ✅ |
 | `QPDFObjectHandle::isNameAndEquals` / `isDictionaryOfType` / `getArrayNItems` / `getArrayItem` / `isOrHasName`（行数は上段に計上済み） | — | `object_handle.rs` の `try_is_name_and_equals` / `try_is_dictionary_of_type` / `try_array_len` / `try_array_item` / `try_is_or_has_name`（`QPDFObjectHandle.cc:456-466,759-785,1027-1039`） | ✅ holder と child を qpdf 順に lazy resolve。container borrow は resolver 再入前に解放し、配列全体を snapshot しない。`try_array_item` は `QPDF::decryptStream` が equal-length 確認後に使う valid-index 面のみで、qpdf が warning と特殊 null を返す invalid access は契約外 |
-| `QPDFObjectHandle::typeWarning` / `warnIfPossible` / `objectWarning` / `warn` / `getIntValue` / `getIntValueAsInt`（行数は上段に計上済み） | — | `object_handle.rs` の `type_warning` / `warn_if_possible` / `object_warning` / `warn_through_context` / `context` と `DocumentResolver::warn`、`try_get_int_value` / `try_get_int_value_as_int`、`reader/resolver.rs` の `push_object_warning`（`QPDFObjectHandle.cc:502-543,2168-2212,2385-2396`; `QPDF.cc:487-494`） | 🔀 メッセージ文言は qpdf と完全一致。live parser が生成した direct value と canonical indirect handle は `HandleResolver::direct_handle` / `ChildHandles` から同じ weak document context と、qpdf の `QPDFParser` と同じ parse-call description template を持つ。非 null の top-level・array・dictionary・scalar は `input-description, object N G at offset $PO` を共有し、`QPDFValue` と同じ container offset shift を経て `DocumentResolver::warn` → `push_object_warning` で `Pdf::repair_diagnostics` と同じ収集先へ同順に届く。parsed null は qpdf と同じく description を持たない。明示的 parse と programmatic direct は qpdf の contextless 分岐を維持する。no-context 分岐は qpdf のまま 2 通り — `typeWarning`/`objectWarning` は `throw QPDFExc`（`std::runtime_error` 派生、`QPDFExc.hh:29`）に対応する `Error::System`、`warnIfPossible` は `QPDFLogger::defaultLogger()->getError()` へ素の文言を書いて正常復帰する。`getKey`/`getKeys` の `typeWarning` は `try_get_key`/`try_get_keys` に実装済み。live parser の direct value は weak document context を持ち、stream_filter の consuming `/DecodeParms` 読み出しで qpdf と同じ回復可能な警告を `DocumentResolver::warn` へ送る。contextless の programmatic direct は qpdf と同じく `Error::System` 相当の throw を維持する。`asDictionary`/`asInteger` に対応する `try_as_dictionary`/`try_as_integer` は qpdf 同様 warning を出さない |
+| `QPDFObjectHandle::typeWarning` / `warnIfPossible` / `objectWarning` / `warn` / `getIntValue` / `getIntValueAsInt`（行数は上段に計上済み） | — | `object_handle.rs` の `type_warning` / `warn_if_possible` / `object_warning` / `warn_through_context` / `context` と `DocumentResolver::warn`、`try_get_int_value` / `try_get_int_value_as_int`、`reader/resolver.rs` の `push_object_warning`（`QPDFObjectHandle.cc:502-543,2168-2212,2385-2396`; `QPDF.cc:487-494`） | 🔀 メッセージ文言は qpdf と完全一致。live parser が生成した direct value と canonical indirect handle は `HandleResolver::direct_handle` / `ChildHandles` から同じ weak document context と、qpdf の `QPDFParser` と同じ parse-call description template を持つ。非 null の top-level・array・dictionary・scalar は `input-description, object N G at offset $PO` を共有し、`QPDFValue` と同じ container offset shift を経て `DocumentResolver::warn` → `push_object_warning` で `Pdf::repair_diagnostics` と同じ収集先へ同順に届く。parsed null は qpdf と同じく description を持たない。literal null は containment parent の context を借りず、qpdf の `QPDF_Null::create` に対応する contextless 分岐をネスト後も維持する一方、missing-key null は `setChildDescription` に対応する Child description 経由で親の context を保持する（`QPDF_Null.cc:12-15`; `QPDFParser.cc:397-410`; `QPDFObject_private.hh:79-91`）。明示的 parse と programmatic direct は qpdf の contextless 分岐を維持する。no-context 分岐は qpdf のまま 2 通り — `typeWarning`/`objectWarning` は `throw QPDFExc`（`std::runtime_error` 派生、`QPDFExc.hh:29`）に対応する `Error::System`、`warnIfPossible` は `QPDFLogger::defaultLogger()->getError()` へ素の文言を書いて正常復帰する。`getKey`/`getKeys` の `typeWarning` は `try_get_key`/`try_get_keys` に実装済み。live parser の direct value は weak document context を持ち、stream_filter の consuming `/DecodeParms` 読み出しで qpdf と同じ回復可能な警告を `DocumentResolver::warn` へ送る。contextless の programmatic direct は qpdf と同じく `Error::System` 相当の throw を維持する。`asDictionary`/`asInteger` に対応する `try_as_dictionary`/`try_as_integer` は qpdf 同様 warning を出さない |
 | `QPDF_Array/Dictionary/Stream/String/Name/Real/Integer/Bool/Null/InlineImage/Operator/Reserved/Unresolved/Destroyed.cc` | 1814 | `object.rs` の `Object` enum に統合 | 🔀 |
 | `QPDFObject.cc` / `QPDFValue.cc` | 79 | `object.rs` の `Object` + `object_handle.rs` の `ObjectHandle` / `ObjectValue`（共有 identity・qpdf 互換 parsed offset・`IndirectState` 遅延解決・Pdf identity provenance） | 🔀 `object.rs` の `Object` は静的な値表現のみ。`QPDFValue` 相当の共有 identity・parsed offset・遅延解決状態は `object_handle.rs` が新たに担う（layer cutover 進行中）。Pdf identity provenance は live containment から分離して detach 後も保持する。両モジュールに分割されているため `✅` から変更 |
 | `QPDFObjGen.cc` | 68 | `object.rs` の `ObjectRef` | ✅ |
@@ -430,6 +431,52 @@ flpdf が「dict キーは drop / 配列要素は null 保持」という非対�
 
 `object_copy.rs`(184) は `QPDF.cc` の `copyForeignObject` に相当するため
 [§2 パース / 読み取り](#2-パース--読み取り) の `QPDF.cc` 行に移した。
+
+なお、`object_copy.rs` の `copy_objects` / `page_closure.rs` は旧来の
+pre-closed raw `Object` 経路であり、canonical parity の責務ではない。
+qpdf 11.9.0 の `QPDF::copyForeignObject`（`QPDF.cc:2019-2272`）に対応する
+正本は `object_copy::copy_foreign_object` で、`reserveObjects` / 完全な
+`ObjectHandle` graph replacement / `/Pages` 境界 / per-source map reuse を
+ここで担う。stream の Buffer/provider/original-source 選択は
+`reader/resolver.rs` の resolver-owned boundary に委譲し、qpdf の
+`ot_reserved` は外部に露出しない内部 reservation sentinel として
+destination-owned indirect null slot で表現する。
+
+⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
+相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を
+`direct_visiting`（`ForeignObjectCopier` フィールド）で bound する。qpdf の該当
+2 関数（`QPDF.cc:2101-2213`）はいずれも direct cycle 用の visited set を持たない。
+実際にパースされた PDF はこの形を表現できない（直接値は自分自身を参照するための
+アドレス可能な identity を持たない）ため、qpdf 側にこの bound の対応物は無い。
+公開 `ObjectHandle::replace_key` API 経由でのみ構築可能な入力への防御であり、
+出力バイトには影響しない。
+
+⚪ `reserve_objects`（`ForeignObjectCopier`）は各ノードの `owning_pdf_unique_id`
+を root の `source_id` と照合し、不一致なら拒否する。`ObjectHandle::replace_key`
+は `QPDFObjectHandle::checkOwnership`（`QPDFObjectHandle.cc:2355-2365`）と同じ
+shallow 比較（`self`/`value` 自身の owning document のみ、子孫は辿らない）を
+実装済み（flpdf-25kg.3.8.1.2）だが、qpdf の `checkOwnership` 自体が shallow で
+ある以上、直接（非間接）コンテナに数ホップ下でネストした foreign indirect object
+は qpdf でも挿入時には検出されない（`QPDF::copyForeignObject` 自身の呼び出し側
+向けドキュメントが、この状況を避けるのは呼び出し側の責務だと明記している）。
+`reserveObjects`/`replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）自身にも
+対応するチェックは無いため、`reserve_objects` のこの再検証は「未実装ギャップの
+暫定穴埋め」ではなく、qpdf のこの境界そのものが持つ shallow-check の弱点に対する
+flpdf 独自の追加防御であり、公開 `ObjectHandle` API 経由でのみ構築可能な入力への
+防御として、実パースされた PDF の出力バイトには影響しない。`QPDF_Array` の各
+ミューテータ側（`check_array_item_ownership`）はまだこの shallow 比較に揃って
+おらず、`belongs_exclusively_to_pdf` の子孫再帰に依存したまま（flpdf-25kg.3.16.7.1
+で追跡）。
+
+⚪ `reserve_objects` と `replace_foreign_indirect_objects` の両方を
+`stacker::maybe_grow`（`OBJECT_COPY_STACK_RED_ZONE`/`OBJECT_COPY_STACK_GROWTH_SIZE`）
+で包む。個別の indirect object から成る非循環チェーン（A → B → C → …、各々が
+別オブジェクト番号）はパーサの container-nesting 上限（`MAX_PARSE_DEPTH`）で
+bound されないため、十分に長い参照チェーンを持つ実在の PDF がこの再帰で
+コールスタックを枯渇させ得る。qpdf の `reserveObjects`/
+`replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）にもこの経路の深さ制限は
+無いため、qpdf parity の欠落ではなく flpdf 実装固有の Rust スタック安全性対応
+であり、出力バイトには影響しない。
 
 ---
 

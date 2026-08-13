@@ -85,7 +85,7 @@
 //! document warning.
 
 use super::{interpret_cf_from_handle, EncryptionMode, EncryptionState};
-use crate::object_handle::{DocumentResolver, ObjectValue, NO_PARSED_OFFSET};
+use crate::object_handle::{DocumentResolver, ObjectValue, StreamDataProvider, NO_PARSED_OFFSET};
 use crate::parser::{
     parse_live_file_object_with_decrypter, parse_qpdf_direct_object_handle_with_diagnostics,
     LiveInput, LiveTokenSource, StringDecrypter,
@@ -287,6 +287,12 @@ pub(crate) struct ResolverWarningOptions {
 /// must still propagate.
 enum ObjectStreamResolutionError {
     Operation(Error),
+    MemberWarning {
+        stream_number: u32,
+        object_ref: ObjectRef,
+        offset: u64,
+        message: String,
+    },
     WarningDelivery(Error),
 }
 
@@ -607,6 +613,44 @@ struct ResolverStringDecrypter<'resolver, R: Read + Seek + 'static> {
     resolver: &'resolver ResolverHandle<R>,
 }
 
+/// qpdf's `ForeignStreamData`/`CopiedStreamDataProvider` split for an
+/// original file-backed stream (`libqpdf/QPDF.cc:2265-2273`). The source
+/// resolver is retained, but the source object handle is not: this lets the
+/// destination continue reading the source input after the source `Pdf` has
+/// run its object-cache teardown.
+struct OriginalStreamDataProvider<R: Read + Seek + 'static> {
+    resolver: Rc<ResolverHandle<R>>,
+    object_ref: ObjectRef,
+    parsed_offset: i64,
+    stream_length: usize,
+    destination_dict: ObjectHandle,
+}
+
+impl<R: Read + Seek + 'static> StreamDataProvider for OriginalStreamDataProvider<R> {
+    fn supports_retry(&self) -> bool {
+        true
+    }
+
+    fn provide_stream_data_with_retry_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        self.resolver.pipe_stream_data(
+            self.object_ref,
+            self.parsed_offset,
+            self.stream_length,
+            &self.destination_dict,
+            pipeline,
+            suppress_warnings,
+            will_retry,
+        )
+    }
+}
+
 impl<R: Read + Seek + 'static> StringDecrypter for ResolverStringDecrypter<'_, R> {
     fn decrypt_string(&mut self, bytes: &mut Vec<u8>) -> Result<()> {
         let warn_unknown_string = {
@@ -814,11 +858,49 @@ impl<R: Read + Seek> ResolverHandle<R> {
             return Ok(());
         }
 
-        destination.replace_stream_data_provider(
-            crate::object_handle::copied_stream_data_provider(source.clone()),
-            filter,
-            decode_parms,
-        )
+        let provider = if source.has_stream_data_provider() {
+            // qpdf's provider-backed source retains the foreign stream/QPDF
+            // because the provider itself is the source of the bytes.
+            crate::object_handle::copied_stream_data_provider(source.clone())
+        } else {
+            // qpdf's original-file source captures the input and stream
+            // metadata instead, so the source QPDF/handle may be destroyed.
+            let source_resolver = source.context().ok_or_else(|| {
+                Error::Internal(
+                    "original foreign stream has no owning document resolver".to_owned(),
+                )
+            })?;
+            source_resolver.original_stream_data_provider(source, &destination_dict)?
+        };
+
+        destination.replace_stream_data_provider(provider, filter, decode_parms)
+    }
+
+    pub(crate) fn original_stream_data_provider(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        let object_ref = source.object_ref().ok_or_else(|| {
+            Error::Internal("original foreign stream has no object reference".to_owned())
+        })?;
+        let stream_length = source.stream_source_length().ok_or_else(|| {
+            Error::Internal("original foreign stream has no stream length".to_owned())
+        })?;
+        // cov:ignore-start: ResolverHandle::new_shared always installs a live
+        // self_weak; only an invalid manually-constructed resolver could reach
+        // this branch.
+        let resolver = self.self_weak.upgrade().ok_or_else(|| {
+            Error::Internal("original foreign stream resolver is no longer live".to_owned())
+        })?;
+        // cov:ignore-end
+        Ok(Rc::new(OriginalStreamDataProvider {
+            resolver,
+            object_ref,
+            parsed_offset: source.get_parsed_offset(),
+            stream_length,
+            destination_dict: destination_dict.clone(),
+        }))
     }
 
     /// The canonical handle for `object_ref`, minting and registering one on
@@ -1310,6 +1392,54 @@ impl<R: Read + Seek> ResolverHandle<R> {
         self.push_warning_with_offset(Some(offset), message)
     }
 
+    /// Emit a warning raised while parsing a canonical ObjStm member.
+    ///
+    /// qpdf parses the member through its `BufferInputSource` whose name is
+    /// the source description plus `object stream N`, so the parser offset is
+    /// relative to the decoded buffer rather than the source PDF
+    /// (`libqpdf/QPDF.cc:1792-1807`). Keep that coordinate in the rendered
+    /// qpdf message, but do not publish it as [`Diagnostic::offset`], whose
+    /// contract is a source-file position.
+    pub(crate) fn push_object_stream_warning(
+        &self,
+        stream_number: u32,
+        object_ref: ObjectRef,
+        offset: u64,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let detail = message.into();
+        let diagnostic_message = format!(
+            "object stream {stream_number} (object {} {}, offset {offset}): {detail}",
+            object_ref.number, object_ref.generation
+        );
+        let object_message = format!(
+            "(object {} {}, offset {offset}): {detail}",
+            object_ref.number, object_ref.generation
+        );
+        let (logger, suppress_warnings, description) = {
+            let mut core = self.core.borrow_mut();
+            core.repair_diagnostics
+                .push(Diagnostic::warning(diagnostic_message, None));
+            (
+                core.logger.clone(),
+                core.suppress_warnings,
+                core.description.clone(),
+            )
+        };
+        let object_stream_description = if description.is_empty() {
+            format!("object stream {stream_number}")
+        } else {
+            format!("{description} object stream {stream_number}")
+        };
+        route_warning(
+            &logger,
+            suppress_warnings,
+            &object_stream_description,
+            None,
+            &object_message,
+        )
+    }
+
     fn push_warning_with_offset(
         &self,
         offset: Option<u64>,
@@ -1612,22 +1742,34 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 description_template: description_template.clone(),
             };
             let (value, parsed_offset, diagnostics) =
-                parse_qpdf_direct_object_handle_with_diagnostics(
+                match parse_qpdf_direct_object_handle_with_diagnostics(
                     &decoded_stream_data[member_start as usize..],
                     member_start,
                     Some(member_start),
                     &mut handles,
-                )?;
+                ) {
+                    Ok(parsed) => parsed,
+                    Err(Error::Parse { offset, message }) => {
+                        return Err(ObjectStreamResolutionError::MemberWarning {
+                            stream_number,
+                            object_ref,
+                            offset: (member_start as u64).saturating_add(offset as u64),
+                            message,
+                        });
+                    }
+                    // cov:ignore-start: SliceLiveInput's parser can only surface Parse or success here; preserve any future non-Parse failure defensively.
+                    Err(error) => return Err(ObjectStreamResolutionError::Operation(error)),
+                    // cov:ignore-end
+                };
             let malformed = !diagnostics.is_empty() && matches!(&value, ObjectValue::Null);
             for diagnostic in diagnostics {
                 let offset =
                     (member_start as u64).saturating_add(diagnostic.relative_offset as u64);
-                self.push_warning_at(
+                self.push_object_stream_warning(
+                    stream_number,
+                    object_ref,
                     offset,
-                    format!(
-                        "object stream {stream_number} (object {} {}, offset {offset}): {}",
-                        object_ref.number, object_ref.generation, diagnostic.message
-                    ),
+                    diagnostic.message,
                 )
                 .map_err(ObjectStreamResolutionError::WarningDelivery)?;
             }
@@ -1674,6 +1816,17 @@ impl<R: Read + Seek> ResolverHandle<R> {
                 }
             }
             Err(ObjectStreamResolutionError::WarningDelivery(error)) => return Err(error),
+            Err(ObjectStreamResolutionError::MemberWarning {
+                stream_number,
+                object_ref,
+                offset,
+                message,
+            }) => {
+                self.push_object_stream_warning(stream_number, object_ref, offset, message)?;
+                if !handle.is_resolved() {
+                    handle.set_missing();
+                }
+            }
             Err(ObjectStreamResolutionError::Operation(error))
                 if Self::is_qpdf_caught_resolution_error(&error) =>
             {
@@ -3368,6 +3521,14 @@ impl<R: Read + Seek> DocumentResolver for ResolverHandle<R> {
         ResolverHandle::copy_stream_data(self, destination, source)
     }
 
+    fn original_stream_data_provider(
+        &self,
+        source: &ObjectHandle,
+        destination_dict: &ObjectHandle,
+    ) -> Result<Rc<dyn StreamDataProvider>> {
+        ResolverHandle::original_stream_data_provider(self, source, destination_dict)
+    }
+
     fn immediate_copy_from(&self) -> bool {
         self.immediate_copy_from()
     }
@@ -3873,6 +4034,48 @@ mod tests {
             ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
             0,
         )
+    }
+
+    #[test]
+    fn foreign_copy_stream_requires_an_owning_source_resolver() {
+        let resolver = bare_resolver();
+        let destination = resolver.new_stream_handle().expect("destination stream");
+        let source = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: ObjectHandle::dictionary(Vec::new()),
+            stream_data: None,
+            stream_provider: None,
+            stream_length: 0,
+        });
+
+        let error = resolver
+            .copy_stream_data(&destination, &source)
+            .expect_err("an original stream without a document cannot be copied lazily");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "original foreign stream has no owning document resolver"));
+    }
+
+    #[test]
+    fn foreign_original_stream_provider_reports_invalid_source_shapes() {
+        let resolver = bare_resolver();
+        let destination_dict = ObjectHandle::dictionary(Vec::new());
+        let direct_stream = ObjectHandle::from_value(ObjectValue::Stream {
+            stream_dict: destination_dict.clone(),
+            stream_data: None,
+            stream_provider: None,
+            stream_length: 0,
+        });
+        let error = resolver
+            .original_stream_data_provider(&direct_stream, &destination_dict)
+            .expect_err("a direct stream has no source object identity");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "original foreign stream has no object reference"));
+
+        let unresolved = ObjectHandle::new_indirect_unresolved(ObjectRef::new(99, 0), -1);
+        let error = resolver
+            .original_stream_data_provider(&unresolved, &destination_dict)
+            .expect_err("an unresolved non-stream handle has no source stream length");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "original foreign stream has no stream length"));
     }
 
     #[test]
@@ -7413,6 +7616,10 @@ mod tests {
         let stream_ref = ObjectRef::new(4, 0);
         let member_ref = ObjectRef::new(7, 0);
         let stream_data = b"7 0 [ 2147483648 0 R ]".to_vec();
+        let decoded_offset = stream_data
+            .windows(b"2147483648".len())
+            .position(|window| window == b"2147483648")
+            .expect("the fixture must contain the malformed integer");
         let stream_dict = ObjectHandle::dictionary(vec![
             (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
             (b"N".to_vec(), ObjectHandle::integer(1)),
@@ -7422,25 +7629,14 @@ mod tests {
                 ObjectHandle::integer(stream_data.len() as i64),
             ),
         ]);
-        let resolver = ResolverHandle::new_shared(
-            Cursor::new(Vec::<u8>::new()),
-            0,
-            BTreeMap::from([
-                (stream_ref, XrefEntry::Uncompressed { offset: 1 }),
-                (
-                    member_ref,
-                    XrefEntry::Compressed {
-                        stream: stream_ref.number,
-                        index: 0,
-                    },
-                ),
-            ]),
-            false,
-            false,
-            BTreeSet::new(),
-            Diagnostics::default(),
-            ResolverWarningOptions::new(crate::QPDFLogger::create(), true, String::new()),
-            0,
+        let (resolver, output) = named_resolver_with_captured_warnings();
+        resolver.insert_xref_entry(stream_ref, XrefEntry::Uncompressed { offset: 1 });
+        resolver.insert_xref_entry(
+            member_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
         );
         resolver
             .get_object_handle(stream_ref)
@@ -7456,16 +7652,113 @@ mod tests {
             .try_dereference()
             .expect("qpdf catches a member parse error and resolves it to null");
         assert!(resolver.get_object_handle(member_ref).is_null());
-        assert!(resolver
-            .repair_diagnostics()
+        let diagnostics = resolver.repair_diagnostics();
+        let warning = diagnostics
             .entries()
             .iter()
-            .any(|diagnostic| {
+            .find(|diagnostic| {
                 diagnostic
                     .message
                     .contains("integer out of range converting 2147483648")
-                    && diagnostic.offset.is_some()
-            }));
+            })
+            .expect("the caught parse failure must be warned");
+        assert_eq!(warning.offset, None);
+        assert_eq!(
+            warning.message,
+            format!(
+                "object stream 4 (object 7 0, offset {decoded_offset}): integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type"
+            )
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            format!(
+                "WARNING: input.pdf object stream 4 (object 7 0, offset {decoded_offset}): integer out of range converting 2147483648 from a 8-byte signed type to a 4-byte signed type\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn canonical_object_stream_diagnostics_keep_decoded_offsets_out_of_source_locations() {
+        let stream_ref = ObjectRef::new(4, 0);
+        let member_ref = ObjectRef::new(7, 0);
+        let stream_data = b"7 0 << /A#zB 1 >>".to_vec();
+        let stream_dict = ObjectHandle::dictionary(vec![
+            (b"Type".to_vec(), ObjectHandle::name(b"ObjStm".to_vec())),
+            (b"N".to_vec(), ObjectHandle::integer(1)),
+            (b"First".to_vec(), ObjectHandle::integer(4)),
+            (
+                b"Length".to_vec(),
+                ObjectHandle::integer(stream_data.len() as i64),
+            ),
+        ]);
+        let (resolver, output) = named_resolver_with_captured_warnings();
+        resolver.insert_xref_entry(stream_ref, XrefEntry::Uncompressed { offset: 1 });
+        resolver.insert_xref_entry(
+            member_ref,
+            XrefEntry::Compressed {
+                stream: stream_ref.number,
+                index: 0,
+            },
+        );
+        resolver
+            .get_object_handle(stream_ref)
+            .set_resolved(ObjectValue::Stream {
+                stream_dict,
+                stream_data: Some(Rc::new(stream_data)),
+                stream_length: 0,
+                stream_provider: None,
+            });
+
+        resolver
+            .get_object_handle(member_ref)
+            .try_dereference()
+            .expect("qpdf preserves the malformed member and warns");
+
+        let diagnostics = resolver.repair_diagnostics();
+        assert_eq!(
+            diagnostics
+                .entries()
+                .iter()
+                .map(|diagnostic| (diagnostic.offset, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                None,
+                "object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2"
+            )]
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"WARNING: input.pdf object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2\n"
+        );
+    }
+
+    #[test]
+    fn canonical_object_stream_warning_without_source_description_stays_contextual() {
+        let resolver = bare_resolver();
+        resolver
+            .push_object_stream_warning(
+                4,
+                ObjectRef::new(7, 0),
+                7,
+                "name with stray # will not work with PDF >= 1.2",
+            )
+            .expect("suppressed warning still records its diagnostic");
+
+        assert_eq!(
+            resolver
+                .repair_diagnostics()
+                .entries()
+                .iter()
+                .map(|diagnostic| (diagnostic.offset, diagnostic.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    None,
+                    "object stream 4 (object 7 0, offset 7): name with stray # will not work with PDF >= 1.2"
+                )
+            ]
+        );
     }
 
     #[test]
@@ -8372,7 +8665,8 @@ mod tests {
         stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .replace_key(b"/Length", ObjectHandle::integer(0));
+            .replace_key(b"/Length", ObjectHandle::integer(0))
+            .unwrap();
         assert_eq!(
             stream
                 .get_raw_stream_data()
