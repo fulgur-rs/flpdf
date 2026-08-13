@@ -8,7 +8,23 @@
 //!
 //! Parent-chain cycle detection follows qpdf's `QPDFObjGen::set`: indirect
 //! object identities are keyed by `ObjectRef` in a `BTreeSet`, while direct
-//! handles are not inserted (`include/qpdf/QPDFObjGen.hh:105-124`).
+//! handles are not inserted (`include/qpdf/QPDFObjGen.hh:105-124`). This
+//! mirrors qpdf exactly for indirect cycles, but qpdf's own guard has the
+//! same gap flpdf would otherwise inherit: a direct object's `QPDFObjGen` is
+//! always `(0, 0)`, so `QPDFObjGen::set::add` unconditionally returns `true`
+//! for it and never terminates a `/Parent` chain built entirely from direct
+//! dictionaries that reciprocally reference each other
+//! (`include/qpdf/QPDFObjGen.hh:112-120`). Such a chain cannot come from
+//! parsing real PDF bytes -- direct values are inline text, so two of them
+//! cannot mutually contain each other in a finite file -- but it is
+//! reachable in memory through the public [`ObjectHandle::replace_key`] API,
+//! whose own doc already records that gap. Unlike qpdf's C++ walk, this
+//! crate's walk must not hang the hosting process for that shape, so this
+//! module bounds consecutive direct hops the same way `top_level_field`'s
+//! existing `DEFAULT_MAX_PAGE_TREE_DEPTH` check bounds its own walk. The
+//! bound only counts a *run* of direct hops and resets on every indirect
+//! hop, so a legitimately deep chain of indirect objects -- bounded only by
+//! the document's own object count, same as qpdf -- is never limited by it.
 
 use crate::object_handle::ObjectHandle;
 use crate::pages::DEFAULT_MAX_PAGE_TREE_DEPTH;
@@ -24,6 +40,29 @@ fn mark_field_node_seen(seen: &mut BTreeSet<ObjectRef>, current: &ObjectHandle) 
         .object_ref()
         .map(|object_ref| seen.insert(object_ref))
         .unwrap_or(true)
+}
+
+/// Bound a run of consecutive **direct** `/Parent` hops. Indirect hops reset
+/// the counter to zero and are otherwise left unbounded here (they are
+/// bounded only by the finite number of indirect objects a document can
+/// have, which the `seen` set already turns into termination for any
+/// indirect cycle). See the module doc for why this exists.
+fn count_direct_hop(
+    direct_depth: &mut usize,
+    current: &ObjectHandle,
+    field_ref: ObjectRef,
+) -> Result<()> {
+    if current.is_direct() {
+        *direct_depth += 1;
+        if *direct_depth > DEFAULT_MAX_PAGE_TREE_DEPTH {
+            return Err(Error::Unsupported(format!(
+                "field tree depth exceeds maximum of {DEFAULT_MAX_PAGE_TREE_DEPTH} at {field_ref}"
+            )));
+        }
+    } else {
+        *direct_depth = 0;
+    }
+    Ok(())
 }
 
 /// Typed access helper for a PDF AcroForm field or widget annotation
@@ -207,8 +246,10 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let mut current = self.field.clone();
         let mut seen = BTreeSet::new();
         let mut parts = Vec::new();
+        let mut direct_depth = 0;
 
         while mark_field_node_seen(&mut seen, &current) {
+            count_direct_hop(&mut direct_depth, &current, self.field_ref)?;
             let node = self.resolved(current.clone())?;
             if node.as_dictionary().is_none() {
                 break;
@@ -720,7 +761,8 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
 
     /// Walk field nodes by live handle identity.  qpdf's seen set is over
     /// object identity, not over a materialized reference spelling, so direct
-    /// children and indirect children follow the same cycle rule here.
+    /// children and indirect children both continue the walk the same way;
+    /// only their termination guard differs -- see the module doc for why.
     fn resolve_inherited_handle_from(
         &mut self,
         field: ObjectHandle,
@@ -729,10 +771,12 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         let key = crate::object_handle::canonical_dictionary_key(key);
         let mut current = field;
         let mut seen = BTreeSet::new();
+        let mut direct_depth = 0;
         loop {
             if !mark_field_node_seen(&mut seen, &current) {
                 return Ok(None);
             }
+            count_direct_hop(&mut direct_depth, &current, self.field_ref)?;
 
             let node = self.resolved(current)?;
             if node.as_dictionary().is_none() {

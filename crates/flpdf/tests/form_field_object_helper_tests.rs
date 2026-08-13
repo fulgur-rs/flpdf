@@ -1,7 +1,7 @@
 //! Integration coverage for the public qpdf-shaped form-field helper.
 
 use flpdf::form_field_object_helper::FormFieldObjectHelper;
-use flpdf::{Object, ObjectHandle, ObjectRef, Pdf};
+use flpdf::{Error, Object, ObjectHandle, ObjectRef, Pdf};
 use std::io::Cursor;
 
 mod common;
@@ -175,6 +175,62 @@ fn inherits_values_through_direct_parent_handles() {
             .and_then(|value| value.as_string()),
         Some(b"parent".to_vec())
     );
+}
+
+#[test]
+fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
+    // qpdf's own `QPDFObjGen::set` cannot key a direct object (its
+    // `QPDFObjGen` is always `(0, 0)`), so a `/Parent` chain built entirely
+    // from direct dictionaries that reciprocally reference each other is
+    // never caught by the `seen` set -- in qpdf or here. Real PDF bytes
+    // cannot produce this shape (two direct values cannot mutually contain
+    // each other in a finite file), but the public `ObjectHandle::replace_key`
+    // API can construct it in memory, and `replace_key`'s own doc already
+    // records that gap. This must terminate with a bounded error rather than
+    // loop forever.
+    let bytes = doc(vec![(10, "<< /T (child) /Parent << /T (a) >> >>".into())]);
+    let mut pdf = open(bytes);
+    let field_ref = ObjectRef::new(10, 0);
+    let field = pdf.get_object_handle(field_ref);
+    pdf.resolve_object_handle(&field).unwrap();
+    let direct_a = field.get_key(b"/Parent");
+    let direct_b =
+        ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
+    direct_a.replace_key(b"/Parent", direct_b.clone()).unwrap();
+    direct_b.replace_key(b"/Parent", direct_a.clone()).unwrap();
+
+    let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
+    let error = field
+        .fully_qualified_name()
+        .expect_err("a reciprocal direct /Parent cycle must not loop forever");
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("field tree depth exceeds maximum")));
+}
+
+#[test]
+fn inherited_value_lookup_terminates_on_a_reciprocal_direct_parent_cycle() {
+    // Same reciprocal direct-cycle shape as
+    // `fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle`,
+    // exercised through `resolve_inherited_handle_from` (backing
+    // `field_value`) instead. Neither direct dictionary defines `/V`, so the
+    // walk can never find a terminal value and must hit the depth bound.
+    let bytes = doc(vec![(10, "<< /Parent << /T (a) >> >>".into())]);
+    let mut pdf = open(bytes);
+    let field_ref = ObjectRef::new(10, 0);
+    let field = pdf.get_object_handle(field_ref);
+    pdf.resolve_object_handle(&field).unwrap();
+    let direct_a = field.get_key(b"/Parent");
+    let direct_b =
+        ObjectHandle::dictionary(vec![(b"/T".to_vec(), ObjectHandle::string(b"b".to_vec()))]);
+    direct_a.replace_key(b"/Parent", direct_b.clone()).unwrap();
+    direct_b.replace_key(b"/Parent", direct_a.clone()).unwrap();
+
+    let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
+    let error = field
+        .field_value()
+        .expect_err("a reciprocal direct /Parent cycle must not loop forever");
+    assert!(matches!(error, Error::Unsupported(ref message)
+        if message.contains("field tree depth exceeds maximum")));
 }
 
 #[test]
