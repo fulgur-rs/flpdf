@@ -5769,7 +5769,9 @@ mod tests {
         // and Indirect slots are distinct storage, unlike qpdf's uniform
         // shared_ptr<QPDFObject> -- see make_indirect_object_handle's own
         // doc comment).
-        clone_kept_by_caller.replace_key(b"/A", ObjectHandle::integer(99));
+        clone_kept_by_caller
+            .replace_key(b"/A", ObjectHandle::integer(99))
+            .unwrap();
         assert_eq!(indirect.get_key(b"/A").as_integer(), Some(1));
     }
 
@@ -5907,7 +5909,7 @@ mod tests {
         let stream_ref = stream.object_ref().expect("stream ref");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve_object_handle(&root).expect("resolve root");
-        root.replace_key(b"/Extra", stream.clone());
+        root.replace_key(b"/Extra", stream.clone()).unwrap();
         pdf.mark_object_dirty(ObjectRef::new(1, 0));
 
         let mut writer = crate::PdfWriter::new(&mut pdf);
@@ -6140,26 +6142,21 @@ mod tests {
     }
 
     #[test]
-    fn canonical_writer_rejects_a_foreign_indirect_child() {
+    fn canonical_mutator_rejects_a_foreign_indirect_child_before_writing() {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open target");
         let mut foreign_pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open foreign");
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve_object_handle(&root)
             .expect("resolve target root");
         let foreign = foreign_pdf.get_object_handle(ObjectRef::new(3, 0));
-        root.replace_key(b"/Foreign", foreign);
-        pdf.mark_object_dirty(ObjectRef::new(1, 0));
-
-        let error = {
-            let mut writer = crate::PdfWriter::new(&mut pdf);
-            writer.set_object_stream_mode(crate::ObjectStreamMode::Disable);
-            writer.set_output_memory().expect("configure memory output");
-            writer.write().expect_err("foreign child must be rejected")
-        };
+        let error = root
+            .replace_key(b"/Foreign", foreign)
+            .expect_err("foreign child must be rejected at the canonical mutation boundary");
 
         assert!(error
             .to_string()
-            .contains("QPDFObjectHandle from different QPDF found while writing"));
+            .contains("Attempting to add an object from a different QPDF"));
+        assert!(!root.has_key(b"/Foreign"));
         assert!(
             pdf.legacy_materialized_memo.is_empty(),
             "foreign-owner rejection must happen before legacy materialization"
@@ -6232,7 +6229,8 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(minimal_pdf_bytes())).expect("open");
         let page = pdf.get_object_handle(page_ref);
         pdf.resolve_object_handle(&page).expect("resolve page");
-        page.replace_key(b"/Rotate", ObjectHandle::integer(90));
+        page.replace_key(b"/Rotate", ObjectHandle::integer(90))
+            .unwrap();
         pdf.mark_object_dirty(page_ref);
         assert!(
             pdf.legacy_materialized_memo.is_empty(),
@@ -7009,7 +7007,9 @@ mod tests {
         );
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle).unwrap();
-        handle.replace_key(b"/Value", ObjectHandle::integer(2));
+        handle
+            .replace_key(b"/Value", ObjectHandle::integer(2))
+            .unwrap();
         pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
@@ -7050,7 +7050,9 @@ mod tests {
         let handle = pdf.get_object_handle(object_ref);
         pdf.resolve_object_handle(&handle)
             .expect("resolve the canonical handle before mutating it");
-        handle.replace_key(b"/Value", ObjectHandle::integer(2));
+        handle
+            .replace_key(b"/Value", ObjectHandle::integer(2))
+            .unwrap();
         pdf.mark_object_dirty(object_ref);
 
         assert_eq!(
@@ -7113,7 +7115,7 @@ mod tests {
         pdf.resolve_object_handle(&owner).unwrap();
         let inner = ObjectHandle::integer(42);
         let container = ObjectHandle::dictionary(vec![(b"Inner".to_vec(), inner.clone())]);
-        owner.replace_key(b"/Container", container);
+        owner.replace_key(b"/Container", container).unwrap();
         pdf.clear_dirty(object_ref);
 
         pdf.mark_object_handle_dirty(&inner).unwrap();
@@ -7134,7 +7136,9 @@ mod tests {
 
         owner.remove_key(b"/Child");
         pdf.clear_dirty(owner_ref);
-        child.replace_key(b"/Value", ObjectHandle::integer(2));
+        child
+            .replace_key(b"/Value", ObjectHandle::integer(2))
+            .unwrap();
         pdf.mark_object_handle_dirty(&child).unwrap();
 
         assert!(!pdf.is_dirty(owner_ref));
@@ -7864,7 +7868,9 @@ mod tests {
         assert_eq!(stream_dict.as_dictionary().expect("dictionary").len(), 0);
         assert!(pdf.is_canonical_object_handle(&stream));
 
-        stream_dict.replace_key(b"/Marker", ObjectHandle::integer(7));
+        stream_dict
+            .replace_key(b"/Marker", ObjectHandle::integer(7))
+            .unwrap();
         assert_eq!(
             stream
                 .as_stream_dict()
@@ -8148,7 +8154,7 @@ mod tests {
         let root = pdf.get_object_handle(ObjectRef::new(1, 0));
         pdf.resolve_object_handle(&root).expect("resolve catalog");
         assert!(root.as_dictionary().is_some(), "catalog dictionary");
-        root.replace_key(b"/Reserved", reserved);
+        root.replace_key(b"/Reserved", reserved).unwrap();
 
         let error = crate::writer::write_qpdf_to_memory(&mut pdf, |_| {})
             .expect_err("full writer must reject a reachable reserved object");
@@ -8275,9 +8281,13 @@ mod tests {
         let direct =
             ObjectHandle::dictionary(vec![(b"/Nested".to_vec(), ObjectHandle::integer(9))]);
         let source_dict = source.as_stream_dict().expect("source dictionary");
-        source_dict.replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()));
-        source_dict.replace_key(b"/Indirect", shared.clone());
-        source_dict.replace_key(b"/Direct", direct.clone());
+        source_dict
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .unwrap();
+        source_dict
+            .replace_key(b"/Indirect", shared.clone())
+            .unwrap();
+        source_dict.replace_key(b"/Direct", direct.clone()).unwrap();
 
         let copy = source.copy_stream().expect("copy stream");
         let copy_dict = copy.as_stream_dict().expect("copy dictionary");
@@ -8296,7 +8306,9 @@ mod tests {
         let copied_direct = copy_dict.get_key(b"/Direct");
         assert!(!copied_direct.is_same_object_as(&direct));
         assert_eq!(copied_direct.get_key(b"/Nested").as_integer(), Some(9));
-        copied_direct.replace_key(b"/Nested", ObjectHandle::integer(10));
+        copied_direct
+            .replace_key(b"/Nested", ObjectHandle::integer(10))
+            .unwrap();
         assert_eq!(direct.get_key(b"/Nested").as_integer(), Some(9));
     }
 
@@ -8435,7 +8447,7 @@ mod tests {
         let root_ref = ObjectRef::new(1, 0);
         let root = pdf.get_object_handle(root_ref);
         pdf.resolve_object_handle(&root).expect("resolve root");
-        root.replace_key(b"/Extra", stream.clone());
+        root.replace_key(b"/Extra", stream.clone()).unwrap();
         pdf.mark_object_dirty(root_ref);
 
         let mut writer = crate::PdfWriter::new(&mut pdf);
@@ -8483,7 +8495,9 @@ mod tests {
         assert!(indirect.is_same_object_as(&alias));
         assert!(alias.is_indirect());
         assert_eq!(alias.object_ref(), Some(object_ref));
-        alias.replace_key(b"/Value", ObjectHandle::integer(11));
+        alias
+            .replace_key(b"/Value", ObjectHandle::integer(11))
+            .unwrap();
         assert_eq!(indirect.get_key(b"/Value").as_integer(), Some(11));
         assert!(!pdf.is_dirty(object_ref));
 
@@ -9829,7 +9843,9 @@ mod tests {
             .get(b"/Nested".as_slice())
             .expect("Nested present")
             .clone();
-        nested_handle.replace_key(b"/Inner", ObjectHandle::integer(999));
+        nested_handle
+            .replace_key(b"/Inner", ObjectHandle::integer(999))
+            .unwrap();
 
         let canonical_target = pdf.get_object_handle(target_ref);
         pdf.resolve_object_handle(&canonical_target)

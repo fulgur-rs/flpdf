@@ -148,13 +148,13 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 names
             } else {
                 let names = ObjectHandle::dictionary(Vec::new());
-                catalog.replace_key(b"/Names", names.clone());
+                catalog.replace_key(b"/Names", names.clone())?;
                 self.pdf.mark_object_handle_dirty(&catalog)?;
                 names
             }
         } else {
             let names = ObjectHandle::dictionary(Vec::new());
-            catalog.replace_key(b"/Names", names.clone());
+            catalog.replace_key(b"/Names", names.clone())?;
             self.pdf.mark_object_handle_dirty(&catalog)?;
             names
         };
@@ -171,7 +171,7 @@ impl<'a, R: Read + Seek> EmbeddedFileDocumentHelper<'a, R> {
                 b"/Names".to_vec(),
                 ObjectHandle::array(Vec::new()),
             )]))?;
-        names.replace_key(b"/EmbeddedFiles", root.clone());
+        names.replace_key(b"/EmbeddedFiles", root.clone())?;
         self.pdf.mark_object_handle_dirty(names)?;
         Ok(root)
     }
@@ -1060,7 +1060,9 @@ mod tests {
             .remove_embedded_file(b"b")
             .expect("remove indirect filespec"));
 
-        retained_filespec.replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()));
+        retained_filespec
+            .replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()))
+            .unwrap();
         let current_filespec = retained_root
             .get_key(b"/Names")
             .as_array()
@@ -1212,7 +1214,9 @@ mod tests {
             .replace_embedded_file(b"b", added)
             .expect("replace");
 
-        retained_filespec.replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()));
+        retained_filespec
+            .replace_key(b"/F", ObjectHandle::string(b"new.txt".to_vec()))
+            .unwrap();
         let current_filespec = retained_root
             .get_key(b"/Names")
             .as_array()

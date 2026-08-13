@@ -427,7 +427,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
         if acroform.as_dictionary().is_none() {
             return Ok(());
         }
-        acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true));
+        acroform.replace_key(b"/NeedAppearances", ObjectHandle::boolean(true))?;
         self.pdf.mark_object_handle_dirty(&acroform)
     }
 
@@ -634,7 +634,7 @@ impl<'a, R: Read + Seek> FormFieldObjectHelper<'a, R> {
             return Ok(());
         };
         let key = crate::object_handle::canonical_dictionary_key(key);
-        dictionary.replace_key(&key, value);
+        dictionary.replace_key(&key, value)?;
         self.pdf.mark_object_handle_dirty(&dictionary)
     }
 

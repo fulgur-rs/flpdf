@@ -8498,7 +8498,8 @@ mod tests {
         stream
             .as_stream_dict()
             .expect("stream dictionary")
-            .replace_key(b"/Length", ObjectHandle::integer(0));
+            .replace_key(b"/Length", ObjectHandle::integer(0))
+            .unwrap();
         assert_eq!(
             stream
                 .get_raw_stream_data()

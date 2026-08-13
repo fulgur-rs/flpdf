@@ -35,7 +35,8 @@ fn external_consumer_can_mark_a_direct_child_array_dirty_for_write_back() {
     root.replace_key(
         b"/DirectValues",
         ObjectHandle::array(vec![ObjectHandle::integer(1)]),
-    );
+    )
+    .expect("install the direct child array");
     let direct_values = root.get_key(b"/DirectValues");
     direct_values
         .append_array_item(ObjectHandle::integer(2))

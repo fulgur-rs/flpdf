@@ -5442,8 +5442,8 @@ mod tests {
         // a depth bound this would recurse until the process aborts.
         let a = ObjectHandle::dictionary(vec![]);
         let b = ObjectHandle::dictionary(vec![]);
-        a.replace_key(b"/Loop", b.clone());
-        b.replace_key(b"/Loop", a.clone());
+        a.replace_key(b"/Loop", b.clone()).unwrap();
+        b.replace_key(b"/Loop", a.clone()).unwrap();
 
         let result = super::pdf_object_to_json(&a);
         assert!(

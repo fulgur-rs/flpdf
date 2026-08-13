@@ -849,8 +849,10 @@ mod tests {
         pdf.delete_object(ObjectRef::new(999, 0));
         let zero = resolved_reference(&mut pdf, ObjectRef::new(100, 0), ObjectRef::new(0, 0));
         let removed = resolved_reference(&mut pdf, ObjectRef::new(101, 0), ObjectRef::new(999, 0));
-        pdf.trailer_handle().replace_key(b"/Zero", zero);
-        pdf.trailer_handle().replace_key(b"/Removed", removed);
+        pdf.trailer_handle().replace_key(b"/Zero", zero).unwrap();
+        pdf.trailer_handle()
+            .replace_key(b"/Removed", removed)
+            .unwrap();
         let missing = pdf.get_object_handle(ObjectRef::new(999, 0));
         let added = ObjectHandle::dictionary(vec![
             (b"Gone".to_vec(), missing),
@@ -859,7 +861,7 @@ mod tests {
                 ObjectHandle::array(vec![ObjectHandle::null()]),
             ),
         ]);
-        pdf.trailer_handle().replace_key(b"/Added", added);
+        pdf.trailer_handle().replace_key(b"/Added", added).unwrap();
 
         let output = {
             let mut writer = PdfWriter::new(&mut pdf);
@@ -882,13 +884,15 @@ mod tests {
             std::fs::File::open(fixture_path("no-stream-one-page.pdf")).unwrap(),
         ))
         .unwrap();
-        pdf.trailer_handle().replace_key(
-            b"/Info",
-            ObjectHandle::dictionary(vec![(
-                b"Title".to_vec(),
-                ObjectHandle::string(b"live-info-replacement-768".to_vec()),
-            )]),
-        );
+        pdf.trailer_handle()
+            .replace_key(
+                b"/Info",
+                ObjectHandle::dictionary(vec![(
+                    b"Title".to_vec(),
+                    ObjectHandle::string(b"live-info-replacement-768".to_vec()),
+                )]),
+            )
+            .unwrap();
         let mut options = write_options(ObjectStreamMode::Disable);
         options.deterministic_id = true;
 
@@ -908,8 +912,12 @@ mod tests {
         .unwrap();
         let trailer = pdf.trailer_handle();
         trailer.remove_key(b"/Info");
-        trailer.replace_key(b"/ A", ObjectHandle::integer(1));
-        trailer.replace_key(b"/!A", ObjectHandle::integer(2));
+        trailer
+            .replace_key(b"/ A", ObjectHandle::integer(1))
+            .unwrap();
+        trailer
+            .replace_key(b"/!A", ObjectHandle::integer(2))
+            .unwrap();
 
         let plan =
             PlainWritePlan::build(&mut pdf, &write_options(ObjectStreamMode::Disable)).unwrap();
@@ -954,10 +962,12 @@ mod tests {
         trailer.remove_key(b"/Info");
         let nested_ref =
             resolved_reference(&mut pdf, ObjectRef::new(1000, 0), ObjectRef::new(999, 0));
-        trailer.replace_key(
-            b"/Nested",
-            ObjectHandle::dictionary(vec![(b"Bare".to_vec(), nested_ref)]),
-        );
+        trailer
+            .replace_key(
+                b"/Nested",
+                ObjectHandle::dictionary(vec![(b"Bare".to_vec(), nested_ref)]),
+            )
+            .unwrap();
 
         let error =
             canonical_trailer_entries(&mut pdf, &HashMap::new(), &BTreeSet::new()).unwrap_err();

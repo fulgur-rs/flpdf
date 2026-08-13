@@ -451,17 +451,21 @@ destination-owned indirect null slot で表現する。
 出力バイトには影響しない。
 
 ⚪ `reserve_objects`（`ForeignObjectCopier`）は各ノードの `owning_pdf_unique_id`
-を root の `source_id` と照合し、不一致なら拒否する。qpdf では
-`QPDFObjectHandle::replaceKey`/`QPDF_Array` の各ミューテータが挿入時に
-`checkOwnership`（`QPDFObjectHandle.cc:1200-1209`、`QPDF_Array.cc:11-26`）を
-呼ぶため、別ドキュメント所有のオブジェクトがそもそも一つのグラフに混在し得ず、
-`reserveObjects`/`replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）自身に
-対応するチェックは無い。flpdf の `ObjectHandle::replace_key` はまだ
-`checkOwnership` を実装していない（同メソッドの doc に明記）ため、この bound は
-その未実装ギャップを `object_copy.rs` 側で暫定的に埋めるもので、公開
-`ObjectHandle::replace_key` API 経由でのみ構築可能な入力への防御であり、実パース
-された PDF の出力バイトには影響しない。`replace_key` 自体への `checkOwnership`
-移植は flpdf-25kg.3.16.7 で追跡する。
+を root の `source_id` と照合し、不一致なら拒否する。`ObjectHandle::replace_key`
+は `QPDFObjectHandle::checkOwnership`（`QPDFObjectHandle.cc:2355-2365`）と同じ
+shallow 比較（`self`/`value` 自身の owning document のみ、子孫は辿らない）を
+実装済み（flpdf-25kg.3.8.1.2）だが、qpdf の `checkOwnership` 自体が shallow で
+ある以上、直接（非間接）コンテナに数ホップ下でネストした foreign indirect object
+は qpdf でも挿入時には検出されない（`QPDF::copyForeignObject` 自身の呼び出し側
+向けドキュメントが、この状況を避けるのは呼び出し側の責務だと明記している）。
+`reserveObjects`/`replaceForeignIndirectObjects`（`QPDF.cc:2101-2213`）自身にも
+対応するチェックは無いため、`reserve_objects` のこの再検証は「未実装ギャップの
+暫定穴埋め」ではなく、qpdf のこの境界そのものが持つ shallow-check の弱点に対する
+flpdf 独自の追加防御であり、公開 `ObjectHandle` API 経由でのみ構築可能な入力への
+防御として、実パースされた PDF の出力バイトには影響しない。`QPDF_Array` の各
+ミューテータ側（`check_array_item_ownership`）はまだこの shallow 比較に揃って
+おらず、`belongs_exclusively_to_pdf` の子孫再帰に依存したまま（flpdf-25kg.3.16.7.1
+で追跡）。
 
 ⚪ `reserve_objects` と `replace_foreign_indirect_objects` の両方を
 `stacker::maybe_grow`（`OBJECT_COPY_STACK_RED_ZONE`/`OBJECT_COPY_STACK_GROWTH_SIZE`）

@@ -147,15 +147,20 @@ struct ForeignObjectCopier<'a, R: Read + Seek + 'static> {
     /// bare source `ObjectRef` numbers under the assumption that every
     /// indirect node encountered belongs to this one document, the same
     /// assumption qpdf's own `reserveObjects`/`replaceForeignIndirectObjects`
-    /// make. qpdf's callers cannot violate that assumption:
-    /// `QPDFObjectHandle::replaceKey`/`QPDF_Array`'s mutators all run
-    /// `checkOwnership` (`libqpdf/QPDFObjectHandle.cc:1200-1209`,
-    /// `libqpdf/QPDF_Array.cc:11-26`) and throw before a foreign-document
-    /// value can be attached anywhere reachable from a document's own graph.
-    /// [`ObjectHandle::replace_key`] does not yet perform that check (see its
-    /// own doc), so `reserve_objects` re-validates each node's owner here
-    /// instead of trusting construction-time enforcement that does not exist
-    /// yet.
+    /// make. [`ObjectHandle::replace_key`]/`QPDF_Array`'s mutators run the
+    /// same shallow `checkOwnership`
+    /// (`libqpdf/QPDFObjectHandle.cc:2355-2365`, `QPDF_Array.cc:10-26`) qpdf
+    /// itself does at insertion time, which only compares each mutated
+    /// handle's own owning document -- it does not, in qpdf either, walk
+    /// into a directly-inserted container's descendants. A foreign indirect
+    /// object several direct hops below an otherwise-accepted direct value
+    /// can therefore still reach a document's graph uncaught at construction
+    /// time (in qpdf too, per `QPDF::copyForeignObject`'s own documented
+    /// advice to the caller), so `reserve_objects` re-validates each node's
+    /// owner here as a flpdf-specific defense qpdf itself does not need at
+    /// this boundary (qpdf's own `reserveObjects`/
+    /// `replaceForeignIndirectObjects`, `QPDF.cc:2101-2213`, have no such
+    /// check; see `docs/qpdf-correspondence.md`).
     source_id: u64,
     object_map: BTreeMap<ObjectRef, ObjectRef>,
     visiting: BTreeSet<ObjectRef>,
@@ -448,7 +453,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             })?;
             for (key, value) in source_dictionary.as_dictionary().unwrap_or_default() {
                 let replacement = self.replace_foreign_indirect_objects(value, false)?;
-                destination_dictionary.replace_key(&key, replacement);
+                destination_dictionary.replace_key(&key, replacement)?;
             }
             self.target
                 .resolver
@@ -486,7 +491,7 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
                 .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
             for (key, value) in entries {
                 let replacement = self.replace_foreign_indirect_objects(value, false)?;
-                copied.replace_key(&key, replacement);
+                copied.replace_key(&key, replacement)?;
             }
             return Ok(copied);
         }
@@ -961,15 +966,15 @@ mod tests {
         let second = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("second cycle node");
-        first.replace_key(b"/Next", second.clone());
-        second.replace_key(b"/Next", first.clone());
+        first.replace_key(b"/Next", second.clone()).unwrap();
+        second.replace_key(b"/Next", first.clone()).unwrap();
 
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/SharedA", shared.clone());
-        root.replace_key(b"/SharedB", shared.clone());
-        root.replace_key(b"/Cycle", first.clone());
+        root.replace_key(b"/SharedA", shared.clone()).unwrap();
+        root.replace_key(b"/SharedB", shared.clone()).unwrap();
+        root.replace_key(b"/Cycle", first.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1107,7 +1112,7 @@ mod tests {
         // whose two-dictionary cycle also traverses reservation before
         // reaching the replacement-phase guard under test there.
         let direct = ObjectHandle::dictionary(Vec::new());
-        direct.replace_key(b"/Self", direct.clone());
+        direct.replace_key(b"/Self", direct.clone()).unwrap();
         let mut target = minimal_pdf();
         let mut copier = empty_copier(&mut target);
         copier.direct_visiting.push(direct.clone());
@@ -1137,12 +1142,12 @@ mod tests {
         let mut target = minimal_pdf();
         let a = ObjectHandle::dictionary(Vec::new());
         let b = ObjectHandle::dictionary(Vec::new());
-        a.replace_key(b"/B", b.clone());
-        b.replace_key(b"/A", a.clone());
+        a.replace_key(b"/B", b.clone()).unwrap();
+        b.replace_key(b"/A", a.clone()).unwrap();
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/A", a);
+        root.replace_key(b"/A", a).unwrap();
 
         let error = target
             .copy_foreign_object(&root)
@@ -1162,7 +1167,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", direct_stream);
+        root.replace_key(b"/Stream", direct_stream).unwrap();
 
         let error = target
             .copy_foreign_object(&root)
@@ -1189,7 +1194,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Redirect", redirect);
+        root.replace_key(b"/Redirect", redirect).unwrap();
 
         let error = target
             .copy_foreign_object(&root)
@@ -1241,24 +1246,32 @@ mod tests {
 
     #[test]
     fn copy_foreign_object_rejects_a_child_owned_by_a_different_document() {
-        // `ObjectHandle::replace_key` does not yet run qpdf's
-        // `checkOwnership` (see the doc on `ForeignObjectCopier::source_id`),
-        // so this attaches an indirect handle from a *second* source `Pdf`
-        // into a graph rooted in the first. Without the reservation-time
-        // ownership check, this child's bare `ObjectRef` would be looked up
-        // in a map keyed for the root's source document; both `minimal_pdf`
-        // instances share the same object numbering (1..=3), so the
-        // collision would silently map `/Foreign` back to the *root's own*
-        // copy instead of copying the second document's distinct object.
+        // `ObjectHandle::replace_key`'s own `checkOwnership`
+        // (`libqpdf/QPDFObjectHandle.cc:2355-2365`) rejects attaching an
+        // indirect handle from a *second* source `Pdf` directly as a
+        // dictionary value, so this seeds `root`'s dictionary with the
+        // foreign child through the dictionary constructor instead --
+        // qpdf's `checkOwnership` is a shallow, insertion-time check with no
+        // construction-time equivalent (see `ForeignObjectCopier::source_id`'s
+        // own doc), so a value already present when a dictionary is minted
+        // indirect never passes through it. Without the reservation-time
+        // ownership check this test exercises, this child's bare `ObjectRef`
+        // would be looked up in a map keyed for the root's source document;
+        // both `minimal_pdf` instances share the same object numbering
+        // (1..=3), so the collision would silently map `/Foreign` back to
+        // the *root's own* copy instead of copying the second document's
+        // distinct object.
         let mut source = minimal_pdf();
         let mut other_source = minimal_pdf();
         let mut target = minimal_pdf();
 
         let foreign_child = other_source.get_object_handle(ObjectRef::new(1, 0));
         let root = source
-            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Foreign".to_vec(),
+                foreign_child,
+            )]))
             .expect("root");
-        root.replace_key(b"/Foreign", foreign_child);
 
         let error = target
             .copy_foreign_object(&root)
@@ -1283,11 +1296,16 @@ mod tests {
         let mut other_source = minimal_pdf();
         let mut target = minimal_pdf();
 
+        // See `copy_foreign_object_rejects_a_child_owned_by_a_different_
+        // document` above for why the foreign child is seeded through the
+        // dictionary constructor rather than `replace_key`.
         let foreign_child = other_source.get_object_handle(ObjectRef::new(1, 0));
         let root = source
-            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .make_indirect_object_handle(ObjectHandle::dictionary(vec![(
+                b"/Foreign".to_vec(),
+                foreign_child,
+            )]))
             .expect("root");
-        root.replace_key(b"/Foreign", foreign_child);
 
         let first_error = target
             .copy_foreign_object(&root)
@@ -1317,12 +1335,13 @@ mod tests {
         let page = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("nested page");
-        page.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()));
-        page.replace_key(b"/Hidden", hidden.clone());
+        page.replace_key(b"/Type", ObjectHandle::name(b"Page".to_vec()))
+            .unwrap();
+        page.replace_key(b"/Hidden", hidden.clone()).unwrap();
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Page", page.clone());
+        root.replace_key(b"/Page", page.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1345,7 +1364,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Page", page.clone());
+        root.replace_key(b"/Page", page.clone()).unwrap();
 
         let copied_root = target
             .copy_foreign_object(&root)
@@ -1418,7 +1437,9 @@ mod tests {
         // and put to the dangling-reference test the finding describes).
         let catalog_ref = target.root_ref().expect("target has a root");
         let catalog = target.get_object_handle(catalog_ref);
-        catalog.replace_key(b"/CopiedRoot", copied_root.clone());
+        catalog
+            .replace_key(b"/CopiedRoot", copied_root.clone())
+            .expect("copy_foreign_object mints a target-owned handle, same document as catalog");
         target.mark_object_dirty(catalog_ref);
 
         let mut writer = PdfWriter::new(&mut target);
@@ -1453,11 +1474,12 @@ mod tests {
         stream
             .as_stream_dict()
             .expect("source stream dictionary")
-            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()));
+            .replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()))
+            .unwrap();
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", stream.clone());
+        root.replace_key(b"/Stream", stream.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1502,7 +1524,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", stream.clone());
+        root.replace_key(b"/Stream", stream.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1529,7 +1551,9 @@ mod tests {
         let immediate_root = immediate_source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("immediate root");
-        immediate_root.replace_key(b"/Stream", immediate_stream.clone());
+        immediate_root
+            .replace_key(b"/Stream", immediate_stream.clone())
+            .unwrap();
         let immediate_copy = immediate_target
             .copy_foreign_object(&immediate_root)
             .expect("immediate foreign copy");
@@ -1561,7 +1585,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", stream);
+        root.replace_key(b"/Stream", stream).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1581,7 +1605,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Stream", source_stream.clone());
+        root.replace_key(b"/Stream", source_stream.clone()).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1606,7 +1630,7 @@ mod tests {
             let root = source
                 .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
                 .expect("root");
-            root.replace_key(b"/Stream", source_stream);
+            root.replace_key(b"/Stream", source_stream).unwrap();
             target
                 .copy_foreign_object(&root)
                 .expect("copy original stream graph")
@@ -1637,7 +1661,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Array", array);
+        root.replace_key(b"/Array", array).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1673,7 +1697,7 @@ mod tests {
         let root = source
             .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
             .expect("root");
-        root.replace_key(b"/Kids", pages);
+        root.replace_key(b"/Kids", pages).unwrap();
 
         let copied = target
             .copy_foreign_object(&root)
@@ -1721,7 +1745,7 @@ mod tests {
                     let node = source
                         .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
                         .expect("chain node");
-                    node.replace_key(b"/Next", leaf.clone());
+                    node.replace_key(b"/Next", leaf.clone()).unwrap();
                     leaf = node;
                 }
                 let mut target = minimal_pdf();
