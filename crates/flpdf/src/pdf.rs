@@ -93,6 +93,20 @@ pub struct Pdf<R: Read + Seek + 'static> {
     // thread-safe for concurrent access to one document.
     /// qpdf's `m->object_copiers[source unique_id].object_map` equivalent.
     pub(crate) foreign_object_maps: BTreeMap<u64, BTreeMap<ObjectRef, ObjectRef>>,
+    /// qpdf's `m->object_copiers[source unique_id].visiting` equivalent
+    /// (`include/qpdf/QPDF.hh:891-897`). qpdf never rolls back
+    /// `ObjCopier::object_map`/`visiting` when `copyForeignObject` fails
+    /// partway (`libqpdf/QPDF.cc:2019-2093`): a `reserveObjects` traversal
+    /// failure leaves the ancestor chain's refs still in `visiting`, and the
+    /// *next* call for that same source checks this exact field before doing
+    /// any work, throwing rather than silently treating the earlier
+    /// failure's partial reservations as complete (`QPDF.cc:2066-2069`). Kept
+    /// separate from [`Self::foreign_object_maps`], rather than folded into
+    /// one bundled per-source struct, so the pre-existing
+    /// `take_foreign_object_map`/`set_foreign_object_map` pair used by the
+    /// legacy `copy_foreign_objects` route is untouched by this poisoning
+    /// mechanism, which only the canonical `copy_foreign_object` port needs.
+    pub(crate) foreign_object_visiting: BTreeMap<u64, BTreeSet<ObjectRef>>,
     /// Canonical trailer handle (`QPDF::getTrailer`-equivalent identity):
     /// repeated [`Pdf::trailer_handle`] calls return the same shared handle
     /// rather than re-deriving a fresh one from `self.trailer` each time.

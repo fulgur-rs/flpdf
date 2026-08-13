@@ -95,17 +95,46 @@ pub(crate) fn copy_foreign_object<R: Read + Seek>(
     }
 
     let object_map = target.take_foreign_object_map(source_id);
+    let visiting = target.take_foreign_object_visiting(source_id);
+    if !visiting.is_empty() {
+        // qpdf persists `ObjCopier::object_map`/`visiting` on the
+        // destination and never rolls either back on failure
+        // (`libqpdf/QPDF.cc:2019-2093` holds one mutable reference to the
+        // shared `m->object_copiers[...]` entry for the whole call). A
+        // `reserveObjects` traversal failure -- a foreign reserved object, a
+        // cross-document child, or an unresolvable reference -- leaves the
+        // still-unwound ancestor chain in `visiting`
+        // (`reserve_objects_inner`'s `self.visiting.remove` sits after the
+        // fallible recursive call and is skipped on `Err`, mirroring qpdf's
+        // own unguarded `obj_copier.visiting.erase` at the end of
+        // `reserveObjects`, `QPDF.cc:2150`). qpdf checks exactly this before
+        // any traversal begins and throws rather than let a later call
+        // re-run reservation against a partially populated `object_map`,
+        // which would see those entries as already-copied, skip real work,
+        // and silently return an unfinished copy as success
+        // (`QPDF.cc:2066-2069`). Put the untouched state back so this
+        // poisoned condition persists for every subsequent call against this
+        // source too, matching qpdf: there is no unpoisoning path either
+        // here or there.
+        target.set_foreign_object_map(source_id, object_map);
+        target.set_foreign_object_visiting(source_id, visiting);
+        return Err(Error::Internal(
+            "obj_copier.visiting is not empty at the beginning of copyForeignObject".to_owned(),
+        ));
+    }
     let mut copier = ForeignObjectCopier {
         target,
         source_id,
         object_map,
-        visiting: BTreeSet::new(),
+        visiting,
         direct_visiting: Vec::new(),
         to_copy: Vec::new(),
     };
     let result = copier.run(foreign);
     let object_map = copier.object_map;
+    let visiting = copier.visiting;
     copier.target.set_foreign_object_map(source_id, object_map);
+    copier.target.set_foreign_object_visiting(source_id, visiting);
     result
 }
 
@@ -1171,6 +1200,45 @@ mod tests {
             .expect_err("a child owned by a different document than the root must be rejected");
         assert!(matches!(error, Error::System(message)
             if message == "QPDF::copyForeign encountered an object owned by a different document"));
+    }
+
+    #[test]
+    fn copy_foreign_object_poisons_retry_after_a_reservation_phase_failure() {
+        // Regression test for round-3 Codex finding #1: qpdf never rolls
+        // `ObjCopier::object_map`/`visiting` back when `copyForeignObject`
+        // fails partway (`libqpdf/QPDF.cc:2019-2093` holds one mutable
+        // reference to the persistent per-source `ObjCopier` for the whole
+        // call). A `reserveObjects` traversal failure leaves the ancestor
+        // chain's refs in `visiting`, and qpdf's *next* call for that same
+        // source checks `visiting.empty()` before doing any work and throws
+        // (`QPDF.cc:2066-2069`) rather than let a later call see the
+        // previous attempt's partial `object_map` as already-copied and
+        // silently return an unfinished graph as success.
+        let mut source = minimal_pdf();
+        let mut other_source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let foreign_child = other_source.get_object_handle(ObjectRef::new(1, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Foreign", foreign_child);
+
+        let first_error = target
+            .copy_foreign_object(&root)
+            .expect_err("a child owned by a different document than the root must be rejected");
+        assert!(matches!(&first_error, Error::System(message)
+            if message == "QPDF::copyForeign encountered an object owned by a different document"));
+
+        // Retrying the same root against the same source must not silently
+        // "succeed" by treating the first attempt's partial `object_map` (the
+        // root's own null reservation, inserted before the failing child was
+        // reached) as a complete copy.
+        let retry_error = target
+            .copy_foreign_object(&root)
+            .expect_err("a source poisoned by a reservation-phase failure must stay rejected");
+        assert!(matches!(retry_error, Error::Internal(message)
+            if message == "obj_copier.visiting is not empty at the beginning of copyForeignObject"));
     }
 
     #[test]
