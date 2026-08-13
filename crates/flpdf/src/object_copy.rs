@@ -618,6 +618,15 @@ pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
     let copied = (|| {
         let mut to_copy = Vec::new();
         let mut base = None;
+        // Counts only fresh allocations from the `Vacant` arm below. The
+        // `Occupied` arm can also push onto `to_copy` (re-queuing a stale
+        // null reservation for copying, without allocating a new target
+        // number for it), so `to_copy.len()` no longer tracks 1:1 with the
+        // number of numbers allocated from `base`; a dedicated counter keeps
+        // each freshly allocated target number offset by the count of
+        // allocations that actually happened, not by the unrelated count of
+        // entries queued for the resolve/rewrite pass below.
+        let mut allocated = 0usize;
 
         for &source_ref in refs {
             match map.entry(source_ref) {
@@ -630,7 +639,8 @@ pub(crate) fn copy_foreign_objects<RS: Read + Seek, RT: Read + Seek>(
                             first
                         }
                     };
-                    let target_ref = ObjectRef::new(alloc_target_number(base, to_copy.len())?, 0);
+                    let target_ref = ObjectRef::new(alloc_target_number(base, allocated)?, 0);
+                    allocated += 1;
                     // Reserve before resolving any source object so cycles can be
                     // rewritten through the complete map, as qpdf does.
                     target.set_object(target_ref, Object::Null);
@@ -881,6 +891,60 @@ mod tests {
         assert!(target
             .take_foreign_object_map(source_id)
             .contains_key(&ObjectRef::new(3, 0)));
+    }
+
+    #[test]
+    fn copy_foreign_objects_recopies_its_own_null_reservation_after_a_failed_call() {
+        // The `Entry::Occupied` re-queue added for round-3 Codex finding #3
+        // (the canonical port sharing this map with a stale nested-page
+        // placeholder) is not limited to that origin: `copy_foreign_objects`
+        // reserves its own null placeholder (`target.set_object(target_ref,
+        // Object::Null)`, above) before resolving/rewriting the source
+        // object, so a failure in that resolve/rewrite step -- exactly the
+        // scenario `foreign_copy_restores_existing_map_after_rewrite_failure`
+        // already constructs -- leaves this route's own reservation
+        // unfulfilled too. Confirm a later successful call reuses that same
+        // target identity and fills in the real content, rather than
+        // permanently returning the leftover null (the same class of bug,
+        // just triggered by this route's own failure instead of a shared
+        // map with the canonical port) or allocating a second target number
+        // for the same source object.
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let source_id = source.unique_id();
+
+        source.set_object(ObjectRef::new(3, 0), nested_arrays(MAX_INLINE_DEPTH + 5));
+        assert!(copy_foreign_objects(
+            &mut source,
+            &mut target,
+            &BTreeSet::from([ObjectRef::new(3, 0)]),
+        )
+        .is_err());
+        let map_after_failure = target.take_foreign_object_map(source_id);
+        let reserved_ref = *map_after_failure
+            .get(&ObjectRef::new(3, 0))
+            .expect("the failed call still reserves a target identity");
+        target.set_foreign_object_map(source_id, map_after_failure);
+        assert!(target.resolve(reserved_ref).unwrap().is_null());
+
+        source.set_object(ObjectRef::new(3, 0), Object::Integer(777));
+        let copied = copy_foreign_objects(
+            &mut source,
+            &mut target,
+            &BTreeSet::from([ObjectRef::new(3, 0)]),
+        )
+        .expect("a retry after fixing the source object must succeed");
+
+        assert_eq!(
+            copied[&ObjectRef::new(3, 0)],
+            reserved_ref,
+            "retry must reuse the identity reserved by the failed call, not allocate a new one"
+        );
+        assert_eq!(
+            target.resolve(reserved_ref).unwrap(),
+            Object::Integer(777),
+            "retry must fill the reservation with the real content"
+        );
     }
 
     #[test]
