@@ -52,10 +52,23 @@ pub(crate) fn emit_bodies<R: Read + Seek>(
                     )?; // cov:ignore: validated source placements have already passed the reference-map invariant
                     match object {
                         Object::Stream(stream) => {
+                            // `is_data_modified` is hardcoded false here:
+                            // this `!plan.canonical` branch (Preserve mode
+                            // with a source that already has ObjStm
+                            // containers, or Generate mode) only has the
+                            // already-materialized `object`, with no
+                            // canonical handle to query `is_data_modified()`
+                            // from. A token-filtered lone-Flate stream
+                            // written through this branch keeps today's
+                            // verbatim-preserve shortcut instead of qpdf's
+                            // forced re-encode; tracked as a follow-up,
+                            // parallel to the linearized-writer fix this
+                            // parameter exists for.
                             let (reencoded, source_filter_is_lone_flate) =
                                 reencode_stream_for_compress(
                                     stream,
                                     options,
+                                    false,
                                     true,
                                     pdf.recovered_stream_eol(*source),
                                     false,

@@ -3378,6 +3378,179 @@ mod tests {
         );
     }
 
+    /// Like [`build_pdf_with_existing_flate_ap`], but the source `/AP/N`
+    /// stream is compressed with `Compression::none()` (stored deflate
+    /// blocks) instead of the default level. flpdf's own re-encoder always
+    /// uses the default level, so a stored-block source makes "was this
+    /// stream decoded and re-encoded, or echoed verbatim" observable from the
+    /// raw output bytes alone, regardless of which DEFLATE backend produced
+    /// them.
+    fn build_pdf_with_existing_flate_ap_stored() -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::none());
+        encoder.write_all(b"q Q").expect("zlib encode");
+        let compressed = encoder.finish().expect("zlib finish");
+
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 12 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget with an existing /AP/N (obj 5) that will be reused.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (Hello) /Rect [10 10 200 30] /AP <</N 5 0 R>>>>\nendobj\n",
+        );
+        // Existing appearance stream, genuinely Flate-compressed (stored blocks).
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!(
+                "5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+                  /BBox [0 0 190 20] /Filter /FlateDecode /Length {}>>\nstream\n",
+                compressed.len()
+            )
+            .as_bytes(),
+        );
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_under_linearization_recompresses_stale_content(
+    ) {
+        // qpdf oracle evidence (probed against a real qpdf 11.9.0 binary,
+        // `qpdf --generate-appearances --linearize` on a widget whose /AP/N
+        // is already a stream): `QPDFWriter::writeLinearized` calls
+        // `willFilterStream` twice per stream -- once from `m->pdf.optimize`'s
+        // `skip_stream_parameters` probe (QPDFWriter.cc:2546), once from the
+        // real `unparseObject` write (QPDFWriter.cc:1539) -- and qpdf's
+        // ValueSetter token filter (`QPDFFormFieldObjectHelper.cc:484-507`)
+        // does not reset its `replaced`/`state` fields between pipes
+        // (`Pl_QPDFTokenizer::finish`, `Pl_QPDFTokenizer.cc:34-63`, never
+        // resets filter state; `QPDF_Stream::token_filters` is never
+        // cleared, `QPDF_Stream.cc:663-666`). So the *second* (real) pipe's
+        // ValueSetter is already in its terminal state and passes every
+        // source token through unchanged: the linearized output keeps the
+        // OLD appearance content, not the freshly generated one. But
+        // `isDataModified()` (true as soon as a token filter is registered,
+        // `QPDF_Stream.cc:321-324`) is still consulted BEFORE that lost
+        // replacement, in `willFilterStream`'s lone-/FlateDecode exemption
+        // (`QPDFWriter.cc:1234-1245`): it is never eligible for the
+        // verbatim-preserve shortcut, so qpdf decodes + re-encodes the
+        // (stale) content instead of echoing the original compressed bytes.
+        //
+        // Confirmed against the real qpdf 11.9.0 binary: a lone-/FlateDecode
+        // source compressed at a non-default level comes back from
+        // `qpdf --generate-appearances --linearize` with a *different* zlib
+        // header (freshly re-encoded at qpdf's default level) while the
+        // *decoded* content is still the pre-replacement text.
+        //
+        // This regression test only pins the compression-policy half (the
+        // is_data_modified()-gated decode/re-encode decision): the content
+        // half is qpdf's own double-pipe artifact, which flpdf's linearized
+        // writer has no equivalent of and must not (re)introduce -- see
+        // append_body_object's is_data_modified doc for why decoding and
+        // re-encoding the already-materialized (pre-filter) bytes reproduces
+        // qpdf's observed output without modeling that double pipe.
+        let raw = build_pdf_with_existing_flate_ap_stored();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let source_handle = pdf.get_object_handle(ObjectRef::new(5, 0));
+        pdf.resolve_object_handle(&source_handle)
+            .expect("resolve source appearance");
+        let source_raw = source_handle
+            .get_raw_stream_data()
+            .expect("source appearance raw bytes")
+            .as_ref()
+            .clone();
+
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            xobj_ref,
+            ObjectRef::new(5, 0),
+            "existing appearance was not reused"
+        );
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_linearization(true);
+        writer.write().expect("write linearized reused appearance");
+        let renumbered = writer
+            .get_renumbered_obj_gen(xobj_ref)
+            .expect("appearance mapping")
+            .expect("appearance is reachable");
+        let output = writer.get_buffer().expect("writer buffer");
+
+        let mut reparsed = Pdf::open(Cursor::new(output)).expect("reparse written PDF");
+        let written = reparsed.get_object_handle(renumbered);
+        reparsed
+            .resolve_object_handle(&written)
+            .expect("resolve written appearance");
+        let raw_written = written
+            .get_raw_stream_data()
+            .expect("written appearance raw bytes");
+        let source_bytes = written
+            .as_stream_dict()
+            .and_then(|dict| dict.get_key(b"/Length").as_integer());
+        assert!(
+            source_bytes.is_some_and(|len| len as usize == raw_written.len()),
+            "/Length must match the emitted raw byte count"
+        );
+        assert_ne!(
+            raw_written.as_ref(),
+            &source_raw,
+            "linearized writer must not echo the stored-block source's raw \
+             compressed bytes verbatim -- isDataModified() must defeat the \
+             lone-/FlateDecode preserve shortcut, matching \
+             QPDFWriter::willFilterStream, and re-encode at flpdf's default \
+             (non-stored) compression level instead"
+        );
+
+        let decoded = written
+            .get_stream_data(crate::writer::DecodeLevel::Generalized)
+            .expect("written appearance must decode via its declared filter");
+        assert!(
+            decoded.windows(b"q Q".len()).any(|w| w == b"q Q"),
+            "linearized output must contain qpdf's observed STALE content, \
+             not the fresh replacement -- decoded: {decoded:?}"
+        );
+        assert!(
+            !decoded.windows(b"(Hello)".len()).any(|w| w == b"(Hello)"),
+            "linearized writer must not apply the token filter's fresh \
+             replacement (qpdf's own double pipe loses it too, so \
+             reproducing that loss is required for byte parity): {decoded:?}"
+        );
+    }
+
     // ── canonical Tf-operand substitution (flpdf-25kg.3.8.2.1) ───────────────
 
     #[test]
