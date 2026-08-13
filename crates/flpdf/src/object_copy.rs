@@ -333,14 +333,26 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
         }
 
         if let Some(entries) = foreign.as_dictionary() {
-            let mut copied = BTreeMap::new();
-            for (key, value) in entries {
-                copied.insert(key, self.replace_foreign_indirect_objects(value, false)?);
-            }
-            return Ok(self
+            // qpdf's own dictionary branch builds the copy through
+            // `result.replaceKey` (`libqpdf/QPDF.cc:2192-2196`), not a raw
+            // map insert, so a direct-null replacement -- the /Pages
+            // boundary above, or any other unmapped indirect child --
+            // removes the key instead of storing an explicit null, per
+            // `QPDF_Dictionary::replaceKey` (`libqpdf/QPDF_Dictionary.cc:
+            // 135-146`: `value.isNull() && !value.isIndirect()` erases the
+            // key). The stream-dictionary branch above already goes through
+            // `replace_key` for this reason; mirror it here so a copied
+            // plain dictionary's `has_key` matches qpdf's own copy instead
+            // of retaining a key qpdf would have omitted.
+            let copied = self
                 .target
                 .resolver
-                .direct_object_handle(ObjectValue::Dictionary(copied)));
+                .direct_object_handle(ObjectValue::Dictionary(BTreeMap::new()));
+            for (key, value) in entries {
+                let replacement = self.replace_foreign_indirect_objects(value, false)?;
+                copied.replace_key(&key, replacement);
+            }
+            return Ok(copied);
         }
 
         let direct = foreign.shallow_copy()?;
@@ -1218,6 +1230,36 @@ mod tests {
             Some(b"Nested".to_vec())
         );
         assert_ne!(copied_shared_from_array.object_ref(), shared.object_ref());
+    }
+
+    #[test]
+    fn copy_foreign_object_omits_a_dictionary_key_left_unreserved_by_a_pages_boundary() {
+        // qpdf's own dictionary branch of `replaceForeignIndirectObjects`
+        // (`libqpdf/QPDF.cc:2192-2196`) builds the copy through
+        // `result.replaceKey`, whose direct-null rule
+        // (`QPDF_Dictionary::replaceKey`, `libqpdf/QPDF_Dictionary.cc:
+        // 135-146`) *removes* a key replaced with a direct null rather than
+        // storing it. `/Kids` here points at a `/Pages` object, which
+        // `reserve_objects` deliberately never reserves (the /Pages
+        // boundary), so replacement's `!top` branch falls back to
+        // `ObjectHandle::null()` -- a direct null -- for it.
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+
+        let pages = source.get_object_handle(ObjectRef::new(2, 0));
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/Kids", pages);
+
+        let copied = target
+            .copy_foreign_object(&root)
+            .expect("copy root referencing an unreserved /Pages object");
+
+        assert!(
+            !copied.has_key(b"/Kids"),
+            "a direct-null replacement must remove the key, matching qpdf's replaceKey"
+        );
     }
 
     #[test]
