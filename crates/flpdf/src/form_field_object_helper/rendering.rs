@@ -3037,6 +3037,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_tx_reusing_a_flate_compressed_normal_appearance_under_preserve_mode_drops_filter()
+    {
+        // Under StreamDataMode::Preserve, the writer's decode/re-encode
+        // compress policy never runs (effective_stream_policy returns None,
+        // "emit the stream verbatim") -- so unlike the default
+        // CompressStreams::Yes case, nothing recomputes /Filter after this
+        // fix clears it. ObjectHandle::replace_key special-cases a direct
+        // null value as a removal (not a stored Null entry), so the cleared
+        // /Filter/DecodeParms are genuinely absent from the dictionary by
+        // the time any writer policy runs, not merely null-valued -- the
+        // Preserve-mode output must therefore have no /Filter key on this
+        // stream at all (not a stale /FlateDecode, and not a literal
+        // `/Filter null`).
+        let raw = build_pdf_with_existing_flate_ap();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+            .expect("canonical Tx generation")
+            .expect("Tx field is handled");
+
+        let mut writer = PdfWriter::new(&mut pdf);
+        writer.set_output_memory().expect("memory output");
+        writer.set_stream_data_mode(crate::writer::StreamDataMode::Preserve);
+        writer
+            .write()
+            .expect("write reused appearance under preserve mode");
+        let output = writer.get_buffer().expect("writer buffer");
+        assert!(
+            !output.windows(b"/Filter".len()).any(|w| w == b"/Filter"),
+            "preserve-mode output must not gain a /Filter key"
+        );
+    }
+
     // ── canonical Tf-operand substitution (flpdf-25kg.3.8.2.1) ───────────────
 
     #[test]
