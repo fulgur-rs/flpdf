@@ -85,6 +85,17 @@ impl OutlineTree {
     ///
     /// `None` represents qpdf's `QPDFObjGen(0, 0)` bucket and therefore also
     /// contains destinations whose page operand is not an indirect reference.
+    ///
+    /// The page-to-outline mapping is computed once and cached for the
+    /// lifetime of this tree, matching qpdf's own
+    /// `QPDFOutlineDocumentHelper::getOutlinesForPage`/`initializeByPage`
+    /// contract (`libqpdf/QPDFOutlineDocumentHelper.cc:35-59`), which lazily
+    /// builds `m->by_page` on first use and never invalidates it. A
+    /// destination mutated through a live [`ObjectHandle`] after this method
+    /// has already been called is not reflected in later results — qpdf has
+    /// the identical hazard for the same reason (its outline destinations
+    /// are live, mutable `QPDFObjectHandle` values too), so this is qpdf
+    /// parity rather than an flpdf-only limitation.
     pub fn outlines_for_page(
         &self,
         page: Option<ObjectRef>,

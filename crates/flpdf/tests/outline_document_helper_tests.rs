@@ -4082,3 +4082,213 @@ fn outline_action_sd_without_d_has_null_destination() {
     let mut pdf = Pdf::open(Cursor::new(pdf_bytes)).unwrap();
     assert_eq!(outline_dest(&root_items(&mut pdf)[0]), Object::Null);
 }
+
+// -----------------------------------------------------------------------
+// PR #796 codex round-2 findings: redirect chases and direct-handle
+// identity gaps reachable only through public `ObjectHandle` mutation APIs
+// (`Pdf::set_object`, `ObjectHandle::shallow_copy`, `replace_key`), never
+// from parsing real PDF bytes.
+// -----------------------------------------------------------------------
+
+/// A GoTo action whose `/S` is stored as an INDIRECT holder (obj 8), later
+/// redirected in place with `Pdf::set_object(8, Object::Reference(9))` to a
+/// freshly allocated obj 9 holding the real `/GoTo` name. This is the same
+/// flpdf-internal `Pdf::set_object` redirect-bridge shape
+/// `resolve_value_handle`'s own doc describes, and that this file's other
+/// dest-resolution call sites (`resolve_node_dest`'s `candidate`,
+/// `resolve_legacy_node_dest`'s `value`, `resolve_name_tree_node_dest`'s
+/// `found`, and `goto_action_dest`'s own `action` holder — see
+/// `outline_destination_resolves_through_multi_hop_action_holder_chain`
+/// above) already chase via `resolve_value_handle` before inspecting the
+/// resolved value. `goto_action_dest`'s `/S` subtype check did not: it
+/// dereferenced the holder exactly once and compared the intermediate
+/// `ObjectValue::Reference(9)` against `ObjectValue::Name("GoTo")`, which
+/// never matches. qpdf-oracle-inapplicable by construction — see
+/// `dest_from_named_legacy_chases_a_set_object_redirect_chain`'s doc: qpdf
+/// has no notion of an object whose own parsed value is another indirect
+/// reference.
+fn action_subtype_redirect_chain_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Act) /Parent 4 0 R /A << /S 8 0 R /D [3 0 R /Fit] >> >>",
+            ),
+            (8, "null"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn goto_action_subtype_chases_a_set_object_redirect_chain() {
+    let mut pdf = Pdf::open(Cursor::new(action_subtype_redirect_chain_pdf())).unwrap();
+    pdf.set_object(
+        ObjectRef::new(8, 0),
+        Object::Reference(ObjectRef::new(9, 0)),
+    );
+    pdf.set_object(ObjectRef::new(9, 0), Object::Name(b"GoTo".to_vec()));
+
+    assert_eq!(outline_dest(&root_items(&mut pdf)[0]), page_dest(3));
+}
+
+/// `/First` installed as a DIRECT handle whose own resolved value is itself
+/// a bare `Object::Reference` — built the way the codex review describes:
+/// `Pdf::set_object` redirects a spare holder (obj 9) to the real target
+/// (obj 8, an ordinary outline item dict), then `shallow_copy` on that
+/// resolved holder handle produces a direct copy (`object_ref() == None`)
+/// whose *value* is still `ObjectValue::Reference(8, 0)` — and that direct
+/// copy is installed on the Outlines dict's `/First` via the public
+/// `ObjectHandle::replace_key` API, never going through `Pdf::set_object`
+/// itself. `materialize_item`'s `resolve_handle` (a thin
+/// `ObjectHandle::try_dereference` wrapper) is a no-op for a direct handle
+/// and never inspects `as_reference()`, so the un-chased cursor's own value
+/// (a bare reference, not a dictionary) materialized as a titleless scalar
+/// instead of reaching object 8's real `<< /Title (Target) ... >>` content.
+fn direct_reference_valued_first_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 8 0 R /Last 8 0 R /Count 1 >>"),
+            (8, "<< /Title (Target) /Parent 4 0 R /Dest [3 0 R /Fit] >>"),
+            (9, "null"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn direct_reference_valued_cursor_is_chased_to_its_target() {
+    let mut pdf = Pdf::open(Cursor::new(direct_reference_valued_first_pdf())).unwrap();
+
+    // Redirect a spare holder (obj 9) to the real outline item (obj 8), then
+    // shallow_copy its resolved handle to obtain a DIRECT handle whose value
+    // is still `ObjectValue::Reference(8, 0)`.
+    pdf.set_object(
+        ObjectRef::new(9, 0),
+        Object::Reference(ObjectRef::new(8, 0)),
+    );
+    let holder = pdf.get_object_handle(ObjectRef::new(9, 0));
+    pdf.resolve_object_handle(&holder).unwrap();
+    let direct_reference = holder.shallow_copy().unwrap();
+    assert!(direct_reference.object_ref().is_none());
+    assert_eq!(direct_reference.as_reference(), Some(ObjectRef::new(8, 0)));
+
+    // Install it as the Outlines dict's /First, bypassing Pdf::set_object.
+    let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&outlines).unwrap();
+    outlines.replace_key(b"/First", direct_reference).unwrap();
+
+    let roots = root_items(&mut pdf);
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0].title, "Target");
+    assert_eq!(outline_dest(&roots[0]), page_dest(3));
+}
+
+/// Two DIRECT outline dictionaries (`object_ref() == None`, obtained via
+/// `shallow_copy`) whose `/Next` keys reciprocally point at each other,
+/// installed as the Outlines dict's `/First` via the public
+/// `ObjectHandle::replace_key` API — the exact gap `replace_key`'s own doc
+/// records ("does not detect a multi-hop reciprocal cycle built from two or
+/// more replace_key calls across distinct direct dictionaries"). Before the
+/// direct-identity fix, `get_tree`'s `top_level_seen: BTreeSet<ObjectRef>`
+/// never records either node (`object_ref()` is `None` for both), so the
+/// `/Next` walk never terminates. Real PDF bytes cannot produce this shape
+/// (direct values are inline text; two of them cannot mutually contain each
+/// other in a finite file).
+fn direct_sibling_cycle_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>"),
+            (5, "<< /Title (A) /Parent 4 0 R >>"),
+            (6, "<< /Title (B) /Parent 4 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn direct_sibling_next_cycle_terminates_the_top_level_walk() {
+    let mut pdf = Pdf::open(Cursor::new(direct_sibling_cycle_pdf())).unwrap();
+
+    let handle_a = pdf.get_object_handle(ObjectRef::new(5, 0));
+    pdf.resolve_object_handle(&handle_a).unwrap();
+    let handle_b = pdf.get_object_handle(ObjectRef::new(6, 0));
+    pdf.resolve_object_handle(&handle_b).unwrap();
+    let direct_a = handle_a.shallow_copy().unwrap();
+    let direct_b = handle_b.shallow_copy().unwrap();
+    assert!(direct_a.object_ref().is_none());
+    assert!(direct_b.object_ref().is_none());
+
+    direct_a.replace_key(b"/Next", direct_b.clone()).unwrap();
+    direct_b.replace_key(b"/Next", direct_a.clone()).unwrap();
+
+    let outlines = pdf.get_object_handle(ObjectRef::new(4, 0));
+    pdf.resolve_object_handle(&outlines).unwrap();
+    outlines.replace_key(b"/First", direct_a).unwrap();
+
+    let roots = root_items(&mut pdf);
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0].title, "A");
+    assert_eq!(roots[1].title, "B");
+}
+
+/// Same reciprocal direct-dictionary `/Next` cycle as
+/// `direct_sibling_next_cycle_terminates_the_top_level_walk`, but one level
+/// down: the cycle sits among a parent item's CHILDREN (`build_item`'s
+/// per-`Frame` `siblings_seen`), not among top-level roots (`get_tree`'s
+/// `top_level_seen`) — a distinct loop with its own separate seen set that
+/// needs the same direct-identity guard.
+fn direct_child_sibling_cycle_pdf() -> Vec<u8> {
+    build_pdf(
+        &[
+            (1, "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>"),
+            (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            (3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>"),
+            (4, "<< /Type /Outlines /First 5 0 R /Last 5 0 R /Count 1 >>"),
+            (
+                5,
+                "<< /Title (Parent) /Parent 4 0 R /First 6 0 R /Last 7 0 R /Count 2 >>",
+            ),
+            (6, "<< /Title (A) /Parent 5 0 R >>"),
+            (7, "<< /Title (B) /Parent 5 0 R >>"),
+        ],
+        1,
+    )
+}
+
+#[test]
+fn direct_child_sibling_next_cycle_terminates_the_frame_walk() {
+    let mut pdf = Pdf::open(Cursor::new(direct_child_sibling_cycle_pdf())).unwrap();
+
+    let handle_a = pdf.get_object_handle(ObjectRef::new(6, 0));
+    pdf.resolve_object_handle(&handle_a).unwrap();
+    let handle_b = pdf.get_object_handle(ObjectRef::new(7, 0));
+    pdf.resolve_object_handle(&handle_b).unwrap();
+    let direct_a = handle_a.shallow_copy().unwrap();
+    let direct_b = handle_b.shallow_copy().unwrap();
+
+    direct_a.replace_key(b"/Next", direct_b.clone()).unwrap();
+    direct_b.replace_key(b"/Next", direct_a.clone()).unwrap();
+
+    let parent = pdf.get_object_handle(ObjectRef::new(5, 0));
+    pdf.resolve_object_handle(&parent).unwrap();
+    parent.replace_key(b"/First", direct_a).unwrap();
+
+    let tree = pdf.outline().get_tree().unwrap();
+    assert_eq!(tree.roots().len(), 1);
+    let parent_item = &tree[tree.roots()[0]];
+    assert_eq!(parent_item.title, "Parent");
+    assert_eq!(parent_item.kids.len(), 2);
+    assert_eq!(tree[parent_item.kids[0]].title, "A");
+    assert_eq!(tree[parent_item.kids[1]].title, "B");
+}

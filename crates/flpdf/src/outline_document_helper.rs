@@ -61,6 +61,33 @@ fn object_key(object: &ObjectHandle, key: &[u8]) -> Result<Option<ObjectHandle>>
     }
 }
 
+/// Detect an actual repeat among **direct** outline sibling handles by live
+/// identity, mirroring `form_field_object_helper.rs`'s
+/// `mark_direct_node_seen` (`ObjectRef`-keyed seen sets never terminate a
+/// `/Next` cycle built entirely from direct dictionaries: a direct handle's
+/// `object_ref()` is always `None`, the same `QPDFObjGen::set` gap
+/// documented there). Real PDF bytes cannot produce two direct dictionaries
+/// that reciprocally reference each other, but it is reachable in memory
+/// through the public [`ObjectHandle::replace_key`] API. Unlike that helper
+/// (which raises an error), this returns a bool like the existing `ObjectRef`
+/// seen-set checks in `get_tree`/`build_item`'s sibling walks, so a cycle
+/// here silently stops the walk the same way a repeated indirect reference
+/// already does — matching qpdf's own `QPDFObjGen::set`-guarded constructor
+/// loop, which also just stops (`libqpdf/QPDFOutlineDocumentHelper.cc:16-21`).
+fn mark_direct_sibling_seen(direct_seen: &mut Vec<ObjectHandle>, current: &ObjectHandle) -> bool {
+    if !current.is_direct() {
+        return true;
+    }
+    if direct_seen
+        .iter()
+        .any(|handle: &ObjectHandle| handle.is_same_object_as(current))
+    {
+        return false;
+    }
+    direct_seen.push(current.clone());
+    true
+}
+
 /// High-level outline helper for a document. See module docs.
 pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
@@ -152,12 +179,15 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         let mut cursor = first;
 
         let mut top_level_seen = BTreeSet::new();
+        let mut top_level_direct_seen = Vec::new();
         let mut constructor_seen = BTreeSet::new();
         loop {
             if let Some(reference) = cursor.object_ref() {
                 if !top_level_seen.insert(reference) {
                     break;
                 }
+            } else if !mark_direct_sibling_seen(&mut top_level_direct_seen, &cursor) {
+                break;
             }
 
             let Some(id) = self.build_item(cursor, None, &mut tree, &mut constructor_seen)? else {
@@ -196,6 +226,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             next: Option<ObjectHandle>,
             depth: usize,
             siblings_seen: BTreeSet<ObjectRef>,
+            direct_siblings_seen: Vec<ObjectHandle>,
         }
 
         let mut frames = Vec::new();
@@ -206,6 +237,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 next: first,
                 depth: 2,
                 siblings_seen: BTreeSet::new(),
+                direct_siblings_seen: Vec::new(),
             });
         }
 
@@ -224,6 +256,9 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                         frame.next = None;
                         continue;
                     }
+                } else if !mark_direct_sibling_seen(&mut frame.direct_siblings_seen, &cursor) {
+                    frame.next = None;
+                    continue;
                 }
                 (frame.owner, frame.depth)
             };
@@ -255,6 +290,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                         next: first,
                         depth: child_depth + 1,
                         siblings_seen: BTreeSet::new(),
+                        direct_siblings_seen: Vec::new(),
                     });
                 }
             }
@@ -269,8 +305,17 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         parent: Option<OutlineId>,
         tree: &mut OutlineTree,
     ) -> Result<Option<OutlineId>> {
+        // Chase a direct handle whose own resolved value is itself a bare
+        // `Object::Reference` (installed via `shallow_copy` on a
+        // `Pdf::set_object`-redirected holder, then set as `/First`/`/Next`
+        // through the public `ObjectHandle::replace_key` API) to its real
+        // target, the same way every other exit path in this file already
+        // chases this shape via `resolve_value_handle`. `object_ref()` is
+        // captured AFTER chasing so cycle detection (`source_ref`, used by
+        // `build_item`'s `constructor_seen`) keys off the terminal identity,
+        // not the pre-chase holder.
+        let cursor = self.resolve_value_handle(cursor)?;
         let source_ref = cursor.object_ref();
-        self.resolve_handle(&cursor)?;
         if cursor.try_is_null()? {
             return Ok(None);
         }
@@ -347,7 +392,13 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         if action.try_as_dictionary()?.is_none() {
             return Ok(None);
         }
-        let subtype = action.try_get_key(b"/S")?;
+        // Chase the same `Pdf::set_object` redirect this file's other
+        // dest-resolution call sites already chase (`resolve_node_dest`'s
+        // `candidate`, `resolve_legacy_node_dest`'s `value`,
+        // `resolve_name_tree_node_dest`'s `found`, and this function's own
+        // `action` above): `try_is_name_and_equals` only dereferences its
+        // receiver once and never follows a bare-reference-valued result.
+        let subtype = self.resolve_value_handle(action.try_get_key(b"/S")?)?;
         if !subtype.try_is_name_and_equals(b"GoTo")? {
             return Ok(None);
         }
@@ -454,9 +505,34 @@ fn qpdf_count(value: &ObjectHandle) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{qpdf_count, qpdf_title};
+    use super::{mark_direct_sibling_seen, qpdf_count, qpdf_title};
     use crate::pipeline::test_support::NthWriteFailure;
     use crate::pipeline::PipelineHandle;
+    use crate::{ObjectHandle, ObjectRef};
+
+    /// Mirrors `form_field_object_helper.rs`'s
+    /// `direct_seen_set_ignores_indirect_handles_and_tracks_direct_identity`:
+    /// an indirect handle is ignored (the `BTreeSet<ObjectRef>` seen-set in
+    /// `get_tree`/`build_item` already owns its identity), a direct handle is
+    /// recorded on first sight, and an actual repeat of the SAME underlying
+    /// allocation is rejected while a distinct direct handle with equal
+    /// contents is not treated as a repeat.
+    #[test]
+    fn direct_sibling_seen_set_ignores_indirect_handles_and_tracks_direct_identity() {
+        let mut direct_seen = Vec::new();
+
+        let indirect = ObjectHandle::new_indirect_unresolved(ObjectRef::new(10, 0), -1);
+        assert!(mark_direct_sibling_seen(&mut direct_seen, &indirect));
+        assert!(mark_direct_sibling_seen(&mut direct_seen, &indirect));
+        assert!(direct_seen.is_empty());
+
+        let direct = ObjectHandle::dictionary(Vec::new());
+        assert!(mark_direct_sibling_seen(&mut direct_seen, &direct));
+        assert!(!mark_direct_sibling_seen(&mut direct_seen, &direct));
+
+        let other_direct = ObjectHandle::dictionary(Vec::new());
+        assert!(mark_direct_sibling_seen(&mut direct_seen, &other_direct));
+    }
 
     #[test]
     fn scalar_warning_sink_failures_propagate() {
