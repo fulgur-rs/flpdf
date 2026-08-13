@@ -441,6 +441,15 @@ qpdf 11.9.0 の `QPDF::copyForeignObject`（`QPDF.cc:2019-2272`）に対応す�
 `ot_reserved` は外部に露出しない内部 reservation sentinel として
 destination-owned indirect null slot で表現する。
 
+⚪ `reserveObjects` 相当（reservation）だけでなく `replaceForeignIndirectObjects`
+相当（replacement）でも、直接（非間接）dictionary/array が作る identity cycle を
+`direct_visiting`（`ForeignObjectCopier` フィールド）で bound する。qpdf の該当
+2 関数（`QPDF.cc:2101-2213`）はいずれも direct cycle 用の visited set を持たない。
+実際にパースされた PDF はこの形を表現できない（直接値は自分自身を参照するための
+アドレス可能な identity を持たない）ため、qpdf 側にこの bound の対応物は無い。
+公開 `ObjectHandle::replace_key` API 経由でのみ構築可能な入力への防御であり、
+出力バイトには影響しない。
+
 ---
 
 ## 検証可能性（safety net）

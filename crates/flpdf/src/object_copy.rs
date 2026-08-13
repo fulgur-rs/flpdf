@@ -36,6 +36,19 @@
 //! special bookkeeping: both endpoints already have target numbers when their
 //! references are remapped.
 //!
+//! `copy_foreign_object` handles indirect cycles the same way, through its
+//! destination reservation map. A cycle formed entirely of *direct*
+//! dictionaries or arrays — constructible with [`ObjectHandle::replace_key`],
+//! though not by any parser, since a direct value has no addressable identity
+//! for another direct value to reference — has no reservation slot to close
+//! the loop through. Both the reservation and replacement passes therefore
+//! track their own currently-active direct objects and reject a repeat with
+//! an error instead of recursing without bound. qpdf's `QPDF::reserveObjects`
+//! and `QPDF::replaceForeignIndirectObjects` (`libqpdf/QPDF.cc:2101-2213`)
+//! have no equivalent tracking, so this bound has no qpdf counterpart; it
+//! guards a shape only the public API can produce, not one qpdf itself
+//! defends against.
+//!
 //! # Independence
 //!
 //! Each call uses a fresh map, so copying the same source set twice produces
@@ -110,10 +123,19 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             })?;
             let replacement = self.replace_foreign_indirect_objects(source.clone(), true)?;
             if source.as_stream_dict().is_none() {
+                // cov:ignore-start: `reserve_objects` inserts every `to_copy` entry's
+                // reservation into `object_map` before queuing it; this guards that
+                // invariant instead of indexing and panicking if it is ever broken.
+                let target_ref = *self.object_map.get(&source_ref).ok_or_else(|| {
+                    Error::Internal(
+                        "foreign copier reservation missing for a queued object".to_owned(),
+                    )
+                })?;
+                // cov:ignore-end
                 self.target
                     .resolver
-                    .replace_object(self.object_map[&source_ref], replacement)?;
-                self.target.mark_object_dirty(self.object_map[&source_ref]);
+                    .replace_object(target_ref, replacement)?;
+                self.target.mark_object_dirty(target_ref);
             }
         }
 
@@ -228,19 +250,62 @@ impl<R: Read + Seek + 'static> ForeignObjectCopier<'_, R> {
             }
         }
 
+        // Every indirect reference is already resolved by the `!top` branch
+        // above, so only a genuinely direct (non-indirect) value can recurse
+        // back into an ancestor still under construction here. qpdf's own
+        // `replaceForeignIndirectObjects` (`QPDF.cc:2158-2213`) has no
+        // visited-set at all — a direct cycle reaching it would also recurse
+        // unbounded — so this bound has no qpdf counterpart; it exists
+        // because the public `ObjectHandle::replace_key` API can construct a
+        // direct cycle that no parsed PDF can express in the first place.
+        // This mirrors reservation's `direct_visiting` guard (`reserve_objects`),
+        // but cannot mirror its `Ok(())` short-circuit: reservation can safely
+        // stop descending because the enclosing frame is already reserving
+        // that subtree, while replacement is still mid-construction of the
+        // ancestor's copy and has no finite value to hand back for the cycle.
+        if foreign.object_ref().is_none() {
+            if self
+                .direct_visiting
+                .iter()
+                .any(|active| active.is_same_object_as(&foreign))
+            {
+                return Err(Error::System(
+                    "QPDF::copyForeign encountered a direct object cycle".to_owned(),
+                ));
+            }
+            self.direct_visiting.push(foreign.clone());
+            let result = self.replace_foreign_value(foreign);
+            self.direct_visiting.pop();
+            return result;
+        }
+
+        self.replace_foreign_value(foreign)
+    }
+
+    /// The container/scalar dispatch shared by both `top` states of
+    /// [`Self::replace_foreign_indirect_objects`], split out so the cycle
+    /// guard there wraps every recursive descent, including the one this
+    /// function itself performs into array items, dictionary values, and
+    /// stream dictionary entries.
+    fn replace_foreign_value(&mut self, foreign: ObjectHandle) -> Result<ObjectHandle> {
         if let Some(source_dictionary) = foreign.as_stream_dict() {
             if !foreign.is_indirect() {
                 return Err(Error::System(
                     "QPDF::copyForeign encountered a direct stream object".to_owned(),
                 ));
             }
-            // cov:ignore-start: an indirect stream always carries its object identity;
-            // direct streams are rejected by the preceding branch.
+            // cov:ignore-start: an indirect stream always carries its object identity,
+            // and `reserve_objects` always reserves a stream (`new_stream`) into
+            // `object_map` before queuing it in `to_copy`; these guard those two
+            // invariants instead of unwrapping/indexing and panicking if either is
+            // ever broken.
             let source_ref = foreign.object_ref().ok_or_else(|| {
                 Error::Internal("foreign stream has no object reference".to_owned())
             })?;
+            let target_ref = *self.object_map.get(&source_ref).ok_or_else(|| {
+                Error::Internal("foreign stream reservation is missing".to_owned())
+            })?;
             // cov:ignore-end
-            let target_ref = self.object_map[&source_ref];
             let destination = self.target.get_object_handle(target_ref);
             let destination_dictionary = destination.as_stream_dict().ok_or_else(|| {
                 Error::Internal("foreign stream reservation is not a stream".to_owned())
@@ -775,6 +840,40 @@ mod tests {
         copier
             .reserve_objects(direct, true)
             .expect("direct identity cycles are bounded during reservation");
+    }
+
+    #[test]
+    fn copy_foreign_object_rejects_a_direct_identity_cycle_during_replacement() {
+        // A single direct handle cannot alias itself through `replace_key`
+        // (`ObjectHandle::is_direct_value_alias` silently no-ops that
+        // insertion), but two direct dictionaries can still reference each
+        // other, producing a genuine identity cycle with no indirect object
+        // anywhere on the path. Reservation's `direct_visiting` guard (see
+        // `foreign_copier_stops_reservation_on_a_direct_identity_cycle`)
+        // lets reservation finish despite the cycle. Without an equivalent
+        // guard here, the replacement phase recurses `a -> b -> a -> b ...`
+        // without end. qpdf's own `replaceForeignIndirectObjects`
+        // (`QPDF.cc:2158-2213`) has no visited-set at all, so this same
+        // input would also recurse unbounded there; this is a flpdf-only
+        // bound (see the `direct_visiting` field doc), not a qpdf parity
+        // restoration, because no parsed PDF can produce a direct cycle in
+        // the first place (only the public `ObjectHandle` API can).
+        let mut source = minimal_pdf();
+        let mut target = minimal_pdf();
+        let a = ObjectHandle::dictionary(Vec::new());
+        let b = ObjectHandle::dictionary(Vec::new());
+        a.replace_key(b"/B", b.clone());
+        b.replace_key(b"/A", a.clone());
+        let root = source
+            .make_indirect_object_handle(ObjectHandle::dictionary(Vec::new()))
+            .expect("root");
+        root.replace_key(b"/A", a);
+
+        let error = target
+            .copy_foreign_object(&root)
+            .expect_err("a direct identity cycle must not recurse unbounded during replacement");
+        assert!(matches!(error, Error::System(message)
+            if message == "QPDF::copyForeign encountered a direct object cycle"));
     }
 
     #[test]
