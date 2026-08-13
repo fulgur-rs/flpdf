@@ -449,6 +449,13 @@ impl<K: TreeKey> NNTreeCursor<K> {
                 .zip(&other.path)
                 .all(|(left, right)| left.kid_number == right.kid_number)
     }
+
+    fn selected_path(&self) -> Option<(Vec<usize>, usize)> {
+        Some((
+            self.path.iter().map(|element| element.kid_number).collect(),
+            self.item_number?,
+        ))
+    }
 }
 
 impl<K: TreeKey> Clone for NNTreeCursor<K> {
@@ -698,6 +705,15 @@ impl PartialEq for NameTreeCursor {
 impl Eq for NameTreeCursor {}
 
 impl NameTreeCursor {
+    pub(crate) fn selected_path(&self) -> Option<(Vec<usize>, usize)> {
+        self.inner.selected_path()
+    }
+
+    /// Whether traversal selected an array slot, even if its key is malformed.
+    pub(crate) fn positioned(&self) -> bool {
+        self.inner.positioned()
+    }
+
     /// Whether the cursor points to a valid key/value pair.
     pub fn valid(&self) -> bool {
         self.inner.current().is_some()
@@ -1191,6 +1207,7 @@ pub(crate) struct HandleNameTree {
     inner: NNTree<NameKey>,
 }
 
+#[allow(dead_code)] // the facade is consumed by the next stacked consumer layer
 impl HandleNameTree {
     pub(crate) fn new(root: ObjectHandle, pdf_id: u64, auto_repair: bool) -> Self {
         Self {
@@ -1204,11 +1221,6 @@ impl HandleNameTree {
         key: K,
     ) -> Result<Option<ObjectHandle>> {
         let cursor = self.inner.find(pdf, &key.as_ref().to_vec(), false)?;
-        if cursor.positioned() && cursor.cloned_current_handle().is_none() {
-            return Err(Error::Internal(
-                "attempt made to dereference an invalid name/number tree iterator".to_string(),
-            ));
-        }
         Ok(cursor.cloned_current_handle().map(|(_, value)| value))
     }
 
@@ -1223,6 +1235,7 @@ impl HandleNameTree {
             .map(|_| ())
     }
 
+    #[allow(dead_code)] // consumed by the EmbeddedFileDocumentHelper cutover above this layer
     pub(crate) fn remove<R: Read + Seek, K: AsRef<[u8]>>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1231,6 +1244,7 @@ impl HandleNameTree {
         self.inner.remove_handle(pdf, &key.as_ref().to_vec())
     }
 
+    #[allow(dead_code)] // consumed by the EmbeddedFileDocumentHelper cutover above this layer
     pub(crate) fn entries<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1379,6 +1393,7 @@ impl<K: TreeKey> NNTree<K> {
         }
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree in the next stacked layer
     fn from_handle(root: ObjectHandle, pdf_id: u64, auto_repair: bool) -> Self {
         let mut tree = Self::new(Object::Null, auto_repair);
         tree.canonical_root = Some(root);
@@ -1548,6 +1563,7 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree in the next stacked layer
     fn insert_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
@@ -1679,17 +1695,13 @@ impl<K: TreeKey> NNTree<K> {
         Ok(Some(value))
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree::remove in the next stack layer
     fn remove_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
         key: &K::Key,
     ) -> Result<Option<ObjectHandle>> {
         let mut cursor = self.find(pdf, key, false)?;
-        if cursor.positioned() && cursor.cloned_current_handle().is_none() {
-            return Err(Error::Internal(
-                "attempt made to dereference an invalid name/number tree iterator".to_string(),
-            ));
-        }
         let Some((_, value)) = cursor.cloned_current_handle() else {
             return Ok(None);
         };
@@ -1707,6 +1719,7 @@ impl<K: TreeKey> NNTree<K> {
         self.finish_mutation(result)
     }
 
+    #[allow(dead_code)] // consumed by HandleNameTree::remove in the next stack layer
     fn remove_at_handle<R: Read + Seek>(
         &mut self,
         pdf: &mut Pdf<R>,
