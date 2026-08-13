@@ -204,7 +204,7 @@ fn fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle() {
         .fully_qualified_name()
         .expect_err("a reciprocal direct /Parent cycle must not loop forever");
     assert!(matches!(error, Error::Unsupported(ref message)
-        if message.contains("field tree depth exceeds maximum")));
+        if message.contains("/Parent cycle of direct dictionaries")));
 }
 
 #[test]
@@ -213,7 +213,8 @@ fn inherited_value_lookup_terminates_on_a_reciprocal_direct_parent_cycle() {
     // `fully_qualified_name_terminates_on_a_reciprocal_direct_parent_cycle`,
     // exercised through `resolve_inherited_handle_from` (backing
     // `field_value`) instead. Neither direct dictionary defines `/V`, so the
-    // walk can never find a terminal value and must hit the depth bound.
+    // walk can never find a terminal value and must hit the direct-cycle
+    // guard.
     let bytes = doc(vec![(10, "<< /Parent << /T (a) >> >>".into())]);
     let mut pdf = open(bytes);
     let field_ref = ObjectRef::new(10, 0);
@@ -230,7 +231,73 @@ fn inherited_value_lookup_terminates_on_a_reciprocal_direct_parent_cycle() {
         .field_value()
         .expect_err("a reciprocal direct /Parent cycle must not loop forever");
     assert!(matches!(error, Error::Unsupported(ref message)
-        if message.contains("field tree depth exceeds maximum")));
+        if message.contains("/Parent cycle of direct dictionaries")));
+}
+
+#[test]
+fn fully_qualified_name_resolves_a_long_acyclic_direct_parent_chain() {
+    // A direct-only `/Parent` chain longer than `DEFAULT_MAX_PAGE_TREE_DEPTH`
+    // (100) is a legitimate acyclic shape, not a pathological one -- this
+    // codebase's own parser accepts direct nesting up to depth 500
+    // (`parser.rs`). The direct-cycle guard must bound an actual repeat, not
+    // depth, so a 150-level acyclic direct chain must resolve.
+    let bytes = doc(vec![(10, "<< /T (leaf) >>".into())]);
+    let mut pdf = open(bytes);
+    let field_ref = ObjectRef::new(10, 0);
+    let field = pdf.get_object_handle(field_ref);
+    pdf.resolve_object_handle(&field).unwrap();
+
+    let mut parent = ObjectHandle::dictionary(vec![(
+        b"/T".to_vec(),
+        ObjectHandle::string(b"top".to_vec()),
+    )]);
+    let mut expected_parts = vec!["top".to_string()];
+    for index in 0..149 {
+        let name = format!("n{index}");
+        expected_parts.push(name.clone());
+        parent = ObjectHandle::dictionary(vec![
+            (b"/T".to_vec(), ObjectHandle::string(name.into_bytes())),
+            (b"/Parent".to_vec(), parent),
+        ]);
+    }
+    field.replace_key(b"/Parent", parent).unwrap();
+    expected_parts.push("leaf".to_string());
+
+    let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
+    let name = field
+        .fully_qualified_name()
+        .expect("a long acyclic direct /Parent chain must resolve, not error");
+    assert_eq!(name, expected_parts.join("."));
+}
+
+#[test]
+fn field_value_resolves_a_long_acyclic_direct_parent_chain() {
+    // Same chain shape as
+    // `fully_qualified_name_resolves_a_long_acyclic_direct_parent_chain`, but
+    // exercised through `resolve_inherited_handle_from` (backing
+    // `field_value`): a genuinely acyclic direct chain past the old depth
+    // bound must still resolve the terminal `/V`.
+    let bytes = doc(vec![(10, "<< >>".into())]);
+    let mut pdf = open(bytes);
+    let field_ref = ObjectRef::new(10, 0);
+    let field = pdf.get_object_handle(field_ref);
+    pdf.resolve_object_handle(&field).unwrap();
+
+    let mut parent = ObjectHandle::dictionary(vec![(
+        b"/V".to_vec(),
+        ObjectHandle::string(b"top-value".to_vec()),
+    )]);
+    for _ in 0..149 {
+        parent = ObjectHandle::dictionary(vec![(b"/Parent".to_vec(), parent)]);
+    }
+    field.replace_key(b"/Parent", parent).unwrap();
+
+    let mut field = FormFieldObjectHelper::new(field_ref, &mut pdf);
+    let value = field
+        .field_value()
+        .expect("a long acyclic direct /Parent chain must resolve, not error")
+        .and_then(|value| value.as_string());
+    assert_eq!(value, Some(b"top-value".to_vec()));
 }
 
 #[test]
