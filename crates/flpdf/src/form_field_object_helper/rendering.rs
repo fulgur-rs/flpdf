@@ -177,9 +177,9 @@ fn install_normal_appearance_canonical<R: Read + Seek>(
                 .as_stream_dict()
                 .map(|stream_dict| pdf.mark_object_handle_dirty(&stream_dict))
                 .transpose()?;
-            return Ok(normal.object_ref().ok_or_else(|| {
+            return normal.object_ref().ok_or_else(|| {
                 Error::Unsupported("normal appearance stream is not indirect".to_string())
-            })?);
+            });
         }
     }
 
