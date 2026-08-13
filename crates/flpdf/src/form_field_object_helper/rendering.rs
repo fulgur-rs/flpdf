@@ -92,12 +92,14 @@ fn resolve_canonical<R: Read + Seek>(
     Ok(handle)
 }
 
-/// Read a widget rectangle through the live annotation handle.
-fn resolve_rect_canonical<R: Read + Seek>(
+/// Read a rectangle-shaped array (`/Rect`, `/BBox`, …) at `key` through a
+/// live handle.
+fn resolve_rectangle_canonical<R: Read + Seek>(
     pdf: &mut Pdf<R>,
-    widget: &ObjectHandle,
+    handle: &ObjectHandle,
+    key: &[u8],
 ) -> Result<Option<PageBox>> {
-    let rect = resolve_canonical(pdf, widget.get_key(b"/Rect"))?;
+    let rect = resolve_canonical(pdf, handle.get_key(key))?;
     let Some(items) = rect.as_array() else {
         return Ok(None);
     };
@@ -119,6 +121,46 @@ fn resolve_rect_canonical<R: Read + Seek>(
     Ok(Some(PageBox::new(
         values[0], values[1], values[2], values[3],
     )))
+}
+
+/// Read a widget rectangle through the live annotation handle.
+fn resolve_rect_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget: &ObjectHandle,
+) -> Result<Option<PageBox>> {
+    resolve_rectangle_canonical(pdf, widget, b"/Rect")
+}
+
+/// Resolve the bounding box used to size a widget's `/AP/N` appearance
+/// content.
+///
+/// qpdf's `QPDFFormFieldObjectHelper::generateTextAppearance` only derives
+/// the box from the widget's `/Rect` when creating a fresh `/AP/N` stream.
+/// When `/AP/N` is *already* a stream, it lays out content against that
+/// stream's own `/BBox` instead -- never against the current `/Rect` -- and
+/// leaves `/BBox` itself completely untouched
+/// (`libqpdf/QPDFFormFieldObjectHelper.cc:766-793`). If that existing
+/// `/BBox` is not a valid four-number rectangle, qpdf warns and aborts
+/// appearance generation entirely rather than falling back to `/Rect`
+/// (`QPDFFormFieldObjectHelper.cc:788-791`).
+///
+/// Verified against a real `qpdf 11.9.0 --generate-appearances` run: a
+/// widget with an existing `/AP/N` `/BBox [0 0 190 20]` and an enlarged
+/// `/Rect [10 10 400 130]` is rewritten with `/BBox` still `[0 0 190 20]`,
+/// and the appearance content's `Td` offsets are computed from that
+/// unchanged 190×20 box.
+fn resolve_appearance_bbox_canonical<R: Read + Seek>(
+    pdf: &mut Pdf<R>,
+    widget: &ObjectHandle,
+) -> Result<Option<PageBox>> {
+    let ap = resolve_canonical(pdf, widget.get_key(b"/AP"))?;
+    if ap.as_dictionary().is_some() {
+        let normal = resolve_canonical(pdf, ap.get_key(b"/N"))?;
+        if let Some(stream_dict) = normal.as_stream_dict() {
+            return resolve_rectangle_canonical(pdf, &stream_dict, b"/BBox");
+        }
+    }
+    resolve_rect_canonical(pdf, widget)
 }
 
 /// Resolve the standard-14 font named by a field's document-level `/DR`.
@@ -298,7 +340,7 @@ pub(crate) fn render_text_field_canonical<R: Read + Seek>(
     let value = FormFieldObjectHelper::new(field_ref, pdf).value_as_string()?;
     let widget = pdf.get_object_handle(widget_ref);
     pdf.resolve_object_handle(&widget)?;
-    let Some(rect) = resolve_rect_canonical(pdf, &widget)? else {
+    let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
     let bbox_w = (rect.urx - rect.llx).abs();
@@ -354,7 +396,7 @@ pub(crate) fn render_choice_field_canonical<R: Read + Seek>(
 
     let widget = pdf.get_object_handle(widget_ref);
     pdf.resolve_object_handle(&widget)?;
-    let Some(rect) = resolve_rect_canonical(pdf, &widget)? else {
+    let Some(rect) = resolve_appearance_bbox_canonical(pdf, &widget)? else {
         return Ok(None);
     };
     let bbox_w = (rect.urx - rect.llx).abs();
@@ -2953,6 +2995,117 @@ mod tests {
         );
     }
 
+    /// PDF whose widget's existing `/AP/N` (obj 5) has a `/BBox [0 0 190
+    /// 20]` that predates the widget's current, enlarged `/Rect [10 10 400
+    /// 130]` -- a caller regenerating the appearance after resizing the
+    /// widget without first clearing `/AP`.
+    fn build_pdf_with_existing_ap_and_enlarged_rect() -> Vec<u8> {
+        let mut pdf: Vec<u8> = Vec::new();
+        pdf.extend_from_slice(b"%PDF-1.4\n");
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"1 0 obj\n<</Type /Catalog /Pages 2 0 R /AcroForm \
+              <</Fields [4 0 R] /DR <<>> /DA (/Helv 10 Tf 0 g)>>>>\nendobj\n",
+        );
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<</Type /Pages /Kids [3 0 R] /Count 1>>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Annots [4 0 R]>>\nendobj\n",
+        );
+        // Widget's /Rect has grown well past the existing appearance's /BBox.
+        let off4 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"4 0 obj\n<</Type /Annot /Subtype /Widget /FT /Tx /T (f) \
+              /V (text) /Rect [10 10 400 130] /AP <</N 5 0 R>>>>\nendobj\n",
+        );
+        // Existing appearance stream: /BBox from the widget's earlier,
+        // smaller /Rect (unchanged by this fixture's regeneration call).
+        let off5 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"5 0 obj\n<</Type /XObject /Subtype /Form /FormType 1 \
+              /BBox [0 0 190 20] /Length 4>>\nstream\nq Q\nendstream\nendobj\n",
+        );
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 6\n\
+             0000000000 65535 f \n\
+             {off1:010} 00000 n \n\
+             {off2:010} 00000 n \n\
+             {off3:010} 00000 n \n\
+             {off4:010} 00000 n \n\
+             {off5:010} 00000 n \n",
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer = format!("trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn canonical_tx_sizes_reused_appearance_from_existing_bbox_not_enlarged_rect() {
+        // qpdf's `generateTextAppearance` sizes a reused appearance stream's
+        // content against *that stream's own* `/BBox`, never the widget's
+        // current `/Rect`, and never rewrites `/BBox` on this path either
+        // (`libqpdf/QPDFFormFieldObjectHelper.cc:766-793`). Verified against
+        // a real `qpdf 11.9.0 --generate-appearances` run on this exact
+        // shape (existing `/BBox [0 0 190 20]`, `/Rect` enlarged to `[10 10
+        // 400 130]`): the output keeps `/BBox [0 0 190 20]` and computes its
+        // `Td` offset (`1 5.2 Td` there, `/Helv 12 Tf`; `1 6 Td` here with
+        // this fixture's `/Helv 10 Tf`) from that unchanged 190x20 box, not
+        // from the enlarged `/Rect`.
+        let raw = build_pdf_with_existing_ap_and_enlarged_rect();
+        let mut pdf = Pdf::open(Cursor::new(raw)).expect("parse");
+        let xobj_ref =
+            render_text_field_canonical(&mut pdf, ObjectRef::new(4, 0), ObjectRef::new(4, 0))
+                .expect("canonical Tx generation")
+                .expect("Tx field is handled");
+        assert_eq!(
+            xobj_ref,
+            ObjectRef::new(5, 0),
+            "existing appearance was not reused"
+        );
+
+        let stream_handle = pdf.get_object_handle(xobj_ref);
+        pdf.resolve_object_handle(&stream_handle)
+            .expect("resolve reused appearance");
+        let stream_dict = stream_handle
+            .as_stream_dict()
+            .expect("reused stream has a dictionary");
+        let bbox = stream_dict.get_key(b"/BBox");
+        pdf.resolve_object_handle(&bbox).expect("resolve /BBox");
+        let items = bbox.as_array().expect("/BBox is an array");
+        let values: Vec<f64> = items
+            .into_iter()
+            .map(|item| {
+                pdf.resolve_object_handle(&item)
+                    .expect("resolve /BBox item");
+                item.as_real()
+                    .or_else(|| item.as_integer().map(|n| n as f64))
+                    .expect("/BBox item is numeric")
+            })
+            .collect();
+        assert_eq!(
+            values,
+            vec![0.0, 0.0, 190.0, 20.0],
+            "/BBox must stay untouched on reuse, matching qpdf"
+        );
+
+        let content = stream_handle
+            .as_stream_data()
+            .expect("reused appearance data");
+        assert!(
+            content.windows(b"1 6 Td".len()).any(|w| w == b"1 6 Td"),
+            "content must be positioned against the existing 190x20 /BBox, \
+             not the widget's enlarged /Rect: {content:?}"
+        );
+        assert!(
+            !content.windows(b"1 56 Td".len()).any(|w| w == b"1 56 Td"),
+            "content must not be sized against the enlarged /Rect: {content:?}"
+        );
+    }
+
     /// PDF whose widget's existing `/AP/N` (obj 5) is a genuinely
     /// Flate-compressed stream (`/Filter /FlateDecode` over real zlib
     /// bytes), mirroring flpdf-25kg.3.8.2.2's empirical repro fixture.
@@ -3364,6 +3517,19 @@ mod tests {
                     ObjectHandle::dictionary(vec![
                         (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
                         (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                        // A valid /BBox so this repro reaches the
+                        // not-indirect guard instead of aborting earlier
+                        // at the /BBox validity check (also qpdf-modeled:
+                        // `QPDFFormFieldObjectHelper.cc:788-791`).
+                        (
+                            b"/BBox".to_vec(),
+                            ObjectHandle::array(vec![
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(100),
+                                ObjectHandle::integer(20),
+                            ]),
+                        ),
                     ]),
                     Rc::new(b"old".to_vec()),
                 ),
@@ -3399,6 +3565,19 @@ mod tests {
                     ObjectHandle::dictionary(vec![
                         (b"/Type".to_vec(), ObjectHandle::name(b"XObject".to_vec())),
                         (b"/Subtype".to_vec(), ObjectHandle::name(b"Form".to_vec())),
+                        // A valid /BBox so this repro reaches the
+                        // not-indirect guard instead of aborting earlier
+                        // at the /BBox validity check (also qpdf-modeled:
+                        // `QPDFFormFieldObjectHelper.cc:788-791`).
+                        (
+                            b"/BBox".to_vec(),
+                            ObjectHandle::array(vec![
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(0),
+                                ObjectHandle::integer(20),
+                                ObjectHandle::integer(20),
+                            ]),
+                        ),
                     ]),
                     Rc::new(b"old".to_vec()),
                 ),
