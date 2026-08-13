@@ -7865,6 +7865,75 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_reserved_child_materialize_rejects_like_a_top_level_reserved_handle() {
+        // `ObjectHandle::shallow_copy` on a reserved handle produces a
+        // *direct* reserved sentinel (see the previous test) -- a shape
+        // `ObjectState::Reserved` could not take before that fix landed.
+        // Nesting that direct copy as an array element and materializing
+        // the array previously substituted `Object::Null` for it silently:
+        // `materialize_child`'s direct branch (`handle.object_ref()` is
+        // `None` for a direct handle) falls through to
+        // `materialize_bounded`, which read `with_value`'s
+        // `Reserved => None` arm as "value not yet known" instead of
+        // "value never exists". qpdf's own `QPDF_Reserved::unparse()`
+        // (`libqpdf/QPDF_Reserved.cc:22-26`) throws once the reserved
+        // object is the value actually being dereferenced -- which a
+        // *direct* child always is, since `QPDFWriter::unparseChild`
+        // (`libqpdf/QPDFWriter.cc:1144-1156`) only ever skips dereferencing
+        // an *indirect* child. Codex Review on PR #789,
+        // crates/flpdf/src/object_handle.rs:3226 (databaseId 3773501422).
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let direct_copy = reserved
+            .shallow_copy()
+            .expect("QPDF_Reserved::copy never throws");
+        assert!(
+            direct_copy.is_direct(),
+            "shallow_copy never carries an object number of its own"
+        );
+
+        let containing = ObjectHandle::array(vec![direct_copy]);
+        let error = containing
+            .materialize()
+            .expect_err("a direct reserved child must reject, not substitute null");
+        assert_eq!(
+            error.to_string(),
+            "QPDFObjectHandle: attempting to unparse a reserved object"
+        );
+    }
+
+    #[test]
+    fn a_direct_reserved_child_is_already_rejected_by_the_ref_map_writer_family() {
+        // Unlike `materialize` (previous test), the production ref-map
+        // writer family's direct branch --
+        // `write_child_with_ref_map(handle, ..)` with `handle.object_ref()`
+        // `None` -- recurses through `unparse_object_walk_with_ref_map`,
+        // which checks `is_reserved()` on whatever handle it is entered
+        // with, not only the original top-level `self`. A direct reserved
+        // child re-enters that same check on its own recursive call, so
+        // this path already rejects it and needs no additional fix; this
+        // pins that existing (if under-documented) behavior against
+        // regression.
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let reserved = pdf.new_reserved().expect("reserved object");
+        let direct_copy = reserved
+            .shallow_copy()
+            .expect("QPDF_Reserved::copy never throws");
+
+        let containing = ObjectHandle::dictionary(vec![(b"/Reserved".to_vec(), direct_copy)]);
+        let mut out = Vec::new();
+        let error = containing
+            .unparse_object_with_ref_map_and_removed(&mut out, &|object_ref| Ok(object_ref), &BTreeSet::new())
+            .expect_err(
+                "a direct reserved child must be rejected, matching QPDF_Reserved::unparse()'s throw",
+            );
+        assert_eq!(
+            error.to_string(),
+            "QPDFObjectHandle: attempting to unparse a reserved object"
+        );
+    }
+
+    #[test]
     fn reserved_objects_are_rejected_by_object_writer_entrypoints() {
         let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
         let reserved = pdf.new_reserved().expect("reserved object");
