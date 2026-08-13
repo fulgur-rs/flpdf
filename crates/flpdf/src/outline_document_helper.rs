@@ -89,6 +89,21 @@ fn mark_direct_sibling_seen(direct_seen: &mut Vec<ObjectHandle>, current: &Objec
     true
 }
 
+/// The two "already visited" trackers a single outline sibling walk needs,
+/// bundled into one value so [`OutlineDocumentHelper::chase_and_mark_seen`]
+/// takes one seen-state argument instead of two: an `ObjectRef`-keyed set
+/// for indirect targets, and a direct-identity `Vec` (see
+/// [`mark_direct_sibling_seen`]) for direct ones. Both `get_tree`'s
+/// top-level walk and `build_item`'s per-frame sibling walk need exactly
+/// this pair. Neither field has an independent qpdf analog beyond
+/// `QPDFObjGen::set` itself (`libqpdf/QPDFOutlineDocumentHelper.cc:16-21`);
+/// bundling them is a Rust-side container choice, not a qpdf structure.
+#[derive(Default)]
+struct SiblingSeen {
+    seen: BTreeSet<ObjectRef>,
+    direct_seen: Vec<ObjectHandle>,
+}
+
 /// High-level outline helper for a document. See module docs.
 pub struct OutlineDocumentHelper<'a, R: Read + Seek + 'static> {
     pdf: &'a mut Pdf<R>,
@@ -164,15 +179,14 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
     fn chase_and_mark_seen(
         &mut self,
         cursor: ObjectHandle,
-        seen: &mut BTreeSet<ObjectRef>,
-        direct_seen: &mut Vec<ObjectHandle>,
+        seen: &mut SiblingSeen,
     ) -> Result<Option<ObjectHandle>> {
         let cursor = self.resolve_value_handle(cursor)?;
         if let Some(reference) = cursor.object_ref() {
-            if !seen.insert(reference) {
+            if !seen.seen.insert(reference) {
                 return Ok(None);
             }
-        } else if !mark_direct_sibling_seen(direct_seen, &cursor) {
+        } else if !mark_direct_sibling_seen(&mut seen.direct_seen, &cursor) {
             return Ok(None);
         }
         Ok(Some(cursor))
@@ -233,13 +247,10 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
         }
         let mut cursor = first;
 
-        let mut top_level_seen = BTreeSet::new();
-        let mut top_level_direct_seen = Vec::new();
+        let mut top_level_seen = SiblingSeen::default();
         let mut constructor_seen = BTreeSet::new();
         loop {
-            let Some(chased) =
-                self.chase_and_mark_seen(cursor, &mut top_level_seen, &mut top_level_direct_seen)?
-            else {
+            let Some(chased) = self.chase_and_mark_seen(cursor, &mut top_level_seen)? else {
                 break;
             };
 
@@ -278,8 +289,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
             owner: OutlineId,
             next: Option<ObjectHandle>,
             depth: usize,
-            siblings_seen: BTreeSet<ObjectRef>,
-            direct_siblings_seen: Vec<ObjectHandle>,
+            seen: SiblingSeen,
         }
 
         let mut frames = Vec::new();
@@ -289,8 +299,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                 owner: root,
                 next: first,
                 depth: 2,
-                siblings_seen: BTreeSet::new(),
-                direct_siblings_seen: Vec::new(),
+                seen: SiblingSeen::default(),
             });
         }
 
@@ -306,11 +315,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                     .expect("outline construction frame exists");
                 let owner = frame.owner;
                 let child_depth = frame.depth;
-                let chased = self.chase_and_mark_seen(
-                    cursor,
-                    &mut frame.siblings_seen,
-                    &mut frame.direct_siblings_seen,
-                )?;
+                let chased = self.chase_and_mark_seen(cursor, &mut frame.seen)?;
                 (owner, child_depth, chased)
             };
             let Some(cursor) = chased else {
@@ -347,8 +352,7 @@ impl<'a, R: Read + Seek> OutlineDocumentHelper<'a, R> {
                         owner: child,
                         next: first,
                         depth: child_depth + 1,
-                        siblings_seen: BTreeSet::new(),
-                        direct_siblings_seen: Vec::new(),
+                        seen: SiblingSeen::default(),
                     });
                 }
             }
