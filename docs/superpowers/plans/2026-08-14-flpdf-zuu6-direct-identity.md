@@ -43,7 +43,7 @@ fn identity_key_matches_qpdf_object_sameness_without_structural_equality() {
 - [ ] Run the RED test:
 
 ~~~bash
-cargo test -p flpdf --lib object_handle::tests::identity_key_matches_qpdf_object_sameness_without_structural_equality
+cargo test -p flpdf --lib identity_key_matches_qpdf_object_sameness_without_structural_equality
 ~~~
 
 Expected: compilation fails because identity_key and its return type do not exist yet. This is the intended feature-missing failure.
@@ -92,7 +92,7 @@ assert_eq!(prepared.pages.len(), WIDTH);
 - [ ] Run the new test before the production implementation:
 
 ~~~bash
-cargo test -p flpdf --lib pages::repair::tests::wide_direct_page_tree_uses_canonical_identity_lookup
+cargo test -p flpdf --lib wide_direct_page_tree_uses_canonical_identity_lookup
 ~~~
 
 Expected: the target remains blocked by the missing identity_key from Task 1. Once implemented, the test must pass without changing page ordering or cycle errors.
@@ -125,10 +125,10 @@ Document the qpdf correspondence at include/qpdf/QPDFObjectHandle.hh:304-309 and
 - [ ] Run the focused RED-to-GREEN checks:
 
 ~~~bash
-cargo test -p flpdf --lib object_handle::tests::identity_key_matches_qpdf_object_sameness_without_structural_equality
-cargo test -p flpdf --lib pages::repair::tests::wide_direct_page_tree_uses_canonical_identity_lookup
-cargo test -p flpdf --lib pages::repair::tests::direct_parent_cycle_terminates
-cargo test -p flpdf --lib pages::repair::tests::direct_kids_cycle_is_rejected_before_depth_overflow
+cargo test -p flpdf --lib identity_key_matches_qpdf_object_sameness_without_structural_equality
+cargo test -p flpdf --lib wide_direct_page_tree_uses_canonical_identity_lookup
+cargo test -p flpdf --lib direct_parent_cycle_terminates
+cargo test -p flpdf --lib direct_kids_cycle_is_rejected_before_depth_overflow
 ~~~
 
 Expected: all pass and direct-cycle diagnostics remain unchanged.
@@ -173,7 +173,7 @@ Expected: flpdf changed executable lines report uncovered 0 and PASS.
 
 ~~~bash
 git push -u origin feature/flpdf-zuu6-direct-identity
-gh pr create --draft --base main --head feature/flpdf-zuu6-direct-identity --title "fix(pages): use stable direct identity lookup" --body-file /tmp/flpdf-zuu6-pr-body.md
+gh pr create --draft --base main --head feature/flpdf-zuu6-direct-identity --title "fix(pages): use stable direct identity lookup" --body "<qpdf parity summary and verification evidence>"
 ~~~
 
 - [ ] Confirm Draft/base/head for the current branch:
