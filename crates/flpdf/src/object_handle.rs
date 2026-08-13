@@ -1,7 +1,7 @@
 //! The core object-handle graph: shared, cloneable identity for direct and
 //! indirect PDF objects, with qpdf-compatible parsed-offset tracking.
 //!
-//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
+//! qpdf correspondence: `QPDFObjectHandle`, `QPDFObject`, and `QPDFValue` identity and payload ownership, `QPDFObjectHandle::copyStream`/`QPDF::copyStreamData` stream-copy primitives, `QPDF::setImmediateCopyFrom`, plus `QPDFWriter.cc` `unparseObject`/`writeTrailer` writer-emission primitives (`unparse_object`/`unparse_object_qdf`/`unparse_stream_body`/`unparse_stream_body_qdf`/`unparse_trailer`).
 //!
 //! `QPDFObjectHandle` holds `std::shared_ptr<QPDFObject>` and defines object
 //! sameness by that pointer, not by structural equality
@@ -199,6 +199,42 @@ where
     }
 }
 
+/// qpdf's `CopiedStreamDataProvider` (`libqpdf/QPDF.cc:126-163`), retaining
+/// the source handle so copied provider/original streams are still dispatched
+/// through the source document when the destination stream is read.
+struct CopiedStreamDataProvider {
+    source: ObjectHandle,
+}
+
+impl StreamDataProvider for CopiedStreamDataProvider {
+    fn supports_retry(&self) -> bool {
+        true
+    }
+
+    fn provide_stream_data_with_retry_by_id(
+        &self,
+        _object_number: u32,
+        _generation: u16,
+        pipeline: &mut dyn Pipeline,
+        suppress_warnings: bool,
+        will_retry: bool,
+    ) -> Result<bool> {
+        let mut filtering_attempted = false;
+        self.source.pipe_stream_data(
+            pipeline,
+            &mut filtering_attempted,
+            0,
+            DecodeLevel::None,
+            suppress_warnings,
+            will_retry,
+        )
+    }
+}
+
+pub(crate) fn copied_stream_data_provider(source: ObjectHandle) -> Rc<dyn StreamDataProvider> {
+    Rc::new(CopiedStreamDataProvider { source })
+}
+
 struct StreamFilterPlan {
     filters: Vec<Box<dyn StreamFilter>>,
     specialized_compression: bool,
@@ -223,6 +259,29 @@ pub type ResourceConflicts =
 /// document implementation can resolve an indirect slot.
 pub(crate) trait DocumentResolver {
     fn resolve_indirect(&self, object_ref: ObjectRef, handle: &ObjectHandle) -> Result<()>;
+
+    /// Create qpdf's owned empty stream object for an ObjectHandle operation.
+    fn new_stream(&self) -> Result<ObjectHandle> {
+        Err(Error::Internal(
+            "stream creation requested from a resolver without a document".to_owned(),
+        ))
+    }
+
+    /// Copy raw stream data into an already-created destination stream. The
+    /// destination resolver owns the provider registration, while the source
+    /// handle retains the source document's lazy dispatch boundary.
+    fn copy_stream_data(&self, destination: &ObjectHandle, source: &ObjectHandle) -> Result<()> {
+        let _ = (destination, source);
+        Err(Error::Internal(
+            "stream data copy requested from a resolver without a document".to_owned(),
+        ))
+    }
+
+    /// Whether this resolver is a qpdf source configured for immediate stream
+    /// copying (`QPDF::setImmediateCopyFrom`).
+    fn immediate_copy_from(&self) -> bool {
+        false
+    }
 
     /// The document-side half of `QPDFObjectHandle::warn`
     /// (`libqpdf/QPDFObjectHandle.cc:2385-2396`): `QPDF::warn`
@@ -1568,7 +1627,7 @@ impl ObjectHandle {
     /// contextless.
     #[allow(dead_code)] // reached through the try_* accessors, whose own
                         // production consumers land with flpdf-25kg.3.6
-    fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
+    pub(crate) fn context(&self) -> Option<Rc<dyn DocumentResolver>> {
         let slot = self.0.borrow();
         slot.resolver
             .as_ref()
@@ -3071,6 +3130,46 @@ impl ObjectHandle {
                 None => Ok(ObjectHandle::null()),
             })
         })
+    }
+
+    /// Create a new stream in this handle's owning document, copying its
+    /// dictionary across indirect boundaries and retaining its data through
+    /// qpdf's buffer/provider source boundary. This is
+    /// `QPDFObjectHandle::copyStream` (`libqpdf/QPDFObjectHandle.cc:2136-2151`):
+    /// indirect dictionary entries keep their identity, while direct entries
+    /// are recursively `shallowCopy`-ed, and stream bytes are copied only by
+    /// sharing an existing buffer or registering a deferred provider.
+    ///
+    /// The source must have an owning document because qpdf's `newStream` is
+    /// document-owned and `StreamCopier::copyStreamData` needs that document
+    /// for the source-dispatch lifetime contract.
+    pub fn copy_stream(&self) -> Result<ObjectHandle> {
+        self.try_dereference()?;
+        let Some(source_dict) = self.as_stream_dict() else {
+            return Err(Error::System(format!(
+                "operation for stream attempted on object of type {}",
+                self.type_name()
+            )));
+        };
+        let resolver = self.context().ok_or_else(|| {
+            Error::Internal("copyStream called on a stream with no owning PDF".to_owned())
+        })?;
+        let result = resolver.new_stream()?;
+        let destination_dict = result.as_stream_dict().ok_or_else(|| {
+            Error::Internal("copyStream created a non-stream destination".to_owned())
+        })?;
+
+        for (key, value) in source_dict.as_dictionary().unwrap_or_default() {
+            let value = if value.is_indirect() {
+                value
+            } else {
+                value.shallow_copy()?
+            };
+            destination_dict.replace_key(&key, value);
+        }
+
+        resolver.copy_stream_data(&result, self)?;
+        Ok(result)
     }
 
     /// Merge `other`'s top-level entries into this handle's dictionary,
@@ -6121,6 +6220,22 @@ pub(crate) mod identity_tests {
         }
     }
 
+    struct NonStreamDestinationResolver;
+
+    impl DocumentResolver for NonStreamDestinationResolver {
+        fn resolve_indirect(
+            &self,
+            object_ref: ObjectRef,
+            handle: &ObjectHandle,
+        ) -> crate::Result<()> {
+            NoStreamSourceResolver.resolve_indirect(object_ref, handle)
+        }
+
+        fn new_stream(&self) -> crate::Result<ObjectHandle> {
+            Ok(ObjectHandle::integer(1))
+        }
+    }
+
     /// An unresolved indirect handle whose resolver installs `value`.
     ///
     /// `pub(crate)` so `stream_filter.rs`'s handle-shape reader tests can
@@ -6164,6 +6279,36 @@ pub(crate) mod identity_tests {
             .expect_err("an object-only resolver has no original stream source");
         assert!(matches!(error, Error::Internal(message)
             if message == "stream data requested from a resolver without a stream source"));
+    }
+
+    #[test]
+    fn stream_copy_resolver_defaults_report_missing_document_operations() {
+        let resolver = NoStreamSourceResolver;
+        assert!(matches!(
+            resolver.new_stream(),
+            Err(Error::Internal(message))
+                if message == "stream creation requested from a resolver without a document"
+        ));
+        assert!(matches!(
+            resolver.copy_stream_data(&ObjectHandle::null(), &ObjectHandle::null()),
+            Err(Error::Internal(message))
+                if message == "stream data copy requested from a resolver without a document"
+        ));
+        assert!(!resolver.immediate_copy_from());
+    }
+
+    #[test]
+    fn copy_stream_rejects_a_non_stream_created_by_its_resolver() {
+        let resolver: Rc<dyn DocumentResolver> = Rc::new(NonStreamDestinationResolver);
+        let stream = ObjectHandle::new_indirect_with_resolver(
+            ObjectRef::new(20, 0),
+            Rc::downgrade(&resolver),
+        );
+        let error = stream
+            .copy_stream()
+            .expect_err("resolver returned a non-stream destination");
+        assert!(matches!(error, Error::Internal(message)
+            if message == "copyStream created a non-stream destination"));
     }
 
     /// [`resolver_bearing_handle`] plus the resolver's [`ResolutionLog`].

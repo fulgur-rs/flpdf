@@ -1691,14 +1691,7 @@ impl<R: Read + Seek> Pdf<R> {
     /// `ObjectHandle` allocation; this method does not use the legacy
     /// cloning allocator or an empty replacement buffer.
     pub fn new_stream(&self) -> Result<ObjectHandle> {
-        let stream = self.resolver.direct_object_handle(ObjectValue::Stream {
-            stream_dict: ObjectHandle::dictionary(Vec::new()),
-            stream_data: None,
-            stream_length: 0,
-            stream_provider: None,
-        });
-        stream.set_parsed_offset_if_unset(0);
-        self.make_indirect_from_object_handle(stream)
+        self.resolver.new_stream_handle()
     }
 
     /// Create an owned stream and replace its data with the supplied buffer.
@@ -5522,6 +5515,34 @@ mod tests {
         pdf
     }
 
+    fn pdf_with_one_stream(stream_data: &[u8]) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let off1 = pdf.len() as u64;
+        pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let off2 = pdf.len() as u64;
+        pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        let off3 = pdf.len() as u64;
+        pdf.extend_from_slice(
+            b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n",
+        );
+        let stream_offset = pdf.len() as u64;
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {} >>\nstream\n", stream_data.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_data);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_start = pdf.len() as u64;
+        let xref = format!(
+            "xref\n0 5\n0000000000 65535 f \n{off1:010} 00000 n \n{off2:010} 00000 n \n{off3:010} 00000 n \n{stream_offset:010} 00000 n \n"
+        );
+        pdf.extend_from_slice(xref.as_bytes());
+        let trailer =
+            format!("trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_start}\n%%EOF\n");
+        pdf.extend_from_slice(trailer.as_bytes());
+        pdf
+    }
+
     #[test]
     fn dropping_pdf_breaks_the_pages_parent_reference_cycle() {
         // `minimal_pdf_bytes`'s Pages node (2 0 obj) and Page (3 0 obj)
@@ -7817,6 +7838,155 @@ mod tests {
             .as_stream_dict()
             .expect("stream dictionary")
             .has_key(b"/Length"));
+    }
+
+    #[test]
+    fn copy_stream_shares_buffer_and_copies_dictionary_at_indirect_boundaries() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let data = Rc::new(b"copy stream payload".to_vec());
+        let source = pdf
+            .new_stream_with_data(Rc::clone(&data))
+            .expect("new source stream");
+        let shared = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(7))
+            .expect("indirect dictionary child");
+        let direct =
+            ObjectHandle::dictionary(vec![(b"/Nested".to_vec(), ObjectHandle::integer(9))]);
+        let source_dict = source.as_stream_dict().expect("source dictionary");
+        source_dict.replace_key(b"/Filter", ObjectHandle::name(b"FlateDecode".to_vec()));
+        source_dict.replace_key(b"/Indirect", shared.clone());
+        source_dict.replace_key(b"/Direct", direct.clone());
+
+        let copy = source.copy_stream().expect("copy stream");
+        let copy_dict = copy.as_stream_dict().expect("copy dictionary");
+
+        assert!(copy.is_indirect());
+        assert_ne!(copy.object_ref(), source.object_ref());
+        assert!(Rc::ptr_eq(
+            &copy.as_stream_data().expect("copied buffer"),
+            &data
+        ));
+        assert_eq!(
+            copy_dict.get_key(b"/Filter").as_name(),
+            Some(b"FlateDecode".to_vec())
+        );
+        assert!(copy_dict.get_key(b"/Indirect").is_same_object_as(&shared));
+        let copied_direct = copy_dict.get_key(b"/Direct");
+        assert!(!copied_direct.is_same_object_as(&direct));
+        assert_eq!(copied_direct.get_key(b"/Nested").as_integer(), Some(9));
+        copied_direct.replace_key(b"/Nested", ObjectHandle::integer(10));
+        assert_eq!(direct.get_key(b"/Nested").as_integer(), Some(9));
+    }
+
+    #[test]
+    fn copy_stream_keeps_provider_data_deferred_and_forwards_retry_flags() {
+        let pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let source = pdf.new_stream().expect("new source stream");
+        let calls = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let calls_for_provider = Rc::clone(&calls);
+        source
+            .replace_stream_data_with_retry_callback(
+                move |pipeline, suppress_warnings, will_retry| {
+                    calls_for_provider
+                        .borrow_mut()
+                        .push((suppress_warnings, will_retry));
+                    pipeline.write(b"provider payload").map_err(Error::from)?;
+                    pipeline.finish().map_err(Error::from)?;
+                    Ok(true)
+                },
+                None,
+                None,
+            )
+            .expect("register source provider");
+
+        let copy = source.copy_stream().expect("copy provider stream");
+        assert!(copy.as_stream_data().is_none());
+        assert!(calls.borrow().is_empty(), "copy must not invoke the source");
+        assert_eq!(
+            copy.get_raw_stream_data()
+                .expect("pipe copied provider")
+                .as_ref(),
+            b"provider payload"
+        );
+        assert_eq!(calls.borrow().as_slice(), &[(false, false)]);
+    }
+
+    #[test]
+    fn copy_stream_keeps_original_file_source_deferred() {
+        let bytes = pdf_with_one_stream(b"original payload");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let source = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve_object_handle(&source)
+            .expect("resolve source stream");
+
+        assert!(source.as_stream_data().is_none());
+        let copy = source.copy_stream().expect("copy original stream");
+        assert!(copy.as_stream_data().is_none());
+        assert_eq!(
+            copy.get_raw_stream_data()
+                .expect("pipe copied original source")
+                .as_ref(),
+            b"original payload"
+        );
+    }
+
+    #[test]
+    fn copy_stream_honors_source_immediate_copy_configuration() {
+        let bytes = pdf_with_one_stream(b"immediate payload");
+        let mut pdf = Pdf::open_mem_owned(bytes).expect("open stream fixture");
+        let source = pdf.get_object_handle(ObjectRef::new(4, 0));
+        pdf.resolve_object_handle(&source)
+            .expect("resolve source stream");
+        pdf.set_immediate_copy_from(true);
+
+        let copy = source.copy_stream().expect("copy immediate stream");
+        let source_data = source.as_stream_data().expect("materialized source data");
+        let copy_data = copy.as_stream_data().expect("shared copied data");
+        assert!(Rc::ptr_eq(&source_data, &copy_data));
+        assert_eq!(source_data.as_ref(), b"immediate payload");
+    }
+
+    #[test]
+    fn copy_stream_matches_qpdf_assertion_and_context_errors() {
+        let non_stream = ObjectHandle::integer(1);
+        assert!(matches!(
+            non_stream.copy_stream(),
+            Err(Error::System(message))
+                if message == "operation for stream attempted on object of type integer"
+        ));
+
+        let direct_stream = ObjectHandle::stream(
+            ObjectHandle::dictionary(Vec::new()),
+            Rc::new(b"detached".to_vec()),
+        );
+        assert!(matches!(
+            direct_stream.copy_stream(),
+            Err(Error::Internal(message))
+                if message == "copyStream called on a stream with no owning PDF"
+        ));
+    }
+
+    #[test]
+    fn resolver_copy_stream_data_rejects_non_stream_contract_inputs() {
+        let mut pdf = Pdf::open_mem_owned(minimal_pdf_bytes()).expect("open");
+        let source = pdf
+            .make_indirect_object_handle(ObjectHandle::integer(1))
+            .expect("make non-stream source");
+        pdf.set_immediate_copy_from(true);
+
+        let destination = ObjectHandle::integer(2);
+        assert!(matches!(
+            pdf.resolver.copy_stream_data(&destination, &source),
+            Err(Error::System(message))
+                if message == "operation for stream attempted on object of type integer"
+        ));
+
+        let destination = pdf.new_stream().expect("new destination stream");
+        assert!(matches!(
+            pdf.resolver.copy_stream_data(&destination, &source),
+            Err(Error::System(message))
+                if message == "operation for stream attempted on object of type integer"
+        ));
     }
 
     #[test]

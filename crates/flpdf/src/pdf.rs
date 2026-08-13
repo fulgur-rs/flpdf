@@ -204,6 +204,15 @@ impl<R: Read + Seek> Pdf<R> {
         &self.version
     }
 
+    /// Configure this document as a qpdf source whose lazy stream data must
+    /// be materialized when it is copied into another document. This is
+    /// qpdf's `QPDF::setImmediateCopyFrom` (`include/qpdf/QPDF.hh:242-257`):
+    /// the flag belongs to the source document, not the destination, and one
+    /// materialized buffer is then shared by every copied stream.
+    pub fn set_immediate_copy_from(&self, value: bool) {
+        self.resolver.set_immediate_copy_from(value);
+    }
+
     /// Whether this document has been asked to enumerate its complete page tree.
     ///
     /// This is monotonic for the lifetime of the [`Pdf`] and mirrors qpdf's
