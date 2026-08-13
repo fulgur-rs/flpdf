@@ -2926,8 +2926,7 @@ mod tests {
             .expect("written appearance must decode via its declared filter");
         assert!(
             decoded.windows(b"(text)".len()).any(|w| w == b"(text)"),
-            "decoded appearance is missing the field value: {:?}",
-            String::from_utf8_lossy(&decoded)
+            "decoded appearance is missing the field value: {decoded:?}"
         );
     }
 
@@ -3034,8 +3033,7 @@ mod tests {
             .expect("appearance stream must decode via its declared filter");
         assert!(
             decoded.windows(b"(Hello)".len()).any(|w| w == b"(Hello)"),
-            "decoded appearance is missing the field value: {:?}",
-            String::from_utf8_lossy(&decoded)
+            "decoded appearance is missing the field value: {decoded:?}"
         );
     }
 
@@ -3061,15 +3059,13 @@ mod tests {
             content
                 .windows(b"/Helv 11 Tf".len())
                 .any(|w| w == b"/Helv 11 Tf"),
-            "resolved 11pt Tf operand missing from {:?}",
-            String::from_utf8_lossy(&content)
+            "resolved 11pt Tf operand missing from {content:?}"
         );
         assert!(
             !content
                 .windows(b"/Helv 0 Tf".len())
                 .any(|w| w == b"/Helv 0 Tf"),
-            "stale unsubstituted 0 Tf operand still present in {:?}",
-            String::from_utf8_lossy(&content)
+            "stale unsubstituted 0 Tf operand still present in {content:?}"
         );
     }
 
@@ -3126,13 +3122,11 @@ mod tests {
         let content = stream.as_stream_data().expect("appearance data");
         assert!(
             content.windows(b"0 g".len()).any(|w| w == b"0 g"),
-            "original DA color operator missing from {:?}",
-            String::from_utf8_lossy(&content)
+            "original DA color operator missing from {content:?}"
         );
         assert!(
             !content.windows(2).any(|w| w == b"Tf"),
-            "no Tf operator must be invented when /DA has none, found one in {:?}",
-            String::from_utf8_lossy(&content)
+            "no Tf operator must be invented when /DA has none, found one in {content:?}"
         );
     }
 
@@ -3420,17 +3414,16 @@ mod tests {
         // display window at the full option list -- exactly the window the
         // original algorithm converges to for any in-range max_rows large
         // enough to show every option.
-        for expected in [b"(Alpha)".as_slice(), b"(Beta)", b"(Gamma)"] {
+        for (expected, label) in [
+            (b"(Alpha)".as_slice(), "Alpha"),
+            (b"(Beta)", "Beta"),
+            (b"(Gamma)", "Gamma"),
+        ] {
             let count = content
                 .windows(expected.len())
                 .filter(|window| *window == expected)
                 .count();
-            assert_eq!(
-                count,
-                1,
-                "expected exactly one `{}` Tj line",
-                String::from_utf8_lossy(expected)
-            );
+            assert_eq!(count, 1, "expected exactly one `{label}` Tj line");
         }
     }
 
@@ -3505,6 +3498,17 @@ mod tests {
         // parse_default_appearance's own "last Tf wins" resolution.
         let out = substitute_da_tf_operand(b"/Helv 12 Tf /Cour 0 Tf", 11.0);
         assert_eq!(out, b"/Helv 12 Tf /Cour 11 Tf");
+    }
+
+    #[test]
+    fn substitute_da_tf_operand_skips_inline_image_payload_without_confusing_operands() {
+        // A pathological /DA containing an inline-image sequence must not
+        // corrupt the Tf-operand scan: the image payload is a distinct
+        // token kind (Object::InlineImage) carrying no operand semantics,
+        // and the operators around it (BI/ID/EI) must not be mistaken for
+        // Tf or leave stale operands behind.
+        let out = substitute_da_tf_operand(b"BI /CS /RGB ID payload EI /Helv 0 Tf 0 g", 11.0);
+        assert_eq!(out, b"BI /CS /RGB ID payload EI /Helv 11 Tf 0 g");
     }
 
     /// PDF whose `/DA` references a `/DR` resource key (`/F1`) rather than a
