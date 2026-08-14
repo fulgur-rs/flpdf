@@ -13,8 +13,9 @@ pub(crate) mod repair;
 pub mod repair;
 
 use crate::filters::decode_stream_data;
+use crate::pipeline::buffer::Buffer;
 use crate::ref_chain::resolve_ref_chain;
-use crate::{Dictionary, Error, Object, ObjectRef, Pdf, Result, Stream};
+use crate::{Dictionary, Error, Object, ObjectHandle, ObjectRef, Pdf, Result, Stream};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{Read, Seek};
@@ -112,10 +113,11 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
 
 /// Return the decoded content-stream bytes for a single `Page` object.
 ///
-/// The page's `/Contents` entry may be absent (returns `Ok(Vec::new())`), a single
-/// `Stream` or `Reference → Stream`, or an `Array` of such references.  Every stream
-/// is decoded through its filter pipeline via [`crate::filters::decode_stream_data`]
-/// and the parts are coalesced the way qpdf's `pipeContentStreams` does: a single
+/// The page's `/Contents` entry may be absent or null (returns `Ok(Vec::new())`),
+/// a single `Stream` or `Reference → Stream`, or an `Array` of such references.
+/// Content is decoded and coalesced through the canonical
+/// [`crate::ObjectHandle::pipe_page_contents`] route, which resolves indirect
+/// `/Filter` and `/DecodeParms` values at the same boundary as qpdf. A single
 /// `\n` is inserted before a stream only when the previous decoded stream did not
 /// already end in a newline (an empty stream, whose last byte is treated as 0,
 /// still forces the separator). No trailing newline is appended.
@@ -123,9 +125,9 @@ pub fn page_refs_with_max_depth<R: Read + Seek>(
 /// # Errors
 ///
 /// - [`Error::Unsupported`] when `page_ref` does not resolve to a dictionary with
-///   `/Type /Page`, or when a `/Contents` element is not a stream.
-/// - Any [`Error`] that [`Pdf::resolve`] or [`crate::filters::decode_stream_data`]
-///   may return.
+///   `/Type /Page`, or when a content stream cannot be decoded.
+/// - Any [`Error`] that [`Pdf::resolve_object_handle`] or the canonical content
+///   pipeline may return.
 ///
 /// # Examples
 ///
@@ -146,23 +148,25 @@ pub fn page_content_bytes<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     page_ref: ObjectRef,
 ) -> Result<Vec<u8>> {
-    // Resolve the page object itself.
-    let page_obj = pdf.resolve_borrowed(page_ref)?;
-    let Some(page_dict) = page_obj.as_dict() else {
+    let page = pdf.get_object_handle(page_ref);
+    pdf.resolve_object_handle(&page)?;
+    if page.as_dictionary().is_none() {
         return Err(Error::Unsupported(format!(
             "object {page_ref} is not a dictionary, cannot extract /Contents"
         )));
-    };
+    }
+
     // Verify the /Type is /Page.
-    match page_dict.get("Type") {
-        Some(Object::Name(name)) if name.as_slice() == b"Page" => {}
-        Some(Object::Name(name)) => {
+    let page_type = page.try_get_key(b"/Type")?;
+    match page_type.try_as_name()? {
+        Some(name) if name.as_slice() == b"Page" => {}
+        Some(name) => {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} has /Type /{}, expected /Page",
-                String::from_utf8_lossy(name)
+                String::from_utf8_lossy(&name)
             )));
         }
-        Some(_) => {
+        None if page.has_key(b"/Type") => {
             return Err(Error::Unsupported(format!(
                 "object {page_ref} has a non-name /Type entry"
             )));
@@ -174,37 +178,48 @@ pub fn page_content_bytes<R: Read + Seek>(
         }
     }
 
-    // Extract the /Contents entry.  Absence is not an error (empty page).
-    let contents = match page_dict.get("Contents").cloned() {
-        None => return Ok(Vec::new()),
-        Some(c) => c,
-    };
-
-    // Collect every stream that /Contents references.
-    let streams: Vec<Stream> = collect_content_streams(pdf, &contents, page_ref)?;
-
-    if streams.is_empty() {
+    let contents = page.try_get_key(b"/Contents")?;
+    let (contents, _) = pdf.resolve_object_handle_to_terminal_ref(&contents)?;
+    if contents.is_null() {
         return Ok(Vec::new());
     }
 
-    // Decode each stream and coalesce exactly as qpdf's `pipeContentStreams`
-    // does (libqpdf/QPDFObjectHandle.cc): a '\n' is inserted before a stream only
-    // when the previous decoded stream did NOT already end in a newline. qpdf
-    // resets its `LastChar` accumulator (initialised to 0) per stream, so an
-    // empty stream — whose last byte is 0, not '\n' — still forces a separator.
-    // No trailing newline is appended after the final stream.
-    let mut result: Vec<u8> = Vec::new();
-    let mut need_newline = false;
-    for stream in streams {
-        let decoded = decode_stream_data(&stream.dict, &stream.data)?;
-        if need_newline {
-            result.push(b'\n');
+    // `ObjectHandle::array_or_stream_to_stream_array` intentionally mirrors
+    // qpdf's one-hop handle view. This public compatibility helper also has a
+    // long-standing contract to follow holder chains in `/Contents`, so first
+    // reduce every legal holder to its terminal handle and then hand the
+    // normalized stream array to the canonical pipe path. The stream handles
+    // themselves remain resolver-backed; no legacy `Object` materialization is
+    // introduced for filter metadata or stream bytes.
+    let mut streams = Vec::new();
+    if let Some(items) = contents.as_array() {
+        for item in items {
+            let (item, _) = pdf.resolve_object_handle_to_terminal_ref(&item)?;
+            if item.as_stream_dict().is_some() {
+                streams.push(item);
+            } else {
+                return Err(Error::Unsupported(format!(
+                    "/Contents array element on page {page_ref} does not resolve to a stream"
+                )));
+            }
         }
-        let last = decoded.last().copied().unwrap_or(0);
-        need_newline = last != b'\n';
-        result.extend_from_slice(&decoded);
+    } else if contents.as_stream_dict().is_some() {
+        streams.push(contents);
+    } else {
+        return Err(Error::Unsupported(format!(
+            "/Contents on page {page_ref} is not a stream or array"
+        )));
     }
-    Ok(result)
+
+    let normalized_contents = ObjectHandle::array(streams);
+    let mut buffer = Buffer::new("page content bytes", None);
+    let mut all_description = String::new();
+    normalized_contents.pipe_content_streams(
+        &mut buffer,
+        &format!("page object {page_ref}"),
+        &mut all_description,
+    )?;
+    Ok(buffer.take_buffer()?)
 }
 
 /// Resolve a `Page`'s `/Contents` into its content streams, each paired with the
@@ -266,6 +281,7 @@ fn page_content_stream_entries_with_policy<R: Read + Seek>(
     }
     let contents = match page_dict.get("Contents").cloned() {
         None => return Ok(Vec::new()),
+        Some(Object::Null) => return Ok(Vec::new()),
         Some(c) => c,
     };
     collect_content_stream_entries(pdf, &contents, page_ref, ignore_non_streams)
@@ -276,9 +292,8 @@ fn page_content_stream_entries_with_policy<R: Read + Seek>(
 /// `Reference` to a stream, an `Array` of `Reference`s (or direct streams), or
 /// a `Reference` to such an array.
 ///
-/// This is the shared holder-chain implementation behind both
-/// [`page_content_stream_entries`] (which keeps the refs) and
-/// [`collect_content_streams`] (which discards them).
+/// This is the shared holder-chain implementation behind both public entry
+/// points (one retaining terminal refs and one returning only streams).
 fn collect_content_stream_entries<R: Read + Seek>(
     pdf: &mut Pdf<R>,
     contents: &Object,
@@ -300,6 +315,7 @@ fn collect_content_stream_entries<R: Read + Seek>(
                 Object::Array(elems) => {
                     collect_content_array_entries(pdf, &elems, page_ref, ignore_non_streams)
                 }
+                Object::Null => Ok(Vec::new()),
                 _ if ignore_non_streams => Ok(Vec::new()),
                 other => Err(Error::Unsupported(format!(
                     "/Contents reference on page {page_ref} resolves to {}, not a stream or array",
@@ -361,24 +377,6 @@ fn collect_content_array_entries<R: Read + Seek>(
         }
     }
     Ok(out)
-}
-
-/// Resolve a `/Contents` value into a flat list of `Stream`s, handling all four
-/// legal forms: a direct `Stream`, a `Reference` to a stream, an `Array` of
-/// `Reference`s (or direct streams), or a `Reference` to such an array. Terminal
-/// refs are discarded; callers that need them use
-/// [`page_content_stream_entries`].
-fn collect_content_streams<R: Read + Seek>(
-    pdf: &mut Pdf<R>,
-    contents: &Object,
-    page_ref: ObjectRef,
-) -> Result<Vec<Stream>> {
-    Ok(
-        collect_content_stream_entries(pdf, contents, page_ref, false)?
-            .into_iter()
-            .map(|(_, s)| s)
-            .collect(),
-    )
 }
 
 /// Coalesce a page's `/Contents` array into a single stream.
@@ -1073,6 +1071,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn page_content_bytes_returns_empty_for_null_contents() {
+        let bytes = build_pdf_with_contents("null", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert!(
+            content.is_empty(),
+            "qpdf treats explicit null /Contents as empty"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test: /Contents = single Reference → decoded bytes
     // -----------------------------------------------------------------------
@@ -1167,6 +1176,35 @@ mod tests {
         assert_eq!(content, body);
     }
 
+    #[test]
+    fn page_content_bytes_resolves_indirect_filter_and_decode_params() {
+        let body = b"q 1 0 0 1 0 0 cm Q";
+        let mut filter_dict = Dictionary::new();
+        filter_dict.insert("Filter", Object::Name(b"FlateDecode".to_vec()));
+        let encoded = encode_stream_data(&filter_dict, body).unwrap();
+
+        let stream_ref = ObjectRef::new(4, 0);
+        let filter_ref = ObjectRef::new(6, 0);
+        let decode_params_ref = ObjectRef::new(7, 0);
+        let bytes = build_pdf_with_binary_extras("4 0 R", &[(4, stream_object_bytes(4, &encoded))]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+
+        let mut stream_dict = Dictionary::new();
+        stream_dict.insert("Filter", Object::Reference(filter_ref));
+        stream_dict.insert("DecodeParms", Object::Reference(decode_params_ref));
+        pdf.set_object(
+            stream_ref,
+            Object::Stream(Stream::new(stream_dict, encoded)),
+        );
+        pdf.set_object(filter_ref, Object::Name(b"FlateDecode".to_vec()));
+        let mut decode_params = Dictionary::new();
+        decode_params.insert("Predictor", Object::Integer(1));
+        pdf.set_object(decode_params_ref, Object::Dictionary(decode_params));
+
+        let content = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+        assert_eq!(content, body);
+    }
+
     // -----------------------------------------------------------------------
     // Test: non-Page object → Error::Unsupported
     // -----------------------------------------------------------------------
@@ -1182,6 +1220,21 @@ mod tests {
             Error::Unsupported(_) => {}
             err => panic!("expected Error::Unsupported, got {err:?}"),
         }
+    }
+
+    #[test]
+    fn page_content_bytes_rejects_non_name_page_type() {
+        let bytes = build_pdf_with_contents("", &[]);
+        let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+        let mut page_dict = Dictionary::new();
+        page_dict.insert("Type", Object::Integer(17));
+        pdf.set_object(ObjectRef::new(3, 0), Object::Dictionary(page_dict));
+
+        let err = page_content_bytes(&mut pdf, ObjectRef::new(3, 0)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(message) if message.contains("non-name /Type")),
+            "expected non-name /Type error, got {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1393,6 +1446,19 @@ mod tests {
         let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
         let entries = page_content_stream_entries(&mut pdf, ObjectRef::new(3, 0)).unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn content_stream_entries_empty_for_null_contents_and_reference_to_null() {
+        let cases = [
+            build_pdf_with_contents("null", &[]),
+            build_pdf_with_binary_extras("4 0 R", &[(4, b"4 0 obj\nnull\nendobj\n".to_vec())]),
+        ];
+        for bytes in cases {
+            let mut pdf = Pdf::open(Cursor::new(bytes)).expect("PDF should parse");
+            let entries = page_content_stream_entries(&mut pdf, ObjectRef::new(3, 0)).unwrap();
+            assert!(entries.is_empty());
+        }
     }
 
     #[test]
