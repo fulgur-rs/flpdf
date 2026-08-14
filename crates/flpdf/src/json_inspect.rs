@@ -5362,6 +5362,16 @@ mod tests {
                 2,
                 b"\"u:hello\"".as_slice(),
             ),
+            (
+                ObjectHandle::string(b"\xef\xbb\xbf\xff".to_vec()),
+                2,
+                b"\"b:efbbbfff\"".as_slice(),
+            ),
+            (
+                ObjectHandle::string(b"     \x7f".to_vec()),
+                2,
+                b"\"b:20202020207f\"".as_slice(),
+            ),
             (ObjectHandle::string(vec![0x08]), 2, b"\"u:\\b\"".as_slice()),
             (
                 ObjectHandle::dictionary(vec![(b"Plain".to_vec(), ObjectHandle::integer(1))]),

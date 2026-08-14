@@ -6613,17 +6613,21 @@ impl<'a> ObjectJsonWriter<'a> {
                 // QPDF_Stream::writeJSON writes only its dictionary. The
                 // outer stream wrapper belongs to QPDF_Stream::writeStreamJSON
                 // and the document JSON layer.
+                // cov:ignore-start: type_code()==10 guarantees that as_stream_dict returns Some
                 let dictionary = handle.as_stream_dict().ok_or_else(|| {
                     ObjectJsonError::Pdf("stream's dict handle is not a dictionary".to_string())
                 })?;
+                // cov:ignore-end
                 self.write_handle(&dictionary, json_version, false, depth + 1)
             }
-            13 => Err(ObjectJsonError::Unresolved),
+            13 => Err(ObjectJsonError::Unresolved), // cov:ignore: as_reference dispatches bare references before type_code
             14 => Err(ObjectJsonError::Destroyed),
-            1 => Err(ObjectJsonError::Reserved),
+            1 => Err(ObjectJsonError::Reserved), // cov:ignore: reserved values are rejected before type dispatch
+            // cov:ignore-start: type_code is exhaustive and every reachable code has a dedicated arm above
             other => Err(ObjectJsonError::Pdf(format!(
                 "unsupported qpdf object type code {other}"
             ))),
+            // cov:ignore-end
         }
     }
 
@@ -6891,6 +6895,19 @@ mod object_json_writer_tests {
 
         assert!(matches!(error, ObjectJsonError::Reserved));
         assert_eq!(bytes, b"{\n  \"/Reserved\": ");
+    }
+
+    #[test]
+    fn writer_key_adds_qpdf_name_slash_for_a_raw_consumer_key() {
+        let mut bytes = Vec::new();
+        let mut output = PlString::new("object-handle-json", None, &mut bytes);
+        let mut writer = ObjectJsonWriter::new(&mut output, 0);
+
+        writer
+            .write_key(b"Plain", 2)
+            .expect("a raw key is normalized before JSON emission");
+
+        assert_eq!(bytes, b"\n\"/Plain\": ");
     }
 
     #[test]
