@@ -250,7 +250,18 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
         .expect("qpdf object-map entries are indirect handles");
     let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
 
-    handle.try_dereference().map_err(ConvertError::from)?;
+    // Chase a `Pdf::set_object`-installed bare-reference redirect
+    // (`ObjectValue::Reference`) to its terminal value before dispatching.
+    // The replaced `qpdf_resolve_top_level_object` path did this chase
+    // itself; `ObjectHandle::write_json`'s `dereference_indirect` only
+    // dereferences `handle`'s own indirect identity (one hop), so a
+    // resolved value that is itself a bare reference needs this second,
+    // explicit chase or the entry both serializes the wrong value and
+    // (for a redirect-to-stream) is misrouted below, since `type_code()`
+    // on the un-chased holder reports 13 (unresolved/reference), never 10.
+    let handle = pdf
+        .resolve_object_handle_to_terminal(handle)
+        .map_err(ConvertError::from)?;
     if handle.type_code() == 10 {
         // Stream payload/retry behavior remains the QPDF_Stream::writeStreamJSON
         // boundary owned by flpdf-3yn9.9. Keep that narrow legacy adapter until
@@ -294,7 +305,7 @@ fn write_non_file_mode_object_entry<R: Read + Seek>(
         return Ok(());
     }
 
-    write_non_stream_value_entry(handle, key.as_bytes(), out, objects_first)?;
+    write_non_stream_value_entry(&handle, key.as_bytes(), out, objects_first)?;
     Ok(())
 }
 
@@ -311,7 +322,11 @@ fn write_file_mode_object_entry<R: Read + Seek>(
         .expect("qpdf object-map entries are indirect handles");
     let key = format!("obj:{} {} R", object_ref.number, object_ref.generation);
 
-    handle.try_dereference().map_err(ConvertError::from)?;
+    // See the non-file writer: chase a `Pdf::set_object` bare-reference
+    // redirect to its terminal value before dispatching.
+    let handle = pdf
+        .resolve_object_handle_to_terminal(handle)
+        .map_err(ConvertError::from)?;
     if handle.type_code() == 10 {
         // See the non-file writer: stream payload/datafile retry semantics are
         // intentionally left to the following stream consumer slice.
@@ -336,7 +351,7 @@ fn write_file_mode_object_entry<R: Read + Seek>(
         return Ok(());
     }
 
-    write_non_stream_value_entry(handle, key.as_bytes(), out, objects_first)?;
+    write_non_stream_value_entry(&handle, key.as_bytes(), out, objects_first)?;
     Ok(())
 }
 
@@ -407,6 +422,7 @@ fn write_file_mode_stream_value<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::Dictionary;
     use crate::object_handle::ObjectValue;
     use crate::pipeline::test_support::{RecordingSink, TraceCall};
     use crate::pipeline::PlString;
@@ -567,5 +583,324 @@ mod tests {
             JsonOutputError::Convert(ConvertError::PdfError(message))
                 if message == "canonical stream handle has no legacy stream payload"
         ));
+    }
+
+    /// qpdf's replaced `qpdf_resolve_top_level_object` chased a
+    /// [`Pdf::set_object`]-installed bare-reference redirect
+    /// (`ObjectValue::Reference`, this crate's compatibility bridge for
+    /// `Pdf::set_object(holder, Object::Reference(target))`) to its terminal
+    /// value before writing the entry. `ObjectHandle::write_json`'s
+    /// `dereference_indirect` only dereferences the holder's own indirect
+    /// identity (one hop); a resolved value that is itself a bare reference
+    /// needs a second, explicit chase (`Pdf::resolve_object_handle_to_terminal`,
+    /// the same helper `outline_document_helper.rs`'s `resolve_value_handle`
+    /// uses for this exact bridge shape) or the holder serializes as the
+    /// literal `"target R"` string instead of the target's value.
+    #[test]
+    fn non_stream_entry_chases_a_set_object_reference_redirect_to_its_terminal_value() {
+        let mut pdf = load_one_page_pdf();
+        let target_ref = ObjectRef::new(50, 0);
+        pdf.set_object(target_ref, Object::Integer(42));
+        let holder_ref = ObjectRef::new(51, 0);
+        pdf.set_object(holder_ref, Object::Reference(target_ref));
+        let handle = pdf.get_object_handle(holder_ref);
+
+        let mut bytes = Vec::new();
+        let mut objects_first = true;
+        {
+            let mut out = PlString::new("json", None, &mut bytes);
+            write_non_file_mode_object_entry(
+                &mut pdf,
+                &handle,
+                DecodeLevel::None,
+                NonFileStreamDataMode::None,
+                &mut out,
+                &mut objects_first,
+            )
+            .expect("redirect chase must succeed");
+        }
+        let text = String::from_utf8(bytes).expect("json output must be utf8");
+        assert!(
+            text.contains("\"value\": 42"),
+            "expected the terminal value 42, got {text}"
+        );
+        assert!(
+            !text.contains("50 0 R"),
+            "the redirect target must not surface as a literal reference: {text}"
+        );
+    }
+
+    /// Same bridge as above, but the redirect's terminal value is itself a
+    /// stream. The replaced path's chase also covered this case (the finding's
+    /// own regression claim: "misclassifies redirects to streams"); the fix
+    /// must gate the stream-vs-value dispatch on the chased terminal handle,
+    /// not the un-chased holder, or the entry silently loses the stream
+    /// wrapper, payload, and side file.
+    #[test]
+    fn non_file_stream_entry_chases_a_set_object_reference_redirect_to_a_stream() {
+        let mut pdf = load_one_page_pdf();
+        let target_ref = ObjectRef::new(50, 0);
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"Test".to_vec()));
+        pdf.set_object(
+            target_ref,
+            Object::Stream(Stream::new(dict, b"hi".to_vec())),
+        );
+        let holder_ref = ObjectRef::new(51, 0);
+        pdf.set_object(holder_ref, Object::Reference(target_ref));
+        let handle = pdf.get_object_handle(holder_ref);
+
+        let mut bytes = Vec::new();
+        let mut objects_first = true;
+        {
+            let mut out = PlString::new("json", None, &mut bytes);
+            write_non_file_mode_object_entry(
+                &mut pdf,
+                &handle,
+                DecodeLevel::None,
+                NonFileStreamDataMode::Inline,
+                &mut out,
+                &mut objects_first,
+            )
+            .expect("redirect-to-stream chase must succeed");
+        }
+        let text = String::from_utf8(bytes).expect("json output must be utf8");
+        assert!(
+            text.contains("\"stream\""),
+            "expected the stream wrapper, got {text}"
+        );
+        assert!(
+            text.contains("/Type"),
+            "expected the target stream's own dict, got {text}"
+        );
+        assert!(
+            !text.contains("50 0 R"),
+            "the redirect target must not surface as a literal reference: {text}"
+        );
+    }
+
+    /// File-mode variant of the redirect-to-stream case above: the side file
+    /// and `datafile` entry must belong to the chased terminal stream.
+    #[test]
+    fn file_mode_stream_entry_chases_a_set_object_reference_redirect_to_a_stream() {
+        let mut pdf = load_one_page_pdf();
+        let target_ref = ObjectRef::new(50, 0);
+        let mut dict = Dictionary::new();
+        dict.insert("Type", Object::Name(b"Test".to_vec()));
+        pdf.set_object(
+            target_ref,
+            Object::Stream(Stream::new(dict, b"hi".to_vec())),
+        );
+        let holder_ref = ObjectRef::new(51, 0);
+        pdf.set_object(holder_ref, Object::Reference(target_ref));
+        let handle = pdf.get_object_handle(holder_ref);
+
+        let dir = std::env::temp_dir();
+        let prefix = dir.join(format!(
+            "flpdf-document-json-redirect-stream-file-{}",
+            std::process::id()
+        ));
+        let prefix = prefix.to_str().expect("prefix must be valid utf8");
+
+        let mut bytes = Vec::new();
+        let mut objects_first = true;
+        {
+            let mut out = PlString::new("json", None, &mut bytes);
+            write_file_mode_object_entry(
+                &mut pdf,
+                &handle,
+                DecodeLevel::None,
+                prefix,
+                &mut out,
+                &mut objects_first,
+            )
+            .expect("redirect-to-stream chase must succeed");
+        }
+        let text = String::from_utf8(bytes).expect("json output must be utf8");
+        assert!(
+            text.contains("\"datafile\""),
+            "expected the side-file datafile entry, got {text}"
+        );
+        // The side file is keyed by the enumerated top-level object
+        // (`holder_ref`), the same as the ordinary non-redirect case, not by
+        // the terminal stream's own object number: qpdf itself can never
+        // hold this bridge shape (`QPDF::replaceObject` rejects an indirect
+        // handle, `libqpdf/QPDF.cc:1980-1991`), so there is no qpdf
+        // precedent for the redirect case specifically, and the enumerated
+        // slot's number is what names "this JSON object's side file" in
+        // every qpdf-reachable (non-redirect) case.
+        let side_path = format_json_side_file_path(prefix, holder_ref.number);
+        let side_data = std::fs::read(&side_path).expect("side file must be written");
+        assert_eq!(side_data, b"hi");
+        let _ = std::fs::remove_file(&side_path);
+        assert!(
+            !text.contains("50 0 R"),
+            "the redirect target must not surface as a literal reference: {text}"
+        );
+    }
+
+    /// Documents (does not fix) the canonical array writer's behavior for a
+    /// nested reference whose generation is 65535, matching qpdf's own
+    /// `writeJSON`: `QPDF_Array::writeJSON` (`QPDF_Array.cc:153-187`) decides
+    /// reference-vs-value purely via `og.isIndirect()`
+    /// (`QPDFObjGen::isIndirect()`, `include/qpdf/QPDFObjGen.hh`, defined as
+    /// `obj != 0` with no generation check at all) — it never validates the
+    /// generation. qpdf's generation-65535 rejection
+    /// (`QPDFParser.cc:168-176`: `id < 1 || gen < 0 || gen >= 65535` =>
+    /// `addNull()`) is a parse-time token-interpretation rule owned by the
+    /// parser, not a property the object model or its JSON writer enforce.
+    /// A live indirect handle with generation 65535 is reachable, in both
+    /// qpdf and flpdf, only via programmatic construction that bypasses the
+    /// parser (`flpdf`'s own `parser.rs:763-768` applies the identical
+    /// `number >= 1 && (0..65535).contains(&generation)` filter at parse
+    /// time), and on that path real qpdf writes the literal reference
+    /// string, not `null`. Live-probed against `/usr/bin/qpdf` 11.9.0: a
+    /// real PDF file with `[0 0 R 1 65535 R (marker)]` already collapses to
+    /// `[null, null, "u:marker"]` before any writer runs (parser-owned), so
+    /// the replaced `ordered_qpdf_object`/`reference_is_valid` null
+    /// normalization this finding asks to restore was never exercised by a
+    /// parsed document and is not qpdf's own array-writer behavior for the
+    /// only way this shape can otherwise arise.
+    #[test]
+    fn nested_reference_with_generation_65535_matches_qpdf_array_writer_no_generation_check() {
+        let mut pdf = load_one_page_pdf();
+        let invalid_ref = ObjectRef::new(7, 65535);
+        let mut inner = Dictionary::new();
+        inner.insert(
+            "Nested",
+            Object::Array(vec![Object::Reference(invalid_ref)]),
+        );
+        let holder_ref = ObjectRef::new(60, 0);
+        pdf.set_object(holder_ref, Object::Dictionary(inner));
+        let handle = pdf.get_object_handle(holder_ref);
+
+        let mut bytes = Vec::new();
+        let mut objects_first = true;
+        {
+            let mut out = PlString::new("json", None, &mut bytes);
+            write_non_file_mode_object_entry(
+                &mut pdf,
+                &handle,
+                DecodeLevel::None,
+                NonFileStreamDataMode::None,
+                &mut out,
+                &mut objects_first,
+            )
+            .expect("a nested reference, valid or not, must not error");
+        }
+        let text = String::from_utf8(bytes).expect("json output must be utf8");
+        assert!(
+            text.contains("\"7 65535 R\""),
+            "qpdf's array writer has no generation validity check \
+             (QPDF_Array.cc:153-187 only tests isIndirect()); expected the \
+             literal reference, got {text}"
+        );
+    }
+    /// Guards the fix's new gate (`terminal.type_code() == 10`, checked
+    /// after the canonical chase, but the stream branch body still reads
+    /// the *legacy* representation via `qpdf_resolve_top_level_object`)
+    /// against the two representations disagreeing about redirect-to-stream
+    /// status. `Pdf::set_object`'s bounded lift
+    /// (`Pdf::lift_for_set_object`, `reader.rs`) can fail for a value nested
+    /// past `MAX_INLINE_DEPTH`, in which case it leaves the *canonical*
+    /// handle graph untouched while the *legacy* cache still receives the
+    /// full value (`reader.rs`'s `set_object` doc: "store `object` directly
+    /// as the bridge's authoritative materialized value instead"). This
+    /// constructs exactly that split — target's dict entry nested
+    /// `MAX_INLINE_DEPTH + 5` deep — and confirms the canonical terminal
+    /// chase reports `null` (not `10`/stream) for the un-lifted target, so
+    /// the new gate correctly stays out of the stream branch instead of
+    /// entering it and hitting the legacy/canonical mismatch error.
+    #[test]
+    fn redirect_to_a_stream_whose_lift_failed_falls_through_to_null_not_an_error() {
+        let mut pdf = load_one_page_pdf();
+        let target_ref = ObjectRef::new(50, 0);
+
+        fn nest(depth: usize) -> Object {
+            if depth == 0 {
+                Object::Integer(1)
+            } else {
+                Object::Array(vec![nest(depth - 1)])
+            }
+        }
+        let mut dict = Dictionary::new();
+        dict.insert("Deep", nest(crate::object::MAX_INLINE_DEPTH + 5));
+        pdf.set_object(
+            target_ref,
+            Object::Stream(Stream::new(dict, b"hi".to_vec())),
+        );
+
+        let holder_ref = ObjectRef::new(51, 0);
+        pdf.set_object(holder_ref, Object::Reference(target_ref));
+        let handle = pdf.get_object_handle(holder_ref);
+
+        let terminal = pdf
+            .resolve_object_handle_to_terminal(&handle)
+            .expect("terminal chase must not error even when the lift failed");
+        assert_eq!(
+            terminal.type_code(),
+            2,
+            "an un-lifted target must not report as a stream to the new gate"
+        );
+
+        let mut bytes = Vec::new();
+        let mut objects_first = true;
+        {
+            let mut out = PlString::new("json", None, &mut bytes);
+            write_non_file_mode_object_entry(
+                &mut pdf,
+                &handle,
+                DecodeLevel::None,
+                NonFileStreamDataMode::None,
+                &mut out,
+                &mut objects_first,
+            )
+            .expect("a lift failure must not surface as a canonical/legacy mismatch error");
+        }
+        let text = String::from_utf8(bytes).expect("json output must be utf8");
+        assert!(
+            text.contains("\"value\": null"),
+            "expected the fallback null value, got {text}"
+        );
+    }
+
+    /// The realistic counterpart of the redirect-to-stream tests above: the
+    /// target is a real, file-parsed stream (never touched by
+    /// `Pdf::set_object`) rather than one constructed in-memory. Confirms
+    /// the canonical terminal chase and the legacy
+    /// `qpdf_resolve_top_level_object` chase agree for ordinary parsed
+    /// content, so the redirect-to-stream entry writes the full wrapper
+    /// (data, dict) with no divergence error.
+    #[test]
+    fn redirect_to_a_real_preexisting_file_stream_writes_the_full_wrapper() {
+        let mut pdf = load_one_page_pdf();
+        let target_ref = ObjectRef::new(7, 0); // the fixture's own content stream
+        let holder_ref = ObjectRef::new(51, 0);
+        pdf.set_object(holder_ref, Object::Reference(target_ref));
+        let handle = pdf.get_object_handle(holder_ref);
+
+        let mut bytes = Vec::new();
+        let mut objects_first = true;
+        {
+            let mut out = PlString::new("json", None, &mut bytes);
+            write_non_file_mode_object_entry(
+                &mut pdf,
+                &handle,
+                DecodeLevel::None,
+                NonFileStreamDataMode::Inline,
+                &mut out,
+                &mut objects_first,
+            )
+            .expect("redirect to a real pre-existing stream must not error");
+        }
+        let text = String::from_utf8(bytes).expect("json output must be utf8");
+        assert!(
+            text.contains("\"data\""),
+            "expected inline data, got {text}"
+        );
+        assert!(
+            text.contains("\"dict\""),
+            "expected the stream dict, got {text}"
+        );
     }
 }
